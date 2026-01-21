@@ -1,0 +1,78 @@
+# Rust build artifacts
+target/
+Cargo.lock  # Comment out if this is a binary project
+
+# Generated documentation
+doc/
+
+# Backup files
+**/*.rs.bk
+*.orig
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.project
+.classpath
+.settings/
+.metadata/
+.history/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Development and debugging
+*.log
+*.tmp
+.env
+.env.local
+
+# Code coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+
+# Benchmark results
+criterion/
+
+# Python (for tooling/scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Node.js (for web/frontend components if any)
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Security - never commit these
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# CI/CD
+.cache/
