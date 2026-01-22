@@ -17,3 +17,11 @@ variables:
   SECRET_DETECTION_ENABLED: 'true'
 secret_detection:
   stage: secret-detection
+
+tests-job:
+  stage: test
+  # Use an official Rust Docker image as the base environment
+  image: rust:latest
+  script:
+    # This command builds the project and runs all defined tests
+    - cargo test --verbose
