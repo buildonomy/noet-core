@@ -35,6 +35,19 @@ Be respectful, inclusive, and considerate in all interactions. We're here to bui
    cargo test
    ```
 
+## Current Development Phase
+
+**Status**: Pre-v0.1.0 (soft open source)
+
+**Workflow**: Direct commits to `main` branch
+- Single developer, no branching strategy yet
+- Breaking changes acceptable
+- Commit history may be messy (will clean up pre-v1.0.0)
+
+**After v0.1.0 announcement**: Will adopt the branching strategy below for external contributors.
+
+---
+
 ## Development Workflow
 
 ### Branch Strategy

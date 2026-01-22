@@ -7,6 +7,7 @@ documentation = "https://docs.rs/noet-core"
 license = "MIT OR Apache-2.0"
 repository = "https://gitlab.com/buildonomy/noet"
 edition = "2021"
+rust-version = "1.80"
 readme = "README.md"
 keywords = ["knowledge-management", "hypergraph", "markdown", "sync", "graph"]
 categories = ["data-structures", "parsing", "database"]
