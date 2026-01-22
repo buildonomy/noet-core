@@ -118,7 +118,7 @@
 //! parser.parse_all(cache.clone()).await?;
 //!
 //! // Watch for file changes
-//! watcher.watch("./docs", RecursiveMode::Recursive)?;
+//! watcher.watch(&PathBuf::from("./docs"), RecursiveMode::Recursive)?;
 //!
 //! // On file modification
 //! parser.on_file_modified(modified_path);
