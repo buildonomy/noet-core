@@ -2,6 +2,8 @@
 
 A Rust library for parsing interconnected documents into a queryable hypergraph with bidirectional synchronization.
 
+[![pipeline status](https://gitlab.com/buildonomy/noet-core/badges/main/pipeline.svg)](https://gitlab.com/buildonomy/noet-core/-/commits/main)
+
 ## What is noet-core?
 
 **noet-core** (from "noetic" - relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure called a "BeliefSet". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.

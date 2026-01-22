@@ -148,7 +148,9 @@ docs/
 
 **✅ SOFT OPEN SOURCE CHECKPOINT COMPLETE** - Repository ready to be made public after Steps 0, 0b, 1, 6a complete
 
-**Completion Date**: 2025-01-17
+**Completion Date**: 2025-01-17  
+**Public Release Date**: 2025-01-18  
+**Public Repository**: https://gitlab.com/buildonomy/noet-core
 
 **Additional Work Completed**:
 - [x] Refactored `lib.rs` rustdoc to be concise "Getting Started" guide (~110 lines vs 240 lines)
@@ -249,8 +251,9 @@ docs/
 - [x] No product-specific references (no LatticeService, Intention Lattice)
 - [x] Documentation self-contained (no cross-repo references)
 - [x] `.gitignore` comprehensive and suitable for open-source project
+- [x] Repository made public (2025-01-18): https://gitlab.com/buildonomy/noet-core
 
-**STATUS**: ✅ READY FOR SOFT OPEN SOURCE
+**STATUS**: ✅ SOFT OPEN SOURCE RELEASED (2025-01-18)
 
 ### Full Completion Success Criteria (post-soft-open-source)
 - [ ] Comprehensive codec tutorial enables custom format implementation
@@ -318,7 +321,9 @@ docs/
 
 ## Stage 1 Completion Notes
 
-**Completed**: 2025-01-18
+**Completed**: 2025-01-18  
+**Public Release**: 2025-01-18  
+**Repository**: https://gitlab.com/buildonomy/noet-core
 
 **Files Created**:
 - `rust_core/crates/core/docs/design/beliefset_architecture.md` (747 lines)
@@ -342,8 +347,11 @@ docs/
 **Known Issues (Deferred to Stage 2)**:
 - 3 documentation warnings for private item links in `src/codec/mod.rs` (acceptable)
 
+**Milestone Achieved**: 🎉 Soft open source release completed
+
 **Next Steps**:
-1. Repository extraction (1-2 days)
-2. Make repository public without announcement
+1. ✅ Repository extraction - COMPLETE
+2. ✅ Make repository public without announcement - COMPLETE (2025-01-18)
 3. Complete Issue 10 (Daemon Testing & CLI)
 4. Complete Issue 5 Stage 2 (Comprehensive Documentation)
+5. Public announcement (Issue 11) after Stage 2 complete

@@ -3,7 +3,7 @@
 **Status**: In Progress  
 **Target**: v0.1.0 - Public Announcement & crates.io Release  
 **Created**: 2025-01-17  
-**Updated**: 2025-01-17
+**Updated**: 2025-01-20
 
 **Parent Document**: [`ROADMAP.md`](./ROADMAP.md) - Main planning document with full backlog
 
@@ -28,31 +28,31 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 ### Issue 5: Core Library Documentation (Minimal Version)
 
 **Deliverables**:
-- [ ] Migrate `beliefset_architecture.md` from `docs/design/` to `rust_core/crates/core/docs/design/`
-- [ ] Remove all product-specific references (LatticeService, Intention Lattice)
-- [ ] Create basic `docs/architecture.md` (core concepts overview)
+- [x] Migrate `beliefset_architecture.md` from `docs/design/` to `rust_core/crates/core/docs/design/`
+- [x] Remove all product-specific references (LatticeService, Intention Lattice)
+- [x] Create basic `docs/architecture.md` (core concepts overview)
 - [ ] Create basic `docs/codecs.md` (DocCodec trait explanation)
 - [ ] Create basic `docs/ids_and_refs.md` (BID system, NodeKey)
-- [ ] Update `rust_core/crates/core/README.md`:
+- [x] Update `rust_core/crates/core/README.md`:
   - Explain library purpose
   - Link to documentation
   - Basic usage example
   - Installation instructions
-- [ ] Clean up `Cargo.toml`:
+- [x] Clean up `Cargo.toml`:
   - Remove dependencies on product crates
   - Verify library builds standalone
   - Check feature flags are appropriate
-- [ ] Verify `cargo doc` passes without errors
-- [ ] Verify basic examples compile (`examples/basic_usage.rs`)
+- [x] Verify `cargo doc` passes without errors
+- [x] Verify basic examples compile (`examples/basic_usage.rs`)
 
 **Success Criteria** (Soft Open Source Ready):
-- [ ] README clearly explains what noet-core is
-- [ ] No product-specific code or references
-- [ ] Cargo.toml has no product dependencies
-- [ ] Basic documentation exists
-- [ ] `cargo build` works in isolation
-- [ ] `cargo test` passes
-- [ ] `cargo doc` generates docs without errors
+- [x] README clearly explains what noet-core is
+- [x] No product-specific code or references
+- [x] Cargo.toml has no product dependencies
+- [x] Basic documentation exists
+- [x] `cargo build` works in isolation
+- [x] `cargo test` passes
+- [x] `cargo doc` generates docs without errors
 
 **Deferred to Post-Soft-Open-Source**:
 - Comprehensive tutorials (can reference Issue 10 examples later)
@@ -79,25 +79,31 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 - No proactive marketing
 
 **Timeline**: 3-5 days  
-**Dependencies**: Phase 3 complete
+**Dependencies**: Issue 5 complete
 
 **Deliverables**:
-- [ ] Extract `rust_core/crates/core/` to standalone repository
+- [x] Extract `rust_core/crates/core/` to standalone repository
 - [ ] Set up CI/CD pipeline (GitLab CI or GitHub Actions)
-  - Test on Linux, macOS, Windows
-  - Multiple Rust versions
-  - Documentation generation
-  - Example verification
-- [ ] Add license headers to all files (MIT/Apache-2.0)
-- [ ] Create `CONTRIBUTING.md`
-- [ ] Create `CHANGELOG.md`
-- [ ] Verify repository builds from clean checkout
+  - [ ] Test on Linux, macOS, Windows
+  - [ ] Multiple Rust versions
+  - [ ] Documentation generation
+  - [ ] Example verification
+  - [x] Security scanning (SAST, secret detection)
+- [x] Add license headers to all files (MIT/Apache-2.0)
+- [x] Create `CONTRIBUTING.md`
+- [x] Create `CHANGELOG.md`
+- [x] Verify repository builds from clean checkout
 
 **Success Criteria**:
-- [ ] CI/CD green on all platforms
-- [ ] Repository self-contained (no external dependencies)
-- [ ] License compliance verified
-- [ ] Contributing guidelines clear
+- [ ] CI/CD green on all platforms (currently only security scanning)
+- [x] Repository self-contained (no external dependencies)
+- [x] License compliance verified
+- [x] Contributing guidelines clear
+
+**Status**: ✅ **SOFT OPEN SOURCE COMPLETE** (2025-01-20)
+- Repository is public on GitLab
+- Basic CI/CD configured (security only)
+- **Next**: Complete comprehensive CI/CD configuration
 
 ---
 
@@ -394,7 +400,7 @@ Standard in Rust ecosystem; maximizes compatibility with other projects; users c
 
 ---
 
-**Current Status**: Pre-soft-open-source  
-**Next Step**: Complete Issue 5 (minimal documentation)  
-**Estimated to Soft Open Source**: 3-4 days  
-**Estimated to v0.1.0 Announcement**: 4-5 weeks from soft open source
+**Current Status**: Post-soft-open-source (repository public, basic CI/CD configured)  
+**Next Step**: Complete comprehensive CI/CD configuration, then proceed with Issue 10  
+**Completed**: 2025-01-20 - Soft open source release  
+**Estimated to v0.1.0 Announcement**: 4-5 weeks from soft open source (mid-February 2025)
