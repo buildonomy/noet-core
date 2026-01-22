@@ -84,7 +84,7 @@ test:linux:nightly:
 
 test:linux:msrv:
   <<: *test_linux_template
-  image: rust:1.80
+  image: rust:1.85
   allow_failure: false
 
 # Test job - macOS

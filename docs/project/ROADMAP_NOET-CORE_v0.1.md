@@ -83,11 +83,11 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 
 **Deliverables**:
 - [x] Extract `rust_core/crates/core/` to standalone repository
-- [ ] Set up CI/CD pipeline (GitLab CI or GitHub Actions)
-  - [ ] Test on Linux, macOS, Windows
-  - [ ] Multiple Rust versions
-  - [ ] Documentation generation
-  - [ ] Example verification
+- [x] Set up CI/CD pipeline (GitLab CI or GitHub Actions)
+  - [x] Test on Linux, macOS, Windows
+  - [x] Multiple Rust versions
+  - [x] Documentation generation
+  - [x] Example verification
   - [x] Security scanning (SAST, secret detection)
 - [x] Add license headers to all files (MIT/Apache-2.0)
 - [x] Create `CONTRIBUTING.md`
@@ -128,7 +128,7 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 - [ ] Test database synchronization
 - [ ] Tutorial documentation with doctests in `daemon.rs` module
 - [ ] Complete `examples/daemon.rs` demonstrating full orchestration
-- [ ] Update Issue 5 docs to include CLI/daemon examples
+- [ ] Update Issue 5 docs to include CLI/daemon examples. Close out any remaining issue 5 tasks.
 
 **Success Criteria**:
 - [ ] CLI tool works: `noet parse` and `noet watch`
