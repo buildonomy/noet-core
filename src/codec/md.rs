@@ -5,7 +5,9 @@ use pulldown_cmark::{
 use pulldown_cmark_to_cmark::{
     cmark_resume_with_source_range_and_options, Options as CmarkToCmarkOptions,
 };
-use std::{borrow::Borrow, collections::VecDeque, mem::replace, ops::Range, result::Result};
+use std::{
+    borrow::Borrow, collections::VecDeque, mem::replace, ops::Range, result::Result, str::FromStr,
+};
 /// Utilities for parsing various document types into BeliefSets
 use toml_edit::value;
 
@@ -21,6 +23,15 @@ use crate::{
 };
 
 pub use pulldown_cmark;
+
+/// A markdown event with optional source range information
+type MdEventWithRange = (MdEvent<'static>, Option<Range<usize>>);
+
+/// A queue of markdown events with range information
+type MdEventQueue = VecDeque<MdEventWithRange>;
+
+/// A proto node paired with its markdown event queue
+type ProtoNodeWithEvents = (ProtoBeliefNode, MdEventQueue);
 
 pub fn buildonomy_md_options() -> Options {
     let mut md_options = Options::empty();
@@ -58,17 +69,17 @@ fn link_to_relation(
         // Autolink like `<http://foo.bar/baz>`
         // change to reference [foo.bar/bax][bid]
         // with NodeKey::Path(api, http://foo.bar/baz)
-        LinkType::Autolink => Some((href_to_nodekey(&dest_url), !title.is_empty())),
+        LinkType::Autolink => Some((href_to_nodekey(dest_url), !title.is_empty())),
 
         // Email address in autolink like `<john@example.org>`
         // change to reference [john@example.org][bid]
         // with NodeKey::Path(api, john@example.org)
-        LinkType::Email => Some((href_to_nodekey(&format!("email:{}", dest_url)), false)),
+        LinkType::Email => Some((href_to_nodekey(&format!("email:{dest_url}")), false)),
 
         // Inline link like `[foo](bar)`
         // change to [foo][bid]
         // with NodeKey::Path(api, bar)
-        LinkType::Inline => Some((href_to_nodekey(&dest_url), !title.is_empty())),
+        LinkType::Inline => Some((href_to_nodekey(dest_url), !title.is_empty())),
 
         // Reference link like `[foo][bar]`
         // if foo matches [net:title] for the reference,
@@ -77,21 +88,21 @@ fn link_to_relation(
         // with NodeKey::?(bar)
         // Reference without destination in the document, but resolved by the broken_link_callback
         LinkType::Reference => None,
-        LinkType::WikiLink { has_pothole } => Some((href_to_nodekey(&title), *has_pothole)),
-        LinkType::ReferenceUnknown => Some((href_to_nodekey(&dest_url), !title.is_empty())),
+        LinkType::WikiLink { has_pothole } => Some((href_to_nodekey(title), *has_pothole)),
+        LinkType::ReferenceUnknown => Some((href_to_nodekey(dest_url), !title.is_empty())),
 
         // Collapsed link like `[foo][]`
         // change to [[net:]title]
         // with NodeKey::?(foo)
         // Collapsed link without destination in the document, but resolved by the broken_link_callback
         LinkType::Collapsed => None,
-        LinkType::CollapsedUnknown => Some((href_to_nodekey(&title), false)),
+        LinkType::CollapsedUnknown => Some((href_to_nodekey(title), false)),
         // Shortcut link like `[foo]`
         // change to [net:title]
         // with NodeKey::?(foo)
         LinkType::Shortcut => None,
         // Shortcut without destination in the document, but resolved by the broken_link_callback
-        LinkType::ShortcutUnknown => Some((href_to_nodekey(&id), false)),
+        LinkType::ShortcutUnknown => Some((href_to_nodekey(id), false)),
     }
 }
 
@@ -113,7 +124,7 @@ impl LinkAccumulator {
                 id,
                 ..
             }) => Some(LinkAccumulator {
-                link_type: link_type.clone(),
+                link_type: *link_type,
                 dest_url: dest_url.clone().into_static(),
                 id: id.clone().into_static(),
                 range: range.clone(),
@@ -133,7 +144,7 @@ impl LinkAccumulator {
             self.range = range.clone();
         } else if let Some(self_range) = self.range.as_mut() {
             if let Some(pushed_range) = range {
-                self_range.end = pushed_range.end.clone();
+                self_range.end = pushed_range.end;
             }
         }
         false
@@ -150,7 +161,6 @@ impl LinkAccumulator {
                     }
                     text += &cow_str
                         .split("\n")
-                        .into_iter()
                         .map(|line| line.trim().to_string())
                         .collect::<Vec<String>>()
                         .join(" ");
@@ -208,14 +218,13 @@ fn check_for_link_and_push(
                         rel.other
                             .keys(Some(ctx.home_net), None, ctx.belief_set())
                             .iter()
-                            .find(|&ctx_source_key| ctx_source_key == link_key)
-                            .is_some()
+                            .any(|ctx_source_key| ctx_source_key == link_key)
                     })
                 });
                 if let Some(relation) = maybe_keyed_relation {
                     let bref_string = CowStr::from(String::from(relation.other.bid.namespace()));
                     let doc_ref = relation.as_link_ref();
-                    let is_title_really_manual = format!("{}:{}", bref_string, title);
+                    let is_title_really_manual = format!("{bref_string}:{title}");
                     if is_title_really_manual == doc_ref {
                         has_manual_title = false;
                     }
@@ -249,7 +258,7 @@ fn check_for_link_and_push(
                          \tsource_links: {:?}.\n\
                          \tctx sink links: {:?}",
                         keys,
-                        ctx.sources().iter().map(|extended_ref| extended_ref.other.keys(Some(ctx.home_net), None, ctx.belief_set())).flatten().collect::<Vec<NodeKey>>()
+                        ctx.sources().iter().flat_map(|extended_ref| extended_ref.other.keys(Some(ctx.home_net), None, ctx.belief_set())).collect::<Vec<NodeKey>>()
                     );
                 }
             } else {
@@ -320,7 +329,7 @@ fn find_frontmatter_end<'a>(
 /// Title should be the first MdEvent if there is one. Metadata block should
 /// start right after the title, or be the first event if there is no title.
 fn update_or_insert_frontmatter(
-    events: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
+    events: &mut MdEventQueue,
     node_string: &str,
 ) -> Result<bool, BuildonomyError> {
     let mut changed = false;
@@ -330,10 +339,7 @@ fn update_or_insert_frontmatter(
 
     let starts_with_title = events
         .front()
-        .map(|(event, _)| match event {
-            MdEvent::Start(MdTag::Heading { .. }) => true,
-            _ => false,
-        })
+        .map(|(event, _)| matches!(event, MdEvent::Start(MdTag::Heading { .. })))
         .unwrap_or(false);
 
     // Push title events onto our temporary vecdeque, and map title ranges to
@@ -367,10 +373,7 @@ fn update_or_insert_frontmatter(
 
     let has_metadata = events
         .front()
-        .map(|(event, _)| match event {
-            MdEvent::Start(MdTag::MetadataBlock(_)) => true,
-            _ => false,
-        })
+        .map(|(event, _)| matches!(event, MdEvent::Start(MdTag::MetadataBlock(_))))
         .unwrap_or(false);
 
     if has_metadata {
@@ -378,7 +381,7 @@ fn update_or_insert_frontmatter(
         while let Some((event, range)) = events.pop_front() {
             let end = match event {
                 MdEvent::Text(ref cow_str) => {
-                    toml_string += &cow_str.to_string();
+                    toml_string += cow_str.as_ref();
                     toml_string_range = match (&toml_string_range, &range) {
                         (Some(toml_range), Some(text_range)) => {
                             Some(toml_range.start..text_range.end)
@@ -440,10 +443,7 @@ fn update_or_insert_frontmatter(
 
 #[derive(Debug, Default, Clone)]
 pub struct MdCodec {
-    current_events: Vec<(
-        ProtoBeliefNode,
-        VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
-    )>,
+    current_events: Vec<ProtoNodeWithEvents>,
     content: String,
 }
 
@@ -463,22 +463,13 @@ impl MdCodec {
         let events_vec: Vec<(MdEvent<'a>, Option<Range<usize>>)> = events
             .inspect(|(e, _r)| {
                 if let MdEvent::Start(MdTag::Link {
-                    link_type,
+                    link_type: LinkType::Shortcut | LinkType::Reference,
                     dest_url,
                     title,
                     id,
                 }) = e
                 {
-                    match link_type {
-                        LinkType::Shortcut | LinkType::Reference => {
-                            shortcuts.push((
-                                id.to_string(),
-                                dest_url.to_string(),
-                                title.to_string(),
-                            ));
-                        }
-                        _ => {}
-                    }
+                    shortcuts.push((id.to_string(), dest_url.to_string(), title.to_string()));
                 }
             })
             .collect();
@@ -554,20 +545,13 @@ impl DocCodec for MdCodec {
 
         // All markdown nodes (document + headings) have events
         // TomlCodec is only used to enrich frontmatter parsing and preserve unknown fields
-        let mut current_events = replace(&mut proto_events.1, VecDeque::default());
+        let mut current_events = std::mem::take(&mut proto_events.1);
 
         let frontmatter_changed = proto_events.0.update_from_context(ctx)?;
         if frontmatter_changed.is_some() {
             let metadata_string = if current_events
                 .iter()
-                .find(|e| {
-                    if let MdEvent::Start(MdTag::Heading { .. }) = e.0 {
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .is_some()
+                .any(|e| matches!(e.0, MdEvent::Start(MdTag::Heading { .. })))
             {
                 proto_events.0.as_subsection()
             } else {
@@ -577,7 +561,7 @@ impl DocCodec for MdCodec {
         }
 
         let link_changed =
-            check_for_link_and_push(&mut current_events, &ctx, &mut proto_events.1, None);
+            check_for_link_and_push(&mut current_events, ctx, &mut proto_events.1, None);
         let maybe_text = if frontmatter_changed.is_some() || link_changed {
             if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
                 Self::events_to_text(
@@ -690,7 +674,7 @@ impl DocCodec for MdCodec {
                         Err(e) => {
                             // Fallback to simple deserialization if TomlCodec fails
                             tracing::warn!("ProtoBeliefNode toml parse failed: {:?}", e);
-                            current.errors.push(e.into());
+                            current.errors.push(e);
                         }
                     };
                 }
@@ -698,7 +682,7 @@ impl DocCodec for MdCodec {
                     if !current.document.contains_key("title") || current.content.is_empty() {
                         if let Some(accum_string_ref) = current.accumulator.as_mut() {
                             *accum_string_ref += " ";
-                            *accum_string_ref += &cow_str;
+                            *accum_string_ref += cow_str;
                         } else {
                             current.accumulator = Some(cow_str.to_string());
                         }
@@ -730,10 +714,7 @@ impl DocCodec for MdCodec {
                     // schema, it will overwrite this when merging the node's toml.
                     let mut proto_to_push = replace(&mut current, new_current);
                     proto_to_push.traverse_schema()?;
-                    let proto_to_push_events = replace(
-                        &mut proto_events,
-                        VecDeque::<(MdEvent<'static>, Option<Range<usize>>)>::default(),
-                    );
+                    let proto_to_push_events = std::mem::take(&mut proto_events);
                     self.current_events
                         .push((proto_to_push, proto_to_push_events));
                 }

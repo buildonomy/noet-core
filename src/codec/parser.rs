@@ -200,13 +200,11 @@ impl BeliefSetParser {
         debug_assert!(
             proto
                 .kind.is_network(),
-            "Expected to generate an anchored BeliefKind::Network. Instead, our generated proto is {:?}",
-            proto
+            "Expected to generate an anchored BeliefKind::Network. Instead, our generated proto is {proto:?}"
         );
         debug_assert!(
             !proto.kind.contains(BeliefKind::Trace),
-            "Expected to generate a BeliefKind::Network. Instead, our generated proto is {:?}",
-            proto
+            "Expected to generate a BeliefKind::Network. Instead, our generated proto is {proto:?}"
         );
         Ok(PathBuf::from(proto.path))
     }
@@ -296,7 +294,7 @@ impl BeliefSetParser {
                         rewritten_content: None,
                         dependent_paths: Vec::new(),
                         diagnostics: vec![crate::codec::ParseDiagnostic::parse_error(
-                            format!("Failed to read file: {}", e),
+                            format!("Failed to read file: {e}"),
                             parse_count + 1,
                         )],
                     }));
@@ -323,7 +321,7 @@ impl BeliefSetParser {
                     rewritten_content: None,
                     dependent_paths: Vec::new(),
                     diagnostics: vec![crate::codec::ParseDiagnostic::parse_error(
-                        format!("Parse failed: {}", e),
+                        format!("Parse failed: {e}"),
                         parse_count + 1,
                     )],
                 }));
@@ -342,8 +340,7 @@ impl BeliefSetParser {
                     parse_result
                         .diagnostics
                         .push(crate::codec::ParseDiagnostic::warning(format!(
-                            "Failed to write rewritten content: {}",
-                            e
+                            "Failed to write rewritten content: {e}"
                         )));
                 }
             }

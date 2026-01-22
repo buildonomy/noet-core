@@ -30,10 +30,17 @@ use tokio::{
     time::sleep,
 };
 
+/// A file system watcher with debouncing for a belief network
+type NetworkWatcher = Debouncer<RecommendedWatcher, FileIdMap>;
+
+/// A watcher paired with its file update syncer
+type WatcherWithSyncer = (NetworkWatcher, FileUpdateSyncer);
+
+/// Map of network paths to their watchers and syncers
+type NetworkWatcherMap = HashMap<PathBuf, WatcherWithSyncer>;
+
 #[derive(Default)]
-struct BnWatchers(
-    pub Arc<Mutex<HashMap<PathBuf, (Debouncer<RecommendedWatcher, FileIdMap>, FileUpdateSyncer)>>>,
-);
+struct BnWatchers(pub Arc<Mutex<NetworkWatcherMap>>);
 
 #[derive(Default)]
 struct PaginationCache(pub Arc<RwLock<HashMap<Query, (SystemTime, Beliefs)>>>);
@@ -104,8 +111,7 @@ impl LatticeService {
 
         if !invalid_paths.is_empty() {
             return Err(BuildonomyError::NotFound(format!(
-                "Belief Network file path(s) are not available: {:?}",
-                invalid_paths
+                "Belief Network file path(s) are not available: {invalid_paths:?}"
             )));
         }
 
@@ -221,8 +227,7 @@ impl LatticeService {
         let mut watchers = binding.0.lock();
         if watchers.contains_key(repo_path) {
             return Err(BuildonomyError::Custom(format!(
-                "BnWatchers already contains a file watcher for belief network at path {:?}",
-                repo_path
+                "BnWatchers already contains a file watcher for belief network at path {repo_path:?}"
             )));
         }
 

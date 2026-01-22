@@ -18,8 +18,8 @@ use petgraph::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt, mem,
+    collections::{btree_map::Entry as BTreeEntry, BTreeMap, BTreeSet},
+    fmt,
     ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -104,18 +104,14 @@ impl BidGraph {
         let to_remove = self
             .as_graph()
             .edge_indices()
-            .filter_map(|edge_idx| {
-                if let Some((source_idx, sink_idx)) = self.as_graph().edge_endpoints(edge_idx) {
+            .filter(|edge_idx| {
+                if let Some((source_idx, sink_idx)) = self.as_graph().edge_endpoints(*edge_idx) {
                     let source = self.as_graph()[source_idx];
                     let sink = self.as_graph()[sink_idx];
-                    let weight = &self.as_graph()[edge_idx];
-                    if !f(&source, &sink, weight) {
-                        Some(edge_idx)
-                    } else {
-                        None
-                    }
+                    let weight = &self.as_graph()[*edge_idx];
+                    !f(&source, &sink, weight)
                 } else {
-                    None
+                    false
                 }
             })
             .collect::<Vec<_>>();
@@ -247,18 +243,14 @@ impl<'a> BidRefGraph<'a> {
         let to_remove = self
             .as_graph()
             .edge_indices()
-            .filter_map(|edge_idx| {
-                if let Some((source_idx, sink_idx)) = self.as_graph().edge_endpoints(edge_idx) {
+            .filter(|edge_idx| {
+                if let Some((source_idx, sink_idx)) = self.as_graph().edge_endpoints(*edge_idx) {
                     let source = self.as_graph()[source_idx];
                     let sink = self.as_graph()[sink_idx];
-                    let weight = &self.as_graph()[edge_idx];
-                    if !f(&source, &sink, weight) {
-                        Some(edge_idx)
-                    } else {
-                        None
-                    }
+                    let weight = &self.as_graph()[*edge_idx];
+                    !f(&source, &sink, weight)
                 } else {
-                    None
+                    false
                 }
             })
             .collect::<Vec<_>>();
@@ -350,7 +342,7 @@ impl<'a> BeliefContext<'a> {
 
     /// Get a reference to the underlying BeliefSet
     pub fn belief_set(&self) -> &'a BeliefSet {
-        &self.set
+        self.set
     }
 
     /// Lazily compute source relations for this node
@@ -468,14 +460,7 @@ impl Beliefs {
         let edge_display = edge_tuple
             .iter()
             .map(|(source, sink, weights)| {
-                format!(
-                    "{:>source_width$} -> {:<sink_width$}: {}",
-                    source,
-                    sink,
-                    weights,
-                    source_width = source_max_len,
-                    sink_width = sink_max_len
-                )
+                format!("{source:>source_max_len$} -> {sink:<sink_max_len$}: {weights}")
             })
             .collect::<Vec<String>>()
             .join("\n- ");
@@ -535,8 +520,8 @@ impl Beliefs {
                             explored.insert(sink_idx);
                             let sink_bid = rhs_relations[sink_idx];
                             if let Some(sink_node) = rhs.states.get(&sink_bid) {
-                                if !self.states.contains_key(&sink_bid) {
-                                    self.states.insert(sink_bid, sink_node.clone());
+                                if let BTreeEntry::Vacant(e) = self.states.entry(sink_bid) {
+                                    e.insert(sink_node.clone());
                                 } else {
                                     // This is expected for unbalanced sets, such as produced by eval_unbalanced.
                                 }
@@ -571,26 +556,26 @@ impl Beliefs {
 
             // Only add edges for nodes that have a state in the now-merged state map.
             if self.states.contains_key(&source) || self.states.contains_key(&sink) {
-                if !self.states.contains_key(&sink) {
+                if let BTreeEntry::Vacant(e) = self.states.entry(sink) {
                     if let Some(rhs_state) = rhs.states.get(&sink) {
                         tracing::debug!(
                             "Adding source {} {} to lhs",
                             rhs_state.bid,
                             rhs_state.display_title()
                         );
-                        self.states.insert(sink, rhs_state.clone());
+                        e.insert(rhs_state.clone());
                     } else {
                         tracing::warn!("neither lhs or rhs contains node with sink id: {}", sink,);
                     }
                 }
-                if !self.states.contains_key(&source) {
+                if let BTreeEntry::Vacant(e) = self.states.entry(source) {
                     if let Some(rhs_state) = rhs.states.get(&source) {
                         tracing::debug!(
                             "Adding source {} {} to lhs",
                             rhs_state.bid,
                             rhs_state.display_title()
                         );
-                        self.states.insert(source, rhs_state.clone());
+                        e.insert(rhs_state.clone());
                     } else {
                         tracing::warn!(
                             "neither lhs or rhs contains node with source id: {}",
@@ -655,7 +640,7 @@ impl Beliefs {
             states: BTreeMap::from_iter(
                 lhs_states
                     .intersection(&rhs_states)
-                    .filter_map(|bid| self.states.get(&bid).map(|n| (n.bid, n.clone()))),
+                    .filter_map(|bid| self.states.get(bid).map(|n| (n.bid, n.clone()))),
             ),
             relations: BidGraph::default(),
         };
@@ -686,7 +671,7 @@ impl Beliefs {
             states: BTreeMap::from_iter(
                 lhs_states
                     .difference(&rhs_states)
-                    .filter_map(|bid| self.states.get(&bid).map(|n| (n.bid, n.clone()))),
+                    .filter_map(|bid| self.states.get(bid).map(|n| (n.bid, n.clone()))),
             ),
             relations: BidGraph::default(),
         };
@@ -738,7 +723,7 @@ impl Beliefs {
             .externals(dir)
             .collect::<Vec<_>>();
         for edge_idx in edge_externals.iter() {
-            if other_externals.iter().any(|idx| *idx == *edge_idx) {
+            if other_externals.contains(edge_idx) {
                 tracing::debug!("Filtering out orphaned node");
                 continue;
             }
@@ -757,7 +742,7 @@ impl Beliefs {
             None
         } else {
             Some(Expression::StateIn(StatePred::Bid(Vec::from_iter(
-                external_bids.into_iter(),
+                external_bids,
             ))))
         }
     }
@@ -771,7 +756,7 @@ impl Beliefs {
             None
         } else {
             Some(Expression::StateIn(StatePred::Bid(Vec::from_iter(
-                external_bids.into_iter(),
+                external_bids,
             ))))
         }
     }
@@ -981,7 +966,7 @@ impl BeliefSet {
         bs.states = states;
         bs.brefs = BTreeMap::from_iter(bs.states.keys().map(|bid| (bid.namespace(), *bid)));
         if inject_api {
-            bs.insert_state(bs.api.clone(), &vec![]);
+            bs.insert_state(bs.api.clone(), &[]);
         }
         bs.index_dirty.store(true, Ordering::SeqCst);
         bs.index_sync(false);
@@ -1112,23 +1097,19 @@ impl BeliefSet {
             NodeKey::Bref { bref } => self
                 .brefs()
                 .get(bref)
-                .map(|bid| self.states.get(bid).cloned())
-                .flatten(),
+                .and_then(|bid| self.states.get(bid).cloned()),
             NodeKey::Id { net, id } => self
                 .paths()
                 .net_get_from_id(net, id)
-                .map(|(_, bid)| self.states.get(&bid).cloned())
-                .flatten(),
+                .and_then(|(_, bid)| self.states.get(&bid).cloned()),
             NodeKey::Path { net, path } => self
                 .paths()
                 .net_get_from_path(net, path)
-                .map(|(_, bid)| self.states.get(&bid).cloned())
-                .flatten(),
+                .and_then(|(_, bid)| self.states.get(&bid).cloned()),
             NodeKey::Title { net, title } => self
                 .paths()
                 .net_get_from_title(net, title)
-                .map(|(_, bid)| self.states.get(&bid).cloned())
-                .flatten(),
+                .and_then(|(_, bid)| self.states.get(&bid).cloned()),
         }
     }
 
@@ -1158,8 +1139,8 @@ impl BeliefSet {
     }
 
     pub fn consume(&mut self) -> Beliefs {
-        let mut old_self = std::mem::replace(self, BeliefSet::default());
-        let states = mem::replace(&mut old_self.states, BTreeMap::new());
+        let mut old_self = std::mem::take(self);
+        let states = std::mem::take(&mut old_self.states);
         while self.relations.is_locked() {
             tracing::info!("[BeliefSet::consume] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1207,46 +1188,43 @@ impl BeliefSet {
         let mut events = Vec::new();
         // Phase 0: Generate NodeUpdate events for new or changed nodes
         let new_relations_arc = new_set.relations();
-        let new_relations: BidGraph =
-            {
-                let new_relations_graph = new_relations_arc.as_graph();
-                BidGraph::from_edges(new_relations_graph.raw_edges().into_iter().filter_map(
-                    |edge| {
-                        let source = new_relations_graph[edge.source()];
-                        let sink = new_relations_graph[edge.target()];
-                        if !(parsed_content.contains(&source) || parsed_content.contains(&sink)) {
-                            return None;
-                        }
+        let new_relations: BidGraph = {
+            let new_relations_graph = new_relations_arc.as_graph();
+            BidGraph::from_edges(new_relations_graph.raw_edges().iter().filter_map(|edge| {
+                let source = new_relations_graph[edge.source()];
+                let sink = new_relations_graph[edge.target()];
+                if !(parsed_content.contains(&source) || parsed_content.contains(&sink)) {
+                    return None;
+                }
 
-                        let mut weightset = WeightSet::empty();
-                        for (kind, weight) in edge.weight.weights.iter() {
-                            let (owner, _sign) = weight
-                                .get(&WEIGHT_OWNED_BY)
-                                .map(|val: String| {
-                                    if &val == "source" {
-                                        (&source, "+")
-                                    } else {
-                                        (&sink, "-")
-                                    }
-                                })
-                                .unwrap_or((&sink, "-"));
-                            // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
-                            // parse_content sets owner to sink unless parent is an api node, meaning
-                            // the owner isn't necessarily in parsed_content for section nodes, but we
-                            // know by construction that parse_content contains sufficient information
-                            // to insert the weightset in this special case for sections.
-                            if *kind == WeightKind::Section || parsed_content.contains(owner) {
-                                weightset.weights.insert(*kind, weight.clone());
+                let mut weightset = WeightSet::empty();
+                for (kind, weight) in edge.weight.weights.iter() {
+                    let (owner, _sign) = weight
+                        .get(WEIGHT_OWNED_BY)
+                        .map(|val: String| {
+                            if &val == "source" {
+                                (&source, "+")
+                            } else {
+                                (&sink, "-")
                             }
-                        }
-                        if weightset.is_empty() {
-                            None
-                        } else {
-                            Some((source, sink, weightset))
-                        }
-                    },
-                ))
-            };
+                        })
+                        .unwrap_or((&sink, "-"));
+                    // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
+                    // parse_content sets owner to sink unless parent is an api node, meaning
+                    // the owner isn't necessarily in parsed_content for section nodes, but we
+                    // know by construction that parse_content contains sufficient information
+                    // to insert the weightset in this special case for sections.
+                    if *kind == WeightKind::Section || parsed_content.contains(owner) {
+                        weightset.weights.insert(*kind, weight.clone());
+                    }
+                }
+                if weightset.is_empty() {
+                    None
+                } else {
+                    Some((source, sink, weightset))
+                }
+            }))
+        };
         let mut node_events = Vec::new();
         let mut relation_events = Vec::new();
 
@@ -1270,7 +1248,7 @@ impl BeliefSet {
             },
         );
         let removed_nodes = old_content
-            .difference(&parsed_content)
+            .difference(parsed_content)
             .cloned()
             .collect::<Vec<Bid>>();
         if !removed_nodes.is_empty() {
@@ -1310,7 +1288,7 @@ impl BeliefSet {
         let parsed_edges = {
             let new_relations_graph = new_relations.as_graph();
             BTreeMap::<(Bid, Bid), WeightSet>::from_iter(
-                new_relations_graph.raw_edges().into_iter().map(|edge| {
+                new_relations_graph.raw_edges().iter().map(|edge| {
                     let source = new_relations_graph[edge.source()];
                     let sink = new_relations_graph[edge.target()];
                     ((source, sink), edge.weight.clone())
@@ -1320,49 +1298,46 @@ impl BeliefSet {
         let old_relations = old_set.relations();
         let old_relations_graph = old_relations.as_graph();
         let old_parsed_edges = BTreeMap::<(Bid, Bid), WeightSet>::from_iter(
-            old_relations_graph
-                .raw_edges()
-                .into_iter()
-                .filter_map(|edge| {
-                    let source = old_relations_graph[edge.source()];
-                    let sink = old_relations_graph[edge.target()];
-                    if !(parsed_content.contains(&source)
-                        || removed_nodes.contains(&source)
-                        || parsed_content.contains(&sink)
-                        || removed_nodes.contains(&sink))
+            old_relations_graph.raw_edges().iter().filter_map(|edge| {
+                let source = old_relations_graph[edge.source()];
+                let sink = old_relations_graph[edge.target()];
+                if !(parsed_content.contains(&source)
+                    || removed_nodes.contains(&source)
+                    || parsed_content.contains(&sink)
+                    || removed_nodes.contains(&sink))
+                {
+                    return None;
+                }
+                let mut weightset = WeightSet::empty();
+                for (kind, weight) in edge.weight.weights.iter() {
+                    let (owner, _sign) = weight
+                        .get(WEIGHT_OWNED_BY)
+                        .map(|val: String| {
+                            if &val == "source" {
+                                (&source, "+")
+                            } else {
+                                (&sink, "-")
+                            }
+                        })
+                        .unwrap_or((&sink, "-"));
+                    // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
+                    // parse_content sets owner to sink unless parent is an api node, meaning
+                    // the owner isn't necessarily in parsed_content for section nodes, but we
+                    // know by construction that parse_content contains sufficient information
+                    // to insert the weightset in this special case for sections.
+                    if *kind == WeightKind::Section
+                        || parsed_content.contains(owner)
+                        || removed_nodes.contains(owner)
                     {
-                        return None;
+                        weightset.weights.insert(*kind, weight.clone());
                     }
-                    let mut weightset = WeightSet::empty();
-                    for (kind, weight) in edge.weight.weights.iter() {
-                        let (owner, _sign) = weight
-                            .get(&WEIGHT_OWNED_BY)
-                            .map(|val: String| {
-                                if &val == "source" {
-                                    (&source, "+")
-                                } else {
-                                    (&sink, "-")
-                                }
-                            })
-                            .unwrap_or((&sink, "-"));
-                        // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
-                        // parse_content sets owner to sink unless parent is an api node, meaning
-                        // the owner isn't necessarily in parsed_content for section nodes, but we
-                        // know by construction that parse_content contains sufficient information
-                        // to insert the weightset in this special case for sections.
-                        if *kind == WeightKind::Section
-                            || parsed_content.contains(owner)
-                            || removed_nodes.contains(owner)
-                        {
-                            weightset.weights.insert(*kind, weight.clone());
-                        }
-                    }
-                    if weightset.is_empty() {
-                        None
-                    } else {
-                        Some(((source, sink), weightset))
-                    }
-                }),
+                }
+                if weightset.is_empty() {
+                    None
+                } else {
+                    Some(((source, sink), weightset))
+                }
+            }),
         );
 
         // Phase 3: Removed edges
@@ -1396,10 +1371,7 @@ impl BeliefSet {
                 for (kind, new_weight) in weights.weights.iter() {
                     let insert = old_weights
                         .get(kind)
-                        .filter(|old_weight| {
-                            let is_eq = **old_weight == *new_weight;
-                            is_eq
-                        })
+                        .filter(|old_weight| **old_weight == *new_weight)
                         .is_none();
                     if insert {
                         events.push(BeliefEvent::RelationInsert(
@@ -1445,20 +1417,17 @@ impl BeliefSet {
                         let actual_weight = &relations.as_graph()[edge_idx];
                         if actual_weight != weight_set {
                             return Err(format!(
-                                "RelationUpdate mismatch: expected {:?}, found {:?}",
-                                weight_set, actual_weight
+                                "RelationUpdate mismatch: expected {weight_set:?}, found {actual_weight:?}"
                             ));
                         }
                     } else {
                         return Err(format!(
-                            "RelationUpdate references non-existent edge: {} -> {}",
-                            source, sink
+                            "RelationUpdate references non-existent edge: {source} -> {sink}"
                         ));
                     }
                 } else {
                     return Err(format!(
-                        "RelationUpdate references non-existent nodes: {} -> {}",
-                        source, sink
+                        "RelationUpdate references non-existent nodes: {source} -> {sink}"
                     ));
                 }
             }
@@ -1466,8 +1435,7 @@ impl BeliefSet {
                 for bid in bids {
                     if self.states().contains_key(bid) {
                         return Err(format!(
-                            "NodesRemoved claims {} was removed but it still exists",
-                            bid
+                            "NodesRemoved claims {bid} was removed but it still exists"
                         ));
                     }
                 }
@@ -1583,8 +1551,7 @@ impl BeliefSet {
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Epistemic, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] epistemic edges contain cycle: {:?}",
-                    scc
+                    "[BeliefSet::built_in_test invariant 0] epistemic edges contain cycle: {scc:?}"
                 ));
             }
         }
@@ -1592,16 +1559,14 @@ impl BeliefSet {
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Pragmatic, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] pragmatic edges contain cycle: {:?}",
-                    scc
+                    "[BeliefSet::built_in_test invariant 0] pragmatic edges contain cycle: {scc:?}"
                 ));
             }
         }
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Section, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] subsection edges contain cycle: {:?}",
-                    scc
+                    "[BeliefSet::built_in_test invariant 0] subsection edges contain cycle: {scc:?}"
                 ));
             }
         }
@@ -1633,20 +1598,16 @@ impl BeliefSet {
                     deduped.dedup();
                     if indices.len() != deduped.len() {
                         errors.push(format!(
-                         "[BeliefSet::build_in_test invariant 2] {} (tagged as trace) {:?} edges \
-                         contains duplicate edge indices. Received {:?}",
-                         bid,
-                         kind,
-                         indices
+                         "[BeliefSet::build_in_test invariant 2] {bid} (tagged as trace) {kind:?} edges \
+                         contains duplicate edge indices. Received {indices:?}"
                      ))
                     }
                 } else {
                     let expected: Vec<u16> = (0..indices.len() as u16).collect();
                     if indices != expected {
                         errors.push(format!(
-                            "[BeliefSet::built_in_test invariant 2] {} {:?} edges are not \
-                            correctly sorted. Received {:?}, Expected: {:?}",
-                            bid, kind, indices, expected
+                            "[BeliefSet::built_in_test invariant 2] {bid} {kind:?} edges are not \
+                            correctly sorted. Received {indices:?}, Expected: {expected:?}"
                         ));
                     }
                 }
@@ -1675,11 +1636,7 @@ impl BeliefSet {
             {
                 if let Err(e) = self.validate_local_event(event) {
                     tracing::warn!("Local event validation failed: {}", e);
-                    debug_assert!(
-                        false,
-                        "Local event doesn't match internal state: {:?}",
-                        event
-                    );
+                    debug_assert!(false, "Local event doesn't match internal state: {event:?}");
                 }
             }
             return Ok(vec![]); // Event already applied, nothing more to do
@@ -1768,7 +1725,7 @@ impl BeliefSet {
     /// Insert or replace a state while preserving path uniqueness
     ///
     /// Return a vector of events for each node that was renamed when matching on the merge keys.
-    fn insert_state(&mut self, node: BeliefNode, merge: &Vec<NodeKey>) -> Vec<BeliefEvent> {
+    fn insert_state(&mut self, node: BeliefNode, merge: &[NodeKey]) -> Vec<BeliefEvent> {
         let mut events = Vec::<BeliefEvent>::new();
         let mut to_replace = BTreeSet::<Bid>::new();
         for key in merge.iter() {
@@ -1802,7 +1759,7 @@ impl BeliefSet {
             events.append(&mut self.replace_bid(*replaced, bid));
 
             // Now remove from states (replace_bid already removed from graph)
-            self.states.remove(&replaced);
+            self.states.remove(replaced);
             self.brefs.remove(&replaced.namespace());
         }
         // Our bid_to_indexes must be regenerated
@@ -2098,7 +2055,7 @@ impl BeliefSet {
                     "We only insert kind into changed_indices when we discovered kind \
                     in the weight. (see above how incoming_edges is constructed).",
                 );
-                weight.set(WEIGHT_SORT_KEY, new_idx as u16).ok();
+                weight.set(WEIGHT_SORT_KEY, new_idx).ok();
             }
             derivative_events.push(BeliefEvent::RelationUpdate(
                 source,
@@ -2286,8 +2243,7 @@ impl BeliefSet {
                 let paths_guard = self.paths();
                 let maybe_bid = paths_guard
                     .get_map(net)
-                    .map(|pm| pm.get(path, &paths_guard).map(|(_net, bid)| bid))
-                    .flatten();
+                    .and_then(|pm| pm.get(path, &paths_guard).map(|(_net, bid)| bid));
                 BTreeMap::from_iter(
                     maybe_bid
                         .iter()
@@ -2296,13 +2252,10 @@ impl BeliefSet {
             }
             StatePred::Title(net, title) => {
                 let paths_guard = self.paths();
-                let maybe_bid = paths_guard
-                    .get_map(net)
-                    .map(|pm| {
-                        pm.get_from_title_regex(title, &paths_guard)
-                            .map(|(_net, bid)| bid)
-                    })
-                    .flatten();
+                let maybe_bid = paths_guard.get_map(net).and_then(|pm| {
+                    pm.get_from_title_regex(title, &paths_guard)
+                        .map(|(_net, bid)| bid)
+                });
                 BTreeMap::from_iter(
                     maybe_bid
                         .iter()
@@ -2345,7 +2298,7 @@ impl BeliefSet {
         self.index_sync(false);
         match expr {
             Expression::StateIn(state_pred) => {
-                let mut states = self.filter_states(&state_pred, None, false);
+                let mut states = self.filter_states(state_pred, None, false);
                 // Mark all states as Trace
                 for node in states.values_mut() {
                     node.kind.insert(BeliefKind::Trace);
@@ -2360,18 +2313,18 @@ impl BeliefSet {
                 // Add sink nodes to states (marked as Trace) so union_mut doesn't filter out the relations
                 for edge in relations.as_graph().raw_edges() {
                     let sink = relations.as_graph()[edge.target()];
-                    if !states.contains_key(&sink) {
+                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
                         if let Some(sink_state) = self.states().get(&sink) {
                             let mut trace_sink = sink_state.clone();
                             trace_sink.kind.insert(BeliefKind::Trace);
-                            states.insert(sink, trace_sink);
+                            e.insert(trace_sink);
                         }
                     }
                 }
                 Beliefs { states, relations }
             }
             Expression::StateNotIn(state_pred) => {
-                let mut states = self.filter_states(&state_pred, None, true);
+                let mut states = self.filter_states(state_pred, None, true);
                 for node in states.values_mut() {
                     node.kind.insert(BeliefKind::Trace);
                 }
@@ -2384,11 +2337,11 @@ impl BeliefSet {
                 // Add sink nodes to states (marked as Trace) so union_mut doesn't filter out the relations
                 for edge in relations.as_graph().raw_edges() {
                     let sink = relations.as_graph()[edge.target()];
-                    if !states.contains_key(&sink) {
+                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
                         if let Some(sink_state) = self.states().get(&sink) {
                             let mut trace_sink = sink_state.clone();
                             trace_sink.kind.insert(BeliefKind::Trace);
-                            states.insert(sink, trace_sink);
+                            e.insert(trace_sink);
                         }
                     }
                 }
@@ -2416,7 +2369,7 @@ impl BeliefSet {
         self.index_sync(false);
         match expr {
             Expression::StateIn(state_pred) => {
-                let mut states = self.filter_states(&state_pred, None, false);
+                let mut states = self.filter_states(state_pred, None, false);
                 let state_set = states.keys().copied().collect::<Vec<Bid>>();
                 let relations = BidGraph::from(
                     self.relations()
@@ -2426,26 +2379,26 @@ impl BeliefSet {
                 // Mark them as Trace since we haven't loaded their full relation set
                 for edge in relations.as_graph().raw_edges() {
                     let sink = relations.as_graph()[edge.target()];
-                    if !states.contains_key(&sink) {
+                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
                         if let Some(sink_state) = self.states().get(&sink) {
                             let mut trace_sink = sink_state.clone();
                             trace_sink.kind.insert(BeliefKind::Trace);
-                            states.insert(sink, trace_sink);
+                            e.insert(trace_sink);
                         }
                     }
                     let source = relations.as_graph()[edge.source()];
-                    if !states.contains_key(&source) {
+                    if let BTreeEntry::Vacant(e) = states.entry(source) {
                         if let Some(source_state) = self.states().get(&source) {
                             let mut trace_source = source_state.clone();
                             trace_source.kind.insert(BeliefKind::Trace);
-                            states.insert(source, trace_source);
+                            e.insert(trace_source);
                         }
                     }
                 }
                 Beliefs { states, relations }
             }
             Expression::StateNotIn(state_pred) => {
-                let mut states = self.filter_states(&state_pred, None, true);
+                let mut states = self.filter_states(state_pred, None, true);
                 let state_set = states.keys().copied().collect::<Vec<Bid>>();
                 let relations = BidGraph::from(
                     self.relations()
@@ -2455,19 +2408,19 @@ impl BeliefSet {
                 // Mark them as Trace since we haven't loaded their full relation set
                 for edge in relations.as_graph().raw_edges() {
                     let sink = relations.as_graph()[edge.target()];
-                    if !states.contains_key(&sink) {
+                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
                         if let Some(sink_state) = self.states().get(&sink) {
                             let mut trace_sink = sink_state.clone();
                             trace_sink.kind.insert(BeliefKind::Trace);
-                            states.insert(sink, trace_sink);
+                            e.insert(trace_sink);
                         }
                     }
                     let source = relations.as_graph()[edge.source()];
-                    if !states.contains_key(&source) {
+                    if let BTreeEntry::Vacant(e) = states.entry(source) {
                         if let Some(source_state) = self.states().get(&source) {
                             let mut trace_source = source_state.clone();
                             trace_source.kind.insert(BeliefKind::Trace);
-                            states.insert(source, trace_source);
+                            e.insert(trace_source);
                         }
                     }
                 }
@@ -2485,22 +2438,22 @@ impl BeliefSet {
                         weights: &edge.weight,
                     };
                     if relation_pred.match_ref(&rel) {
-                        if !states.contains_key(&sink) {
+                        if let BTreeEntry::Vacant(e) = states.entry(sink) {
                             if let Some(state) = self.states().get(&sink) {
                                 let mut sink_state = state.clone();
                                 // We don't have the entirety of the node relation set, so insert
                                 // the trace nodekind graph color
                                 sink_state.kind.insert(BeliefKind::Trace);
-                                states.insert(sink, sink_state.clone());
+                                e.insert(sink_state.clone());
                             }
                         }
-                        if !states.contains_key(&source) {
+                        if let BTreeEntry::Vacant(e) = states.entry(source) {
                             if let Some(state) = self.states().get(&source) {
                                 let mut source_state = state.clone();
                                 // We don't have the entirety of the node relation set, so insert
                                 // the trace nodekind graph color
                                 source_state.kind.insert(BeliefKind::Trace);
-                                states.insert(source, source_state.clone());
+                                e.insert(source_state.clone());
                             }
                         }
                         edges.push(BeliefRelation::from(&rel));
@@ -2508,7 +2461,7 @@ impl BeliefSet {
                 }
                 Beliefs {
                     states,
-                    relations: BidGraph::from_edges(edges.into_iter()),
+                    relations: BidGraph::from_edges(edges),
                 }
             }
             Expression::RelationNotIn(relation_pred) => {
@@ -2523,22 +2476,22 @@ impl BeliefSet {
                         weights: &edge.weight,
                     };
                     if !relation_pred.match_ref(&rel) {
-                        if !states.contains_key(&sink) {
+                        if let BTreeEntry::Vacant(e) = states.entry(sink) {
                             if let Some(state) = self.states().get(&sink) {
                                 let mut sink_state = state.clone();
                                 // We don't have the entirety of the node relation set, so insert
                                 // the trace nodekind graph color
                                 sink_state.kind.insert(BeliefKind::Trace);
-                                states.insert(sink, sink_state.clone());
+                                e.insert(sink_state.clone());
                             }
                         }
-                        if !states.contains_key(&source) {
+                        if let BTreeEntry::Vacant(e) = states.entry(source) {
                             if let Some(state) = self.states().get(&source) {
                                 let mut source_state = state.clone();
                                 // We don't have the entirety of the node relation set, so insert
                                 // the trace nodekind graph color
                                 source_state.kind.insert(BeliefKind::Trace);
-                                states.insert(source, source_state.clone());
+                                e.insert(source_state.clone());
                             }
                         }
                         edges.push(BeliefRelation::from(&rel));
@@ -2546,7 +2499,7 @@ impl BeliefSet {
                 }
                 Beliefs {
                     states,
-                    relations: BidGraph::from_edges(edges.into_iter()),
+                    relations: BidGraph::from_edges(edges),
                 }
             }
             Expression::Dyad(lhs_p, op, rhs_p) => {

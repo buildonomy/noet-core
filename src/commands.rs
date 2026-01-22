@@ -42,8 +42,8 @@ impl Display for Op {
                     .join(", ")
             ),
             Op::GetNetFromDir => write!(f, "GetNetFromDir"),
-            Op::GetProc(net, p) => write!(f, "GetProc({}:{})", net, p),
-            Op::SetProc(p, _) => write!(f, "SetProc({})", p),
+            Op::GetProc(net, p) => write!(f, "GetProc({net}:{p})"),
+            Op::SetProc(p, _) => write!(f, "SetProc({p})"),
             Op::GetFocus => write!(f, "GetFocus"),
             Op::SetFocus(focus) => write!(
                 f,
@@ -57,7 +57,7 @@ impl Display for Op {
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
-            Op::GetStates(pq) => write!(f, "GetStates({:?})", pq),
+            Op::GetStates(pq) => write!(f, "GetStates({pq:?})"),
         }
     }
 }

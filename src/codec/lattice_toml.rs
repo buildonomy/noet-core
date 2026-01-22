@@ -45,15 +45,8 @@ fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
         .filter_map(|mut p| {
             if p.is_file() {
                 if p.extension()
-                    .map(|e| e.to_str())
-                    .flatten()
-                    .filter(|&e| {
-                        CODECS
-                            .extensions()
-                            .iter()
-                            .find(|ce| ce.as_str() == e)
-                            .is_some()
-                    })
+                    .and_then(|e| e.to_str())
+                    .filter(|&e| CODECS.extensions().iter().any(|ce| ce.as_str() == e))
                     .is_some()
                 {
                     if subnets.iter().any(|subnet_path| p.starts_with(subnet_path)) {
@@ -100,10 +93,8 @@ fn toml_edit_to_toml_value(item: &toml_edit::Item) -> Option<toml::Value> {
         Some(toml::Value::Boolean(b))
     } else if let Some(arr) = item.as_array() {
         // Recursively convert array items (array contains Value, not Item)
-        let converted: Option<Vec<toml::Value>> = arr
-            .iter()
-            .map(|value| toml_edit_value_to_toml_value(value))
-            .collect();
+        let converted: Option<Vec<toml::Value>> =
+            arr.iter().map(toml_edit_value_to_toml_value).collect();
         converted.map(toml::Value::Array)
     } else if let Some(table) = item.as_inline_table() {
         // Convert inline table (inline tables contain Value, not Item)
@@ -134,10 +125,8 @@ fn toml_edit_value_to_toml_value(value: &toml_edit::Value) -> Option<toml::Value
     } else if let Some(b) = value.as_bool() {
         Some(toml::Value::Boolean(b))
     } else if let Some(arr) = value.as_array() {
-        let converted: Option<Vec<toml::Value>> = arr
-            .iter()
-            .map(|v| toml_edit_value_to_toml_value(v))
-            .collect();
+        let converted: Option<Vec<toml::Value>> =
+            arr.iter().map(toml_edit_value_to_toml_value).collect();
         converted.map(toml::Value::Array)
     } else if let Some(table) = value.as_inline_table() {
         let mut map = toml::map::Map::new();
@@ -429,36 +418,6 @@ impl ProtoBeliefNode {
         Ok(proto)
     }
 
-    // Use TomlCodec for schema-aware frontmatter parsing
-    // Benefits:
-    // 1. Parses parent_connections → downstream
-    // 2. Preserves unknown TOML fields for round-trip
-    pub fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
-        let mut proto = ProtoBeliefNode::default();
-        proto.content = str.trim().to_string();
-        proto.document = proto
-            .content
-            .parse::<DocumentMut>()
-            .map_err(|e| BuildonomyError::Codec(format!("Failed to parse TOML: {}", e)))?;
-        // Remove/translate BeliefNode fields into a proto node format.
-        proto.document.remove("kind");
-        if let Some(mut payload) = proto.document.remove("payload") {
-            if let Some(table) = payload.as_table_mut() {
-                let keys = table
-                    .iter()
-                    .map(|(k, _)| k.to_string())
-                    .collect::<Vec<String>>();
-                for key_str in keys {
-                    let (key, item) = table
-                        .remove_entry(&key_str)
-                        .expect("received key_str from table itself.");
-                    proto.document.insert_formatted(&key, item);
-                }
-            }
-        }
-        Ok(proto)
-    }
-
     /// Parse a file or directory into a ProtoBeliefNode, discovering direct filesystem descendants.
     ///
     /// # Filesystem Discovery Design
@@ -473,24 +432,15 @@ impl ProtoBeliefNode {
     ///
     /// ## Alternative Implementations via Codec Swapping
     ///
-    /// This filesystem-based implementation is just one strategy. The `CODECS` map allows
-    /// swapping implementations at runtime for different environments:
+    /// This filesystem-based implementation is just one strategy. The [`crate::codecs::CODECS`] map
+    /// allows swapping implementations at runtime for different environments:
     ///
     /// - **Native/Desktop**: Use this `ProtoBeliefNode` with direct filesystem access
     /// - **Browser/WASM**: Swap in a `BrowserProtoBeliefNode` that reads from IndexedDB
     /// - **Testing**: Swap in a `MockProtoBeliefNode` with in-memory content
     ///
     /// The codec abstraction provides this flexibility without changing the parser or
-    /// accumulator layers:
-    ///
-    /// ```ignore
-    /// // In browser context
-    /// CODECS.insert::<BrowserProtoBeliefNode>("toml".to_string());
-    ///
-    /// // Parser and accumulator work unchanged
-    /// let parser = BeliefSetParser::new(entry_point, tx, None)?;
-    /// parser.parse_all(cache).await?;
-    /// ```
+    /// accumulator layers. See [crate::codecs] for details on how to swap out `CODECS`.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<ProtoBeliefNode, BuildonomyError> {
         let mut file_path = PathBuf::from(path.as_ref());
         let mut is_net = false;
@@ -501,8 +451,7 @@ impl ProtoBeliefNode {
         let mut proto = ProtoBeliefNode::default();
         if !file_path.exists() {
             return Err(BuildonomyError::NotFound(format!(
-                "Node {:?} does not exist",
-                file_path
+                "Node {file_path:?} does not exist"
             )));
         }
 
@@ -519,8 +468,7 @@ impl ProtoBeliefNode {
             proto.merge(&mut file_proto);
             if !proto.document.contains_key("id") {
                 return Err(BuildonomyError::Codec(format!(
-                    "Network nodes require a semantic ID. Received: {:?}",
-                    proto
+                    "Network nodes require a semantic ID. Received: {proto:?}"
                 )));
             }
 
@@ -599,14 +547,14 @@ impl ProtoBeliefNode {
             }
         }
 
-        let mut other_upstream = replace(&mut other.upstream, Vec::new());
+        let mut other_upstream = std::mem::take(&mut other.upstream);
         if self.upstream != other.upstream && !other.upstream.is_empty() {
             self.upstream.append(&mut other_upstream);
             changed = true;
         }
 
         if self.downstream != other.downstream && !other.downstream.is_empty() {
-            let mut other_downstream = replace(&mut other.downstream, Vec::new());
+            let mut other_downstream = std::mem::take(&mut other.downstream);
             self.downstream.append(&mut other_downstream);
             changed = true;
         }
@@ -617,13 +565,13 @@ impl ProtoBeliefNode {
         }
 
         if self.errors != other.errors && !other.errors.is_empty() {
-            let mut other_errors = replace(&mut other.errors, Vec::default());
+            let mut other_errors = std::mem::take(&mut other.errors);
             self.errors.append(&mut other_errors);
             changed = true;
         }
 
         if self.path != other.path && !other.path.is_empty() {
-            self.path = replace(&mut other.path, String::default());
+            self.path = std::mem::take(&mut other.path);
             changed = true;
         }
 
@@ -652,7 +600,7 @@ impl ProtoBeliefNode {
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
         let mut changed = self.merge(&mut ProtoBeliefNode::try_from(ctx.node)?);
         // We need to fold in and updates to the references stored in our schema so that we can write them out to file here.
-        if self.update_schema(&ctx)? {
+        if self.update_schema(ctx)? {
             changed = true;
         }
         if changed {
@@ -676,8 +624,7 @@ impl ProtoBeliefNode {
         let schema_type = self
             .document
             .get("schema")
-            .map(|item| item.as_str().map(|str| str.to_string()))
-            .flatten();
+            .and_then(|item| item.as_str().map(|str| str.to_string()));
 
         let schema_name = match schema_type {
             Some(name) => name,
@@ -690,18 +637,18 @@ impl ProtoBeliefNode {
         // Convert document to toml::Value for migration, then back to toml_edit
         let toml_string = self.document.to_string();
         let mut toml_value: toml::Value = toml::from_str(&toml_string).map_err(|e| {
-            BuildonomyError::Codec(format!("Failed to convert to toml::Value: {}", e))
+            BuildonomyError::Codec(format!("Failed to convert to toml::Value: {e}"))
         })?;
 
         if migrate_schema(&schema_name, &mut toml_value) {
             // Migration occurred - convert back and update document
             let migrated_string = toml::to_string(&toml_value).map_err(|e| {
-                BuildonomyError::Codec(format!("Failed to serialize migrated TOML: {}", e))
+                BuildonomyError::Codec(format!("Failed to serialize migrated TOML: {e}"))
             })?;
             self.document = migrated_string
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| {
-                    BuildonomyError::Codec(format!("Failed to parse migrated TOML: {}", e))
+                    BuildonomyError::Codec(format!("Failed to parse migrated TOML: {e}"))
                 })?;
 
             // Update content to reflect the migration (marks as changed for rewrite)
@@ -803,6 +750,39 @@ impl ProtoBeliefNode {
         }
 
         Ok(())
+    }
+}
+
+impl FromStr for ProtoBeliefNode {
+    type Err = BuildonomyError;
+    // Use TomlCodec for schema-aware frontmatter parsing
+    // Benefits:
+    // 1. Parses parent_connections → downstream
+    // 2. Preserves unknown TOML fields for round-trip
+    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+        let mut proto = ProtoBeliefNode::default();
+        proto.content = str.trim().to_string();
+        proto.document = proto
+            .content
+            .parse::<DocumentMut>()
+            .map_err(|e| BuildonomyError::Codec(format!("Failed to parse TOML: {e}")))?;
+        // Remove/translate BeliefNode fields into a proto node format.
+        proto.document.remove("kind");
+        if let Some(mut payload) = proto.document.remove("payload") {
+            if let Some(table) = payload.as_table_mut() {
+                let keys = table
+                    .iter()
+                    .map(|(k, _)| k.to_string())
+                    .collect::<Vec<String>>();
+                for key_str in keys {
+                    let (key, item) = table
+                        .remove_entry(&key_str)
+                        .expect("received key_str from table itself.");
+                    proto.document.insert_formatted(&key, item);
+                }
+            }
+        }
+        Ok(proto)
     }
 }
 

@@ -13,9 +13,8 @@ use noet_core::{
     BuildonomyError,
 };
 use petgraph::visit::EdgeRef;
-use std::path::PathBuf;
+use std::path::Path;
 use tempfile::TempDir;
-use tokio;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), BuildonomyError> {
@@ -36,15 +35,14 @@ async fn main() -> Result<(), BuildonomyError> {
     // 2. Set up parser configuration
     println!("2. Configuring parser...");
     // 3. Create parser and parse all documents
-    println!("3. Parsing documents from {:?}...", docs_path);
+    println!("3. Parsing documents from {docs_path:?}...");
     let mut parser = BeliefSetParser::simple(docs_path)?;
 
     // Initial parse - this will do multiple passes to resolve forward references
     let mut parse_results = parser.parse_all(BeliefSet::default()).await?;
     let diagnostics: Vec<ParseDiagnostic> = parse_results
         .drain(..)
-        .map(|pr| pr.diagnostics)
-        .flatten()
+        .flat_map(|pr| pr.diagnostics)
         .collect();
 
     println!("   ✓ Parsed {} nodes\n", parser.cache().states().len());
@@ -152,7 +150,7 @@ async fn main() -> Result<(), BuildonomyError> {
 }
 
 /// Create some example markdown documents in the temporary directory
-fn create_example_documents(base_path: &PathBuf) -> std::io::Result<()> {
+fn create_example_documents(base_path: &Path) -> std::io::Result<()> {
     use std::fs;
 
     // Create index.md

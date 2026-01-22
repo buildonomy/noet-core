@@ -74,8 +74,7 @@ fn test_relation_removal_triggers_reindexing() {
     let final_errors = set.built_in_test(false);
     assert!(
         final_errors.is_empty(),
-        "Final state should be balanced: {:?}",
-        final_errors
+        "Final state should be balanced: {final_errors:?}"
     );
 }
 

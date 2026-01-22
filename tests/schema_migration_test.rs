@@ -1,5 +1,6 @@
 /// Test automatic schema migration from old relationship_profile to new relationship_semantics
 use noet_core::codec::lattice_toml::ProtoBeliefNode;
+use std::str::FromStr;
 
 #[test]
 fn test_relationship_profile_migration() {
@@ -37,8 +38,7 @@ exploratory = 0.3
     assert!(
         !migrated.contains("[parent_connections.relationship_profile]")
             && !migrated.contains("relationship_profile ="),
-        "Migration should remove relationship_profile field. Output:\n{}",
-        migrated
+        "Migration should remove relationship_profile field. Output:\n{migrated}"
     );
 
     // Should contain semantic kinds for non-zero values

@@ -38,7 +38,7 @@ fn generate_test_root(test_net: &str) -> Result<TempDir, BuildonomyError> {
         "generating test root. Files: {}",
         fs::read_dir(&temp_dir)
             .unwrap()
-            .map(|f| format!("{:?}", f))
+            .map(|f| format!("{f:?}"))
             .collect::<Vec<String>>()
             .join(", ")
     );
@@ -59,7 +59,7 @@ fn extract_bids_from_content(content: &str) -> Result<Vec<Bid>, BuildonomyError>
     let mut bids = Vec::new();
     for line in content.lines() {
         if line.trim().starts_with("bid") && line.trim()[3..].trim().starts_with('=') {
-            let a_bid: ABid = from_str(&line)?;
+            let a_bid: ABid = from_str(line)?;
             bids.push(a_bid.bid);
         }
     }
@@ -77,7 +77,7 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
         test_root,
         fs::read_dir(&test_tempdir)
             .unwrap()
-            .map(|f| format!("{:?}", f))
+            .map(|f| format!("{f:?}"))
             .collect::<Vec<String>>()
             .join(", ")
     );
@@ -134,7 +134,7 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
         "File writes:\n - {}",
         writes
             .iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
+            .map(|(k, v)| format!("{k}: {v}"))
             .collect::<Vec<String>>()
             .join("\n - ")
     );
@@ -143,9 +143,7 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
     let cached_bids = BTreeSet::from_iter(global_cache.states().values().map(|n| n.bid));
     debug_assert!(
         written_bids.eq(&cached_bids),
-        "Written: {:?}\n\nCached: {:?}",
-        written_bids,
-        cached_bids
+        "Written: {written_bids:?}\n\nCached: {cached_bids:?}"
     );
 
     // 8. Initialize a NEW BeliefSetParser using the SAME global_cache and repository state
@@ -171,8 +169,7 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
     }
     debug_assert!(
         received_events.is_empty(),
-        "Expected no events. Received: {:?}",
-        received_events
+        "Expected no events. Received: {received_events:?}"
     );
 
     // Cleanup is handled by tempdir dropping

@@ -24,6 +24,12 @@ pub struct Transaction<'a> {
     pub staged: usize,
 }
 
+impl<'a> Default for Transaction<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> Transaction<'a> {
     pub fn new() -> Transaction<'a> {
         Transaction {
@@ -79,10 +85,10 @@ impl<'a> Transaction<'a> {
             BeliefEvent::RelationInsert(source, sink, kind, payload, _) => {
                 let mut weight_set = WeightSet::empty();
                 weight_set.set(*kind, payload.clone());
-                self.update_relation(&source, &sink, &weight_set);
+                self.update_relation(source, sink, &weight_set);
             }
             BeliefEvent::RelationUpdate(source, sink, weight_set, _) => {
-                self.update_relation(&source, &sink, weight_set);
+                self.update_relation(source, sink, weight_set);
             }
             BeliefEvent::RelationRemoved(source, sink, _) => {
                 self.remove_relation(source, sink);
@@ -116,7 +122,7 @@ impl<'a> Transaction<'a> {
         self.staged += 1;
     }
 
-    fn remove_nodes(&mut self, nodes: &Vec<Bid>) {
+    fn remove_nodes(&mut self, nodes: &[Bid]) {
         if nodes.is_empty() {
             return;
         }
@@ -177,7 +183,7 @@ impl<'a> Transaction<'a> {
         self.staged += 1;
     }
 
-    fn remove_paths(&mut self, net: &Bid, paths: &Vec<String>) {
+    fn remove_paths(&mut self, net: &Bid, paths: &[String]) {
         if paths.is_empty() {
             return;
         }
@@ -234,7 +240,7 @@ pub struct DbConnection(pub(crate) Pool<Sqlite>);
 ///
 /// <https://docs.rs/sqlx-core/0.5.13/sqlx_core/query_builder/struct.QueryBuilder.html#method.push_values>
 /// <https://www.sqlite.org/limits.html#max_variable_number>
-// pub const SQLITE_LIMIT_VARIABLE_NUMBER: usize = 32766;
+pub const SQLITE_LIMIT_VARIABLE_NUMBER: usize = 32766;
 
 impl DbConnection {
     #[tracing::instrument(skip(self))]
@@ -319,12 +325,11 @@ impl BeliefCache for DbConnection {
                 // start the query builder over
                 let state_set = states
                     .keys()
-                    .map(|bid| format!("\"{}\"", bid))
+                    .map(|bid| format!("\"{bid}\""))
                     .collect::<Vec<String>>()
                     .join(", ");
                 let mut qb = QueryBuilder::new(&format!(
-                    "SELECT * FROM relations WHERE sink IN ({});",
-                    state_set
+                    "SELECT * FROM relations WHERE sink IN ({state_set});"
                 ));
                 let relation_query = qb.build_query_as::<BeliefRelation>();
                 let relation_sql = relation_query.sql();
@@ -340,8 +345,7 @@ impl BeliefCache for DbConnection {
                     })?;
 
                 qb = QueryBuilder::new(&format!(
-                    "SELECT * FROM relations WHERE source IN ({});",
-                    state_set
+                    "SELECT * FROM relations WHERE source IN ({state_set});"
                 ));
                 let relation_query = qb.build_query_as::<BeliefRelation>();
                 let relation_sql = relation_query.sql();
@@ -373,13 +377,13 @@ impl BeliefCache for DbConnection {
                 // start the query builder over
                 let state_set = states
                     .keys()
-                    .map(|bid| format!("\"{}\"", bid))
+                    .map(|bid| format!("\"{bid}\""))
                     .collect::<Vec<String>>()
                     .join(", ");
                 let mut kind_q = Vec::<String>::new();
                 for (kind, _) in weight_filter {
-                    let column_name = format!("{:?}", kind).to_lowercase();
-                    kind_q.push(format!("{} IS NOT NULL", column_name,));
+                    let column_name = format!("{kind:?}").to_lowercase();
+                    kind_q.push(format!("{column_name} IS NOT NULL",));
                 }
                 let mut qb = QueryBuilder::new(&format!(
                     "SELECT * FROM relations WHERE sink IN ({}) AND {};",

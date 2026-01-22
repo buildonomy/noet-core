@@ -59,6 +59,18 @@ Update design documents when:
 
 Design documents should **synchronize with implementation**. Sometimes it is best for design document to lead, sometimes implementation leads in order to properly explore the complexity of the problem. In all cases, learning occurs from entering design documentation, so design MUST stay synchronized with implementation.
 
+### Length Guidelines for Design Documents
+
+Design documents are **technical specifications** and typically require comprehensive detail:
+
+- **Target length**: ~700-800 lines for complete technical specifications
+- **When longer is appropriate**: Complex systems with multiple subsystems may exceed this
+- **When to split**: If a design doc approaches ~1000+ lines, consider splitting by subsystem or creating separate trade study documents
+
+See `DOCUMENTATION_STRATEGY.md` for the full documentation hierarchy (lib.rs → architecture.md → design specs → module docs).
+
+**Key principle**: Design docs should be detailed enough to understand implementation. Module-level rustdoc should be brief API guides that link to design docs for architectural details.
+
 ## Session Management
 
 ### Starting New Sessions
@@ -300,10 +312,13 @@ Keep **Roadmaps** focused on:
 
 ## Code Examples in Documents
 
+See `DOCUMENTATION_STRATEGY.md` for the complete documentation hierarchy and where code examples belong.
+
 ### When to Include Code
 - **Issues**: High-level pseudocode or type signatures only
 - **Design Docs**: Interface definitions, schemas, example usage
 - **Trade Studies**: Comparison snippets showing key differences
+- **Module Rustdoc**: Focused API usage examples (brief, not architectural explanations)
 
 ### Code Style
 - Prefer standard markdown language identifiers: ```rust
@@ -324,8 +339,10 @@ Before proposing implementations or writing detailed code in issues:
 **Always check:**
 1. **Search for related functionality**: Use `grep` to find similar patterns
 2. **Read relevant files**: Check `@file.rs` or use `find_path` to locate modules
-3. **Identify existing infrastructure**: Look for helper functions, existing patterns
-4. **Reference, don't reinvent**: Point to existing code to extend rather than rewriting
+3. **Check module documentation**: Read module-level rustdoc for API patterns and usage examples
+4. **Check design docs**: Review `docs/design/*.md` for architectural context and implementation details
+5. **Identify existing infrastructure**: Look for helper functions, existing patterns
+6. **Reference, don't reinvent**: Point to existing code to extend rather than rewriting
 
 **Pattern:**
 ```markdown

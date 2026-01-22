@@ -19,11 +19,12 @@ pub fn init_logging() {
 
 /// Helper function to create a simple BeliefNode for testing
 pub fn create_test_node(title: &str, kind: BeliefKind) -> BeliefNode {
-    let mut node = BeliefNode::default();
-    node.title = title.to_string();
-    node.kind = BeliefKindSet(kind.into());
-    node.bid = Bid::new(Bid::nil());
-    node
+    BeliefNode {
+        title: title.to_string(),
+        kind: BeliefKindSet(kind.into()),
+        bid: Bid::new(Bid::nil()),
+        ..Default::default()
+    }
 }
 
 /// Helper function to create a test BeliefSet with some nodes and relations

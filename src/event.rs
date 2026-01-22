@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// Indicates the origin of a BeliefEvent for proper handling by different cache implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EventOrigin {
     /// Event was generated locally by this BeliefSet and has already been applied to its state.
     /// BeliefSet should validate consistency but skip reapplication.
@@ -16,13 +16,8 @@ pub enum EventOrigin {
 
     /// Event came from an external source (DbConnection restore, file watcher, network sync).
     /// BeliefSet must apply these events to synchronize state.
+    #[default]
     Remote,
-}
-
-impl Default for EventOrigin {
-    fn default() -> Self {
-        EventOrigin::Remote
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

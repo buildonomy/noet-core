@@ -385,7 +385,135 @@ pub struct BeliefSetAccumulator {
 
 **Key Insight**: The stack-based approach enables **streaming parsing** of large document trees without loading entire files into memory first.
 
-### 3.2. BeliefSet vs Beliefs: Full API vs Transport Layer
+### 3.2. The Codec System: Three Sources of Truth
+
+The `BeliefSetAccumulator` mediates between three sources of truth during parsing:
+
+1. **The Parsed Document** (source of truth for text and ordering)
+   - Absolute authority for its own content
+   - Defines the sequence of subsections
+   - The accumulator must trust this order implicitly
+   - Changes here trigger cache updates
+
+2. **The Local Cache (`self.set`)** (source of truth for current parse state)
+   - In-memory representation of the filesystem tree being parsed
+   - Resolves cross-document links within the same filesystem
+   - Represents the **NEW state** being built from parsing
+   - Source of truth for what documents currently contain
+
+3. **The Global Cache (Database)** (source of truth for identity)
+   - Persistent canonical store of all `BeliefNode`s
+   - Ultimate authority for BIDs (Belief IDs)
+   - Canonicalizes references across different filesystems/networks
+   - Queried to resolve node identities
+
+**The Core Challenge**: The accumulator generates:
+1. `BeliefEvent`s that update the global cache to reflect source documents
+2. Context to inject BIDs back into source documents for absolute references
+
+This synchronization enables cross-document and cross-project coordination. For example, if a subsection title changes within a document, external documents can be updated to reflect the new title in their link text.
+
+#### Two-Cache Architecture: `self.set` vs `stack_cache`
+
+The `BeliefSetAccumulator` maintains two separate `BeliefSet` instances during parsing:
+
+- **`self.set`**: The NEW state (what documents currently contain after parsing)
+- **`stack_cache`**: The OLD state (what existed in the global cache before this parse)
+
+**Parsing Lifecycle**:
+
+1. **`initialize_stack`**: Clears `stack_cache` to start fresh for this parse operation
+
+2. **During parsing (`push`)**:
+   - `cache_fetch` queries the global cache and populates `stack_cache` via `merge()`
+   - This includes both nodes and their relationships, building a snapshot of the old state
+   - Remote events are processed into `self.set` only
+   - `self.set` and `stack_cache` intentionally diverge during this phase
+
+3. **`terminate_stack`**: Reconciles the two caches:
+   - Compares `self.set` (new parsed state) against `stack_cache` (old cached state)
+   - Identifies nodes that existed before but are no longer referenced
+   - Generates `NodesRemoved` events for the differences
+   - Sends reconciliation events to both `stack_cache` and the transmitter (for global cache)
+
+**Key Insight**: This two-cache architecture enables the accumulator to detect what was removed from a document by comparing old and new manifolds, then propagating those removals to other caches.
+
+#### Link Rewriting and Bi-Directional References
+
+Links are critical to the Buildonomy system. All links in source material are treated as bi-directional references. Links are one of the only places Buildonomy will edit a source document directly (the other being metadata blocks).
+
+**Link Design Constraints** (simultaneously satisfied):
+
+- **Preserve legibility**: Practitioners should be able to manually navigate to referenced documents without complicated tools. Link text should indicate what the link contains.
+
+- **Auto-update descriptions**: When a reference title changes, link descriptions update automatically, unless explicitly specified separately from the link reference.
+
+- **Track all references**: Track references-to (sinks) for everything important enough to document, even external sources.
+
+- **External reference navigation**: Be able to fetch a node that navigates to an external reference simply by failing resolution of the reference's NodeKey (preserving schema, host, etc.).
+
+- **Anchor uniqueness**: Treat URL anchors as unique nodes, not just the anchored document.
+
+**Link Types**:
+- **Epistemic links**: Appear within the text of a node
+- **Pragmatic/Subsection references**: Appear in metadata
+
+Implementation is handled via the interaction between `BeliefSetAccumulator::cache_fetch` and `crate::nodekey::href_to_nodekey`.
+
+#### Relative Path Resolution Protocol
+
+Links must be interpretable by both practitioners reading raw source documents and the software parsing them. Source documents constantly evolve, and links must remain interpretable as both source and reference material change.
+
+**Relative Path Philosophy**:
+
+Within source documents, relative links should be prioritized for readability:
+- **Titles as anchors**: Preferred when unique
+- **Path-based anchors**: When titles are non-unique, use `/source/network/relative/doc_path#node_bref` (abbreviated bid)
+
+Within the instantiated network cache:
+- Nodes are referenced by `Bid` (Belief ID)
+- If a BID is not available in source, one is generated and injected back into the source
+- `BeliefSetAccumulator::{push,push_relation}` generate appropriate `BeliefNode`s when necessary.
+
+**Path Tracking** (`crate::beliefset::BeliefSet::paths`):
+
+The path system tracks:
+- **Relative paths**: Anchored with respect to each network sink
+- **External URLs**: Treated as absolute paths; if not resolvable, returned as `UnresolvedReference`
+- **Resolved references**: BID is synchronized with source document and cache
+- **Path relativity**: Paths are not intrinsic to nodes but are properties relative to network spatial structure
+
+**Complexity: Path Stability**:
+
+Relative paths change when documents are restructured or renamed:
+- Section reordering breaks document index anchors
+- Title changes break slug-based anchors
+- Must rely on BIDs for stability, but BIDs are human-illegible
+- After querying by BID, must translate back to relative link format
+
+**Reference Resolution Protocol**:
+
+1. **BID Generation**: If a parsed node (proto node) lacks a BID in source material, one is generated and written back to the source
+
+2. **Unresolved References**: When parsing a link, if the path is not resolvable, an `UnresolvedReference` diagnostic is returned. The parser uses this to:
+   - Queue the referenced file for parsing (if available)
+   - Track which files need reparsing once the reference is resolved
+
+3. **Network Context**: When mapping a reference to an ID, the nearest network must be specified so only paths relative to that network are considered
+
+4. **Path Change Propagation**: When a subsection reference path changes between versions, the accumulator must:
+   - Find all sink relationships containing the old relative path
+   - Propagate events back to source documents to rewrite them with updated relative links
+
+**Unresolved References as Promises**:
+
+We cannot assume all relations are immediately accessible during parsing. Unresolved references represent *promises* that something useful exists and will be resolved in subsequent passes. The `BeliefSetParser` maintains a two-queue architecture:
+- **Primary queue**: Never-parsed files
+- **Reparse queue**: Files with unresolved dependencies
+
+This handles multi-pass resolution efficiently without polluting the cache with incomplete nodes.
+
+### 3.4. BeliefSet vs Beliefs: Full API vs Transport Layer
 
 The codebase maintains two distinct but related structures for representing compiled graphs:
 
@@ -478,7 +606,7 @@ let context = belief_set.get_context(some_bid)?;
 **Lazy Indexing:**
 The `bid_to_index` mapping is rebuilt only when `index_dirty` is set, enabling batched updates without per-operation overhead. This is analogous to incremental compilation in modern compilers.
 
-### 3.3. DocCodec: The Frontend Interface
+### 3.5. DocCodec: The Frontend Interface
 
 The `DocCodec` trait defines the contract for file format parsers:
 
@@ -506,7 +634,7 @@ pub trait DocCodec {
 
 **Key Responsibility**: Codecs are **syntax-only**. They produce ProtoBeliefNodes with unresolved references (NodeKey instances). The accumulator handles semantic analysis and linking.
 
-### 3.4. The Document Stack: Nested Structure Parsing
+### 3.6. The Document Stack: Nested Structure Parsing
 
 The stack mechanism (codec/mod.rs:1160-1402) is a critical innovation enabling hierarchical document parsing:
 

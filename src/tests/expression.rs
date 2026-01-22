@@ -177,7 +177,7 @@ fn test_evaluate_expression_dyad_union() {
         .values()
         .map(|n| (n.bid, n.title.clone()))
         .collect();
-    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(&title_b));
+    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(title_b));
 
     let expr1 = Expression::StateIn(StatePred::Bid(vec![bids[0].0]));
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[1].0]));
@@ -228,7 +228,7 @@ fn test_evaluate_expression_dyad_intersection() {
         .values()
         .map(|n| (n.bid, n.title.clone()))
         .collect();
-    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(&title_b));
+    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(title_b));
 
     let expr1 = Expression::StateIn(StatePred::Bid(vec![bids[0].0, bids[1].0]));
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[1].0, bids[2].0]));
@@ -260,7 +260,7 @@ fn test_evaluate_expression_dyad_difference() {
         .values()
         .map(|n| (n.bid, n.title.clone()))
         .collect();
-    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(&title_b));
+    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(title_b));
 
     let expr1 = Expression::StateIn(StatePred::Bid(vec![bids[0].0, bids[1].0, bids[2].0]));
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[2].0]));
@@ -294,7 +294,7 @@ fn test_evaluate_expression_dyad_symmetric_difference() {
         .values()
         .map(|n| (n.bid, n.title.clone()))
         .collect();
-    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(&title_b));
+    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(title_b));
 
     // Contains 0
     let expr1 = Expression::StateIn(StatePred::Bid(vec![bids[0].0, bids[1].0]));
@@ -332,7 +332,7 @@ fn test_evaluate_expression_nested_dyads() {
         .values()
         .map(|n| (n.bid, n.title.clone()))
         .collect();
-    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(&title_b));
+    bids.sort_by(|(_, title_a), (_, title_b)| title_a.cmp(title_b));
 
     // (A ∪ B) ∩ (C ∪ D)
     let expr_a = Expression::StateIn(StatePred::Bid(vec![bids[0].0]));
@@ -501,13 +501,11 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
     // The query result should include Document and its upstream relation to Network
     assert!(
         query_result.states.contains_key(&doc_node.bid),
-        "WAT:\n{}",
-        query_result
+        "WAT:\n{query_result}"
     );
     assert!(
         query_result.states.contains_key(&network_node.bid),
-        "WAT:\n{}",
-        query_result
+        "WAT:\n{query_result}"
     );
 
     // Now try to balance the query result

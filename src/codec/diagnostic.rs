@@ -18,17 +18,22 @@ use toml_edit::Table as TomlTable;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # use noet_core::{nodekey::NodeKey, properties::{Bid, WeightKind}, codec::UnresolvedReference};
+/// # use petgraph::Direction;
+/// # let network_bid = Bid::default();
+/// # let bid_of_document_a = Bid::new(network_bid);
 /// // Document A references Document B before B is parsed:
-/// UnresolvedReference {
+/// let unresolved = UnresolvedReference {
 ///     direction: Direction::Outgoing,
 ///     self_bid: bid_of_document_a,
-///     self_path: PathBuf::from("docs/a.md"),
-///     other_key: NodeKey::Path { net: network_bid, path: "docs/b.md" },
+///     self_net: network_bid,
+///     self_path: "docs/a.md".to_string(),
+///     other_keys: vec![NodeKey::Path { net: network_bid, path: "docs/b.md".to_string() }],
 ///     weight_kind: WeightKind::Epistemic,
 ///     weight_data: None,
 ///     reference_location: Some((42, 10)), // Line 42, column 10
-/// }
+/// };
 /// ```
 #[derive(Debug, Clone)]
 pub struct UnresolvedReference {
@@ -124,23 +129,17 @@ impl UnresolvedReference {
 
     /// Check if this diagnostic represents a sink dependency
     pub fn is_sink_dependency(&self) -> bool {
-        if self.direction == Direction::Incoming {
-            true
-        } else {
-            false
-        }
+        self.direction == Direction::Incoming
     }
 
     /// Get the sink path if this is a sink dependency
     pub fn as_sink_dependency(&self) -> Option<(String, Bid)> {
         if self.direction == Direction::Incoming {
-            if let Some(NodeKey::Path { net, path }) = self.other_keys.iter().find(|k| {
-                if let NodeKey::Path { .. } = k {
-                    true
-                } else {
-                    false
-                }
-            }) {
+            if let Some(NodeKey::Path { net, path }) = self
+                .other_keys
+                .iter()
+                .find(|k| matches!(k, NodeKey::Path { .. }))
+            {
                 Some((get_doc_path(path).to_string(), *net))
             } else {
                 None
@@ -151,6 +150,13 @@ impl UnresolvedReference {
     }
 }
 
+// UnresolvedReference is the common variant during multi-pass compilation.
+// Boxing would add indirection overhead to the hot path. Since diagnostics
+// are already heap-allocated in Vec<ParseDiagnostic>, the size difference
+// is acceptable for now. If memory usage becomes a problem, consider boxing
+// large fields within UnresolvedReference (e.g., weight_data) instead of
+// boxing the entire variant.
+#[allow(clippy::large_enum_variant)]
 /// Diagnostic information produced during document parsing.
 ///
 /// Diagnostics represent non-fatal issues or information discovered during parsing.
@@ -245,9 +251,9 @@ impl std::fmt::Display for ParseDiagnostic {
             Self::ParseError {
                 message,
                 attempt_count,
-            } => write!(f, "Parse error (attempt {}): {}", attempt_count, message),
-            Self::Warning(msg) => write!(f, "Warning: {}", msg),
-            Self::Info(msg) => write!(f, "Info: {}", msg),
+            } => write!(f, "Parse error (attempt {attempt_count}): {message}"),
+            Self::Warning(msg) => write!(f, "Warning: {msg}"),
+            Self::Info(msg) => write!(f, "Info: {msg}"),
         }
     }
 }

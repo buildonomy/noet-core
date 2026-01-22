@@ -163,9 +163,9 @@ pub struct PathMap {
 ///     path structures.
 ///
 /// 2. **Path Resolution:** Provides methods to query paths for specific [Bid]s across all managed
-/// networks ([Self::path], [Self::get]) or within a particular network ([Self::net_path],
-/// [Self::net_get_from_path], [Self::net_get_from_id], [Self::net_get_from_title]). It handles path
-/// resolution that might span across sub-networks.
+///    networks ([Self::path], [Self::get]) or within a particular network ([Self::net_path],
+///    [Self::net_get_from_path], [Self::net_get_from_id], [Self::net_get_from_title]). It handles path
+///    resolution that might span across sub-networks.
 ///
 /// 3.  **Hierarchy Management:** It uses a `BidGraph` (`relations`) to
 ///     understand the relationships between [BeliefNode]s. This graph is the
@@ -296,14 +296,13 @@ pub fn path_join(base: &str, end: &str, end_is_anchor: bool) -> String {
 /// if `full` is not relative to `base` according to the rules specified.
 pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, BuildonomyError> {
     let err = BuildonomyError::Serialization(format!(
-        "Path {:?} is not relative to {:?}",
-        full_ref, base_ref
+        "Path {full_ref:?} is not relative to {base_ref:?}"
     ));
-    let mut full = &full_ref[..];
+    let mut full = full_ref;
     while full.starts_with('/') {
         full = &full[1..];
     }
-    let mut base = &base_ref[..];
+    let mut base = base_ref;
     while base.starts_with('/') {
         base = &base[1..];
     }
@@ -325,8 +324,10 @@ pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, Buildonom
 impl PathMapMap {
     #[tracing::instrument(skip(states, relations))]
     pub fn new(states: &BTreeMap<Bid, BeliefNode>, relations: Arc<RwLock<BidGraph>>) -> PathMapMap {
-        let mut pmm = PathMapMap::default();
-        pmm.relations = relations.clone();
+        let mut pmm = PathMapMap {
+            relations: relations.clone(),
+            ..Default::default()
+        };
         for node in states.values() {
             pmm.anchors.insert(node.bid, to_anchor(&node.title));
             if let Some(id) = node.id.as_ref() {
@@ -351,7 +352,7 @@ impl PathMapMap {
         for net in pmm.nets.iter() {
             if !pmm.map.contains_key(net) {
                 let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
-                pmm.map.insert(net.clone(), Arc::new(RwLock::new(pm)));
+                pmm.map.insert(*net, Arc::new(RwLock::new(pm)));
             }
         }
         pmm
@@ -383,8 +384,7 @@ impl PathMapMap {
 
     pub fn net_get_doc(&self, net: &Bid, node: &Bid) -> Option<(String, Bid, Vec<u16>)> {
         self.get_map(net)
-            .map(|pm| pm.get_doc_from_id(node, self))
-            .flatten()
+            .and_then(|pm| pm.get_doc_from_id(node, self))
     }
 
     pub fn get_doc(&self, node: &Bid) -> Option<(String, Bid, Vec<u16>)> {
@@ -396,22 +396,19 @@ impl PathMapMap {
     pub fn net_get_from_path(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
         let normalized_net = if *net == Bid::nil() { &self.root } else { net };
         self.get_map(normalized_net)
-            .map(|pm| pm.get(path.as_ref(), self))
-            .flatten()
+            .and_then(|pm| pm.get(path.as_ref(), self))
     }
 
     pub fn net_get_from_title(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
         let normalized_net = if *net == Bid::nil() { &self.root } else { net };
         self.get_map(normalized_net)
-            .map(|pm| pm.get_from_title(path.as_ref(), self))
-            .flatten()
+            .and_then(|pm| pm.get_from_title(path.as_ref(), self))
     }
 
     pub fn net_get_from_id(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
         let normalized_net = if *net == Bid::nil() { &self.root } else { net };
         self.get_map(normalized_net)
-            .map(|pm| pm.get_from_id(path.as_ref(), self))
-            .flatten()
+            .and_then(|pm| pm.get_from_id(path.as_ref(), self))
     }
 
     pub fn get(&self, path: &str) -> Option<(Bid, Bid)> {
@@ -428,8 +425,7 @@ impl PathMapMap {
     pub fn net_indexed_path(&self, net: &Bid, bid: &Bid) -> Option<(Bid, String, Vec<u16>)> {
         let normalized_net = if *net == Bid::nil() { &self.root } else { net };
         self.get_map(normalized_net)
-            .map(|pm| pm.path(bid, self))
-            .flatten()
+            .and_then(|pm| pm.path(bid, self))
     }
 
     pub fn path(&self, bid: &Bid) -> Option<(Bid, String)> {
@@ -540,7 +536,7 @@ impl PathMapMap {
 
         if node.kind.is_network() {
             self.nets.insert(node.bid);
-            let pm = PathMap::new(WeightKind::Section, node.bid, &self, relations.clone());
+            let pm = PathMap::new(WeightKind::Section, node.bid, self, relations.clone());
             self.map.insert(node.bid, Arc::new(RwLock::new(pm)));
         }
         if node.kind.is_document() {
@@ -599,7 +595,7 @@ fn generate_terminal_path(
             .map(|p| p.to_string())
             .or_else(|| {
                 nets.anchors
-                    .get(&source)
+                    .get(source)
                     .filter(|anchor| !anchor.is_empty())
                     .cloned()
             })
@@ -628,7 +624,7 @@ fn generate_path_name_with_collision_check(
         .any(|(path, bid, _)| path == &full_path && *bid != *source);
 
     if has_collision {
-        terminal_path = format!("{}-{}", index, terminal_path);
+        terminal_path = format!("{index}-{terminal_path}");
     }
     full_path = path_join(sink_path, &terminal_path, nets.is_anchor(source));
     // Since the index is unique, this should guarantee we don't have any collisions
@@ -675,9 +671,9 @@ impl PathMap {
             match event {
                 DfsEvent::Discover(sink, _) => {
                     // Initialize onto our stack if we haven't already initialized off a TreeEdge event.
-                    if !stack.contains_key(&sink) {
-                        stack.insert(sink, (BTreeSet::new(), BTreeMap::new()));
-                    }
+                    stack
+                        .entry(sink)
+                        .or_insert_with(|| (BTreeSet::new(), BTreeMap::new()));
                     Control::<()>::Continue
                 }
                 DfsEvent::TreeEdge(sink, source)
@@ -686,14 +682,8 @@ impl PathMap {
                     // TreeeEdge: source isn't discovered and will be visited after this event
                     // CrossForwardEdge: source was already visited, so sink is an additional parent.
                     // BackEdge: There's a search already in progress for sink, meaning this is a loop.
-                    match event {
-                        DfsEvent::BackEdge(_, _) => {
-                            loops.insert((sink, source));
-                        }
-                        // DfsEvent::CrossForwardEdge(_, _) => {
-                        //     tracing::debug!("Discovered crossforward edge from {} back to previously visited node {}", source, sink);
-                        // }
-                        _ => {}
+                    if let DfsEvent::BackEdge(_, _) = event {
+                        loops.insert((sink, source));
                     }
                     let (weight, maybe_sub_path) = tree_graph.edge_weight(sink, source).expect(
                         "Edge weight should exist since we received a DfsEvent for this relation",
@@ -734,7 +724,7 @@ impl PathMap {
                         debug_assert!(source_sub_paths.is_empty());
                         for sink in sinks.iter() {
                             let (_, sink_paths) = stack
-                                .get(&sink)
+                                .get(sink)
                                 .expect("To have all sinks still present in the stack");
 
                             debug_assert!(sink_paths.get(&source).is_some());
@@ -763,7 +753,7 @@ impl PathMap {
                                 continue;
                             }
                             let (_, sink_paths) = stack
-                                .get_mut(&sink)
+                                .get_mut(sink)
                                 .expect("To have all sinks still present in the stack");
 
                             let (source_base_order, source_base_path) =
@@ -781,7 +771,7 @@ impl PathMap {
                                         path_join(
                                             &source_base_path,
                                             &sub_path.clone(),
-                                            nets.is_anchor(&bid),
+                                            nets.is_anchor(bid),
                                         ),
                                     ),
                                 );
@@ -879,12 +869,11 @@ impl PathMap {
         nets: &PathMapMap,
     ) -> Option<(String, Bid, Vec<u16>)> {
         self.path(node, nets)
-            .map(|(_home_net, path_ref, _order)| {
+            .and_then(|(_home_net, path_ref, _order)| {
                 let doc_path = get_doc_path(&path_ref);
                 self.indexed_get(doc_path, nets)
                     .map(|(_net, bid, order)| (doc_path.to_string(), bid, order))
             })
-            .flatten()
     }
 
     /// Returns the net and doc bid that matches the input doc title
@@ -895,11 +884,9 @@ impl PathMap {
             .map(|bid| (self.net, *bid))
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
-                    nets.get_map(net_bid)
-                        .map(|subnet_path_map| {
-                            subnet_path_map.get_from_title(&anchored_title, nets)
-                        })
-                        .flatten()
+                    nets.get_map(net_bid).and_then(|subnet_path_map| {
+                        subnet_path_map.get_from_title(&anchored_title, nets)
+                    })
                 })
             })
     }
@@ -915,9 +902,9 @@ impl PathMap {
             .map(|bid| (self.net, *bid))
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
-                    nets.get_map(net_bid)
-                        .map(|subnet_path_map| subnet_path_map.get_from_title_regex(title, nets))
-                        .flatten()
+                    nets.get_map(net_bid).and_then(|subnet_path_map| {
+                        subnet_path_map.get_from_title_regex(title, nets)
+                    })
                 })
             })
     }
@@ -930,8 +917,7 @@ impl PathMap {
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
                     nets.get_map(net_bid)
-                        .map(|subnet_path_map| subnet_path_map.get_from_id(id, nets))
-                        .flatten()
+                        .and_then(|subnet_path_map| subnet_path_map.get_from_id(id, nets))
                 })
             })
     }
@@ -957,26 +943,20 @@ impl PathMap {
                     let first_idx = self
                         .bid_map
                         .get(net_bid)
-                        .map(|idx_vec| idx_vec.first().copied())
-                        .flatten()
+                        .and_then(|idx_vec| idx_vec.first().copied())
                         .expect("pathmap subnets to be synchronized with pathmap.bid_map");
                     let (subnet_path, _subnet_bid, net_order) = &self.map[first_idx];
-                    relative_path(path, &subnet_path)
-                        .ok()
-                        .map(|sub_path| {
-                            nets.get_map(net_bid)
-                                .map(|subnet_path_map| {
-                                    subnet_path_map.indexed_get(&sub_path, nets).map(
-                                        |(home_net, bid, home_order)| {
-                                            let mut full_order = net_order.clone();
-                                            full_order.append(&mut home_order.clone());
-                                            (home_net, bid, full_order)
-                                        },
-                                    )
-                                })
-                                .flatten()
+                    relative_path(path, subnet_path).ok().and_then(|sub_path| {
+                        nets.get_map(net_bid).and_then(|subnet_path_map| {
+                            subnet_path_map.indexed_get(&sub_path, nets).map(
+                                |(home_net, bid, home_order)| {
+                                    let mut full_order = net_order.clone();
+                                    full_order.append(&mut home_order.clone());
+                                    (home_net, bid, full_order)
+                                },
+                            )
                         })
-                        .flatten()
+                    })
                 })
             })
     }
@@ -998,21 +978,15 @@ impl PathMap {
                     let first_idx = self
                         .bid_map
                         .get(net_bid)
-                        .map(|idx_vec| idx_vec.first().copied())
-                        .flatten()
+                        .and_then(|idx_vec| idx_vec.first().copied())
                         .expect("pathmap subnets to be synchronized with pathmap.bid_map");
                     let (subnet_path, _subnet_bid, net_order) = &self.map[first_idx];
                     nets.get_map(net_bid)
-                        .map(|subnet_path_map| subnet_path_map.path(bid, nets))
-                        .flatten()
+                        .and_then(|subnet_path_map| subnet_path_map.path(bid, nets))
                         .map(|(home_net_bid, home_path, home_order)| {
                             let mut full_order = net_order.clone();
                             full_order.append(&mut home_order.clone());
-                            let res = (
-                                home_net_bid,
-                                path_join(subnet_path, &home_path, false),
-                                full_order,
-                            );
+
                             // tracing::debug!(
                             //     "combined subnet path for bid {}:\
                             //     \n\tres: {}\
@@ -1025,7 +999,11 @@ impl PathMap {
                             //     self.net,
                             //     res.0
                             // );
-                            res
+                            (
+                                home_net_bid,
+                                path_join(subnet_path, &home_path, false),
+                                full_order,
+                            )
                         })
                 })
             })
@@ -1050,8 +1028,7 @@ impl PathMap {
         .or_else(|| {
             self.subnets.iter().find_map(|subnet_bid| {
                 nets.get_map(subnet_bid)
-                    .map(|subnet_path_map| subnet_path_map.home_path(bid, nets))
-                    .flatten()
+                    .and_then(|subnet_path_map| subnet_path_map.home_path(bid, nets))
             })
         })
     }
@@ -1228,7 +1205,7 @@ impl PathMap {
                         None
                     }
                 }) {
-                    for sub_idx in sub_indices.into_iter().rev() {
+                    for sub_idx in sub_indices.iter().rev() {
                         let starts_with = self.map[*sub_idx].2.starts_with(&source_order);
                         if starts_with {
                             let (rm_path, _rm_bid, _rm_order) = self.map.remove(*sub_idx);
@@ -1246,7 +1223,7 @@ impl PathMap {
                 self.bid_map.clear();
                 self.path_map.clear();
                 for (idx, (path, bid, _order)) in self.map.iter().enumerate() {
-                    let bid_idx_vec = self.bid_map.entry(*bid).or_insert(Vec::<usize>::default());
+                    let bid_idx_vec = self.bid_map.entry(*bid).or_default();
                     bid_idx_vec.push(idx);
                     self.path_map.insert(path.clone(), idx);
                 }
@@ -1366,7 +1343,7 @@ impl PathMap {
             self.bid_map.clear();
             self.path_map.clear();
             for (idx, (path, bid, _order)) in self.map.iter().enumerate() {
-                let bid_idx_vec = self.bid_map.entry(*bid).or_insert(Vec::<usize>::default());
+                let bid_idx_vec = self.bid_map.entry(*bid).or_default();
                 bid_idx_vec.push(idx);
                 self.path_map.insert(path.clone(), idx);
             }
@@ -1376,13 +1353,10 @@ impl PathMap {
             }
 
             // Update our title and id maps
-            if derivatives.iter().any(|e| {
-                if let BeliefEvent::PathAdded(..) = e {
-                    true
-                } else {
-                    false
-                }
-            }) {
+            if derivatives
+                .iter()
+                .any(|e| matches!(e, BeliefEvent::PathAdded(..)))
+            {
                 if let Some(source_title) = nets.anchors.get(source) {
                     if !nets.is_anchor(source) && !source_title.is_empty() {
                         // We only get title anchors if the title anchor is non-empty

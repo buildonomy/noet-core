@@ -11,7 +11,6 @@ use std::{
     hash::{Hash, Hasher},
     mem::replace,
     ops::{Deref, DerefMut},
-    u8,
 };
 use toml::{from_str, to_string, value::Table, Value};
 
@@ -265,13 +264,13 @@ impl Display for Bid {
 
 impl From<&Bid> for String {
     fn from(val: &Bid) -> Self {
-        format!("{}", val)
+        format!("{val}")
     }
 }
 
 impl From<Bid> for String {
     fn from(val: Bid) -> Self {
-        format!("{}", val)
+        format!("{val}")
     }
 }
 
@@ -374,7 +373,7 @@ pub enum BeliefKind {
 
 impl Display for BeliefKind {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -585,7 +584,7 @@ impl WeightKind {
 
 impl Display for WeightKind {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -618,8 +617,7 @@ impl TryFrom<&str> for WeightKind {
             "subsection" => Ok(WeightKind::Section),
             "pragmatic" => Ok(WeightKind::Pragmatic),
             _ => Err(BuildonomyError::Custom(format!(
-                "Invalid str for WeightKind. Received {}. Valid options: epistemic, subsection, pragmatic",
-                src
+                "Invalid str for WeightKind. Received {src}. Valid options: epistemic, subsection, pragmatic"
             ))),
         }
     }
@@ -634,8 +632,7 @@ impl TryFrom<u32> for WeightKind {
             256..=511 => Ok(WeightKind::Section),
             512..=767 => Ok(WeightKind::Pragmatic),
             _ => Err(BuildonomyError::Custom(format!(
-                "Invalid u32 for WeightKind. Max allowed value is 767. Received {}",
-                src
+                "Invalid u32 for WeightKind. Max allowed value is 767. Received {src}"
             ))),
         }
     }
@@ -735,10 +732,7 @@ impl From<WeightKind> for WeightSet {
                 payload: Table::new(),
             },
         );
-        Self {
-            weights,
-            ..Default::default()
-        }
+        Self { weights }
     }
 }
 
@@ -996,10 +990,7 @@ impl Display for BeliefNode {
             self.title,
             self.bid,
             self.kind,
-            self.schema
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or("default"),
+            self.schema.as_deref().unwrap_or("default"),
             self.payload.to_string().replace("\n", "\n\t")
         )
     }
@@ -1018,7 +1009,7 @@ impl FromRow<'_, SqliteRow> for BeliefNode {
         let schema_str: Option<&str> = row.try_get("schema")?;
         let maybe_id_str: Option<&str> = row.try_get("id")?;
         let serde_str: &str = row.try_get("payload")?;
-        let table = toml::from_str::<Table>(&serde_str).map_err(|e| BuildonomyError::from(e))?;
+        let table = toml::from_str::<Table>(serde_str).map_err(BuildonomyError::from)?;
 
         Ok(BeliefNode {
             bid,
@@ -1048,8 +1039,7 @@ impl TryFrom<&ProtoBeliefNode> for BeliefNode {
         Ok(BeliefNode {
             bid: doc
                 .remove("bid")
-                .map(|val| val.as_str().map(|bid_str| Bid::try_from(bid_str)))
-                .flatten()
+                .and_then(|val| val.as_str().map(Bid::try_from))
                 .unwrap_or(Ok(Bid::nil()))?,
             title: doc
                 .remove("title")
@@ -1109,12 +1099,12 @@ impl<'a> Eq for BeliefRefRelation<'a> {}
 
 impl<'a> Ord for BeliefRefRelation<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        let sink_cmp = self.sink.cmp(&other.sink);
+        let sink_cmp = self.sink.cmp(other.sink);
         match sink_cmp {
             Ordering::Equal => {
-                let source_cmp = self.source.cmp(&other.source);
+                let source_cmp = self.source.cmp(other.source);
                 match source_cmp {
-                    Ordering::Equal => self.weights.cmp(&other.weights),
+                    Ordering::Equal => self.weights.cmp(other.weights),
                     _ => source_cmp,
                 }
             }
@@ -1185,7 +1175,7 @@ impl FromRow<'_, SqliteRow> for BeliefRelation {
         let mut weights = BTreeMap::new();
 
         for kind in WeightKind::all() {
-            let column_name = format!("{:?}", kind).to_lowercase();
+            let column_name = format!("{kind:?}").to_lowercase();
             // Try to get JSON string from column and deserialize as Weight
             if let Ok(Some(json_str)) = row.try_get::<Option<String>, &str>(&column_name) {
                 if let Ok(weight) = toml::from_str::<Weight>(&json_str) {
@@ -1222,7 +1212,7 @@ pub enum RenderMode {
 
 impl Display for RenderMode {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -1236,8 +1226,7 @@ impl TryFrom<&str> for RenderMode {
             "Presentation" => Ok(RenderMode::Presentation),
             "Graph" => Ok(RenderMode::Graph),
             _ => Err(BuildonomyError::Command(format!(
-                "Unknown RenderMode '{}'",
-                string
+                "Unknown RenderMode '{string}'"
             ))),
         }
     }
@@ -1263,7 +1252,7 @@ uniffi::custom_type!(AsRunStateSet, u64, {
 
 impl Display for AsRunState {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 

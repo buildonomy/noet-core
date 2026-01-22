@@ -6,7 +6,6 @@ use std::{
     fmt::{Display, Formatter},
     path::PathBuf,
     str::FromStr,
-    u8,
 };
 use toml::{from_str, to_string};
 pub use url::Url;
@@ -26,11 +25,11 @@ use crate::{
 
 pub const TRIM: &[char] = &['/', '#'];
 
-pub fn trim_joiners<'a>(input: &'a str) -> &'a str {
+pub fn trim_joiners(input: &str) -> &str {
     input.trim_start_matches(TRIM).trim_end_matches(TRIM)
 }
 
-pub fn trim_path_sep<'a>(input: &'a str) -> &'a str {
+pub fn trim_path_sep(input: &str) -> &str {
     input.trim_start_matches('/').trim_end_matches('/')
 }
 
@@ -41,15 +40,15 @@ pub fn to_anchor(title: &str) -> String {
         .replace(char::is_whitespace, "-")
 }
 
-pub fn get_doc_path<'a>(path: &'a str) -> &'a str {
-    let idx = path.rfind(|c: char| c == '#').unwrap_or(path.len());
+pub fn get_doc_path(path: &str) -> &str {
+    let idx = path.rfind('#').unwrap_or(path.len());
     &path[..idx]
 }
 
 /// Remove the trailing file path, leaving it's parent directory
-pub fn trim_doc_path<'a>(path: &'a str) -> &'a str {
-    let ext_idx = path.rfind(|c: char| c == '.').unwrap_or(path.len());
-    let parent_idx = path.rfind(|c: char| c == '/').unwrap_or(path.len());
+pub fn trim_doc_path(path: &str) -> &str {
+    let ext_idx = path.rfind('.').unwrap_or(path.len());
+    let parent_idx = path.rfind('/').unwrap_or(path.len());
     let idx = if ext_idx > parent_idx {
         parent_idx
     } else {
@@ -80,7 +79,7 @@ impl NodeKey {
     /// Prefer `regularize()` when possible.
     #[tracing::instrument(skip(self))]
     pub fn regularize_unchecked(&self, home_net: Bid, home_path: &str) -> NodeKey {
-        let home_doc_path = get_doc_path(&home_path).to_string();
+        let home_doc_path = get_doc_path(home_path).to_string();
         match self {
             NodeKey::Path {
                 net: link_base,
@@ -95,7 +94,7 @@ impl NodeKey {
                     let full_path = if link_path.starts_with('#') {
                         format!("{}{}", regularized_path.to_string_lossy(), link_path)
                     } else {
-                        clean_path(&regularized_path.join(link_path))
+                        clean_path(regularized_path.join(link_path))
                             .to_string_lossy()
                             .to_string()
                     };
@@ -142,8 +141,7 @@ impl NodeKey {
         // Get network and path from the relative_to node
         let (home_net, home_path) = cache.paths().path(&relative_to).ok_or_else(|| {
             BuildonomyError::NotFound(format!(
-                "Could not determine network/path for node {}",
-                relative_to
+                "Could not determine network/path for node {relative_to}"
             ))
         })?;
         Ok(self.regularize_unchecked(home_net, &home_path))
@@ -187,8 +185,7 @@ impl NodeKey {
                         title: to_anchor(&value),
                     }),
                     _ => Err(BuildonomyError::Serialization(format!(
-                        "Unknown key type: {}",
-                        key_type
+                        "Unknown key type: {key_type}"
                     ))),
                 }
             }
@@ -220,8 +217,7 @@ impl NodeKey {
                         title: to_anchor(&value),
                     }),
                     _ => Err(BuildonomyError::Serialization(format!(
-                        "Unknown key type: {}",
-                        key_type
+                        "Unknown key type: {key_type}"
                     ))),
                 }
             }
@@ -243,14 +239,13 @@ impl NodeKey {
 
         // Try finding by ID
         for node in cache.states().values() {
-            if node.id.as_ref().map(|id| id.as_str()) == Some(network_ref) {
+            if node.id.as_deref() == Some(network_ref) {
                 return Ok(node.bid);
             }
         }
 
         Err(BuildonomyError::NotFound(format!(
-            "Network reference '{}' not found in cache",
-            network_ref
+            "Network reference '{network_ref}' not found in cache"
         )))
     }
 
@@ -287,8 +282,7 @@ impl NodeKey {
         }
 
         Err(BuildonomyError::NotFound(format!(
-            "Network reference '{}' not found in cache",
-            network_ref
+            "Network reference '{network_ref}' not found in cache"
         )))
     }
 
@@ -296,16 +290,17 @@ impl NodeKey {
     pub fn as_url(&self) -> Url {
         match self {
             NodeKey::Bid { bid } => {
-                Url::parse(&format!("bid://{}", bid)).expect("Url format explicitly specified.")
+                Url::parse(&format!("bid://{bid}")).expect("Url format explicitly specified.")
             }
             NodeKey::Bref { bref } => {
-                Url::parse(&format!("bref://{}", bref)).expect("Url format explicitly specified.")
+                Url::parse(&format!("bref://{bref}")).expect("Url format explicitly specified.")
             }
-            NodeKey::Id { net, id } => Url::parse(&format!("id://{}/{}", net, id))
+            NodeKey::Id { net, id } => {
+                Url::parse(&format!("id://{net}/{id}")).expect("Url format explicitly specified.")
+            }
+            NodeKey::Path { net, path } => Url::parse(&format!("path://{net}/{path}"))
                 .expect("Url format explicitly specified."),
-            NodeKey::Path { net, path } => Url::parse(&format!("path://{}/{}", net, path))
-                .expect("Url format explicitly specified."),
-            NodeKey::Title { net, title } => Url::parse(&format!("title://{}/{}", net, title))
+            NodeKey::Title { net, title } => Url::parse(&format!("title://{net}/{title}"))
                 .expect("Url format explicitly specified."),
         }
     }
@@ -315,31 +310,31 @@ impl Display for NodeKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeKey::Bid { bid } => {
-                write!(f, "bid://{}", bid)
+                write!(f, "bid://{bid}")
             }
             NodeKey::Bref { bref } => {
-                write!(f, "bref://{}", bref)
+                write!(f, "bref://{bref}")
             }
             NodeKey::Id { net, id } => {
                 write!(f, "id://")?;
                 if *net != Bid::default() {
-                    write!(f, "{}/", net)?;
+                    write!(f, "{net}/")?;
                 };
-                write!(f, "{}", id)
+                write!(f, "{id}")
             }
             NodeKey::Path { net, path } => {
                 write!(f, "path://")?;
                 if *net != Bid::default() {
-                    write!(f, "{}/", net)?;
+                    write!(f, "{net}/")?;
                 };
-                write!(f, "{}", path)
+                write!(f, "{path}")
             }
             NodeKey::Title { net, title } => {
                 write!(f, "title://")?;
                 if *net != Bid::default() {
-                    write!(f, "{}/", net)?;
+                    write!(f, "{net}/")?;
                 };
-                write!(f, "{}", title)
+                write!(f, "{title}")
             }
         }
     }
@@ -404,8 +399,7 @@ impl FromStr for NodeKey {
                 }
                 _ => {
                     return Err(BuildonomyError::Serialization(format!(
-                        "Invalid URL format: {}",
-                        s
+                        "Invalid URL format: {s}"
                     )));
                 }
             };
@@ -552,7 +546,7 @@ mod tests {
 
         // Network form: id://network/value (host is network, path is value)
         let network_bid = Bid::new(Bid::nil());
-        let key: NodeKey = format!("id://{}/supremum", network_bid).parse().unwrap();
+        let key: NodeKey = format!("id://{network_bid}/supremum").parse().unwrap();
         assert!(matches!(key, NodeKey::Id { net, id }
         if net == network_bid && id == "supremum"));
 
@@ -573,18 +567,18 @@ mod tests {
         // Test URL-based explicit formats
         let network_bid = Bid::new(Bid::nil());
         let test_bid = Bid::new(Bid::nil());
-        let test_bref = Bref::try_from(test_bid.namespace()).unwrap();
+        let test_bref = test_bid.namespace();
 
         // BID format (no network needed)
-        let key: NodeKey = format!("bid:///{}", test_bid).parse().unwrap();
+        let key: NodeKey = format!("bid:///{test_bid}").parse().unwrap();
         assert!(matches!(key, NodeKey::Bid { bid } if bid == test_bid));
 
         // Bref format (network optional)
-        let key: NodeKey = format!("bref:///{}", test_bref).parse().unwrap();
+        let key: NodeKey = format!("bref:///{test_bref}").parse().unwrap();
         assert!(matches!(key, NodeKey::Bref { bref } if bref == test_bref));
 
         // ID with network
-        let key: NodeKey = format!("id://{}/supremum", network_bid).parse().unwrap();
+        let key: NodeKey = format!("id://{network_bid}/supremum").parse().unwrap();
         assert!(matches!(key, NodeKey::Id { net, id }
         if net == network_bid && id == "supremum"));
 
@@ -594,14 +588,14 @@ mod tests {
         if net == Bid::nil() && id == "supremum"));
 
         // Path with network
-        let key: NodeKey = format!("path://{}/docs/council/README.md", network_bid)
+        let key: NodeKey = format!("path://{network_bid}/docs/council/README.md")
             .parse()
             .unwrap();
         assert!(matches!(key, NodeKey::Path { net, path }
         if net == network_bid && path == "docs/council/README.md"));
 
         // Title with network - titles are normalized to anchor format
-        let key: NodeKey = format!("title://{}/My%20Node%20Title", network_bid)
+        let key: NodeKey = format!("title://{network_bid}/My%20Node%20Title")
             .parse()
             .unwrap();
         assert!(matches!(key, NodeKey::Title { net, title }
@@ -623,7 +617,7 @@ mod tests {
 
         // Valid BID should work fine
         let network_bid = Bid::new(Bid::nil());
-        let result: Result<NodeKey, _> = format!("id://{}/supremum", network_bid).parse();
+        let result: Result<NodeKey, _> = format!("id://{network_bid}/supremum").parse();
         assert!(result.is_ok());
 
         // Simple form (no network) should work fine
@@ -634,7 +628,7 @@ mod tests {
     #[test]
     fn test_nodekey_backward_compatibility() {
         let test_bid = Bid::new(Bid::nil());
-        let test_bref = Bref::try_from(test_bid.namespace()).unwrap();
+        let test_bref = test_bid.namespace();
 
         // Bare BID string
         let key: NodeKey = test_bid.to_string().parse().unwrap();

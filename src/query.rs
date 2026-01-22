@@ -31,11 +31,11 @@ pub const MAX_TRAVERSAL: u8 = 10;
 #[cfg(feature = "service")]
 fn push_id_expr<I: ToString>(
     qb: &mut QueryBuilder<Sqlite>,
-    bids: &Vec<I>,
+    bids: &[I],
     column: &str,
     match_pred: bool,
 ) {
-    let last_sep = if bids.len() > 0 { bids.len() - 1 } else { 0 };
+    let last_sep = if !bids.is_empty() { bids.len() - 1 } else { 0 };
     qb.push(column);
     if match_pred {
         qb.push(" IN(");
@@ -54,18 +54,18 @@ fn push_id_expr<I: ToString>(
 #[cfg(feature = "service")]
 pub fn push_string_expr(
     qb: &mut QueryBuilder<Sqlite>,
-    strings: &Vec<String>,
+    strings: &[String],
     column: &str,
     match_pred: bool,
     starts_with: bool,
 ) {
-    let last_sep = if strings.len() > 0 {
+    let last_sep = if !strings.is_empty() {
         strings.len() - 1
     } else {
         0
     };
     for (idx, string) in strings.iter().enumerate() {
-        qb.push(&format!(
+        qb.push(format!(
             "{} {}{} ",
             column,
             if match_pred {
@@ -94,17 +94,17 @@ pub fn push_string_expr(
 #[cfg(feature = "service")]
 fn push_namespace_expr(
     qb: &mut QueryBuilder<Sqlite>,
-    namespaces: &Vec<Bref>,
+    namespaces: &[Bref],
     column: &str,
     match_pred: bool,
 ) {
-    let last_sep = if namespaces.len() > 0 {
+    let last_sep = if !namespaces.is_empty() {
         namespaces.len() - 1
     } else {
         0
     };
     for (idx, bref) in namespaces.iter().enumerate() {
-        qb.push(&format!(
+        qb.push(format!(
             "{} {}LIKE concat('%', ",
             column,
             if match_pred { "" } else { "NOT " }
@@ -198,11 +198,7 @@ impl From<&NodeKey> for Expression {
             NodeKey::Title { net, title } => {
                 // TODO/fixme: path can't specify Make title search use the paths table. Doc titles
                 // are simply special paths tied to the network
-                Expression::StateIn(StatePred::Title(
-                    *net,
-                    WrappedRegex::try_from(title.as_str())
-                        .expect("a standard title to not be an invalid regex"),
-                ))
+                Expression::StateIn(StatePred::Title(*net, WrappedRegex::from(title.as_str())))
             }
             NodeKey::Id { net: _, id } => Expression::StateIn(StatePred::Id(vec![id.clone()])),
         }
@@ -375,7 +371,7 @@ impl AsSql for StatePred {
         }
         match self {
             StatePred::Any => {
-                qb.push(&format!(
+                qb.push(format!(
                     "bid {}LIKE '%'",
                     if match_pred { "" } else { "NOT " }
                 ));
@@ -393,7 +389,7 @@ impl AsSql for StatePred {
                 push_id_expr(qb, id_vec, "id", match_pred);
             }
             StatePred::Schema(schema) => {
-                push_id_expr(qb, &vec![schema], "schema", match_pred);
+                push_id_expr(qb, &[schema], "schema", match_pred);
             }
             StatePred::Kind(kind_set) => {
                 let kind_mask = kind_set.as_u32();
@@ -453,12 +449,12 @@ impl RelationPred {
     pub fn match_ref(&self, rel: &BeliefRefRelation) -> bool {
         match self {
             RelationPred::Any => true,
-            RelationPred::SinkIn(bid_vec) => bid_vec.contains(&rel.sink),
-            RelationPred::SourceIn(bid_vec) => bid_vec.contains(&rel.source),
+            RelationPred::SinkIn(bid_vec) => bid_vec.contains(rel.sink),
+            RelationPred::SourceIn(bid_vec) => bid_vec.contains(rel.source),
             RelationPred::NodeIn(bid_vec) => {
-                bid_vec.contains(&rel.source) || bid_vec.contains(&rel.sink)
+                bid_vec.contains(rel.source) || bid_vec.contains(rel.sink)
             }
-            RelationPred::Kind(kind) => !rel.weights.intersection(&kind).is_empty(),
+            RelationPred::Kind(kind) => !rel.weights.intersection(kind).is_empty(),
         }
     }
 }
@@ -479,10 +475,10 @@ impl AsSql for RelationPred {
                     ));
                 }
                 RelationPred::SinkIn(bid_vec) => {
-                    push_id_expr(qb, &bid_vec, "sink", match_pred);
+                    push_id_expr(qb, bid_vec, "sink", match_pred);
                 }
                 RelationPred::SourceIn(bid_vec) => {
-                    push_id_expr(qb, &bid_vec, "source", match_pred);
+                    push_id_expr(qb, bid_vec, "source", match_pred);
                 }
                 RelationPred::NodeIn(bid_vec) => {
                     RelationPred::SourceIn(bid_vec.to_vec()).build_query(match_pred, qb);
@@ -492,14 +488,14 @@ impl AsSql for RelationPred {
                 RelationPred::Kind(kinds) => {
                     let mut kind_q = Vec::<String>::new();
                     for kind in kinds {
-                        let column_name = format!("{:?}", kind).to_lowercase();
+                        let column_name = format!("{kind:?}").to_lowercase();
                         kind_q.push(format!(
                             "{} IS{} NULL",
                             column_name,
                             if !match_pred { "" } else { " NOT" }
                         ));
                     }
-                    qb.push(&kind_q.join(" AND "));
+                    qb.push(kind_q.join(" AND "));
                 }
             }
         }
@@ -614,10 +610,10 @@ pub trait BeliefCache: Sync {
                 }
                 // tracing::debug!("loop {}: Processing balance_expr: {:?}", loop_iter, expr);
                 // Use eval_trace to only get Subsection relations and mark nodes as Trace
-                let mut balance_set = self
+                let balance_set = self
                     .eval_trace(&expr, WeightSet::from(WeightKind::Section))
                     .await?;
-                set.union_mut(&mut balance_set);
+                set.union_mut(&balance_set);
                 balance_expr = set.build_balance_expr();
 
                 if let Some(ref new_expr) = balance_expr {
@@ -655,7 +651,7 @@ pub trait BeliefCache: Sync {
                 let mut upstream_set = None;
                 let mut upstream_loop = 0;
                 let mut upstream_expr = bs.build_upstream_expr(neighbor_walk.filter.clone());
-                let upstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.upstream.clone());
+                let upstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.upstream);
                 while let Some(up_expr) = upstream_expr {
                     // Traverse 1 should mean loop once, not twice
                     if upstream_loop >= upstream_cutoff {
@@ -667,8 +663,8 @@ pub trait BeliefCache: Sync {
                         states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
                         relations: bs.relations.clone(),
                     });
-                    let mut upwalk_eval_set = self.eval_unbalanced(&up_expr).await?;
-                    up_set.union_mut(&mut upwalk_eval_set);
+                    let upwalk_eval_set = self.eval_unbalanced(&up_expr).await?;
+                    up_set.union_mut(&upwalk_eval_set);
                     upstream_expr = up_set.build_upstream_expr(neighbor_walk.filter.clone());
                     if let Some(ref new_up_expr) = upstream_expr {
                         if *new_up_expr == up_expr {
@@ -687,7 +683,7 @@ pub trait BeliefCache: Sync {
                 let mut downstream_set = None;
                 let mut downstream_loop = 0;
                 let mut downstream_expr = bs.build_downstream_expr(neighbor_walk.filter.clone());
-                let downstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.downstream.clone());
+                let downstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.downstream);
                 while let Some(down_expr) = downstream_expr {
                     // Traverse 1 should mean loop once, not twice
                     if downstream_loop >= downstream_cutoff {
@@ -699,8 +695,8 @@ pub trait BeliefCache: Sync {
                         states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
                         relations: bs.relations.clone(),
                     });
-                    let mut downwalk_eval_set = self.eval_unbalanced(&down_expr).await?;
-                    down_set.union_mut(&mut downwalk_eval_set);
+                    let downwalk_eval_set = self.eval_unbalanced(&down_expr).await?;
+                    down_set.union_mut(&downwalk_eval_set);
                     downstream_expr = down_set.build_downstream_expr(neighbor_walk.filter.clone());
                     if let Some(ref new_down_expr) = downstream_expr {
                         if *new_down_expr == down_expr {

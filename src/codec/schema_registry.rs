@@ -5,9 +5,7 @@ use toml::Value as TomlValue;
 
 /// List of all known schema names that have graph field definitions.
 /// Used by detect_schema_from_path to match path components.
-pub const KNOWN_SCHEMAS: &[(&str, &str)] = &[
-    ("intentions", "intention_lattice.intention"),
-];
+pub const KNOWN_SCHEMAS: &[(&str, &str)] = &[("intentions", "intention_lattice.intention")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeDirection {
@@ -20,7 +18,7 @@ pub struct GraphField {
     pub direction: EdgeDirection,
     pub weight_kind: WeightKind,
     pub required: bool,
-    pub payload_fields: Vec<&'static str>,  // Fields to extract into edge payload
+    pub payload_fields: Vec<&'static str>, // Fields to extract into edge payload
 }
 
 pub struct SchemaDefinition {
@@ -30,15 +28,13 @@ pub struct SchemaDefinition {
 pub fn get_schema_definition(schema_name: &str) -> Option<SchemaDefinition> {
     match schema_name {
         "intention_lattice.intention" => Some(SchemaDefinition {
-            graph_fields: vec![
-                GraphField {
-                    field_name: "parent_connections",
-                    direction: EdgeDirection::Downstream,
-                    weight_kind: WeightKind::Pragmatic,
-                    payload_fields: vec!["relationship_semantics", "motivation_kinds", "notes"],
-                    required: false,
-                },
-            ],
+            graph_fields: vec![GraphField {
+                field_name: "parent_connections",
+                direction: EdgeDirection::Downstream,
+                weight_kind: WeightKind::Pragmatic,
+                payload_fields: vec!["relationship_semantics", "motivation_kinds", "notes"],
+                required: false,
+            }],
         }),
         _ => None,
     }
@@ -53,12 +49,12 @@ pub fn get_schema_definition(schema_name: &str) -> Option<SchemaDefinition> {
 /// - Converts to PascalCase enum values
 pub fn migrate_relationship_profile(item: &mut TomlValue) -> bool {
     let mut migrated = false;
-    
+
     // Check if this is a table with relationship_profile
     if let TomlValue::Table(table) = item {
         if let Some(TomlValue::Table(profile)) = table.get("relationship_profile") {
             let mut semantics = Vec::new();
-            
+
             // Map any non-zero intensity to semantic kinds
             if let Some(TomlValue::Float(v)) = profile.get("constitutive") {
                 if *v > 0.0 {
@@ -76,25 +72,29 @@ pub fn migrate_relationship_profile(item: &mut TomlValue) -> bool {
                 }
             }
             if let Some(TomlValue::Float(v)) = profile.get("exploratory") {
-                if *v > 0.0 {  // Include exploratory if present at all
+                if *v > 0.0 {
+                    // Include exploratory if present at all
                     semantics.push(TomlValue::String("Exploratory".to_string()));
                 }
             }
-            
+
             // Only migrate if we found semantic kinds
             if !semantics.is_empty() {
-                table.insert("relationship_semantics".to_string(), TomlValue::Array(semantics));
+                table.insert(
+                    "relationship_semantics".to_string(),
+                    TomlValue::Array(semantics),
+                );
                 table.remove("relationship_profile");
                 migrated = true;
             }
         }
     }
-    
+
     migrated
 }
 
 /// Recursively migrate all items in an array field
-pub fn migrate_array_field(array: &mut Vec<TomlValue>) -> bool {
+pub fn migrate_array_field(array: &mut [TomlValue]) -> bool {
     let mut migrated = false;
     for item in array.iter_mut() {
         if migrate_relationship_profile(item) {
@@ -112,7 +112,7 @@ pub fn migrate_schema(schema_name: &str, document: &mut TomlValue) -> bool {
     match schema_name {
         "intention_lattice.intention" => {
             let mut migrated = false;
-            
+
             // Migrate parent_connections array
             if let TomlValue::Table(table) = document {
                 if let Some(TomlValue::Array(connections)) = table.get_mut("parent_connections") {
@@ -121,7 +121,7 @@ pub fn migrate_schema(schema_name: &str, document: &mut TomlValue) -> bool {
                     }
                 }
             }
-            
+
             migrated
         }
         _ => false,

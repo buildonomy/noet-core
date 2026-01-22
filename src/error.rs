@@ -88,45 +88,45 @@ impl BuildonomyError {
 
 impl From<StripPrefixError> for BuildonomyError {
     fn from(src: StripPrefixError) -> BuildonomyError {
-        BuildonomyError::NotFound(format!("Strip prefix failed for path. Error: {}", src))
+        BuildonomyError::NotFound(format!("Strip prefix failed for path. Error: {src}"))
     }
 }
 
 impl From<toml::de::Error> for BuildonomyError {
     fn from(src: toml::de::Error) -> BuildonomyError {
-        BuildonomyError::Serialization(format!("Toml deserialization error: {}", src))
+        BuildonomyError::Serialization(format!("Toml deserialization error: {src}"))
     }
 }
 
 impl From<toml::ser::Error> for BuildonomyError {
     fn from(src: toml::ser::Error) -> BuildonomyError {
-        BuildonomyError::Serialization(format!("Toml serialization error: {}", src))
+        BuildonomyError::Serialization(format!("Toml serialization error: {src}"))
     }
 }
 
 #[cfg(feature = "service")]
 impl From<JsonError> for BuildonomyError {
     fn from(src: JsonError) -> BuildonomyError {
-        BuildonomyError::Serialization(format!("JSON (de)serialization error: {}", src))
+        BuildonomyError::Serialization(format!("JSON (de)serialization error: {src}"))
     }
 }
 
 impl From<uuid::Error> for BuildonomyError {
     fn from(src: uuid::Error) -> BuildonomyError {
-        BuildonomyError::Serialization(format!("UUID conversion failed: {}", src))
+        BuildonomyError::Serialization(format!("UUID conversion failed: {src}"))
     }
 }
 
 impl From<UrlParseError> for BuildonomyError {
     fn from(src: UrlParseError) -> BuildonomyError {
-        BuildonomyError::Serialization(format!("Invalid URL: {}", src))
+        BuildonomyError::Serialization(format!("Invalid URL: {src}"))
     }
 }
 
 impl From<io::Error> for BuildonomyError {
     fn from(x: io::Error) -> Self {
         match x.kind() {
-            io::ErrorKind::NotFound => BuildonomyError::NotFound(format!("{}", x)),
+            io::ErrorKind::NotFound => BuildonomyError::NotFound(format!("{x}")),
             io::ErrorKind::PermissionDenied => BuildonomyError::PermissionDenied,
             _ => BuildonomyError::Io(format!("IOError: {}", x.kind())),
         }
@@ -135,19 +135,19 @@ impl From<io::Error> for BuildonomyError {
 
 impl From<fmt::Error> for BuildonomyError {
     fn from(x: fmt::Error) -> Self {
-        BuildonomyError::Codec(format!("{}", x))
+        BuildonomyError::Codec(format!("{x}"))
     }
 }
 
 impl From<CmarkToCmarkError> for BuildonomyError {
     fn from(x: CmarkToCmarkError) -> Self {
-        BuildonomyError::Codec(format!("{}", x))
+        BuildonomyError::Codec(format!("{x}"))
     }
 }
 
 impl From<RegexError> for BuildonomyError {
     fn from(x: RegexError) -> Self {
-        BuildonomyError::Serialization(format!("Regex parse failed: {}", x))
+        BuildonomyError::Serialization(format!("Regex parse failed: {x}"))
     }
 }
 
@@ -172,7 +172,7 @@ impl From<TokioSendError<BeliefEvent>> for BuildonomyError {
 #[cfg(feature = "wasm")]
 impl From<WasmError> for BuildonomyError {
     fn from(wasm_error: WasmError) -> Self {
-        BuildonomyError::Serialization(format!("Serde-wasm-bindgen error: {}", wasm_error))
+        BuildonomyError::Serialization(format!("Serde-wasm-bindgen error: {wasm_error}"))
     }
 }
 
@@ -235,7 +235,7 @@ impl From<NotifyError> for BuildonomyError {
 #[cfg(feature = "service")]
 impl From<SqlxError> for BuildonomyError {
     fn from(db_error: SqlxError) -> Self {
-        BuildonomyError::Io(format!("database error: {:?}", db_error))
+        BuildonomyError::Io(format!("database error: {db_error:?}"))
     }
 }
 

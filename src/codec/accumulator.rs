@@ -43,10 +43,7 @@ pub enum NodeSource {
 
 impl NodeSource {
     fn is_from_cache(&self) -> bool {
-        match self {
-            NodeSource::Generated | NodeSource::Merged => false,
-            _ => true,
-        }
+        !matches!(self, NodeSource::Generated | NodeSource::Merged)
     }
 }
 
@@ -140,9 +137,8 @@ impl BeliefSetAccumulator {
             true => Ok(()),
             false => {
                 let invalid_err = BuildonomyError::Codec(format!(
-                    "BeliefSetAccumulator initialization failed. Received root path {:?}. \
-                     Expected a directory or path to a {} file",
-                    repo_root, NETWORK_CONFIG_NAME
+                    "BeliefSetAccumulator initialization failed. Received root path {repo_root:?}. \
+                     Expected a directory or path to a {NETWORK_CONFIG_NAME} file"
                 ));
                 if let Some(path_name) = repo_root.file_name() {
                     if path_name.to_string_lossy()[..] == NETWORK_CONFIG_NAME[..] {
@@ -237,10 +233,10 @@ impl BeliefSetAccumulator {
 
     /// Returns:
     ///
-    /// - new content to write to file (containing newly parsed IDs and/or updated link
+    /// new content to write to file (containing newly parsed IDs and/or updated link
     /// titles), if the content should change.
     ///
-    /// - Additionally, if any docs need to be parsed or re-parsed in order to IDs were renamed or
+    /// Additionally, if any docs need to be parsed or re-parsed in order to IDs were renamed or
     /// their titles changed, returns an ordered list of documents which reference those elements,
     /// so that the documents can be rewritten with the updated titles and IDs.
     ///
@@ -274,8 +270,7 @@ impl BeliefSetAccumulator {
             full_path.push(NETWORK_CONFIG_NAME);
         }
         let file_err = BuildonomyError::Codec(format!(
-            "Cannot parse {:?}. Path has no extention type",
-            full_path,
+            "Cannot parse {full_path:?}. Path has no extention type",
         ));
         let doc_home_path =
             trim_path_sep(&full_path.strip_prefix(&self.repo_root)?.to_string_lossy()).to_string();
@@ -479,7 +474,7 @@ impl BeliefSetAccumulator {
                     // Inject proto text into our self set here, because inject context is where the
                     // markdown parser generates section-specific text fields regardless of whether
                     // it changes the markdown itself due to the injected context.
-                    if let Some(updated_node) = codec.inject_context(&proto, &ctx)? {
+                    if let Some(updated_node) = codec.inject_context(proto, &ctx)? {
                         is_changed = true;
                         let _derivatives = self.set.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
@@ -499,8 +494,7 @@ impl BeliefSetAccumulator {
             }
         } else {
             return Err(BuildonomyError::Codec(format!(
-                "Cannot parse {:?}. No Codec for extension type {} found in CodecMap",
-                full_path, ext
+                "Cannot parse {full_path:?}. No Codec for extension type {ext} found in CodecMap"
             )));
         };
 
@@ -939,7 +933,6 @@ impl BeliefSetAccumulator {
         let unique_old = BTreeSet::from_iter(
             BTreeSet::from_iter(keys.into_iter())
                 .difference(&current_keys)
-                .into_iter()
                 .cloned(),
         );
         // tracing::debug!(
@@ -953,6 +946,7 @@ impl BeliefSetAccumulator {
         Ok((bid, (source, current_keys, unique_old)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn push_relation<B: BeliefCache + Clone>(
         &mut self,
         other_key: &NodeKey,
@@ -1195,7 +1189,7 @@ impl BeliefSetAccumulator {
                     //     cache_update.relations().as_graph().edge_count(),
                     //     cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")
                     // );
-                    if let Some(cached_state) = cache_update.get(&key) {
+                    if let Some(cached_state) = cache_update.get(key) {
                         found_state = Some(cached_state);
                         let update = cache_update.consume();
                         // Percolate global cache updates into closer caches.
@@ -1233,9 +1227,10 @@ impl BeliefSetAccumulator {
             // For now, we'll create an UnresolvedReference with basic info
             // The caller (push_relation) will provide proper context
             tracing::debug!("Fetch miss! Keys: {:?}", keys);
-            let mut unresolved = UnresolvedReference::default();
-            unresolved.other_keys = keys.clone();
-            Ok(GetOrCreateResult::Unresolved(unresolved))
+            Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
+                other_keys: keys.clone(),
+                ..Default::default()
+            }))
         }
     }
 }
