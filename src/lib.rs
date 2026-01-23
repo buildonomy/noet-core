@@ -222,8 +222,6 @@ pub mod codec;
 #[cfg(feature = "service")]
 pub mod commands;
 #[cfg(feature = "service")]
-pub mod compiler;
-#[cfg(feature = "service")]
 pub mod config;
 #[cfg(feature = "service")]
 pub mod db;
@@ -235,6 +233,8 @@ pub mod properties;
 pub mod query;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "service")]
+pub mod watch;
 
 pub use error::*;
 

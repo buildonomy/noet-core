@@ -113,26 +113,26 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 
 **Dependencies**: Soft open source complete
 
-### Phase 1: CLI and Daemon
+### Phase 1: CLI and Watch Service
 
 **Timeline**: 2-3 days  
 **Issue**: [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md)
 
 **Deliverables**:
-- [ ] Migrate `compiler.rs` → `daemon.rs`
-- [ ] Rename `LatticeService` → `DaemonService`
+- [ ] Migrate `compiler.rs` → `watch.rs`
+- [ ] Rename `LatticeService` → `WatchService`
 - [ ] Create `bin/noet.rs` with subcommands:
   - `noet parse <path>` - one-shot parsing with diagnostics
   - `noet watch <path>` - continuous foreground parsing
 - [ ] Test `FileUpdateSyncer` file watching integration
 - [ ] Test database synchronization
-- [ ] Tutorial documentation with doctests in `daemon.rs` module
-- [ ] Complete `examples/daemon.rs` demonstrating full orchestration
-- [ ] Update Issue 5 docs to include CLI/daemon examples. Close out any remaining issue 5 tasks.
+- [ ] Tutorial documentation with doctests in `watch.rs` module
+- [ ] Complete `examples/watch_service.rs` demonstrating full orchestration
+- [ ] Update Issue 5 docs to include CLI/service examples. Close out any remaining issue 5 tasks.
 
 **Success Criteria**:
 - [ ] CLI tool works: `noet parse` and `noet watch`
-- [ ] Daemon patterns tested and documented
+- [ ] Watch service patterns tested and documented
 - [ ] Tutorial docs with working doctests
 - [ ] Examples referenced in Issue 5 documentation
 

@@ -82,18 +82,52 @@ When beginning work, agent should:
   - `find_path "ROADMAP*"` for roadmaps
   - `grep "keyword"` for related content
 - **Review existing code** before proposing solutions (search for related files/functions)
+- **Check scratchpad** for session notes from previous work (`docs/project/.scratchpad/`)
 - Confirm understanding before proposing solutions
 
 ### Mid-Session Context
 - Track open decisions and park them explicitly
-- Summarize progress before large context switches
+- Summarize progress before large context switches (in scratchpad, not chat)
 - Ask "Should I continue or pivot?" when direction is unclear
+- **Update scratchpad** with progress and next steps (don't wait for end of session)
 
 ### Ending Sessions
-Human should explicitly state:
+
+**Agent should**:
+- Update scratchpad with final status
+- Note remaining work and blockers
+- Clean up old scratchpad files if no longer needed
+
+**Human should explicitly state**:
 - What got done
 - What's next
 - Open questions to resume with
+
+### Context Management (Token Efficiency)
+
+**Prefer outlines over full files**:
+- Read file outlines first (shows structure without full content)
+- Only read specific sections when needed (use `start_line`, `end_line`)
+- Don't re-read files unnecessarily (use scratchpad to track what you've learned)
+
+**Avoid context waste**:
+- ❌ Reading full files when outline is sufficient
+- ❌ Reading same file multiple times in one session
+- ❌ Reading implementation details before understanding architecture
+- ❌ Writing summaries (use scratchpad instead)
+- ❌ Over-explaining in responses (be concise, link to docs)
+
+**Efficient pattern**:
+1. User: "Work on Issue X"
+2. Agent: Read Issue X outline → identify dependencies → read those outlines
+3. Agent: Read specific code sections only when implementation needed
+4. Agent: Update scratchpad with understanding and next steps
+
+**Warning signs of context bloat**:
+- Reading same content multiple times
+- Reading full files "just in case"
+- Explaining things already documented
+- Creating documents that duplicate existing information
 
 ## Issues and Roadmaps
 
@@ -428,6 +462,40 @@ Before proposing implementations or writing detailed code in issues:
 - Summarize what happened and current state
 - Rely on human to recover (they have better tools and context)
 
+### Clarity Check (Before Starting Work)
+
+**If requirements are unclear, STOP and ask**:
+- Don't guess at architecture without confirming understanding
+- Don't start coding without clear success criteria
+- Don't create documents without knowing what problem they solve
+
+**Red flags that mean ASK FIRST**:
+- "I think the user wants..." (you're guessing)
+- Multiple equally-valid interpretations
+- Conflicting information in different documents
+- Unclear scope (is this Issue X or Issue Y?)
+
+**Pattern for seeking clarity**:
+1. State what you understand: "My understanding is..."
+2. State what's unclear: "But I'm unsure about..."
+3. Ask specific question: "Should I..." or "Does this mean..."
+4. Wait for confirmation before proceeding
+
+**Example**:
+```
+User: "Add Automerge integration"
+
+Agent: "I see Automerge mentioned in cross_platform_architecture.md.
+My understanding is you want activity log sync across devices.
+But I'm unsure if this is for:
+  A) Simple state sync (SQLite + export/import is sufficient)
+  B) Event sourcing with procedure matching (needs Automerge CRDTs)
+
+Which use case are we solving?"
+
+[Wait for clarification before writing 700-line issue]
+```
+
 ### Efficiency with Repetitive Changes
 
 **For simple search-and-replace operations:**
@@ -483,6 +551,52 @@ Agent should explicitly state:
 2. Check naming pattern matches convention
 3. Confirm with human if uncertain
 
+## Agent Scratchpad
+
+**Purpose**: Agents may maintain ephemeral working notes to organize thoughts, validate cross-references, and plan complex architectural decisions during sessions.
+
+**Location**: `docs/project/.scratchpad/` directory
+
+**When to Use**:
+- ✅ Organizing scattered context into coherent architecture
+- ✅ Checking consistency across multiple issues/documents
+- ✅ Planning complex changes before implementation
+- ✅ Validating that decisions are internally consistent
+- ✅ Tracking session progress and next steps
+
+**Rules**:
+- ✅ Agent can create/read/write without explicit authorization
+- ✅ Use for working notes during complex multi-document sessions
+- ✅ Can reference other documents to check cross-links
+- ❌ Never reference scratchpad files from issues/roadmaps/design docs
+- ❌ Don't treat as deliverables or permanent documentation
+- ❌ Don't include in commit messages or PR descriptions
+- ⚠️ Mark clearly as "SCRATCHPAD - NOT DOCUMENTATION" in file header
+
+**Cleanup**:
+- Delete at end of session if no longer needed
+- Human can delete entire `.scratchpad/` directory anytime
+- Don't accumulate more than 2-3 scratchpad files at once
+
+**Alternative: Operational Documentation**
+
+If working notes would help users, **ask first**:
+- "Should I create a setup guide for X?" (e.g., CI_CD_SETUP.md)
+- "Would a troubleshooting doc for Y be helpful?"
+
+**Operational docs are valuable** (CI setup, deployment guides, architecture overviews).  
+**Session summaries are not** (redundant, stale instantly).
+
+**Example Valid Operational Docs**:
+- `docs/CI_CD_SETUP.md` - How to configure GitLab CI/CD
+- `docs/DEPLOYMENT.md` - How to deploy to crates.io
+- `docs/CONTRIBUTING.md` - How to contribute to the project
+
+**Example Invalid Scratchpad Pollution**:
+- `docs/project/SESSION_SUMMARY_2025-01-23.md` - ❌ Redundant
+- `docs/project/AUTOMERGE_INTEGRATION_SUMMARY.md` - ❌ Info already in ISSUE_16
+- `docs/project/PROGRESS_UPDATE.md` - ❌ Stale immediately
+
 ## Improving This Document
 
 This document should evolve based on what works:
@@ -495,11 +609,19 @@ This document should evolve based on what works:
 - Were issues kept concise with references vs. full implementations?
 - Did agent search for existing documents before creating new ones?
 - Were issues under 300 lines?
+- Did agent use scratchpad appropriately (vs creating summary docs)?
 
 **Human should update AGENTS.md when:**
 - A pattern emerges that should be formalized
 - An anti-pattern is discovered
 - Tool usage changes (new Zed features, etc.)
+- Agent repeatedly wastes context in same way
+- Session clarity improves after establishing new rule
 
 **Version this document:**
 Track meaningful changes to collaboration patterns, not just typos.
+
+**Agent should suggest updates when:**
+- Noticing repeated context waste patterns
+- Discovering better ways to organize work
+- Finding guidelines that conflict with practice

@@ -5,7 +5,7 @@ use crate::{
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
     event::{BeliefEvent, Event},
-    query::{BeliefCache, Focus, PaginatedQuery, Query, ResultsPage},
+    query::{BeliefCache, PaginatedQuery, Query, ResultsPage},
 };
 
 use notify_debouncer_full::{
@@ -45,7 +45,7 @@ struct BnWatchers(pub Arc<Mutex<NetworkWatcherMap>>);
 #[derive(Default)]
 struct PaginationCache(pub Arc<RwLock<HashMap<Query, (SystemTime, Beliefs)>>>);
 
-pub struct LatticeService {
+pub struct WatchService {
     watchers: Arc<Mutex<BnWatchers>>,
     pagination_cache: Arc<Mutex<PaginationCache>>,
     db: DbConnection,
@@ -55,7 +55,7 @@ pub struct LatticeService {
     config_provider: Arc<dyn crate::config::LatticeConfigProvider>,
 }
 
-impl LatticeService {
+impl WatchService {
     pub fn new(root_dir: PathBuf, event_tx: Sender<Event>) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .worker_threads(4)
@@ -76,7 +76,7 @@ impl LatticeService {
 
         let codecs = CodecMap::create();
 
-        Ok(LatticeService {
+        Ok(WatchService {
             watchers: Arc::new(Mutex::new(BnWatchers::default())),
             pagination_cache: Arc::new(Mutex::new(PaginationCache::default())),
             db,
@@ -130,25 +130,17 @@ impl LatticeService {
         for record in added_networks.iter() {
             let path = PathBuf::from(&record.path);
             ProtoBeliefNode::try_from(&record.node)?.write(&path)?;
-            self.enable_belief_network_syncer(&path)?;
+            self.enable_network_syncer(&path)?;
         }
         for str_path in removed_networks.iter() {
             let path = PathBuf::from(&str_path);
-            self.disable_belief_network_syncer(&path)?;
+            self.disable_network_syncer(&path)?;
         }
 
         if nets != old_nets {
             self.config_provider.set_networks(nets.clone())?;
         }
         Ok(nets)
-    }
-
-    pub fn get_focus(&self) -> Result<Focus, BuildonomyError> {
-        self.config_provider.get_focus()
-    }
-
-    pub fn set_focus(&self, focus: &Focus) -> Result<(), BuildonomyError> {
-        self.config_provider.set_focus(focus.clone())
     }
 
     pub fn db_connection(&self) -> DbConnection {
@@ -222,7 +214,7 @@ impl LatticeService {
         Ok(page)
     }
 
-    pub fn enable_belief_network_syncer(&self, repo_path: &PathBuf) -> Result<(), BuildonomyError> {
+    pub fn enable_network_syncer(&self, repo_path: &PathBuf) -> Result<(), BuildonomyError> {
         let binding = self.watchers.lock();
         let mut watchers = binding.0.lock();
         if watchers.contains_key(repo_path) {
@@ -316,7 +308,7 @@ impl LatticeService {
         Ok(())
     }
 
-    pub fn disable_belief_network_syncer(
+    pub fn disable_network_syncer(
         &self,
         repo_path: &PathBuf,
     ) -> Result<(), BuildonomyError> {

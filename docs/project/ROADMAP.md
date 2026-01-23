@@ -177,7 +177,7 @@
 
 **Status**: Backlog
 
-**Goal**: Full-featured IDE experience with navigation, completion, and refactoring.
+**Goal**: Full-featured IDE experience with navigation, completion, refactoring, and real-time collaboration.
 
 **Target Timeline**: 2-3 months after v0.2.0
 
@@ -190,6 +190,14 @@
   - **Performance**: Incremental sync, lazy parsing, debounced diagnostics
   - **Quality of Life**: Semantic tokens, inlay hints
 
+#### Real-Time Collaboration
+- **[Issue 15: Filtered Event Streaming](./ISSUE_15_FILTERED_EVENT_STREAMING.md)** (5-7 days, MEDIUM PRIORITY)
+  - Query-based event subscriptions (reimagined "focus")
+  - Bidirectional event streaming (client ↔ server)
+  - LSP custom notifications for filtered updates
+  - Multiple concurrent subscriptions with different filters
+  - Efficient real-time updates for IDE extensions and dashboards
+
 **Deliverables**:
 - Click on `[[links]]` to jump to definition
 - Autocomplete available references
@@ -197,22 +205,75 @@
 - Rename symbols with automatic reference updates
 - Document outline in sidebar
 - Workspace-wide symbol search
+- Query-based event subscriptions via LSP
+- Real-time filtered updates to IDE extensions
+- Bidirectional event flow (client can send updates)
 
 **Success Metrics**:
 - IDE experience comparable to programming languages
 - Navigation works across documents
 - Autocomplete response time < 50ms
 - Rename works on 100+ document workspaces
+- Filtered event routing latency < 10ms
+- Multiple concurrent subscriptions work correctly
 
 ---
 
-### v0.4.0+ - Future Enhancements (BACKLOG)
+### v0.4.0 - Multi-Device Sync & Collaboration (BACKLOG)
+
+**Status**: Planning
+
+**Goal**: Distributed state synchronization and collaborative features using Automerge CRDT.
+
+**Target Timeline**: 3-4 months after v0.3.0
+
+**Issues**:
+
+#### Automerge Integration
+- **[Issue 16: Automerge Integration for Activity Logs and Distributed State](./ISSUE_16_AUTOMERGE_INTEGRATION.md)** (2-3 weeks, MEDIUM PRIORITY)
+  - Activity log sync (user motivations, focus history)
+  - Subscription state sync across devices
+  - Peer-to-peer sync (mDNS, QR pairing)
+  - Collaborative presence indicators
+  - Offline-first workflow
+  - Optional relay server for internet sync
+  - Future: Keyhive authorization integration (v0.5.0+)
+
+**Deliverables**:
+- Activity logs synced across user's devices
+- Subscription state synced (ISSUE_15 filters)
+- Peer discovery on local network (mDNS)
+- Automatic conflict resolution (CRDT)
+- Collaborative presence (who's viewing/editing what)
+- UI state sync (preferences, window layout)
+- Offline-first sync on reconnect
+
+**Success Metrics**:
+- Sync latency < 100ms on local network
+- Activity logs preserved across devices
+- Conflicts resolved automatically (no user intervention)
+- Works offline → syncs on reconnect
+
+**Architecture**:
+- Hybrid model: Files remain canonical (git-versioned), Automerge for ephemeral state
+- Feature flag: `automerge` (optional dependency)
+- Integration with ISSUE_15 (filtered event streaming)
+
+---
+
+### v0.5.0+ - Future Enhancements (BACKLOG)
 
 **Status**: Ideas / Not Planned Yet
 
 **Potential Features**:
 
+#### Authorization & Security
+- Keyhive distributed authorization (when stable)
+- Capability-based access control
+- Multi-user permissions
+
 #### Language Features
+
 - Syntax extensions (custom block types, attributes)
 - Template system for document generation
 - Macro system for reusable content
