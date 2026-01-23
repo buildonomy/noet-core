@@ -72,14 +72,9 @@ test:linux:stable:
   <<: *test_linux_template
   image: rust:latest
 
-test:linux:beta:
-  <<: *test_linux_template
-  image: rust:beta
-  allow_failure: true
-
 test:linux:nightly:
   <<: *test_linux_template
-  image: rust:nightly
+  image: rustlang/rust:nightly
   allow_failure: true
 
 test:linux:msrv:
@@ -108,10 +103,18 @@ test:macos:stable:
   allow_failure: true # Allow failure if no macOS runner available
 
 # Test job - Windows
+.windows_job:
+  tags:
+    - saas-windows-medium-amd64
+  before_script:
+    - Set-Variable -Name "time" -Value (date -Format "%H:%m")
+    - echo ${time}
+    - echo "started by ${GITLAB_USER_NAME} / @${GITLAB_USER_LOGIN}"
+
 test:windows:stable:
   stage: test
-  tags:
-    - windows
+  extends:
+    - .windows_job
   before_script:
     - choco install rustup.install -y
     - $env:Path = "C:\Users\$env:UserName\.cargo\bin;$env:Path"

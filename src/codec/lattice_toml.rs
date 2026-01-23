@@ -432,7 +432,7 @@ impl ProtoBeliefNode {
     ///
     /// ## Alternative Implementations via Codec Swapping
     ///
-    /// This filesystem-based implementation is just one strategy. The [`crate::codecs::CODECS`] map
+    /// This filesystem-based implementation is just one strategy. The [`crate::codec::CODECS`] map
     /// allows swapping implementations at runtime for different environments:
     ///
     /// - **Native/Desktop**: Use this `ProtoBeliefNode` with direct filesystem access
@@ -440,7 +440,7 @@ impl ProtoBeliefNode {
     /// - **Testing**: Swap in a `MockProtoBeliefNode` with in-memory content
     ///
     /// The codec abstraction provides this flexibility without changing the parser or
-    /// accumulator layers. See [crate::codecs] for details on how to swap out `CODECS`.
+    /// accumulator layers. See [crate::codec] for details on how to swap out `CODECS`.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<ProtoBeliefNode, BuildonomyError> {
         let mut file_path = PathBuf::from(path.as_ref());
         let mut is_net = false;

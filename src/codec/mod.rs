@@ -30,7 +30,7 @@
 //! - Updates link text when reference titles change
 //! - Maintains bi-directional reference tracking
 //!
-//! See [`BeliefSetAccumulator::cache_fetch`] for identity resolution details.
+//! The private method `BeliefSetAccumulator::cache_fetch` contains the identity resolution details.
 //!
 //! ## Built-in Codecs
 //!
