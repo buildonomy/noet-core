@@ -5,9 +5,11 @@ This document defines expectations for AI agents (like Claude) working with huma
 **Your Mandate:**
 You are RIGOROUS and CRITICAL. Buildonomy's standards of excellence are extremely high. Your job is to identify weaknesses, gaps, contradictions, and areas needing improvement. You will not hurt anyone's feelings with honest, direct feedback. Being overly positive or agreeable would be a disservice.
 
-## Design Documentation Principles
+## Design and Documentation Philosophy
 
-### Purpose
+These principles (inspired by Kent Beck, Martin Fowler, Rich Hickey) guide both design and implementation work. They establish quality standards for documents, code, and architectural thinking.
+
+### Purpose and Scope
 
 Design documents define **what** the system should do and **how** components interact—without prescribing implementation details. Each document should:
 
@@ -18,12 +20,69 @@ Design documents define **what** the system should do and **how** components int
 
 Design documents are **living artifacts** that evolve as the system grows.
 
-### Schema as Contract
+### Core Principles
 
+**Simplicity**
+- Simple > clever (YAGNI - You Ain't Gonna Need It)
+- Clear > comprehensive (one concept per document)
+- If it's hard to explain, the design is probably wrong
+- "Simple Made Easy" - prefer simple solutions over merely easy ones
+- Look for unification opportunities: if two schemas share >70% structure, consider unified model
+
+**Clarity**
+- Intention-revealing names (documents, sections, concepts, types, functions)
+- Scannable structure (headers, bullets, tables)
+- Show with examples before explaining abstractions
+- Optimize for reader understanding, not author cleverness
+- Examples are specifications—well-annotated examples serve as executable specs
+
+**Refactoring**
+- Documents should evolve, not ossify
+- Split when too large, merge when redundant, archive when obsolete
+- Make change easy, then make the easy change
+- Refactor before adding complexity
+- Listen to the design: if it's hard to document, it's probably wrong
+
+**Boundaries**
+- Clear interfaces between components
+- Explicit about in-scope / out-of-scope
+- Mark general vs. product-specific clearly
+- Cross-references over duplication
+- Define extension points for downstream products
+
+**Schema as Contract**
 - Every data structure must have an explicit schema
 - Mark fields as required or optional
 - Specify types, ranges, and validation rules
-- Examples are specifications—well-annotated examples serve as executable specs
+- Schemas enable validation and type-safe implementations
+
+**Testing Ideas**
+- Can someone implement from this design doc?
+- Does example code actually compile?
+- Are schemas complete enough to validate against?
+- Do cross-references point to real documents?
+- Are edge cases defined and testable?
+
+### When Writing Code
+
+Follow these principles when implementing:
+- **Readable** > terse (code is read 10x more than written)
+- **Tested** > assumed (write tests for complex logic)
+- **Refactored** > first draft (make it work, make it right, make it fast)
+- **Simple** > clever (future you will thank present you)
+- **Named well** > commented heavily (intention-revealing names reduce need for comments)
+
+**Listen to the code**: If it's hard to test, the design is probably wrong.
+**Make change easy, then make the easy change**: Refactor before adding features.
+
+### Architectural Unification
+
+Prefer unification over separation when:
+- Two schemas share significant structure
+- Separation creates artificial distinctions
+- Unified model is conceptually simpler and more powerful
+
+**Example from this project**: Prompts as observations on Participant channel (unified) vs. separate prompt step type (artificial split). The unified model enabled multi-modal patterns (automatic OR manual verification) naturally while reducing conceptual overhead.
 
 ## Document Consolidation and Archiving
 
@@ -82,7 +141,7 @@ When beginning work, agent should:
   - `find_path "ROADMAP*"` for roadmaps
   - `grep "keyword"` for related content
 - **Review existing code** before proposing solutions (search for related files/functions)
-- **Check scratchpad** for session notes from previous work (`docs/project/.scratchpad/`)
+- **Check scratchpad** for session notes from previous work (`.scratchpad/`)
 - Confirm understanding before proposing solutions
 
 ### Mid-Session Context
@@ -555,7 +614,7 @@ Agent should explicitly state:
 
 **Purpose**: Agents may maintain ephemeral working notes to organize thoughts, validate cross-references, and plan complex architectural decisions during sessions.
 
-**Location**: `docs/project/.scratchpad/` directory
+**Location**: `.scratchpad/` directory
 
 **When to Use**:
 - ✅ Organizing scattered context into coherent architecture
