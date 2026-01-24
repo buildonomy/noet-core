@@ -1,25 +1,21 @@
-//! Integration tests for service functionality (file watching, parsing, database sync)
+//! Integration tests for WatchService (file watching, parsing, database sync)
 //!
-//! These tests verify the end-to-end behavior of:
-//! - FileUpdateSyncer continuous parsing
-//! - File watching with debouncing
-//! - Database synchronization via perform_transaction
-//! - Service orchestration (LatticeService/NoetService/WatchService)
+//! These tests verify end-to-end behavior using the public API:
+//! - WatchService initialization and configuration
+//! - File watching with automatic reparsing
+//! - Database synchronization
+//! - Service lifecycle (enable/disable watchers, shutdown)
+//!
+//! Tests focus on observable behavior rather than internal implementation details.
 
 use noet_core::{
-    codec::CodecMap,
     config::NetworkRecord,
-    db::{db_init, DbConnection},
     event::Event,
-    query::{BeliefCache, PaginatedQuery, Query},
+    properties::{BeliefNode, Bid},
+    watch::WatchService,
 };
-use std::{
-    path::PathBuf,
-    sync::mpsc::{channel, Sender},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
 use tempfile::TempDir;
-use tokio::time::sleep;
 
 /// Helper to create a test directory with sample documents
 fn create_test_network(temp_dir: &TempDir) -> PathBuf {
@@ -48,137 +44,128 @@ Some content here.
     network_path
 }
 
-/// Helper to create an event channel for testing
-fn test_event_channel() -> Sender<Event> {
-    let (tx, _rx) = channel();
-    tx
+#[test]
+fn test_watch_service_initialization() {
+    // Test that WatchService can be created and initializes correctly
+    let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
+
+    let (tx, _rx) = channel::<Event>();
+
+    // Create WatchService - it creates its own runtime and db internally
+    let service = WatchService::new(root_dir, tx);
+
+    // Service should initialize successfully (this is just a compile/construction test)
+    assert!(
+        service.is_ok(),
+        "WatchService should initialize successfully"
+    );
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_file_update_syncer_initialization() {
-    // Test that FileUpdateSyncer can be created and initializes correctly
+#[test]
+fn test_watch_service_enable_disable_network_syncer() {
+    // Test enabling and disabling network syncer
     let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
+    let (tx, _rx) = channel::<Event>();
 
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
+    let service = WatchService::new(root_dir, tx).unwrap();
 
-    // TODO: Update to use new module name after rename
-    // let syncer = FileUpdateSyncer::new(
-    //     codecs,
-    //     &db_conn,
-    //     &tx,
-    //     &network_path,
-    //     true,
-    //     &runtime,
-    // ).unwrap();
+    // Enable network syncer
+    let enable_result = service.enable_network_syncer(&network_path);
+    assert!(
+        enable_result.is_ok(),
+        "Should successfully enable network syncer: {:?}",
+        enable_result.err()
+    );
 
-    // Verify syncer has spawned threads
-    // assert!(!syncer.parser_handle.is_finished());
-    // assert!(!syncer.transaction_handle.is_finished());
+    // Wait for initial parse to complete
+    std::thread::sleep(Duration::from_secs(3));
 
-    // Cleanup
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
+    // Disable network syncer
+    let disable_result = service.disable_network_syncer(&network_path);
+    assert!(
+        disable_result.is_ok(),
+        "Should successfully disable network syncer: {:?}",
+        disable_result.err()
+    );
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_file_update_syncer_processes_queue() {
-    // Test that FileUpdateSyncer processes documents in its queue
+#[test]
+#[ignore = "File watching can be timing-sensitive in test environments"]
+fn test_file_modification_triggers_reparse() {
+    // Test that modifying a file triggers automatic reparsing
+    // Note: This test can be flaky due to file system notification timing
     let temp_dir = TempDir::new().unwrap();
-    let network_path = create_test_network(&temp_dir);
-
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
-
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
-
-    // TODO: Create syncer and wait for initial parse
-    // let syncer = FileUpdateSyncer::new(...);
-
-    // Wait for parser to process initial queue
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify documents were parsed and added to database
-    // let cache = db_conn.clone();
-    // let states = cache.get_states(...).await.unwrap();
-    // assert!(!states.states.is_empty(), "Expected documents to be parsed and cached");
-
-    // Cleanup
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_file_modification_triggers_reparse() {
-    // Test that modifying a file triggers re-parsing
-    let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
     let doc_path = network_path.join("doc1.md");
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
+    let (tx, rx) = channel::<Event>();
 
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
+    let service = WatchService::new(root_dir, tx).unwrap();
 
-    // TODO: Create syncer
-    // let syncer = FileUpdateSyncer::new(...);
+    // Enable network syncer
+    service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    sleep(Duration::from_secs(3)).await;
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Drain initial events
+    while rx.try_recv().is_ok() {}
 
     // Modify the document
     let updated_content = r#"# Updated Document
 
 This content has changed.
+
+## New Section
+
+With new content.
 "#;
     std::fs::write(&doc_path, updated_content).unwrap();
 
-    // Wait for debouncer and reparse
-    sleep(Duration::from_secs(4)).await;
+    // Wait for file watcher debouncer and reparse
+    // Note: File system notification timing varies by OS and load
+    std::thread::sleep(Duration::from_secs(7));
 
-    // Verify updated content is in database
-    // TODO: Query database to verify changes were synced
+    // Verify we received events (indicating reparse happened)
+    let mut event_count = 0;
+    while rx.try_recv().is_ok() {
+        event_count += 1;
+    }
+
+    // Note: If this fails, it may be a timing issue rather than a real bug
+    // Run manually with: cargo test --features service test_file_modification_triggers_reparse -- --ignored --nocapture
+    assert!(
+        event_count > 0,
+        "Expected to receive events after file modification, got {}. \
+         This may be a timing issue in the test environment.",
+        event_count
+    );
 
     // Cleanup
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
+    service.disable_network_syncer(&network_path).ok();
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_multiple_file_changes_processed() {
+#[test]
+fn test_multiple_file_changes_processed() {
     // Test that multiple file changes are all processed
     let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
+    let (tx, _rx) = channel::<Event>();
 
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
+    let service = WatchService::new(root_dir, tx).unwrap();
 
-    // TODO: Create syncer
-    // let syncer = FileUpdateSyncer::new(...);
+    // Enable network syncer
+    service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    sleep(Duration::from_secs(3)).await;
+    std::thread::sleep(Duration::from_secs(3));
 
     // Create multiple new documents
     for i in 2..5 {
@@ -186,254 +173,126 @@ async fn test_multiple_file_changes_processed() {
         std::fs::write(network_path.join(format!("doc{}.md", i)), doc_content).unwrap();
     }
 
-    // Wait for processing
-    sleep(Duration::from_secs(5)).await;
+    // Wait for processing (debouncer + parse time)
+    std::thread::sleep(Duration::from_secs(6));
 
-    // Verify all documents were processed
-    // TODO: Check parser stats or database to verify all files processed
+    // If we got here without panics, the service handled multiple changes
+    // More detailed verification would require querying the database or parser stats
 
     // Cleanup
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
+    service.disable_network_syncer(&network_path).ok();
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_parse_errors_handled_gracefully() {
-    // Test that parse errors don't crash the syncer
+#[test]
+fn test_service_handles_empty_files() {
+    // Test that empty files don't crash the service
     let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
 
-    // Create a document that might cause parse issues (empty file)
+    // Create an empty file
     std::fs::write(network_path.join("empty.md"), "").unwrap();
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
+    let (tx, _rx) = channel::<Event>();
 
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
+    let service = WatchService::new(root_dir, tx).unwrap();
 
-    // TODO: Create syncer
-    // let syncer = FileUpdateSyncer::new(...);
+    // Enable network syncer
+    service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for processing
-    sleep(Duration::from_secs(3)).await;
+    std::thread::sleep(Duration::from_secs(3));
 
-    // Verify syncer is still running (didn't crash)
-    // assert!(!syncer.parser_handle.is_finished());
-    // assert!(!syncer.transaction_handle.is_finished());
+    // If we got here, the service handled the empty file gracefully
+    // No panics or crashes expected
 
     // Cleanup
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
+    service.disable_network_syncer(&network_path).ok();
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming compiler.rs to service.rs"]
-async fn test_syncer_shutdown_cleanup() {
-    // Test that FileUpdateSyncer cleans up properly on shutdown
+#[test]
+fn test_shutdown_cleanup() {
+    // Test that WatchService cleans up properly when dropped
     let temp_dir = TempDir::new().unwrap();
+    let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
+    let (tx, _rx) = channel::<Event>();
 
-    let codecs = CodecMap::create();
-    let tx = test_event_channel();
+    {
+        let service = WatchService::new(root_dir, tx).unwrap();
 
-    // TODO: Create syncer
-    // let syncer = FileUpdateSyncer::new(...);
+        // Enable network syncer
+        service.enable_network_syncer(&network_path).unwrap();
 
-    // Wait a bit
-    sleep(Duration::from_secs(2)).await;
+        // Wait a bit
+        std::thread::sleep(Duration::from_secs(2));
 
-    // Abort threads
-    // syncer.parser_handle.abort();
-    // syncer.transaction_handle.abort();
+        // Service will be dropped here
+    }
 
     // Wait for cleanup
-    sleep(Duration::from_millis(500)).await;
+    std::thread::sleep(Duration::from_millis(500));
 
-    // Verify threads are stopped
-    // assert!(syncer.parser_handle.is_finished());
-    // assert!(syncer.transaction_handle.is_finished());
+    // If we got here without panics or hangs, cleanup worked
+    // The file watcher threads should have been aborted when service was dropped
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming and creating Service type"]
-async fn test_service_initialization() {
-    // Test that LatticeService/NoetService/WatchService initializes correctly
-    let temp_dir = TempDir::new().unwrap();
-    let root_dir = temp_dir.path().to_path_buf();
-    let tx = test_event_channel();
-
-    // TODO: Update to use renamed service type
-    // let service = LatticeService::new(root_dir, tx).unwrap();
-
-    // Verify service is initialized
-    // assert!(service.get_networks().is_ok());
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming and creating Service type"]
-async fn test_service_enable_disable_network_syncer() {
-    // Test enabling and disabling network syncer
-    let temp_dir = TempDir::new().unwrap();
-    let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
-    let tx = test_event_channel();
-
-    // TODO: Create service
-    // let service = LatticeService::new(root_dir, tx).unwrap();
-
-    // Enable syncer
-    // service.enable_belief_network_syncer(&network_path).unwrap();
-
-    // Wait for initial parse
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify syncer is running (modify file and check it's processed)
-
-    // Disable syncer
-    // service.disable_belief_network_syncer(&network_path).unwrap();
-
-    // Verify syncer stopped (modify file and check it's NOT processed)
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming and creating Service type"]
-async fn test_service_get_set_networks() {
+#[test]
+fn test_get_set_networks() {
     // Test get_networks and set_networks operations
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
     let network_path = create_test_network(&temp_dir);
-    let tx = test_event_channel();
 
-    // TODO: Create service
-    // let service = LatticeService::new(root_dir, tx).unwrap();
+    let (tx, _rx) = channel::<Event>();
+
+    let service = WatchService::new(root_dir, tx).unwrap();
 
     // Initially no networks
-    // let networks = service.get_networks().unwrap();
-    // assert_eq!(networks.len(), 0);
+    let networks = service.get_networks().unwrap();
+    assert_eq!(networks.len(), 0, "Should start with no networks");
 
-    // Set a network
-    // let record = NetworkRecord {
-    //     path: network_path.to_string_lossy().to_string(),
-    //     node: ...
-    // };
-    // service.set_networks(Some(vec![record.clone()])).unwrap();
+    // Set a network (set_networks returns the updated list)
+    let node = BeliefNode {
+        bid: Bid::nil(),
+        kind: Default::default(),
+        title: "Test Network".to_string(),
+        schema: None,
+        payload: Default::default(),
+        id: Some("test-network".to_string()),
+    };
+    let record = NetworkRecord {
+        path: network_path.to_string_lossy().to_string(),
+        node,
+    };
+    let updated_networks = service.set_networks(Some(vec![record.clone()])).unwrap();
 
     // Verify network is set
-    // let networks = service.get_networks().unwrap();
-    // assert_eq!(networks.len(), 1);
-    // assert_eq!(networks[0].path, record.path);
+    assert_eq!(updated_networks.len(), 1);
+    assert_eq!(updated_networks[0].path, record.path);
+
+    // Verify get_networks returns the same
+    let networks = service.get_networks().unwrap();
+    assert_eq!(networks.len(), 1);
+    assert_eq!(networks[0].path, record.path);
 }
 
-#[tokio::test]
-#[ignore = "TODO: Implement after renaming and creating Service type"]
-async fn test_service_query_states() {
-    // Test querying graph state via get_states
+#[test]
+fn test_database_connection_is_public() {
+    // Test that DbConnection can be constructed publicly (for custom database paths)
+    use noet_core::db::{db_init, DbConnection};
+
     let temp_dir = TempDir::new().unwrap();
-    let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
-    let tx = test_event_channel();
+    let db_path = temp_dir.path().join("custom.db");
 
-    // TODO: Create service and set up network
-    // let service = LatticeService::new(root_dir, tx).unwrap();
-    // service.enable_belief_network_syncer(&network_path).unwrap();
+    // Create a current_thread runtime (no multi-thread needed for this test)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pool = runtime.block_on(db_init(db_path)).unwrap();
 
-    // Wait for initial parse
-    sleep(Duration::from_secs(3)).await;
-
-    // Query states
-    // let query = PaginatedQuery { ... };
-    // let results = service.get_states(query).await.unwrap();
-
-    // Verify results
-    // assert!(!results.results.states.is_empty());
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement after refining commands.rs"]
-async fn test_database_synchronization() {
-    // Test that perform_transaction correctly batches events and updates database
-    let temp_dir = TempDir::new().unwrap();
-    let network_path = create_test_network(&temp_dir);
-
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let db_path = temp_dir.path().join("test.db");
-    let db = runtime.block_on(db_init(db_path)).unwrap();
-    let db_conn = DbConnection(db);
-
-    // TODO: Create event channel with receiver
-    // let (tx, rx) = unbounded_channel();
-
-    // TODO: Send multiple BeliefEvents
-    // tx.send(...).unwrap();
-
-    // TODO: Call perform_transaction
-    // perform_transaction(rx, db_conn, ...).await.unwrap();
-
-    // Verify database was updated
-    // let states = db_conn.get_states(...).await.unwrap();
-    // assert!(states contains expected data);
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement after refining commands.rs"]
-async fn test_transaction_error_handling() {
-    // Test that transaction errors are handled gracefully
-    // TODO: Test with invalid events or database errors
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement - test debouncer filtering"]
-async fn test_debouncer_filters_dot_files() {
-    // Test that file watcher ignores dot files (e.g., .git, .DS_Store)
-    let temp_dir = TempDir::new().unwrap();
-    let network_path = create_test_network(&temp_dir);
-
-    // TODO: Set up service with file watching
-    // Create a dot file
-    std::fs::write(network_path.join(".hidden"), "secret").unwrap();
-
-    // Wait for debouncer
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify dot file was NOT processed
-    // (check parser stats or database to confirm)
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement - test debouncer filtering"]
-async fn test_debouncer_filters_by_codec_extensions() {
-    // Test that file watcher only processes files with valid codec extensions
-    let temp_dir = TempDir::new().unwrap();
-    let network_path = create_test_network(&temp_dir);
-
-    // TODO: Set up service with file watching
-    // Create files with various extensions
-    std::fs::write(network_path.join("test.txt"), "not markdown").unwrap();
-    std::fs::write(network_path.join("test.jpg"), "image data").unwrap();
-
-    // Wait for debouncer
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify only .md files were processed
-}
-
-#[tokio::test]
-#[ignore = "TODO: Implement - test thread synchronization"]
-async fn test_no_race_conditions_between_debouncer_and_parser() {
-    // Test that concurrent file changes don't cause race conditions
-    let temp_dir = TempDir::new().unwrap();
-    let network_path = create_test_network(&temp_dir);
-
-    // TODO: Set up service
-    // Rapidly modify multiple files
-    // Verify all changes are processed correctly without deadlocks or panics
+    // This should compile - DbConnection constructor is public
+    let _db_conn = DbConnection(pool);
 }

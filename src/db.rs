@@ -234,7 +234,7 @@ impl<'a> Transaction<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct DbConnection(pub(crate) Pool<Sqlite>);
+pub struct DbConnection(pub Pool<Sqlite>);
 
 /// TODO: ensure push_values iter counts never exceed this huge value
 ///

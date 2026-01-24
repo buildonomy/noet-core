@@ -1,3 +1,246 @@
+//! # Watch Service - Continuous Parsing and File Watching
+//!
+//! The `watch` module provides [`WatchService`], a long-running service that automatically
+//! monitors document directories for changes and keeps the in-memory cache and database
+//! synchronized with the file system.
+//!
+//! ## Overview
+//!
+//! `WatchService` is designed for applications that need continuous parsing and synchronization:
+//! - **File watching**: Automatically detects file changes via filesystem notifications
+//! - **Debounced parsing**: Batches rapid file changes to avoid redundant parses
+//! - **Database sync**: Keeps SQLite database in sync with parsed documents
+//! - **Event streaming**: Emits [`Event`]s for cache updates and downstream processing
+//!
+//! ## When to Use WatchService
+//!
+//! Use `WatchService` when you need:
+//! - **Long-running applications**: Servers, daemons, IDE integrations (LSP servers)
+//! - **Continuous synchronization**: Keep database in sync with changing files
+//! - **File watching**: Automatic reparsing when documents are modified
+//! - **Multi-network management**: Watch multiple document networks simultaneously
+//!
+//! **Don't use WatchService** for:
+//! - One-shot parsing (use [`BeliefSetParser::simple()`](crate::codec::BeliefSetParser::simple) instead)
+//! - Build scripts or short-lived commands (use direct parsing)
+//! - Applications without file watching needs (use parser directly)
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use noet_core::{watch::WatchService, event::Event};
+//! use std::{sync::mpsc::channel, path::PathBuf};
+//!
+//! // Create event channel for receiving parser events
+//! let (tx, rx) = channel::<Event>();
+//!
+//! // Initialize service (creates its own runtime and database)
+//! let root_dir = PathBuf::from("/path/to/workspace");
+//! let service = WatchService::new(root_dir, tx)?;
+//!
+//! // Enable file watching for a document network
+//! let network_path = PathBuf::from("/path/to/workspace/my_network");
+//! service.enable_network_syncer(&network_path)?;
+//!
+//! // Service now watches for file changes and emits events
+//! // Process events in your application
+//! for event in rx {
+//!     match event {
+//!         Event::Belief(belief_event) => {
+//!             println!("Received belief update: {:?}", belief_event);
+//!         }
+//!         Event::Focus(focus_event) => {
+//!             println!("Received focus update: {:?}", focus_event);
+//!         }
+//!         Event::Ping => {
+//!             // Keepalive event
+//!         }
+//!     }
+//! }
+//! # Ok::<(), noet_core::BuildonomyError>(())
+//! ```
+//!
+//! ## File Watching Pattern
+//!
+//! The service automatically watches directories and reparses files when they change:
+//!
+//! ```rust,no_run
+//! use noet_core::{watch::WatchService, event::Event};
+//! use std::{sync::mpsc::channel, path::PathBuf};
+//!
+//! let (tx, rx) = channel::<Event>();
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx)?;
+//!
+//! // Enable watching - initial parse happens automatically
+//! let network_path = PathBuf::from("/workspace/docs");
+//! service.enable_network_syncer(&network_path)?;
+//!
+//! // Now modify a file in /workspace/docs/...
+//! // The service will:
+//! // 1. Detect the change via filesystem notification
+//! // 2. Debounce rapid changes (300ms default)
+//! // 3. Reparse the modified file
+//! // 4. Emit Event::Belief updates
+//! // 5. Sync changes to database
+//!
+//! // Disable watching when done
+//! service.disable_network_syncer(&network_path)?;
+//! # Ok::<(), noet_core::BuildonomyError>(())
+//! ```
+//!
+//! ## Network Management
+//!
+//! Manage multiple document networks with persistent configuration:
+//!
+//! ```rust,no_run
+//! use noet_core::{
+//!     watch::WatchService,
+//!     config::NetworkRecord,
+//!     properties::{BeliefNode, Bid},
+//!     event::Event,
+//! };
+//! use std::{sync::mpsc::channel, path::PathBuf};
+//!
+//! let (tx, _rx) = channel::<Event>();
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx)?;
+//!
+//! // Get current networks (reads from config.toml)
+//! let networks = service.get_networks()?;
+//! println!("Currently configured networks: {}", networks.len());
+//!
+//! // Add a new network
+//! let mut networks = service.get_networks()?;
+//! networks.push(NetworkRecord {
+//!     path: "/workspace/new_network".to_string(),
+//!     node: BeliefNode {
+//!         bid: Bid::nil(),
+//!         kind: Default::default(),
+//!         title: "New Network".to_string(),
+//!         schema: None,
+//!         payload: Default::default(),
+//!         id: Some("new-network".to_string()),
+//!     },
+//! });
+//! service.set_networks(Some(networks))?;
+//!
+//! // Configuration persists to /workspace/config.toml
+//! # Ok::<(), noet_core::BuildonomyError>(())
+//! ```
+//!
+//! ## Threading Model
+//!
+//! `WatchService` uses multiple threads for concurrent processing:
+//!
+//! ### Main Thread
+//! - Owns the `WatchService` instance
+//! - Coordinates watcher lifecycle (enable/disable)
+//! - Receives events via `mpsc::channel`
+//!
+//! ### Per-Network Threads (spawned by `enable_network_syncer`)
+//!
+//! 1. **File Watcher Thread** (from `notify-debouncer-full`)
+//!    - Monitors filesystem for changes
+//!    - Debounces rapid modifications (300ms window)
+//!    - Filters by codec extensions (.md, .toml, etc.)
+//!    - Ignores dot files (.git, .DS_Store)
+//!
+//! 2. **Parser Thread** (`FileUpdateSyncer::parser_handle`)
+//!    - Runs continuous parsing loop
+//!    - Processes files from parse queue
+//!    - Emits `BeliefEvent`s to transaction thread
+//!    - Uses `BeliefSetParser` with incremental updates
+//!
+//! 3. **Transaction Thread** (`FileUpdateSyncer::transaction_handle`)
+//!    - Receives `BeliefEvent`s from parser
+//!    - Batches events into database transactions
+//!    - Updates SQLite database atomically
+//!    - Forwards events to main application via `event_tx`
+//!
+//! ### Synchronization Points
+//!
+//! - **Parse Queue**: Parser thread blocks on queue when empty
+//! - **Event Channel**: Transaction thread blocks on event receiver
+//! - **Database Lock**: Transaction thread serializes database writes
+//! - **Watcher Mutex**: `BnWatchers` mutex guards watcher map access
+//!
+//! ### Shutdown
+//!
+//! - `disable_network_syncer()`: Aborts parser and transaction handles for specific network
+//! - Drop `WatchService`: Aborts all active watchers and threads
+//! - Threads abort gracefully via `JoinHandle::abort()`
+//!
+//! ## Database Synchronization
+//!
+//! The service maintains a SQLite database that mirrors the parsed document graph:
+//!
+//! ```rust,no_run
+//! use noet_core::watch::WatchService;
+//! use std::{sync::mpsc::channel, path::PathBuf};
+//!
+//! let (tx, _rx) = channel();
+//! let root_dir = PathBuf::from("/workspace");
+//!
+//! // Database created at /workspace/belief_cache.db
+//! let service = WatchService::new(root_dir.clone(), tx)?;
+//!
+//! // Database location is fixed: {root_dir}/belief_cache.db
+//! let db_path = root_dir.join("belief_cache.db");
+//! assert!(db_path.exists(), "Database should be created on initialization");
+//!
+//! // For custom database paths, use db_init() and DbConnection directly:
+//! use noet_core::db::{db_init, DbConnection};
+//! let custom_db = PathBuf::from("/custom/path/cache.db");
+//! let runtime = tokio::runtime::Builder::new_current_thread()
+//!     .enable_all()
+//!     .build()?;
+//! let pool = runtime.block_on(db_init(custom_db))?;
+//! let _db_conn = DbConnection(pool);
+//!
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## CLI Tool Integration
+//!
+//! The `noet` CLI uses `WatchService` for continuous parsing:
+//!
+//! ```bash
+//! # One-shot parse (uses BeliefSetParser::simple)
+//! noet parse /path/to/network
+//!
+//! # Continuous watching (uses WatchService)
+//! noet watch /path/to/network
+//! ```
+//!
+//! See `src/bin/noet.rs` for implementation details.
+//!
+//! ## Error Handling
+//!
+//! The service handles errors gracefully:
+//! - **Parse errors**: Emitted as `Event::Diagnostic`, parsing continues
+//! - **File system errors**: Logged, watcher continues monitoring
+//! - **Database errors**: Logged, may cause event loss but service continues
+//! - **Invalid paths**: Return `BuildonomyError` on `enable_network_syncer()`
+//!
+//! ## Feature Flags
+//!
+//! This module requires the `service` feature flag:
+//!
+//! ```toml
+//! [dependencies]
+//! noet-core = { version = "0.1", features = ["service"] }
+//! ```
+//!
+//! ## Examples
+//!
+//! See `examples/watch_service.rs` for a complete orchestration example.
+//!
+//! ## See Also
+//!
+//! - [`BeliefSetParser`](crate::codec::BeliefSetParser) - The underlying parser
+//! - [`Event`] - Events emitted by the service
+//! - [`DbConnection`](crate::db::DbConnection) - Database connection wrapper
+//! - [`LatticeConfigProvider`](crate::config::LatticeConfigProvider) - Configuration interface
+
 use crate::{
     beliefset::Beliefs,
     codec::{lattice_toml::ProtoBeliefNode, parser::BeliefSetParser, CodecMap},
@@ -308,10 +551,7 @@ impl WatchService {
         Ok(())
     }
 
-    pub fn disable_network_syncer(
-        &self,
-        repo_path: &PathBuf,
-    ) -> Result<(), BuildonomyError> {
+    pub fn disable_network_syncer(&self, repo_path: &PathBuf) -> Result<(), BuildonomyError> {
         let binding = self.watchers.lock();
         let mut watchers = binding.0.lock();
         if let Some((mut debouncer, update_syncer)) = watchers.remove(repo_path) {

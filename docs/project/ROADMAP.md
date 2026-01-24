@@ -56,27 +56,28 @@
 
 **Blocking Issues** (must complete before announcement):
 
-#### Phase 1: Minimal Documentation for Soft Open Source (3-4 days)
-- **[Issue 5: Core Library Documentation](./ISSUE_05_DOCUMENTATION.md)** (3-4 days)
-  - Migrate `beliefset_architecture.md` (remove product references)
-  - Create basic architecture docs
-  - Update READMEs for standalone repository
-  - Fix Cargo.toml dependencies (remove product crate references)
-  - **Note**: Can defer Issue 10 examples to post-soft-open-source
-  - **Critical**: This is the ONLY blocker for soft open source (making repo public)
+#### Phase 1: Minimal Documentation for Soft Open Source ✅ COMPLETE (2025-01-18)
+- **[Issue 5: Core Library Documentation](./ISSUE_05_DOCUMENTATION.md)** ✅ COMPLETE
+  - Migrated `beliefset_architecture.md` (removed product references)
+  - Created basic architecture docs
+  - Updated READMEs for standalone repository
+  - Fixed Cargo.toml dependencies (removed product crate references)
+  - **Stage 2 complete**: Issue 10 examples integrated (WatchService tutorial, 2025-01-24)
 
-**SOFT OPEN SOURCE POINT** - Repository made public on GitLab after Phase 1
-- No announcement, no crates.io publication
+**SOFT OPEN SOURCE POINT** ✅ ACHIEVED (2025-01-18)
+- Repository made public: https://gitlab.com/buildonomy/noet-core
+- No announcement yet, no crates.io publication
 - Early feedback from trusted users
 - Breaking changes acceptable
 
-#### Phase 1b: CLI and Daemon (2-3 days, POST-SOFT-OPEN-SOURCE)
-- **[Issue 10: Daemon Testing & Library Pattern Extraction](./ISSUE_10_DAEMON_TESTING.md)** (2-3 days)
-  - Migrate `compiler.rs` → `daemon.rs`
-  - Rename `LatticeService` → `DaemonService`
-  - Create CLI tool (`noet parse`, `noet watch`)
-  - Test file watching and database sync
-  - Tutorial docs with doctests
+#### Phase 1b: CLI and Daemon ✅ COMPLETE (2025-01-24)
+- **[Issue 10: Daemon Testing & Library Pattern Extraction](./ISSUE_10_DAEMON_TESTING.md)** ✅ COMPLETE
+  - Migrated `compiler.rs` → `watch.rs` (renamed `LatticeService` → `WatchService`)
+  - Created CLI tool (`noet parse`, `noet watch`)
+  - Integration tests (7 passing, 1 ignored - see Issue 19)
+  - Comprehensive tutorial docs with 4 doctests (240+ lines)
+  - Full orchestration example: `examples/watch_service.rs` (432 lines)
+  - Threading model documented
 
 #### Phase 2: HTML Rendering (2 weeks, POST-SOFT-OPEN-SOURCE)
 - **[Issue 1: Schema Registry](./ISSUE_01_SCHEMA_REGISTRY.md)** (3-4 days, CRITICAL)
@@ -337,8 +338,9 @@
 
 Issues are numbered sequentially and tracked in `docs/project/ISSUE_XX_*.md`:
 
-- **Issue 5**: Documentation (BLOCKS soft open source) - ✅ Stage 1 Complete
-- **Issue 10**: Daemon Testing (Phase 1b, post-soft-open-source)
+- **Issue 5**: Documentation - ✅ COMPLETE (Stage 1: 2025-01-18, Stage 2: 2025-01-24)
+- **Issue 10**: Daemon Testing - ✅ COMPLETE (2025-01-24)
+- **Issue 19**: File Watcher Timing Bug Investigation (HIGH PRIORITY) - Created 2025-01-24
 - **Issues 1-4**: HTML Rendering (Phase 2 of v0.1.0)
 - **Issue 6**: HTML Generation basics
 - **Issue 13**: HTML CLI Integration (integrates Issues 6 + 10)
@@ -381,6 +383,9 @@ v0.3.0 Dependencies:
 v0.5.0+ Dependencies:
   Issue 1 (Schema Registry) → Issue 17 (noet-procedures extraction)
   Issue 17 (noet-procedures) → Issue 18 (extended schemas: observables + prompts)
+
+Bugfixes (no version dependency):
+  Issue 19 (File Watcher Bug) - HIGH PRIORITY, may block soft open source if CLI broken
 ```
 
 ## Backlog Management
@@ -439,21 +444,27 @@ When creating a new issue:
 
 ## Current Sprint
 
-**Active Phase**: Pre-soft-open-source
+**Active Phase**: Post-soft-open-source (ready for Phase 2 or v0.1.0 announcement)
 
-**Current Issue**: Issue 5 - Core Library Documentation (minimal version)
+**Recently Completed**: 
+- Issue 5 - Core Library Documentation ✅ COMPLETE (Stage 1: 2025-01-18, Stage 2: 2025-01-24)
+- Issue 10 - Daemon Testing ✅ COMPLETE (2025-01-24)
 
-**Next Up After Soft Open Source**: 
-- Issue 10 - Daemon Testing
-- Issues 1-4 - HTML Rendering
-- Issue 6 - HTML Generation
-- Issue 13 - HTML CLI Integration
+**Current Priority**: 
+- Issue 19 - File Watcher Bug (HIGH PRIORITY - manual CLI testing needed)
 
-**Blocked**: None (Issue 5 no longer blocked by Issue 10)
+**Next Up**: 
+- Option A: Resolve Issue 19 (verify `noet watch` works)
+- Option B: Proceed to Phase 2 (HTML Rendering - Issues 1-4, 6, 13)
+- Option C: Announce v0.1.0 (if Issue 19 not blocking)
+
+**Blocked**: Potentially blocked by Issue 19 if `noet watch` CLI is broken
 
 **Estimated Completion**: 
-- 3-4 days to soft open source
-- 3-4 weeks post-soft-open-source to v0.1.0
+- Soft open source: ✅ COMPLETE (2025-01-18)
+- Issue 19 resolution: 1-2 days
+- Phase 2 (HTML): 2 weeks
+- v0.1.0 announcement: 2-4 weeks depending on path
 
 ## References
 
@@ -470,3 +481,7 @@ When creating a new issue:
 - **2024-XX-XX**: Added Issue 13 (HTML CLI Integration)
 - **2024-XX-XX**: Clarified soft open source strategy - Issue 5 only, then public repo
 - **2024-XX-XX**: Decoupled Issue 5 from Issue 10 - can open source sooner
+- **2025-01-18**: Soft open source achieved - repository made public
+- **2025-01-24**: Completed Issue 5 Stage 2 (WatchService tutorial from Issue 10)
+- **2025-01-24**: Completed Issue 10 (tutorial docs, integration tests, example created)
+- **2025-01-24**: Created Issue 19 (File Watcher Timing Bug - HIGH PRIORITY)

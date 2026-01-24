@@ -256,6 +256,27 @@ Products should be able to:
 5. **Step IDs**: Should step IDs be globally unique or procedure-scoped?
    - Design: Procedure-scoped, qualified by `procedure_id` + `step_index`
 
+6. **Event.rs Redesign for Procedure Execution** (HIGH PRIORITY)
+   - **Context**: Current `src/event.rs` was designed before LSP diagnostics and procedure execution
+   - **Problem**: May not fully support message passing needed for:
+     - Procedure execution events (see `procedure_execution.md`)
+     - Observable action detection (see `action_observable_schema.md`)
+     - LSP-style diagnostics and progress notifications
+     - Bidirectional communication (executor responses, corrections)
+   - **Current Event enum**: Only `Ping`, `Belief(BeliefEvent)`, `Focus(PerceptionEvent)`
+   - **Missing event types** (from procedure_execution.md):
+     - `proc_triggered`, `step_matched`, `proc_completed`, `proc_aborted`
+     - `prompt_response`, `deviation_detected`, `procedure_correction`
+     - `action_detected` (from action_observable_schema.md)
+   - **Questions**:
+     - Should Event enum expand to include procedure-specific variants?
+     - Should noet-procedures define its own Event type?
+     - How to integrate with LSP notifications (textDocument/publishDiagnostics pattern)?
+     - How to handle bidirectional events (server → client, client → server)?
+   - **Decision needed before**: Phase 2 (noet-procedures crate implementation)
+   - **Related**: Issue 15 (Filtered Event Streaming), Issue 11 (LSP), Issue 18 (Participant channel)
+   - **Status**: Needs design document or architectural decision before proceeding
+
 ## Migration Path
 
 ### Material to Move from Product Docs
