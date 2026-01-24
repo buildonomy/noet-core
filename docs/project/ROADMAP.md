@@ -279,6 +279,20 @@
 - Macro system for reusable content
 - Query language for complex graph queries
 
+#### Procedural Extensions
+- **[Issue 17: Extract noet-procedures Crate](./ISSUE_17_NOET_PROCEDURES_EXTRACTION.md)** (2-3 weeks, MEDIUM PRIORITY)
+  - Extract procedural execution functionality to separate crate
+  - Implement "as-run" tracking (template + context + execution record)
+  - Provide core redline system (deviation recording, not prediction)
+  - Depends on Issue 1 (Schema Registry)
+  - Note: `procedures.md` will be removed from noet-core - procedures become a runtime-registered schema
+
+- **[Issue 18: Extended Procedure Schemas](./ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md)** (1.5-2 weeks, MEDIUM PRIORITY)
+  - Observable action schema (`inference_hint` for passive detection)
+  - Prompt schema (interactive participant input)
+  - Extension points for observation producers and prompt renderers
+  - Depends on Issue 1 (Schema Registry) and Issue 17 (noet-procedures)
+
 #### Code Quality
 - **[Issue 14: Naming Improvements](./ISSUE_14_NAMING_IMPROVEMENTS.md)** (2-3 days, OPTIONAL)
   - Rename types to match compiler architecture analogy
@@ -331,7 +345,10 @@ Issues are numbered sequentially and tracked in `docs/project/ISSUE_XX_*.md`:
 - **Issue 11**: Basic LSP (v0.2.0)
 - **Issue 12**: Advanced LSP (v0.3.0)
 - **Issue 14**: Naming Improvements (pedagogical clarity) - Optional for v0.1.0, recommended before v1.0.0
-- **Issues 15+**: TBD (future work)
+- **Issue 15**: Filtered Event Streaming (v0.3.0)
+- **Issue 16**: Automerge Integration (v0.4.0)
+- **Issue 17**: Extract noet-procedures Crate (v0.5.0+, depends on Issue 1)
+- **Issue 18**: Extended Procedure Schemas (v0.5.0+, depends on Issue 1 and Issue 17)
 
 ### Issue States
 
@@ -360,6 +377,10 @@ v0.2.0 Dependencies:
 
 v0.3.0 Dependencies:
   Issue 11 (Basic LSP) → Issue 12 (Advanced LSP)
+
+v0.5.0+ Dependencies:
+  Issue 1 (Schema Registry) → Issue 17 (noet-procedures extraction)
+  Issue 17 (noet-procedures) → Issue 18 (extended schemas: observables + prompts)
 ```
 
 ## Backlog Management
