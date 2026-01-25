@@ -1,15 +1,15 @@
 //! Basic usage example for noet
 //!
 //! This example demonstrates:
-//! - Creating a BeliefSet
+//! - Creating a BeliefBase
 //! - Parsing documents from a directory
 //! - Querying the resulting graph
 //!
 //! Run with: cargo run --example basic_usage
 
 use noet_core::{
-    beliefset::BeliefSet,
-    codec::{BeliefSetParser, ParseDiagnostic},
+    beliefbase::BeliefBase,
+    codec::{DocumentCompiler, ParseDiagnostic},
     BuildonomyError,
 };
 use petgraph::visit::EdgeRef;
@@ -32,26 +32,26 @@ async fn main() -> Result<(), BuildonomyError> {
     // Create some example markdown documents
     create_example_documents(&docs_path)?;
 
-    // 2. Set up parser configuration
-    println!("2. Configuring parser...");
-    // 3. Create parser and parse all documents
+    // 2. Set up compiler configuration
+    println!("2. Configuring compiler...");
+    // 3. Create compiler and parse all documents
     println!("3. Parsing documents from {docs_path:?}...");
-    let mut parser = BeliefSetParser::simple(docs_path)?;
+    let mut compiler = DocumentCompiler::simple(docs_path)?;
 
     // Initial parse - this will do multiple passes to resolve forward references
-    let mut parse_results = parser.parse_all(BeliefSet::default()).await?;
+    let mut parse_results = compiler.parse_all(BeliefBase::default()).await?;
     let diagnostics: Vec<ParseDiagnostic> = parse_results
         .drain(..)
         .flat_map(|pr| pr.diagnostics)
         .collect();
 
-    println!("   ✓ Parsed {} nodes\n", parser.cache().states().len());
+    println!("   ✓ Parsed {} nodes\n", compiler.cache().states().len());
 
     // 4. Query the graph
     println!("4. Querying the graph:");
 
     // Get all document nodes
-    let doc_nodes: Vec<_> = parser
+    let doc_nodes: Vec<_> = compiler
         .cache()
         .states()
         .values()
@@ -67,18 +67,18 @@ async fn main() -> Result<(), BuildonomyError> {
     // 5. Explore relationships
     println!("5. Exploring relationships:");
     for node in &doc_nodes {
-        let edge_idx = parser.cache().bid_to_index(&node.bid);
+        let edge_idx = compiler.cache().bid_to_index(&node.bid);
         if let Some(idx) = edge_idx {
             println!("   Document '{}' links to:", node.display_title());
-            for edge in parser.cache().relations().as_graph().edges(idx) {
-                let source = parser.cache().relations().as_graph()[edge.source()];
-                let sink = parser.cache().relations().as_graph()[edge.target()];
+            for edge in compiler.cache().relations().as_graph().edges(idx) {
+                let source = compiler.cache().relations().as_graph()[edge.source()];
+                let sink = compiler.cache().relations().as_graph()[edge.target()];
                 let (other, direction) = if source == node.bid {
                     (sink, "↦")
                 } else {
                     (source, "↤")
                 };
-                if let Some(target) = parser.cache().states().get(&other) {
+                if let Some(target) = compiler.cache().states().get(&other) {
                     println!(
                         "     {} {} ({})",
                         direction,
@@ -101,7 +101,7 @@ async fn main() -> Result<(), BuildonomyError> {
     println!();
 
     // 7. Show diagnostics
-    println!("7. Parser diagnostics:");
+    println!("7. Compiler diagnostics:");
     if diagnostics.is_empty() {
         println!("   ✓ No issues found!");
     } else {
@@ -187,7 +187,7 @@ You should read the [[concepts]] first.
 ## Quick Start
 
 1. Install the library
-2. Create a BeliefSet
+2. Create a BeliefBase
 3. Parse your documents
 4. Query the graph
 
@@ -202,9 +202,9 @@ Return to the [[index]] for more topics.
         base_path.join("concepts.md"),
         r#"# Core Concepts
 
-## BeliefSet
+## BeliefBase
 
-A BeliefSet is a hypergraph that stores:
+A BeliefBase is a hypergraph that stores:
 - Nodes (documents, sections, metadata). Each node specifies its schema
 - Edges (relationships between nodes). Each edge has a type (currently Section, Epistemic, Pragmatic)
 - Nodes and Edges can each contain a schema-specific Payload (key-value data)
@@ -218,7 +218,7 @@ BID stands for Belief ID. Each node gets a unique identifier that:
 
 ## Multi-pass Compilation
 
-The parser makes multiple passes to resolve forward references,
+The compiler makes multiple passes to resolve forward references,
 similar to a compiler handling forward declarations.
 
 See [[getting-started]] to begin using these concepts.

@@ -226,7 +226,7 @@ noet-core/                    (new repository root)
      - `question` - User questions
      - `wontfix` - Intentional design decision
    - [ ] Create initial issues from roadmap:
-     - Issue: Improve parser ergonomics (convenience constructors)
+     - Issue: Improve compiler ergonomics (convenience constructors)
      - Issue: Add more examples
      - Issue: Performance benchmarks
      - Issue: WASM support improvements

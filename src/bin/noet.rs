@@ -8,7 +8,7 @@
 //! - `watch <path>`: Continuous file watching and parsing
 
 use clap::{Parser, Subcommand};
-use noet_core::{codec::parser::BeliefSetParser, event::Event, watch::WatchService};
+use noet_core::{codec::compiler::DocumentCompiler, event::Event, watch::WatchService};
 use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
 
 #[derive(Parser)]
@@ -63,21 +63,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Parsing: {:?}", path);
             }
 
-            // Create a simple parser without event transmission
-            let parser = BeliefSetParser::simple(&path)?;
+            // Create a simple compiler without event transmission
+            let compiler = DocumentCompiler::simple(&path)?;
 
             // Parse all documents
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let mut parser = parser;
-                // Use the accumulated BeliefSet as cache for parsing
-                let cache = parser.accumulator().set().clone();
-                parser.parse_all(cache).await?;
+                let mut compiler = compiler;
+                // Use the accumulated BeliefBase as cache for parsing
+                let cache = compiler.builder().doc_bb().clone();
+                compiler.parse_all(cache).await?;
 
                 // Get final stats
-                let stats = parser.stats();
+                let stats = compiler.stats();
 
                 println!("\n=== Parse Results ===");
                 println!("Primary queue: {}", stats.primary_queue_len);

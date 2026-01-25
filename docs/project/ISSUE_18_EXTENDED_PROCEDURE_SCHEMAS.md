@@ -365,7 +365,7 @@ stores_in_variable = "diameter_mm"
 
 - **action_observable_schema.md** - Unified observable action schema (includes Participant channel)
 - **procedure_execution.md** - Execution lifecycle
-- **beliefset_architecture.md** - BeliefNode structure
+- **beliefbase_architecture.md** - BeliefNode structure
 - **ISSUE_01_SCHEMA_REGISTRY.md** - Foundation
 - **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - Companion issue
 

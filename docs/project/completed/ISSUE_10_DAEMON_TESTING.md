@@ -7,7 +7,7 @@
 
 ## Summary
 
-Migrate `compiler.rs` to `watch.rs`, extract library patterns for file watching and database integration. The `compiler.rs` module was written before `parser.rs` and contains untested code. It uses product-specific language (`LatticeService`) for library patterns (`FileUpdateSyncer`, file watching, database sync) that should be documented and exposed as examples and as an executable that can be installed and run locally as a service or user-space executable. This issue determines what belongs in the library vs. product, creates working tests/examples/executables, and prepares these patterns for Issue 5 documentation.
+Migrate `compiler.rs` to `watch.rs`, extract library patterns for file watching and database integration. The `compiler.rs` (original `watch.rs`) module was written before `codec/compiler.rs` (and contains untested code. It uses product-specific language (`LatticeService`) for library patterns (`FileUpdateSyncer`, file watching, database sync) that should be documented and exposed as examples and as an executable that can be installed and run locally as a service or user-space executable. This issue determines what belongs in the library vs. product, creates working tests/examples/executables, and prepares these patterns for Issue 5 documentation.
 
 ## Goals
 
@@ -31,14 +31,14 @@ Migrate `compiler.rs` to `watch.rs`, extract library patterns for file watching 
 - `new()` - initializes runtime, db, config, codecs
 - `get_networks()` / `set_networks()` - network management
 - `get_focus()` / `set_focus()` - focus management (PRODUCT-SPECIFIC)
-- `enable_belief_network_syncer()` - sets up file watcher + parser
+- `enable_belief_network_syncer()` - sets up file watcher + compiler
 - `disable_belief_network_syncer()` - tears down watcher
 - `get_content()` / `set_content()` - content access
 - `get_states()` - query interface
 
 **FileUpdateSyncer** (lines 331-472):
-- Spawns two async tasks: parser thread + transaction thread
-- Parser thread: continuously processes `BeliefSetParser` queue
+- Spawns two async tasks: compiler thread + transaction thread
+- Compiler thread: continuously processes `DocumentCompiler` queue
 - Transaction thread: batches `BeliefEvent`s and syncs to database
 - Coordinates file watching → parsing → database sync pipeline
 
@@ -117,7 +117,7 @@ noet serve [--config]          # (Future: ISSUE_11) Background service
 
 4. **Test FileUpdateSyncer in Isolation** (1 day)
    - [ ] Create test: Initialize `FileUpdateSyncer` with temp directory
-   - [ ] Create test: Modify file, verify parser thread processes it
+   - [ ] Create test: Modify file, verify compiler thread processes it
    - [ ] Create test: Verify `BeliefEvent`s flow to transaction thread
    - [ ] Create test: Verify database sync completes
    - [ ] Create test: Multiple file changes, verify all processed
@@ -131,23 +131,23 @@ noet serve [--config]          # (Future: ISSUE_11) Background service
    - [ ] Create test: File modification triggers debouncer callback
    - [ ] Create test: Debouncer filters dot files correctly
    - [ ] Create test: Debouncer filters by codec extensions
-   - [ ] Create test: Parser queue gets updated on file change
+   - [ ] Create test: Compiler queue gets updated on file change
    - [ ] Create test: `disable_network_syncer()` tears down cleanly
-   - [ ] Verify no race conditions between debouncer and parser thread
+   - [ ] Verify no race conditions between debouncer and compiler thread
 
 6. **Test Database Synchronization** (0.5 days)
    - [ ] Create test: `perform_transaction()` batches multiple events
    - [ ] Create test: Events update database correctly
    - [ ] Create test: Transaction errors are handled gracefully
    - [ ] Create test: Event channel backpressure (if applicable)
-   - [ ] Verify database state matches parser cache after sync
+   - [ ] Verify database state matches builder cache after sync
    - [ ] Document transaction boundaries and consistency guarantees
 
 7. **Create CLI Tool: noet binary** (1 day)
    - [x] Create `src/bin/noet.rs` - CLI entry point using `clap`
    - [x] Implement `noet parse <path>` subcommand:
-     - One-shot parse using `BeliefSetParser::simple()`
-     - Display parser statistics
+     - One-shot parse using `DocumentCompiler::simple()`
+     - Display compiler statistics
      - Exit code based on error count (TODO: improve diagnostics display)
    - [x] Implement `noet watch <path>` subcommand:
      - Initialize `WatchService` in foreground
@@ -187,7 +187,7 @@ noet serve [--config]          # (Future: ISSUE_11) Background service
 
 **Unit Tests**:
 - `FileUpdateSyncer::new()` initializes correctly
-- Parser thread processes queue continuously
+- Compiler thread processes queue continuously
 - Transaction thread batches events correctly
 - Shutdown aborts threads cleanly
 - `WatchService` methods work correctly (rename from `LatticeService`)
@@ -332,7 +332,7 @@ noet serve [--config]          # (Future: ISSUE_11) Background service
 - Date: 2025-01-24
 - Added 240+ lines of module-level rustdoc to `src/watch.rs`
 - Created 4 doctest examples covering: Quick Start, File Watching, Network Management, Database Sync
-- Documented threading model with 3 per-network threads (watcher, parser, transaction)
+- Documented threading model with 3 per-network threads (watcher, compiler, transaction)
 - Documented synchronization points, shutdown semantics, error handling
 - All 10 doctests passing (4 new + 6 existing)
 - Status: Step 2 complete (tutorial documentation ready for soft open source)
@@ -365,7 +365,7 @@ noet serve [--config]          # (Future: ISSUE_11) Background service
 - **Code to migrate**: 
   - `src/compiler.rs` → `src/watch.rs` (rename entire module)
   - `rust_core/crates/lattice_service/src/commands.rs` → `src/commands.rs` (extract library operations)
-- **Pattern**: `src/codec/parser.rs` - `BeliefSetParser` integration points
+- **Pattern**: `src/codec/compiler.rs` - `DocumentCompiler` integration points
 - **Dependencies**: 
   - `notify-debouncer-full` - file watching
   - `tokio` - async runtime and task spawning

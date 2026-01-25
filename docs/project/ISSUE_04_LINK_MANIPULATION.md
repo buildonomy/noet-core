@@ -218,8 +218,8 @@ fn rebuild_title(user_title: &Option<String>, config: &RefConfig) -> String {
    - Parse title for Bref and config using simplified split approach
    - Update paths while preserving Bref
    - Auto-update link text when title changes (use old_context)
-3. Update `inject_context()` signature to accept `old_context: Option<&Beliefs>`
-4. Store old node state from stack_cache for comparison
+3. Update `inject_context()` signature to accept `old_context: Option<&BeliefGraph>`
+4. Store old node state from session_bb for comparison
 
 **Title Processing Strategy:**
 - Split title at first "noet:" occurrence
@@ -261,7 +261,7 @@ implementation notes above and use these implementation steps as inspiration.
 
 **File**: `src/codec/md.rs::inject_context(old_context, new_context)`
 
-- [ ] Update signature to accept `old_context: Option<&Beliefs>` from stack_cache
+- [ ] Update signature to accept `old_context: Option<&BeliefGraph>` from session_bb
 - [ ] For each link, resolve to target node:
   - Bref-only: `new_context.bref_to_bid()` → `new_context.get_node()`
   - Path+Bref: Try Bref first, fallback to path
@@ -309,7 +309,7 @@ implementation notes above and use these implementation steps as inspiration.
 **File**: `src/codec/md.rs`
 
 - [ ] Detect `[[Title]]` and `[[Title#Section]]` syntax
-- [ ] Resolve title to node via BeliefSet
+- [ ] Resolve title to node via BeliefBase
 - [ ] Extract section anchor if present
 - [ ] Generate standard markdown: `[Title](./path.md#section "noet:bref")`
 - [ ] Add diagnostic if title doesn't resolve
@@ -386,7 +386,7 @@ implementation notes above and use these implementation steps as inspiration.
 - If `noet-auto-title:true`: always update to new title (if changed)
 - If unspecified (default): update only if link text matches old target title
 - Preserve user-customized link text (default behavior)
-- Requires `old_context` from stack_cache
+- Requires `old_context` from session_bb
 </text>
 
 <old_text line=642>
@@ -469,7 +469,7 @@ implementation notes above and use these implementation steps as inspiration.
 - pulldown_cmark events: `Event::Start(Tag::Link { title: Option<CowStr> })`
 - Current parser: `codec/md.rs`
 - PathMap: `paths.rs`
-- Accumulator: `accumulator.rs::push()` and `parse_content()`
+- Builder: `builder.rs::push()` and `parse_content()`
 - Issue 3: Heading anchors and ID management
 - Issue 6: HTML generation adds `data-bref` attributes
 

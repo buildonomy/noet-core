@@ -8,7 +8,7 @@
 
 ## Summary
 
-Integrate HTML generation from Issue 6 into the `noet` CLI tool and daemon from Issue 10. Add `--html` flag to both one-shot parsing (`noet parse`) and continuous watching (`noet watch`), enabling static site generation workflows. When enabled, the parser runs parsed content through a configured markdown renderer and writes HTML output to a specified directory, maintaining the same directory structure as source documents.
+Integrate HTML generation from Issue 6 into the `noet` CLI tool and daemon from Issue 10. Add `--html` flag to both one-shot parsing (`noet parse`) and continuous watching (`noet watch`), enabling static site generation workflows. When enabled, the compiler runs parsed content through a configured markdown renderer and writes HTML output to a specified directory, maintaining the same directory structure as source documents.
 
 **User Experience**: 
 - `noet parse docs/ --html ./site` - one-shot: parse and generate HTML
@@ -82,7 +82,7 @@ show_metadata = true
 ```
 File Change Event
       ↓
-BeliefSetParser parses markdown
+DocumentCompiler parses markdown
       ↓
 Generate BeliefNode with BID
       ↓
@@ -101,14 +101,14 @@ Write to output_dir
 
 ### Integration Points
 
-**In `BeliefSetParser`**:
+**In `DocumentCompiler`**:
 ```rust
-pub struct BeliefSetParser {
+pub struct DocumentCompiler {
     // ... existing fields
     html_generator: Option<Arc<HtmlGenerator>>,
 }
 
-impl BeliefSetParser {
+impl DocumentCompiler {
     pub fn with_html_output(mut self, config: HtmlConfig) -> Self {
         self.html_generator = Some(Arc::new(HtmlGenerator::new(config)));
         self
@@ -119,7 +119,7 @@ impl BeliefSetParser {
 **In `FileUpdateSyncer`**:
 ```rust
 // After successful parse
-if let Some(html_gen) = &parser.html_generator {
+if let Some(html_gen) = &compiler.html_generator {
     let html = codec.generate_html(&content, &options)?;
     let output_path = html_gen.resolve_output_path(&source_path)?;
     html_gen.write_html(&output_path, &html).await?;
@@ -194,11 +194,11 @@ noet parse <path> [OPTIONS]
     --serve <port>       Start live reload server (with --html)
 ```
 
-### 3. Integrate with BeliefSetParser (0.5 days)
+### 3. Integrate with DocumentCompiler (0.5 days)
 
-**Update `src/codec/parser.rs`**:
+**Update `src/codec/compiler.rs`**:
 
-- [ ] Add `html_generator` field to `BeliefSetParser`
+- [ ] Add `html_generator` field to `DocumentCompiler`
 - [ ] Add `with_html_output()` builder method
 - [ ] Trigger HTML generation after successful parse
 - [ ] Handle HTML generation errors gracefully (don't block parsing)
@@ -457,7 +457,7 @@ async fn serve_html(output_dir: PathBuf, port: u16) {
 - **Code Changes**:
   - `src/html/` - new module for HTML generation
   - `src/bin/noet.rs` - add `--html` flag
-  - `src/codec/parser.rs` - integrate HTML generator
+  - `src/codec/compiler.rs` - integrate HTML generator
   - `src/daemon.rs` - HTML generation in FileUpdateSyncer
 - **Configuration**: `.noet/config.toml` - HTML generation settings
 - **Dependencies** (new):

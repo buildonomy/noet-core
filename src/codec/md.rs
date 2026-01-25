@@ -8,11 +8,11 @@ use pulldown_cmark_to_cmark::{
 use std::{
     borrow::Borrow, collections::VecDeque, mem::replace, ops::Range, result::Result, str::FromStr,
 };
-/// Utilities for parsing various document types into BeliefSets
+/// Utilities for parsing various document types into BeliefBases
 use toml_edit::value;
 
 use crate::{
-    beliefset::BeliefContext,
+    beliefbase::BeliefContext,
     codec::{
         lattice_toml::{detect_schema_from_path, ProtoBeliefNode},
         DocCodec,
@@ -206,7 +206,7 @@ fn check_for_link_and_push(
                 &title,
                 &link_data.id,
             ) {
-                // Regularize the key using the BeliefSet context, falling back to the original if it fails
+                // Regularize the key using the BeliefBase context, falling back to the original if it fails
                 let regularized = key
                     .regularize(ctx.belief_set(), ctx.node.bid)
                     .unwrap_or(key.clone());
@@ -522,7 +522,7 @@ impl MdCodec {
 impl DocCodec for MdCodec {
     /// convert proto,
     /// insert bid into source if proto.bid is none
-    /// rewrite links according to accumulator.set relations
+    /// rewrite links according to builder.doc_bb relations
     fn nodes(&self) -> Vec<ProtoBeliefNode> {
         self.current_events
             .iter()

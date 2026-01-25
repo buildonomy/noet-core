@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 use crate::{
-    beliefset::Beliefs,
+    beliefbase::BeliefGraph,
     config::NetworkRecord,
     properties::BeliefNode,
     query::{PaginatedQuery, ResultsPage},
@@ -17,7 +17,7 @@ pub enum Op {
     SetNetworks(Vec<NetworkRecord>),
     /// Update content at a specific path
     UpdateContent(String, String),
-    /// Return a BeliefSet corresponding to a paginated query
+    /// Return a BeliefBase corresponding to a paginated query
     GetStates(PaginatedQuery),
 }
 
@@ -49,9 +49,9 @@ pub struct OpPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OpResult {
     Ok,
-    Page(ResultsPage<Beliefs>),
+    Page(ResultsPage<BeliefGraph>),
     Networks(Vec<NetworkRecord>),
-    State(Beliefs),
+    State(BeliefGraph),
     NetworkState(String, BeliefNode),
 }
 

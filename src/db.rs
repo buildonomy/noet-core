@@ -1,9 +1,9 @@
 use crate::{
-    beliefset::{BeliefSet, Beliefs, BidGraph},
+    beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     error::BuildonomyError,
     event::BeliefEvent,
     properties::{BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
-    query::{push_string_expr, AsSql, BeliefCache, Expression},
+    query::{push_string_expr, AsSql, BeliefSource, Expression},
 };
 use futures_core::future::BoxFuture;
 use sqlx::Execute;
@@ -78,7 +78,7 @@ impl<'a> Transaction<'a> {
                 self.add_paths(net, vec![(path, *bid, order)]);
             }
             // For relations and nodes, these cases should handled by other, more atomic
-            // transactions. At least it is via Beliefsetaccumulator. Paths must be updated though.
+            // transactions. At least it is via GraphBuilder. Paths must be updated though.
             BeliefEvent::NodeRenamed(from, to, _) => {
                 self.rename_node(from, to);
             }
@@ -100,7 +100,7 @@ impl<'a> Transaction<'a> {
             }
             BeliefEvent::BuiltInTest => {
                 tracing::debug!(
-                    "BuiltInTest: All BeliefSet invariants *should* be true now but we're not checking."
+                    "BuiltInTest: All BeliefBase invariants *should* be true now but we're not checking."
                 );
             }
         }
@@ -306,18 +306,18 @@ impl DbConnection {
             states.len(),
             relations.0.edge_count()
         );
-        let bs = BeliefSet::new_unbalanced(states, relations, false);
+        let bs = BeliefBase::new_unbalanced(states, relations, false);
 
         bs.is_balanced()
     }
 }
 
-impl BeliefCache for DbConnection {
+impl BeliefSource for DbConnection {
     /// db eval sets should return the state of all relationships of the primary query --- both
     /// incoming or outgoing. This provides user's bidirectional awareness of how each belief is
     /// using and is used by other beliefs.
     #[tracing::instrument(skip(self))]
-    async fn eval_unbalanced(&self, expr: &Expression) -> Result<Beliefs, BuildonomyError> {
+    async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         let states = self.get_states(expr).await?;
         let relations = match !states.is_empty() {
             false => BidGraph::default(),
@@ -363,13 +363,13 @@ impl BeliefCache for DbConnection {
             }
         };
 
-        Ok(Beliefs { states, relations })
+        Ok(BeliefGraph { states, relations })
     }
     async fn eval_trace(
         &self,
         expr: &Expression,
         weight_filter: WeightSet,
-    ) -> Result<Beliefs, BuildonomyError> {
+    ) -> Result<BeliefGraph, BuildonomyError> {
         let states = self.get_states(expr).await?;
         let relations = match !states.is_empty() {
             false => BidGraph::default(),
@@ -406,7 +406,7 @@ impl BeliefCache for DbConnection {
             }
         };
 
-        Ok(Beliefs { states, relations })
+        Ok(BeliefGraph { states, relations })
     }
 }
 

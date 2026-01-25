@@ -87,11 +87,11 @@ tokio = { version = "1.40", features = ["fs", "rt-multi-thread"] }
 
 **Documented 3 threads per network**:
 1. **File Watcher Thread** - Monitors filesystem, debounces (300ms), filters
-2. **Parser Thread** - Continuous parsing loop, processes queue
+2. **Compiler Thread** - Continuous parsing loop, processes queue
 3. **Transaction Thread** - Batches events, updates database
 
 **Synchronization points**:
-- Parse queue (parser blocks when empty)
+- Parse queue (compiler blocks when empty)
 - Event channel (transaction thread blocks on receiver)
 - Database lock (serializes writes)
 - Watcher mutex (guards watcher map)

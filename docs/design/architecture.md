@@ -2,7 +2,7 @@
 
 **Purpose**: High-level overview of noet-core's architecture for developers getting started with the library.
 
-**For detailed specifications**, see [`design/beliefset_architecture.md`](./design/beliefset_architecture.md).
+**For detailed specifications**, see [`design/beliefbase_architecture.md`](./design/beliefbase_architecture.md).
 
 ## What is noet-core?
 
@@ -23,16 +23,16 @@ Source Files (*.md, *.toml)
     ↓
 ProtoBeliefNode (Intermediate Representation)
     ↓
-[Link] → Reference resolution via BeliefSetAccumulator
+[Link] → Reference resolution via GraphBuilder
     ↓
-BeliefSet (Compiled Hypergraph)
+BeliefBase (Compiled Hypergraph)
     ↓
 [Query/Traverse] → Application logic
 ```
 
-### 2. The BeliefSet: Your Document Graph
+### 2. The BeliefBase: Your Document Graph
 
-A **BeliefSet** is the compiled representation of your document network:
+A **BeliefBase** is the compiled representation of your document network:
 
 - **Nodes** (`BeliefNode`): Represent documents, sections, or custom entities
 - **Edges** (typed relationships): Connect nodes with semantic meaning
@@ -98,15 +98,15 @@ BeliefNode {
 
 ### Components
 
-**[`beliefset`](../src/beliefset.rs)**: Core hypergraph data structures
-- `BeliefSet`: Full-featured graph with indices and query operations
-- `Beliefs`: Lightweight transport structure (states + relations only)
+**[`beliefbase`](../src/beliefbase.rs)**: Core hypergraph data structures
+- `BeliefBase`: Full-featured graph with indices and query operations
+- `BeliefGraph`: Lightweight transport structure (states + relations only)
 - `BidGraph`: Underlying petgraph representation
 
 **[`codec`](../src/codec/mod.rs)**: Document parsing and synchronization
 - `DocCodec` trait: Pluggable parsers for different formats
-- `BeliefSetParser`: Queue-based multi-pass compilation orchestrator
-- `BeliefSetAccumulator`: Stateful builder for constructing BeliefSets
+- `DocumentCompiler`: Queue-based multi-pass compilation orchestrator
+- `GraphBuilder`: Stateful builder for constructing BeliefBases
 - Built-in codecs: `MdCodec` (Markdown), `TomlCodec` (TOML)
 
 **[`properties`](../src/properties.rs)**: Node and edge types
@@ -131,13 +131,13 @@ BeliefNode {
 ```
 1. File system changes detected
    ↓
-2. BeliefSetParser enqueues modified files
+2. DocumentCompiler enqueues modified files
    ↓
 3. DocCodec parses file → ProtoBeliefNodes
    ↓
-4. BeliefSetAccumulator resolves references → BeliefEvents
+4. GraphBuilder resolves references → BeliefEvents
    ↓
-5. BeliefSet updated, events published
+5. BeliefBase updated, events published
    ↓
 6. Application reacts to events, queries graph
 ```
@@ -160,7 +160,7 @@ pub enum ParseDiagnostic {
 }
 ```
 
-**Key concept**: Unresolved references are **diagnostics, not errors**. The parser tracks them and resolves automatically in subsequent passes.
+**Key concept**: Unresolved references are **diagnostics, not errors**. The compiler tracks them and resolves automatically in subsequent passes.
 
 ## Relationship to Prior Art
 

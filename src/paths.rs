@@ -1,5 +1,5 @@
 /// Defines [PathMapMap], and [PathMap], who's primary job is to generate and
-/// maintain relative paths between [BeliefNodes] within a [BeliefSet], even
+/// maintain relative paths between [BeliefNodes] within a [BeliefBase], even
 /// when the relations within that set are changing.
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 use petgraph::visit::{depth_first_search, Control, DfsEvent};
@@ -13,7 +13,7 @@ use std::{
 use url::Url;
 
 use crate::{
-    beliefset::BidGraph,
+    beliefbase::BidGraph,
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
     nodekey::{get_doc_path, to_anchor, trim_doc_path, trim_joiners, trim_path_sep, TRIM},
@@ -25,7 +25,7 @@ use crate::{
 
 /// `core::paths::PathMap::subtree` returns a `Vec<BeliefRow>`. `BeliefRow` contains the information
 /// necessary to render a belief node within the graph structure of a particular
-/// `BeliefSet::relations`` a hierarchical structure.
+/// `BeliefBase::relations`` a hierarchical structure.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BeliefRow {
     pub sink: Bid,
@@ -102,9 +102,9 @@ impl IdMap {
 
 /// [PathMap] generates unique relative paths between [crate::properties::BeliefNode]s based on the
 /// graph structure for a particular [crate::properties::WeightKind] within a
-/// [crate::beliefset::BeliefSet::relations] hypergraph.
+/// [crate::beliefbase::BeliefBase::relations] hypergraph.
 ///
-/// Since [crate::beliefset::BeliefSet::relations] storeas a [crate::beliefset::BidGraph]
+/// Since [crate::beliefbase::BeliefBase::relations] storeas a [crate::beliefbase::BidGraph]
 /// hypergraph, there are multiple possible relational path structures within the object. A PathMap
 /// generates a [crate::properties::WeightKind]-specific tree structure from the BidGraph, and
 /// assigns each node within that tree a unique path. This helps source documents reference node
@@ -147,10 +147,10 @@ pub struct PathMap {
 }
 
 /// [PathMapMap] serves as a central manager for all [PathMap] instances for a specific
-/// [crate::properties::WeightKind] within a [crate::beliefset::BeliefSet].
+/// [crate::properties::WeightKind] within a [crate::beliefbase::BeliefBase].
 ///
 /// It orchestrates the creation, storage, and updating of [PathMap]s, each corresponding to a
-/// distinct sub-network instantiated within the BeliefSet. Each
+/// distinct sub-network instantiated within the BeliefBase. Each
 /// [crate::properties::BeliefKind::Network] is similar to a separate hard drive, so PathMapMap is
 /// responsible for generating a 'Logical Drive' based off how each one of these networks is mounted
 /// to each other.
@@ -180,13 +180,13 @@ pub struct PathMap {
 /// **Usage:**
 ///
 /// `PathMapMap` is crucial for applications that need to:
-/// *   Render hierarchical views of [crate::beliefset::BeliefSet]s.
+/// *   Render hierarchical views of [crate::beliefbase::BeliefBase]s.
 /// *   Generate stable, relative URLs or paths for [crate::properties::BeliefNode]s.
 /// *   Track how entities are interconnected across different, potentially nested,
 ///     networks.
 ///
 /// It acts as the primary interface for querying and maintaining the overall
-/// navigable structure of a [crate::beliefset::BeliefSet].
+/// navigable structure of a [crate::beliefbase::BeliefBase].
 #[derive(Debug, Clone)]
 pub struct PathMapMap {
     map: BTreeMap<Bid, Arc<RwLock<PathMap>>>,
@@ -479,7 +479,7 @@ impl PathMapMap {
     }
 
     /// Process a queue of events and generate path mutation events
-    /// This is the main entry point for updating PathMaps based on BeliefSet events
+    /// This is the main entry point for updating PathMaps based on BeliefBase events
     pub fn process_event_queue(
         &mut self,
         events: &[&BeliefEvent],

@@ -21,9 +21,9 @@
 //! - **Multi-network management**: Watch multiple document networks simultaneously
 //!
 //! **Don't use WatchService** for:
-//! - One-shot parsing (use [`BeliefSetParser::simple()`](crate::codec::BeliefSetParser::simple) instead)
+//! - One-shot parsing (use [`DocumentCompiler::simple()`](crate::codec::DocumentCompiler::simple) instead)
 //! - Build scripts or short-lived commands (use direct parsing)
-//! - Applications without file watching needs (use parser directly)
+//! - Applications without file watching needs (use compiler directly)
 //!
 //! ## Quick Start
 //!
@@ -31,7 +31,7 @@
 //! use noet_core::{watch::WatchService, event::Event};
 //! use std::{sync::mpsc::channel, path::PathBuf};
 //!
-//! // Create event channel for receiving parser events
+//! // Create event channel for receiving compiler events
 //! let (tx, rx) = channel::<Event>();
 //!
 //! // Initialize service (creates its own runtime and database)
@@ -144,28 +144,28 @@
 //!    - Filters by codec extensions (.md, .toml, etc.)
 //!    - Ignores dot files (.git, .DS_Store)
 //!
-//! 2. **Parser Thread** (`FileUpdateSyncer::parser_handle`)
+//! 2. **Compiler Thread** (`FileUpdateSyncer::compiler_handle`)
 //!    - Runs continuous parsing loop
 //!    - Processes files from parse queue
 //!    - Emits `BeliefEvent`s to transaction thread
-//!    - Uses `BeliefSetParser` with incremental updates
+//!    - Uses `DocumentCompiler` with incremental updates
 //!
 //! 3. **Transaction Thread** (`FileUpdateSyncer::transaction_handle`)
-//!    - Receives `BeliefEvent`s from parser
+//!    - Receives `BeliefEvent`s from compiler
 //!    - Batches events into database transactions
 //!    - Updates SQLite database atomically
 //!    - Forwards events to main application via `event_tx`
 //!
 //! ### Synchronization Points
 //!
-//! - **Parse Queue**: Parser thread blocks on queue when empty
+//! - **Parse Queue**: Compiler thread blocks on queue when empty
 //! - **Event Channel**: Transaction thread blocks on event receiver
 //! - **Database Lock**: Transaction thread serializes database writes
 //! - **Watcher Mutex**: `BnWatchers` mutex guards watcher map access
 //!
 //! ### Shutdown
 //!
-//! - `disable_network_syncer()`: Aborts parser and transaction handles for specific network
+//! - `disable_network_syncer()`: Aborts compiler and transaction handles for specific network
 //! - Drop `WatchService`: Aborts all active watchers and threads
 //! - Threads abort gracefully via `JoinHandle::abort()`
 //!
@@ -204,7 +204,7 @@
 //! The `noet` CLI uses `WatchService` for continuous parsing:
 //!
 //! ```bash
-//! # One-shot parse (uses BeliefSetParser::simple)
+//! # One-shot parse (uses DocumentCompiler::simple)
 //! noet parse /path/to/network
 //!
 //! # Continuous watching (uses WatchService)
@@ -236,19 +236,19 @@
 //!
 //! ## See Also
 //!
-//! - [`BeliefSetParser`](crate::codec::BeliefSetParser) - The underlying parser
+//! - [`DocumentCompiler`](crate::codec::DocumentCompiler) - The underlying compiler
 //! - [`Event`] - Events emitted by the service
 //! - [`DbConnection`](crate::db::DbConnection) - Database connection wrapper
 //! - [`LatticeConfigProvider`](crate::config::LatticeConfigProvider) - Configuration interface
 
 use crate::{
-    beliefset::Beliefs,
-    codec::{lattice_toml::ProtoBeliefNode, parser::BeliefSetParser, CodecMap},
+    beliefbase::BeliefGraph,
+    codec::{compiler::DocumentCompiler, lattice_toml::ProtoBeliefNode, CodecMap},
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
     event::{BeliefEvent, Event},
-    query::{BeliefCache, PaginatedQuery, Query, ResultsPage},
+    query::{BeliefSource, PaginatedQuery, Query, ResultsPage},
 };
 
 use notify_debouncer_full::{
@@ -286,7 +286,7 @@ type NetworkWatcherMap = HashMap<PathBuf, WatcherWithSyncer>;
 struct BnWatchers(pub Arc<Mutex<NetworkWatcherMap>>);
 
 #[derive(Default)]
-struct PaginationCache(pub Arc<RwLock<HashMap<Query, (SystemTime, Beliefs)>>>);
+struct PaginationCache(pub Arc<RwLock<HashMap<Query, (SystemTime, BeliefGraph)>>>);
 
 pub struct WatchService {
     watchers: Arc<Mutex<BnWatchers>>,
@@ -406,7 +406,7 @@ impl WatchService {
     pub async fn get_states(
         &self,
         pq: PaginatedQuery,
-    ) -> Result<ResultsPage<Beliefs>, BuildonomyError> {
+    ) -> Result<ResultsPage<BeliefGraph>, BuildonomyError> {
         let (mut maybe_page, pagination_complete) = {
             while self.pagination_cache.lock().0.is_locked() {
                 tracing::info!("[client operation] Waiting for read access to query cache");
@@ -475,7 +475,7 @@ impl WatchService {
             &self.runtime,
         )?;
 
-        let parser_ref = network_syncer.parser.clone();
+        let compiler_ref = network_syncer.compiler.clone();
         let debouncer_codec_extensions = self.codecs.extensions();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
@@ -514,21 +514,21 @@ impl WatchService {
 
                                     if !sync_paths.is_empty() {
                                         // Enqueue changed files for re-parsing
-                                        while parser_ref.is_locked() {
+                                        while compiler_ref.is_locked() {
                                             tracing::debug!(
-                                                "[Debouncer] Waiting for write access to parser"
+                                                "[Debouncer] Waiting for write access to compiler"
                                             );
                                             std::thread::sleep(Duration::from_millis(100));
                                         }
-                                        let mut parser = parser_ref.write();
+                                        let mut compiler = compiler_ref.write();
                                         for path in sync_paths {
                                             tracing::info!(
                                                 "[Debouncer] File changed, enqueuing for re-parse: {:?}",
                                                 path
                                             );
                                             // Reset processed count to allow re-parsing
-                                            parser.reset_processed(path);
-                                            parser.enqueue(path);
+                                            compiler.reset_processed(path);
+                                            compiler.enqueue(path);
                                         }
                                     }
                                 }
@@ -556,7 +556,7 @@ impl WatchService {
         let mut watchers = binding.0.lock();
         if let Some((mut debouncer, update_syncer)) = watchers.remove(repo_path) {
             let unwatch_res = debouncer.watcher().unwatch(repo_path);
-            update_syncer.parser_handle.abort();
+            update_syncer.compiler_handle.abort();
             update_syncer.transaction_handle.abort();
             tracing::debug!("Unwatch_res(path: {:?}) = {:?}", repo_path, unwatch_res);
             unwatch_res?;
@@ -566,8 +566,8 @@ impl WatchService {
 }
 
 pub(crate) struct FileUpdateSyncer {
-    pub parser: Arc<RwLock<BeliefSetParser>>,
-    pub parser_handle: JoinHandle<Result<(), BuildonomyError>>,
+    pub compiler: Arc<RwLock<DocumentCompiler>>,
+    pub compiler_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
 }
 
@@ -575,7 +575,7 @@ impl FileUpdateSyncer {
     #[tracing::instrument(skip_all)]
     pub(crate) fn new(
         _codecs: CodecMap,
-        global_cache: &DbConnection,
+        global_bb: &DbConnection,
         tx: &Sender<Event>,
         root: &Path,
         notify: bool,
@@ -583,44 +583,46 @@ impl FileUpdateSyncer {
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
-        // Create the parser with the event channel
-        let parser = Arc::new(RwLock::new(BeliefSetParser::new(
+        // Create the compiler with the event channel
+        let compiler = Arc::new(RwLock::new(DocumentCompiler::new(
             root,
             Some(accum_tx),
             Some(3), // max_reparse_count
             true,    // write rewritten content back to files
         )?));
 
-        let parser_ref = parser.clone();
-        let parser_global_cache = global_cache.clone();
+        let compiler_ref = compiler.clone();
+        let compiler_global_bb = global_bb.clone();
         let transaction_events = Arc::new(RwLock::new(accum_rx));
-        let transaction_global_cache = global_cache.clone();
+        let transaction_global_bb = global_bb.clone();
         let transaction_tx = tx.clone();
 
-        // doc_parser thread
-        let parser_handle = runtime.spawn(async move {
-            tracing::info!("[BeliefSetParser] Starting parser thread");
+        // doc_compiler thread
+        let compiler_handle = runtime.spawn(async move {
+            tracing::info!("[DocumentCompiler] Starting compiler thread");
 
             loop {
                 // Check if there's work to do
                 let has_pending = {
-                    while parser_ref.is_locked_exclusive() {
-                        tracing::debug!("[BeliefSetParser] Waiting for read access to parser");
+                    while compiler_ref.is_locked_exclusive() {
+                        tracing::debug!("[DocumentCompiler] Waiting for read access to compiler");
                         sleep(Duration::from_millis(100)).await;
                     }
-                    let parser_read = parser_ref.read_arc();
-                    parser_read.has_pending()
+                    let compiler_read = compiler_ref.read_arc();
+                    compiler_read.has_pending()
                 };
 
                 if has_pending {
                     // Parse next document
                     let parse_result = {
-                        while parser_ref.is_locked() {
-                            tracing::debug!("[BeliefSetParser] Waiting for write access to parser");
+                        while compiler_ref.is_locked() {
+                            tracing::debug!(
+                                "[DocumentCompiler] Waiting for write access to compiler"
+                            );
                             sleep(Duration::from_millis(100)).await;
                         }
-                        let mut parser_write = parser_ref.write_arc();
-                        parser_write.parse_next(parser_global_cache.clone()).await
+                        let mut compiler_write = compiler_ref.write_arc();
+                        compiler_write.parse_next(compiler_global_bb.clone()).await
                     };
 
                     match parse_result {
@@ -646,7 +648,7 @@ impl FileUpdateSyncer {
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!("[BeliefSetParser] Queue is empty");
+                            tracing::debug!("[DocumentCompiler] Queue is empty");
                             sleep(Duration::from_secs(1)).await;
                         }
                         Err(e) => {
@@ -662,7 +664,7 @@ impl FileUpdateSyncer {
             }
         });
 
-        // transaction accumulator/executor thread
+        // transaction builder/executor thread
         let transaction_handle = runtime.spawn(async move {
             loop {
                 let is_empty = {
@@ -678,7 +680,7 @@ impl FileUpdateSyncer {
                 if !is_empty {
                     match perform_transaction(
                         transaction_events.clone(),
-                        transaction_global_cache.clone(),
+                        transaction_global_bb.clone(),
                         transaction_tx.clone(),
                         notify,
                     )
@@ -700,8 +702,8 @@ impl FileUpdateSyncer {
         });
 
         let syncer = FileUpdateSyncer {
-            parser,
-            parser_handle,
+            compiler,
+            compiler_handle,
             transaction_handle,
         };
         Ok(syncer)
@@ -710,7 +712,7 @@ impl FileUpdateSyncer {
 
 async fn perform_transaction(
     rx_lock: Arc<RwLock<UnboundedReceiver<BeliefEvent>>>,
-    global_cache: DbConnection,
+    global_bb: DbConnection,
     tx: Sender<Event>,
     notify: bool,
 ) -> Result<(), BuildonomyError> {
@@ -750,8 +752,8 @@ async fn perform_transaction(
         }
     }
     if transaction.staged > 0 {
-        transaction.execute(&global_cache.0).await?;
-        match global_cache.is_db_balanced().await {
+        transaction.execute(&global_bb.0).await?;
+        match global_bb.is_db_balanced().await {
             Ok(_) => tracing::debug!("Global DB Cache is balanced"),
             Err(e) => tracing::warn!("Global DB Cache is Not Balanced. Errors: {}", e),
         };

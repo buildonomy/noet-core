@@ -1,6 +1,6 @@
 use petgraph::{visit::EdgeRef, Direction};
 use serde::{Deserialize, Serialize};
-/// Utilities for parsing various document types into BeliefSets
+/// Utilities for parsing various document types into BeliefBases
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -9,11 +9,11 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc::UnboundedSender, time::sleep};
-/// Utilities for parsing various document types into BeliefSets
+/// Utilities for parsing various document types into BeliefBases
 use toml::value::Table as TomlTable;
 
 use crate::{
-    beliefset::{BeliefSet, Beliefs},
+    beliefbase::{BeliefBase, BeliefGraph},
     codec::{
         diagnostic::ParseDiagnostic,
         lattice_toml::{ProtoBeliefNode, NETWORK_CONFIG_NAME},
@@ -27,7 +27,7 @@ use crate::{
         buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight,
         WeightKind, WEIGHT_SORT_KEY,
     },
-    query::{BeliefCache, Expression, Query},
+    query::{BeliefSource, Expression, Query},
 };
 
 use super::UnresolvedReference;
@@ -93,27 +93,27 @@ impl ParseContentResult {
 }
 
 #[derive(Debug)]
-pub struct BeliefSetAccumulator {
+pub struct GraphBuilder {
     // pub parsed_content: BTreeSet<Bid>,
     // pub parsed_structure: BTreeSet<Bid>,
-    set: BeliefSet,
+    doc_bb: BeliefBase,
     repo: Bid,
     repo_root: PathBuf,
     stack: Vec<(Bid, String, usize)>,
-    stack_cache: BeliefSet,
+    session_bb: BeliefBase,
     tx: UnboundedSender<BeliefEvent>,
 }
 
-/// BeliefSetAccumulator collects source material, parses it into a BeliefSet representation, maps
+/// GraphBuilder collects source material, parses it into a BeliefBase representation, maps
 /// that to the last-known representation of the set in order to determine consistent state and
 /// relation IDs and weights, and finally publishes updated versions of the set back to the source
-/// material as well as to the provided global_cache [BeliefCache] implementation.
+/// material as well as to the provided global_bb [BeliefSource] implementation.
 ///
-/// A core responsibility of the accumulator is to integrate relative file paths, arbitrary document
+/// A core responsibility of the builder is to integrate relative file paths, arbitrary document
 /// structures, and other arbitrary API formats, as well as the URL schema/protocol into a unified
 /// relative or absolute identification for each node referenced within a BeliefNetwork.
 ///
-/// The accumulator is responsible for tracking changes to this mapping, such that when beliefs are
+/// The builder is responsible for tracking changes to this mapping, such that when beliefs are
 /// added, removed, changed, or moved, the relative links within the source documents and the cache
 /// itself are changed to stay consistent with those updates.
 ///
@@ -124,7 +124,7 @@ pub struct BeliefSetAccumulator {
 /// This creates an environment where action works top-down, from executing intentions using the
 /// configured procedures, as well as bottom up, where mutations of integrated sub-systems percolate
 /// into events that the containing-processes must adapt to.
-impl BeliefSetAccumulator {
+impl GraphBuilder {
     pub fn new<P>(
         repo_path: P,
         mut maybe_tx: Option<UnboundedSender<BeliefEvent>>,
@@ -137,7 +137,7 @@ impl BeliefSetAccumulator {
             true => Ok(()),
             false => {
                 let invalid_err = BuildonomyError::Codec(format!(
-                    "BeliefSetAccumulator initialization failed. Received root path {repo_root:?}. \
+                    "GraphBuilder initialization failed. Received root path {repo_root:?}. \
                      Expected a directory or path to a {NETWORK_CONFIG_NAME} file"
                 ));
                 if let Some(path_name) = repo_root.file_name() {
@@ -158,7 +158,7 @@ impl BeliefSetAccumulator {
         let tx = match maybe_tx.take() {
             Some(tx) => tx,
             None => {
-                tracing::warn!("Accumulator was initialized without an output event transmitter, stubbing out a process to swallow parsing events");
+                tracing::warn!("Builder was initialized without an output event transmitter, stubbing out a process to swallow parsing events");
                 let (accum_tx, mut accum_rx) =
                     tokio::sync::mpsc::unbounded_channel::<BeliefEvent>();
                 std::thread::spawn(move || {
@@ -178,38 +178,38 @@ impl BeliefSetAccumulator {
             }
         };
 
-        let accum = BeliefSetAccumulator {
+        let accum = GraphBuilder {
             // parsed_content: BTreeSet::default(),
             // parsed_structure: BTreeSet::default(),
-            set: BeliefSet::empty(),
+            doc_bb: BeliefBase::empty(),
             repo: Bid::nil(),
             repo_root,
             stack: Vec::default(),
-            stack_cache: BeliefSet::empty(),
+            session_bb: BeliefBase::empty(),
             tx,
         };
 
         tracing::info!(
-            "Initializing BeliefSetAccumulator for repo_path: {:?}",
+            "Initializing GraphBuilder for repo_path: {:?}",
             repo_path.as_ref()
         );
         Ok(accum)
     }
 
     pub fn api(&self) -> &BeliefNode {
-        self.set.api()
+        self.doc_bb.api()
     }
 
     pub fn repo(&self) -> Bid {
         self.repo
     }
 
-    pub fn set(&self) -> &BeliefSet {
-        &self.set
+    pub fn doc_bb(&self) -> &BeliefBase {
+        &self.doc_bb
     }
 
-    pub fn stack_cache(&self) -> &BeliefSet {
-        &self.stack_cache
+    pub fn session_bb(&self) -> &BeliefBase {
+        &self.session_bb
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -218,15 +218,15 @@ impl BeliefSetAccumulator {
 
     pub fn built_in_test(&mut self) -> Vec<String> {
         let mut combined_errors = Vec::default();
-        let mut set_errors = self.set.built_in_test(true);
+        let mut set_errors = self.doc_bb.built_in_test(true);
         if !set_errors.is_empty() {
-            combined_errors.push("accumulator.set errors:".to_string());
+            combined_errors.push("builder.doc_bb errors:".to_string());
             combined_errors.append(&mut set_errors);
         }
-        let mut stack_cache_errors = self.stack_cache.built_in_test(true);
-        if !stack_cache_errors.is_empty() {
-            combined_errors.push("accumulator.stack_cache errors:".to_string());
-            combined_errors.append(&mut stack_cache_errors);
+        let mut session_bb_errors = self.session_bb.built_in_test(true);
+        if !session_bb_errors.is_empty() {
+            combined_errors.push("builder.session_bb errors:".to_string());
+            combined_errors.append(&mut session_bb_errors);
         }
         set_errors
     }
@@ -242,17 +242,17 @@ impl BeliefSetAccumulator {
     ///
     pub async fn parse_content<
         P: AsRef<std::path::Path> + std::fmt::Debug,
-        B: BeliefCache + Clone,
+        B: BeliefSource + Clone,
     >(
         &mut self,
         input_path: P,
         content: String,
-        global_cache: B,
+        global_bb: B,
     ) -> Result<ParseContentResult, BuildonomyError> {
         tracing::debug!("Phase 0: initialize stack");
         let mut full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let initial = self
-            .initialize_stack(input_path.as_ref(), global_cache.clone())
+            .initialize_stack(input_path.as_ref(), global_bb.clone())
             .await?;
 
         let mut maybe_content: Option<String> = None;
@@ -293,18 +293,18 @@ impl BeliefSetAccumulator {
             parsed_bids = Vec::with_capacity(codec.nodes().len());
             let mut check_sinks = BTreeMap::<Bid, BTreeSet<NodeKey>>::default();
             let mut relation_event_queue = Vec::<BeliefEvent>::default();
-            let mut missing_structure = Beliefs::default();
+            let mut missing_structure = BeliefGraph::default();
 
             tracing::debug!("Phase 1: Create all nodes");
             debug_assert!(
-                self.stack_cache.is_balanced().is_ok(),
-                "Why isn't stack_cache balanced? (phase 1 start)"
+                self.session_bb.is_balanced().is_ok(),
+                "Why isn't session_bb balanced? (phase 1 start)"
             );
             for proto in codec.nodes().iter() {
                 let (bid, (source, _nodekeys, unique_oldkeys)) = self
                     .push(
                         proto,
-                        global_cache.clone(),
+                        global_bb.clone(),
                         false,
                         &mut relation_event_queue,
                         &mut missing_structure,
@@ -312,20 +312,20 @@ impl BeliefSetAccumulator {
                     .await?;
                 if !missing_structure.is_empty() {
                     tracing::debug!(
-                        "Phase 1 {}: merging missing structure onto self.stack_cache",
+                        "Phase 1 {}: merging missing structure onto self.session_bb",
                         bid
                     );
-                    // Don't merge missing_structure into self.set here -- we want to preserve the
+                    // Don't merge missing_structure into self.doc_bb here -- we want to preserve the
                     // relations we're building up from the parse
-                    self.stack_cache.merge(&missing_structure);
+                    self.session_bb.merge(&missing_structure);
                     // We did a bunch of cache_fetch operations, so the stack cache should be
                     // rebalanced as well.
-                    self.stack_cache.process_event(&BeliefEvent::BalanceCheck)?;
-                    missing_structure = Beliefs::default();
+                    self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
+                    missing_structure = BeliefGraph::default();
                 }
 
                 for edge_update in relation_event_queue.drain(..) {
-                    let _deriv = self.set.process_event(&edge_update)?;
+                    let _deriv = self.doc_bb.process_event(&edge_update)?;
                 }
                 if !source.is_from_cache() {
                     inject_context = true;
@@ -348,7 +348,7 @@ impl BeliefSetAccumulator {
                 parsed_bids.push(bid);
             }
 
-            self.set.process_event(&BeliefEvent::BalanceCheck)?;
+            self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
             tracing::debug!("Phase 2: Balance and process relations");
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
@@ -362,7 +362,7 @@ impl BeliefSetAccumulator {
                             bid,
                             Direction::Incoming, // upstream_relations are sink-owned
                             index,
-                            global_cache.clone(),
+                            global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
                         )
@@ -391,7 +391,7 @@ impl BeliefSetAccumulator {
                             bid,
                             Direction::Outgoing, // downstream_relations are source-owned
                             index,
-                            global_cache.clone(),
+                            global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
                         )
@@ -414,18 +414,18 @@ impl BeliefSetAccumulator {
             // Perform this after going through all the proto relations so we don't destroy our
             // balanced set.
             if !missing_structure.is_empty() {
-                tracing::debug!("Phase 2: merging missing structure onto stack_cache and set");
-                self.stack_cache.merge(&missing_structure);
-                self.stack_cache.process_event(&BeliefEvent::BalanceCheck)?;
-                // we need to merge this phase 2 missing structure into self.set as well to ensure
+                tracing::debug!("Phase 2: merging missing structure onto session_bb and set");
+                self.session_bb.merge(&missing_structure);
+                self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
+                // we need to merge this phase 2 missing structure into self.doc_bb as well to ensure
                 // we have full structural paths to all the external nodes we connect to within the
                 // relation_event_queue
-                self.set.merge(&missing_structure);
+                self.doc_bb.merge(&missing_structure);
             }
             for edge_update in relation_event_queue.drain(..) {
-                let _deriv = self.set.process_event(&edge_update)?;
+                let _deriv = self.doc_bb.process_event(&edge_update)?;
             }
-            self.set.process_event(&BeliefEvent::BalanceCheck)?;
+            self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
             tracing::debug!(
                 "Phase 3: inform external sinks about nodekey changes from this document"
@@ -434,15 +434,15 @@ impl BeliefSetAccumulator {
             // 1) update their contents to reflect updated nodekey's from this parsed document.
             if !parsed_bids.is_empty() {
                 for (source_bid, _old_keys) in check_sinks.iter() {
-                    if let Some(source_idx) = self.stack_cache.bid_to_index(source_bid) {
-                        let stack_paths_guard = self.stack_cache.paths();
+                    if let Some(source_idx) = self.session_bb.bid_to_index(source_bid) {
+                        let stack_paths_guard = self.session_bb.paths();
                         let mut sink_docs = self
-                            .stack_cache
+                            .session_bb
                             .relations()
                             .as_graph()
                             .edges_directed(source_idx, Direction::Outgoing)
                             .filter_map(|edge| {
-                                let sink = self.stack_cache.relations().as_graph()[edge.target()];
+                                let sink = self.session_bb.relations().as_graph()[edge.target()];
                                 stack_paths_guard.get_doc(&sink)
                             })
                             .collect::<Vec<_>>();
@@ -468,7 +468,7 @@ impl BeliefSetAccumulator {
             if inject_context {
                 for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                     let ctx = self
-                        .set
+                        .doc_bb
                         .get_context(bid)
                         .expect("Set should be balanced here");
                     // Inject proto text into our self set here, because inject context is where the
@@ -476,7 +476,7 @@ impl BeliefSetAccumulator {
                     // it changes the markdown itself due to the injected context.
                     if let Some(updated_node) = codec.inject_context(proto, &ctx)? {
                         is_changed = true;
-                        let _derivatives = self.set.process_event(&BeliefEvent::NodeUpdate(
+                        let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
                                 bid: updated_node.bid,
                             }],
@@ -498,7 +498,7 @@ impl BeliefSetAccumulator {
             )));
         };
 
-        tracing::debug!("Phase 5: terminating stack and transmitting updates to global_cache");
+        tracing::debug!("Phase 5: terminating stack and transmitting updates to global_bb");
         self.terminate_stack(
             bid_renames,
             &BTreeSet::<Bid>::from_iter(parsed_bids.into_iter()),
@@ -512,31 +512,31 @@ impl BeliefSetAccumulator {
     }
 
     /// Initializes internal variables for parsing and merging
-    async fn initialize_stack<P: AsRef<Path> + Debug, B: BeliefCache + Clone>(
+    async fn initialize_stack<P: AsRef<Path> + Debug, B: BeliefSource + Clone>(
         &mut self,
         path: P,
-        global_cache: B,
+        global_bb: B,
     ) -> Result<ProtoBeliefNode, BuildonomyError> {
         // self.parsed_content.clear();
         // self.parsed_structure.clear();
         // self.parsed_structure.insert(self.api().bid);
         self.stack = vec![];
         // // Uncomment this for easier testing as it makes cache order of operations more clear.
-        // self.stack_cache = BeliefSet::empty();
-        self.set = BeliefSet::empty();
+        // self.session_bb = BeliefBase::empty();
+        self.doc_bb = BeliefBase::empty();
         let api_node = self.api().clone();
         let api_key = NodeKey::Bid { bid: api_node.bid };
         let api_node_event =
             BeliefEvent::NodeUpdate(vec![api_key.clone()], api_node.toml(), EventOrigin::Remote);
-        self.set.process_event(&api_node_event)?;
-        // Ensure global_cache shares our API node
+        self.doc_bb.process_event(&api_node_event)?;
+        // Ensure global_bb shares our API node
         //
-        // TODO figure out a way to do this check only once per Accumulator initialization instead
+        // TODO figure out a way to do this check only once per session instead
         // of at each initialize_stack operation.
-        if self.stack_cache.get(&api_key).is_none() {
-            self.stack_cache.process_event(&api_node_event)?;
+        if self.session_bb.get(&api_key).is_none() {
+            self.session_bb.process_event(&api_node_event)?;
         }
-        if global_cache.get_async(&api_key).await?.is_none() {
+        if global_bb.get_async(&api_key).await?.is_none() {
             self.tx.send(api_node_event)?;
         }
 
@@ -557,14 +557,14 @@ impl BeliefSetAccumulator {
         parent_path_stack.reverse();
         let maybe_content_parent_path = parent_path_stack.last();
         let mut maybe_content_parent_proto = None;
-        let mut missing_structure = Beliefs::default();
+        let mut missing_structure = BeliefGraph::default();
         let mut events = Vec::<BeliefEvent>::default();
         for path in parent_path_stack.iter() {
             let state_accum = ProtoBeliefNode::new(self.repo_root.as_path(), path.as_path())?;
             let (ancestor, (_source, _, _)) = self
                 .push(
                     &state_accum,
-                    global_cache.clone(),
+                    global_bb.clone(),
                     true,
                     &mut events,
                     &mut missing_structure,
@@ -575,28 +575,28 @@ impl BeliefSetAccumulator {
             }
             // Merge missing_structure after each push so it's available for the next iteration.
             if !missing_structure.is_empty() {
-                // Keep self.set isolated from the structure, that way we can ensure our comparison
+                // Keep self.doc_bb isolated from the structure, that way we can ensure our comparison
                 // between the source material and the cache stays consistent.
-                self.stack_cache.merge(&missing_structure);
-                missing_structure = Beliefs::default(); // reset for next interation
+                self.session_bb.merge(&missing_structure);
+                missing_structure = BeliefGraph::default(); // reset for next interation
             }
             if Some(path) == maybe_content_parent_path {
                 maybe_content_parent_proto = Some((ancestor, state_accum));
             }
         }
 
-        self.stack_cache.process_event(&BeliefEvent::BalanceCheck)?;
+        self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
-        // We can safely expect the beliefset to be balanced after after stack initialization
+        // We can safely expect the BeliefBase to be balanced after after stack initialization
         // tracing::debug!(
-        //     "processing {} events and adding to our self.set",
+        //     "processing {} events and adding to our self.doc_bb",
         //     events.len()
         // );
         for event in events.iter() {
-            self.set.process_event(event)?;
+            self.doc_bb.process_event(event)?;
         }
         events.clear();
-        self.set.process_event(&BeliefEvent::BalanceCheck)?;
+        self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // Initialize any child links found by the last state_accum. This ensures we can sort the
         // parsed_content's relation to its parent correctly
@@ -609,17 +609,17 @@ impl BeliefSetAccumulator {
                     &parent_bid,
                     Direction::Incoming, // upstream_relations are sink-owned
                     index,
-                    global_cache.clone(),
+                    global_bb.clone(),
                     &mut events,
                     &mut missing_structure,
                 )
                 .await?;
             }
             for event in events.iter() {
-                self.set.process_event(event)?;
+                self.doc_bb.process_event(event)?;
             }
             if !events.is_empty() {
-                self.set.process_event(&BeliefEvent::BalanceCheck)?;
+                self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
             }
         }
         Ok(initial)
@@ -634,19 +634,20 @@ impl BeliefSetAccumulator {
         self.stack.clear();
         // Ensure we operate on a balanced set
         let balance_check = BeliefEvent::BalanceCheck;
-        self.set.process_event(&balance_check)?;
+        self.doc_bb.process_event(&balance_check)?;
         // First, apply node renames in order to have a solid basis for our next operations
         let mut tx_events = Vec::new();
         for (from_bid, to_bid) in renamed_nodes.iter() {
             let rename_event = BeliefEvent::NodeRenamed(*from_bid, *to_bid, EventOrigin::Remote);
-            let mut derivatives = self.stack_cache.process_event(&rename_event)?;
+            let mut derivatives = self.session_bb.process_event(&rename_event)?;
             tx_events.push(rename_event);
             tx_events.append(&mut derivatives);
         }
-        let mut diff_events = BeliefSet::compute_diff(&self.stack_cache, &self.set, parsed_nodes)?;
+        let mut diff_events =
+            BeliefBase::compute_diff(&self.session_bb, &self.doc_bb, parsed_nodes)?;
         let mut path_events = Vec::new();
         for event in diff_events.iter() {
-            let derivative_events = self.stack_cache.process_event(event)?;
+            let derivative_events = self.session_bb.process_event(event)?;
             for derivative in derivative_events.into_iter() {
                 let insert_event = match &derivative {
                     BeliefEvent::PathAdded(..)
@@ -660,7 +661,7 @@ impl BeliefSetAccumulator {
                 }
             }
         }
-        self.stack_cache.process_event(&balance_check)?;
+        self.session_bb.process_event(&balance_check)?;
         diff_events.append(&mut path_events);
         tx_events.append(&mut diff_events);
         if !tx_events.is_empty() {
@@ -709,7 +710,7 @@ impl BeliefSetAccumulator {
             self.tx.send(event)?;
         }
         if !events_is_empty {
-            // tracing::debug!("Ensuring our global_cache is balanced");
+            // tracing::debug!("Ensuring our global_bb is balanced");
             tracing::debug!("{:?}", balance_check);
             self.tx.send(balance_check)?;
         }
@@ -763,30 +764,30 @@ impl BeliefSetAccumulator {
     /// old_unique) set of nodekeys for the node. If either is not empty, then this informs
     /// whether we need to rewrite the parsed content and/or inform documents that reference this
     /// content that they should change their references.
-    async fn push<B: BeliefCache + Clone>(
+    async fn push<B: BeliefSource + Clone>(
         &mut self,
         proto: &ProtoBeliefNode,
-        global_cache: B,
+        global_bb: B,
         as_trace: bool,
         event_queue: &mut Vec<BeliefEvent>,
-        missing_structure: &mut Beliefs,
+        missing_structure: &mut BeliefGraph,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
         let (parent_bid, path_info) = self.get_parent_from_stack(proto);
 
-        // Can't use self.set.paths() to generate keys here, because we can't assume that self.set
+        // Can't use self.doc_bb.paths() to generate keys here, because we can't assume that self.doc_bb
         // is balanced until we're out of phase 1 of parse_content.
 
         let mut parsed_node = BeliefNode::try_from(proto)?;
-        let mut keys = parsed_node.keys(Some(self.repo()), Some(parent_bid), self.set());
+        let mut keys = parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb());
 
         // On top of providing us with the old state of the node (if such a state exists), this will
-        // also update our stack_cache to include all the old relationships tied to this node. We
+        // also update our session_bb to include all the old relationships tied to this node. We
         // will use this info later in terminate_stack to determine what our "affected_sink" set is,
         // that is the set of nodes external to this parsed content that 'source' information from
         // this node that need to be informed about changes to the node's reference ids (it's set of
         // nodekeys).
         let cache_fetch_result = self
-            .cache_fetch(&keys, global_cache.clone(), true, missing_structure)
+            .cache_fetch(&keys, global_bb.clone(), true, missing_structure)
             .await?;
 
         let (mut node, source) = match cache_fetch_result {
@@ -833,19 +834,19 @@ impl BeliefSetAccumulator {
         let bid = node.bid;
 
         // We want parsed_node to be the source of truth for title, summary, and path. But we
-        // want cache_fetch node to be source of truth for bid If source is non-accumulator
+        // want cache_fetch node to be source of truth for bid If source is non-session
         // cache.
         if !as_trace {
-            // Clear all relationships in the accumulator for this node, this way we ensure the
+            // Clear all relationships in the doc_bb for this node, this way we ensure the
             // currently parsed content is processed as the source of truth for the node's content
             // and all relationships where it is the sink.
-            let mut remove_events = if let Some(node_idx) = self.set.bid_to_index(&node.bid) {
-                self.set
+            let mut remove_events = if let Some(node_idx) = self.doc_bb.bid_to_index(&node.bid) {
+                self.doc_bb
                     .relations()
                     .as_graph()
                     .edges_directed(node_idx, Direction::Incoming)
                     .map(|edge| {
-                        let source = self.set.relations().as_graph()[edge.source()];
+                        let source = self.doc_bb.relations().as_graph()[edge.source()];
                         BeliefEvent::RelationRemoved(source, node.bid, EventOrigin::Remote)
                     })
                     .collect::<Vec<BeliefEvent>>()
@@ -898,9 +899,9 @@ impl BeliefSetAccumulator {
         self.stack.push((bid, proto.path.clone(), proto.heading));
 
         if node.kind.is_network() {
-            // If the accumulator repo is nil, and this node is a network, and the
-            // stack is empty, then initialize the accumulator repo to this element.
-            // We don't do this operation in [BeliefAccumulator::new] because
+            // If the builder repo is nil, and this node is a network, and the
+            // stack is empty, then initialize the builder repo to this element.
+            // We don't do this operation in [GraphBuilder::new] because
             // reading the repo source is part of our async operations.
             if self.repo == Bid::nil() && parent_bid == self.api().bid {
                 tracing::debug!("Setting repo to {}", node.bid);
@@ -928,7 +929,7 @@ impl BeliefSetAccumulator {
         }
 
         let current_keys =
-            BTreeSet::from_iter(node.keys(Some(self.repo()), Some(parent_bid), self.set()));
+            BTreeSet::from_iter(node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb()));
 
         let unique_old = BTreeSet::from_iter(
             BTreeSet::from_iter(keys.into_iter())
@@ -947,7 +948,7 @@ impl BeliefSetAccumulator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn push_relation<B: BeliefCache + Clone>(
+    async fn push_relation<B: BeliefSource + Clone>(
         &mut self,
         other_key: &NodeKey,
         kind: &WeightKind,
@@ -955,14 +956,14 @@ impl BeliefSetAccumulator {
         owner_bid: &Bid,
         direction: Direction,
         index: usize,
-        global_cache: B,
+        global_bb: B,
         update_queue: &mut Vec<BeliefEvent>,
-        missing_structure: &mut Beliefs,
+        missing_structure: &mut BeliefGraph,
     ) -> Result<GetOrCreateResult, BuildonomyError> {
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
 
-        let other_key_regularized = other_key.regularize(&self.set, *owner_bid).expect(
+        let other_key_regularized = other_key.regularize(&self.doc_bb, *owner_bid).expect(
             "parse_content Phase 1 parsing ensures that we have a valid subsection \
             structure to get paths from for all our parsed nodes",
         );
@@ -976,7 +977,7 @@ impl BeliefSetAccumulator {
         weight.set(crate::properties::WEIGHT_OWNED_BY, owner).ok();
         // Translate relative paths into absolute paths and resolve the "other" node
         let cache_fetch_result = self
-            .cache_fetch(&other_keys, global_cache.clone(), true, missing_structure)
+            .cache_fetch(&other_keys, global_bb.clone(), true, missing_structure)
             .await?;
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
@@ -999,10 +1000,10 @@ impl BeliefSetAccumulator {
                 } {
                     // First reference to this http[s] schema link.
                     // First ensure we've installed the href network, do that if necessary.
-                    if !self.set.states().contains_key(&href_namespace()) {
+                    if !self.doc_bb.states().contains_key(&href_namespace()) {
                         let href_net_node = BeliefNode::href_network();
                         update_queue.push(BeliefEvent::NodeUpdate(
-                            href_net_node.keys(Some(buildonomy_namespace()), None, &self.set),
+                            href_net_node.keys(Some(buildonomy_namespace()), None, &self.doc_bb),
                             href_net_node.toml(),
                             EventOrigin::Remote,
                         ));
@@ -1024,7 +1025,7 @@ impl BeliefSetAccumulator {
                         id: Some(href.clone()),
                     };
                     update_queue.push(BeliefEvent::NodeUpdate(
-                        href_node.keys(Some(href_namespace()), None, &self.set),
+                        href_node.keys(Some(href_namespace()), None, &self.doc_bb),
                         href_node.toml(),
                         EventOrigin::Remote,
                     ));
@@ -1040,7 +1041,7 @@ impl BeliefSetAccumulator {
                     let mut unresolved = unresolved_initial.clone();
                     unresolved.direction = direction;
                     unresolved.self_bid = *owner_bid;
-                    let pmm_guard = self.set.paths();
+                    let pmm_guard = self.doc_bb.paths();
                     let (owner_home_net, owner_home_path) =
                     pmm_guard.api_map().home_path(owner_bid, &pmm_guard).expect(
                         "parse_content Phase 1 parsing ensures that we have a valid subsection \
@@ -1067,10 +1068,10 @@ impl BeliefSetAccumulator {
         //
         // - alyjak, 2025-03-07 (updated 2025-11-07)
         //
-        // First enqueue the node to add it to self.set if it's not already there
+        // First enqueue the node to add it to self.doc_bb if it's not already there
         if other_node_source != NodeSource::SourceFile {
             // We want to delineate between parsed sources and linked content. If we're not from the
-            // accumulator, color the other_node by Trace to ensure we can separate parsed content
+            // doc_bb, color the other_node by Trace to ensure we can separate parsed content
             // from referenced content.
             //
             // Note we perform a similar coloring to the missing structure in parse_content at the
@@ -1081,14 +1082,14 @@ impl BeliefSetAccumulator {
                 EventOrigin::Remote,
             ));
         }
-        // Next, make sure its substructure is available in self.set
+        // Next, make sure its substructure is available in self.doc_bb
         match other_node_source {
-            NodeSource::Merged => panic!(
-                "We should only produced NodeSource::Merged from BeliefSetAccumulator::push!"
-            ),
+            NodeSource::Merged => {
+                panic!("We should only produced NodeSource::Merged from GraphBuilder::push!")
+            }
             NodeSource::GlobalCache => {
                 // The missing_structure from cache_fetch has all the other node structure we
-                // need. We will merge that into self.set within parse_content before processing the
+                // need. We will merge that into self.doc_bb within parse_content before processing the
                 // event queue.
             }
             NodeSource::SourceFile | NodeSource::Generated => {
@@ -1098,17 +1099,17 @@ impl BeliefSetAccumulator {
 
             NodeSource::StackCache => {
                 // There is no missing structure with respect to the stack cache, but we do need to
-                // get missing structure from the stack cache to apply to self.set in order to
-                // maintain a balanced beliefset.
+                // get missing structure from the stack cache to apply to self.doc_bb in order to
+                // maintain a balanced BeliefBase.
                 let query = Query {
                     seed: Expression::from(&NodeKey::Bid {
                         bid: other_node.bid,
                     }),
                     traverse: None,
                 };
-                let stack_result = self.stack_cache.eval_query(&query, true).await?;
+                let stack_result = self.session_bb.eval_query(&query, true).await?;
                 // tracing::debug!(
-                //     "Returned stack_cache missing structure for query bid {}:\n{}",
+                //     "Returned session_bb missing structure for query bid {}:\n{}",
                 //     other_node.bid,
                 //     stack_result.display_contents()
                 // );
@@ -1140,18 +1141,18 @@ impl BeliefSetAccumulator {
         Ok(GetOrCreateResult::Resolved(other_node, other_node_source))
     }
 
-    async fn cache_fetch<B: BeliefCache + Clone>(
+    async fn cache_fetch<B: BeliefSource + Clone>(
         &mut self,
         keys: &Vec<NodeKey>,
-        global_cache: B,
+        global_bb: B,
         check_local: bool,
-        missing_structure: &mut Beliefs,
+        missing_structure: &mut BeliefGraph,
     ) -> Result<GetOrCreateResult, BuildonomyError> {
         let mut found_state: Option<BeliefNode> = None;
         let mut source = NodeSource::Generated;
         for key in keys.iter() {
             if check_local {
-                if let Some(existing_state) = self.set.get(key) {
+                if let Some(existing_state) = self.doc_bb.get(key) {
                     found_state = Some(existing_state);
                     source = NodeSource::SourceFile;
                     break;
@@ -1165,12 +1166,12 @@ impl BeliefSetAccumulator {
 
             // use eval_query in order to receive a balanced_set if/when we get a query hit on
             // one of our caches
-            let stack_result = BeliefSet::from(self.stack_cache.eval_query(&query, true).await?);
+            let stack_result = BeliefBase::from(self.session_bb.eval_query(&query, true).await?);
 
             // tracing::debug!(
-            //     "stack_result has {} nodes. stack_cache.is_balanced = {}",
+            //     "stack_result has {} nodes. session_bb.is_balanced = {}",
             //     stack_result.states().len(),
-            //     self.stack_cache.is_balanced(),
+            //     self.session_bb.is_balanced(),
             // );
 
             match stack_result.get(key) {
@@ -1181,10 +1182,10 @@ impl BeliefSetAccumulator {
                 }
                 None => {
                     let mut cache_update =
-                        BeliefSet::from(global_cache.eval_query(&query, false).await?);
+                        BeliefBase::from(global_bb.eval_query(&query, false).await?);
 
                     // tracing::debug!(
-                    //     "global_cache result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
+                    //     "global_bb result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
                     //     cache_update.states().len(),
                     //     cache_update.relations().as_graph().edge_count(),
                     //     cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")

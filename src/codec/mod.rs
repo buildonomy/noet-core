@@ -1,19 +1,19 @@
-//! Document parsing and integration into BeliefSets.
+//! Document parsing and integration into BeliefBases.
 //!
 //! This module provides the core parsing infrastructure for converting source documents
-//! (Markdown, TOML, etc.) into [`BeliefSet`](crate::beliefset::BeliefSet) graphs.
+//! (Markdown, TOML, etc.) into [`BeliefBase`](crate::beliefbase::BeliefBase) graphs.
 //!
 //! ## Key Components
 //!
-//! - [`BeliefSetAccumulator`] - Stateful parser that integrates documents into belief networks
-//! - [`BeliefSetParser`] - Orchestrates multi-pass compilation across multiple files
+//! - [`GraphBuilder`] - Stateful BeliefBase builder that integrates documents into belief networks
+//! - [`DocumentCompiler`] - Orchestrates multi-pass compilation across multiple files
 //! - [`DocCodec`] trait - Implement custom document parsers for new file formats
 //! - [`CodecMap`] - Global registry of available codecs (accessible via [`CODECS`])
 //! - [`ParseDiagnostic`] - Tracks unresolved references and parsing issues
 //!
 //! ## Multi-Pass Compilation
 //!
-//! The parser handles forward references through multi-pass resolution:
+//! The compiler handles forward references through multi-pass resolution:
 //!
 //! 1. **First Pass**: Parse all files, collect unresolved references
 //! 2. **Resolution Passes**: Reparse files once their dependencies are available
@@ -24,13 +24,13 @@
 //!
 //! ## Link Rewriting
 //!
-//! The accumulator automatically rewrites links in source documents to maintain consistency:
+//! The builder automatically rewrites links in source documents to maintain consistency:
 //!
 //! - Injects BIDs (Belief IDs) into documents that lack them
 //! - Updates link text when reference titles change
 //! - Maintains bi-directional reference tracking
 //!
-//! The private method `BeliefSetAccumulator::cache_fetch` contains the identity resolution details.
+//! The private method `GraphBuilder::cache_fetch` contains the identity resolution details.
 //!
 //! ## Built-in Codecs
 //!
@@ -40,7 +40,7 @@
 //! Register custom codecs via [`CodecMap::insert`]:
 //!
 //! ```rust
-//! use noet_core::{beliefset::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode}, properties::BeliefNode};
+//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode}, properties::BeliefNode};
 //!
 //! #[derive(Default, Clone)]
 //! struct MyCustomCodec;
@@ -50,7 +50,7 @@
 //!         &mut self,
 //!         // The source content to be parsed by the DocCodec implementation
 //!         content: String,
-//!         // Contains the accumulator root-path relative information to seed the parse with
+//!         // Contains the builder root-path relative information to seed the parse with
 //!         current: ProtoBeliefNode,
 //!     ) -> Result<(), BuildonomyError> {
 //!         todo!();
@@ -79,31 +79,31 @@
 //!
 //! For detailed information about the parsing architecture, including:
 //! - The "three sources of truth" (parsed document, local cache, global cache)
-//! - Two-cache architecture (`self.set` vs `stack_cache`)
+//! - Two-cache architecture (`self.doc_bb` vs `session_bb`)
 //! - Link resolution protocol and relative path handling
 //!
-//! See `docs/design/beliefset_architecture.md` (Section 3.2: The Codec System).
+//! See `docs/design/beliefbase_architecture.md` (Section 3.2: The Codec System).
 //!
 
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
-/// Utilities for parsing various document types into BeliefSets
+/// Utilities for parsing various document types into BeliefBases
 use std::{result::Result, sync::Arc, time::Duration};
 
-use crate::{beliefset::BeliefContext, error::BuildonomyError, properties::BeliefNode};
+use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
 
-pub mod accumulator;
+pub mod builder;
+pub mod compiler;
 pub mod diagnostic;
 pub mod lattice_toml;
 pub mod md;
-pub mod parser;
 pub mod schema_registry;
 
 // Re-export for backward compatibility
-pub use accumulator::BeliefSetAccumulator;
+pub use builder::GraphBuilder;
+pub use compiler::DocumentCompiler;
 pub use diagnostic::{ParseDiagnostic, UnresolvedReference};
 pub use lattice_toml::ProtoBeliefNode;
-pub use parser::BeliefSetParser;
 
 /// Global singleton codec map with builtin codecs (md, toml)
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
@@ -118,7 +118,7 @@ pub trait DocCodec: Sync {
         &mut self,
         // The source content to be parsed by the DocCodec implementation
         content: String,
-        // Contains the accumulator root-path relative information to seed the parse with
+        // Contains the builder root-path relative information to seed the parse with
         current: ProtoBeliefNode,
     ) -> Result<(), BuildonomyError>;
 

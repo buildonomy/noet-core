@@ -8,7 +8,7 @@
 
 ## Summary
 
-Implement basic Language Server Protocol (LSP) support for noet, enabling IDE integration with real-time diagnostics and hover information. This transforms noet from a CLI tool into a language with first-class editor support in VSCode, Zed, Neovim, and other LSP-compatible editors. The implementation adds position tracking to the parser, implements the LSP protocol using `tower-lsp`, and provides document synchronization between editor state and the daemon's parser cache.
+Implement basic Language Server Protocol (LSP) support for noet, enabling IDE integration with real-time diagnostics and hover information. This transforms noet from a CLI tool into a language with first-class editor support in VSCode, Zed, Neovim, and other LSP-compatible editors. The implementation adds position tracking to the compiler, implements the LSP protocol using `tower-lsp`, and provides document synchronization between editor state and the daemon's compiler cache.
 
 **User Experience**: Users edit markdown documents in their IDE, see parse errors as they type, hover over headings/links to see metadata (BID, node type, resolved references), and get immediate feedback on broken references.
 
@@ -16,7 +16,7 @@ Implement basic Language Server Protocol (LSP) support for noet, enabling IDE in
 
 ## Goals
 
-1. Add position and range tracking to parser (line/column for nodes, links, BIDs)
+1. Add position and range tracking to the DocCodec trait (proper extension point for all parsers)
 2. Implement LSP server using `tower-lsp` with JSON-RPC over stdio
 3. Provide document synchronization (didOpen, didChange, didSave, didClose)
 4. Publish diagnostics in real-time as documents change
@@ -51,7 +51,7 @@ Implement basic Language Server Protocol (LSP) support for noet, enabling IDE in
 ┌────────────────▼────────────────────────────────┐
 │  DaemonService (src/daemon.rs)                  │
 │  - Parses in-memory documents                   │
-│  - Maintains BeliefSet cache                    │
+│  - Maintains BeliefBase cache                   │
 │  - Generates diagnostics with ranges            │
 │  - Resolves cross-document references           │
 └─────────────────────────────────────────────────┘
@@ -59,16 +59,24 @@ Implement basic Language Server Protocol (LSP) support for noet, enabling IDE in
 
 ### Data Structures
 
-**Position and Range Tracking**:
+**Position Tracking Architecture**:
+
+Position information is kept separate from the domain model (BeliefNode) to avoid polluting core types with presentation concerns. Instead, positions are tracked at the codec and builder layers:
+
 ```rust
 use lsp_types::{Position, Range};
 
-pub struct BeliefNode {
-    pub bid: Bid,
-    pub title: String,
-    pub kind: BeliefKind,
-    pub range: Option<Range>,      // NEW: where node appears in source
-    // ... existing fields
+// NEW: Position index maintained by GraphBuilder during parse_content
+pub struct PositionIndex {
+    // Maps BID to its source range in the document
+    node_ranges: HashMap<Bid, Range>,
+    // Maps source positions to BIDs for reverse lookup
+    position_tree: IntervalTree<Range, Bid>,
+}
+
+impl PositionIndex {
+    pub fn get_range(&self, bid: &Bid) -> Option<Range>;
+    pub fn get_node_at_position(&self, line: u32, col: u32) -> Option<Bid>;
 }
 
 pub struct ParseDiagnostic {
@@ -78,13 +86,15 @@ pub struct ParseDiagnostic {
     // ... existing fields
 }
 
-// NEW: Track link positions for navigation
+// NEW: Track link positions for navigation (codec-specific)
 pub struct LinkPosition {
     pub range: Range,
     pub target: NodeKey,
     pub resolved: bool,
 }
 ```
+
+**Note**: BeliefNode remains unchanged - it's a domain model and shouldn't contain presentation-layer Range data.
 
 **LSP Server State**:
 ```rust
@@ -118,30 +128,65 @@ struct NoetLanguageServer {
 
 ## Implementation Steps
 
-### 1. Add Position Tracking to Parser (1-2 days)
+### 1. Add Position Tracking to DocCodec Trait (1-2 days)
 
-**Objective**: Track line/column positions for all parsed elements
+**Objective**: Extend the DocCodec trait to support position tracking while keeping domain model clean
 
-**Changes to `src/codec/parser.rs`**:
-- [ ] Add `Range` field to `BeliefNode`
-- [ ] Track line/column during markdown parsing
-- [ ] Store range for each heading, link, BID
-- [ ] Add method: `get_node_at_position(path, line, col) -> Option<&BeliefNode>`
+**Rationale**: The `DocCodec` trait (defined in `src/codec/mod.rs`) is the proper extension point for adding position tracking. All parsers implement this trait, so extending it ensures uniform position tracking. **Critically, position data stays in the codec/builder layers and does NOT pollute BeliefNode** (which is a domain model).
+
+**Architecture**: Position tracking happens in three places:
+1. **DocCodec implementations** - Track positions during parsing, store internally
+2. **GraphBuilder** - Builds a `PositionIndex` during `parse_content()` by querying codec
+3. **LSP Server** - Queries GraphBuilder's position index for LSP operations
+
+**Changes to `src/codec/mod.rs` (DocCodec trait)**:
+- [ ] Add trait method: `fn get_node_range(&self, bid: &Bid) -> Option<Range>`
+- [ ] Add trait method: `fn get_link_ranges(&self) -> Vec<LinkPosition>`
+- [ ] Add trait method: `fn supports_positions(&self) -> bool { false }` (default: opt-in)
+- [ ] Document position tracking contract in trait documentation
+- [ ] Position data is codec-internal - NOT stored in ProtoBeliefNode or BeliefNode
 
 **Changes to `src/codec/diagnostic.rs`**:
-- [ ] Add `Range` field to `ParseDiagnostic`
-- [ ] Update diagnostic generation to include ranges
-- [ ] Convert from internal ranges to `lsp_types::Range`
+- [ ] Add `range: Option<Range>` field to `ParseDiagnostic`
+- [ ] Update diagnostic generation to include ranges when available
+- [ ] Add conversion utility: `lsp_types::Range` ↔ internal range type (if needed)
 
 **Changes to codec implementations**:
-- [ ] Update `MarkdownCodec` to track positions during parsing
-- [ ] Update `TomlCodec` to track frontmatter positions
-- [ ] Store original source position with each node
+- [ ] Update `src/codec/md.rs` (MdCodec):
+  - Add internal `positions: HashMap<Bid, Range>` field
+  - Track heading positions during parsing (line/column of `#` markers)
+  - Track link positions (source range of `[text](ref)`)
+  - Track BID annotation positions
+  - Implement `get_node_range()` and `get_link_ranges()`
+  - Return `true` for `supports_positions()`
+- [ ] Update `src/codec/lattice_toml.rs` (TomlCodec):
+  - Add internal position tracking for frontmatter blocks
+  - Track individual TOML field positions if possible
+  - Implement position query methods
+- [ ] Position data lives only in codec instances, never in ProtoBeliefNode or BeliefNode
+
+**Changes to `src/codec/builder.rs` (GraphBuilder)**:
+- [ ] Add `position_index: Option<PositionIndex>` field to GraphBuilder
+- [ ] During `parse_content()`, after codec.parse():
+  - Query `codec.get_node_range()` for each parsed BID
+  - Build PositionIndex mapping BID ↔ Range
+  - Store in `self.position_index`
+- [ ] Add method: `pub fn position_index(&self) -> Option<&PositionIndex>`
+- [ ] Add helper: `pub fn get_node_at_position(&self, line: u32, col: u32) -> Option<Bid>`
+
+**Changes to `src/codec/position.rs` (NEW FILE)**:
+- [ ] Create `PositionIndex` struct with BID ↔ Range mappings
+- [ ] Implement efficient position queries (interval tree or simple lookup)
+- [ ] Provide conversion utilities for lsp_types::Range
 
 **Testing**:
-- [ ] Test: Parse document, verify all nodes have correct ranges
-- [ ] Test: Get node at position returns correct node
+- [ ] Test: MdCodec tracks positions internally, query methods return correct ranges
+- [ ] Test: TomlCodec tracks frontmatter positions
+- [ ] Test: GraphBuilder builds PositionIndex during parse_content
+- [ ] Test: `get_node_at_position()` returns correct BID for various positions
 - [ ] Test: Diagnostic ranges point to correct source locations
+- [ ] Test: Custom codec can opt-out (supports_positions returns false, no crash)
+- [ ] Test: BeliefNode remains unchanged (no Range field)
 
 ### 2. Implement LSP Server with tower-lsp (1-2 days)
 
@@ -465,7 +510,7 @@ async fn main() {
   - marksman (markdown LSP): https://github.com/artempyanykh/marksman
   - zeta-note (zettelkasten LSP): https://github.com/artempyanykh/zeta-note
 - **Code Changes**:
-  - `src/codec/parser.rs` - add position tracking
+  - `src/codec/builder.rs` - add position tracking in order to construct diagnostics with this information
   - `src/codec/diagnostic.rs` - add ranges to diagnostics
   - `src/properties.rs` - add Range to BeliefNode
   - `src/bin/noet-lsp.rs` - new LSP server binary

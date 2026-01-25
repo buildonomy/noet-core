@@ -1,14 +1,14 @@
 use crate::{
-    beliefset::BeliefSet,
+    beliefbase::BeliefBase,
     codec::{
-        accumulator::BeliefSetAccumulator,
+        builder::GraphBuilder,
         lattice_toml::{ProtoBeliefNode, NETWORK_CONFIG_NAME},
         UnresolvedReference,
     },
     error::BuildonomyError,
     event::BeliefEvent,
     properties::{BeliefKind, Bid},
-    query::BeliefCache,
+    query::BeliefSource,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -16,23 +16,23 @@ use std::{
 };
 use toml_edit::value;
 
-/// A wrapper around BeliefSetAccumulator that manages recursive document parsing with queue
+/// A wrapper around GraphBuilder that manages recursive document parsing with queue
 /// management and loop prevention.
 ///
 /// ## Overview
 ///
-/// This parser acts as a "filesystem orchestrator" that discovers files, reads content, and
-/// feeds it to the accumulator for parsing. It automatically handles the complex dependency
+/// This compiler acts as a "filesystem orchestrator" that discovers files, reads content, and
+/// feeds it to the builder for parsing. It automatically handles the complex dependency
 /// resolution workflow where documents reference each other and need multiple parse passes.
 ///
 /// ## Two-Queue Architecture
 ///
-/// The parser maintains two separate queues to handle the recursive nature of document parsing:
+/// The compiler maintains two separate queues to handle the recursive nature of document parsing:
 ///
 /// ### Primary Queue (Never-Parsed Files)
 /// Contains files that have never been parsed in this session. These are processed first using
 /// a simple FIFO order. Files are added to this queue when:
-/// - Parser is initialized with an entry point
+/// - Compiler is initialized with an entry point
 /// - A parsed document discovers a new dependency
 /// - File watcher detects a new file
 ///
@@ -95,16 +95,16 @@ use toml_edit::value;
 /// ## Architecture: Cache Separation
 ///
 /// The global cache is intentionally NOT stored in this struct to maintain the architectural
-/// separation between the parser (which reads from the cache) and the transaction handler
+/// separation between the compiler (which reads from the cache) and the transaction handler
 /// (which writes to the cache via BeliefEvents). The cache must be passed to each parse method.
 ///
 /// This design ensures:
-/// - Parser thread: reads from cache, generates events
+/// - Compiler thread: reads from cache, generates events
 /// - Transaction thread: receives events, writes to cache
 /// - No contention between reader and writer
-pub struct BeliefSetParser {
+pub struct DocumentCompiler {
     write: bool,
-    accumulator: BeliefSetAccumulator,
+    builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
     pending_dependencies: BTreeMap<PathBuf, Vec<PathBuf>>,
@@ -121,8 +121,8 @@ pub struct ParseResult {
     pub diagnostics: Vec<crate::codec::ParseDiagnostic>,
 }
 
-impl BeliefSetParser {
-    /// Create a new parser with an entry point (file or directory)
+impl DocumentCompiler {
+    /// Create a new compiler with an entry point (file or directory)
     ///
     /// # Arguments
     /// * `entry_point` - The file or directory to start parsing from
@@ -137,13 +137,13 @@ impl BeliefSetParser {
     ) -> Result<Self, BuildonomyError> {
         let entry_path = entry_point.as_ref().canonicalize()?;
 
-        let accumulator = BeliefSetAccumulator::new(&entry_path, tx)?;
+        let builder = GraphBuilder::new(&entry_path, tx)?;
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
         Ok(Self {
             write,
-            accumulator,
+            builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
             pending_dependencies: BTreeMap::new(),
@@ -152,7 +152,7 @@ impl BeliefSetParser {
         })
     }
 
-    /// Create a new parser with an entry point (file or directory) and default arguments: no
+    /// Create a new compiler with an entry point (file or directory) and default arguments: no
     /// receiver of BeliefEvents, default reparse count, and write=false.
     ///
     /// # Arguments
@@ -160,13 +160,13 @@ impl BeliefSetParser {
     pub fn simple(entry_point: impl AsRef<Path>) -> Result<Self, BuildonomyError> {
         let entry_path = entry_point.as_ref().canonicalize()?;
 
-        let accumulator = BeliefSetAccumulator::new(&entry_path, None)?;
+        let builder = GraphBuilder::new(&entry_path, None)?;
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
         Ok(Self {
             write: false,
-            accumulator,
+            builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
             pending_dependencies: BTreeMap::new(),
@@ -215,15 +215,15 @@ impl BeliefSetParser {
     /// For the reparse queue, it selects files with the most resolved dependencies first.
     ///
     /// # Arguments
-    /// * `global_cache` - The belief cache to query during parsing (typically a DbConnection)
+    /// * `global_bb` - The belief cache to query during parsing (typically a DbConnection)
     ///
     /// # Returns
     /// * `Ok(Some(ParseResult))` - Successfully parsed a document
     /// * `Ok(None)` - Queue is empty, nothing to parse
     /// * `Err(_)` - Parse error or infinite loop detected
-    pub async fn parse_next<B: BeliefCache + Clone>(
+    pub async fn parse_next<B: BeliefSource + Clone>(
         &mut self,
-        global_cache: B,
+        global_bb: B,
     ) -> Result<Option<ParseResult>, BuildonomyError> {
         // 1. PEEK at next item (don't pop until we have a successful parse)
         let path = if let Some(p) = self.primary_queue.front() {
@@ -242,7 +242,7 @@ impl BeliefSetParser {
             // Max retries reached - remove from queues and return with error diagnostic
             self.remove_from_queues(&path);
             tracing::warn!(
-                "[Parser] Max reparse limit reached for {:?} ({} attempts)",
+                "[Compiler] Max reparse limit reached for {:?} ({} attempts)",
                 path,
                 parse_count
             );
@@ -284,7 +284,7 @@ impl BeliefSetParser {
                 Ok(c) => c,
                 Err(e) => {
                     // IO error - return as diagnostic
-                    tracing::warn!("[Parser] Failed to read {:?}: {}", path, e);
+                    tracing::warn!("[Compiler] Failed to read {:?}: {}", path, e);
 
                     // Remove from queues (file might be deleted or inaccessible)
                     self.remove_from_queues(&path);
@@ -304,14 +304,14 @@ impl BeliefSetParser {
 
         // 4. Try to parse the content
         let mut parse_result = match self
-            .accumulator
-            .parse_content(&path, content, global_cache.clone())
+            .builder
+            .parse_content(&path, content, global_bb.clone())
             .await
         {
             Ok(result) => result,
             Err(e) => {
                 // Parse error - return as diagnostic but keep in queue (might be fixed)
-                tracing::warn!("[Parser] Failed to parse {:?}: {}", path, e);
+                tracing::warn!("[Compiler] Failed to parse {:?}: {}", path, e);
 
                 // Move to back of queue for retry later
                 self.move_to_back(&path);
@@ -357,7 +357,7 @@ impl BeliefSetParser {
 
         if !unresolved_references.is_empty() && !self.reparse_queue.contains(&path) {
             // tracing::debug!(
-            //     "[Parser] File {:?} has unresolved references, adding to reparse queue",
+            //     "[Compiler] File {:?} has unresolved references, adding to reparse queue",
             //     path
             // );
             self.reparse_queue.push_back(path.clone());
@@ -369,20 +369,25 @@ impl BeliefSetParser {
                 continue;
             };
             dependent_paths.push((net_dep_path_str.clone(), net));
-            let repo_pathmap = self.accumulator().set().paths().get_map(&self.accumulator().repo()).expect(
-                "accumulator.repo to be instantiated after parse_content was successfully called."
-            );
+            let repo_pathmap = self
+                .builder()
+                .doc_bb()
+                .paths()
+                .get_map(&self.builder().repo())
+                .expect(
+                    "builder.repo to be instantiated after parse_content was successfully called.",
+                );
             let full_dep_path = if let Some((_home_net, net_path, _order)) =
-                repo_pathmap.path(&net, &self.accumulator().set().paths())
+                repo_pathmap.path(&net, &self.builder().doc_bb().paths())
             {
                 debug_assert!(_home_net == net);
                 // Convert relative path to absolute
                 let dep_path_str = PathBuf::from(net_path).join(net_dep_path_str);
-                // Resolve relative to accumulator's repo_root
-                self.accumulator.repo_root().join(dep_path_str)
+                // Resolve relative to builder's repo_root
+                self.builder.repo_root().join(dep_path_str)
             } else {
                 tracing::warn!(
-                    "No connectivity between accumulator.repo and dependent path network {}",
+                    "No connectivity between builder.repo and dependent path network {}",
                     net
                 );
                 continue;
@@ -393,7 +398,7 @@ impl BeliefSetParser {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::debug!(
-                        "[Parser] Cannot canonicalize {:?}, treating as external",
+                        "[Compiler] Cannot canonicalize {:?}, treating as external",
                         full_dep_path
                     );
                     continue; // Skip external/non-existent dependencies
@@ -405,7 +410,7 @@ impl BeliefSetParser {
                 && !self.reparse_queue.contains(&canonical_dep_path)
             {
                 // tracing::debug!(
-                //     "[Parser] Enqueuing new dependency: {:?}",
+                //     "[Compiler] Enqueuing new dependency: {:?}",
                 //     canonical_dep_path
                 // );
                 self.primary_queue.push_back(canonical_dep_path.clone());
@@ -437,26 +442,26 @@ impl BeliefSetParser {
     /// or until an unrecoverable error occurs.
     ///
     /// # Arguments
-    /// * `global_cache` - The belief cache to query during parsing
+    /// * `global_bb` - The belief cache to query during parsing
     ///
     /// # Returns
     /// * `Ok(Vec<ParseResult>)` - All successfully parsed documents
     /// * `Err(_)` - First unrecoverable error encountered (parsing stops on error)
-    pub async fn parse_all<B: BeliefCache + Clone>(
+    pub async fn parse_all<B: BeliefSource + Clone>(
         &mut self,
-        global_cache: B,
+        global_bb: B,
     ) -> Result<Vec<ParseResult>, BuildonomyError> {
         let mut results = Vec::new();
 
-        while let Some(result) = self.parse_next(global_cache.clone()).await? {
+        while let Some(result) = self.parse_next(global_bb.clone()).await? {
             results.push(result);
         }
 
         Ok(results)
     }
 
-    pub fn cache(&self) -> &BeliefSet {
-        self.accumulator().stack_cache()
+    pub fn cache(&self) -> &BeliefBase {
+        self.builder().session_bb()
     }
 
     /// Peek at the next file from the reparse queue without removing it
@@ -528,7 +533,7 @@ impl BeliefSetParser {
     pub fn enqueue(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         if !self.primary_queue.contains(&path) && !self.reparse_queue.contains(&path) {
-            // tracing::debug!("[Parser] Enqueuing path: {:?}", path);
+            // tracing::debug!("[Compiler] Enqueuing path: {:?}", path);
             self.primary_queue.push_back(path);
         }
     }
@@ -540,7 +545,7 @@ impl BeliefSetParser {
         self.reparse_queue.retain(|p| p != &path);
 
         if !self.primary_queue.contains(&path) {
-            // tracing::debug!("[Parser] Enqueuing path at front (priority): {:?}", path);
+            // tracing::debug!("[Compiler] Enqueuing path at front (priority): {:?}", path);
             self.primary_queue.push_front(path);
         }
     }
@@ -580,7 +585,7 @@ impl BeliefSetParser {
     ///
     /// This resets the parse count for all files but keeps the queue state.
     /// Useful when you want to re-parse everything from scratch while maintaining
-    /// the accumulator's stack_cache.
+    /// the builder's session_bb.
     pub fn clear_processed(&mut self) {
         self.processed.clear();
         self.pending_dependencies.clear();
@@ -630,14 +635,14 @@ impl BeliefSetParser {
         self.primary_queue.len() + self.reparse_queue.len()
     }
 
-    /// Get a reference to the underlying accumulator
-    pub fn accumulator(&self) -> &BeliefSetAccumulator {
-        &self.accumulator
+    /// Get a reference to the underlying builder
+    pub fn builder(&self) -> &GraphBuilder {
+        &self.builder
     }
 
-    /// Get a mutable reference to the underlying accumulator
-    pub fn accumulator_mut(&mut self) -> &mut BeliefSetAccumulator {
-        &mut self.accumulator
+    /// Get a mutable reference to the underlying builder
+    pub fn builder_mut(&mut self) -> &mut GraphBuilder {
+        &mut self.builder
     }
 
     /// Get statistics about processed files
@@ -650,9 +655,9 @@ impl BeliefSetParser {
         self.processed.get(path.as_ref()).copied().unwrap_or(0)
     }
 
-    /// Get statistics about the parser state (useful for debugging)
-    pub fn stats(&self) -> ParserStats {
-        ParserStats {
+    /// Get statistics about the compiler state (useful for debugging)
+    pub fn stats(&self) -> CompilerStats {
+        CompilerStats {
             primary_queue_len: self.primary_queue.len(),
             reparse_queue_len: self.reparse_queue.len(),
             processed_count: self.processed.len(),
@@ -662,9 +667,9 @@ impl BeliefSetParser {
     }
 }
 
-/// Statistics about the parser's current state
+/// Statistics about the compiler's current state
 #[derive(Debug, Clone)]
-pub struct ParserStats {
+pub struct CompilerStats {
     pub primary_queue_len: usize,
     pub reparse_queue_len: usize,
     pub processed_count: usize,
@@ -677,40 +682,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parser_creation() {
+    fn test_compiler_creation() {
         // This is a basic structure test - actual functional tests would require
         // setting up a test filesystem and mock cache
         let temp_dir = std::env::temp_dir();
-        let result = BeliefSetParser::new(&temp_dir, None, Some(5), false);
+        let result = DocumentCompiler::new(&temp_dir, None, Some(5), false);
         assert!(result.is_ok());
 
-        let parser = result.unwrap();
-        assert_eq!(parser.max_reparse_count, 5);
-        assert!(parser.has_pending());
-        assert_eq!(parser.primary_queue_len(), 1);
-        assert_eq!(parser.reparse_queue_len(), 0);
+        let compiler = result.unwrap();
+        assert_eq!(compiler.max_reparse_count, 5);
+        assert!(compiler.has_pending());
+        assert_eq!(compiler.primary_queue_len(), 1);
+        assert_eq!(compiler.reparse_queue_len(), 0);
     }
 
     #[test]
     fn test_enqueue_deduplication() {
         let temp_dir = std::env::temp_dir();
-        let mut parser = BeliefSetParser::new(&temp_dir, None, None, false).unwrap();
+        let mut compiler = DocumentCompiler::new(&temp_dir, None, None, false).unwrap();
 
         let test_path = temp_dir.join("test.md");
-        parser.enqueue(&test_path);
-        let initial_len = parser.total_queue_len();
+        compiler.enqueue(&test_path);
+        let initial_len = compiler.total_queue_len();
 
         // Enqueuing the same path again should not increase queue size
-        parser.enqueue(&test_path);
-        assert_eq!(parser.total_queue_len(), initial_len);
+        compiler.enqueue(&test_path);
+        assert_eq!(compiler.total_queue_len(), initial_len);
     }
 
     #[test]
     fn test_stats() {
         let temp_dir = std::env::temp_dir();
-        let parser = BeliefSetParser::new(&temp_dir, None, None, false).unwrap();
+        let compiler = DocumentCompiler::new(&temp_dir, None, None, false).unwrap();
 
-        let stats = parser.stats();
+        let stats = compiler.stats();
         assert_eq!(stats.primary_queue_len, 1);
         assert_eq!(stats.reparse_queue_len, 0);
         assert_eq!(stats.processed_count, 0);

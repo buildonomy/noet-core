@@ -28,7 +28,7 @@ This is a pre-release version for early feedback. The API is not yet stable and 
 - Event streaming for incremental cache updates
 - SQLite database integration for persistent storage
 - File watching with `FileUpdateSyncer`
-- BeliefSet hypergraph data structures
+- BeliefBase hypergraph data structures
 - Query system for graph traversal
 - Nested network support (similar to git submodules)
 - Extensible codec system via `DocCodec` trait
@@ -37,7 +37,7 @@ This is a pre-release version for early feedback. The API is not yet stable and 
 ### Documentation
 - Comprehensive README with usage examples
 - Architecture overview in `docs/architecture.md`
-- Detailed specification in `docs/design/beliefset_architecture.md`
+- Detailed specification in `docs/design/beliefbase_architecture.md`
 - API documentation with examples
 - Contributing guidelines
 - Basic usage example

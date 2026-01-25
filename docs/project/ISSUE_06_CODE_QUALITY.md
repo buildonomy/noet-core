@@ -52,8 +52,8 @@ Conduct comprehensive code review and quality improvements before open source re
      - Should it be `pub(crate)` instead?
    - [ ] Document public API surface in architecture.md
    - [ ] Consider API simplification opportunities:
-     - `BeliefSetParser::new()` convenience constructor?
-     - `BeliefSet` builder pattern?
+     - `DocumentCompiler::new()` convenience constructor?
+     - `BeliefBase` builder pattern?
      - Default trait implementations?
 
 2. **Error Handling Review** (1 day)
@@ -72,7 +72,7 @@ Conduct comprehensive code review and quality improvements before open source re
    - [ ] Add top-level module docs to `src/lib.rs`
    - [ ] Add module docs to major modules:
      - `codec/` - Parsing and document transformation
-     - `beliefset/` - Graph data structure
+     - `beliefbase/` - Graph data structure
      - `properties/` - Node and edge properties
      - `error/` - Error types and handling
    - [ ] Document feature flags in `lib.rs`
@@ -171,6 +171,6 @@ Conduct comprehensive code review and quality improvements before open source re
 - **Rust API Guidelines**: https://rust-lang.github.io/api-guidelines/
 - **Error Handling Book**: https://doc.rust-lang.org/book/ch09-00-error-handling.html
 - **Clippy Lints**: https://rust-lang.github.io/rust-clippy/master/
-- **Example**: `src/codec/parser.rs` - Review `BeliefSetParser::new()` signature for ergonomics
-- **Example**: `src/beliefset/mod.rs` - Review public API surface
+- **Example**: `src/codec/compiler.rs` - Review `DocumentCompiler::new()` signature for ergonomics
+- **Example**: `src/beliefbase/mod.rs` - Review public API surface
 - **Pattern**: tokio, serde, anyhow for documentation quality benchmarks

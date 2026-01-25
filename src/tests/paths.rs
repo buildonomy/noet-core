@@ -13,7 +13,7 @@ use test_log::test;
 #[test]
 fn test_relation_removal_triggers_reindexing() {
     // Start with a balanced test set
-    let mut set = create_balanced_test_beliefset();
+    let mut set = create_balanced_test_beliefbase();
 
     // Get the parent doc and children from the set
     let parent_doc = set
@@ -81,7 +81,7 @@ fn test_relation_removal_triggers_reindexing() {
 #[test]
 fn test_parent_reindex_updates_child_order_vectors() {
     // Start with a balanced test set
-    let mut set = create_balanced_test_beliefset();
+    let mut set = create_balanced_test_beliefbase();
 
     // Add a grandchild to test order vector propagation
     let child1 = set
@@ -183,7 +183,7 @@ fn test_parent_reindex_updates_child_order_vectors() {
 #[test]
 fn test_event_driven_pathmap_matches_constructor() {
     // Start with a balanced test set
-    let mut set = create_balanced_test_beliefset();
+    let mut set = create_balanced_test_beliefbase();
 
     // Get references to nodes for manipulation
     let child1 = set

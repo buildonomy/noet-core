@@ -6,14 +6,14 @@
 
 ## Summary
 
-The file watcher integration test (`test_file_modification_triggers_reparse`) is currently marked `#[ignore]` due to timing sensitivity. After a 7-second wait, the test receives 0 events when it should receive multiple `Event::Belief` updates after file modification. This suggests a potential bug in the file watcher → parser → event emission pipeline rather than just test flakiness.
+The file watcher integration test (`test_file_modification_triggers_reparse`) is currently marked `#[ignore]` due to timing sensitivity. After a 7-second wait, the test receives 0 events when it should receive multiple `Event::Belief` updates after file modification. This suggests a potential bug in the file watcher → compiler → event emission pipeline rather than just test flakiness.
 
 **Critical concern**: If this is a real bug (not just test timing), it means `noet watch` CLI command may not work correctly, which would block soft open source release.
 
 ## Goals
 
 1. Determine if file watcher timing issue is a real bug or test environment artifact
-2. If bug: Identify root cause in watcher → parser → event emission chain
+2. If bug: Identify root cause in watcher → compiler → event emission chain
 3. If bug: Fix and verify with reliable test
 4. If test artifact: Document why test is unreliable and create manual verification procedure
 5. Verify `noet watch` CLI works correctly with real file changes
@@ -66,7 +66,7 @@ File Watcher Thread (notify-debouncer-full)
     ↓ (300ms debounce)
 Debouncer Callback
     ↓ (enqueue modified path)
-Parser Thread (FileUpdateSyncer::parser_handle)
+compiler Thread (FileUpdateSyncer::compiler_handle)
     ↓ (parse and emit BeliefEvents)
 Transaction Thread (FileUpdateSyncer::transaction_handle)
     ↓ (batch and forward)
@@ -80,8 +80,8 @@ Main Thread (mpsc::Receiver<Event>)
    - Debouncer not invoking callback
    - Filter excluding modified file
 
-2. **Parser queue not processing**
-   - Parser thread blocked/panicked
+2. **Compiler queue not processing**
+   - Compiler thread blocked/panicked
    - Queue not receiving paths
    - Parse errors causing silent failures
 
@@ -147,10 +147,10 @@ Add detailed logging to trace event flow:
    tracing::info!("File watcher detected change: {:?}", event.paths);
    ```
 
-2. **Add tracing to parser queue** (`src/watch.rs`, FileUpdateSyncer)
+2. **Add tracing to compiler queue** (`src/watch.rs`, FileUpdateSyncer)
    ```rust
-   tracing::info!("Parser enqueuing: {:?}", path);
-   tracing::info!("Parser processing: {:?}", path);
+   tracing::info!("Compiler enqueuing: {:?}", path);
+   tracing::info!("Compiler processing: {:?}", path);
    ```
 
 3. **Add tracing to event emission** (transaction thread)
@@ -166,8 +166,8 @@ Add detailed logging to trace event flow:
 
 5. **Analyze logs**: Where does the pipeline break?
    - Watcher triggers? (if not: OS notification issue)
-   - Parser enqueues? (if not: debouncer callback broken)
-   - Parser processes? (if not: parser thread issue)
+   - Compiler enqueues? (if not: debouncer callback broken)
+   - Compiler processes? (if not: compiler thread issue)
    - Events emitted? (if not: transaction thread issue)
    - Events received? (if not: channel issue)
 
@@ -181,7 +181,7 @@ If manual testing works but automated test fails:
 - Possible platform-specific test configuration
 
 **Option B: Mock file watcher for testing**
-- Create `MockWatcher` that directly calls parser queue
+- Create `MockWatcher` that directly calls compiler queue
 - Test pipeline without OS file system notifications
 - Keep current test as manual verification only
 
@@ -256,7 +256,7 @@ After fix implemented:
 
 2. **Which thread/component is the bottleneck?**
    - File watcher thread?
-   - Parser thread?
+   - Compiler thread?
    - Transaction thread?
    - Event channel?
 

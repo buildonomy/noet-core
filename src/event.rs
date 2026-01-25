@@ -9,13 +9,13 @@ use crate::{
 /// Indicates the origin of a BeliefEvent for proper handling by different cache implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EventOrigin {
-    /// Event was generated locally by this BeliefSet and has already been applied to its state.
-    /// BeliefSet should validate consistency but skip reapplication.
+    /// Event was generated locally by this BeliefBase and has already been applied to its state.
+    /// BeliefBase should validate consistency but skip reapplication.
     /// Other caches (DbConnection, remote syncs) should apply these events.
     Local,
 
     /// Event came from an external source (DbConnection restore, file watcher, network sync).
-    /// BeliefSet must apply these events to synchronize state.
+    /// BeliefBase must apply these events to synchronize state.
     #[default]
     Remote,
 }
@@ -37,7 +37,7 @@ pub enum BeliefEvent {
     RelationInsert(Bid, Bid, WeightKind, Weight, EventOrigin),
     /// Source, Sink relation removed
     RelationRemoved(Bid, Bid, EventOrigin),
-    /// A signal that the BeliefSet should be balanced at this point.
+    /// A signal that the BeliefBase should be balanced at this point.
     BalanceCheck,
     /// A signal to run a full built in test.
     BuiltInTest,
@@ -146,7 +146,7 @@ pub enum PerceptionEvent {
     Input(Bid, String),
     /// A participant focus event (hover/select within a table of contents or belief link for example)
     Focus(Bid),
-    /// A change of awareness that should result in a change to the beliefSet store within the UI
+    /// A change of awareness that should result in a change to the BeliefBase store within the UI
     Awareness(Vec<Bid>),
 }
 

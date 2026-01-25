@@ -1,12 +1,12 @@
-//! Tests for BeliefSet expression evaluation
+//! Tests for BeliefBase expression evaluation
 
 use super::helpers::*;
 use crate::{
-    beliefset::BeliefSet,
+    beliefbase::BeliefBase,
     event::BeliefEvent,
     nodekey::NodeKey,
     properties::{BeliefKind, BeliefNode, Bid, Weight, WeightKind, WeightSet},
-    query::{BeliefCache, Expression, RelationPred, SetOp, StatePred},
+    query::{BeliefSource, Expression, RelationPred, SetOp, StatePred},
 };
 use petgraph::{visit::EdgeRef, Direction};
 use std::collections::BTreeSet;
@@ -14,19 +14,19 @@ use test_log::test;
 
 #[test]
 fn test_evaluate_expression_state_in_any() {
-    let beliefset = create_test_beliefset();
+    let beliefbase = create_test_beliefbase();
     let expr = Expression::StateIn(StatePred::Any);
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return all states
-    assert_eq!(result.states.len(), beliefset.states().len());
+    assert_eq!(result.states.len(), beliefbase.states().len());
     assert_eq!(result.relations.as_graph().edge_count(), 2);
 }
 
 #[test]
 fn test_evaluate_expression_state_in_bid() {
-    let beliefset = create_test_beliefset();
-    let bids: Vec<Bid> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let bids: Vec<Bid> = beliefbase
         .states()
         .values()
         .filter_map(|n| {
@@ -39,7 +39,7 @@ fn test_evaluate_expression_state_in_bid() {
         .collect();
 
     let expr = Expression::StateIn(StatePred::Bid(bids.clone()));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return all the specified nodes, but only nodes 1 and 2 are uncolored by the trace
     // kind.
@@ -60,26 +60,26 @@ fn test_evaluate_expression_state_in_bid() {
 
 #[test]
 fn test_evaluate_expression_state_not_in() {
-    let beliefset = create_test_beliefset();
-    let bids: Vec<Bid> = beliefset.states().keys().take(2).copied().collect();
+    let beliefbase = create_test_beliefbase();
+    let bids: Vec<Bid> = beliefbase.states().keys().take(2).copied().collect();
 
     let expr = Expression::StateNotIn(StatePred::Bid(bids.clone()));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return all nodes except the specified ones
-    assert_eq!(result.states.len(), beliefset.states().len() - 2);
+    assert_eq!(result.states.len(), beliefbase.states().len() - 2);
     assert!(!result.states.contains_key(&bids[0]));
     assert!(!result.states.contains_key(&bids[1]));
 }
 
 #[test]
 fn test_evaluate_expression_state_in_namespace() {
-    let beliefset = create_test_beliefset();
-    let first_bid = *beliefset.states().keys().next().unwrap();
+    let beliefbase = create_test_beliefbase();
+    let first_bid = *beliefbase.states().keys().next().unwrap();
     let bref = first_bid.namespace();
 
     let expr = Expression::StateIn(StatePred::InNamespace(vec![bref]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return the node in that namespace, and all other nodes annotated with trace.
     assert!(result
@@ -90,9 +90,9 @@ fn test_evaluate_expression_state_in_namespace() {
 
 #[test]
 fn test_evaluate_expression_relation_in_any() {
-    let beliefset = create_test_beliefset();
+    let beliefbase = create_test_beliefbase();
     let expr = Expression::RelationIn(RelationPred::Any);
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return all relations
     assert_eq!(result.relations.as_graph().edge_count(), 2);
@@ -102,11 +102,11 @@ fn test_evaluate_expression_relation_in_any() {
 
 #[test]
 fn test_evaluate_expression_relation_in_source() {
-    let beliefset = create_test_beliefset();
-    let source_bid = *beliefset.states().keys().next().unwrap();
+    let beliefbase = create_test_beliefbase();
+    let source_bid = *beliefbase.states().keys().next().unwrap();
 
     let expr = Expression::RelationIn(RelationPred::SourceIn(vec![source_bid]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should only include relations with the specified source
     for edge in result.relations.as_graph().raw_edges() {
@@ -121,12 +121,12 @@ fn test_evaluate_expression_relation_in_source() {
 
 #[test]
 fn test_evaluate_expression_relation_in_sink() {
-    let beliefset = create_test_beliefset();
-    let all_bids: Vec<Bid> = beliefset.states().keys().copied().collect();
+    let beliefbase = create_test_beliefbase();
+    let all_bids: Vec<Bid> = beliefbase.states().keys().copied().collect();
     let sink_bid = all_bids[2]; // Node 3, which is a sink
 
     let expr = Expression::RelationIn(RelationPred::SinkIn(vec![sink_bid]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     assert_eq!(result.states.len(), 2);
     assert_eq!(result.relations.as_graph().edge_count(), 1);
@@ -143,11 +143,11 @@ fn test_evaluate_expression_relation_in_sink() {
 
 #[test]
 fn test_evaluate_expression_relation_not_in() {
-    let beliefset = create_test_beliefset();
-    let source_bid = *beliefset.states().keys().next().unwrap();
+    let beliefbase = create_test_beliefbase();
+    let source_bid = *beliefbase.states().keys().next().unwrap();
 
     let expr = Expression::RelationNotIn(RelationPred::SourceIn(vec![source_bid]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should exclude relations with the specified source
     for edge in result.relations.as_graph().raw_edges() {
@@ -158,12 +158,12 @@ fn test_evaluate_expression_relation_not_in() {
 
 #[test]
 fn test_evaluate_expression_relation_kind() {
-    let beliefset = create_test_beliefset();
+    let beliefbase = create_test_beliefbase();
     let mut weight_filter = WeightSet::empty();
     weight_filter.set(WeightKind::Section, Weight::default());
 
     let expr = Expression::RelationIn(RelationPred::Kind(weight_filter));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return all subsection relations
     assert_eq!(result.relations.as_graph().edge_count(), 2);
@@ -171,8 +171,8 @@ fn test_evaluate_expression_relation_kind() {
 
 #[test]
 fn test_evaluate_expression_dyad_union() {
-    let beliefset = create_test_beliefset();
-    let mut bids: Vec<(Bid, String)> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let mut bids: Vec<(Bid, String)> = beliefbase
         .states()
         .values()
         .map(|n| (n.bid, n.title.clone()))
@@ -183,7 +183,7 @@ fn test_evaluate_expression_dyad_union() {
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[1].0]));
     let union_expr = Expression::Dyad(Box::new(expr1), SetOp::Union, Box::new(expr2));
 
-    let result = beliefset.evaluate_expression(&union_expr);
+    let result = beliefbase.evaluate_expression(&union_expr);
 
     let non_trace_states = BTreeSet::from_iter(result.states.values().filter_map(|n| {
         if n.kind.is_complete() {
@@ -222,8 +222,8 @@ fn test_evaluate_expression_dyad_union() {
 
 #[test]
 fn test_evaluate_expression_dyad_intersection() {
-    let beliefset = create_test_beliefset();
-    let mut bids: Vec<(Bid, String)> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let mut bids: Vec<(Bid, String)> = beliefbase
         .states()
         .values()
         .map(|n| (n.bid, n.title.clone()))
@@ -234,7 +234,7 @@ fn test_evaluate_expression_dyad_intersection() {
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[1].0, bids[2].0]));
     let intersection_expr = Expression::Dyad(Box::new(expr1), SetOp::Intersection, Box::new(expr2));
 
-    let result = beliefset.evaluate_expression(&intersection_expr);
+    let result = beliefbase.evaluate_expression(&intersection_expr);
     let non_trace_states = BTreeSet::from_iter(result.states.values().filter_map(|n| {
         if n.kind.is_complete() {
             Some(n.bid)
@@ -254,8 +254,8 @@ fn test_evaluate_expression_dyad_intersection() {
 
 #[test]
 fn test_evaluate_expression_dyad_difference() {
-    let beliefset = create_test_beliefset();
-    let mut bids: Vec<(Bid, String)> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let mut bids: Vec<(Bid, String)> = beliefbase
         .states()
         .values()
         .map(|n| (n.bid, n.title.clone()))
@@ -266,7 +266,7 @@ fn test_evaluate_expression_dyad_difference() {
     let expr2 = Expression::StateIn(StatePred::Bid(vec![bids[2].0]));
     let difference_expr = Expression::Dyad(Box::new(expr1), SetOp::Difference, Box::new(expr2));
 
-    let result = beliefset.evaluate_expression(&difference_expr);
+    let result = beliefbase.evaluate_expression(&difference_expr);
     let non_trace_states = BTreeSet::from_iter(result.states.values().filter_map(|n| {
         if n.kind.is_complete() {
             Some(n.bid)
@@ -288,8 +288,8 @@ fn test_evaluate_expression_dyad_difference() {
 
 #[test]
 fn test_evaluate_expression_dyad_symmetric_difference() {
-    let beliefset = create_test_beliefset();
-    let mut bids: Vec<(Bid, String)> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let mut bids: Vec<(Bid, String)> = beliefbase
         .states()
         .values()
         .map(|n| (n.bid, n.title.clone()))
@@ -302,7 +302,7 @@ fn test_evaluate_expression_dyad_symmetric_difference() {
     let sym_diff_expr =
         Expression::Dyad(Box::new(expr1), SetOp::SymmetricDifference, Box::new(expr2));
 
-    let result = beliefset.evaluate_expression(&sym_diff_expr);
+    let result = beliefbase.evaluate_expression(&sym_diff_expr);
 
     let non_trace_states = BTreeSet::from_iter(result.states.values().filter_map(|n| {
         if n.kind.is_complete() {
@@ -326,8 +326,8 @@ fn test_evaluate_expression_dyad_symmetric_difference() {
 
 #[test]
 fn test_evaluate_expression_nested_dyads() {
-    let beliefset = create_test_beliefset();
-    let mut bids: Vec<(Bid, String)> = beliefset
+    let beliefbase = create_test_beliefbase();
+    let mut bids: Vec<(Bid, String)> = beliefbase
         .states()
         .values()
         .map(|n| (n.bid, n.title.clone()))
@@ -348,7 +348,7 @@ fn test_evaluate_expression_nested_dyads() {
     let intersection_expr =
         Expression::Dyad(Box::new(union_ab), SetOp::Intersection, Box::new(union_cd));
 
-    let result = beliefset.evaluate_expression(&intersection_expr);
+    let result = beliefbase.evaluate_expression(&intersection_expr);
 
     // Should only contain bids[1] (the intersection of {0,1} and {1,2})
     let non_trace_states = BTreeSet::from_iter(result.states.values().filter_map(|n| {
@@ -369,12 +369,12 @@ fn test_evaluate_expression_nested_dyads() {
 
 #[test]
 fn test_evaluate_expression_empty_result() {
-    let beliefset = create_test_beliefset();
+    let beliefbase = create_test_beliefbase();
 
     // Create a non-existent BID
     let nonexistent_bid = Bid::new(Bid::nil());
     let expr = Expression::StateIn(StatePred::Bid(vec![nonexistent_bid]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return empty result
     assert_eq!(result.states.len(), 0);
@@ -383,12 +383,12 @@ fn test_evaluate_expression_empty_result() {
 
 #[test]
 fn test_evaluate_expression_relations_follow_states() {
-    let beliefset = create_test_beliefset();
-    let bids: Vec<Bid> = beliefset.states().keys().copied().collect();
+    let beliefbase = create_test_beliefbase();
+    let bids: Vec<Bid> = beliefbase.states().keys().copied().collect();
 
     // Select only the source node, relation should not be included
     let expr = Expression::StateIn(StatePred::Bid(vec![bids[0]]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Includes bids[0] as well as its relation nodes (annotated with BeliefKind::Trace)
     assert_eq!(result.states.len(), 2);
@@ -398,12 +398,12 @@ fn test_evaluate_expression_relations_follow_states() {
 
 #[test]
 fn test_evaluate_expression_state_in_bref() {
-    let beliefset = create_test_beliefset();
-    let first_bid = *beliefset.states().keys().next().unwrap();
+    let beliefbase = create_test_beliefbase();
+    let first_bid = *beliefbase.states().keys().next().unwrap();
     let bref = first_bid.namespace();
 
     let expr = Expression::StateIn(StatePred::Bref(vec![bref]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return the node with matching bref
     assert!(result.states.contains_key(&first_bid));
@@ -411,12 +411,12 @@ fn test_evaluate_expression_state_in_bref() {
 
 #[test]
 fn test_evaluate_expression_complex_relation_filter() {
-    let beliefset = create_test_beliefset();
-    let all_bids: Vec<Bid> = beliefset.states().keys().copied().collect();
+    let beliefbase = create_test_beliefbase();
+    let all_bids: Vec<Bid> = beliefbase.states().keys().copied().collect();
 
     // Filter relations where either source or sink matches
     let expr = Expression::RelationIn(RelationPred::NodeIn(vec![all_bids[0]]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should include relations involving the specified node
     assert!(result.relations.as_graph().edge_count() >= 1);
@@ -424,9 +424,9 @@ fn test_evaluate_expression_complex_relation_filter() {
 
 #[test]
 fn test_evaluate_expression_maintains_relation_weights() {
-    let beliefset = create_test_beliefset();
+    let beliefbase = create_test_beliefbase();
     let expr = Expression::RelationIn(RelationPred::Any);
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Verify that relation weights are preserved
     for edge in result.relations.as_graph().raw_edges() {
@@ -438,12 +438,12 @@ fn test_evaluate_expression_maintains_relation_weights() {
 
 #[test]
 fn test_evaluate_expression_state_preserves_node_properties() {
-    let beliefset = create_test_beliefset();
-    let first_bid = *beliefset.states().keys().next().unwrap();
-    let original_node = beliefset.states().get(&first_bid).unwrap();
+    let beliefbase = create_test_beliefbase();
+    let first_bid = *beliefbase.states().keys().next().unwrap();
+    let original_node = beliefbase.states().get(&first_bid).unwrap();
 
     let expr = Expression::StateIn(StatePred::Bid(vec![first_bid]));
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     let result_node = result.states.get(&first_bid).unwrap();
     assert_eq!(result_node.title, original_node.title);
@@ -452,10 +452,10 @@ fn test_evaluate_expression_state_preserves_node_properties() {
 }
 
 #[test]
-fn test_evaluate_expression_empty_beliefset() {
-    let beliefset = BeliefSet::empty();
+fn test_evaluate_expression_empty_beliefbase() {
+    let beliefbase = BeliefBase::empty();
     let expr = Expression::StateIn(StatePred::Any);
-    let result = beliefset.evaluate_expression(&expr);
+    let result = beliefbase.evaluate_expression(&expr);
 
     // Should return empty result
     assert_eq!(result.states.len(), 0);
@@ -470,7 +470,7 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
     // API -> Network -> Document
     // where we query for Document and expect the balance to include Network->API
 
-    let set = create_balanced_test_beliefset();
+    let set = create_balanced_test_beliefbase();
     let doc_node = set
         .get(&NodeKey::Title {
             net: Bid::nil(),
@@ -509,7 +509,7 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
     );
 
     // Now try to balance the query result
-    let mut balanced_result = BeliefSet::from(query_result);
+    let mut balanced_result = BeliefBase::from(query_result);
 
     // This should succeed - the balance should pull in the Network->API relation
     let balance_result = balanced_result.process_event(&BeliefEvent::BalanceCheck);

@@ -6,7 +6,7 @@ A Rust library for parsing interconnected documents into a queryable hypergraph 
 
 ## What is noet-core?
 
-**noet-core** (from "noetic" - relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure called a "BeliefSet". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.
+**noet-core** (from "noetic" - relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.
 
 ### Key Features
 
@@ -22,22 +22,22 @@ A Rust library for parsing interconnected documents into a queryable hypergraph 
 ## Quick Start
 
 ```rust
-use noet_core::{codec::BeliefSetParser, beliefset::BeliefSet};
+use noet_core::{codec::DocumentCompiler, beliefbase::BeliefBase};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create parser (simple convenience constructor)
-    let mut parser = BeliefSetParser::simple("./docs")?;
+    // Create compiler (simple convenience constructor)
+    let mut compiler = DocumentCompiler::simple("./docs")?;
     
-    // Stand-in for our global-cache (No effect when used in BeliefSetParser::simple() constructor but
-    // used to access DB-backed version of our BeliefSet if available).
-    let cache = BeliefSet::default()
+    // Stand-in for our global-cache (No effect when used in DocumentCompiler::simple() constructor but
+    // used to access DB-backed version of our BeliefBase if available).
+    let cache = BeliefBase::default()
     
     // Parse all documents (handles multi-pass resolution automatically)
-    let results = parser.parse_all(BeliefSet::default()).await?;
+    let results = compiler.parse_all(BeliefBase::default()).await?;
     
     // Access the compiled graph
-    let belief_set = parser.accumulator().set();
+    let belief_set = compiler.builder().doc_bb();
     
     // Query nodes
     for (bid, node) in belief_set.states() {
@@ -101,7 +101,7 @@ pub enum ParseDiagnostic {
 }
 ```
 
-The parser automatically tracks and resolves references across multiple passes.
+The compiler automatically tracks and resolves references across multiple passes.
 
 ## Use Cases
 
@@ -132,9 +132,9 @@ Source Files (*.md, *.toml)
     ↓
 ProtoBeliefNode (IR)
     ↓
-[Link] → BeliefSetAccumulator (multi-pass)
+[Link] → GraphBuilder (multi-pass)
     ↓
-BeliefSet (Compiled Graph)
+BeliefBase (Compiled Graph)
     ↓
 [Query/Traverse] → Application logic
 ```
@@ -142,8 +142,8 @@ See the [Architecture Guide](docs/architecture.md) for details.
 
 ### Core Components
 
-- **`beliefset`**: Hypergraph data structures (BeliefSet, BidGraph)
-- **`codec`**: Document parsing (BeliefSetParser, DocCodec trait)
+- **`beliefbase`**: Hypergraph data structures (BeliefBase, BidGraph)
+- **`codec`**: Document parsing (DocumentCompiler, DocCodec trait)
 - **`properties`**: Node/edge types, identifiers (BID), relationship semantics
 - **`event`**: Event streaming for cache synchronization
 - **`query`**: Query language for graph traversal
@@ -189,7 +189,7 @@ noet-core = { version = "0.0.0", features = ["service"] }
 ## Documentation
 
 - **[Architecture Overview](docs/architecture.md)** - High-level concepts and design
-- **[Design Specification](docs/design/beliefset_architecture.md)** - Detailed technical specification
+- **[Design Specification](docs/design/beliefbase_architecture.md)** - Detailed technical specification
 - **[API Documentation](https://docs.rs/noet-core)** - Generated from source (run `cargo doc --open`)
 - **[Examples](examples/)** - Working code examples
 
@@ -198,14 +198,14 @@ noet-core = { version = "0.0.0", features = ["service"] }
 ### Basic Parsing
 
 ```rust
-use noet_core::{beliefset::BeliefSet, codec::BeliefSetParser};
+use noet_core::{beliefbase::BeliefBase, codec::DocumentCompiler};
 
-let mut parser = BeliefSetParser::simple("./docs")?;
-// Stand-in for our global-cache (No effect when used in BeliefSetParser::simple() constructor but
-// used to access DB-backed version of our BeliefSet if available).
-let cache = BeliefSet::default()
-let results = parser.parse_all(cache).await?;
-let accumulated_set = parser.accumulator().stack_cache();
+let mut compiler = DocumentCompiler::simple("./docs")?;
+// Stand-in for our global-cache (No effect when used in DocumentCompiler::simple() constructor but
+// used to access DB-backed version of our BeliefBase if available).
+let cache = BeliefBase::default()
+let results = compiler.parse_all(cache).await?;
+let accumulated_set = compiler.builder().session_bb();
 ```
 
 ### With Diagnostics

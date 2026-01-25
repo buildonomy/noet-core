@@ -1,5 +1,5 @@
 /// [crate::nodekey] contains NodeKey and the link markup parsing for converting links into
-/// [crate::beliefset::BeliefSet] [crate::properties::BeliefNode] references.
+/// [crate::beliefbase::BeliefBase] [crate::properties::BeliefNode] references.
 use path_clean::clean as clean_path;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,9 +17,9 @@ uniffi::custom_type!(Url, String, {
 });
 
 use crate::{
-    beliefset::BeliefSet,
+    beliefbase::BeliefBase,
     properties::{href_namespace, Bid, Bref},
-    query::{BeliefCache, Expression, StatePred},
+    query::{BeliefSource, Expression, StatePred},
     BuildonomyError,
 };
 
@@ -130,12 +130,12 @@ impl NodeKey {
     /// Regularize relative references to absolute within network context (sync).
     ///
     /// Converts relative paths, titles, and IDs to absolute references using the
-    /// [crate::beliefset::BeliefSet]. Paths are bounded by their home network's document path for
+    /// [crate::beliefbase::BeliefBase]. Paths are bounded by their home network's document path for
     /// security.
     #[tracing::instrument(skip(self, cache))]
     pub fn regularize(
         &self,
-        cache: &BeliefSet,
+        cache: &BeliefBase,
         relative_to: Bid,
     ) -> Result<NodeKey, BuildonomyError> {
         // Get network and path from the relative_to node
@@ -149,23 +149,23 @@ impl NodeKey {
 
     /// Regularize relative references to absolute within network context (async).
     ///
-    /// Converts relative paths, titles, and IDs to absolute references using the BeliefCache.
+    /// Converts relative paths, titles, and IDs to absolute references using the BeliefSource.
     /// Paths are bounded by their home network's document path for security.
-    pub async fn regularize_async<C: BeliefCache>(
+    pub async fn regularize_async<C: BeliefSource>(
         &self,
         cache: &C,
         relative_to: Bid,
     ) -> Result<NodeKey, BuildonomyError> {
         // Query for the relative_to node to get its path
         let query_expr = Expression::StateIn(StatePred::Bid(vec![relative_to]));
-        let cache = BeliefSet::from(cache.eval(&query_expr).await?);
+        let cache = BeliefBase::from(cache.eval(&query_expr).await?);
         self.regularize(&cache, relative_to)
     }
 
-    /// Parse a string into a NodeKey with network resolution using a [crate::beliefset::BeliefSet] (sync).
+    /// Parse a string into a NodeKey with network resolution using a [crate::beliefbase::BeliefBase] (sync).
     ///
     /// This handles UnresolvedNetwork errors by querying the cache for the network reference.
-    pub fn from_str_with_cache(s: &str, cache: &BeliefSet) -> Result<Self, BuildonomyError> {
+    pub fn from_str_with_cache(s: &str, cache: &BeliefBase) -> Result<Self, BuildonomyError> {
         match s.parse::<NodeKey>() {
             Ok(key) => Ok(key),
             Err(BuildonomyError::UnresolvedNetwork {
@@ -193,8 +193,8 @@ impl NodeKey {
         }
     }
 
-    /// Parse a string into a NodeKey with network resolution using a BeliefCache (async).
-    pub async fn from_str_with_cache_async<C: BeliefCache>(
+    /// Parse a string into a NodeKey with network resolution using a BeliefSource (async).
+    pub async fn from_str_with_cache_async<C: BeliefSource>(
         s: &str,
         cache: &C,
     ) -> Result<Self, BuildonomyError> {
@@ -225,8 +225,8 @@ impl NodeKey {
         }
     }
 
-    /// Resolve a network reference string to a BID using a [crate::beliefset::BeliefSet] (sync).
-    fn resolve_network_sync(network_ref: &str, cache: &BeliefSet) -> Result<Bid, BuildonomyError> {
+    /// Resolve a network reference string to a BID using a [crate::beliefbase::BeliefBase] (sync).
+    fn resolve_network_sync(network_ref: &str, cache: &BeliefBase) -> Result<Bid, BuildonomyError> {
         // Try parsing as Bref first
         if let Ok(bref) = Bref::try_from(network_ref) {
             // Search states for a node with this namespace
@@ -249,8 +249,8 @@ impl NodeKey {
         )))
     }
 
-    /// Resolve a network reference string to a BID using a BeliefCache (async).
-    async fn resolve_network_async<C: BeliefCache>(
+    /// Resolve a network reference string to a BID using a BeliefSource (async).
+    async fn resolve_network_async<C: BeliefSource>(
         network_ref: &str,
         cache: &C,
     ) -> Result<Bid, BuildonomyError> {
@@ -357,7 +357,7 @@ impl FromStr for NodeKey {
     /// - If only value is provided (e.g., `id://supremum`), it's treated as the value with default network.
     /// - If network + value are provided (e.g., `id://abc123/supremum`), the network must be a valid BID string.
     /// - If network is not a valid BID (e.g., `id://my-network-id/supremum`), returns `UnresolvedNetwork` error.
-    /// - Use `resolve_network()` with a `BeliefCache` to resolve network references by ID/Bref to BID (future feature).
+    /// - Use `resolve_network()` with a `BeliefSource` to resolve network references by ID/Bref to BID (future feature).
     ///
     /// Backward compatibility (heuristic detection):
     /// - Bare BID/Bref strings

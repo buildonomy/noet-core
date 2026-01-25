@@ -147,7 +147,7 @@ From AGENTS.md:
 2. **Quick Start** - Minimal working example with event handling
 3. **File Watching Pattern** - Automatic reparsing on file changes
 4. **Network Management** - Configuration with `get_networks`/`set_networks`
-5. **Threading Model** - 3 threads per network (watcher, parser, transaction)
+5. **Threading Model** - 3 threads per network (watcher, compiler, transaction)
 6. **Database Synchronization** - SQLite persistence and custom paths
 7. **CLI Tool Integration** - References to `noet parse` and `noet watch`
 8. **Error Handling** - Graceful degradation strategy
@@ -171,7 +171,7 @@ From AGENTS.md:
 - ✅ Clear boundaries (when to use vs. when not to use)
 
 **Threading model documentation**:
-- Main thread, file watcher thread, parser thread, transaction thread
+- Main thread, file watcher thread, compiler thread, transaction thread
 - Synchronization points (queue, channel, database lock, mutex)
 - Shutdown semantics (abort handles, graceful cleanup)
 

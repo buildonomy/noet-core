@@ -12,7 +12,7 @@ Implement a clean, cross-renderer compatible anchor strategy using title-based I
 
 1. Parse existing anchors from headings: `{#introduction}`, `{#custom-anchor}`
 2. Generate IDs using title-first, Bref-fallback strategy
-3. Track BID-to-ID mappings internally via BeliefSet
+3. Track BID-to-ID mappings internally via BeliefBase
 4. Preserve cross-renderer compatibility (GitHub, GitLab, Obsidian auto-generate title anchors)
 5. Enable automatic ID updates when titles change (for auto-generated IDs only)
 6. Only inject anchors when necessary (Bref collision case)
@@ -210,7 +210,7 @@ fn inject_context(&mut self, proto: &ProtoBeliefNode) -> Result<(), BuildonomyEr
 
 ### 4. Implement ID Update Detection (1 day)
 
-**File**: `src/codec/accumulator.rs::push()`
+**File**: `src/codec/builder.rs::push()`
 
 - [ ] During cache_fetch, retrieve old node state
 - [ ] Compare old title with new title
@@ -309,7 +309,7 @@ fn inject_context(&mut self, proto: &ProtoBeliefNode) -> Result<(), BuildonomyEr
 - Current parser: `codec/md.rs`
 - BID/Bref generation: `properties.rs::Bid::namespace()` (lines 180-188)
 - PathMap: `paths.rs`
-- Accumulator: `accumulator.rs::push()` (lines 772-954)
+- Builder: `builder.rs::push()` (lines 772-954)
 - Anchor support: GitHub, GitLab, Obsidian, mdBook, Pandoc
 - Issue 4: Link manipulation uses Bref (not BID or ID) as standard strong NodeKey in title attribute
 - Issue 6: HTML generation adds `data-bid` and `data-bref` attributes
@@ -533,12 +533,12 @@ bid: abc123
 - Generates paths with collision-safe anchors
 - Used during triangulation for Path-based lookups
 
-**BeliefSet** (`beliefset.rs`):
+**BeliefBase** (`beliefbase.rs`):
 - Maintains all ID mappings: `bid_to_index`, `brefs`, `ids`, `paths`
 - Enables O(1) lookup by any NodeKey type
 - Central registry for triangulation
 
-**Accumulator** (`accumulator.rs::parse_content()`):
+**Builder** (`builder.rs::parse_content()`):
 - Phase 1: Create nodes, cache_fetch via multiple keys (triangulation)
 - Phase 2: Process relations, resolve forward references
 - Phase 3: Notify sinks of ID changes, queue rewrites

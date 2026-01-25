@@ -1,6 +1,6 @@
 pub use enumset::EnumSet;
 /// [crate::properties] contains the basic building blocks for assembling and manipulating
-/// [crate::beliefset::BeliefSet]s and associated structures.
+/// [crate::beliefbase::BeliefBase]s and associated structures.
 use enumset::*;
 use petgraph::IntoWeightedEdge;
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ uniffi::custom_type!(Table, String, {
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 
 use crate::{
-    beliefset::BeliefSet,
+    beliefbase::BeliefBase,
     codec::lattice_toml::ProtoBeliefNode,
     error::BuildonomyError,
     nodekey::{to_anchor, NodeKey},
@@ -87,8 +87,8 @@ pub(crate) mod enumset_list {
 }
 
 /// The Buildonomy namespace UUID. This is used to create an anchor node within
-/// [`crate::beliefset::BidGraph`]`s in order to identify the top of the graph, as well as identify what
-/// buildonomy core API the beliefset structure complies to.
+/// [`crate::beliefbase::BidGraph`]`s in order to identify the top of the graph, as well as identify what
+/// buildonomy core API the beliefbase structure complies to.
 pub const UUID_NAMESPACE_BUILDONOMY: Uuid = Uuid::from_bytes([
     0x6b, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
 ]);
@@ -332,14 +332,14 @@ impl From<Bref> for String {
 
 /// [BeliefKind] enumerates all available [BeliefNode] object types per this core api version. Each
 /// [BeliefNode] contains an [EnumSet] of these options, in order to designate it's functionality
-/// and available operations within a [crate::beliefset::BeliefSet].
+/// and available operations within a [crate::beliefbase::BeliefBase].
 #[derive(
     Debug, Default, Serialize, Deserialize, PartialOrd, Ord, Hash, EnumSetType, uniffi::Enum,
 )]
 #[enumset(repr = "u32")]
 pub enum BeliefKind {
     /// A Buildonomy API node serving as an anchor point for a specific schema version or
-    /// implementation. Multiple API nodes can coexist in a BeliefSet, each representing different
+    /// implementation. Multiple API nodes can coexist in a BeliefBase, each representing different
     /// schema versions or alternative implementations. All nodes in a valid subgraph must have a
     /// path (via Subsection relations) to at least one API node, which serves as the root of that
     /// subgraph's hierarchy. Network nodes connected to an API represent content representable
@@ -525,7 +525,7 @@ impl Ord for Weight {
 }
 
 /// [WeightKind] identifies what type of node to node relationship an edge represents. Each
-/// [crate::beliefset::BidGraph] represents a hypergraph of these relationship types.
+/// [crate::beliefbase::BidGraph] represents a hypergraph of these relationship types.
 ///
 /// **Architecture Note (Advisory Council 2025-11-19):** WeightKind is infrastructure-only,
 /// carrying NO semantic payload. All semantic information is stored in the Weight.payload field:
@@ -640,8 +640,8 @@ impl TryFrom<u32> for WeightKind {
 
 use std::collections::BTreeMap;
 
-/// [WeightSet] is the edge data structure used within a [crate::beliefset::BidGraph] to represent the full
-/// [crate::beliefset::BeliefSet] hypergraph within a single graph structure.
+/// [WeightSet] is the edge data structure used within a [crate::beliefbase::BidGraph] to represent the full
+/// [crate::beliefbase::BeliefBase] hypergraph within a single graph structure.
 ///
 /// WeightSet methods provide convenience functions for extracting and comparing [WeightKind]
 /// specific measures.
@@ -755,7 +755,7 @@ impl<'a> IntoIterator for &'a WeightSet {
 }
 
 /// Acts as a reference-to and configuration-of an actionable element within a
-/// [crate::beliefset::BeliefSet]. [BeliefNode]s are the nodes (duh) of a Network.
+/// [crate::beliefbase::BeliefBase]. [BeliefNode]s are the nodes (duh) of a Network.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct BeliefNode {
     pub bid: Bid,
@@ -874,7 +874,7 @@ impl BeliefNode {
         &self,
         maybe_ns: Option<Bid>,
         maybe_parent: Option<Bid>,
-        bs: &BeliefSet,
+        bs: &BeliefBase,
     ) -> Vec<NodeKey> {
         let ns = maybe_ns.unwrap_or_default();
         let mut ids = Vec::default();
@@ -1071,7 +1071,7 @@ impl PartialOrd for BeliefNode {
     }
 }
 
-/// Represents a [crate::beliefset::BidGraph] edge as a structure suitable for saving into a database table.
+/// Represents a [crate::beliefbase::BidGraph] edge as a structure suitable for saving into a database table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BeliefRelation {
     pub source: Bid,
@@ -1200,7 +1200,7 @@ impl IntoWeightedEdge<WeightSet> for BeliefRelation {
     }
 }
 
-/// Express the intended participant experience for a BeliefSet rendering.
+/// Express the intended participant experience for a BeliefBase rendering.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum RenderMode {
     #[default]

@@ -43,7 +43,7 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 **Target Audience**: Developers who want to understand how the library works
 
 **Content**:
-- Core concepts (BID, BeliefSet, multi-pass compilation)
+- Core concepts (BID, BeliefBase, multi-pass compilation)
 - Architecture overview (components and their roles)
 - Data flow diagrams
 - Relationship to prior art (detailed comparisons)
@@ -55,9 +55,9 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 
 **Source of Truth For**: "How does the library work at a conceptual level?"
 
-**Links to**: `docs/design/beliefset_architecture.md` for technical details
+**Links to**: `docs/design/beliefbase_architecture.md` for technical details
 
-### 3. `docs/design/beliefset_architecture.md`: "Technical Specification"
+### 3. `docs/design/beliefbase_architecture.md`: "Technical Specification"
 
 **Purpose**: Complete technical specification for understanding internals, contributing, or making architectural decisions
 
@@ -78,7 +78,7 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 
 **Source of Truth For**: "How is this implemented and why?"
 
-**References**: Code locations (e.g., `beliefset.rs:660-2420`)
+**References**: Code locations (e.g., `beliefbase.rs:660-2420`)
 
 ### 4. Module-Level Rustdoc: "API Guide"
 
@@ -94,7 +94,7 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 - Links to related modules
 
 **Examples**:
-- `src/beliefset.rs`: BeliefSet data structure and operations
+- `src/beliefbase.rs`: BeliefBase data structure and operations
 - `src/codec/mod.rs`: Parsing and codec system
 - `src/properties.rs`: Node and edge types
 
@@ -127,7 +127,7 @@ src/lib.rs (rustdoc)
     ↓ (Learn concepts)
 docs/architecture.md
     ↓ (Deep dive)
-docs/design/beliefset_architecture.md
+docs/design/beliefbase_architecture.md
     ↓ (Use API)
 Module-level rustdoc
 ```
@@ -150,7 +150,7 @@ Module-level rustdoc
 ```rust
 // lib.rs
 //! noet-core implements multi-pass compilation to handle forward references.
-//! See `docs/design/beliefset_architecture.md` for algorithm specification.
+//! See `docs/design/beliefbase_architecture.md` for algorithm specification.
 ```
 
 ### Rule 2: Brief in Rustdoc, Detailed in Design Docs
@@ -163,7 +163,7 @@ Module-level rustdoc
 //! 2. **Resolution Passes**: Reparse with resolved dependencies
 //! 3. **Convergence**: Iterate until complete
 //!
-//! See `docs/design/beliefset_architecture.md` for details.
+//! See `docs/design/beliefbase_architecture.md` for details.
 ```
 
 **design doc example**:
@@ -174,7 +174,7 @@ Module-level rustdoc
 - Parses all files without prior context
 - Target not yet parsed → `cache_fetch()` returns `GetOrCreateResult::Unresolved(...)`
 - Collect `UnresolvedReference` diagnostic (no relation created yet)
-- Parser tracks unresolved refs for later resolution checking
+- Compiler tracks unresolved refs for later resolution checking
 - Continue parsing all files
 
 [... detailed algorithm specification ...]
@@ -196,9 +196,9 @@ Each example should be maintained independently.
 Use markdown links and rustdoc links to connect related content:
 
 ```rust
-//! See [`beliefset::BeliefSet`] for graph operations.
+//! See [`beliefbase::BeliefBase`] for graph operations.
 //! See `docs/architecture.md` for conceptual overview.
-//! See `docs/design/beliefset_architecture.md` for implementation details.
+//! See `docs/design/beliefbase_architecture.md` for implementation details.
 ```
 
 ## When Content Overlaps: Decision Matrix
@@ -290,7 +290,7 @@ lib.rs (rustdoc)          ← tokio/serde style: brief, links to guides
     ↓
 architecture.md            ← Website guide equivalent: conceptual
     ↓
-design/beliefset_architecture.md  ← RFC-style: technical spec
+design/beliefbase_architecture.md  ← RFC-style: technical spec
     ↓
 Module rustdoc            ← Standard Rust: API reference
 ```
@@ -303,7 +303,7 @@ Module rustdoc            ← Standard Rust: API reference
 | Multi-pass algorithm | design spec | - |
 | BID system concept | lib.rs (brief) | architecture.md (example), design spec (full spec) |
 | BID implementation | design spec | - |
-| BeliefSet API | beliefset module doc | lib.rs (mention), architecture.md (concept) |
+| BeliefBase API | BeliefBase module doc | lib.rs (mention), architecture.md (concept) |
 | Comparison to other tools | architecture.md | lib.rs (brief), README (table) |
 | Getting started | lib.rs | README (simpler), architecture.md (enhanced) |
 | Architecture components | lib.rs (list) | architecture.md (explanation), design spec (detailed) |

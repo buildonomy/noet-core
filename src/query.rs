@@ -14,7 +14,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::{QueryBuilder, Sqlite};
 
 use crate::{
-    beliefset::{BeliefSet, Beliefs},
+    beliefbase::{BeliefBase, BeliefGraph},
     nodekey::NodeKey,
     properties::{
         AsRun, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref, WeightKind,
@@ -121,7 +121,7 @@ fn push_namespace_expr(
     }
 }
 
-/// Query language for interacting with Beliefs and their relations.
+/// Query language for interacting with BeliefGraph and their relations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Hash)]
 pub enum Expression {
     StateIn(StatePred),
@@ -423,7 +423,7 @@ impl AsSql for StatePred {
             StatePred::Payload(_key, _re_val) => {
                 tracing::warn!(
                     "Cannot construct a payload query using the database! Instead, perform a \
-                    general query to the database then query the resulting BeliefSet in order \
+                    general query to the database then query the resulting BeliefBase in order \
                     to filter by payload value."
                 );
             }
@@ -531,11 +531,11 @@ pub trait AsSql {
 /// Cutoff limit for build balance expression recursion
 pub const BALANCE_CUTOFF: usize = 10;
 
-pub trait BeliefCache: Sync {
+pub trait BeliefSource: Sync {
     fn eval_unbalanced(
         &self,
         expr: &Expression,
-    ) -> impl std::future::Future<Output = Result<Beliefs, BuildonomyError>> + Send;
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
 
     /// Evaluate an expression as a trace, marking nodes as Trace and only returning
     /// relations matching the provided weight filter. This prevents pulling in the
@@ -544,15 +544,15 @@ pub trait BeliefCache: Sync {
         &self,
         expr: &Expression,
         weight_filter: WeightSet,
-    ) -> impl std::future::Future<Output = Result<Beliefs, BuildonomyError>> + Send;
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
 
     fn eval_balanced(
         &self,
         expr: &Expression,
-    ) -> impl std::future::Future<Output = Result<BeliefSet, BuildonomyError>> + Send {
+    ) -> impl std::future::Future<Output = Result<BeliefBase, BuildonomyError>> + Send {
         async {
             let beliefs = self.eval_unbalanced(expr).await?;
-            let bset = BeliefSet::from(beliefs);
+            let bset = BeliefBase::from(beliefs);
             bset.is_balanced()?;
             Ok(bset)
         }
@@ -561,7 +561,7 @@ pub trait BeliefCache: Sync {
     fn eval(
         &self,
         expr: &Expression,
-    ) -> impl std::future::Future<Output = Result<Beliefs, BuildonomyError>> {
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> {
         async {
             let mut set = self.eval_unbalanced(expr).await?;
             self.balance(&mut set).await?;
@@ -575,13 +575,13 @@ pub trait BeliefCache: Sync {
         key: &NodeKey,
     ) -> impl std::future::Future<Output = Result<Option<BeliefNode>, BuildonomyError>> + Send {
         async {
-            let result_set = BeliefSet::from(self.eval_unbalanced(&Expression::from(key)).await?);
+            let result_set = BeliefBase::from(self.eval_unbalanced(&Expression::from(key)).await?);
             Ok(result_set.get(key))
         }
     }
 
-    /// This will keep querying the [BeliefCache] until the provided set returns an empty option for
-    /// [Beliefs::build_balance_expr], or the BALANCE_CUTOFF max query depth is reached.
+    /// This will keep querying the [BeliefSource] until the provided set returns an empty option for
+    /// [BeliefGraph::build_balance_expr], or the BALANCE_CUTOFF max query depth is reached.
     ///
     /// If balanced, the resulting set may still have relation sources who's Node's are not
     /// known. In order to access those nodes, an explicit query must be exectuted.
@@ -590,7 +590,7 @@ pub trait BeliefCache: Sync {
     /// a subset of their relations (specifically Subsection relations) have been loaded.
     fn balance<'a>(
         &'a self,
-        set: &'a mut Beliefs,
+        set: &'a mut BeliefGraph,
     ) -> impl std::future::Future<Output = Result<(), BuildonomyError>> + Send + 'a {
         async move {
             // Go upstream once in order to jump start our balance expression
@@ -603,7 +603,7 @@ pub trait BeliefCache: Sync {
             while let Some(expr) = balance_expr {
                 if loop_iter > BALANCE_CUTOFF {
                     tracing::warn!(
-                        "Cutting off building of a balanced BeliefSet - \
+                        "Cutting off building of a balanced BeliefBase - \
                          the expression is taking too long to complete."
                     );
                     break;
@@ -642,7 +642,7 @@ pub trait BeliefCache: Sync {
         &self,
         query: &Query,
         all_or_none: bool,
-    ) -> impl std::future::Future<Output = Result<Beliefs, BuildonomyError>> + Send {
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
         async move {
             let mut bs = self.eval_unbalanced(&query.seed).await?;
 
@@ -659,7 +659,7 @@ pub trait BeliefCache: Sync {
                     }
                     // tracing::debug!("upstream loop {}", upstream_loop);
                     upstream_loop += 1;
-                    let up_set = upstream_set.get_or_insert(Beliefs {
+                    let up_set = upstream_set.get_or_insert(BeliefGraph {
                         states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
                         relations: bs.relations.clone(),
                     });
@@ -670,7 +670,7 @@ pub trait BeliefCache: Sync {
                         if *new_up_expr == up_expr {
                             if all_or_none {
                                 // tracing::debug!("Returning empty set");
-                                return Ok(Beliefs::default());
+                                return Ok(BeliefGraph::default());
                             } else {
                                 // tracing::debug!("breaking traversal");
                                 break;
@@ -691,7 +691,7 @@ pub trait BeliefCache: Sync {
                     }
                     // tracing::debug!("downstream loop {}", downstream_loop);
                     downstream_loop += 1;
-                    let down_set = downstream_set.get_or_insert(Beliefs {
+                    let down_set = downstream_set.get_or_insert(BeliefGraph {
                         states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
                         relations: bs.relations.clone(),
                     });
@@ -702,7 +702,7 @@ pub trait BeliefCache: Sync {
                         if *new_down_expr == down_expr {
                             if all_or_none {
                                 // tracing::debug!("Returning empty set");
-                                return Ok(Beliefs::default());
+                                return Ok(BeliefGraph::default());
                             } else {
                                 // tracing::debug!("breaking traversal");
                                 break;
@@ -733,7 +733,7 @@ pub trait BeliefCache: Sync {
             }
             if !bs.states.is_empty() {
                 self.balance(&mut bs).await?;
-                // debug_assert!(BeliefSet::from(bs.clone()).check(true).is_err_and(|e| {
+                // debug_assert!(BeliefBase::from(bs.clone()).check(true).is_err_and(|e| {
                 //     if let BuildonomyError::Custom(msg) = e {
                 //         tracing::warn!(
                 //             "Query results for {:?} aren't balanced! errors are:\n\t{}",

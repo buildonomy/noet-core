@@ -10,8 +10,8 @@ use tokio::sync::mpsc::unbounded_channel;
 use toml::from_str;
 
 use noet_core::{
-    beliefset::BeliefSet,
-    codec::{lattice_toml::NETWORK_CONFIG_NAME, BeliefSetParser, CODECS},
+    beliefbase::BeliefBase,
+    codec::{lattice_toml::NETWORK_CONFIG_NAME, DocumentCompiler, CODECS},
     error::BuildonomyError,
     event::BeliefEvent,
     properties::Bid,
@@ -67,9 +67,9 @@ fn extract_bids_from_content(content: &str) -> Result<Vec<Bid>, BuildonomyError>
 }
 
 #[test(tokio::test)]
-async fn test_belief_set_accumulator_bid_generation_and_caching(
+async fn test_belief_set_builder_bid_generation_and_caching(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Initialize global_cache (BeliefSet) and other necessary dependencies.");
+    tracing::info!("Initialize global_bb (BeliefBase) and other necessary dependencies.");
     let test_tempdir = generate_test_root("network_1")?;
     let test_root = test_tempdir.path().to_path_buf();
     tracing::info!(
@@ -81,22 +81,22 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
             .collect::<Vec<String>>()
             .join(", ")
     );
-    let mut global_cache = BeliefSet::empty();
+    let mut global_bb = BeliefBase::empty();
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
     tracing::info!(
-        "Initialized BeliefSet codec extension types: {:?}",
+        "Initialized BeliefBase codec extension types: {:?}",
         CODECS.extensions()
     );
 
-    tracing::info!("Initialize BeliefSetParser");
-    let mut parser = BeliefSetParser::new(&test_root, Some(accum_tx), None, false)?;
+    tracing::info!("Initialize DocumentCompiler");
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
 
     let mut docs_to_reparse = BTreeSet::default();
     let mut written_bids = BTreeSet::default();
-    written_bids.insert(parser.accumulator().api().bid);
+    written_bids.insert(compiler.builder().api().bid);
 
-    tracing::info!("Run parser.parse_all()");
-    let parse_results = parser.parse_all(global_cache.clone()).await?;
+    tracing::info!("Run compiler.parse_all()");
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
 
     let mut writes = BTreeMap::<String, usize>::default();
     for parse_result in parse_results {
@@ -120,15 +120,15 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
         }
 
         while let Ok(event) = accum_rx.try_recv() {
-            global_cache.process_event(&event)?;
+            global_bb.process_event(&event)?;
             // tracing::debug!("global cache event: {:?}", event);
         }
     }
     tracing::debug!(
-        "Global cache nodes: {}, accum.stack_cache nodes: {}, accum.set nodes: {}",
-        global_cache.states().len(),
-        parser.accumulator().stack_cache().states().len(),
-        parser.accumulator().set().states().len()
+        "Global cache nodes: {}, accum.session_bb nodes: {}, builder.doc_bb nodes: {}",
+        global_bb.states().len(),
+        compiler.builder().session_bb().states().len(),
+        compiler.builder().doc_bb().states().len()
     );
     tracing::debug!(
         "File writes:\n - {}",
@@ -140,23 +140,23 @@ async fn test_belief_set_accumulator_bid_generation_and_caching(
     );
 
     tracing::info!("Ensure written bids match cached bids");
-    let cached_bids = BTreeSet::from_iter(global_cache.states().values().map(|n| n.bid));
+    let cached_bids = BTreeSet::from_iter(global_bb.states().values().map(|n| n.bid));
     debug_assert!(
         written_bids.eq(&cached_bids),
         "Written: {written_bids:?}\n\nCached: {cached_bids:?}"
     );
 
-    // 8. Initialize a NEW BeliefSetParser using the SAME global_cache and repository state
+    // 8. Initialize a NEW DocumentCompiler using the SAME global_bb and repository state
     tracing::info!(
-        "Initialize a NEW BeliefSetParser for the second parsing run, reusing global_cache."
+        "Initialize a NEW DocumentCompiler for the second parsing run, reusing global_bb."
     );
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
-    parser = BeliefSetParser::new(&test_root, Some(accum_tx), None, false)?;
+    compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
     written_bids = BTreeSet::default();
-    written_bids.insert(parser.accumulator().api().bid);
+    written_bids.insert(compiler.builder().api().bid);
 
-    tracing::info!("Re-running parser.parse_all()");
-    let final_parse_results = parser.parse_all(global_cache.clone()).await?;
+    tracing::info!("Re-running compiler.parse_all()");
+    let final_parse_results = compiler.parse_all(global_bb.clone()).await?;
 
     for parse_result in final_parse_results {
         tracing::debug!("Parsing doc {:?}", parse_result.path);

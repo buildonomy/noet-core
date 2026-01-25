@@ -11,10 +11,12 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 
 **Key Problems**:
 1. `BeliefSetParser` doesn't parse - it orchestrates (like a build system)
-2. `BeliefSetAccumulator` does both parsing AND linking - not just accumulation
+2. `GraphBuilder` does both parsing AND linking - not just accumulation
 3. Field names are backwards: `.set` is local, `.stack_cache` is global
 4. `BeliefSet` vs `Beliefs` distinction is unclear
 5. Names don't align with the compiler analogy we document
+
+**Decision**: After analysis, we'll rename `BeliefSet` → `BeliefBase` to better capture its role as database-style infrastructure that applications build upon. The `.bb` abbreviation parallels the familiar `.db` pattern.
 
 ## Goals
 
@@ -39,7 +41,7 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 
 **Compiler analogy**: Build system, compilation driver (like `rustc` coordinator, `make`)
 
-### 2. BeliefSetAccumulator (codec/mod.rs)
+### 2. GraphBuilder (codec/mod.rs)
 
 **Problem**: Name suggests it only accumulates, but it both parses files AND links references.
 
@@ -52,7 +54,7 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 
 **Compiler analogy**: Semantic analyzer + linker
 
-### 3. BeliefSetAccumulator.set
+### 3. GraphBuilder.set
 
 **Problem**: Misleading name - this is the LOCAL/CURRENT document's BeliefSet, not the accumulated result.
 
@@ -60,7 +62,7 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 
 **Expected meaning**: The accumulated result (but it's not!)
 
-### 4. BeliefSetAccumulator.stack_cache
+### 4. GraphBuilder.stack_cache
 
 **Problem**: Name doesn't convey that this is the SESSION-accumulated cache, not the global persistent cache.
 
@@ -75,8 +77,13 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 **Problem**: Distinction is unclear from names alone.
 
 **What they are**:
-- `BeliefSet`: Full-featured, indexed, queryable graph structure
-- `Beliefs`: Lightweight transport structure (just states + relations)
+- `BeliefSet`: Full-featured, indexed, queryable graph structure (like a database)
+- `Beliefs`: Lightweight transport structure (just states + relations - raw graph data)
+
+**Analysis**: "BeliefSet" undersells the richness - it's not just a set, it's a database-style structure with indexing, querying, and graph operations. The name should emphasize:
+- Infrastructure that applications build upon
+- Domain-specific storage with query semantics (like a database)
+- Foundation for belief storage without prescribing application logic
 
 ## Three-Tier Caching Architecture
 
@@ -84,21 +91,21 @@ Understanding the three levels of scope is critical to understanding the confusi
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Document-Scoped (.set)                                     │
+│  Document-Scoped (.set → .doc_bb)                           │
 │  - Currently-being-parsed document only                     │
 │  - Cleared/reset between documents                          │
-│  - BeliefSet for single file                                │
+│  - BeliefBase for single file                               │
 └─────────────────────────────────────────────────────────────┘
                          ↓ accumulates into
 ┌─────────────────────────────────────────────────────────────┐
-│  Session-Scoped (.stack_cache)                              │
+│  Session-Scoped (.stack_cache → .session_bb)                │
 │  - Accumulated across all documents in this parse session   │
 │  - In-memory only, lost on process exit                     │
-│  - BeliefSet for all parsed files                           │
+│  - BeliefBase for all parsed files                          │
 └─────────────────────────────────────────────────────────────┘
                          ↓ syncs to/from
 ┌─────────────────────────────────────────────────────────────┐
-│  Global/Persistent (global_cache: B parameter)              │
+│  Global/Persistent (global_cache: B parameter → global_bb)  │
 │  - DB-backed, persists across sessions                      │
 │  - Authoritative source for BID identity                    │
 │  - Shared across all parsing sessions                       │
@@ -107,65 +114,80 @@ Understanding the three levels of scope is critical to understanding the confusi
 
 **The Problem**: Field names don't clearly indicate which scope they represent.
 
+**The Solution**: Use `.bb` abbreviation (paralleling `.db` for database) with scope prefixes to make the three-tier architecture explicit.
+
 ## Proposed Naming Scheme
 
 **Three Levels of Scope**:
-1. **Document-local**: Current document being parsed (`.set` → `.document_graph`)
-2. **Session-local**: Accumulated in-memory during parsing session (`.stack_cache` → `.session_graph`)
-3. **Global/persistent**: DB-backed cache passed as parameter (`global_cache: B` - already well-named)
+1. **Document-local**: Current document being parsed (`.set` → `.doc_bb`)
+2. **Session-local**: Accumulated in-memory during parsing session (`.stack_cache` → `.session_bb`)
+3. **Global/persistent**: DB-backed cache passed as parameter (`global_cache: B` → `global_bb: B`)
 
-### Option A: Traditional Compiler Terms
+**Rationale for BeliefBase**:
+- Database analogy: BeliefBase is to beliefs what database is to data
+- Infrastructure foundation: Applications build upon it without it prescribing logic
+- Familiar abbreviation: `.bb` parallels `.db` convention
+- Unique and recognizable: `.bb` is distinctive, unlikely to collide
+- Domain-specific semantics: Like a database but with graph query semantics for beliefs
+
+### SELECTED: Domain-Aware Database-Style Naming
+
+**Rationale**: 
+- `BeliefBase` captures the database-style infrastructure role
+- Infrastructure types drop "Belief" prefix (they operate on beliefs but aren't beliefs)
+- Field abbreviations use `.bb` (paralleling `.db`) with scope prefixes
+- Maintains "Belief" terminology where it matters (domain concepts)
+
+| Current | Proposed | Rationale |
+|---------|----------|-----------|
+| `BeliefSetParser` | `DocumentCompiler` | Infrastructure - orchestrates compilation |
+| `BeliefSetAccumulator` | `GraphBuilder` | Infrastructure - builds graph from documents |
+| `BeliefSet` | `BeliefBase` | Database-style belief storage with query semantics |
+| `Beliefs` | `BeliefGraph` | Raw graph data (states + relations) |
+| `BeliefCache` trait | `BeliefSource` trait | Abstraction for sources that provide belief data |
+| `.set` | `.doc_bb` | Document-scoped BeliefBase |
+| `.stack_cache` | `.session_bb` | Session-scoped BeliefBase |
+| `global_cache: B` | `global_bb: B` | Global-scoped BeliefBase parameter |
+
+**Why BeliefBase**:
+1. **Database analogy**: BeliefBase : beliefs :: Database : data
+2. **Infrastructure foundation**: Applications build upon it, it doesn't prescribe logic
+3. **Familiar pattern**: `.bb` parallels `.db` (database) convention
+4. **Unique abbreviation**: `.bb` is distinctive and unlikely to collide
+5. **Semantic fit**: "Base" implies foundational, structural, durable
+6. **Works with Intention Lattice**: BeliefBase is the general container; Intention Lattice is a lattice-structured interpretation of certain paths within it
+
+### Alternative Options (Not Selected)
+
+<details>
+<summary>Option A: Traditional Compiler Terms</summary>
 
 **Pros**: Clear analogy to compiler architecture  
-**Cons**: Moves away from "Belief" terminology
+**Cons**: Loses "Belief" domain terminology entirely
 
-| Current | Proposed | Rationale |
-|---------|----------|-----------|
-| `BeliefSetParser` | `DocumentCompiler` | Orchestrates compilation of document network |
-| `BeliefSetAccumulator` | `GraphLinker` | Links documents into graph |
-| `BeliefSet` | `IndexedGraph` | Indexed, queryable graph structure |
-| `Beliefs` | `GraphData` | Raw graph data (states + relations) |
-| `.set` | `.current_document` | Document-scoped (one file) |
-| `.stack_cache` | `.session_cache` | Session-scoped (in-memory accumulation) |
+| Current | Proposed |
+|---------|----------|
+| `BeliefSet` | `IndexedGraph` |
+| `Beliefs` | `GraphData` |
+| `.set` | `.current_document` |
+| `.stack_cache` | `.session_cache` |
 
-### Option B: Keep "Belief" Terminology
+</details>
 
-**Pros**: Maintains domain terminology consistency  
-**Cons**: Less obvious compiler analogy
+<details>
+<summary>Option B: Network-Based Naming</summary>
 
-| Current | Proposed | Rationale |
-|---------|----------|-----------|
-| `BeliefSetParser` | `BeliefCompiler` | Compiles document network into BeliefSet |
-| `BeliefSetAccumulator` | `BeliefLinker` | Links beliefs across documents |
-| `BeliefSet` | `IndexedBeliefSet` | Clarifies this is the indexed version |
-| `Beliefs` | `RawBeliefs` | Clarifies this is the raw data |
-| `.set` | `.document_set` | Document-scoped |
-| `.stack_cache` | `.session_set` | Session-scoped (in-memory) |
+**Pros**: Emphasizes interconnection  
+**Cons**: "Network" could imply distributed systems
 
-### Option C: Hybrid Approach (RECOMMENDED)
+| Current | Proposed |
+|---------|----------|
+| `BeliefSet` | `BeliefNetwork` |
+| `Beliefs` | `BeliefGraph` |
+| `.set` | `.doc_net` |
+| `.stack_cache` | `.session_net` |
 
-**Pros**: Clear roles while keeping some domain terminology  
-**Cons**: Mix of styles
-
-| Current | Proposed | Rationale |
-|---------|----------|-----------|
-| `BeliefSetParser` | `DocumentCompiler` | Clear orchestration role |
-| `BeliefSetAccumulator` | `GraphBuilder` | Builds graph from documents |
-| `BeliefSet` | `BeliefSet` | Keep (well-known) |
-| `Beliefs` | `BeliefGraph` | Clarifies it's graph data |
-| `.set` | `.document_graph` | Document-scoped graph |
-| `.stack_cache` | `.session_graph` | Session-scoped accumulation |
-
-### Option D: Most Intuitive (ALTERNATIVE)
-
-| Current | Proposed | Rationale |
-|---------|----------|-----------|
-| `BeliefSetParser` | `CompilationOrchestrator` | Most explicit |
-| `BeliefSetAccumulator` | `DocumentLinker` | Clear linking role |
-| `BeliefSet` | `QueryableGraph` | Emphasizes usage |
-| `Beliefs` | `GraphSnapshot` | Lightweight snapshot |
-| `.set` | `.current_doc` | Short, document-scoped |
-| `.stack_cache` | `.session_cache` | Short, session-scoped |
+</details>
 
 ## Implementation Steps
 
@@ -181,14 +203,20 @@ pub type BeliefSetParser = DocumentCompiler;
 // In codec/mod.rs
 #[deprecated(note = "Use GraphBuilder instead")]
 pub type BeliefSetAccumulator = GraphBuilder;
+
+// In beliefset.rs
+#[deprecated(note = "Use BeliefBase instead")]
+pub type BeliefSet = BeliefBase;
 ```
 
 ### Phase 2: Rename Types (1 day)
 
 1. **Rename struct definitions**:
-   - [ ] `BeliefSetParser` → chosen name
-   - [ ] `BeliefSetAccumulator` → chosen name
-   - [ ] `Beliefs` → chosen name (if changing)
+   - [ ] `BeliefSetParser` → `DocumentCompiler`
+   - [ ] `BeliefSetAccumulator` → `GraphBuilder`
+   - [ ] `BeliefSet` → `BeliefBase`
+   - [ ] `Beliefs` → `BeliefGraph`
+   - [ ] `BeliefCache` trait → `BeliefSource` trait
 
 2. **Update all usages**:
    - [ ] Update imports across codebase
@@ -201,16 +229,19 @@ pub type BeliefSetAccumulator = GraphBuilder;
 
 ### Phase 3: Rename Fields (0.5 days)
 
-1. **In BeliefSetAccumulator/GraphBuilder**:
-   - [ ] `.set` → `.document_graph` (or chosen name) - document-scoped
-   - [ ] `.stack_cache` → `.session_graph` or `.session_cache` (or chosen name) - session-scoped
+1. **In GraphBuilder (formerly BeliefSetAccumulator)**:
+   - [ ] `.set` → `.doc_bb` - document-scoped BeliefBase
+   - [ ] `.stack_cache` → `.session_bb` - session-scoped BeliefBase
+   - [ ] Add public accessors: `pub fn document_base(&self) -> &BeliefBase { &self.doc_bb }`
+   - [ ] Add public accessors: `pub fn session_base(&self) -> &BeliefBase { &self.session_bb }`
 
 2. **Update all field accesses**:
-   - [ ] Search for `.set` usages
+   - [ ] Search for `.set` usages (careful - common name!)
    - [ ] Search for `.stack_cache` usages
-   - [ ] Update with new names
+   - [ ] Update with new names (`.doc_bb`, `.session_bb`)
+   - [ ] Update parameter names: `global_cache: B` → `global_bb: B`
 
-**Note**: The `global_cache: B` parameter is already well-named and represents the true global/persistent cache.
+**Note**: The `.bb` abbreviation parallels `.db` for database, making the three-tier scope (`.doc_bb`, `.session_bb`, `.global_bb`) immediately clear.
 
 ### Phase 4: Documentation (1 day)
 
@@ -244,14 +275,22 @@ Create `docs/MIGRATION_v0.X.md`:
 
 - `BeliefSetParser` → `DocumentCompiler`
 - `BeliefSetAccumulator` → `GraphBuilder`
+- `BeliefSet` → `BeliefBase`
 - `Beliefs` → `BeliefGraph`
+- `BeliefCache` trait → `BeliefSource` trait
 
 ## Field Renames
 
-- `BeliefSetAccumulator.set` → `GraphBuilder.document_graph` (document-scoped)
-- `BeliefSetAccumulator.stack_cache` → `GraphBuilder.session_graph` (session-scoped, in-memory)
+- `GraphBuilder.set` → `GraphBuilder.doc_bb` (document-scoped BeliefBase)
+- `GraphBuilder.stack_cache` → `GraphBuilder.session_bb` (session-scoped BeliefBase)
+- `global_cache: B` → `global_bb: B` (global-scoped BeliefBase parameter)
 
-Note: The actual global cache is the DB-backed parameter, not a field.
+## Abbreviation Convention
+
+The `.bb` abbreviation parallels `.db` (database) and emphasizes the three-tier scope:
+- `.doc_bb` - document-scoped (current file being parsed)
+- `.session_bb` - session-scoped (accumulated in-memory this session)
+- `.global_bb` - global-scoped (persisted across sessions)
 
 ## Code Migration
 
@@ -259,19 +298,37 @@ Note: The actual global cache is the DB-backed parameter, not a field.
 ```rust
 let parser = BeliefSetParser::new(...);
 let accumulator = parser.accumulator();
-let doc_local = accumulator.set();
-let session_accumulated = accumulator.stack_cache();
+let doc_local: &BeliefSet = accumulator.set();
+let session_accumulated: &BeliefSet = accumulator.stack_cache();
+
+// Using trait bound
+async fn query<B: BeliefCache>(cache: &B, expr: &Expression) {
+    let result = cache.eval_unbalanced(expr).await;
+}
 ```
 
 ### After
 ```rust
 let compiler = DocumentCompiler::new(...);
 let builder = compiler.graph_builder();
-let doc_local = builder.document_graph();
-let session_accumulated = builder.session_graph();
+let doc_local: &BeliefBase = builder.document_base();
+let session_accumulated: &BeliefBase = builder.session_base();
+
+// Using trait bound
+async fn query<B: BeliefSource>(source: &B, expr: &Expression) {
+    let result = source.eval_unbalanced(expr).await;
+}
 ```
 
-Note: Global persistent cache is accessed via the `global_cache` parameter.
+### Internal Code (Direct Field Access)
+```rust
+// Before
+self.set.states()
+self.stack_cache.relations()
+
+// After
+self.doc_bb.states()
+self.session_bb.relations()
 ```
 
 ## Testing Requirements
@@ -310,9 +367,10 @@ Note: Global persistent cache is accessed via the `global_cache` parameter.
 
 ## Open Questions
 
-1. **Which naming option to choose?** (A, B, C, or D)
-   - Recommendation: Option C (Hybrid) or D (Most Intuitive)
-   - Need feedback from maintainers and early users
+1. **~~Which naming option to choose?~~** ✅ RESOLVED
+   - **Decision**: BeliefBase with `.bb` abbreviation
+   - **Rationale**: Database analogy, familiar `.db`-style pattern, unique abbreviation
+   - See "SELECTED: Domain-Aware Database-Style Naming" section above
 
 2. **Gradual or atomic migration?**
    - Gradual: Use type aliases, deprecate over multiple versions
@@ -325,10 +383,12 @@ Note: Global persistent cache is accessed via the `global_cache` parameter.
    - Recommendation: Remove by v1.0.0
 
 4. **Rename related types too?**
-   - `ProtoBeliefNode` → `ParsedNode`?
-   - `BeliefEvent` → `GraphEvent`?
-   - `BeliefNode` → keep as is?
-   - Recommendation: Address in separate issue if needed
+   - `ProtoBeliefNode` → keep as is (still a belief node, just proto)
+   - `BeliefEvent` → keep as is (events about beliefs)
+   - `BeliefNode` → keep as is (domain concept)
+   - `BeliefKind` → keep as is (domain concept)
+   - `BeliefCache` trait → **BeliefSource** (abstraction for sources that provide belief data)
+   - **Decision**: Keep "Belief" terminology for domain concepts; infrastructure and abstraction traits get clearer names
 
 ## Additional Improvements
 
@@ -366,11 +426,18 @@ Consider renaming in related areas:
 
 ## Decision Log
 
-**To be filled during implementation**:
-- Which naming option was chosen
-- Rationale for final decision
-- Any deviations from proposal
-- Breaking vs non-breaking approach
+**2025-01-27: BeliefBase Decision**
+- **Chosen naming**: BeliefBase with `.bb` abbreviation pattern
+- **Rationale**: 
+  - Database analogy: BeliefBase is infrastructure like a database
+  - Familiar pattern: `.bb` parallels `.db` convention
+  - Three-tier clarity: `.doc_bb`, `.session_bb`, `.global_bb` make scope explicit
+  - Domain terminology preserved: "Belief" remains in domain concepts (BeliefNode, BeliefEvent, etc.)
+  - Infrastructure distinction: Parser/Accumulator drop "Belief" prefix as they're build tools
+  - Trait abstraction: BeliefCache → BeliefSource (clearer role as source of belief data)
+- **Context**: Analyzed relationship to Intention Lattice (lattice-structured interpretation of paths within the general BeliefBase container)
+- **Migration approach**: TBD - likely atomic for pre-1.0 simplicity
+- **BeliefSource rationale**: Common pattern (DataSource, EventSource), concise, accurately describes trait's role as abstraction over different sources of belief data (in-memory or persistent)
 
 ---
 

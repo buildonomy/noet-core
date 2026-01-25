@@ -272,7 +272,7 @@ pub struct CompletionCache {
 
 **Implementation**:
 - [ ] Implement `textDocument/formatting`
-- [ ] Use existing BID injection logic from parser
+- [ ] Use existing BID injection logic from builder
 - [ ] Normalize link syntax: `[[title]]` → `[[title|bid:xxx]]`
 - [ ] Fix broken links (if target found)
 - [ ] Sort frontmatter keys (optional)
@@ -586,7 +586,7 @@ pub struct CompletionCache {
 - **Code Changes**:
   - `src/bin/noet-lsp.rs` - implement all new LSP methods
   - `src/daemon.rs` - add indexing for navigation/completion
-  - `src/codec/parser.rs` - incremental parsing support
+  - `src/codec/compiler.rs` - incremental parsing support
   - `src/query/mod.rs` - optimize for LSP queries
 - **Performance Tools**:
   - `cargo flamegraph` for profiling

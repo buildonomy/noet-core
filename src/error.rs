@@ -59,7 +59,7 @@ pub enum BuildonomyError {
     Serialization(String),
     #[error("Service API error: {0}")]
     Service(String),
-    #[error("Unresolved network reference '{network_ref}' in {key_type}://{network_ref}/{value}. Use resolve_network() to resolve via BeliefCache.")]
+    #[error("Unresolved network reference '{network_ref}' in {key_type}://{network_ref}/{value}. Use resolve_network() to resolve via BeliefSource.")]
     UnresolvedNetwork {
         network_ref: String,
         key_type: String,

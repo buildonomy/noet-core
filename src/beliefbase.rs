@@ -6,7 +6,7 @@ use crate::{
         BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref, WeightKind,
         WeightSet, WEIGHT_DOC_PATH, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
     },
-    query::{BeliefCache, Expression, RelationPred, ResultsPage, SetOp, StatePred, DEFAULT_LIMIT},
+    query::{BeliefSource, Expression, RelationPred, ResultsPage, SetOp, StatePred, DEFAULT_LIMIT},
     BuildonomyError,
 };
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
@@ -289,7 +289,7 @@ impl<'a> ExtendedRelation<'a> {
     pub fn new(
         other_bid: Bid,
         weight: &'a WeightSet,
-        set: &'a BeliefSet,
+        set: &'a BeliefBase,
     ) -> Option<ExtendedRelation<'a>> {
         let Some(other) = set.states().get(&other_bid) else {
             tracing::info!("Could not find 'other' node: {:?}", other_bid);
@@ -330,7 +330,7 @@ pub struct BeliefContext<'a> {
     pub node: &'a BeliefNode,
     pub home_path: String,
     pub home_net: Bid,
-    set: &'a BeliefSet,
+    set: &'a BeliefBase,
     relations_guard: ArcRwLockReadGuard<RawRwLock, BidGraph>,
 }
 
@@ -340,8 +340,8 @@ impl<'a> BeliefContext<'a> {
         Ok(origin.join(&self.home_path)?.as_str().to_string())
     }
 
-    /// Get a reference to the underlying BeliefSet
-    pub fn belief_set(&self) -> &'a BeliefSet {
+    /// Get a reference to the underlying BeliefBase
+    pub fn belief_set(&self) -> &'a BeliefBase {
         self.set
     }
 
@@ -384,15 +384,15 @@ impl<'a> BeliefContext<'a> {
     }
 }
 
-/// Used for Serialization/Deserialization of `BeliefSet`s as well as for returning `BeliefCache`
+/// Used for Serialization/Deserialization of `BeliefBase`s as well as for returning `BeliefSource`
 /// query results.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct Beliefs {
+pub struct BeliefGraph {
     pub states: BTreeMap<Bid, BeliefNode>,
     pub relations: BidGraph,
 }
 
-impl Beliefs {
+impl BeliefGraph {
     pub fn is_empty(&self) -> bool {
         self.states.is_empty() && self.relations.as_graph().node_count() == 0
     }
@@ -471,7 +471,7 @@ impl Beliefs {
                 .values()
                 .map(|n| format!(
                     "{}; {}",
-                    n.keys(None, None, &BeliefSet::default())
+                    n.keys(None, None, &BeliefBase::default())
                         .iter()
                         .map(|k| k.to_string())
                         .collect::<Vec<String>>()
@@ -484,7 +484,7 @@ impl Beliefs {
         )
     }
 
-    fn add_relations(&mut self, rhs: &Beliefs) {
+    fn add_relations(&mut self, rhs: &BeliefGraph) {
         let mut bid_to_index: BTreeMap<_, _> = self
             .relations
             .as_graph()
@@ -602,13 +602,13 @@ impl Beliefs {
     /// that key.
     ///
     /// rhs relations are all added, overwriting lhs if a source+sink combo for that edge was present
-    pub fn union(&self, rhs: &Beliefs) -> Beliefs {
+    pub fn union(&self, rhs: &BeliefGraph) -> BeliefGraph {
         let mut out = self.clone();
         out.union_mut(rhs);
         out
     }
 
-    pub fn union_mut(&mut self, rhs: &Beliefs) {
+    pub fn union_mut(&mut self, rhs: &BeliefGraph) {
         // First, union the states with the non-trace elements of rhs.
         for node in rhs.states.values().filter(|node| node.kind.is_complete()) {
             let self_node_entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
@@ -623,7 +623,7 @@ impl Beliefs {
     }
 
     /// The (non-trace) state set intersection between lhs and rhs
-    pub fn intersection(&self, rhs: &Beliefs) -> Beliefs {
+    pub fn intersection(&self, rhs: &BeliefGraph) -> BeliefGraph {
         let lhs_states = BTreeSet::from_iter(
             self.states
                 .values()
@@ -636,7 +636,7 @@ impl Beliefs {
                 .filter(|n| n.kind.is_complete())
                 .map(|n| n.bid),
         );
-        let mut beliefs = Beliefs {
+        let mut beliefs = BeliefGraph {
             states: BTreeMap::from_iter(
                 lhs_states
                     .intersection(&rhs_states)
@@ -649,12 +649,12 @@ impl Beliefs {
         beliefs
     }
 
-    pub fn intersection_mut(&mut self, rhs: &Beliefs) {
+    pub fn intersection_mut(&mut self, rhs: &BeliefGraph) {
         *self = self.intersection(rhs)
     }
 
     /// The (non-trace) state set difference between lhs and rhs
-    pub fn difference(&self, rhs: &Beliefs) -> Beliefs {
+    pub fn difference(&self, rhs: &BeliefGraph) -> BeliefGraph {
         let lhs_states = BTreeSet::from_iter(
             self.states
                 .values()
@@ -667,7 +667,7 @@ impl Beliefs {
                 .filter(|n| n.kind.is_complete())
                 .map(|n| n.bid),
         );
-        let mut beliefs = Beliefs {
+        let mut beliefs = BeliefGraph {
             states: BTreeMap::from_iter(
                 lhs_states
                     .difference(&rhs_states)
@@ -680,19 +680,19 @@ impl Beliefs {
         beliefs
     }
 
-    pub fn difference_mut(&mut self, rhs: &Beliefs) {
+    pub fn difference_mut(&mut self, rhs: &BeliefGraph) {
         *self = self.difference(rhs);
     }
 
-    pub fn symmetric_difference(&self, rhs: &Beliefs) -> Beliefs {
+    pub fn symmetric_difference(&self, rhs: &BeliefGraph) -> BeliefGraph {
         self.difference(rhs).union(&rhs.difference(self))
     }
 
-    pub fn symmetric_difference_mut(&mut self, rhs: &Beliefs) {
+    pub fn symmetric_difference_mut(&mut self, rhs: &BeliefGraph) {
         *self = self.symmetric_difference(rhs);
     }
 
-    /// In order to (attempt to) fullfill the balanced beliefset invariants, this will keep building
+    /// In order to (attempt to) fullfill the balanced beliefbase invariants, this will keep building
     /// queries so long as there are subsection relation sinks who's nodes are not loaded.
     pub fn build_balance_expr(&self) -> Option<Expression> {
         self.build_downstream_expr(Some(WeightKind::Section.into()))
@@ -761,7 +761,11 @@ impl Beliefs {
         }
     }
 
-    pub fn paginate(&self, limit: Option<usize>, offset: Option<usize>) -> ResultsPage<Beliefs> {
+    pub fn paginate(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> ResultsPage<BeliefGraph> {
         let count = self.states.len();
         let start = offset.unwrap_or(0);
         let mut page_limit = limit.unwrap_or(DEFAULT_LIMIT);
@@ -804,9 +808,9 @@ impl Beliefs {
                 //     "[paginate] self relation count: {}, self state count: {}, paginate state count {}, paginate relation count {}",
                 //     self.states().len(), self.relations().node_count(), states.len(), relations.node_count()
                 // );
-                Beliefs { states, relations }
+                BeliefGraph { states, relations }
             }
-            false => Beliefs {
+            false => BeliefGraph {
                 states: self.states.clone(),
                 relations: self.relations.clone(),
             },
@@ -819,7 +823,7 @@ impl Beliefs {
     }
 }
 
-impl PartialEq for Beliefs {
+impl PartialEq for BeliefGraph {
     fn eq(&self, other: &Self) -> bool {
         let lhs_states = BTreeSet::from_iter(self.states.keys().copied());
         let rhs_states = BTreeSet::from_iter(other.states.keys().copied());
@@ -829,20 +833,20 @@ impl PartialEq for Beliefs {
     }
 }
 
-impl From<&BeliefSet> for Beliefs {
-    fn from(beliefset: &BeliefSet) -> Self {
-        beliefset.clone().consume()
+impl From<&BeliefBase> for BeliefGraph {
+    fn from(beliefbase: &BeliefBase) -> Self {
+        beliefbase.clone().consume()
     }
 }
 
-impl fmt::Display for Beliefs {
+impl fmt::Display for BeliefGraph {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.display_contents())
     }
 }
 
 #[derive(Debug)]
-pub struct BeliefSet {
+pub struct BeliefBase {
     states: BTreeMap<Bid, BeliefNode>,
     relations: Arc<RwLock<BidGraph>>,
     bid_to_index: RwLock<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
@@ -853,13 +857,13 @@ pub struct BeliefSet {
     api: BeliefNode,
 }
 
-impl From<Beliefs> for BeliefSet {
-    fn from(beliefs: Beliefs) -> Self {
-        BeliefSet::new_unbalanced(beliefs.states, beliefs.relations, false)
+impl From<BeliefGraph> for BeliefBase {
+    fn from(beliefs: BeliefGraph) -> Self {
+        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false)
     }
 }
 
-impl PartialEq for BeliefSet {
+impl PartialEq for BeliefBase {
     fn eq(&self, other: &Self) -> bool {
         let lhs_states = BTreeSet::from_iter(self.states.keys().copied());
         let rhs_states = BTreeSet::from_iter(other.states.keys().copied());
@@ -869,29 +873,29 @@ impl PartialEq for BeliefSet {
     }
 }
 
-impl fmt::Display for BeliefSet {
+impl fmt::Display for BeliefBase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "BeliefSet({} nodes, {} edges)",
+            "BeliefBase({} nodes, {} edges)",
             self.states().len(),
             self.relations().as_graph().edge_count()
         )
     }
 }
 
-/// The same as [BeliefSet::empty] except it contains the api_node within the states and paths
+/// The same as [BeliefBase::empty] except it contains the api_node within the states and paths
 /// properties.
-impl Default for BeliefSet {
-    fn default() -> BeliefSet {
-        BeliefSet::new(BTreeMap::default(), BidGraph::default())
-            .expect("Single state set with no relations to pass the BeliefSet built in test")
+impl Default for BeliefBase {
+    fn default() -> BeliefBase {
+        BeliefBase::new(BTreeMap::default(), BidGraph::default())
+            .expect("Single state set with no relations to pass the BeliefBase built in test")
     }
 }
 
-impl Clone for BeliefSet {
-    fn clone(&self) -> BeliefSet {
-        BeliefSet {
+impl Clone for BeliefBase {
+    fn clone(&self) -> BeliefBase {
+        BeliefBase {
             states: self.states.clone(),
             relations: Arc::new(RwLock::new(self.relations.read().clone())),
             bid_to_index: RwLock::new(self.bid_to_index.read().clone()),
@@ -904,14 +908,14 @@ impl Clone for BeliefSet {
     }
 }
 
-/// BeliefSet: A structured collection of `BeliefState`s and their relations that can be queried and
+/// BeliefBase: A structured collection of `BeliefState`s and their relations that can be queried and
 /// manipulated while preserving a global graph structure.
 ///
 /// - Creates a cache that maps belief IDs and belief paths to quick lookup information such as:
 ///   local path, title, bid, content summary, version control state, belief type
 /// - Creates typed belief-to-belief directional relationships between belief objects
 ///
-/// Static Invariants for a balanced BeliefSet (checked by BeliefSet::built_in_test):
+/// Static Invariants for a balanced BeliefBase (checked by BeliefBase::built_in_test):
 ///
 /// 0. Each BeliefRelationKind sub-graph forms a directed acyclic graph. sub-graph cycles are not
 ///    supported.
@@ -937,10 +941,10 @@ impl Clone for BeliefSet {
 ///
 /// 2. PathMaps identify how to acquire the source starting from
 ///    known network locations.
-impl BeliefSet {
+impl BeliefBase {
     #[tracing::instrument]
-    pub fn empty() -> BeliefSet {
-        BeliefSet {
+    pub fn empty() -> BeliefBase {
+        BeliefBase {
             states: BTreeMap::default(),
             relations: Arc::new(RwLock::new(BidGraph(petgraph::Graph::new()))),
             bid_to_index: RwLock::new(BTreeMap::default()),
@@ -957,8 +961,8 @@ impl BeliefSet {
         states: BTreeMap<Bid, BeliefNode>,
         relations: BidGraph,
         inject_api: bool,
-    ) -> BeliefSet {
-        let mut bs = BeliefSet::empty();
+    ) -> BeliefBase {
+        let mut bs = BeliefBase::empty();
         // Newly created RwLock, so we know there's no one else locking it.
         {
             *bs.relations.write_arc() = relations;
@@ -978,8 +982,8 @@ impl BeliefSet {
     pub fn new(
         states: BTreeMap<Bid, BeliefNode>,
         relations: BidGraph,
-    ) -> Result<BeliefSet, BuildonomyError> {
-        let set = BeliefSet::new_unbalanced(states, relations, true);
+    ) -> Result<BeliefBase, BuildonomyError> {
+        let set = BeliefBase::new_unbalanced(states, relations, true);
         Ok(set)
     }
 
@@ -994,7 +998,7 @@ impl BeliefSet {
     pub fn paths(&self) -> ArcRwLockReadGuard<RawRwLock, PathMapMap> {
         self.index_sync(false);
         while self.paths.is_locked_exclusive() {
-            tracing::info!("[BeliefSet] Waiting for read access to paths");
+            tracing::info!("[BeliefBase] Waiting for read access to paths");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.paths.read_arc()
@@ -1084,7 +1088,7 @@ impl BeliefSet {
     pub fn relations(&self) -> ArcRwLockReadGuard<RawRwLock, BidGraph> {
         self.index_sync(false);
         while self.relations.is_locked_exclusive() {
-            tracing::info!("[BeliefSet] Waiting for read access to relations");
+            tracing::info!("[BeliefBase] Waiting for read access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.relations.read_arc()
@@ -1118,7 +1122,7 @@ impl BeliefSet {
         self.index_sync(false);
         assert!(
             self.is_balanced().is_ok(),
-            "get_context called on an unbalanced BeliefSet. errors: {:?}",
+            "get_context called on an unbalanced BeliefBase. errors: {:?}",
             self.errors.read().clone()
         );
         self.states().get(bid).map(|node| {
@@ -1138,28 +1142,28 @@ impl BeliefSet {
         })
     }
 
-    pub fn consume(&mut self) -> Beliefs {
+    pub fn consume(&mut self) -> BeliefGraph {
         let mut old_self = std::mem::take(self);
         let states = std::mem::take(&mut old_self.states);
         while self.relations.is_locked() {
-            tracing::info!("[BeliefSet::consume] Waiting for write access to relations");
+            tracing::info!("[BeliefBase::consume] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let relations = std::mem::replace(
             old_self.relations.write_arc().as_graph_mut(),
             petgraph::Graph::new(),
         );
-        Beliefs {
+        BeliefGraph {
             states,
             relations: BidGraph(relations),
         }
     }
 
-    /// Compares two BeliefSet manifolds (old vs new) and generates a consolidated set of events
+    /// Compares two BeliefBase manifolds (old vs new) and generates a consolidated set of events
     /// representing their differences. This is the core reconciliation function used during parsing.
     ///
     /// # Arguments
-    /// * `old_set` - The previous state (typically from stack_cache or global_cache)
+    /// * `old_set` - The previous state (typically from session_bb or global_bb)
     /// * `new_set` - The current state (typically from self.set after parsing)
     /// * `parsed_nodes` - The set of nodes that were fully parsed (for scoping the comparison)
     ///
@@ -1179,8 +1183,8 @@ impl BeliefSet {
     /// Note: To get path updates, run the diff events through old set and collect the derived
     /// path events.
     pub fn compute_diff(
-        old_set: &BeliefSet,
-        new_set: &BeliefSet,
+        old_set: &BeliefBase,
+        new_set: &BeliefBase,
         parsed_content: &BTreeSet<Bid>,
         // _parsed_structure: &BTreeSet<Bid>,
     ) -> Result<Vec<BeliefEvent>, BuildonomyError> {
@@ -1506,7 +1510,7 @@ impl BeliefSet {
         }
         if !nodeless_sinks.is_empty() {
             errors.push(format!(
-                "[BeliefSet.built_in_test: invariant 1.0] subsection sinks must map to \
+                "[BeliefBase.built_in_test: invariant 1.0] subsection sinks must map to \
                  a belief node. Nodes for the following sinks are missing:\n\t{}",
                 nodeless_sinks
                     .iter()
@@ -1517,7 +1521,7 @@ impl BeliefSet {
         }
         if !pathless_sinks.is_empty() {
             errors.push(format!(
-                "[BeliefSet.built_in_test: invariant 1.1] relation sinks must have a path to \
+                "[BeliefBase.built_in_test: invariant 1.1] relation sinks must have a path to \
                  an API node (or be an API node themselves). Paths for the following sinks are missing:\n\
                  \t{}\n\
                  set:\n{}",
@@ -1532,7 +1536,7 @@ impl BeliefSet {
         errors
     }
 
-    /// Ensure the BeliefSet static invariants are true.
+    /// Ensure the BeliefBase static invariants are true.
     ///
     /// The operational rules must be checked with test cases.
     ///
@@ -1551,7 +1555,7 @@ impl BeliefSet {
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Epistemic, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] epistemic edges contain cycle: {scc:?}"
+                    "[BeliefBase::built_in_test invariant 0] epistemic edges contain cycle: {scc:?}"
                 ));
             }
         }
@@ -1559,14 +1563,14 @@ impl BeliefSet {
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Pragmatic, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] pragmatic edges contain cycle: {scc:?}"
+                    "[BeliefBase::built_in_test invariant 0] pragmatic edges contain cycle: {scc:?}"
                 ));
             }
         }
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Section, false)).iter() {
             if scc.len() > 1 {
                 errors.push(format!(
-                    "[BeliefSet::built_in_test invariant 0] subsection edges contain cycle: {scc:?}"
+                    "[BeliefBase::built_in_test invariant 0] subsection edges contain cycle: {scc:?}"
                 ));
             }
         }
@@ -1598,7 +1602,7 @@ impl BeliefSet {
                     deduped.dedup();
                     if indices.len() != deduped.len() {
                         errors.push(format!(
-                         "[BeliefSet::build_in_test invariant 2] {bid} (tagged as trace) {kind:?} edges \
+                         "[BeliefBase::build_in_test invariant 2] {bid} (tagged as trace) {kind:?} edges \
                          contains duplicate edge indices. Received {indices:?}"
                      ))
                     }
@@ -1606,7 +1610,7 @@ impl BeliefSet {
                     let expected: Vec<u16> = (0..indices.len() as u16).collect();
                     if indices != expected {
                         errors.push(format!(
-                            "[BeliefSet::built_in_test invariant 2] {bid} {kind:?} edges are not \
+                            "[BeliefBase::built_in_test invariant 2] {bid} {kind:?} edges are not \
                             correctly sorted. Received {indices:?}, Expected: {expected:?}"
                         ));
                     }
@@ -1616,13 +1620,13 @@ impl BeliefSet {
         errors
     }
 
-    /// Processes a `BeliefEvent` to mutate the `BeliefSet`.
+    /// Processes a `BeliefEvent` to mutate the `BeliefBase`.
     ///
     /// This function is the primary entry point for all state changes. It is responsible for
     /// maintaining the integrity and invariants of the set.
     ///
     /// # Event Origin Handling
-    /// - `EventOrigin::Local`: Event generated by this BeliefSet. State already updated,
+    /// - `EventOrigin::Local`: Event generated by this BeliefBase. State already updated,
     ///   so we validate consistency in debug builds and skip reapplication.
     /// - `EventOrigin::Remote`: Event from external source (DbConnection, file, network).
     ///   Must apply to synchronize state.
@@ -1655,7 +1659,7 @@ impl BeliefSet {
                 derivative_events.append(&mut self.remove_nodes(&bid_set));
             }
             // This case should handled by other, more atomic transactions. At least it is via
-            // [BeliefSetAccumulator].
+            // [GraphBuilder].
             BeliefEvent::NodeRenamed(_from, _to, _) => {}
             BeliefEvent::PathAdded(..)
             | BeliefEvent::PathUpdate(..)
@@ -1673,7 +1677,7 @@ impl BeliefSet {
                     let &BeliefEvent::RelationUpdate(source, sink, ref weight_set, _) =
                         &relation_mutated_event
                     else {
-                        panic!("Unexpected return value from BeliefSet::generate_edge_update");
+                        panic!("Unexpected return value from BeliefBase::generate_edge_update");
                     };
                     let mut reindex_events = self.update_relation(source, sink, weight_set.clone());
                     derivative_events.push(relation_mutated_event);
@@ -1686,7 +1690,7 @@ impl BeliefSet {
                 {
                     while self.relations.is_locked() {
                         tracing::info!(
-                            "[BeliefSet::process_event] Waiting for write access to relations"
+                            "[BeliefBase::process_event] Waiting for write access to relations"
                         );
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
@@ -1730,7 +1734,7 @@ impl BeliefSet {
         let mut to_replace = BTreeSet::<Bid>::new();
         for key in merge.iter() {
             let results = self.evaluate_expression(&Expression::from(key));
-            if let Some(node) = BeliefSet::from(results).get(key) {
+            if let Some(node) = BeliefBase::from(results).get(key) {
                 to_replace.insert(node.bid);
             }
         }
@@ -1917,7 +1921,7 @@ impl BeliefSet {
         new_weight_set: WeightSet,
     ) -> Vec<BeliefEvent> {
         while self.relations.is_locked() {
-            tracing::info!("[BeliefSet::update_relation] Waiting for write access to relations");
+            tracing::info!("[BeliefBase::update_relation] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
@@ -2142,10 +2146,10 @@ impl BeliefSet {
         derivative_events
     }
 
-    /// If the BeliefSet is singular (only one state in the set) returns a clone of the
+    /// If the BeliefBase is singular (only one state in the set) returns a clone of the
     /// state. Otherwise None
     pub fn into_state(&mut self) -> Option<BeliefNode> {
-        let Beliefs { mut states, .. } = self.consume();
+        let BeliefGraph { mut states, .. } = self.consume();
         let mut maybe_node = None;
         while let Some((_, a_state)) = states.pop_first() {
             if a_state.bid != self.api.bid {
@@ -2155,31 +2159,31 @@ impl BeliefSet {
         }
         if !states.is_empty() {
             tracing::warn!(
-                "Converted a multi-node BeliefSet into a BeliefNode. Remaining nodes: {:?}",
+                "Converted a multi-node BeliefBase into a BeliefNode. Remaining nodes: {:?}",
                 states
             );
         }
         maybe_node
     }
 
-    pub fn merge(&mut self, rhs: &Beliefs) {
+    pub fn merge(&mut self, rhs: &BeliefGraph) {
         let mut lhs = self.consume();
         lhs.union_mut(rhs);
-        *self = BeliefSet::from(lhs);
+        *self = BeliefBase::from(lhs);
     }
 
-    pub fn set_merge(&mut self, rhs_set: &mut BeliefSet) {
+    pub fn set_merge(&mut self, rhs_set: &mut BeliefBase) {
         let mut lhs = self.consume();
         let rhs = rhs_set.consume();
         lhs.union_mut(&rhs);
-        *self = BeliefSet::from(lhs);
+        *self = BeliefBase::from(lhs);
     }
 
     /// Remove all relations where source or sink is not contained in the states set, or in the
     /// optional to_retain Bid set.
     pub fn trim(&mut self, to_retain: Option<BTreeSet<Bid>>) {
         while self.relations.is_locked() {
-            tracing::info!("[BeliefSet::trim] Waiting for write access to relations");
+            tracing::info!("[BeliefBase::trim] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let mut write_relations = self.relations.write_arc();
@@ -2294,7 +2298,7 @@ impl BeliefSet {
         &self,
         expr: &Expression,
         weight_set: WeightSet,
-    ) -> Beliefs {
+    ) -> BeliefGraph {
         self.index_sync(false);
         match expr {
             Expression::StateIn(state_pred) => {
@@ -2321,7 +2325,7 @@ impl BeliefSet {
                         }
                     }
                 }
-                Beliefs { states, relations }
+                BeliefGraph { states, relations }
             }
             Expression::StateNotIn(state_pred) => {
                 let mut states = self.filter_states(state_pred, None, true);
@@ -2345,7 +2349,7 @@ impl BeliefSet {
                         }
                     }
                 }
-                Beliefs { states, relations }
+                BeliefGraph { states, relations }
             }
             // Relation expression's use the standard evaluate_expression logic
             Expression::RelationIn(..) | Expression::RelationNotIn(..) => {
@@ -2365,7 +2369,7 @@ impl BeliefSet {
         }
     }
 
-    pub fn evaluate_expression(&self, expr: &Expression) -> Beliefs {
+    pub fn evaluate_expression(&self, expr: &Expression) -> BeliefGraph {
         self.index_sync(false);
         match expr {
             Expression::StateIn(state_pred) => {
@@ -2395,7 +2399,7 @@ impl BeliefSet {
                         }
                     }
                 }
-                Beliefs { states, relations }
+                BeliefGraph { states, relations }
             }
             Expression::StateNotIn(state_pred) => {
                 let mut states = self.filter_states(state_pred, None, true);
@@ -2424,7 +2428,7 @@ impl BeliefSet {
                         }
                     }
                 }
-                Beliefs { states, relations }
+                BeliefGraph { states, relations }
             }
             Expression::RelationIn(relation_pred) => {
                 let mut states = BTreeMap::new();
@@ -2459,7 +2463,7 @@ impl BeliefSet {
                         edges.push(BeliefRelation::from(&rel));
                     }
                 }
-                Beliefs {
+                BeliefGraph {
                     states,
                     relations: BidGraph::from_edges(edges),
                 }
@@ -2497,7 +2501,7 @@ impl BeliefSet {
                         edges.push(BeliefRelation::from(&rel));
                     }
                 }
-                Beliefs {
+                BeliefGraph {
                     states,
                     relations: BidGraph::from_edges(edges),
                 }
@@ -2517,9 +2521,9 @@ impl BeliefSet {
     }
 }
 
-impl BeliefCache for BeliefSet {
+impl BeliefSource for BeliefBase {
     #[tracing::instrument(skip(self))]
-    async fn eval_unbalanced(&self, expr: &Expression) -> Result<Beliefs, BuildonomyError> {
+    async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
     }
 
@@ -2528,14 +2532,14 @@ impl BeliefCache for BeliefSet {
         &self,
         expr: &Expression,
         weight_filter: WeightSet,
-    ) -> Result<Beliefs, BuildonomyError> {
+    ) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression_as_trace(expr, weight_filter))
     }
 }
 
-impl BeliefCache for &BeliefSet {
+impl BeliefSource for &BeliefBase {
     #[tracing::instrument(skip(self))]
-    async fn eval_unbalanced(&self, expr: &Expression) -> Result<Beliefs, BuildonomyError> {
+    async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
     }
 
@@ -2544,7 +2548,7 @@ impl BeliefCache for &BeliefSet {
         &self,
         expr: &Expression,
         weight_filter: WeightSet,
-    ) -> Result<Beliefs, BuildonomyError> {
+    ) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression_as_trace(expr, weight_filter))
     }
 }

@@ -4,7 +4,7 @@ authors = "Andrew Lyjak, Claude"
 last_updated = "2025-01-24"
 status = "Active"
 version = "0.2"
-dependencies = ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)", "beliefset_architecture.md"]
+dependencies = ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)", "beliefbase_architecture.md"]
 ---
 
 # Observable Action Schema
@@ -844,7 +844,7 @@ Each step is a BeliefNode, which provides:
 - **procedure_schema.md** - Core procedure schema
 - **procedure_execution.md** - Execution lifecycle
 - **redline_system.md** - As-run deviation tracking
-- **beliefset_architecture.md** - BeliefNode structure
+- **beliefbase_architecture.md** - BeliefNode structure
 - **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - Implementation plan
 - **ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md** - Extended schemas
 

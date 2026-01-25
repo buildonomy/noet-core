@@ -108,7 +108,7 @@ Current features in `Cargo.toml`:
      ```
    - [ ] Review coverage report for critical modules:
      - `codec/` - Document parsing and transformation
-     - `beliefset/` - Graph operations
+     - `beliefbase/` - Graph operations
      - `properties/` - BID generation and resolution
    - [ ] Identify untested code paths
    - [ ] Add tests for critical missing coverage:

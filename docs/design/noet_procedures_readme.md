@@ -67,7 +67,7 @@ When sample.csv appears, load and analyze it.
 ```
 
 **Execution**:
-1. **BeliefSet** (compiled structure): WHAT to do, relationships between nodes
+1. **BeliefBase** (compiled structure): WHAT to do, relationships between nodes
 2. **Procedure Engine** (runtime): Watches event streams, matches patterns
 3. **As-Run Record** (audit trail): What ACTUALLY happened vs. template
 
@@ -503,7 +503,7 @@ Unlike Jupyter (mutable but opaque), noet-procedures provides **mutable executio
 
 ### The Redline Channel
 
-The redline system is a **privileged observable channel** that can inject BeliefEvents to modify the loaded BeliefSet:
+The redline system is a **privileged observable channel** that can inject BeliefEvents to modify the loaded BeliefBase:
 
 ```
 Template (as-written):

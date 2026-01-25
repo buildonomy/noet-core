@@ -241,7 +241,7 @@ Mitigation: Thorough testing, backup before migration, provide rollback tool.
 ## References
 
 - **Issues**: See `ISSUE_01` through `ISSUE_06` in this directory
-- **Design Docs**: `docs/design/beliefset_architecture.md`
+- **Design Docs**: `docs/design/beliefbase_architecture.md`
 - **NodeKey Implementation**: `src/properties/nodekey.rs`
 - **Current Codec**: `src/codec/md.rs`
 

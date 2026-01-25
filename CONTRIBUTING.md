@@ -145,12 +145,12 @@ Closes #123
 All public items must have documentation:
 
 ```rust
-/// Parses a document and returns a BeliefSet.
+/// Parses a document and returns a BeliefBase.
 ///
 /// # Arguments
 ///
 /// * `path` - Path to the document to parse
-/// * `belief_set` - Mutable reference to the target BeliefSet
+/// * `belief_set` - Mutable reference to the target BeliefBase
 ///
 /// # Examples
 ///
@@ -163,7 +163,7 @@ All public items must have documentation:
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or parsed.
-pub fn parse_document(path: &Path, belief_set: &mut BeliefSet) -> Result<()> {
+pub fn parse_document(path: &Path, belief_set: &mut BeliefBase) -> Result<()> {
     // implementation
 }
 ```
@@ -175,7 +175,7 @@ pub fn parse_document(path: &Path, belief_set: &mut BeliefSet) -> Result<()> {
 - Use descriptive test names:
   ```rust
   #[test]
-  fn test_parser_handles_forward_references() {
+  fn test_compiler_handles_forward_references() {
       // test implementation
   }
   ```
@@ -219,7 +219,7 @@ pub enum ParseError {
 ```
 noet/
 ├── src/
-│   ├── beliefset.rs      # Core hypergraph data structures
+│   ├── beliefbase.rs     # Core hypergraph data structures
 │   ├── codec/            # Document parsing and codecs
 │   ├── properties.rs     # Node/edge types and BIDs
 │   ├── event.rs          # Event streaming
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_belief_set_creation() {
-        let bs = BeliefSet::new();
+        let bs = BeliefBase::new();
         assert!(bs.is_empty());
     }
 }

@@ -58,7 +58,7 @@
 
 #### Phase 1: Minimal Documentation for Soft Open Source ✅ COMPLETE (2025-01-18)
 - **[Issue 5: Core Library Documentation](./ISSUE_05_DOCUMENTATION.md)** ✅ COMPLETE
-  - Migrated `beliefset_architecture.md` (removed product references)
+  - Migrated `beliefbase_architecture.md` (removed product references)
   - Created basic architecture docs
   - Updated READMEs for standalone repository
   - Fixed Cargo.toml dependencies (removed product crate references)
@@ -104,7 +104,7 @@
 
 #### Phase 3: Code Quality & Testing (1 week, POST-SOFT-OPEN-SOURCE)
 - Comprehensive test suite (unit + integration)
-- Property-based testing for parser
+- Property-based testing for compiler
 - Fuzzing for codec implementations
 - Performance benchmarks
 - Memory leak detection
@@ -153,7 +153,7 @@
 
 #### Core LSP Implementation
 - **[Issue 11: Basic LSP](./ISSUE_11_BASIC_LSP.md)** (3-5 days, HIGH PRIORITY)
-  - Add position/range tracking to parser
+  - Add position/range tracking to builder
   - Implement LSP server with `tower-lsp`
   - Document synchronization (didOpen, didChange, didSave, didClose)
   - Real-time diagnostics

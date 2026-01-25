@@ -1,7 +1,7 @@
-//! Shared test utilities for BeliefSet testing
+//! Shared test utilities for BeliefBase testing
 
 use crate::{
-    beliefset::{BeliefSet, BidGraph},
+    beliefbase::{BeliefBase, BidGraph},
     properties::{
         BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
     },
@@ -27,8 +27,8 @@ pub fn create_test_node(title: &str, kind: BeliefKind) -> BeliefNode {
     }
 }
 
-/// Helper function to create a test BeliefSet with some nodes and relations
-pub fn create_test_beliefset() -> BeliefSet {
+/// Helper function to create a test BeliefBase with some nodes and relations
+pub fn create_test_beliefbase() -> BeliefBase {
     init_logging();
 
     let mut states = BTreeMap::new();
@@ -64,16 +64,16 @@ pub fn create_test_beliefset() -> BeliefSet {
 
     let relations = BidGraph::from_edges(vec![(bid1, bid3, weights1), (bid2, bid4, weights2)]);
 
-    BeliefSet::new_unbalanced(states, relations, false)
+    BeliefBase::new_unbalanced(states, relations, false)
 }
 
-/// Create a balanced test BeliefSet with the proper hierarchy:
+/// Create a balanced test BeliefBase with the proper hierarchy:
 /// API <- Network <- Document <- Anchors
 ///
-/// This structure satisfies BeliefSet::is_balanced() checks and is suitable
+/// This structure satisfies BeliefBase::is_balanced() checks and is suitable
 /// for testing path updates, reindexing, and other operations that require
-/// a fully valid BeliefSet structure.
-pub fn create_balanced_test_beliefset() -> BeliefSet {
+/// a fully valid BeliefBase structure.
+pub fn create_balanced_test_beliefbase() -> BeliefBase {
     init_logging();
 
     let mut states = BTreeMap::new();
@@ -125,5 +125,5 @@ pub fn create_balanced_test_beliefset() -> BeliefSet {
 
     let relations = BidGraph::from_edges(&edges);
 
-    BeliefSet::new(states, relations).unwrap()
+    BeliefBase::new(states, relations).unwrap()
 }

@@ -1,5 +1,5 @@
 use crate::{
-    beliefset::BeliefContext,
+    beliefbase::BeliefContext,
     codec::{
         schema_registry::{get_schema_definition, migrate_schema, EdgeDirection},
         DocCodec, CODECS,
@@ -379,7 +379,7 @@ impl PartialEq for ProtoBeliefNode {
     }
 }
 
-// impl Eq for BeliefSet {}
+// impl Eq for BeliefBase {}
 
 impl ProtoBeliefNode {
     pub fn new<P: AsRef<Path>>(repo_path: P, path: P) -> Result<ProtoBeliefNode, BuildonomyError> {
@@ -439,8 +439,8 @@ impl ProtoBeliefNode {
     /// - **Browser/WASM**: Swap in a `BrowserProtoBeliefNode` that reads from IndexedDB
     /// - **Testing**: Swap in a `MockProtoBeliefNode` with in-memory content
     ///
-    /// The codec abstraction provides this flexibility without changing the parser or
-    /// accumulator layers. See [crate::codec] for details on how to swap out `CODECS`.
+    /// The codec abstraction provides this flexibility without changing the compiler or
+    /// builder layers. See [crate::codec] for details on how to swap out `CODECS`.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<ProtoBeliefNode, BuildonomyError> {
         let mut file_path = PathBuf::from(path.as_ref());
         let mut is_net = false;

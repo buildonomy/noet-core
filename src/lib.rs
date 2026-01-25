@@ -7,7 +7,7 @@
 //! ## Overview
 //!
 //! noet-core transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure
-//! called a "BeliefSet". It maintains **bidirectional synchronization** between human-readable source
+//! called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source
 //! files and a machine-queryable graph, automatically managing cross-document references and propagating
 //! changes.
 //!
@@ -26,8 +26,8 @@
 //!
 //! The library is organized around several key components:
 //!
-//! - **[`beliefset`]**: Core hypergraph data structures (`BeliefSet`, `BidGraph`)
-//! - **[`codec`]**: Document parsing (`BeliefSetParser`, `BeliefSetAccumulator`, `DocCodec` trait)
+//! - **[`beliefbase`]**: Core hypergraph data structures (`BeliefBase`, `BidGraph`)
+//! - **[`codec`]**: Document parsing (`DocumentCompiler`, `GraphBuilder`, `DocCodec` trait)
 //! - **[`properties`]**: Node/edge types, identifiers (`Bid`), relationship semantics
 //! - **[`event`]**: Event streaming for cache synchronization
 //! - **[`query`]**: Query language for graph traversal and filtering
@@ -35,30 +35,30 @@
 //!
 //! For detailed architecture documentation, see:
 //! - High-level overview: `docs/architecture.md`
-//! - Technical specification: `docs/design/beliefset_architecture.md`
+//! - Technical specification: `docs/design/beliefbase_architecture.md`
 //!
 //! ## Quick Start
 //!
 //! ### Basic Parsing
 //!
-//! Parse a directory of documents into a BeliefSet:
+//! Parse a directory of documents into a BeliefBase:
 //!
 //! ```rust,no_run
-//! use noet_core::{beliefset::BeliefSet, codec::BeliefSetParser};
+//! use noet_core::{beliefbase::BeliefBase, codec::DocumentCompiler};
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create parser (simple convenience constructor)
-//!     let mut parser = BeliefSetParser::simple("./docs")?;
-//!     // Stand-in for our global-cache (No effect when used in BeliefSetParser::simple() constructor but
-//!     // used to access DB-backed version of our BeliefSet if available).
-//!     let cache = BeliefSet::default();
+//!     // Create compiler (simple convenience constructor)
+//!     let mut compiler = DocumentCompiler::simple("./docs")?;
+//!     // Stand-in for our global-cache (No effect when used in DocumentCompiler::simple() constructor but
+//!     // used to access DB-backed version of our BeliefBase if available).
+//!     let cache = BeliefBase::default();
 //!
 //!     // Parse all documents (handles multi-pass resolution automatically)
-//!     let results = parser.parse_all(cache).await?;
+//!     let results = compiler.parse_all(cache).await?;
 //!
 //!     // Access the accumulated graph
-//!     let belief_set = parser.accumulator().stack_cache();
+//!     let belief_set = compiler.builder().session_bb();
 //!
 //!     // Query nodes
 //!     for (bid, node) in belief_set.states() {
@@ -71,15 +71,15 @@
 //!
 //! ### Working with Diagnostics
 //!
-//! The parser tracks unresolved references and errors as diagnostics:
+//! The compiler tracks unresolved references and errors as diagnostics:
 //!
 //! ```rust,no_run
-//! # use noet_core::{beliefset::BeliefSet, codec::{BeliefSetParser, ParseDiagnostic}};
+//! # use noet_core::{beliefbase::BeliefBase, codec::{DocumentCompiler, ParseDiagnostic}};
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # let mut parser = BeliefSetParser::simple("./docs")?;
-//! # let cache = BeliefSet::default();
-//! # let results = parser.parse_all(cache).await?;
+//! # let mut compiler = DocumentCompiler::simple("./docs")?;
+//! # let cache = BeliefBase::default();
+//! # let results = compiler.parse_all(cache).await?;
 //! for result in results {
 //!     for diagnostic in result.diagnostics {
 //!         match diagnostic {
@@ -102,27 +102,27 @@
 //! ```rust,no_run
 //! # #[cfg(feature = "service")]
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! use noet_core::codec::BeliefSetParser;
-//! use noet_core::beliefset::BeliefSet;
+//! use noet_core::codec::DocumentCompiler;
+//! use noet_core::beliefbase::BeliefBase;
 //! use notify::{Watcher, RecursiveMode};
 //! # use std::path::PathBuf;
 //! # use tokio::sync::mpsc;
 //! # let (tx, _rx) = mpsc::unbounded_channel();
-//! # let cache = BeliefSet::default();
+//! # let cache = BeliefBase::default();
 //! # let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
 //! # let modified_path = PathBuf::from("./docs/example.md");
 //!
-//! let mut parser = BeliefSetParser::new("./docs", Some(tx), None, true)?;
+//! let mut compiler = DocumentCompiler::new("./docs", Some(tx), None, true)?;
 //!
 //! // Initial parse
-//! parser.parse_all(cache.clone()).await?;
+//! compiler.parse_all(cache.clone()).await?;
 //!
 //! // Watch for file changes
 //! watcher.watch(&PathBuf::from("./docs"), RecursiveMode::Recursive)?;
 //!
 //! // On file modification
-//! parser.on_file_modified(modified_path);
-//! if let Some(result) = parser.parse_next(cache.clone()).await? {
+//! compiler.on_file_modified(modified_path);
+//! if let Some(result) = compiler.parse_next(cache.clone()).await? {
 //!     // Handle reparse result
 //! }
 //! # Ok(())
@@ -139,7 +139,7 @@
 //! 2. **Resolution Passes**: Reparse files with resolved dependencies, inject BIDs
 //! 3. **Convergence**: Iterate until all resolvable references are linked
 //!
-//! See `docs/design/beliefset_architecture.md` for detailed algorithm specification.
+//! See `docs/design/beliefbase_architecture.md` for detailed algorithm specification.
 //!
 //! ### BID System
 //!
@@ -160,7 +160,7 @@
 //!
 //! ### Hypergraph Structure
 //!
-//! The BeliefSet is a typed, weighted, directed hypergraph where:
+//! The BeliefBase is a typed, weighted, directed hypergraph where:
 //! - **Nodes** are `BeliefNode` instances (documents, sections, custom entities)
 //! - **Edges** are typed relationships (`WeightKind`: Subsection, Epistemic, Pragmatic)
 //! - Each edge can carry custom metadata in its `payload`
@@ -184,7 +184,7 @@
 //! # }
 //! ```
 //!
-//! The parser automatically tracks and resolves these across multiple passes.
+//! The compiler automatically tracks and resolves these across multiple passes.
 //!
 //! ## Comparison to Other Tools
 //!
@@ -208,16 +208,16 @@
 //! ## Documentation
 //!
 //! - **Getting started**: `docs/architecture.md` (high-level concepts)
-//! - **Technical spec**: `docs/design/beliefset_architecture.md` (detailed architecture)
+//! - **Technical spec**: `docs/design/beliefbase_architecture.md` (detailed architecture)
 //! - **API reference**: Module-level docs (run `cargo doc --open`)
 //! - **Examples**: See `examples/` directory
 //!
 //! ## Module Guide
 //!
-//! Start with [`codec::BeliefSetParser`] for parsing documents, then explore [`beliefset::BeliefSet`]
+//! Start with [`codec::DocumentCompiler`] for parsing documents, then explore [`beliefbase::BeliefBase`]
 //! for graph operations. See [`properties`] for understanding node and edge types.
 
-pub mod beliefset;
+pub mod beliefbase;
 pub mod codec;
 #[cfg(feature = "service")]
 pub mod commands;

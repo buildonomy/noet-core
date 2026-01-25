@@ -28,7 +28,7 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 ### Issue 5: Core Library Documentation (Minimal Version)
 
 **Deliverables**:
-- [x] Migrate `beliefset_architecture.md` from `docs/design/` to `rust_core/crates/core/docs/design/`
+- [x] Migrate `beliefbase_architecture.md` from `docs/design/` to `rust_core/crates/core/docs/design/`
 - [x] Remove all product-specific references (LatticeService, Intention Lattice)
 - [x] Create basic `docs/architecture.md` (core concepts overview)
 - [ ] Create basic `docs/codecs.md` (DocCodec trait explanation)
@@ -202,7 +202,7 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 **Deliverables**:
 - [ ] Comprehensive unit test suite
 - [ ] Integration tests for all major workflows
-- [ ] Property-based testing for parser
+- [ ] Property-based testing for builder
 - [ ] Fuzzing for codec implementations
 - [ ] Performance benchmarks established
 - [ ] Memory leak detection tests

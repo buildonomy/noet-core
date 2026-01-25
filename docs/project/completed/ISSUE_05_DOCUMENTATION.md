@@ -16,7 +16,7 @@
 Documentation for `noet-core` open source library completed in two stages:
 
 **Stage 1: Soft Open Source** ✅ COMPLETE (2025-01-18)
-- Migrated `beliefset_architecture.md` with product references removed
+- Migrated `beliefbase_architecture.md` with product references removed
 - Created basic `docs/architecture.md` 
 - Updated core README with library purpose and basic usage
 - Cleaned Cargo.toml (removed product crate dependencies)
@@ -38,8 +38,8 @@ Documentation for `noet-core` open source library completed in two stages:
 
 ## Goals
 
-1. Migrate `beliefset_architecture.md` to core library design docs, removing lattice references
-2. Create architecture overview explaining core concepts (BID, BeliefSet, Codec)
+1. Migrate `beliefbase_architecture.md` to core library design docs, removing lattice references
+2. Create architecture overview explaining core concepts (BID, BeliefBase, Codec)
 3. Write codec implementation tutorial
 4. Provide working examples (parsing, querying, custom codecs)
 5. Document public API clearly via rustdoc (`lib.rs`, module docs)
@@ -56,7 +56,7 @@ Documentation for `noet-core` open source library completed in two stages:
 
 ```
 docs/
-├── architecture.md     # Migrated from docs/design/beliefset_architecture with lattice references removed.
+├── architecture.md     # Migrated from docs/design/beliefbase_architecture with lattice references removed.
 ├── codecs.md           # DocCodec trait, implementation tutorial
 ├── ids_and_refs.md     # Multi-ID system and NodeKey multi reference system deep dive (material mainly derived from docs/design/design_architecture.md and docs/design/intention_lattice.md)
 ├── faq.md              # Common questions
@@ -103,13 +103,13 @@ docs/
 ### Stage 1: Soft Open Source (1-2 days)
 
 0. **Migrate Core Design Document** (0.5 days) ⭐ REQUIRED FOR SOFT OPEN SOURCE ✅ COMPLETE
-   - [x] Copy `docs/design/beliefset_architecture.md` to `rust_core/crates/core/docs/design/`
+   - [x] Copy `docs/design/beliefbase_architecture.md` to `rust_core/crates/core/docs/design/`
    - [x] **Remove all LatticeService references** (Section 3.5, lines 550-679) - this is product-specific orchestration
    - [x] Remove "Relationship to Intention Lattice" section (lines 681-708) - product-specific
    - [x] Verify `cargo doc` passes and cross-references resolve
    - [x] Ensure no external references - doc must be self-contained for standalone repo
 
-**Result**: Created `rust_core/crates/core/docs/design/beliefset_architecture.md` (747 lines) with product sections removed, version updated to 0.2, library-focused terminology
+**Result**: Created `rust_core/crates/core/docs/design/beliefbase_architecture.md` (747 lines) with product sections removed, version updated to 0.2, library-focused terminology
 
 0b. **Clean Cargo.toml Dependencies** (0.25 days) ⭐ REQUIRED FOR SOFT OPEN SOURCE ✅ COMPLETE
    - [x] Audit `rust_core/crates/core/Cargo.toml` dependencies
@@ -126,7 +126,7 @@ docs/
 
 1. **Create Basic Architecture Overview** (0.5 days) ⭐ REQUIRED FOR SOFT OPEN SOURCE ✅ COMPLETE
    - [x] Create `rust_core/crates/core/docs/architecture.md` with:
-     - High-level overview of core concepts (BID, BeliefSet, Codec)
+     - High-level overview of core concepts (BID, BeliefBase, Codec)
      - Multi-pass compilation explanation (extracted from `lib.rs`)
      - Relationship to prior art (brief summary)
      - Link to full design doc for details
@@ -169,7 +169,7 @@ docs/
 1. **WatchService Documentation** ✅ COMPLETE (Issue 10, 2025-01-24)
    - [x] Comprehensive tutorial in `src/watch.rs` (240+ lines module-level rustdoc)
    - [x] 4 doctest examples (Quick Start, File Watching, Network Management, Database Sync)
-   - [x] Threading model documented (3 threads: watcher, parser, transaction)
+   - [x] Threading model documented (3 threads: watcher, compiler, transaction)
    - [x] Synchronization points and shutdown semantics documented
    - [x] CLI tool integration documented (`noet parse`, `noet watch`)
    - [x] Error handling patterns documented
@@ -178,7 +178,7 @@ docs/
 
 2. **Architecture Expansion** (OPTIONAL - 0.5 days)
    - [ ] Extract and expand multi-pass compilation explanation from `lib.rs`
-   - [ ] Extract compilation model details from `beliefset_architecture.md`
+   - [ ] Extract compilation model details from `beliefbase_architecture.md`
    - [ ] Add beginner-friendly examples beyond existing doctests
    - **Current Status**: Basic architecture documented, comprehensive details available in rustdoc
 
@@ -237,7 +237,7 @@ docs/
 - [x] `cargo build --all-features` works standalone (no product dependencies)
 - [x] `cargo test --all-features` passes (all tests including doc tests - fixed 2025-01-18)
 - [x] `cargo doc` passes (3 warnings acceptable)
-- [x] `beliefset_architecture.md` migrated with LatticeService/product references removed
+- [x] `beliefbase_architecture.md` migrated with LatticeService/product references removed
 - [x] Basic `docs/architecture.md` explains core concepts
 - [x] Core README clearly explains library purpose
 - [x] `examples/basic_usage.rs` compiles and runs
@@ -283,8 +283,8 @@ docs/
 **Risk**: Documentation has cross-repository references after extraction  
 **Mitigation**: Use only relative paths within `rust_core/crates/core/`, verify all links resolve locally
 
-**Risk**: API changes break examples (e.g., `BeliefSetParser::new()` signature)  
-**Mitigation**: Already added `Parser::simple()` convenience constructor; keep examples focused on common use cases; note API is pre-1.0 and evolving
+**Risk**: API changes break examples (e.g., `DocumentCompiler::new()` signature)  
+**Mitigation**: Already added `Builder::simple()` convenience constructor; keep examples focused on common use cases; note API is pre-1.0 and evolving
 
 **Risk**: Rustdoc and manual docs become out of sync  
 **Mitigation**: Cross-link bidirectionally; make `cargo doc` part of testing requirements; review both during updates
@@ -302,19 +302,19 @@ docs/
 - **Roadmap Context**: [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md) - overall open source preparation plan
 - **Future Work**: [`ROADMAP_HTML_RENDERING.md`](./ROADMAP_HTML_RENDERING.md) - will be part of extracted repo
 - **Primary Source**: `src/lib.rs` - extensive rustdoc with overview, prior art comparison, multi-pass compilation
-- **Migrate**: `docs/design/beliefset_architecture.md` → `rust_core/crates/core/docs/design/beliefset_architecture.md`
+- **Migrate**: `docs/design/beliefbase_architecture.md` → `rust_core/crates/core/docs/design/beliefbase_architecture.md`
   - Remove Section 3.5 "LatticeService" (lines 550-679) - product-specific
   - Remove Section 4 "Relationship to Intention Lattice" (lines 681-708) - product-specific
 - **Extract from**: 
   - `lib.rs` rustdoc (primary source for architecture, capabilities, examples)
-  - Migrated `beliefset_architecture.md` (specification details)
+  - Migrated `beliefbase_architecture.md` (specification details)
 - **Update**: `docs/design/README.md` (add pointer to core library docs)
 - **Note**: `docs/design/README.md` philosophy already captured in `rust_core/crates/core/AGENTS.md`
 - **Pattern**: Other Rust libraries (tokio, serde) for doc structure and rustdoc integration
 - **Examples**: 
-  - `examples/basic_usage.rs` - now compiles with `Parser::simple()`
+  - `examples/basic_usage.rs` - now compiles with `Builder::simple()`
   - `lib.rs` examples (lines 220-310) - need fixing to compile
-- **Parser API**: `src/codec/parser.rs` - `Parser::simple()` added as convenience constructor
+- **Builder API**: `src/codec/builder.rs` - `Builder::simple()` added as convenience constructor
 
 ## Stage 1 Completion Notes
 
@@ -323,7 +323,7 @@ docs/
 **Repository**: https://gitlab.com/buildonomy/noet-core
 
 **Files Created**:
-- `docs/design/beliefset_architecture.md` (747 lines)
+- `docs/design/beliefbase_architecture.md` (747 lines)
 - `docs/architecture.md` (275 lines)
 - `docs/project/DOCUMENTATION_STRATEGY.md` (320 lines)
 

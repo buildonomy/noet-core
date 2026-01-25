@@ -177,7 +177,7 @@ fn test_multiple_file_changes_processed() {
     std::thread::sleep(Duration::from_secs(6));
 
     // If we got here without panics, the service handled multiple changes
-    // More detailed verification would require querying the database or parser stats
+    // More detailed verification would require querying the database or compiler stats
 
     // Cleanup
     service.disable_network_syncer(&network_path).ok();

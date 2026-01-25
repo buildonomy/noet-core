@@ -160,7 +160,7 @@ impl UnresolvedReference {
 /// Diagnostic information produced during document parsing.
 ///
 /// Diagnostics represent non-fatal issues or information discovered during parsing.
-/// They allow the parser to continue processing while tracking problems that may
+/// They allow the compiler to continue processing while tracking problems that may
 /// need attention or resolution in later passes.
 #[derive(Debug, Clone)]
 pub enum ParseDiagnostic {
@@ -174,7 +174,7 @@ pub enum ParseDiagnostic {
     ///
     /// The file remains in the parse queue and may be retried. Unlike fatal errors
     /// which propagate as `Err`, these are returned as part of a `ParseResult` to allow
-    /// the parser to continue processing other files.
+    /// the compiler to continue processing other files.
     ParseError {
         /// Description of what went wrong
         message: String,

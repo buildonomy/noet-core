@@ -24,7 +24,7 @@ Implement filtered event streaming to allow consumers to subscribe to a subset o
 ### High-Level Flow
 
 ```
-Client                    WatchService                   Parser/DB
+Client                    WatchService                   Compiler/DB
   |                            |                              |
   |-- Subscribe(Query) ------->|                              |
   |                            |-- Register filter            |
@@ -200,7 +200,7 @@ impl WatchService {
 4. **Implement Bidirectional Communication** (1.5 days)
    - [ ] Define `ClientEvent` enum for inbound events
    - [ ] Implement `ingest_client_event()` validation and routing
-   - [ ] Integrate with file writing and parser queue
+   - [ ] Integrate with file writing and compiler queue
    - [ ] Prevent event loops (client → server → client)
    - [ ] Add conflict detection for concurrent edits
    - [ ] Test bidirectional flow end-to-end
@@ -345,7 +345,7 @@ impl WatchService {
 ### Use Case 1: Editor Extension (Real-Time Graph View)
 - User opens a document in VSCode
 - Extension subscribes to events for nodes in that document
-- User edits file → parser updates → extension receives events → graph view updates
+- User edits file → compiler updates → extension receives events → graph view updates
 - Extension shows related documents (via relationships)
 
 ### Use Case 2: Dashboard (Project Overview)

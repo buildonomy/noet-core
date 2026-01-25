@@ -153,7 +153,7 @@ File: `docs/project/ROADMAP.md`
 ┌─────────────────────────────────────────────────┐
 │ noet-core (data structures)                     │
 │ • Schema registry API                           │
-│ • Lattice primitives (BeliefNode, BeliefSet)    │
+│ • Lattice primitives (BeliefNode, BeliefBase)    │
 │ • TOML parsing                                  │
 └─────────────────────────────────────────────────┘
                     ▲

@@ -27,14 +27,14 @@ This directory contains all documentation for the noet-core library.
 
 ```
 docs/
-├── README.md                    # This file
-├── design/                      # Architecture and design specifications
-│   ├── architecture.md          # High-level architecture guide
-│   └── beliefset_architecture.md # Detailed technical specification
-└── project/                     # Project management documents
-    ├── ROADMAP*.md              # Version roadmaps and planning
-    ├── ISSUE_*.md               # Issue tracking and specifications
-    └── DOCUMENTATION_STRATEGY.md # Documentation organization guide
+├── README.md                      # This file
+├── design/                        # Architecture and design specifications
+│   ├── architecture.md            # High-level architecture guide
+│   └── beliefbase_architecture.md # Detailed technical specification
+└── project/                       # Project management documents
+    ├── ROADMAP*.md                # Version roadmaps and planning
+    ├── ISSUE_*.md                 # Issue tracking and specifications
+    └── DOCUMENTATION_STRATEGY.md  # Documentation organization guide
 ```
 
 ## Documentation Levels
@@ -43,7 +43,7 @@ noet-core follows a **hierarchical documentation strategy**:
 
 1. **Quick Start** → `../README.md` - "Should I use this library?"
 2. **Conceptual** → `design/architecture.md` - "How does it work?"
-3. **Technical** → `design/beliefset_architecture.md` - "How is it implemented?"
+3. **Technical** → `design/beliefbase_architecture.md` - "How is it implemented?"
 4. **API Reference** → Rustdoc - "How do I use this API?"
 
 See [DOCUMENTATION_STRATEGY.md](project/DOCUMENTATION_STRATEGY.md) for details on our single-source-of-truth approach.
@@ -56,14 +56,14 @@ See [DOCUMENTATION_STRATEGY.md](project/DOCUMENTATION_STRATEGY.md) for details o
 High-level overview of noet-core's architecture for developers getting started with the library.
 
 **Contents**:
-- Core concepts (BID, BeliefSet, multi-pass compilation)
+- Core concepts (BID, BeliefBase, multi-pass compilation)
 - Architecture components and data flow
 - Relationship to prior art (Obsidian, Neo4j, rust-analyzer)
 - Getting started examples
 
 **Audience**: Developers learning the library
 
-### [beliefset_architecture.md](design/beliefset_architecture.md)
+### [beliefbase_architecture.md](design/beliefbase_architecture.md)
 Complete technical specification for understanding internals and contributing.
 
 **Contents**:

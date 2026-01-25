@@ -302,14 +302,14 @@ noet-core = "0.1.0"
 ## Quick Example
 
 ```rust
-use noet_core::{BeliefSet, codec::BeliefSetParser};
+use noet_core::{BeliefBase, codec::DocumentCompiler};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut belief_set = BeliefSet::new();
-    let mut parser = BeliefSetParser::new(config, &mut belief_set).await?;
+    let mut belief_set = BeliefBase::new();
+    let mut compiler = DocumentCompiler::new(config, &mut belief_set).await?;
     
-    parser.parse_all().await?;
+    compiler.parse_all().await?;
     
     // Query the graph
     for node in belief_set.nodes() {
