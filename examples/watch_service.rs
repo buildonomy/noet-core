@@ -55,9 +55,7 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
             match rx.try_recv() {
                 Ok(Event::Belief(belief_event)) => {
                     event_count += 1;
-                    println!(
-                        "  [{event_count}] Received belief event: {belief_event}"
-                    );
+                    println!("  [{event_count}] Received belief event: {belief_event}");
                 }
                 Ok(Event::Focus(_)) => {
                     println!("  Received focus event");
@@ -325,14 +323,10 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
         }
         BeliefEvent::PathAdded(network, path, _node, _order, origin) => {
             stats.paths_added += 1;
-            println!(
-                "  [PathAdded] {path} in network {network}, origin: {origin:?}"
-            );
+            println!("  [PathAdded] {path} in network {network}, origin: {origin:?}");
         }
         BeliefEvent::PathUpdate(network, path, _node, _order, origin) => {
-            println!(
-                "  [PathUpdate] {path} in network {network}, origin: {origin:?}"
-            );
+            println!("  [PathUpdate] {path} in network {network}, origin: {origin:?}");
         }
         BeliefEvent::PathsRemoved(network, paths, origin) => {
             println!(
@@ -353,14 +347,10 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
             );
         }
         BeliefEvent::RelationInsert(source, sink, kind, _weight, origin) => {
-            println!(
-                "  [RelationInsert] {source} -> {sink} ({kind:?}), origin: {origin:?}"
-            );
+            println!("  [RelationInsert] {source} -> {sink} ({kind:?}), origin: {origin:?}");
         }
         BeliefEvent::RelationRemoved(source, sink, origin) => {
-            println!(
-                "  [RelationRemoved] {source} -> {sink}, origin: {origin:?}"
-            );
+            println!("  [RelationRemoved] {source} -> {sink}, origin: {origin:?}");
         }
         BeliefEvent::BalanceCheck => {
             println!("  [BalanceCheck]");
