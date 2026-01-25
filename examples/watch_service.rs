@@ -56,8 +56,7 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
                 Ok(Event::Belief(belief_event)) => {
                     event_count += 1;
                     println!(
-                        "  [{}] Received belief event: {}",
-                        event_count, belief_event
+                        "  [{event_count}] Received belief event: {belief_event}"
                     );
                 }
                 Ok(Event::Focus(_)) => {
@@ -76,7 +75,7 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
             }
         }
 
-        println!("\nReceived {} events during initial parse", event_count);
+        println!("\nReceived {event_count} events during initial parse");
 
         // Disable watcher before shutdown
         println!("Disabling network syncer...");
@@ -187,7 +186,7 @@ Some content here.
                 process_belief_event(&belief_event, &mut stats);
             }
             Ok(Event::Focus(focus_event)) => {
-                println!("  [Focus] {:?}", focus_event);
+                println!("  [Focus] {focus_event:?}");
                 stats.focus_events += 1;
             }
             Ok(Event::Ping) => {
@@ -253,7 +252,7 @@ fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::erro
         match rx.try_recv() {
             Ok(Event::Belief(belief_event)) => {
                 event_count += 1;
-                println!("[{}] {}", event_count, belief_event);
+                println!("[{event_count}] {belief_event}");
             }
             Ok(Event::Focus(_)) => {
                 println!("[Focus event]");
@@ -274,7 +273,7 @@ fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::erro
     // Graceful shutdown
     println!("\nShutting down gracefully...");
     service.disable_network_syncer(&network_path)?;
-    println!("Service stopped. Processed {} events", event_count);
+    println!("Service stopped. Processed {event_count} events");
 
     println!("Example 4 complete!\n");
     Ok(())
@@ -322,19 +321,17 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
             );
         }
         BeliefEvent::NodeRenamed(from, to, origin) => {
-            println!("  [NodeRenamed] {} -> {}, origin: {:?}", from, to, origin);
+            println!("  [NodeRenamed] {from} -> {to}, origin: {origin:?}");
         }
-        BeliefEvent::PathAdded(network, path, node, order, origin) => {
+        BeliefEvent::PathAdded(network, path, _node, _order, origin) => {
             stats.paths_added += 1;
             println!(
-                "  [PathAdded] {} in network {}, origin: {:?}",
-                path, network, origin
+                "  [PathAdded] {path} in network {network}, origin: {origin:?}"
             );
         }
-        BeliefEvent::PathUpdate(network, path, node, order, origin) => {
+        BeliefEvent::PathUpdate(network, path, _node, _order, origin) => {
             println!(
-                "  [PathUpdate] {} in network {}, origin: {:?}",
-                path, network, origin
+                "  [PathUpdate] {path} in network {network}, origin: {origin:?}"
             );
         }
         BeliefEvent::PathsRemoved(network, paths, origin) => {
@@ -355,16 +352,14 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
                 origin
             );
         }
-        BeliefEvent::RelationInsert(source, sink, kind, weight, origin) => {
+        BeliefEvent::RelationInsert(source, sink, kind, _weight, origin) => {
             println!(
-                "  [RelationInsert] {} -> {} ({:?}), origin: {:?}",
-                source, sink, kind, origin
+                "  [RelationInsert] {source} -> {sink} ({kind:?}), origin: {origin:?}"
             );
         }
         BeliefEvent::RelationRemoved(source, sink, origin) => {
             println!(
-                "  [RelationRemoved] {} -> {}, origin: {:?}",
-                source, sink, origin
+                "  [RelationRemoved] {source} -> {sink}, origin: {origin:?}"
             );
         }
         BeliefEvent::BalanceCheck => {
@@ -398,17 +393,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 1: Basic watch
     if let Err(e) = example_basic_watch(workspace_root.clone()) {
-        eprintln!("Example 1 failed: {}", e);
+        eprintln!("Example 1 failed: {e}");
     }
 
     // Example 2: Multiple networks
     if let Err(e) = example_multiple_networks(workspace_root.clone()) {
-        eprintln!("Example 2 failed: {}", e);
+        eprintln!("Example 2 failed: {e}");
     }
 
     // Example 3: Event processing
     if let Err(e) = example_event_processing(workspace_root.clone()) {
-        eprintln!("Example 3 failed: {}", e);
+        eprintln!("Example 3 failed: {e}");
     }
 
     // Example 4: Long-running (optional, requires Ctrl-C)
@@ -417,7 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdin().read_line(&mut input)?;
     if input.trim().to_lowercase() == "y" {
         if let Err(e) = example_long_running(workspace_root.clone()) {
-            eprintln!("Example 4 failed: {}", e);
+            eprintln!("Example 4 failed: {e}");
         }
     } else {
         println!("Skipping example 4");

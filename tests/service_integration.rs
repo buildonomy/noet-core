@@ -141,9 +141,8 @@ With new content.
     // Run manually with: cargo test --features service test_file_modification_triggers_reparse -- --ignored --nocapture
     assert!(
         event_count > 0,
-        "Expected to receive events after file modification, got {}. \
-         This may be a timing issue in the test environment.",
-        event_count
+        "Expected to receive events after file modification, got {event_count}. \
+         This may be a timing issue in the test environment."
     );
 
     // Cleanup
@@ -169,8 +168,8 @@ fn test_multiple_file_changes_processed() {
 
     // Create multiple new documents
     for i in 2..5 {
-        let doc_content = format!("# Document {}\n\nContent for document {}.", i, i);
-        std::fs::write(network_path.join(format!("doc{}.md", i)), doc_content).unwrap();
+        let doc_content = format!("# Document {i}\n\nContent for document {i}.");
+        std::fs::write(network_path.join(format!("doc{i}.md")), doc_content).unwrap();
     }
 
     // Wait for processing (debouncer + parse time)

@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Parse { path, verbose } => {
             if verbose {
-                println!("Parsing: {:?}", path);
+                println!("Parsing: {path:?}");
             }
 
             // Create a simple compiler without event transmission
@@ -105,9 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
         } => {
             if verbose {
-                println!("Watching: {:?}", path);
+                println!("Watching: {path:?}");
                 if let Some(ref cfg) = config {
-                    println!("Config: {:?}", cfg);
+                    println!("Config: {cfg:?}");
                 }
             }
 
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Spawn event handler thread
             let event_handle = std::thread::spawn(move || {
                 for event in rx {
-                    println!("[Event] {:?}", event);
+                    println!("[Event] {event:?}");
                 }
             });
 
