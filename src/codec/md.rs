@@ -1410,3 +1410,114 @@ schema = "Document"
         assert!(result.is_none());
     }
 }
+
+    // ========================================================================
+    // Issue 3: Anchor Management Tests
+    // ========================================================================
+
+    /// Helper function for Issue 3: Determine node ID with collision detection.
+    /// Will be implemented in Issue 3.
+    #[allow(dead_code)]
+    fn determine_node_id(
+        explicit_id: Option<&str>,
+        title: &str,
+        bref: &str,
+        existing_ids: &HashSet<String>,
+    ) -> String {
+        // TODO: Implement in Issue 3
+        // Priority: explicit ID > title-derived ID > bref (on collision)
+        let candidate = if let Some(id) = explicit_id {
+            to_anchor(id)
+        } else {
+            to_anchor(title)
+        };
+
+        if existing_ids.contains(&candidate) {
+            bref.to_string()
+        } else {
+            candidate
+        }
+    }
+
+    #[test]
+    fn test_determine_node_id_no_collision() {
+        let existing_ids = HashSet::new();
+        let bref = "a1b2c3d4e5f6";
+
+        // No explicit ID, unique title
+        let id = determine_node_id(None, "Introduction", bref, &existing_ids);
+        assert_eq!(id, "introduction");
+
+        // Explicit ID, no collision
+        let id = determine_node_id(Some("custom-id"), "Introduction", bref, &existing_ids);
+        assert_eq!(id, "custom-id");
+    }
+
+    #[test]
+    fn test_determine_node_id_title_collision() {
+        let mut existing_ids = HashSet::new();
+        existing_ids.insert("details".to_string());
+        let bref = "a1b2c3d4e5f6";
+
+        // No explicit ID, title collides → use Bref
+        let id = determine_node_id(None, "Details", bref, &existing_ids);
+        assert_eq!(id, bref, "Should use Bref when title collides");
+    }
+
+    #[test]
+    fn test_determine_node_id_explicit_collision() {
+        let mut existing_ids = HashSet::new();
+        existing_ids.insert("my-section".to_string());
+        let bref = "a1b2c3d4e5f6";
+
+        // Explicit ID collides → use Bref
+        let id = determine_node_id(Some("my-section"), "Different Title", bref, &existing_ids);
+        assert_eq!(id, bref, "Should use Bref even when explicit ID collides");
+    }
+
+    #[test]
+    fn test_determine_node_id_normalization() {
+        let existing_ids = HashSet::new();
+        let bref = "a1b2c3d4e5f6";
+
+        // Explicit ID with special chars gets normalized
+        let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
+        assert_eq!(
+            id, "section-one",
+            "Should normalize explicit ID using to_anchor()"
+        );
+
+        // Explicit ID with various special chars
+        let id = determine_node_id(Some("API & Reference"), "Title", bref, &existing_ids);
+        assert_eq!(
+            id, "api--reference",
+            "Should strip punctuation and normalize"
+        );
+    }
+
+    #[test]
+    fn test_determine_node_id_normalization_collision() {
+        let mut existing_ids = HashSet::new();
+        existing_ids.insert("section-one".to_string());
+        let bref = "a1b2c3d4e5f6";
+
+        // Explicit ID normalizes to existing ID → collision → use Bref
+        let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
+        assert_eq!(
+            id, bref,
+            "Should detect collision after normalization and use Bref"
+        );
+    }
+
+    #[test]
+    fn test_to_anchor_consistency() {
+        // Verify to_anchor() behavior for collision detection
+        assert_eq!(to_anchor("Details"), "details");
+        assert_eq!(to_anchor("Section One"), "section-one");
+        assert_eq!(to_anchor("API & Reference"), "api--reference");
+        assert_eq!(to_anchor("My-Section!"), "my-section");
+
+        // Case insensitivity
+        assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
+        assert_eq!(to_anchor("Section"), to_anchor("section"));
+    }

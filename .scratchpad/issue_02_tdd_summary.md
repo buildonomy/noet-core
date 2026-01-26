@@ -1,28 +1,42 @@
 # SCRATCHPAD - Issue 02 TDD Implementation Summary
 
 **Date**: 2025-01-26
-**Status**: ✅ COMPLETE TDD SCAFFOLDING - Ready for Implementation
+**Status**: ✅✅ IMPLEMENTATION COMPLETE ✅✅
 
-## TDD Phase Complete: Full Test Coverage
+**Completion Date**: 2025-01-26
+**Final Status**: All 14 tests passing (10 unit + 4 integration)
 
-**What's Ready:**
-- ✅ 10 unit tests (all passing) - Test helper functions
-- ✅ 4 integration tests (all passing) - Test end-to-end behavior
-- ✅ Test fixture with comprehensive scenarios
-- ✅ Bug fix: `to_anchor()` punctuation stripping
-- ✅ Trait method: `finalize()` added to DocCodec
-- ✅ Builder integration: Phase 4b calls codec.finalize()
-- ✅ Issue 02 documentation updated with implementation plan
-- ✅ Scratchpad has complete implementation guide
+## Implementation Complete! 🎉
 
-**Next Session Can:**
-1. Add `matched_sections: HashSet<NodeKey>` field to MdCodec
-2. Implement "look up" pattern in inject_context()
-3. Implement finalize() method
-4. Uncomment TODO assertions in tests
-5. Watch all tests turn green! 🎯
+**What Was Implemented:**
+- ✅ Added `matched_sections: HashSet<NodeKey>` field to MdCodec
+- ✅ Extracted helper functions from tests to main implementation
+- ✅ Implemented "look up" pattern in inject_context()
+- ✅ Implemented finalize() with garbage collection
+- ✅ Fixed borrowing issues with proper sequencing
+- ✅ Updated frontmatter events after finalize() modifications
+- ✅ Used original TOML key strings (not NodeKey::to_string()) for removal
+- ✅ Uncommented API Reference test assertions (title matching works!)
+- ✅ All 14 tests passing (10 unit + 4 integration)
 
-**Total Test Coverage:** 14 tests validating all requirements
+**What Works Now:**
+- ✅ **Title Matching**: Headings match sections by slugified title
+- ✅ **Metadata Enrichment**: Matched headings enriched with sections fields
+- ✅ **Garbage Collection**: Unmatched sections removed from frontmatter
+- ✅ **Round-trip Stability**: Second parse doesn't rewrite (clean convergence)
+- ✅ **Proper BeliefNode conversion**: Sections metadata in payload
+
+**What Requires Issue 3 (Anchor Parsing):**
+- ⏳ BID matching: Requires parsing `{#bid://...}` from heading text
+- ⏳ Anchor matching: Requires parsing `{#anchor}` from heading text
+- ⏳ Auto-generation: Adding sections entries for unmatched headings
+
+**Test Results:**
+```
+✅ All 66 lib tests pass
+✅ All 4 integration tests pass (test_sections_*)
+✅ cargo test - no failures
+```
 
 ## Quick-Start Implementation Guide
 
@@ -371,7 +385,39 @@ test test_sections_round_trip_preservation ... ok
 
 ---
 
-**Status**: ✅ TDD phase complete. All tests green. `to_anchor()` bug fixed. Ready for implementation.
+**Status**: ✅✅ IMPLEMENTATION COMPLETE ✅✅
+
+---
+
+## Issue 03 Discovery (2025-01-26)
+
+**Critical Finding**: pulldown_cmark already parses heading anchors when `ENABLE_HEADING_ATTRIBUTES` is enabled!
+
+**Test Results**:
+```rust
+// WITHOUT ENABLE_HEADING_ATTRIBUTES:
+"## Test Heading {#my-id}" → id=None, text="Test Heading {#my-id}"
+
+// WITH ENABLE_HEADING_ATTRIBUTES:
+"## Test Heading {#my-id}" → id=Some("my-id"), text="Test Heading"
+```
+
+**Key Features**:
+- ✅ Anchor syntax `{#...}` automatically stripped from heading text
+- ✅ Anchor extracted into `id` field of `MdTag::Heading`
+- ✅ Works with all formats: plain IDs, BID URIs, Brefs
+- ✅ Text event contains only title (without anchor)
+
+**What This Means**:
+1. Uncomment `ENABLE_HEADING_ATTRIBUTES` in `buildonomy_md_options()`
+2. Capture `id` field during parse (change `id: _` to `id`)
+3. Store in `ProtoBeliefNode.document.insert("id", ...)`
+4. Issue 2's `extract_anchor_from_node()` already checks for "id" field!
+5. **BID and anchor matching will immediately start working**
+
+**Effort Reduction**: Issue 3 reduced from 2-3 days → 1-2 days (parsing is free!)
+
+**Next Steps**: Implement Issue 3 to complete the full section metadata enrichment system.
 
 ## Bug Fix: to_anchor() Punctuation Handling
 

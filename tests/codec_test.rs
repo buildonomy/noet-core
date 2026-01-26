@@ -18,6 +18,7 @@ use noet_core::{
     error::BuildonomyError,
     event::BeliefEvent,
     properties::{Bid, WeightKind},
+    query::Query,
 };
 
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
@@ -539,6 +540,231 @@ async fn test_sections_round_trip_preservation() -> Result<(), Box<dyn std::erro
         );
     } else {
         tracing::info!("sections_test.md stable on second parse (correct round-trip behavior)");
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Issue 3: Anchor Management Integration Tests
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_anchor_collision_detection() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing anchor collision detection with Bref fallback");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find the collision test document
+    let doc_result = parse_results
+        .iter()
+        .find(|r| r.path.to_string_lossy().contains("anchors_collision_test.md"));
+
+    assert!(
+        doc_result.is_some(),
+        "Should find anchors_collision_test.md"
+    );
+
+    let doc_bid = global_bb
+        .states().values().find(|n| n.title.contains("anchors_collision_test.md") || n.payload.get("text").and_then(|v| v.as_str()).map(|s| s.contains("anchors_collision_test.md")).unwrap_or(false)).map(|n| n.bid)
+        .expect("Should find document node");
+
+    // Find all heading nodes (connected via Section edge)
+    let heading_nodes: Vec<BeliefNode> = global_bb
+        .graph()
+        .neighbors_directed(
+            global_bb.bid_to_index(&doc_bid).unwrap(),
+            petgraph::Direction::Outgoing,
+        )
+        .filter_map(|idx| global_bb.index_to_node(&idx).ok())
+        .filter(|node| {
+            global_bb
+                .graph()
+                .edges_directed(
+                    global_bb.bid_to_index(&doc_bid).unwrap(),
+                    petgraph::Direction::Outgoing,
+                )
+                .filter(|edge| edge.target() == global_bb.bid_to_index(&node.bid).unwrap())
+                .any(|edge| edge.weight().weights.contains_key(&WeightKind::Section))
+        })
+        .collect();
+
+    tracing::info!("Found {} heading nodes", heading_nodes.len());
+
+    // Should have 4 heading nodes: Details (1), Implementation, Details (2), Testing
+    assert_eq!(
+        heading_nodes.len(),
+        4,
+        "Should have 4 heading nodes from markdown"
+    );
+
+    // Find the two "Details" headings
+    let details_nodes: Vec<&BeliefNode> = heading_nodes
+        .iter()
+        .filter(|n| n.title.contains("Details"))
+        .collect();
+
+    assert_eq!(details_nodes.len(), 2, "Should have 2 'Details' headings");
+
+    // TODO: After Issue 3 implementation, verify:
+    // - First "Details" has id="details" (title-derived, no anchor in markdown)
+    // - Second "Details" has id=<bref> (Bref injected as {#<bref>})
+    // - Both have different IDs (no collision in final output)
+    // - Rewritten content shows {#<bref>} on second "Details" heading only
+
+    tracing::info!("Details nodes: {:#?}", details_nodes);
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_explicit_anchor_preservation() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing explicit anchor preservation");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find nodes from anchors_explicit_test.md
+    let getting_started = global_bb
+        .states().values().find(|n| n.title.contains("Getting Started"));
+
+    let setup = global_bb
+        .states().values().find(|n| n.title.contains("Setup"));
+
+    let configuration = global_bb
+        .states().values().find(|n| n.title.contains("Configuration"));
+
+    let advanced = global_bb
+        .states().values().find(|n| n.title.contains("Advanced Usage"));
+
+    // TODO: After Issue 3 implementation, verify:
+    // - getting_started.id == Some("getting-started")
+    // - setup.id == Some("custom-setup-id")
+    // - configuration.id == Some("configuration")
+    // - advanced.id == Some("usage")
+    //
+    // - Explicit anchors appear in markdown source: {#getting-started}, {#custom-setup-id}, {#usage}
+    // - Configuration has NO anchor in markdown (title-derived)
+    // - All explicit anchors are preserved exactly as written
+
+    tracing::info!(
+        "Nodes found: getting_started={}, setup={}, config={}, advanced={}",
+        getting_started.is_some(),
+        setup.is_some(),
+        configuration.is_some(),
+        advanced.is_some()
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_anchor_normalization() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing anchor normalization for collision detection");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find nodes with special char anchors
+    let api_node = global_bb
+        .states().values().find(|n| n.title.contains("API & Reference"));
+
+    let section_one = global_bb
+        .states().values().find(|n| n.title.contains("Section One"));
+
+    let custom_id = global_bb
+        .states().values().find(|n| n.title.contains("My-Custom-ID"));
+
+    // TODO: After Issue 3 implementation, verify:
+    // - All explicit anchors are normalized for collision check
+    // - API & Reference → api--reference (punctuation stripped)
+    // - Section One! → section-one (space and punctuation normalized)
+    // - My-Custom-ID → my-custom-id (case normalized)
+    // - No collisions after normalization
+    // - Original anchor text preserved in markdown
+
+    tracing::info!(
+        "Nodes with special char anchors found: api={}, section={}, custom={}",
+        api_node.is_some(),
+        section_one.is_some(),
+        custom_id.is_some()
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_anchor_selective_injection() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing selective anchor injection (only Brefs for collisions)");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Check rewritten content from collision test
+    let collision_doc = parse_results
+        .iter()
+        .find(|r| r.path.to_string_lossy().contains("anchors_collision_test.md"));
+
+    if let Some(result) = collision_doc {
+        if let Some(ref rewritten) = result.rewritten_content {
+            tracing::info!(
+                "Collision test rewritten (first 800 chars):\n{}",
+                &rewritten[..rewritten.len().min(800)]
+            );
+
+            // TODO: After Issue 3 implementation, verify:
+            // - First "Details" heading has NO anchor in markdown (title-derived ID is unique)
+            // - Second "Details" heading HAS anchor {#<bref>} (collision → Bref injected)
+            // - Other unique headings (Implementation, Testing) have NO anchors
+            // - Only inject anchors when necessary (Bref collision case)
+
+            // For now, just verify the document was parsed
+            assert!(
+                !rewritten.is_empty(),
+                "Should have rewritten content for collision doc"
+            );
+        }
     }
 
     Ok(())
