@@ -154,6 +154,18 @@ pub trait DocCodec: Sync {
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError>;
 
+    /// Called after all inject_context() calls complete, allowing the codec to:
+    /// - Perform cross-node cleanup (e.g., track unmatched sections)
+    /// - Emit events for nodes modified during finalization
+    /// - Log diagnostics for unmatched metadata
+    ///
+    /// Returns a vector of (ProtoBeliefNode, BeliefNode) pairs for nodes that were modified
+    /// during finalization and need NodeUpdate events emitted.
+    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+        // Default implementation: no finalization needed
+        Ok(Vec::new())
+    }
+
     fn generate_source(&self) -> Option<String>;
 }
 

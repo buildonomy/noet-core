@@ -496,6 +496,21 @@ impl GraphBuilder {
                         tracing::debug!("phase 4 node update derivs: {:?}", _derivatives);
                     }
                 }
+
+                // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
+                tracing::debug!("Phase 4b: codec finalization");
+                let finalized_nodes = codec.finalize()?;
+                for (_proto, updated_node) in finalized_nodes {
+                    is_changed = true;
+                    let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
+                        vec![NodeKey::Bid {
+                            bid: updated_node.bid,
+                        }],
+                        updated_node.toml(),
+                        EventOrigin::Remote,
+                    ))?;
+                    tracing::debug!("phase 4b finalize node update derivs: {:?}", _derivatives);
+                }
             }
 
             if is_changed {

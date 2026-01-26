@@ -754,3 +754,419 @@ pub fn to_html(content: &str, output: &mut String) -> Result<(), BuildonomyError
     pulldown_cmark::html::write_html_fmt(output, parser)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        nodekey::{to_anchor, NodeKey},
+        properties::Bid,
+    };
+    use std::collections::HashMap;
+    use toml_edit::{DocumentMut, Table as TomlTable};
+
+    /// Parse sections field from frontmatter into flat metadata map.
+    /// Returns HashMap<NodeKey, TomlTable> for matching against heading nodes.
+    fn parse_sections_metadata(sections: &toml_edit::Item) -> HashMap<NodeKey, TomlTable> {
+        let mut metadata = HashMap::new();
+
+        if let Some(table) = sections.as_table() {
+            for (key_str, value) in table.iter() {
+                // Parse key as NodeKey
+                if let Ok(node_key) = NodeKey::from_str(key_str) {
+                    // Extract value as TomlTable
+                    if let Some(value_table) = value.as_table() {
+                        metadata.insert(node_key, value_table.clone());
+                    }
+                }
+            }
+        }
+
+        metadata
+    }
+
+    /// Extract anchor from heading node (e.g., {#intro} syntax).
+    /// Returns the anchor ID without the '#' prefix.
+    fn extract_anchor_from_node(node: &ProtoBeliefNode) -> Option<String> {
+        // TODO: Parse anchor from heading syntax once Issue 3 is implemented
+        // For now, check if there's an "id" or "anchor" field in the document
+        node.document
+            .get("anchor")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                node.document
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    }
+
+    /// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
+    fn find_metadata_match<'a>(
+        node: &ProtoBeliefNode,
+        metadata: &'a HashMap<NodeKey, TomlTable>,
+    ) -> Option<&'a TomlTable> {
+        // Priority 1: Match by BID (most explicit)
+        if let Some(bid_value) = node.document.get("bid") {
+            if let Some(bid_str) = bid_value.as_str() {
+                if let Ok(bid) = Bid::try_from(bid_str) {
+                    let bid_key = NodeKey::Bid { bid };
+                    if let Some(meta) = metadata.get(&bid_key) {
+                        return Some(meta);
+                    }
+                }
+            }
+        }
+
+        // Priority 2: Match by anchor (medium specificity)
+        if let Some(anchor) = extract_anchor_from_node(node) {
+            // Try as Id variant (anchors are IDs within a document)
+            let anchor_key = NodeKey::Id {
+                net: Bid::nil(),
+                id: anchor.clone(),
+            };
+            if let Some(meta) = metadata.get(&anchor_key) {
+                return Some(meta);
+            }
+        }
+
+        // Priority 3: Match by title anchor (least specific)
+        // Use Id variant since titles are only guaranteed unique for documents
+        if let Some(title_value) = node.document.get("title") {
+            if let Some(title) = title_value.as_str() {
+                let anchor = to_anchor(title);
+                let id_key = NodeKey::Id {
+                    net: Bid::nil(),
+                    id: anchor,
+                };
+                if let Some(meta) = metadata.get(&id_key) {
+                    return Some(meta);
+                }
+            }
+        }
+
+        None
+    }
+
+    // ========== UNIT TESTS ==========
+
+    #[test]
+    fn test_parse_sections_metadata_with_bid_keys() {
+        let toml_str = r#"
+bid = "00000000-0000-0000-0000-000000000001"
+schema = "Document"
+
+[sections."bid://00000000-0000-0000-0000-000000000002"]
+schema = "Section"
+complexity = "high"
+
+[sections."bid://00000000-0000-0000-0000-000000000003"]
+schema = "Section"
+complexity = "medium"
+"#;
+        let doc: DocumentMut = toml_str.parse().unwrap();
+        let sections = doc.get("sections").unwrap();
+
+        let metadata = parse_sections_metadata(sections);
+
+        assert_eq!(metadata.len(), 2);
+
+        let bid2 = Bid::try_from("00000000-0000-0000-0000-000000000002").unwrap();
+        let key2 = NodeKey::Bid { bid: bid2 };
+        assert!(metadata.contains_key(&key2));
+        assert_eq!(
+            metadata
+                .get(&key2)
+                .unwrap()
+                .get("complexity")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn test_parse_sections_metadata_with_anchor_keys() {
+        let toml_str = r#"
+bid = "00000000-0000-0000-0000-000000000001"
+
+[sections.introduction]
+schema = "Section"
+complexity = "high"
+
+[sections.background]
+schema = "Section"
+complexity = "low"
+"#;
+        let doc: DocumentMut = toml_str.parse().unwrap();
+        let sections = doc.get("sections").unwrap();
+
+        let metadata = parse_sections_metadata(sections);
+
+        // Note: Plain strings like "introduction" (no whitespace) are parsed as Id variant
+        // Strings with whitespace become Title variant (normalized via to_anchor)
+        assert_eq!(metadata.len(), 2);
+
+        // Verify that plain string keys become NodeKey::Id
+        let intro_key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "introduction".to_string(),
+        };
+        assert!(metadata.contains_key(&intro_key));
+    }
+
+    #[test]
+    fn test_parse_sections_metadata_empty_sections() {
+        let toml_str = r#"
+bid = "00000000-0000-0000-0000-000000000001"
+schema = "Document"
+"#;
+        let doc: DocumentMut = toml_str.parse().unwrap();
+        let sections = doc.get("sections");
+
+        if let Some(sections_item) = sections {
+            let metadata = parse_sections_metadata(sections_item);
+            assert_eq!(metadata.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_to_anchor_usage() {
+        // Using existing to_anchor from nodekey module
+        // Note: to_anchor trims / and #, lowercases, replaces whitespace with -,
+        // and removes punctuation for HTML/URL compatibility
+        assert_eq!(to_anchor("Introduction"), "introduction");
+        assert_eq!(to_anchor("My Section Title"), "my-section-title");
+        assert_eq!(to_anchor("Section 2.1: Overview"), "section-21-overview");
+        assert_eq!(to_anchor("API & Reference"), "api--reference");
+    }
+
+    #[test]
+    fn test_find_metadata_match_by_bid() {
+        let mut metadata = HashMap::new();
+        let bid = Bid::try_from("00000000-0000-0000-0000-000000000002").unwrap();
+        let key = NodeKey::Bid { bid };
+
+        let mut table = TomlTable::new();
+        table.insert("complexity", value("high"));
+        metadata.insert(key, table);
+
+        // Create a node with matching BID
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("00000000-0000-0000-0000-000000000002"));
+        doc.insert("title", value("Introduction"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().get("complexity").unwrap().as_str().unwrap(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn test_find_metadata_match_by_anchor() {
+        let mut metadata = HashMap::new();
+        let key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "intro".to_string(),
+        };
+
+        let mut table = TomlTable::new();
+        table.insert("complexity", value("medium"));
+        metadata.insert(key, table);
+
+        // Create a node with matching anchor
+        let mut doc = DocumentMut::new();
+        doc.insert("title", value("Introduction"));
+        doc.insert("anchor", value("intro"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().get("complexity").unwrap().as_str().unwrap(),
+            "medium"
+        );
+    }
+
+    #[test]
+    fn test_find_metadata_match_by_title_anchor() {
+        let mut metadata = HashMap::new();
+        // Use Id variant for title-based matching (not Title)
+        let key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "introduction".to_string(),
+        };
+
+        let mut table = TomlTable::new();
+        table.insert("complexity", value("low"));
+        metadata.insert(key, table);
+
+        // Create a node with matching title (no BID, no anchor)
+        let mut doc = DocumentMut::new();
+        doc.insert("title", value("Introduction"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().get("complexity").unwrap().as_str().unwrap(),
+            "low"
+        );
+    }
+
+    #[test]
+    fn test_find_metadata_match_priority_bid_over_anchor() {
+        let mut metadata = HashMap::new();
+
+        // Add BID match
+        let bid = Bid::try_from("00000000-0000-0000-0000-000000000002").unwrap();
+        let bid_key = NodeKey::Bid { bid };
+        let mut bid_table = TomlTable::new();
+        bid_table.insert("source", value("bid"));
+        metadata.insert(bid_key, bid_table);
+
+        // Add anchor match
+        let anchor_key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "intro".to_string(),
+        };
+        let mut anchor_table = TomlTable::new();
+        anchor_table.insert("source", value("anchor"));
+        metadata.insert(anchor_key, anchor_table);
+
+        // Create node with BOTH BID and anchor
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("00000000-0000-0000-0000-000000000002"));
+        doc.insert("anchor", value("intro"));
+        doc.insert("title", value("Introduction"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_some());
+        // Should match by BID (highest priority)
+        assert_eq!(
+            result.unwrap().get("source").unwrap().as_str().unwrap(),
+            "bid"
+        );
+    }
+
+    #[test]
+    fn test_find_metadata_match_priority_anchor_over_title() {
+        let mut metadata = HashMap::new();
+
+        // Add anchor match
+        let anchor_key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "intro".to_string(),
+        };
+        let mut anchor_table = TomlTable::new();
+        anchor_table.insert("source", value("anchor"));
+        metadata.insert(anchor_key, anchor_table);
+
+        // Add title match (using Id variant)
+        let title_key = NodeKey::Id {
+            net: Bid::nil(),
+            id: "introduction".to_string(),
+        };
+        let mut title_table = TomlTable::new();
+        title_table.insert("source", value("title"));
+        metadata.insert(title_key, title_table);
+
+        // Create node with anchor and title (no BID)
+        let mut doc = DocumentMut::new();
+        doc.insert("anchor", value("intro"));
+        doc.insert("title", value("Introduction"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_some());
+        // Should match by anchor (higher priority than title)
+        assert_eq!(
+            result.unwrap().get("source").unwrap().as_str().unwrap(),
+            "anchor"
+        );
+    }
+
+    #[test]
+    fn test_find_metadata_match_no_match() {
+        let metadata = HashMap::new(); // Empty metadata
+
+        let mut doc = DocumentMut::new();
+        doc.insert("title", value("Introduction"));
+
+        let node = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 4,
+        };
+
+        let result = find_metadata_match(&node, &metadata);
+        assert!(result.is_none());
+    }
+}
