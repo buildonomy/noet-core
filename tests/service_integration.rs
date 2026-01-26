@@ -45,6 +45,7 @@ Some content here.
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_watch_service_initialization() {
     // Test that WatchService can be created and initializes correctly
     let temp_dir = TempDir::new().unwrap();
@@ -63,6 +64,7 @@ fn test_watch_service_initialization() {
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_watch_service_enable_disable_network_syncer() {
     // Test enabling and disabling network syncer
     let temp_dir = TempDir::new().unwrap();
@@ -95,6 +97,7 @@ fn test_watch_service_enable_disable_network_syncer() {
 
 #[test]
 #[ignore = "File watching can be timing-sensitive in test environments"]
+#[cfg(feature = "service")]
 fn test_file_modification_triggers_reparse() {
     // Test that modifying a file triggers automatic reparsing
     // Note: This test can be flaky due to file system notification timing
@@ -150,6 +153,7 @@ With new content.
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_multiple_file_changes_processed() {
     // Test that multiple file changes are all processed
     let temp_dir = TempDir::new().unwrap();
@@ -183,6 +187,7 @@ fn test_multiple_file_changes_processed() {
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_service_handles_empty_files() {
     // Test that empty files don't crash the service
     let temp_dir = TempDir::new().unwrap();
@@ -210,6 +215,7 @@ fn test_service_handles_empty_files() {
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_shutdown_cleanup() {
     // Test that WatchService cleans up properly when dropped
     let temp_dir = TempDir::new().unwrap();
@@ -238,6 +244,7 @@ fn test_shutdown_cleanup() {
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_get_set_networks() {
     // Test get_networks and set_networks operations
     let temp_dir = TempDir::new().unwrap();
@@ -278,6 +285,7 @@ fn test_get_set_networks() {
 }
 
 #[test]
+#[cfg(feature = "service")]
 fn test_database_connection_is_public() {
     // Test that DbConnection can be constructed publicly (for custom database paths)
     use noet_core::db::{db_init, DbConnection};
