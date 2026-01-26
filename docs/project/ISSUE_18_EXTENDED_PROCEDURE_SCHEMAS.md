@@ -2,12 +2,14 @@
 
 **Priority**: MEDIUM  
 **Estimated Effort**: 1 week  
-**Dependencies**: Issue 1 (Schema Registry), Issue 17 (noet-procedures extraction)  
+**Dependencies**: Issue 1 (Schema Registry), Issue 17 (noet-procedures extraction with ProcedureCodec)  
 **Blocks**: None (enables richer procedural features)
 
 ## Summary
 
 Extend the noet-procedures crate to support **Participant channel observations** - treating operator input as just another observation source in the unified observable action model. This eliminates the need for a separate "prompt" step type by recognizing that participant responses are observations on the `Participant` channel, using the same `inference_hint` mechanism as sensor readings, barcode scans, and system metrics.
+
+**Note**: This issue builds on Issue 17's ProcedureCodec, which generates nodes from `.procedure` files via the `steps` field. Procedures are human-authored and executed, but their primary attributes are structure and operations (connections, steps, execution order) rather than text content. This requires specialized parsing beyond basic markdown.
 
 ## Goals
 
@@ -18,6 +20,19 @@ Extend the noet-procedures crate to support **Participant channel observations**
 5. Keep schemas general-purpose (applicable beyond behavior change)
 
 ## Architecture
+
+### Context: ProcedureCodec and .procedure Files
+
+Procedures are defined in `.procedure` files, parsed by ProcedureCodec:
+- Primary attributes: structure and operations (connections, execution order)
+- `steps` field defines node hierarchy (structure-driven generation)
+- Each step becomes a BeliefNode with `inference_hint` field
+- ProcedureCodec orchestrates parsing, may use MdCodec for text content
+- Schema validates `steps` field and `inference_hint` structure
+
+While procedures are human-authored and executed, they require specialized parsing because connections and operations are more important than text content for editing, analysis, and execution.
+
+This issue extends the `inference_hint` schema to support Participant channel.
 
 ### Unified Observable Model
 
@@ -132,7 +147,7 @@ This unifies the conceptual model: all steps wait for observation events.
 
 ### Response Configuration Schema
 
-Added to `transitionEvent` as optional property:
+Added to `inference_hint` schema (within step definition) as optional property for Participant channel:
 
 ```toml
 [properties.response_config]
@@ -171,30 +186,36 @@ type = "string"
 type = "string"
 ```
 
-## Example: Lab Protocol
+## Example: Lab Protocol (.procedure file)
 
 ```toml
----
+# lab_protocol.procedure
+bid = "proc_sample_analysis"
+title = "Sample Analysis Protocol"
+
+[[steps]]
 bid = "step_record_sample_temp"
 title = "Record Sample Temperature"
+text = "Enter the current temperature of Sample A using the digital thermometer. This reading will be used to verify incubation conditions are maintained."
 
-[inference_hint]
+[steps.inference_hint]
 channel = "Participant"
 producer = "Measurement"
 
-[inference_hint.response_config]
+[steps.inference_hint.response_config]
 form_element = "number"
 stores_in_variable = "sample_temp"
 min = -20
 max = 100
 step = 0.1
----
-
-Enter the current temperature of Sample A using the digital thermometer. This reading will be used to verify incubation conditions are maintained.
 ```
 
-When the procedure reaches this step:
-1. Engine emits `observation_requested` with BeliefNode data
+When ProcedureCodec parses this:
+1. Generates BeliefNode from step with `inference_hint` field
+2. GraphBuilder creates node in lattice
+
+During execution:
+1. Engine reaches step, emits `observation_requested` with BeliefNode data
 2. UI renderer displays:
    - Title: "Record Sample Temperature"
    - Text: "Enter the current temperature of Sample A..."
@@ -239,15 +260,23 @@ When the procedure reaches this step:
 
 ### General-Purpose (noet-procedures)
 
-**Observable Actions (all channels)**:
-- `inference_hint` schema structure
-- Participant channel conventions
+**ProcedureCodec**:
+- Parses `.procedure` files
+- Generates nodes from `steps` field
+- Sets `inference_hint` field on step nodes
+
+**Schema**:
+- Validates `steps` field structure
+- Validates `inference_hint` structure
+- Defines Participant channel conventions
 - Response configuration schema
+
+**Observable Actions (all channels)**:
 - `action_detected` event schema
 - Variable storage mechanism
 
 **What's NOT included**:
-- No `prompt` step type (it's just `action` with `channel = "Participant"`)
+- No `prompt` step type (it's just step with `channel = "Participant"`)
 - BeliefNode structure used as-is (title, text already exist)
 
 ### Product-Specific (Downstream)
@@ -298,22 +327,26 @@ Unified model is simpler and more powerful.
 
 ## Use Cases (Non-Behavior-Change Examples)
 
-### Manufacturing SOP
+### Manufacturing SOP (safety_check.procedure)
 ```toml
-[inference_hint]
+[[steps]]
+title = "Safety Check"
+[steps.inference_hint]
 channel = "Participant"
 producer = "Confirmation"
-[inference_hint.response_config]
+[steps.inference_hint.response_config]
 form_element = "checkbox"
 stores_in_variable = "safety_confirmed"
 ```
 
-### Lab Protocol
+### Lab Protocol (measure_ph.procedure)
 ```toml
-[inference_hint]
+[[steps]]
+title = "Measure pH"
+[steps.inference_hint]
 channel = "Participant"
 producer = "Measurement"
-[inference_hint.response_config]
+[steps.inference_hint.response_config]
 form_element = "number"
 stores_in_variable = "ph_level"
 min = 0
@@ -321,31 +354,35 @@ max = 14
 step = 0.1
 ```
 
-### Deployment Runbook
+### Deployment Runbook (rollback.procedure)
 ```toml
-[inference_hint]
+[[steps]]
+title = "Select Rollback Strategy"
+[steps.inference_hint]
 channel = "Participant"
 producer = "Choice"
-[inference_hint.response_config]
+[steps.inference_hint.response_config]
 form_element = "radio"
 stores_in_variable = "rollback_strategy"
 options = ["immediate", "gradual", "manual"]
 ```
 
-### Quality Control
+### Quality Control (measure_part.procedure)
 ```toml
-[inference_hint]
+[[steps]]
+title = "Measure Part Diameter"
+[steps.inference_hint]
 operator = "any_of"
-[[inference_hint.events]]
+[[steps.inference_hint.events]]
 # Automatic measurement
 channel = "Instrument"
 producer = "Caliper"
 
-[[inference_hint.events]]
+[[steps.inference_hint.events]]
 # Manual measurement fallback
 channel = "Participant"
 producer = "Measurement"
-[inference_hint.events.response_config]
+[steps.inference_hint.events.response_config]
 form_element = "number"
 stores_in_variable = "diameter_mm"
 ```
@@ -353,7 +390,7 @@ stores_in_variable = "diameter_mm"
 ## Risks
 
 **Risk**: Confusion about BeliefNode structure  
-**Mitigation**: Document clearly that steps are BeliefNodes, fields already exist
+**Mitigation**: Document clearly that ProcedureCodec generates BeliefNodes from steps, fields already exist
 
 **Risk**: UI rendering expectations unclear  
 **Mitigation**: Provide detailed sequence diagram, reference BeliefNode fields explicitly
@@ -361,22 +398,29 @@ stores_in_variable = "diameter_mm"
 **Risk**: Response value type mismatches  
 **Mitigation**: Runtime validation, clear documentation of form_element → type mapping
 
+**Risk**: Confusion between .procedure and .md files  
+**Mitigation**: Clear documentation that procedures use ProcedureCodec, not MdCodec
+
 ## References
 
 - **action_observable_schema.md** - Unified observable action schema (includes Participant channel)
 - **procedure_execution.md** - Execution lifecycle
+- **procedure_schema.md** - Procedure schema definition and ProcedureCodec behavior
 - **beliefbase_architecture.md** - BeliefNode structure
 - **ISSUE_01_SCHEMA_REGISTRY.md** - Foundation
-- **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - Companion issue
+- **ISSUE_02_SECTION_METADATA.md** - Why procedures need separate codec (avoid merge hell)
+- **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - ProcedureCodec implementation
 
 ## Next Steps After Completion
 
-1. Products implement UI renderers for Participant channel
-2. Renderer subscribes to `observation_requested` events
-3. Reads BeliefNode title/text for prompt content
-4. Renders form element based on `response_config`
-5. Emits `ObservationEvent` on response
-6. Procedure advances via standard `action_detected` flow
+1. Define `.procedure` files using extended schema
+2. ProcedureCodec parses and generates step nodes with `inference_hint`
+3. Products implement UI renderers for Participant channel
+4. Renderer subscribes to `observation_requested` events
+5. Reads BeliefNode title/text for prompt content
+6. Renders form element based on `response_config`
+7. Emits `ObservationEvent` on response
+8. Procedure advances via standard `action_detected` flow
 
 ## Notes
 
@@ -387,3 +431,5 @@ stores_in_variable = "diameter_mm"
 - Enable natural multi-modal patterns (automatic OR manual)
 
 This is a significant architectural insight that simplifies the model considerably.
+
+**Codec-first design**: Procedures use ProcedureCodec (`.procedure` files) because their primary attributes are structure and operations, not text content. While fundamentally human-authored and executed, procedures require specialized parsing for editing, analysis, and execution. This separation avoids "merge hell" where structure-driven generation (steps field) conflicts with content-driven generation (markdown headings). MdCodec may assist with text content, but ProcedureCodec orchestrates. See Issue 2 for design rationale.

@@ -527,12 +527,14 @@ Before proposing implementations or writing detailed code in issues:
 - Don't guess at architecture without confirming understanding
 - Don't start coding without clear success criteria
 - Don't create documents without knowing what problem they solve
+- Don't explore extensively when constraints are ambiguous
 
 **Red flags that mean ASK FIRST**:
 - "I think the user wants..." (you're guessing)
 - Multiple equally-valid interpretations
 - Conflicting information in different documents
 - Unclear scope (is this Issue X or Issue Y?)
+- Multiple components could own same responsibility
 
 **Pattern for seeking clarity**:
 1. State what you understand: "My understanding is..."
@@ -554,6 +556,14 @@ Which use case are we solving?"
 
 [Wait for clarification before writing 700-line issue]
 ```
+
+**Design Exploration Constraint**:
+When architectural exploration generates multiple valid approaches, STOP and identify the constraint:
+- "These three approaches are all viable. What's the constraint that eliminates options?"
+- "Who has authority here: codec, schema, or content?"
+- "Is this field for CREATING or ENRICHING nodes?"
+
+Exploration is valuable, but unconstrained exploration wastes tokens. Establish boundaries first.
 
 ### Efficiency with Repetitive Changes
 

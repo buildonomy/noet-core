@@ -56,12 +56,6 @@ Pattern matches `CodecMap` in `codec/mod.rs`.
    - [x] Export `SCHEMAS` from `codec/mod.rs`
    - [x] Add module documentation example
 
-5. **Update `compile_schema.py`** (1 day, Optional Phase 2 - DEFERRED)
-   - [ ] Script doesn't exist yet in codebase
-   - [ ] Generate initialization code instead of match
-   - [ ] Call from `SchemaRegistry::create()`
-   - [ ] Note: This is optional and not blocking downstream issues
-
 ## Testing Requirements ✅
 
 - [x] Register/retrieve schemas

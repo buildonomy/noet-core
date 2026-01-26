@@ -2,22 +2,41 @@
 
 **Priority**: MEDIUM  
 **Estimated Effort**: 2-3 weeks  
-**Dependencies**: Issue 1 (Schema Registry)  
+**Dependencies**: Issue 1 (Schema Registry), Issue 2 (Section Metadata)  
 **Blocks**: None (enables future procedural features)
 
 ## Summary
 
-Extract procedural execution functionality into a separate `noet-procedures` crate. This crate will provide general-purpose runtime infrastructure for executing, tracking, and adapting procedures defined in noet lattices. The extraction establishes a clean boundary: `noet-core` provides data structures and schemas, `noet-procedures` provides execution and tracking, and the noet product provides behavior-specific learning and inference.
+Extract procedural execution functionality into a separate `noet-procedures` crate with a dedicated `.procedure` file extension and `ProcedureCodec`. This crate provides general-purpose runtime infrastructure for executing, tracking, and adapting procedures defined in noet lattices. The extraction establishes clean boundaries: `noet-core` provides data structures, `noet-procedures` provides codec + execution + tracking, and the noet product provides behavior-specific learning and inference.
+
+**Key Architectural Decision**: Procedures use a specialized codec because their primary attributes are structure and operations (connections, steps, execution order), not text content. While procedures are fundamentally human-authored and executed, they require more advanced parsing and rendering than basic markdown to provide good editing, analysis, and execution experiences. The `.procedure` extension signals this need for specialized handling.
 
 ## Goals
 
 1. Create `noet-procedures` crate with clear API boundaries
-2. Define procedure schema as runtime-registered extension (not built into noet-core)
-3. Implement "as-run" tracking (template + context + execution record)
-4. Provide core redline system (deviation recording, not prediction)
-5. Enable downstream products to extend with learning/adaptation
+2. Implement `ProcedureCodec` for `.procedure` files (registers with noet-core codec map)
+3. Define procedure schema as runtime-registered extension (validates procedure structure)
+4. Generate nodes from `steps` field (schema-driven, hierarchical)
+5. Implement "as-run" tracking (template + context + execution record)
+6. Provide core redline system (deviation recording, not prediction)
+7. Enable downstream products to extend with learning/adaptation
 
 ## Architecture
+
+### Codec-First Design Principle
+
+**Why a specialized codec?** Procedures prioritize structure and operations (connections, execution order, logical operators) over text content. While procedures are human-authored and executed, generating nodes from the `steps` field hierarchy (schema-driven) conflicts with markdown's content-driven generation from headings. Rather than merging three sources of truth (metadata, schema, content) and entering "merge hell," we use file extensions to signal parsing strategy:
+
+- `.md` files → MdCodec → nodes from headings, `sections` as metadata, text is primary
+- `.procedure` files → ProcedureCodec → nodes from `steps` field, text supplements structure
+
+This separation provides:
+✅ Clear semantics per file type
+✅ No authority conflicts (codec owns generation strategy)
+✅ Specialized optimization per use case (text vs. operations)
+✅ Extensible pattern for new domains
+
+**Note**: MdCodec may play a role in procedure implementation (for text content), but ProcedureCodec orchestrates the parsing based on structural attributes.
 
 ### The Three-Piece "As-Run" Model
 
@@ -33,9 +52,13 @@ This is analogous to paper procedures in aviation, manufacturing, and lab protoc
 ```
 noet-procedures/
 ├── src/
+│   ├── codec/            # ProcedureCodec implementation
+│   │   ├── mod.rs       # ProcedureCodec, registers with CODECS
+│   │   ├── parse.rs     # Parse .procedure files, generate nodes from steps
+│   │   └── generate.rs  # Generate .procedure source from nodes
 │   ├── schema/           # Procedure schema definitions
-│   │   ├── mod.rs       # Schema registration with noet-core
-│   │   ├── procedure.rs # Core procedure schema
+│   │   ├── mod.rs       # Schema registration with SCHEMAS
+│   │   ├── procedure.rs # Core procedure schema (validates steps field)
 │   │   └── steps.rs     # Step types (action, prompt, logical operators)
 │   ├── execution/        # Runtime execution tracking
 │   │   ├── mod.rs
@@ -46,21 +69,57 @@ noet-procedures/
 │   │   ├── correction.rs # CorrectionEvent schema
 │   │   ├── deviation.rs  # Deviation analysis (template vs as-run)
 │   │   └── promotion.rs  # Promote as-run to new template
-│   └── lib.rs           # Public API
-├── examples/            # Usage examples
+│   └── lib.rs           # Public API, initialization
+├── examples/            # Usage examples (.procedure files)
 └── tests/              # Integration tests
+```
+
+### ProcedureCodec Behavior
+
+```rust
+impl DocCodec for ProcedureCodec {
+    fn parse(&mut self, content: &str, initial: ProtoBeliefNode) -> Result<()> {
+        // 1. Parse TOML frontmatter (document node)
+        let doc_node = parse_procedure_frontmatter(content)?;
+        
+        // 2. Get procedure schema
+        let schema = SCHEMAS.get("Procedure")?;
+        
+        // 3. Generate nodes from steps field (schema-driven)
+        let step_nodes = generate_nodes_from_steps(&doc_node.content["steps"])?;
+        
+        // 4. Optionally parse markdown for documentation (injected as text)
+        let markdown_content = parse_optional_markdown(content)?;
+        inject_markdown_into_steps(&mut step_nodes, markdown_content)?;
+        
+        // 5. Store all nodes
+        self.nodes = vec![doc_node] + step_nodes;
+        
+        Ok(())
+    }
+}
+
+fn generate_nodes_from_steps(steps: &TomlValue) -> Result<Vec<ProtoBeliefNode>> {
+    // Recursively generate ProtoBeliefNodes from steps array
+    // Each step becomes a node, substeps become child nodes
+    // Sets heading field for parent-child relationships
+    // This is the OPPOSITE of MdCodec (schema-driven, not content-driven)
+}
 ```
 
 ### Boundary with noet-core
 
 **noet-core provides:**
-- Schema registry API (Issue 1)
+- Codec registry API (`CODECS.insert()`)
+- Schema registry API (`SCHEMAS.register()`)
 - Lattice data structure and query primitives
 - Node/edge storage and manipulation
-- TOML parsing infrastructure
+- TOML/markdown parsing utilities
 
 **noet-procedures provides:**
-- Procedure schema (registered at runtime via schema registry)
+- `ProcedureCodec` (registered with `.procedure` extension)
+- Procedure schema (registered at runtime, validates steps structure)
+- Node generation from steps field (hierarchical, recursive)
 - Execution tracking (runs, steps, timing)
 - Deviation recording (as-run vs template)
 - Template/as-run comparison
@@ -83,6 +142,22 @@ The noet product will extend `noet-procedures` with:
 
 ## Implementation Steps
 
+### Phase 0: Codec Infrastructure (3 days)
+
+1. **Create ProcedureCodec Skeleton** (1 day)
+   - [ ] Create `noet-procedures/src/codec/mod.rs`
+   - [ ] Implement `DocCodec` trait for `ProcedureCodec`
+   - [ ] Register with `CODECS.insert("procedure", ProcedureCodec::default())`
+   - [ ] Add initialization function called from downstream products
+
+2. **Implement Steps-to-Nodes Generation** (2 days)
+   - [ ] Parse `steps` field from TOML frontmatter
+   - [ ] Recursively generate ProtoBeliefNodes from steps array
+   - [ ] Set `heading` field for parent-child relationships (substeps)
+   - [ ] Handle step types: action, prompt, sequence, parallel, any_of, all_of
+   - [ ] Set appropriate BIDs for step nodes
+   - [ ] Store step metadata in node payload
+
 ### Phase 1: Design Document Migration (1 week)
 
 1. **Migrate Core Procedure Documents to noet-core** (3 days)
@@ -90,6 +165,8 @@ The noet product will extend `noet-procedures` with:
    - [x] Create `docs/design/procedure_execution.md` (from `procedure_engine.md`) - COMPLETE
    - [x] Create `docs/design/redline_system.md` (from `redline_system.md`) - COMPLETE
    - [x] Strip product-specific sections (motivation tracking, sensor integration) - COMPLETE
+   - [ ] Update `procedure_schema.md` to document ProcedureCodec behavior
+   - [ ] Clarify that procedures use `.procedure` extension, not `.md`
    - [x] Keep general-purpose concepts (as-run model, deviation tracking) - COMPLETE
 
 2. **Extract and Unify Observable Action Schema** (3 days)
@@ -130,7 +207,7 @@ The noet product will extend `noet-procedures` with:
    - [ ] Write registration tests
    - [ ] Verify TOML parsing with registered schema
 
-### Phase 3: Execution Tracking (1 week)
+### Phase 4: Execution Tracking (1 week)
 
 6. **Core Execution Infrastructure** (3 days)
    - [ ] `ProcedureRun` struct (run metadata, status)
@@ -149,15 +226,15 @@ The noet product will extend `noet-procedures` with:
    - [ ] Step execution table
    - [ ] Query API (list runs, get run details)
 
-### Phase 4: Redline System (1 week)
+### Phase 5: Redline System (1 week)
 
-9. **Deviation Recording** (3 days)
+10. **Deviation Detection** (3 days)
    - [ ] `CorrectionEvent` schema
    - [ ] `DeviationReport` (template vs as-run diff)
    - [ ] Manual correction API
    - [ ] Deviation storage
 
-10. **Template Comparison** (2 days)
+11. **Template Promotion** (2 days)
     - [ ] Compute diff between template and as-run
     - [ ] Identify skipped steps, reordering, timing differences
     - [ ] Report generation
@@ -167,9 +244,9 @@ The noet product will extend `noet-procedures` with:
     - [ ] Preserve reference to original template
     - [ ] Metadata tracking (promoted_from, promoted_at)
 
-### Phase 5: Documentation & Examples (3 days)
+### Phase 6: Documentation & Examples (3 days)
 
-12. **API Documentation** (1 day)
+13. **API Documentation** (1 day)
     - [ ] Rustdoc for all public APIs
     - [ ] Module-level documentation
     - [ ] Usage examples in doc comments
@@ -180,37 +257,53 @@ The noet product will extend `noet-procedures` with:
     - [ ] Promoting as-run to template
     - [ ] Querying execution history
 
-14. **Integration Guide** (1 day)
+15. **Integration Guide** (1 day)
     - [ ] How to register custom schemas
     - [ ] How to extend with learning (for products)
     - [ ] Best practices for execution tracking
 
 ## Testing Requirements
 
+### Codec Tests
+- ProcedureCodec registration with CODECS
+- Parse `.procedure` files (TOML frontmatter)
+- Generate nodes from `steps` field (hierarchical)
+- Handle recursive substeps (heading levels)
+- Inject optional markdown documentation
+- Round-trip: parse → generate → parse
+- Step types: action, prompt, sequence, parallel, any_of, all_of
+
 ### Unit Tests
 - Schema registration and retrieval
+- Procedure schema validation (steps field structure)
 - Execution record creation and storage
 - Deviation computation
 - Template promotion logic
 
 ### Integration Tests
-- End-to-end procedure execution
+- End-to-end procedure execution from `.procedure` file
 - Correction event handling
 - Multi-step procedures with logical operators
 - Query API correctness
+- GraphBuilder creates correct edges for substeps
 
 ### Examples as Tests
-- All examples compile and run
+- All `.procedure` examples parse correctly
+- Generated node hierarchy matches step structure
 - Doctests pass
 - Tutorial code is valid
 
 ## Success Criteria
 
 - [ ] `noet-procedures` crate compiles independently
-- [ ] Procedure schema registered via noet-core API (no hardcoding)
+- [ ] ProcedureCodec registered with `.procedure` extension
+- [ ] Procedure schema registered via SCHEMAS API (no hardcoding in noet-core)
+- [ ] Parse `.procedure` files and generate nodes from `steps` field
+- [ ] Handle hierarchical substeps (recursive generation)
 - [ ] Can execute and track procedure runs
 - [ ] Can record deviations from template
 - [ ] Can promote as-run to new template
+- [ ] Documentation clearly explains codec-first approach
 - [ ] Documentation complete
 - [ ] Integration tests pass
 - [ ] Examples demonstrate key features
@@ -218,10 +311,20 @@ The noet product will extend `noet-procedures` with:
 
 ## Design Principles
 
+### Codec-First Architecture
+- **Procedures prioritize structure/operations** over text content
+- **Human-authored and executed**, but connections and operations are primary attributes
+- **`.procedure` extension** signals specialized codec with structure-driven node generation
+- **MdCodec may assist** with text content, but ProcedureCodec orchestrates parsing
+- **Avoid merge hell** by establishing clear authority (structure vs. text)
+- **File extension = parsing strategy** - clear semantics, no ambiguity
+
 ### Clean Boundaries
 - **If it's about recording reality** → noet-procedures
 - **If it's about predicting behavior** → noet product
 - **If it's core data structure** → noet-core
+- **If it's node generation** → codec (ProcedureCodec, MdCodec)
+- **If it's validation** → schema (registered with SCHEMAS)
 
 ### General-Purpose Design
 Avoid behavior-change assumptions. Design for:
@@ -237,24 +340,34 @@ Products should be able to:
 - Register additional event types
 - Extend schema with custom fields
 - Plug in custom storage backends
+- Register additional codecs for domain-specific formats
 
 ## Open Questions
 
-1. **Schema Versioning**: How should `noet-procedures` handle schema evolution?
+1. **Markdown in .procedure files**: Should we support optional markdown for documentation?
+   - Design: Yes, markdown after frontmatter is optional documentation text
+   - Injected into step nodes as `text` field (same as MdCodec)
+   - Does NOT define structure (steps field has authority)
+
+2. **Schema Versioning**: How should `noet-procedures` handle schema evolution?
    - Likely: Semantic versioning, migration utilities
    
-2. **Storage Backend**: Should storage be pluggable (SQLite, Postgres, custom)?
+3. **Storage Backend**: Should storage be pluggable (SQLite, Postgres, custom)?
    - Phase 1: SQLite only
    - Phase 2: Consider abstraction
 
-3. **Event Log**: Should `noet-procedures` maintain its own event log or integrate with external?
+4. **Event Log**: Should `noet-procedures` maintain its own event log or integrate with external?
    - Likely: Provide event schemas, let caller handle storage
 
-4. **Concurrent Execution**: How to handle multiple simultaneous procedure runs?
+5. **Concurrent Execution**: How to handle multiple simultaneous procedure runs?
    - Design: Each run has unique `run_id`, no shared state
 
-5. **Step IDs**: Should step IDs be globally unique or procedure-scoped?
+6. **Step IDs**: Should step IDs be globally unique or procedure-scoped?
    - Design: Procedure-scoped, qualified by `procedure_id` + `step_index`
+
+7. **Cross-referencing**: Can markdown docs reference .procedure steps?
+   - Design: Yes, via BID URLs (bid://procedures/baking#mix_batter)
+   - Enables documentation to link to procedural definitions
 
 6. **Event.rs Redesign for Procedure Execution** (HIGH PRIORITY)
    - **Context**: Current `src/event.rs` was designed before LSP diagnostics and procedure execution
