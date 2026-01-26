@@ -8,16 +8,20 @@
 //!
 //! Tests focus on observable behavior rather than internal implementation details.
 
+#[cfg(feature = "service")]
 use noet_core::{
     config::NetworkRecord,
     event::Event,
     properties::{BeliefNode, Bid},
     watch::WatchService,
 };
+#[cfg(feature = "service")]
 use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
+#[cfg(feature = "service")]
 use tempfile::TempDir;
 
 /// Helper to create a test directory with sample documents
+#[cfg(feature = "service")]
 fn create_test_network(temp_dir: &TempDir) -> PathBuf {
     let network_path = temp_dir.path().join("test_network");
     std::fs::create_dir(&network_path).unwrap();
