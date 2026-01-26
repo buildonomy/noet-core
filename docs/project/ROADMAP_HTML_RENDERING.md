@@ -87,6 +87,13 @@ Current BID injection uses YAML blocks under headings, which:
   - Auto-update paths when targets move (preserve NodeKey)
   - Requires Issues 1, 2, 3
 
+- **[@ISSUE_21_JSON_FALLBACK_PARSING.md](./ISSUE_21_JSON_FALLBACK_PARSING.md)** (3-4 days, MEDIUM)
+  - JSON as default format (cross-platform compatibility)
+  - Support both BeliefNetwork.json and BeliefNetwork.toml
+  - Network configuration schema for repo-wide format preferences
+  - Bidirectional JSON/TOML conversion for uniform handling
+  - Requires Issue 1
+
 **Additional Phase 1 Work** (not yet in dedicated issue):
 - **Migration Tool** (2 days): Convert existing YAML-block documents to new format
   - CLI: `noet migrate <directory>`
@@ -96,6 +103,8 @@ Current BID injection uses YAML blocks under headings, which:
 **Dependencies**:
 ```
 Issue 1 (Schema Registry)
+    ↓
+    ├──→ Issue 21 (JSON/TOML Dual-Format)
     ↓
 Issue 2 (Multi-Node TOML) ← Issue 3 (Heading Anchors)
     ↓                              ↓

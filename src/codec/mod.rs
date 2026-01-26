@@ -9,6 +9,7 @@
 //! - [`DocumentCompiler`] - Orchestrates multi-pass compilation across multiple files
 //! - [`DocCodec`] trait - Implement custom document parsers for new file formats
 //! - [`CodecMap`] - Global registry of available codecs (accessible via [`CODECS`])
+//! - [`SchemaRegistry`](schema_registry::SchemaRegistry) - Global registry of schema definitions (accessible via [`SCHEMAS`])
 //! - [`ParseDiagnostic`] - Tracks unresolved references and parsing issues
 //!
 //! ## Multi-Pass Compilation
@@ -35,7 +36,7 @@
 //! ## Built-in Codecs
 //!
 //! - **Markdown** (`.md`) - via [`md::MdCodec`]
-//! - **TOML** (`.toml`) - via [`lattice_toml::ProtoBeliefNode`]
+//! - **TOML** (`.toml`) - via [`belief_ir::ProtoBeliefNode`]
 //!
 //! Register custom codecs via [`CodecMap::insert`]:
 //!
@@ -75,6 +76,28 @@
 //! CODECS.insert::<MyCustomCodec>("myext".to_string());
 //! ```
 //!
+//! ## Schema Registration
+//!
+//! Schemas define how TOML fields map to graph edges. Register custom schemas via [`SCHEMAS`]:
+//!
+//! ```rust
+//! use noet_core::codec::{SCHEMAS, schema_registry::{SchemaDefinition, GraphField, EdgeDirection}};
+//! use noet_core::properties::WeightKind;
+//!
+//! SCHEMAS.register(
+//!     "my_app.task".to_string(),
+//!     SchemaDefinition {
+//!         graph_fields: vec![GraphField {
+//!             field_name: "dependencies",
+//!             direction: EdgeDirection::Downstream,
+//!             weight_kind: WeightKind::Pragmatic,
+//!             required: false,
+//!             payload_fields: vec!["notes"],
+//!         }],
+//!     },
+//! );
+//! ```
+//!
 //! ## Architecture Details
 //!
 //! For detailed information about the parsing architecture, including:
@@ -92,18 +115,19 @@ use std::{result::Result, sync::Arc, time::Duration};
 
 use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
 
+pub mod belief_ir;
 pub mod builder;
 pub mod compiler;
 pub mod diagnostic;
-pub mod lattice_toml;
 pub mod md;
 pub mod schema_registry;
 
 // Re-export for backward compatibility
+pub use belief_ir::ProtoBeliefNode;
 pub use builder::GraphBuilder;
 pub use compiler::DocumentCompiler;
 pub use diagnostic::{ParseDiagnostic, UnresolvedReference};
-pub use lattice_toml::ProtoBeliefNode;
+pub use schema_registry::SCHEMAS;
 
 /// Global singleton codec map with builtin codecs (md, toml)
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);

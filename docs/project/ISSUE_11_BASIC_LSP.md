@@ -159,7 +159,7 @@ struct NoetLanguageServer {
   - Track BID annotation positions
   - Implement `get_node_range()` and `get_link_ranges()`
   - Return `true` for `supports_positions()`
-- [ ] Update `src/codec/lattice_toml.rs` (TomlCodec):
+- [ ] Update `src/codec/belief_ir.rs` (TomlCodec):
   - Add internal position tracking for frontmatter blocks
   - Track individual TOML field positions if possible
   - Implement position query methods

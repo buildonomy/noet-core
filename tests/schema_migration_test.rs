@@ -1,5 +1,5 @@
 /// Test automatic schema migration from old relationship_profile to new relationship_semantics
-use noet_core::codec::lattice_toml::ProtoBeliefNode;
+use noet_core::codec::belief_ir::ProtoBeliefNode;
 use std::str::FromStr;
 
 #[test]

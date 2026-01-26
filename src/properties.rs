@@ -41,7 +41,7 @@ use sqlx::{sqlite::SqliteRow, FromRow, Row};
 
 use crate::{
     beliefbase::BeliefBase,
-    codec::lattice_toml::ProtoBeliefNode,
+    codec::belief_ir::ProtoBeliefNode,
     error::BuildonomyError,
     nodekey::{to_anchor, NodeKey},
     paths::path_join,

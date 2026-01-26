@@ -14,7 +14,7 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        lattice_toml::{detect_schema_from_path, ProtoBeliefNode},
+        belief_ir::{detect_schema_from_path, ProtoBeliefNode},
         DocCodec,
     },
     error::BuildonomyError,

@@ -157,6 +157,82 @@ Current features in `Cargo.toml`:
      - Benchmarks (`benches/` directory)
      - Examples (`examples/` directory)
 
+### 7. File Watcher Integration Test (from Issue 19) (0.5-1 day)
+
+**Context**: Test `test_file_modification_triggers_reparse` is currently ignored due to timing sensitivity.
+
+- [ ] Manual verification: Confirm `noet watch` works correctly (Step 1 from Issue 19)
+- [ ] If CLI works: Fix test infrastructure (mock watcher or longer timeouts)
+- [ ] If CLI broken: Debug pipeline (add tracing, identify failure point)
+- [ ] Make test reliable (>95% pass rate over 20 runs)
+- [ ] Remove `#[ignore]` attribute
+- [ ] Document platform-specific behavior if needed
+
+**Decision: If manual CLI testing passes**, treat as test infrastructure issue and use mocking or extended timeouts. Don't spend >1 day on this - file watcher tests are inherently flaky in CI.
+
+
+**Critical first step**: Verify if `noet watch` actually works in real usage.
+
+```bash
+# Create test directory
+mkdir -p /tmp/noet_test/network
+cd /tmp/noet_test/network
+
+# Create BeliefNetwork.toml
+cat > BeliefNetwork.toml << EOF
+id = "test-network"
+title = "Test Network"
+EOF
+
+# Create initial document
+cat > doc1.md << EOF
+# Document 1
+
+Initial content.
+EOF
+
+# Start watching
+cargo run --features service --bin noet -- watch /tmp/noet_test
+
+# In another terminal, modify doc1.md
+echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
+
+# Observe: Does noet watch output show reparse?
+```
+
+**Success criteria**:
+- [ ] `noet watch` detects file change within 1-2 seconds
+- [ ] Console output shows "Parsing..." or similar
+- [ ] Database updated with new content
+- [ ] No errors or warnings
+
+**If this fails**: Real bug, proceed to Step 2
+**If this succeeds**: Test environment issue, proceed to Step 3
+
+**Open Questions re file watcher**
+
+1. **Does `noet watch` CLI actually work in manual testing?**
+   - If yes: Test environment issue only
+   - If no: Critical bug blocking soft open source
+
+2. **Which thread/component is the bottleneck?**
+   - File watcher thread?
+   - Compiler thread?
+   - Transaction thread?
+   - Event channel?
+
+3. **Is 300ms debounce too aggressive?**
+   - Should it be configurable?
+   - Does test need longer wait for debounce + parse + transaction?
+
+4. **Is this OS-specific?**
+   - Linux inotify vs. macOS FSEvents vs. Windows ReadDirectoryChangesW
+   - Test environment (container, VM, CI) affecting notifications?
+
+5. **Are there existing issues in notify-debouncer-full?**
+   - Check: https://github.com/notify-rs/notify/issues
+   - Version: currently using notify-debouncer-full v0.3.1
+
 ## Testing Requirements
 
 - All feature combinations pass tests

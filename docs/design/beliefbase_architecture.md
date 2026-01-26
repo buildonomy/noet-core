@@ -622,7 +622,7 @@ pub trait DocCodec {
 
 **Current Implementations:**
 
-- **TomlCodec** (lattice_toml.rs): Parses standalone TOML files and TOML frontmatter
+- **TomlCodec** (belief_ir.rs): Parses standalone TOML files and TOML frontmatter
   - Schema-aware: Can detect schema type from file path or frontmatter
   - Preserves formatting via `toml_edit::DocumentMut`
   - Extensible for custom relationship field handling

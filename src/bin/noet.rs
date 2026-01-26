@@ -6,9 +6,26 @@
 //!
 //! - `parse <path>`: One-shot parsing with diagnostics
 //! - `watch <path>`: Continuous file watching and parsing
+//!
+//! ## Write-Back Support
+//!
+//! By default, both commands operate in read-only mode. Use the `--write` flag to enable
+//! writing normalized/updated content back to source files.
+//!
+//! **Warning**: The `--write` flag modifies files in place. Ensure you have backups or are
+//! using version control before enabling write-back.
+
+// Compile-time check for service feature (required for watch command)
+#[cfg(all(not(feature = "service"), not(doc)))]
+compile_error!(
+    "The 'watch' subcommand requires the 'service' feature. \
+     Please rebuild with '--features service' or use the default 'bin' feature."
+);
 
 use clap::{Parser, Subcommand};
-use noet_core::{codec::compiler::DocumentCompiler, event::Event, watch::WatchService};
+#[cfg(feature = "service")]
+use noet_core::watch::WatchService;
+use noet_core::{codec::compiler::DocumentCompiler, event::Event};
 use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
 
 #[derive(Parser)]
@@ -29,6 +46,10 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Write normalized/updated content back to source files (default: read-only)
+        #[arg(short, long)]
+        write: bool,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -43,6 +64,10 @@ enum Commands {
         /// Configuration file path
         #[arg(short, long)]
         config: Option<PathBuf>,
+
+        /// Write normalized/updated content back to source files (default: read-only)
+        #[arg(short, long)]
+        write: bool,
     },
 }
 
@@ -58,13 +83,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Parse { path, verbose } => {
+        Commands::Parse {
+            path,
+            verbose,
+            write,
+        } => {
             if verbose {
                 println!("Parsing: {path:?}");
+                if write {
+                    println!("Write-back: ENABLED (files will be modified)");
+                } else {
+                    println!("Write-back: disabled (read-only mode)");
+                }
             }
 
-            // Create a simple compiler without event transmission
-            let compiler = DocumentCompiler::simple(&path)?;
+            // Create a compiler with write flag
+            let compiler = DocumentCompiler::new(&path, None, None, write)?;
 
             // Parse all documents
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -86,6 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Total parses: {}", stats.total_parses);
                 println!("Pending dependencies: {}", stats.pending_dependencies_count);
 
+                if write {
+                    println!("\n=== Write Results ===");
+                    println!("Files processed: {}", stats.processed_count);
+                    println!("Note: Only modified files are written back");
+                }
+
                 // TODO: Display diagnostics from accumulated cache
                 // For now, we just show that parsing completed
 
@@ -103,67 +143,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path,
             verbose,
             config,
+            write,
         } => {
-            if verbose {
-                println!("Watching: {path:?}");
-                if let Some(ref cfg) = config {
-                    println!("Config: {cfg:?}");
-                }
+            #[cfg(not(feature = "service"))]
+            {
+                eprintln!("Error: The 'watch' subcommand requires the 'service' feature.");
+                eprintln!("Please rebuild with: cargo build --features service");
+                std::process::exit(1);
             }
 
-            // Determine root directory for service
-            let root_dir = if let Some(cfg_path) = config {
-                cfg_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap())
-            } else {
-                std::env::current_dir()?
-            };
-
-            // Create event channel
-            let (tx, rx) = channel::<Event>();
-
-            // Spawn event handler thread
-            let event_handle = std::thread::spawn(move || {
-                for event in rx {
-                    println!("[Event] {event:?}");
+            #[cfg(feature = "service")]
+            {
+                if verbose {
+                    println!("Watching: {path:?}");
+                    if let Some(ref cfg) = config {
+                        println!("Config: {cfg:?}");
+                    }
+                    if write {
+                        println!("Write-back: ENABLED (files will be modified on change)");
+                    } else {
+                        println!("Write-back: disabled (read-only mode)");
+                    }
                 }
-            });
 
-            // Create watch service
-            let service = WatchService::new(root_dir, tx)?;
+                // Determine root directory for service
+                let root_dir = if let Some(cfg_path) = config {
+                    cfg_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap())
+                } else {
+                    std::env::current_dir()?
+                };
 
-            // Enable network syncer for the path
-            service.enable_network_syncer(&path)?;
+                // Create event channel
+                let (tx, rx) = channel::<Event>();
 
-            println!(
-                "Watching {} for changes. Press Ctrl-C to stop.",
-                path.display()
-            );
+                // Spawn event handler thread with write support
+                let event_verbose = verbose;
+                let event_handle = std::thread::spawn(move || {
+                    for event in rx {
+                        if event_verbose {
+                            println!("[Event] {event:?}");
+                        }
+                    }
+                });
 
-            // Set up Ctrl-C handler
-            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let r = running.clone();
+                // Create watch service with write flag
+                let service = WatchService::new(root_dir, tx, write)?;
 
-            ctrlc::set_handler(move || {
-                println!("\nShutting down...");
-                r.store(false, std::sync::atomic::Ordering::SeqCst);
-            })?;
+                // Enable network syncer for the path
+                service.enable_network_syncer(&path)?;
 
-            // Keep running until Ctrl-C
-            while running.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(100));
+                println!(
+                    "Watching {} for changes. Press Ctrl-C to stop.",
+                    path.display()
+                );
+
+                // Set up Ctrl-C handler
+                let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let r = running.clone();
+
+                ctrlc::set_handler(move || {
+                    println!("\nShutting down...");
+                    r.store(false, std::sync::atomic::Ordering::SeqCst);
+                })?;
+
+                // Keep running until Ctrl-C
+                while running.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+
+                // Cleanup
+                service.disable_network_syncer(&path)?;
+                drop(service);
+                drop(event_handle);
+
+                println!("Shutdown complete");
+
+                Ok(())
             }
-
-            // Cleanup
-            service.disable_network_syncer(&path)?;
-            drop(service);
-            drop(event_handle);
-
-            println!("Shutdown complete");
-
-            Ok(())
         }
     }
 }

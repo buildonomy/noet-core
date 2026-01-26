@@ -1,8 +1,8 @@
 use crate::{
     beliefbase::BeliefBase,
     codec::{
+        belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
         builder::GraphBuilder,
-        lattice_toml::{ProtoBeliefNode, NETWORK_CONFIG_NAME},
         UnresolvedReference,
     },
     error::BuildonomyError,
@@ -275,8 +275,13 @@ impl DocumentCompiler {
         let content = {
             let file_path = if path.is_dir() {
                 // BeliefNetwork directories are enqueued as the directory, not the contained
-                // BeliefNetwork.toml file.
-                path.join(NETWORK_CONFIG_NAME)
+                // BeliefNetwork.json or BeliefNetwork.toml file.
+                if let Some((detected_path, _format)) = detect_network_file(&path) {
+                    detected_path
+                } else {
+                    // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                    path.join(NETWORK_CONFIG_NAMES[0])
+                }
             } else {
                 path.clone()
             };

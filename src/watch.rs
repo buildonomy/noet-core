@@ -21,7 +21,7 @@
 //! - **Multi-network management**: Watch multiple document networks simultaneously
 //!
 //! **Don't use WatchService** for:
-//! - One-shot parsing (use [`DocumentCompiler::simple()`](crate::codec::DocumentCompiler::simple) instead)
+//! - One-shot parsing (use [`DocumentCompiler::simple`] instead)
 //! - Build scripts or short-lived commands (use direct parsing)
 //! - Applications without file watching needs (use compiler directly)
 //!
@@ -36,7 +36,7 @@
 //!
 //! // Initialize service (creates its own runtime and database)
 //! let root_dir = PathBuf::from("/path/to/workspace");
-//! let service = WatchService::new(root_dir, tx)?;
+//! let service = WatchService::new(root_dir, tx, true)?;
 //!
 //! // Enable file watching for a document network
 //! let network_path = PathBuf::from("/path/to/workspace/my_network");
@@ -69,7 +69,7 @@
 //! use std::{sync::mpsc::channel, path::PathBuf};
 //!
 //! let (tx, rx) = channel::<Event>();
-//! let service = WatchService::new(PathBuf::from("/workspace"), tx)?;
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true)?;
 //!
 //! // Enable watching - initial parse happens automatically
 //! let network_path = PathBuf::from("/workspace/docs");
@@ -102,7 +102,7 @@
 //! use std::{sync::mpsc::channel, path::PathBuf};
 //!
 //! let (tx, _rx) = channel::<Event>();
-//! let service = WatchService::new(PathBuf::from("/workspace"), tx)?;
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true)?;
 //!
 //! // Get current networks (reads from config.toml)
 //! let networks = service.get_networks()?;
@@ -181,7 +181,7 @@
 //! let root_dir = PathBuf::from("/workspace");
 //!
 //! // Database created at /workspace/belief_cache.db
-//! let service = WatchService::new(root_dir.clone(), tx)?;
+//! let service = WatchService::new(root_dir.clone(), tx, true)?;
 //!
 //! // Database location is fixed: {root_dir}/belief_cache.db
 //! let db_path = root_dir.join("belief_cache.db");
@@ -236,14 +236,14 @@
 //!
 //! ## See Also
 //!
-//! - [`DocumentCompiler`](crate::codec::DocumentCompiler) - The underlying compiler
+//! - [`DocumentCompiler`] - The underlying compiler
 //! - [`Event`] - Events emitted by the service
-//! - [`DbConnection`](crate::db::DbConnection) - Database connection wrapper
-//! - [`LatticeConfigProvider`](crate::config::LatticeConfigProvider) - Configuration interface
+//! - [`DbConnection`] - Database connection wrapper
+//! - [`LatticeConfigProvider`] - Configuration interface
 
 use crate::{
     beliefbase::BeliefGraph,
-    codec::{compiler::DocumentCompiler, lattice_toml::ProtoBeliefNode, CodecMap},
+    codec::{belief_ir::ProtoBeliefNode, compiler::DocumentCompiler, CodecMap},
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
@@ -296,10 +296,15 @@ pub struct WatchService {
     event_tx: Sender<Event>,
     runtime: Runtime,
     config_provider: Arc<dyn crate::config::LatticeConfigProvider>,
+    write: bool,
 }
 
 impl WatchService {
-    pub fn new(root_dir: PathBuf, event_tx: Sender<Event>) -> Result<Self, BuildonomyError> {
+    pub fn new(
+        root_dir: PathBuf,
+        event_tx: Sender<Event>,
+        write: bool,
+    ) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .worker_threads(4)
             .enable_all()
@@ -327,6 +332,7 @@ impl WatchService {
             event_tx,
             runtime,
             config_provider,
+            write,
         })
     }
 
@@ -473,6 +479,7 @@ impl WatchService {
             repo_path,
             true,
             &self.runtime,
+            self.write,
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
@@ -580,6 +587,7 @@ impl FileUpdateSyncer {
         root: &Path,
         notify: bool,
         runtime: &Runtime,
+        write: bool,
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
@@ -588,7 +596,7 @@ impl FileUpdateSyncer {
             root,
             Some(accum_tx),
             Some(3), // max_reparse_count
-            true,    // write rewritten content back to files
+            write,   // write rewritten content back to files
         )?));
 
         let compiler_ref = compiler.clone();

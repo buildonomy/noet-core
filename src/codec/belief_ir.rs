@@ -1,7 +1,7 @@
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        schema_registry::{get_schema_definition, migrate_schema, EdgeDirection},
+        schema_registry::{migrate_schema, EdgeDirection, SCHEMAS},
         DocCodec, CODECS,
     },
     error::BuildonomyError,
@@ -10,7 +10,6 @@ use crate::{
 };
 
 use std::{
-    ffi::OsStr,
     fs,
     io::Write,
     mem::replace,
@@ -22,12 +21,20 @@ use toml::{to_string, Table as TomlTable};
 use toml_edit::{value, DocumentMut};
 use walkdir::{DirEntry, WalkDir};
 
-/// Standard filename designating a directory as the root of a BeliefNetwork.
-pub const NETWORK_CONFIG_NAME: &str = "BeliefNetwork.toml";
+/// Metadata format for document frontmatter and network configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataFormat {
+    Json,
+    Toml,
+}
+
+/// Standard filenames designating a directory as the root of a BeliefNetwork.
+/// JSON is preferred for cross-platform compatibility.
+pub const NETWORK_CONFIG_NAMES: &[&str] = &["BeliefNetwork.json", "BeliefNetwork.toml"];
 
 /// Iterates through a directory subtree, filtering to return a sorted list of network directories
-/// (directories containing a [toml::NETWORK_CONFIG_NAME] file), as well as file paths matching
-/// known codec extensions.
+/// (directories containing a BeliefNetwork.json or BeliefNetwork.toml file), as well as file paths
+/// matching known codec extensions.
 fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
     fn is_hidden(entry: &DirEntry) -> bool {
         entry
@@ -36,7 +43,6 @@ fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
             .map(|s| s.starts_with("."))
             .unwrap_or(false)
     }
-    let network_dir_name = OsStr::new(NETWORK_CONFIG_NAME);
     let mut subnets = Vec::default();
     let mut sorted_files = WalkDir::new(&path)
         .into_iter()
@@ -52,14 +58,22 @@ fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
                     if subnets.iter().any(|subnet_path| p.starts_with(subnet_path)) {
                         // Don't include subnet files
                         None
-                    } else if p.file_name() == Some(network_dir_name) {
-                        p.pop();
-                        if !p.eq(&path.as_ref()) {
-                            subnets.push(p.clone());
+                    } else if let Some(file_name) = p.file_name() {
+                        let file_name_str = file_name.to_string_lossy();
+                        if NETWORK_CONFIG_NAMES
+                            .iter()
+                            .any(|&name| name == file_name_str.as_ref())
+                        {
+                            p.pop();
+                            if !p.eq(&path.as_ref()) {
+                                subnets.push(p.clone());
 
-                            Some(p)
+                                Some(p)
+                            } else {
+                                None
+                            }
                         } else {
-                            None
+                            Some(p)
                         }
                     } else {
                         Some(p)
@@ -141,6 +155,209 @@ fn toml_edit_value_to_toml_value(value: &toml_edit::Value) -> Option<toml::Value
         let value_str = value.to_string();
         toml::from_str::<toml::Value>(&value_str).ok()
     }
+}
+
+/// Network-level configuration for metadata format preferences
+#[derive(Debug, Clone)]
+pub struct NetworkConfig {
+    pub default_metadata_format: MetadataFormat,
+    pub strict_format: bool,
+    pub validate_on_parse: bool,
+    pub auto_normalize: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        NetworkConfig {
+            default_metadata_format: MetadataFormat::Json,
+            strict_format: false,
+            validate_on_parse: true,
+            auto_normalize: true,
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Extract network config from a TOML document
+    pub fn from_document(doc: &DocumentMut) -> Option<Self> {
+        let config_item = doc.get("config")?;
+        let config_table = config_item.as_table()?;
+
+        let default_format = config_table
+            .get("default_metadata_format")
+            .and_then(|v| v.as_str())
+            .and_then(|s| match s {
+                "json" => Some(MetadataFormat::Json),
+                "toml" => Some(MetadataFormat::Toml),
+                _ => {
+                    tracing::warn!("Unknown metadata format '{}', defaulting to JSON", s);
+                    None
+                }
+            })
+            .unwrap_or(MetadataFormat::Json);
+
+        let strict_format = config_table
+            .get("strict_format")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let validate_on_parse = config_table
+            .get("validate_on_parse")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let auto_normalize = config_table
+            .get("auto_normalize")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        Some(NetworkConfig {
+            default_metadata_format: default_format,
+            strict_format,
+            validate_on_parse,
+            auto_normalize,
+        })
+    }
+}
+
+/// Parse content as JSON and convert to TOML DocumentMut
+fn parse_json_to_document(json_str: &str) -> Result<DocumentMut, BuildonomyError> {
+    // Parse JSON string to serde_json::Value
+    let json_value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to parse JSON: {e}")))?;
+
+    // Convert JSON to TOML via intermediate serialization
+    // This handles type conversions (null, datetime, etc.)
+    let toml_string = json_to_toml_string(&json_value)?;
+
+    // Parse as TOML DocumentMut
+    toml_string
+        .parse::<DocumentMut>()
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to convert JSON to TOML: {e}")))
+}
+
+/// Parse content as TOML DocumentMut
+fn parse_toml_to_document(toml_str: &str) -> Result<DocumentMut, BuildonomyError> {
+    toml_str
+        .parse::<DocumentMut>()
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to parse TOML: {e}")))
+}
+
+/// Convert JSON value to TOML string
+fn json_to_toml_string(json: &serde_json::Value) -> Result<String, BuildonomyError> {
+    // Convert JSON to TOML via toml::Value
+    let toml_value = json_value_to_toml_value(json)?;
+    toml::to_string(&toml_value)
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to serialize to TOML: {e}")))
+}
+
+/// Convert serde_json::Value to toml::Value
+fn json_value_to_toml_value(json: &serde_json::Value) -> Result<toml::Value, BuildonomyError> {
+    match json {
+        serde_json::Value::Null => {
+            // TOML doesn't have null - skip or use empty string
+            // For now, treat as empty string to preserve structure
+            Ok(toml::Value::String(String::new()))
+        }
+        serde_json::Value::Bool(b) => Ok(toml::Value::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(toml::Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(toml::Value::Float(f))
+            } else {
+                Err(BuildonomyError::Codec(format!(
+                    "Unsupported JSON number: {n}"
+                )))
+            }
+        }
+        serde_json::Value::String(s) => Ok(toml::Value::String(s.clone())),
+        serde_json::Value::Array(arr) => {
+            let toml_arr: Result<Vec<toml::Value>, BuildonomyError> =
+                arr.iter().map(json_value_to_toml_value).collect();
+            Ok(toml::Value::Array(toml_arr?))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut toml_table = toml::map::Map::new();
+            for (key, value) in obj {
+                // Skip null values in objects
+                if !value.is_null() {
+                    toml_table.insert(key.clone(), json_value_to_toml_value(value)?);
+                }
+            }
+            Ok(toml::Value::Table(toml_table))
+        }
+    }
+}
+
+/// Parse content with format preference and fallback
+fn parse_with_fallback(
+    content: &str,
+    primary: MetadataFormat,
+) -> Result<DocumentMut, BuildonomyError> {
+    match primary {
+        MetadataFormat::Json => {
+            // Try JSON first
+            match parse_json_to_document(content) {
+                Ok(doc) => {
+                    tracing::debug!("Parsed as JSON");
+                    Ok(doc)
+                }
+                Err(json_err) => {
+                    tracing::debug!("JSON parsing failed, trying TOML fallback");
+                    match parse_toml_to_document(content) {
+                        Ok(doc) => {
+                            tracing::info!("Parsed with fallback format TOML");
+                            Ok(doc)
+                        }
+                        Err(toml_err) => Err(BuildonomyError::Codec(format!(
+                            "Failed to parse as JSON or TOML.\nJSON: {json_err}\nTOML: {toml_err}"
+                        ))),
+                    }
+                }
+            }
+        }
+        MetadataFormat::Toml => {
+            // Try TOML first
+            match parse_toml_to_document(content) {
+                Ok(doc) => {
+                    tracing::debug!("Parsed as TOML");
+                    Ok(doc)
+                }
+                Err(toml_err) => {
+                    tracing::debug!("TOML parsing failed, trying JSON fallback");
+                    match parse_json_to_document(content) {
+                        Ok(doc) => {
+                            tracing::info!("Parsed with fallback format JSON");
+                            Ok(doc)
+                        }
+                        Err(json_err) => Err(BuildonomyError::Codec(format!(
+                            "Failed to parse as TOML or JSON.\nTOML: {toml_err}\nJSON: {json_err}"
+                        ))),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Detect network file in directory and return (path, format)
+///
+/// Prefers BeliefNetwork.json over BeliefNetwork.toml when both exist.
+pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
+    // Try BeliefNetwork.json first (default)
+    let json_path = dir.join(NETWORK_CONFIG_NAMES[0]);
+    if json_path.exists() {
+        return Some((json_path, MetadataFormat::Json));
+    }
+
+    // Fallback to BeliefNetwork.toml
+    let toml_path = dir.join(NETWORK_CONFIG_NAMES[1]);
+    if toml_path.exists() {
+        return Some((toml_path, MetadataFormat::Toml));
+    }
+
+    None
 }
 
 // pub fn parse_procedure(
@@ -426,7 +643,7 @@ impl ProtoBeliefNode {
     /// Per the graph design, each network owns a **flat list** of 'document' or 'network' nodes
     /// that are its **direct filesystem descendants**. This means:
     ///
-    /// - **Prune subdirectories** containing `NETWORK_CONFIG_NAME` (they are sub-networks)
+    /// - **Prune subdirectories** containing BeliefNetwork files (they are sub-networks)
     /// - **Flatten all other files** matching CODEC extensions as direct source→sink connections
     /// - The parent network treats the entire non-network filetree as its direct children
     ///
@@ -445,7 +662,13 @@ impl ProtoBeliefNode {
         let mut file_path = PathBuf::from(path.as_ref());
         let mut is_net = false;
         if file_path.is_dir() {
-            file_path.push(NETWORK_CONFIG_NAME);
+            // Try to detect network file (JSON or TOML)
+            if let Some((detected_path, _format)) = detect_network_file(&file_path) {
+                file_path = detected_path;
+            } else {
+                // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                file_path.push(NETWORK_CONFIG_NAMES[0]);
+            }
         }
 
         let mut proto = ProtoBeliefNode::default();
@@ -456,8 +679,11 @@ impl ProtoBeliefNode {
         }
 
         if let Some(file_name) = file_path.file_name() {
-            let file_name_string = file_name.to_string_lossy().to_string();
-            if file_name_string[..] == NETWORK_CONFIG_NAME[..] {
+            let file_name_string = file_name.to_string_lossy();
+            if NETWORK_CONFIG_NAMES
+                .iter()
+                .any(|&name| name == file_name_string.as_ref())
+            {
                 is_net = true;
             }
         }
@@ -506,7 +732,13 @@ impl ProtoBeliefNode {
 
     pub fn write<P: AsRef<Path>>(&self, path: P) -> Result<(), BuildonomyError> {
         let file_path = if path.as_ref().is_dir() {
-            path.as_ref().join(NETWORK_CONFIG_NAME)
+            // Detect existing network file or default to JSON
+            if let Some((detected_path, _format)) = detect_network_file(path.as_ref()) {
+                detected_path
+            } else {
+                // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                path.as_ref().join(NETWORK_CONFIG_NAMES[0])
+            }
         } else {
             path.as_ref().to_path_buf()
         };
@@ -655,7 +887,7 @@ impl ProtoBeliefNode {
             self.content = self.document.to_string();
         }
 
-        let schema_def = match get_schema_definition(&schema_name) {
+        let schema_def = match SCHEMAS.get(&schema_name) {
             Some(def) => def,
             None => return Ok(()), // Schema not found in registry
         };
@@ -755,17 +987,28 @@ impl ProtoBeliefNode {
 
 impl FromStr for ProtoBeliefNode {
     type Err = BuildonomyError;
-    // Use TomlCodec for schema-aware frontmatter parsing
+    // Use JSON-first parsing with TOML fallback for cross-platform compatibility
     // Benefits:
     // 1. Parses parent_connections → downstream
-    // 2. Preserves unknown TOML fields for round-trip
+    // 2. Preserves unknown fields for round-trip
+    // 3. JSON default enables browser/web tool compatibility
     fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+        Self::from_str_with_format(str, MetadataFormat::Json)
+    }
+}
+
+impl ProtoBeliefNode {
+    /// Parse content with explicit format preference
+    pub fn from_str_with_format(
+        str: &str,
+        preferred_format: MetadataFormat,
+    ) -> Result<ProtoBeliefNode, BuildonomyError> {
         let mut proto = ProtoBeliefNode::default();
         proto.content = str.trim().to_string();
-        proto.document = proto
-            .content
-            .parse::<DocumentMut>()
-            .map_err(|e| BuildonomyError::Codec(format!("Failed to parse TOML: {e}")))?;
+
+        // Parse with format preference and fallback
+        proto.document = parse_with_fallback(&proto.content, preferred_format)?;
+
         // Remove/translate BeliefNode fields into a proto node format.
         proto.document.remove("kind");
         if let Some(mut payload) = proto.document.remove("payload") {
@@ -829,5 +1072,210 @@ impl DocCodec for ProtoBeliefNode {
         self.traverse_schema()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_json_format() {
+        let json_content = r#"{
+            "bid": "12345678-1234-1234-1234-123456789abc",
+            "schema": "intention_lattice.intention",
+            "title": "Test Node",
+            "parent_connections": []
+        }"#;
+
+        let result = ProtoBeliefNode::from_str(json_content);
+        assert!(result.is_ok(), "JSON parsing should succeed");
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("title").and_then(|v| v.as_str()),
+            Some("Test Node")
+        );
+    }
+
+    #[test]
+    fn test_parse_toml_format() {
+        let toml_content = r#"
+bid = "12345678-1234-1234-1234-123456789abc"
+schema = "intention_lattice.intention"
+title = "Test Node"
+parent_connections = []
+"#;
+
+        let result = ProtoBeliefNode::from_str(toml_content);
+        assert!(result.is_ok(), "TOML parsing should succeed via fallback");
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("title").and_then(|v| v.as_str()),
+            Some("Test Node")
+        );
+    }
+
+    #[test]
+    fn test_parse_with_format_json_first() {
+        let json_content = r#"{"title": "JSON Test"}"#;
+
+        let result = ProtoBeliefNode::from_str_with_format(json_content, MetadataFormat::Json);
+        assert!(result.is_ok());
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("title").and_then(|v| v.as_str()),
+            Some("JSON Test")
+        );
+    }
+
+    #[test]
+    fn test_parse_with_format_toml_first() {
+        let toml_content = r#"title = "TOML Test""#;
+
+        let result = ProtoBeliefNode::from_str_with_format(toml_content, MetadataFormat::Toml);
+        assert!(result.is_ok());
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("title").and_then(|v| v.as_str()),
+            Some("TOML Test")
+        );
+    }
+
+    #[test]
+    fn test_json_to_toml_conversion() {
+        let json_value = serde_json::json!({
+            "string": "hello",
+            "number": 42,
+            "float": 3.0123,
+            "bool": true,
+            "array": [1, 2, 3],
+            "null": null
+        });
+
+        let toml_value = json_value_to_toml_value(&json_value);
+        assert!(toml_value.is_ok());
+
+        let toml = toml_value.unwrap();
+        assert_eq!(toml.get("string").and_then(|v| v.as_str()), Some("hello"));
+        assert_eq!(toml.get("number").and_then(|v| v.as_integer()), Some(42));
+        assert_eq!(toml.get("bool").and_then(|v| v.as_bool()), Some(true));
+        // null values are skipped in TOML (TOML doesn't support null)
+        assert_eq!(toml.get("null"), None);
+    }
+
+    #[test]
+    fn test_network_config_extraction() {
+        let toml_str = r#"
+bid = "12345678-1234-1234-1234-123456789abc"
+schema = "noet.network_config"
+
+[config]
+default_metadata_format = "toml"
+strict_format = true
+validate_on_parse = false
+auto_normalize = true
+"#;
+
+        let document = toml_str.parse::<DocumentMut>().unwrap();
+        let config = NetworkConfig::from_document(&document);
+
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert_eq!(config.default_metadata_format, MetadataFormat::Toml);
+        assert!(config.strict_format);
+        assert!(!config.validate_on_parse);
+        assert!(config.auto_normalize);
+    }
+
+    #[test]
+    fn test_network_config_defaults() {
+        let toml_str = r#"
+bid = "12345678-1234-1234-1234-123456789abc"
+schema = "noet.network_config"
+
+[config]
+"#;
+
+        let document = toml_str.parse::<DocumentMut>().unwrap();
+        let config = NetworkConfig::from_document(&document);
+
+        assert!(config.is_some());
+        let config = config.unwrap();
+        // Should use defaults
+        assert_eq!(config.default_metadata_format, MetadataFormat::Json);
+        assert!(!config.strict_format);
+        assert!(config.validate_on_parse);
+        assert!(config.auto_normalize);
+    }
+
+    #[test]
+    fn test_detect_network_file_json() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let json_path = temp_dir.path().join("BeliefNetwork.json");
+        fs::write(&json_path, r#"{"bid": "test"}"#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, json_path);
+        assert_eq!(format, MetadataFormat::Json);
+    }
+
+    #[test]
+    fn test_detect_network_file_toml() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+        fs::write(&toml_path, r#"bid = "test""#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, toml_path);
+        assert_eq!(format, MetadataFormat::Toml);
+    }
+
+    #[test]
+    fn test_detect_network_file_prefers_json() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let json_path = temp_dir.path().join("BeliefNetwork.json");
+        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+
+        fs::write(&json_path, r#"{"bid": "json"}"#).unwrap();
+        fs::write(&toml_path, r#"bid = "toml""#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, json_path, "Should prefer JSON when both exist");
+        assert_eq!(format, MetadataFormat::Json);
+    }
+
+    #[test]
+    fn test_parse_fallback_both_formats_invalid() {
+        let invalid_content = "this is not valid JSON or TOML {]";
+
+        let result = ProtoBeliefNode::from_str(invalid_content);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_msg = format!("{err}");
+        assert!(err_msg.contains("JSON") || err_msg.contains("json"));
+        assert!(err_msg.contains("TOML") || err_msg.contains("toml"));
     }
 }

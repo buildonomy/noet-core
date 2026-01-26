@@ -26,7 +26,6 @@ use sqlx::{
     Error as SqlxError,
 };
 
-#[cfg(feature = "service")]
 use serde_json::Error as JsonError;
 
 #[cfg(feature = "wasm")]
@@ -104,7 +103,6 @@ impl From<toml::ser::Error> for BuildonomyError {
     }
 }
 
-#[cfg(feature = "service")]
 impl From<JsonError> for BuildonomyError {
     fn from(src: JsonError) -> BuildonomyError {
         BuildonomyError::Serialization(format!("JSON (de)serialization error: {src}"))

@@ -33,7 +33,7 @@ pulldown-cmark = { version = "0.13.0" }
 pulldown-cmark-to-cmark = { git = "https://github.com/alyjak/pulldown-cmark-to-cmark.git", branch = "upgrade_to_cmark_v0.13" }
 reactive_stores = { version = "0.1.0" }
 regex = "1.10.5"
-serde_json = { version = "1.0.117", optional = true }
+serde_json = "1.0.117"
 serde-wasm-bindgen = { version = "0.6", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 sqlx = { version = "0.8", features = [
@@ -68,7 +68,7 @@ trybuild = "1.0"
 [features]
 default = ["bin"]
 bin = ["service", "clap", "ctrlc", "tracing-subscriber"]
-service = ["notify", "serde_json", "sqlx", "dep:notify-debouncer-full", "dep:futures-core"]
+service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core"]
 wasm = ["serde-wasm-bindgen", "uuid/js"]
 
 [[bin]]

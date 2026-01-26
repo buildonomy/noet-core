@@ -15,8 +15,8 @@ use toml::value::Table as TomlTable;
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
     codec::{
+        belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
         diagnostic::ParseDiagnostic,
-        lattice_toml::{ProtoBeliefNode, NETWORK_CONFIG_NAME},
         CODECS,
     },
     error::BuildonomyError,
@@ -138,10 +138,14 @@ impl GraphBuilder {
             false => {
                 let invalid_err = BuildonomyError::Codec(format!(
                     "GraphBuilder initialization failed. Received root path {repo_root:?}. \
-                     Expected a directory or path to a {NETWORK_CONFIG_NAME} file"
+                     Expected a directory or path to a BeliefNetwork.json or BeliefNetwork.toml file"
                 ));
                 if let Some(path_name) = repo_root.file_name() {
-                    if path_name.to_string_lossy()[..] == NETWORK_CONFIG_NAME[..] {
+                    let file_name_str = path_name.to_string_lossy();
+                    if NETWORK_CONFIG_NAMES
+                        .iter()
+                        .any(|&name| name == file_name_str.as_ref())
+                    {
                         repo_root.pop();
                         Ok(())
                     } else {
@@ -267,7 +271,13 @@ impl GraphBuilder {
         let mut diagnostics = Vec::<ParseDiagnostic>::new();
 
         if input_path.as_ref().is_dir() {
-            full_path.push(NETWORK_CONFIG_NAME);
+            // Detect network file (JSON or TOML)
+            if let Some((detected_path, _format)) = detect_network_file(&full_path) {
+                full_path = detected_path;
+            } else {
+                // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                full_path.push(NETWORK_CONFIG_NAMES[0]);
+            }
         }
         let file_err = BuildonomyError::Codec(format!(
             "Cannot parse {full_path:?}. Path has no extention type",
@@ -545,12 +555,18 @@ impl GraphBuilder {
         let mut parent_path = PathBuf::from(&initial.path);
         let mut parent_path_stack: Vec<PathBuf> = Vec::default();
         // If path is a sub-network node, dont count self path as a parent path
-        if parent_path.ends_with(NETWORK_CONFIG_NAME) {
-            parent_path.pop();
+        if let Some(file_name) = parent_path.file_name() {
+            let file_name_str = file_name.to_string_lossy();
+            if NETWORK_CONFIG_NAMES
+                .iter()
+                .any(|&name| name == file_name_str.as_ref())
+            {
+                parent_path.pop();
+            }
         }
         while parent_path.pop() {
-            let parent_yaml = self.repo_root.join(&parent_path).join(NETWORK_CONFIG_NAME);
-            if parent_yaml.is_file() {
+            // Check for either JSON or TOML network file
+            if detect_network_file(&self.repo_root.join(&parent_path)).is_some() {
                 parent_path_stack.push(parent_path.clone());
             }
         }

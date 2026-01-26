@@ -122,5 +122,5 @@ struct SectionMetadata {
 ## References
 
 - Current parser: `codec/md.rs`
-- TOML parsing: `codec/lattice_toml.rs`
+- TOML parsing: `codec/belief_ir.rs`
 - Schema migration: `utilities/schema_migration_notes.md`

@@ -146,7 +146,7 @@ tokio = { version = "1.40", features = ["fs", "rt-multi-thread"] }
 ### Part 4: Issue Creation
 
 #### 4.1 Created Issue 19: File Watcher Timing Bug
-**File**: `docs/project/ISSUE_19_FILE_WATCHER_TIMING_BUG.md` (310 lines)
+**File**: `docs/project/ISSUE_19_FILE_WATCHER_TIMING_BUG.md` (310 lines) - Consolidated into 
 
 **Problem**: Integration test receives 0 events after 7-second wait
 **Concern**: Real bug (not test flakiness) - may break `noet watch` CLI

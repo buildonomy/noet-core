@@ -11,7 +11,10 @@ use toml::from_str;
 
 use noet_core::{
     beliefbase::BeliefBase,
-    codec::{lattice_toml::NETWORK_CONFIG_NAME, DocumentCompiler, CODECS},
+    codec::{
+        belief_ir::{detect_network_file, NETWORK_CONFIG_NAMES},
+        DocumentCompiler, CODECS,
+    },
     error::BuildonomyError,
     event::BeliefEvent,
     properties::Bid,
@@ -107,7 +110,13 @@ async fn test_belief_set_builder_bid_generation_and_caching(
         if let Some(rewrite_content) = parse_result.rewritten_content {
             let mut write_path = parse_result.path.clone();
             if write_path.is_dir() {
-                write_path.push(NETWORK_CONFIG_NAME);
+                // Detect network file (JSON or TOML)
+                if let Some((detected_path, _format)) = detect_network_file(&write_path) {
+                    write_path = detected_path;
+                } else {
+                    // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                    write_path.push(NETWORK_CONFIG_NAMES[0]);
+                }
             }
             *doc_entry += 1;
             written_bids.append(&mut BTreeSet::from_iter(

@@ -96,6 +96,12 @@
   - Parse NodeKey link attributes
   - Auto-update paths when targets move
 
+- **[Issue 21: JSON/TOML Dual-Format Support](./ISSUE_21_JSON_FALLBACK_PARSING.md)** (3-4 days, MEDIUM)
+  - JSON as default format (cross-platform compatibility)
+  - Support both BeliefNetwork.json and BeliefNetwork.toml
+  - Network configuration schema for repo-wide format preferences
+  - Bidirectional JSON/TOML conversion for uniform handling
+
 - **[Issue 13: HTML CLI Integration](./ISSUE_13_HTML_CLI_INTEGRATION.md)** (2-3 days)
   - Add `--html <output_dir>` to `noet parse` and `noet watch`
   - Integrate HTML generation into FileUpdateSyncer
@@ -341,6 +347,7 @@ Issues are numbered sequentially and tracked in `docs/project/ISSUE_XX_*.md`:
 - **Issue 5**: Documentation - ✅ COMPLETE (Stage 1: 2025-01-18, Stage 2: 2025-01-24)
 - **Issue 10**: Daemon Testing - ✅ COMPLETE (2025-01-24)
 - **Issue 19**: File Watcher Timing Bug Investigation (HIGH PRIORITY) - Created 2025-01-24
+- **Issue 20**: CLI Write-Back Support - ✅ COMPLETE (2025-01-26)
 - **Issues 1-4**: HTML Rendering (Phase 2 of v0.1.0)
 - **Issue 6**: HTML Generation basics
 - **Issue 13**: HTML CLI Integration (integrates Issues 6 + 10)
@@ -485,3 +492,5 @@ When creating a new issue:
 - **2025-01-24**: Completed Issue 5 Stage 2 (WatchService tutorial from Issue 10)
 - **2025-01-24**: Completed Issue 10 (tutorial docs, integration tests, example created)
 - **2025-01-24**: Created Issue 19 (File Watcher Timing Bug - HIGH PRIORITY)
+- **2025-01-24**: Created Issue 20 (CLI Write-Back Support - extends Issue 10 CLI functionality)
+- **2025-01-26**: Completed Issue 20 (CLI Write-Back Support)
