@@ -264,7 +264,8 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     assert!(intro_node.is_some(), "Should find Introduction node");
     let intro_node = intro_node.unwrap();
 
-    // TODO: After Issue 02 implementation, verify enriched metadata:
+    // TODO: After Issue 03 implementation (anchor parsing), verify enriched metadata:
+    // BID matching requires parsing {#bid://...} syntax from heading text
     // assert_eq!(intro_node.payload.get("complexity").and_then(|v| v.as_str()), Some("high"));
     // assert_eq!(intro_node.payload.get("priority").and_then(|v| v.as_integer()), Some(1));
     tracing::info!(
@@ -281,7 +282,8 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     assert!(background_node.is_some(), "Should find Background node");
     let background_node = background_node.unwrap();
 
-    // TODO: After Issue 02 implementation, verify enriched metadata:
+    // TODO: After Issue 03 implementation (anchor parsing), verify enriched metadata:
+    // Anchor matching requires parsing {#background} syntax from heading text
     // assert_eq!(background_node.payload.get("complexity").and_then(|v| v.as_str()), Some("medium"));
     // assert_eq!(background_node.payload.get("priority").and_then(|v| v.as_integer()), Some(2));
     tracing::info!(
@@ -298,9 +300,20 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     assert!(api_node.is_some(), "Should find API Reference node");
     let api_node = api_node.unwrap();
 
-    // TODO: After Issue 02 implementation, verify enriched metadata:
-    // assert_eq!(api_node.payload.get("complexity").and_then(|v| v.as_str()), Some("low"));
-    // assert_eq!(api_node.payload.get("priority").and_then(|v| v.as_integer()), Some(3));
+    // Issue 02 IMPLEMENTED: Title matching works now! Verify enriched metadata:
+    assert_eq!(
+        api_node.payload.get("complexity").and_then(|v| v.as_str()),
+        Some("low"),
+        "API Reference should have complexity='low' from sections metadata"
+    );
+    assert_eq!(
+        api_node
+            .payload
+            .get("priority")
+            .and_then(|v| v.as_integer()),
+        Some(3),
+        "API Reference should have priority=3 from sections metadata"
+    );
     tracing::info!(
         "API Reference node: bid={}, title={}, payload={:?}",
         api_node.bid,
@@ -318,12 +331,11 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     );
     let untracked_node = untracked_node.unwrap();
 
-    // TODO: After Issue 02 implementation, verify:
-    // - Node exists (created from markdown heading)
-    // - Has auto-generated ID: "untracked-section" (via to_anchor)
-    // - Gets sections entry ADDED to frontmatter with auto-generated ID
-    // - Initially has no custom metadata (no complexity field from frontmatter)
-    // But after implementation, frontmatter will be updated to include this section
+    // Issue 02 IMPLEMENTED: Node exists (markdown defines structure)
+    // Initially has no custom metadata (no pre-defined sections entry)
+    // TODO: After full Issue 02 + auto-generation feature:
+    // - Verify auto-generated ID: "untracked-section" (via to_anchor)
+    // - Verify sections entry was ADDED to frontmatter during finalize()
     tracing::info!(
         "Untracked Section node: bid={}, title={}, payload={:?}",
         untracked_node.bid,
@@ -368,10 +380,9 @@ async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Er
         if let Some(ref rewritten) = result.rewritten_content {
             tracing::info!("sections_test.md was rewritten by finalize()");
 
-            // TODO: After Issue 02 implementation, verify:
-            // - "unmatched" section was REMOVED (garbage collected)
-            // - "untracked-section" was ADDED (auto-generated ID for new heading)
-            // - Other sections (matched ones) were preserved
+            // Issue 02 IMPLEMENTED: finalize() performs garbage collection
+            // Verify "unmatched" section was REMOVED (no matching heading)
+            // Other matched sections should be preserved
             tracing::info!("Rewritten content length: {}", rewritten.len());
 
             // Check that "unmatched" is NOT in the rewritten frontmatter
@@ -381,8 +392,12 @@ async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Er
             // Check that "untracked-section" IS in the rewritten frontmatter
             let has_untracked = rewritten.contains("untracked-section");
 
-            // TODO: After implementation, verify:
-            // assert!(!has_unmatched, "Unmatched section should be garbage collected");
+            // Issue 02 IMPLEMENTED: Verify garbage collection worked
+            assert!(
+                !has_unmatched,
+                "Unmatched section should be garbage collected by finalize()"
+            );
+            // TODO: Auto-generation of sections entries for new headings (future enhancement)
             // assert!(has_untracked, "New heading should get sections entry added");
             tracing::info!("Frontmatter contains 'unmatched': {}", has_unmatched);
             tracing::info!(
@@ -421,11 +436,12 @@ async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Err
         .find(|n| n.title.contains("Introduction"));
 
     if let Some(node) = intro_node {
-        // TODO: After Issue 02 implementation, verify it matched by BID:
+        // TODO: After Issue 03 (anchor parsing), verify it matched by BID:
+        // BID matching requires parsing {#bid://...} syntax from heading text
         // - Should have complexity="high" (from BID match)
         // - NOT complexity from any other potential match
         tracing::info!(
-            "Introduction matched. Expected BID match with complexity=high. Got: {:?}",
+            "Introduction node. Expected BID match (after Issue 03). Got: {:?}",
             node.payload.get("complexity")
         );
     }
@@ -437,10 +453,11 @@ async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Err
         .find(|n| n.title.contains("Background"));
 
     if let Some(node) = background_node {
-        // TODO: After Issue 02 implementation, verify it matched by anchor:
+        // TODO: After Issue 03 (anchor parsing), verify it matched by anchor:
+        // Anchor matching requires parsing {#background} syntax from heading text
         // - Should have complexity="medium" (from anchor match)
         tracing::info!(
-            "Background matched. Expected anchor match with complexity=medium. Got: {:?}",
+            "Background node. Expected anchor match (after Issue 03). Got: {:?}",
             node.payload.get("complexity")
         );
     }
@@ -452,10 +469,14 @@ async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Err
         .find(|n| n.title.contains("API Reference"));
 
     if let Some(node) = api_node {
-        // TODO: After Issue 02 implementation, verify it matched by title:
-        // - Should have complexity="low" (from title match)
+        // Issue 02 IMPLEMENTED: Title matching works!
+        assert_eq!(
+            node.payload.get("complexity").and_then(|v| v.as_str()),
+            Some("low"),
+            "API Reference should match by title with complexity='low'"
+        );
         tracing::info!(
-            "API Reference matched. Expected title match with complexity=low. Got: {:?}",
+            "API Reference matched by title with complexity=low: {:?}",
             node.payload.get("complexity")
         );
     }

@@ -6,7 +6,12 @@ use pulldown_cmark_to_cmark::{
     cmark_resume_with_source_range_and_options, Options as CmarkToCmarkOptions,
 };
 use std::{
-    borrow::Borrow, collections::VecDeque, mem::replace, ops::Range, result::Result, str::FromStr,
+    borrow::Borrow,
+    collections::{HashMap, HashSet, VecDeque},
+    mem::replace,
+    ops::Range,
+    result::Result,
+    str::FromStr,
 };
 /// Utilities for parsing various document types into BeliefBases
 use toml_edit::value;
@@ -18,8 +23,8 @@ use crate::{
         DocCodec,
     },
     error::BuildonomyError,
-    nodekey::{href_to_nodekey, NodeKey},
-    properties::{BeliefNode, Weight, WeightKind},
+    nodekey::{href_to_nodekey, to_anchor, NodeKey},
+    properties::{BeliefNode, Bid, Weight, WeightKind},
 };
 
 pub use pulldown_cmark;
@@ -441,16 +446,118 @@ fn update_or_insert_frontmatter(
     Ok(changed)
 }
 
+/// Parse sections field from frontmatter into flat metadata map.
+/// Returns HashMap<NodeKey, TomlTable> for matching against heading nodes.
+fn parse_sections_metadata(sections: &toml_edit::Item) -> HashMap<NodeKey, toml_edit::Table> {
+    let mut metadata = HashMap::new();
+
+    if let Some(table) = sections.as_table() {
+        for (key_str, value) in table.iter() {
+            // Parse key as NodeKey
+            if let Ok(node_key) = NodeKey::from_str(key_str) {
+                // Extract value as TomlTable
+                if let Some(value_table) = value.as_table() {
+                    metadata.insert(node_key, value_table.clone());
+                }
+            }
+        }
+    }
+
+    metadata
+}
+
+/// Extract anchor from heading node (e.g., {#intro} syntax).
+/// Returns the anchor ID without the '#' prefix.
+///
+/// TODO: This is a placeholder until Issue 3 implements anchor parsing.
+/// Currently checks for "anchor" or "id" fields in the document.
+fn extract_anchor_from_node(node: &ProtoBeliefNode) -> Option<String> {
+    node.document
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            node.document
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
+///
+/// Returns a reference to the matching metadata table if found.
+fn find_metadata_match<'a>(
+    node: &ProtoBeliefNode,
+    metadata: &'a HashMap<NodeKey, toml_edit::Table>,
+) -> Option<(NodeKey, &'a toml_edit::Table)> {
+    // Priority 1: Match by BID (most explicit)
+    if let Some(bid_value) = node.document.get("bid") {
+        if let Some(bid_str) = bid_value.as_str() {
+            if let Ok(bid) = Bid::try_from(bid_str) {
+                let bid_key = NodeKey::Bid { bid };
+                if let Some(meta) = metadata.get(&bid_key) {
+                    return Some((bid_key, meta));
+                }
+            }
+        }
+    }
+
+    // Priority 2: Match by anchor (medium specificity)
+    if let Some(anchor) = extract_anchor_from_node(node) {
+        // Try as Id variant (anchors are IDs within a document)
+        let anchor_key = NodeKey::Id {
+            net: Bid::nil(),
+            id: anchor.clone(),
+        };
+        if let Some(meta) = metadata.get(&anchor_key) {
+            return Some((anchor_key, meta));
+        }
+    }
+
+    // Priority 3: Match by title anchor (least specific)
+    // Use Id variant since titles are only guaranteed unique for documents
+    if let Some(title_value) = node.document.get("title") {
+        if let Some(title) = title_value.as_str() {
+            let anchor = to_anchor(title);
+            let id_key = NodeKey::Id {
+                net: Bid::nil(),
+                id: anchor,
+            };
+            if let Some(meta) = metadata.get(&id_key) {
+                return Some((id_key, meta));
+            }
+        }
+    }
+
+    None
+}
+
+/// Merge metadata from a TomlTable into a ProtoBeliefNode's document.
+/// Preserves existing fields, adds new fields from metadata.
+fn merge_metadata_into_node(node: &mut ProtoBeliefNode, metadata: &toml_edit::Table) {
+    for (key, value) in metadata.iter() {
+        // Don't overwrite existing fields in the node
+        if !node.document.contains_key(key) {
+            node.document.insert(key, value.clone());
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MdCodec {
     current_events: Vec<ProtoNodeWithEvents>,
     content: String,
+    /// Track which section keys have been matched during inject_context phase
+    matched_sections: HashSet<NodeKey>,
 }
 
 impl MdCodec {
     pub fn new() -> Self {
         MdCodec {
-            ..Default::default()
+            current_events: Vec::new(),
+            content: String::new(),
+            matched_sections: HashSet::new(),
         }
     }
 
@@ -535,6 +642,17 @@ impl DocCodec for MdCodec {
         node: &ProtoBeliefNode,
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
+        // Phase 2: Section Metadata Enrichment ("Look Up" Pattern)
+        // Extract sections metadata BEFORE taking mutable borrow
+        let sections_metadata = if node.heading > 2 {
+            self.current_events
+                .first()
+                .and_then(|doc_node| doc_node.0.document.get("sections"))
+                .map(parse_sections_metadata)
+        } else {
+            None
+        };
+
         let proto_events = self
             .current_events
             .iter_mut()
@@ -548,7 +666,35 @@ impl DocCodec for MdCodec {
         let mut current_events = std::mem::take(&mut proto_events.1);
 
         let frontmatter_changed = proto_events.0.update_from_context(ctx)?;
-        if frontmatter_changed.is_some() {
+
+        // Apply section metadata matching if we extracted it
+        let mut sections_metadata_merged = false;
+        if let Some(sections_map) = sections_metadata {
+            // Try to find a match using priority: BID > Anchor > Title
+            if let Some((matched_key, metadata_table)) =
+                find_metadata_match(&proto_events.0, &sections_map)
+            {
+                // Track that we matched this key
+                self.matched_sections.insert(matched_key.clone());
+
+                // Merge metadata into the heading node
+                merge_metadata_into_node(&mut proto_events.0, metadata_table);
+                sections_metadata_merged = true;
+
+                tracing::debug!(
+                    "Matched heading '{}' to section metadata via key: {:?}",
+                    proto_events
+                        .0
+                        .document
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<untitled>"),
+                    matched_key
+                );
+            }
+        }
+
+        if frontmatter_changed.is_some() || sections_metadata_merged {
             let metadata_string = if current_events
                 .iter()
                 .any(|e| matches!(e.0, MdEvent::Start(MdTag::Heading { .. })))
@@ -562,26 +708,53 @@ impl DocCodec for MdCodec {
 
         let link_changed =
             check_for_link_and_push(&mut current_events, ctx, &mut proto_events.1, None);
-        let maybe_text = if frontmatter_changed.is_some() || link_changed {
-            if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
-                Self::events_to_text(
-                    &self.content,
-                    proto_events.1.iter().skip(start_idx).cloned(),
-                )
+        let maybe_text =
+            if frontmatter_changed.is_some() || sections_metadata_merged || link_changed {
+                if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
+                    Self::events_to_text(
+                        &self.content,
+                        proto_events.1.iter().skip(start_idx).cloned(),
+                    )
+                } else {
+                    Self::events_to_text(&self.content, proto_events.1.iter().cloned())
+                }
             } else {
-                Self::events_to_text(&self.content, proto_events.1.iter().cloned())
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         if let Some(text) = maybe_text {
             proto_events.0.document.insert("text", value(text.clone()));
-            let mut new_node = frontmatter_changed.unwrap_or(ctx.node.clone());
-            new_node
+            // If sections metadata was merged OR frontmatter changed, create new node from proto
+            // This ensures we capture both context updates AND sections metadata
+            let new_node = if sections_metadata_merged || frontmatter_changed.is_some() {
+                match BeliefNode::try_from(&proto_events.0) {
+                    Ok(node) => node,
+                    Err(e) => {
+                        tracing::warn!("Failed to convert updated proto to BeliefNode: {:?}", e);
+                        frontmatter_changed.unwrap_or(ctx.node.clone())
+                    }
+                }
+            } else {
+                frontmatter_changed.unwrap_or(ctx.node.clone())
+            };
+            let mut new_node_with_text = new_node;
+            new_node_with_text
                 .payload
                 .insert("text".to_string(), toml::Value::String(text));
-            Ok(Some(new_node))
+            Ok(Some(new_node_with_text))
+        } else if sections_metadata_merged || frontmatter_changed.is_some() {
+            // No text regeneration needed, but metadata was merged or context changed
+            // Create new BeliefNode from the updated ProtoBeliefNode
+            match BeliefNode::try_from(&proto_events.0) {
+                Ok(new_node) => Ok(Some(new_node)),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to convert proto with merged metadata to BeliefNode: {:?}",
+                        e
+                    );
+                    Ok(frontmatter_changed)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -595,6 +768,72 @@ impl DocCodec for MdCodec {
         Self::events_to_text(&self.content, events)
     }
 
+    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+        let mut modified_nodes = Vec::new();
+
+        // Access document node (always at index 0) to check for unmatched sections
+        if let Some(doc_proto) = self.current_events.first_mut() {
+            if let Some(sections_item) = doc_proto.0.document.get("sections") {
+                // Collect all section keys from the frontmatter (both NodeKey and original string)
+                let mut all_section_keys = HashMap::new();
+                if let Some(table) = sections_item.as_table() {
+                    for (key_str, _) in table.iter() {
+                        if let Ok(node_key) = NodeKey::from_str(key_str) {
+                            all_section_keys.insert(node_key, key_str.to_string());
+                        }
+                    }
+                }
+
+                // Calculate unmatched sections (keys in frontmatter but not matched to headings)
+                let unmatched: Vec<(NodeKey, String)> = all_section_keys
+                    .iter()
+                    .filter(|(node_key, _)| !self.matched_sections.contains(node_key))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Log and remove unmatched sections (garbage collection)
+                if !unmatched.is_empty() {
+                    for (unmatched_key, _) in &unmatched {
+                        tracing::info!(
+                            "Garbage collecting unmatched section (heading removed from markdown): {:?}",
+                            unmatched_key
+                        );
+                    }
+
+                    // Remove unmatched sections from the document's sections table
+                    // Use the original TOML key string, not NodeKey::to_string()
+                    if let Some(sections_table) = doc_proto.0.document.get_mut("sections") {
+                        if let Some(table) = sections_table.as_table_mut() {
+                            for (_unmatched_key, original_key_str) in &unmatched {
+                                table.remove(original_key_str);
+                            }
+                        }
+                    }
+
+                    // Update the frontmatter events with the modified document
+                    let metadata_string = doc_proto.0.as_frontmatter();
+                    update_or_insert_frontmatter(&mut doc_proto.1, &metadata_string)?;
+
+                    // Document was modified, need to create updated BeliefNode
+                    // Convert ProtoBeliefNode to BeliefNode for the modified document
+                    match BeliefNode::try_from(&doc_proto.0) {
+                        Ok(updated_node) => {
+                            modified_nodes.push((doc_proto.0.clone(), updated_node));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to convert modified document node to BeliefNode: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(modified_nodes)
+    }
+
     fn parse(
         &mut self,
         content: String,
@@ -603,6 +842,7 @@ impl DocCodec for MdCodec {
         // Initial parse and format to try and make pulldown_cmark <-> pulldown_cmark_to_cmark idempotent
         self.content = content;
         self.current_events = Vec::default();
+        self.matched_sections.clear();
         if let Some(schema) = detect_schema_from_path(&current.path) {
             if current.document.get("schema").is_none() {
                 current.document.insert("schema", value(schema));
