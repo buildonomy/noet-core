@@ -2,10 +2,7 @@
 bid = "10000000-0000-0000-0000-000000000001"
 schema = "Document"
 
-[sections."bid://20000000-0000-0000-0000-000000000002"]
-schema = "Section"
-complexity = "high"
-priority = 1
+
 
 [sections."id://background"]
 schema = "Section"
@@ -27,29 +24,37 @@ note = "This section has no matching heading - should be logged as info"
 
 This document tests the sections metadata enrichment feature (Issue 02).
 
-## Introduction {#bid://20000000-0000-0000-0000-000000000002}
+## Introduction
 
-This section should match by BID (highest priority).
+This section has no sections entry, so it gets default metadata only.
 
-The frontmatter has: `sections."bid://20000000-0000-0000-0000-000000000002"`
-This heading has the BID anchor `{#bid://20000000-0000-0000-0000-000000000002}` which should match.
-This should be enriched with `complexity = "high"` and `priority = 1`.
+BID matching is possible by including a sections entry like:
+`[sections."bid://12345678-90ab-cdef-1234-567890abcdef"]`
+
+However, heading BIDs are auto-generated during parsing, so we can't predict them
+in a static test fixture. BID matching is better tested with dynamic tests that
+capture the actual BID after parsing.
+
+This test focuses on ID (anchor) and Title matching, which we CAN control.
 
 ## Background {#background}
 
-This section should match by anchor (medium priority).
+This section matches by ID anchor (high priority after BID).
 
+The markdown has: `{#background}` anchor
 The frontmatter has: `sections."id://background"`
-The anchor `{#background}` should match to the NodeKey::Id("background").
+Issue 03 parses the anchor and stores it in the node's `id` field.
+Issue 02 matches via NodeKey::Id { net, id: "background" }.
 This should be enriched with `complexity = "medium"` and `priority = 2`.
 
 ## API Reference
 
-This section should match by title anchor (lowest priority).
+This section matches by title normalization (same priority as ID when no explicit anchor).
 
+The title "API Reference" normalizes via to_anchor() to "api-reference".
 The frontmatter has: `sections."id://api-reference"`
-The title "API Reference" → to_anchor("API Reference") = "api-reference" should match.
-Since sections are not guaranteed unique titles, we use NodeKey::Id for matching.
+Issue 03 auto-generates the ID from the title (no explicit anchor).
+Issue 02 matches via NodeKey::Id { net, id: "api-reference" }.
 This should be enriched with `complexity = "low"` and `priority = 3`.
 
 ## Untracked Section

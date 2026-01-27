@@ -50,25 +50,51 @@ Like a traditional compiler, noet-core handles forward references and circular d
 
 This means you can reference documents before they're parsed - the system figures it out automatically.
 
-### 4. BID: Stable Identity
+### 4. Node Identity: BID and Multi-ID Triangulation
 
-Every node gets a **Bid** (Belief ID) - a UUID injected into the source document:
+Every node can be referenced through **multiple identity types** working together:
 
-```toml
-# Before first parse (user-authored)
-id = "my_document"
-title = "My Document"
-
-# After compilation (BID injected by system)
-bid = "01234567-89ab-cdef-0123-456789abcdef"
-id = "my_document"
-title = "My Document"
+```rust
+pub enum NodeKey {
+    Bid { bid: Bid },                    // Globally unique UUIDv6
+    Bref { bref: Bref },                 // 12-char compact reference
+    Id { net: Bid, id: String },         // User-defined semantic ID
+    Title { net: Bid, title: String },   // Auto-generated from title
+    Path { net: Bid, path: String },     // Filesystem location
+}
 ```
 
-**Why BIDs matter**:
-- **Stable references**: Links survive file renames/moves
-- **Cross-network merging**: Combine graphs without ID collisions
-- **Distributed collaboration**: Unique IDs across all users
+**Why multiple IDs?**
+
+Each identity type serves different needs:
+
+- **BID**: Globally unique UUIDv6 that survives all changes (renames, moves, title edits)
+- **Bref**: Compact 12-char reference for links (derived from BID)
+- **ID**: Optional user-defined identifier (e.g., `{#intro}` in markdown headings)
+- **Title**: Auto-generated anchor from heading text
+- **Path**: Filesystem location (changes on move)
+
+**Example: BID injection lifecycle**
+```toml
+# Before: user creates file
+title = "My Document"
+
+# After: BID injected by system
+bid = "01234567-89ab-cdef-0123-456789abcdef"
+title = "My Document"
+
+# Later: title changes, BID stays same
+bid = "01234567-89ab-cdef-0123-456789abcdef"  # Stable!
+title = "Updated Document"
+```
+
+**Benefits**:
+- **Stable references**: Links survive file renames/moves (BID-based)
+- **User control**: Optional explicit IDs for semantic anchors
+- **Collision handling**: Automatic Bref fallback for duplicate titles
+- **Distributed sync**: No ID collisions across devices
+
+**For detailed specifications** including collision detection, normalization rules, and implementation details, see [`design/beliefbase_architecture.md` § 2.2](./design/beliefbase_architecture.md#22-identity-management-bid-bref-and-nodekey).
 
 ### 5. Relationship Types (WeightKind)
 

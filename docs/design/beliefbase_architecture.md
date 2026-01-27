@@ -57,28 +57,315 @@ Each stage has distinct responsibilities:
 
 ### 2.2. Identity Management: BID, Bref, and NodeKey
 
-The system maintains three parallel identity schemes to handle the complexity of distributed, evolving documents:
+noet-core implements **multi-ID triangulation** - the same node can be referenced through multiple identity types, each serving different purposes. This enables robust references that survive structural changes while supporting user-friendly semantic identifiers.
 
-**Bid (Belief ID):**
-- A UUID-like globally unique identifier
-- Persisted in source files (TOML frontmatter `bid` field)
-- Primary key for graph nodes
-- Stable across file renames, moves, and content changes
+#### Identity Types
 
-**Bref (Belief Reference):**
-- A human-readable namespace derived from the BID (e.g., first 8 characters)
-- Used for compact display and logging
+Every node in the system can be referenced through five **NodeKey** variants:
+
+```rust
+pub enum NodeKey {
+    Bid { bid: Bid },                    // Globally unique UUID (primary key)
+    Bref { bref: Bref },                 // 12-char hex compact reference
+    Id { net: Bid, id: String },         // User-defined semantic ID
+    Title { net: Bid, title: String },   // Auto-generated from heading text
+    Path { net: Bid, path: String },     // Filesystem location
+}
+```
+
+**Implementation**: `src/nodekey.rs`, `src/properties.rs:871-923` (BeliefNode::keys())
+
+##### 1. BID (Belief ID) - System-Generated Stable Identity
+
+**Purpose**: Primary key for nodes, globally unique, survives all content changes
+
+**Properties**:
+- UUIDv6 format: `01234567-89ab-cdef-0123-456789abcdef`
+- Injected automatically during first parse
+- Written to source file frontmatter (`bid = "..."`)
+- Never changes once assigned
+- Includes namespace hierarchy for distributed generation (namespace derived via UUIDv5)
+
+**Generation**: `src/properties.rs:138-141` (Bid::new uses `Uuid::now_v6()`), `src/properties.rs:117-122` (namespace via `Uuid::new_v5()`)
+
+**Example lifecycle**:
+```toml
+# Before first parse (user-authored)
+title = "My Document"
+
+# After first parse (BID injected)
+bid = "01234567-89ab-cdef-0123-456789abcdef"
+title = "My Document"
+
+# After title change (BID stable)
+bid = "01234567-89ab-cdef-0123-456789abcdef"  # Same!
+title = "Updated Document Title"
+```
+
+**Why UUIDv6**: Time-ordered for efficient database indexing, includes namespace bytes for hierarchical distributed generation without central coordination. Namespace generation uses UUIDv5 for deterministic derivation from parent BIDs.
+
+##### 2. Bref (Belief Reference) - Compact Display Form
+
+**Purpose**: Human-readable compact reference for links and logging
+
+**Properties**:
+- 12 hexadecimal characters: `a1b2c3d4e5f6`
+- Derived from BID's namespace bytes (last 48 bits)
+- Used in markdown links: `[text](doc.md#a1b2c3d4e5f6)`
+- Collision probability ~1 in 281 trillion within same namespace
 - Maps to BID via `brefs: BTreeMap<Bref, Bid>` in BeliefBase
 
-**NodeKey:**
-- A polymorphic reference type used during parsing and linking
-- Can represent:
-  - `Bid { bid: Bid }` - Direct reference to a node
-  - `Id { id: String, net: Bid }` - Human-readable ID within a network
-  - `Path { ... }` - File system path reference
-  - `UnresolvedRef { href: String }` - Deferred resolution (future enhancement)
+**Generation**: `src/properties.rs:167-176` (Bid::namespace)
 
-The `IdMap` (beliefbase.rs:617-657) and `PathMapMap` structures maintain bidirectional mappings between these identity schemes, enabling fast lookups in either direction.
+**Usage in links**:
+```markdown
+# Document A
+See [[a1b2c3d4e5f6]] for details.
+
+# Link survives even if target file is renamed or moved!
+```
+
+##### 3. ID - User-Defined Semantic Identifier
+
+**Purpose**: Optional user-controlled identifier with semantic meaning
+
+**Properties**:
+- Specified in frontmatter: `id = "introduction"`
+- For markdown headings: `## Introduction {#introduction}`
+- Normalized to HTML-safe anchors (lowercase, hyphens for spaces)
+- Scoped to network (namespace) to prevent collisions
+- Optional - not all nodes have explicit IDs
+
+**Normalization**: `src/nodekey.rs:to_anchor()` function
+- Lowercase: `Section` → `section`
+- Spaces to hyphens: `Getting Started` → `getting-started`
+- Strip special chars: `API & Reference!` → `api--reference`
+
+**Example**:
+```markdown
+## Introduction {#intro}
+Content here...
+
+## Getting Started
+Content here (auto-generates #getting-started)...
+
+## Details
+First occurrence...
+
+## Details
+Second occurrence - collision! Gets Bref: {#a1b2c3d4e5f6}
+```
+
+**Collision Handling**: Two-level detection (see § 2.2.1 below)
+1. **Document-level**: During parse, track IDs within single file
+2. **Network-level**: During enrichment, check PathMap for cross-file collisions
+
+##### 4. Title - Auto-Generated Anchor
+
+**Purpose**: Automatic anchor generation from heading text
+
+**Properties**:
+- Always present: `title = "Introduction"`
+- Normalized via `to_anchor()` for HTML anchor compatibility
+- Used when no explicit ID provided
+- Can change (breaking references unless BID/Bref used)
+
+**Generation**: Automatic from heading text or TOML `title` field
+
+##### 5. Path - Filesystem Location
+
+**Purpose**: File system operations and initial discovery
+
+**Properties**:
+- Relative to network root: `docs/design/architecture.md`
+- Changes when files move
+- Least stable identifier (use BID for permanent references)
+- Used by `PathMapMap` for efficient lookups
+
+**Storage**: `src/paths.rs:PathMapMap` maintains bidirectional mappings
+
+#### Identity Resolution Hierarchy
+
+When multiple references could match, resolution priority:
+
+1. **BID** - Most explicit, globally unique, always preferred
+2. **Bref** - Compact, collision-resistant, stable
+3. **ID** - User-controlled semantic identifier, network-scoped
+4. **Title** - Auto-generated, subject to collisions
+5. **Path** - Least stable, fallback only
+
+This hierarchy enables **progressive enhancement**: start with simple title references, add explicit IDs where needed, rely on BIDs for permanent stability.
+
+#### 2.2.1. Collision Detection and Resolution
+
+**Problem**: Multiple headings in a document or network may normalize to the same ID.
+
+**Solution**: Two-level collision detection with Bref fallback.
+
+##### Document-Level Collision Detection
+
+**Implementation**: `src/codec/md.rs:1027-1054` (End(Heading) handler)
+
+**Algorithm**:
+```rust
+fn determine_node_id(
+    explicit_id: Option<&str>,      // User-provided {#id}
+    title: &str,                     // Heading text
+    bref: &str,                      // Node's Bref
+    existing_ids: &HashSet<String>,  // Already seen IDs in document
+) -> String {
+    // Priority: explicit ID > title-derived ID
+    let candidate = if let Some(id) = explicit_id {
+        to_anchor(id)  // Normalize user ID
+    } else {
+        to_anchor(title)  // Derive from title
+    };
+    
+    // Fallback to Bref if collision detected
+    if existing_ids.contains(&candidate) {
+        bref.to_string()
+    } else {
+        candidate
+    }
+}
+```
+
+**Example**:
+```markdown
+## Details
+<!-- First occurrence: gets ID "details" -->
+
+## Details
+<!-- Collision detected: gets Bref {#a1b2c3d4e5f6} -->
+
+## Getting Started {#getting-started}
+<!-- Explicit ID: gets "getting-started" -->
+
+## Getting Started
+<!-- Collision with explicit ID: gets Bref {#b2c3d4e5f6a1} -->
+```
+
+##### Network-Level Collision Detection
+
+**Implementation**: `src/codec/md.rs:700-723` (inject_context function)
+
+**Purpose**: Detect when an ID is already used by a different node in the network
+
+**Algorithm**:
+```rust
+// After document-level collision detection
+if let Some(current_id) = proto.id {
+    // Query PathMap for network-level collision
+    if let Some((doc_bid, node_bid)) = paths.net_get_from_id(&net, &current_id) {
+        if node_bid != ctx.node.bid {
+            // Different node already owns this ID - remove it
+            tracing::info!("Network collision: '{}' already used", current_id);
+            proto.id = None;
+        }
+    }
+}
+```
+
+**Why separate levels?**
+- Document-level catches `##Details` / `##Details` in same file
+- Network-level catches `docs/a.md#intro` and `docs/b.md#intro` collision
+
+##### Selective ID Injection
+
+**Policy**: Only inject anchors when necessary (normalized or collision-resolved)
+
+**Implementation**: `src/codec/md.rs:725-751` (inject_context function)
+
+**Rules**:
+1. **Explicit ID matches normalized form**: No injection (keep source clean)
+   - User writes `{#intro}` → already normalized → no rewrite
+2. **Explicit ID normalized differently**: Inject normalized form
+   - User writes `{#Intro!}` → normalized to `{#intro}` → inject `{#intro}`
+3. **Collision detected**: Inject Bref
+   - Second "Details" → collision → inject `{#a1b2c3d4e5f6}`
+4. **Title-derived, no collision**: No injection (implicit anchor)
+   - `## Introduction` → generates `#introduction` implicitly → no rewrite
+
+**Write-back**: Uses pulldown_cmark_to_cmark which writes event's `id` field as `{ #id }` syntax
+
+#### 2.2.2. Storage and Indexing
+
+**PathMapMap** (`src/paths.rs:38-362`) maintains bidirectional mappings for O(1) lookups:
+
+```rust
+pub struct PathMapMap {
+    map: BTreeMap<Bid, Arc<RwLock<PathMap>>>,  // Net → PathMap
+    nets: BTreeSet<Bid>,                        // Network BIDs
+    docs: BTreeSet<Bid>,                        // Document BIDs
+    apis: BTreeSet<Bid>,                        // API node BIDs
+    anchors: BTreeMap<Bid, String>,             // BID → normalized title
+    ids: BTreeMap<Bid, String>,                 // BID → explicit ID
+    // ...
+}
+```
+
+**Query methods**:
+- `net_get_from_id(&net, &id)` → `Option<(doc_bid, node_bid)>`
+- `net_get_from_title(&net, &title)` → `Option<(doc_bid, node_bid)>`
+- `net_path(&net, &bid)` → `Option<(net, path)>`
+
+**BeliefNode::keys()** (`src/properties.rs:871-923`) generates all valid references:
+
+```rust
+fn keys(&self, net: Bid, parent: Option<Bid>, bs: &BeliefBase) -> Vec<NodeKey> {
+    vec![
+        NodeKey::Bid { bid: self.bid },
+        NodeKey::Bref { bref: self.bid.namespace() },
+        NodeKey::Id { net, id: self.id.clone() },        // If id.is_some()
+        NodeKey::Title { net, title: to_anchor(&self.title) },
+        NodeKey::Path { net, path: /* from PathMap */ },
+    ]
+}
+```
+
+#### 2.2.3. Benefits of Multi-ID Triangulation
+
+**For Users**:
+- Write natural markdown with simple links
+- System maintains stability automatically (BID injection)
+- Explicit control when needed (custom IDs)
+- Files remain readable as plain text
+
+**For Developers**:
+- Query by any identity type
+- Graceful degradation (BID → Bref → ID → Title → Path)
+- Robust to structural changes (renames, moves)
+- Efficient O(1) lookups via PathMapMap indices
+
+**For Distributed Systems**:
+- No central ID authority needed (UUIDv6 for BIDs, v5 for namespaces)
+- Merge without collisions (BID uniqueness guarantees)
+- Namespace hierarchy prevents ID conflicts (v5 ensures deterministic namespace derivation)
+- Time-ordered BIDs for efficient database operations
+
+**Example scenario - File refactoring**:
+```markdown
+# Before: docs/getting-started.md
+[[a1b2c3d4e5f6]]  # Link using Bref
+
+# After: tutorials/quickstart.md
+# File moved and renamed, but link still works!
+# BID unchanged, PathMap updated automatically
+```
+
+**Example scenario - Cross-device sync**:
+```markdown
+# Device A creates: docs/notes.md
+bid = "aaaa1111-2222-3333-4444-555566667777"
+
+# Device B creates: drafts/notes.md  
+bid = "bbbb8888-9999-aaaa-bbbb-ccccddddeeee"
+
+# No collision - different BIDs despite same filename!
+# Merge creates two separate nodes
+```
+
+This comprehensive identity system enables robust knowledge management across evolving documents, distributed collaboration, and complex cross-references while maintaining source file readability.
 
 ### 2.3. Schema vs Kind: Semantic Distinction
 

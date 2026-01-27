@@ -45,7 +45,7 @@ pub fn buildonomy_md_options() -> Options {
     md_options.insert(Options::ENABLE_DEFINITION_LIST);
     md_options.insert(Options::ENABLE_FOOTNOTES);
     md_options.insert(Options::ENABLE_GFM);
-    // md_options.insert(MdOptions::ENABLE_HEADING_ATTRIBUTES);
+    md_options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
     md_options.insert(Options::ENABLE_MATH);
     // md_options.insert(MdOptions::ENABLE_OLD_FOOTNOTES);
     // md_options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
@@ -550,6 +550,8 @@ pub struct MdCodec {
     content: String,
     /// Track which section keys have been matched during inject_context phase
     matched_sections: HashSet<NodeKey>,
+    /// Track heading IDs within current document for collision detection
+    seen_ids: HashSet<String>,
 }
 
 impl MdCodec {
@@ -558,6 +560,7 @@ impl MdCodec {
             current_events: Vec::new(),
             content: String::new(),
             matched_sections: HashSet::new(),
+            seen_ids: HashSet::new(),
         }
     }
 
@@ -694,7 +697,69 @@ impl DocCodec for MdCodec {
             }
         }
 
-        if frontmatter_changed.is_some() || sections_metadata_merged {
+        // Network-level collision detection and ID injection
+        let mut id_changed = false;
+        if proto_events.0.heading > 2 {
+            // This is a heading node (not document)
+            if let Some(current_id) = proto_events.0.id.as_ref() {
+                // Check for network-level collision
+                let net = ctx.home_net;
+
+                // Check if this ID already exists in the network PathMap
+                if let Some(existing_bid) =
+                    ctx.belief_set().paths().net_get_from_id(&net, current_id)
+                {
+                    // Collision detected if the existing node is different from current node
+                    if existing_bid.1 != ctx.node.bid {
+                        tracing::info!(
+                            "Network-level ID collision detected: '{}' already used by another node. Removing ID.",
+                            current_id
+                        );
+                        proto_events.0.id = None;
+                        id_changed = true;
+                    }
+                }
+            }
+
+            // Inject ID into heading event if it differs from original
+            // Find the original ID from the heading event
+            let original_event_id = proto_events.1.iter().find_map(|(event, _)| {
+                if let MdEvent::Start(MdTag::Heading { id, .. }) = event {
+                    id.as_ref().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+
+            // Determine if we need to inject
+            let needs_injection = if proto_events.0.id.as_ref() != original_event_id.as_ref() {
+                // ID changed (normalized, collision-resolved, or added)
+                true
+            } else {
+                false
+            };
+
+            if needs_injection {
+                // Mutate heading event to inject final ID
+                for (event, _range) in proto_events.1.iter_mut() {
+                    if let MdEvent::Start(MdTag::Heading { id, .. }) = event {
+                        *id = proto_events.0.id.as_ref().map(|s| CowStr::from(s.clone()));
+                        id_changed = true;
+                        break;
+                    }
+                }
+            }
+
+            // Store ID in document for BeliefNode conversion
+            // We do this during inject_context rather than parse to avoid spurious update events
+            if let Some(ref id) = proto_events.0.id {
+                if proto_events.0.document.get("id").is_none() {
+                    proto_events.0.document.insert("id", value(id.clone()));
+                }
+            }
+        }
+
+        if frontmatter_changed.is_some() || sections_metadata_merged || id_changed {
             let metadata_string = if current_events
                 .iter()
                 .any(|e| matches!(e.0, MdEvent::Start(MdTag::Heading { .. })))
@@ -708,19 +773,22 @@ impl DocCodec for MdCodec {
 
         let link_changed =
             check_for_link_and_push(&mut current_events, ctx, &mut proto_events.1, None);
-        let maybe_text =
-            if frontmatter_changed.is_some() || sections_metadata_merged || link_changed {
-                if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
-                    Self::events_to_text(
-                        &self.content,
-                        proto_events.1.iter().skip(start_idx).cloned(),
-                    )
-                } else {
-                    Self::events_to_text(&self.content, proto_events.1.iter().cloned())
-                }
+        let maybe_text = if frontmatter_changed.is_some()
+            || sections_metadata_merged
+            || link_changed
+            || id_changed
+        {
+            if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
+                Self::events_to_text(
+                    &self.content,
+                    proto_events.1.iter().skip(start_idx).cloned(),
+                )
             } else {
-                None
-            };
+                Self::events_to_text(&self.content, proto_events.1.iter().cloned())
+            }
+        } else {
+            None
+        };
 
         if let Some(text) = maybe_text {
             proto_events.0.document.insert("text", value(text.clone()));
@@ -843,6 +911,7 @@ impl DocCodec for MdCodec {
         self.content = content;
         self.current_events = Vec::default();
         self.matched_sections.clear();
+        self.seen_ids.clear();
         if let Some(schema) = detect_schema_from_path(&current.path) {
             if current.document.get("schema").is_none() {
                 current.document.insert("schema", value(schema));
@@ -930,7 +999,7 @@ impl DocCodec for MdCodec {
                 }
                 MdEvent::Start(MdTag::Heading {
                     level,
-                    id: _,
+                    id,
                     classes: _,
                     attrs: _,
                 }) => {
@@ -945,9 +1014,12 @@ impl DocCodec for MdCodec {
                         HeadingLevel::H5 => 7,
                         HeadingLevel::H6 => 8,
                     };
+                    // Capture and normalize explicit ID from {#anchor} syntax
+                    let normalized_id = id.as_ref().map(|id_str| to_anchor(id_str));
                     let new_current = ProtoBeliefNode {
                         path: current.path.clone(),
                         heading,
+                        id: normalized_id,
                         ..Default::default()
                     };
                     // Inherit the schema type from the prior parse. If the node has an explicit
@@ -961,10 +1033,31 @@ impl DocCodec for MdCodec {
                 MdEvent::End(MdTagEnd::Heading(_)) => {
                     // We should never encounter a heading end tag before a heading start tag, and
                     // we initialize title_accum to Some(String::new) in the start tag.
-                    current.document.insert(
-                        "title",
-                        value(current.accumulator.take().unwrap_or_default()),
-                    );
+                    let title = current.accumulator.take().unwrap_or_default();
+                    current.document.insert("title", value(&title));
+
+                    // Collision detection: determine final ID based on explicit ID, title, and seen IDs
+                    // Only for section headings (heading > 2), not document nodes
+                    if current.heading > 2 {
+                        let explicit_id = current.id.as_deref();
+                        let bref = current
+                            .document
+                            .get("bid")
+                            .and_then(|v| v.as_str())
+                            .and_then(|bid_str| Bid::try_from(bid_str).ok())
+                            .map(|bid| bid.namespace().to_string())
+                            .unwrap_or_else(|| "000000000000".to_string());
+
+                        let final_id =
+                            determine_node_id(explicit_id, &title, &bref, &self.seen_ids);
+
+                        // Track this ID to detect future collisions
+                        self.seen_ids.insert(final_id.clone());
+
+                        // Store final ID in node's id field
+                        // Note: We store in document during inject_context to avoid spurious update events
+                        current.id = Some(final_id);
+                    }
                 }
                 _ => {}
             }
@@ -1026,20 +1119,10 @@ mod tests {
     }
 
     /// Extract anchor from heading node (e.g., {#intro} syntax).
-    /// Returns the anchor ID without the '#' prefix.
+    /// Returns the normalized anchor ID without the '#' prefix.
     fn extract_anchor_from_node(node: &ProtoBeliefNode) -> Option<String> {
-        // TODO: Parse anchor from heading syntax once Issue 3 is implemented
-        // For now, check if there's an "id" or "anchor" field in the document
-        node.document
-            .get("anchor")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                node.document
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
+        // Return the parsed and normalized ID from heading syntax
+        node.id.clone()
     }
 
     /// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
@@ -1208,6 +1291,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1245,6 +1329,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: Some("intro".to_string()), // Normalized anchor
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1282,6 +1367,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1328,6 +1414,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1363,7 +1450,6 @@ schema = "Document"
 
         // Create node with anchor and title (no BID)
         let mut doc = DocumentMut::new();
-        doc.insert("anchor", value("intro"));
         doc.insert("title", value("Introduction"));
 
         let node = ProtoBeliefNode {
@@ -1376,6 +1462,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: Some("intro".to_string()), // Explicit anchor from {#intro} syntax
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1404,6 +1491,7 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
+            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1411,113 +1499,273 @@ schema = "Document"
     }
 }
 
-    // ========================================================================
-    // Issue 3: Anchor Management Tests
-    // ========================================================================
+// ========================================================================
+// Issue 3: Anchor Management Tests
+// ========================================================================
 
-    /// Helper function for Issue 3: Determine node ID with collision detection.
-    /// Will be implemented in Issue 3.
-    #[allow(dead_code)]
-    fn determine_node_id(
-        explicit_id: Option<&str>,
-        title: &str,
-        bref: &str,
-        existing_ids: &HashSet<String>,
-    ) -> String {
-        // TODO: Implement in Issue 3
-        // Priority: explicit ID > title-derived ID > bref (on collision)
-        let candidate = if let Some(id) = explicit_id {
-            to_anchor(id)
-        } else {
-            to_anchor(title)
-        };
+/// Determine node ID with collision detection.
+/// Priority: explicit ID > title-derived ID > bref (on collision)
+fn determine_node_id(
+    explicit_id: Option<&str>,
+    title: &str,
+    bref: &str,
+    existing_ids: &HashSet<String>,
+) -> String {
+    // Try explicit ID first, then title-derived ID
+    let candidate = if let Some(id) = explicit_id {
+        to_anchor(id)
+    } else {
+        to_anchor(title)
+    };
 
-        if existing_ids.contains(&candidate) {
-            bref.to_string()
+    // Fallback to Bref if collision detected
+    if existing_ids.contains(&candidate) {
+        bref.to_string()
+    } else {
+        candidate
+    }
+}
+
+#[test]
+fn test_determine_node_id_no_collision() {
+    let existing_ids = HashSet::new();
+    let bref = "a1b2c3d4e5f6";
+
+    // No explicit ID, unique title
+    let id = determine_node_id(None, "Introduction", bref, &existing_ids);
+    assert_eq!(id, "introduction");
+
+    // Explicit ID, no collision
+    let id = determine_node_id(Some("custom-id"), "Introduction", bref, &existing_ids);
+    assert_eq!(id, "custom-id");
+}
+
+#[test]
+fn test_determine_node_id_title_collision() {
+    let mut existing_ids = HashSet::new();
+    existing_ids.insert("details".to_string());
+    let bref = "a1b2c3d4e5f6";
+
+    // No explicit ID, title collides → use Bref
+    let id = determine_node_id(None, "Details", bref, &existing_ids);
+    assert_eq!(id, bref, "Should use Bref when title collides");
+}
+
+#[test]
+fn test_determine_node_id_explicit_collision() {
+    let mut existing_ids = HashSet::new();
+    existing_ids.insert("my-section".to_string());
+    let bref = "a1b2c3d4e5f6";
+
+    // Explicit ID collides → use Bref
+    let id = determine_node_id(Some("my-section"), "Different Title", bref, &existing_ids);
+    assert_eq!(id, bref, "Should use Bref even when explicit ID collides");
+}
+
+#[test]
+fn test_determine_node_id_normalization() {
+    let existing_ids = HashSet::new();
+    let bref = "a1b2c3d4e5f6";
+
+    // Explicit ID with special chars gets normalized
+    let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
+    assert_eq!(
+        id, "section-one",
+        "Should normalize explicit ID using to_anchor()"
+    );
+
+    // Explicit ID with various special chars
+    let id = determine_node_id(Some("API & Reference"), "Title", bref, &existing_ids);
+    assert_eq!(
+        id, "api--reference",
+        "Should strip punctuation and normalize"
+    );
+}
+
+#[test]
+fn test_determine_node_id_normalization_collision() {
+    let mut existing_ids = HashSet::new();
+    existing_ids.insert("section-one".to_string());
+    let bref = "a1b2c3d4e5f6";
+
+    // Explicit ID normalizes to existing ID → collision → use Bref
+    let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
+    assert_eq!(
+        id, bref,
+        "Should detect collision after normalization and use Bref"
+    );
+}
+
+#[test]
+fn test_to_anchor_consistency() {
+    // Verify to_anchor() behavior for collision detection
+    assert_eq!(to_anchor("Details"), "details");
+    assert_eq!(to_anchor("Section One"), "section-one");
+    assert_eq!(to_anchor("API & Reference"), "api--reference");
+    assert_eq!(to_anchor("My-Section!"), "my-section");
+
+    // Case insensitivity
+    assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
+    assert_eq!(to_anchor("Section"), to_anchor("section"));
+}
+
+#[test]
+fn test_pulldown_cmark_to_cmark_writes_heading_ids() {
+    // Verify that pulldown_cmark_to_cmark writes the `id` field from heading events
+    use pulldown_cmark::{Event as MdEvent, HeadingLevel, Tag as MdTag, TagEnd as MdTagEnd};
+
+    // Test 1: Parse heading with ID
+    let markdown = "## My Heading {#my-id}";
+    let parser = MdParser::new_ext(markdown, buildonomy_md_options());
+    let events: Vec<MdEvent> = parser.collect();
+
+    // Verify ID was parsed
+    let has_id = events.iter().any(|e| {
+        if let MdEvent::Start(MdTag::Heading { id, .. }) = e {
+            id.as_ref().map(|s| s.as_ref()) == Some("my-id")
         } else {
-            candidate
+            false
         }
-    }
+    });
+    assert!(has_id, "Should parse heading ID");
 
-    #[test]
-    fn test_determine_node_id_no_collision() {
-        let existing_ids = HashSet::new();
-        let bref = "a1b2c3d4e5f6";
+    // Test 2: Write back with cmark
+    let mut buf = String::new();
+    pulldown_cmark_to_cmark::cmark(events.iter(), &mut buf).unwrap();
+    assert!(
+        buf.contains("{ #my-id }") || buf.contains("{#my-id}"),
+        "Should write heading ID back. Got: {buf}"
+    );
 
-        // No explicit ID, unique title
-        let id = determine_node_id(None, "Introduction", bref, &existing_ids);
-        assert_eq!(id, "introduction");
+    // Test 3: Modify ID and write
+    let modified_events = vec![
+        MdEvent::Start(MdTag::Heading {
+            level: HeadingLevel::H2,
+            id: Some(CowStr::from("new-id")),
+            classes: Vec::new(),
+            attrs: Vec::new(),
+        }),
+        MdEvent::Text(CowStr::from("My Heading")),
+        MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
+    ];
 
-        // Explicit ID, no collision
-        let id = determine_node_id(Some("custom-id"), "Introduction", bref, &existing_ids);
-        assert_eq!(id, "custom-id");
-    }
+    let mut buf2 = String::new();
+    pulldown_cmark_to_cmark::cmark(modified_events.iter(), &mut buf2).unwrap();
+    assert!(
+        buf2.contains("{ #new-id }") || buf2.contains("{#new-id}"),
+        "Should write modified heading ID. Got: {buf2}"
+    );
 
-    #[test]
-    fn test_determine_node_id_title_collision() {
-        let mut existing_ids = HashSet::new();
-        existing_ids.insert("details".to_string());
-        let bref = "a1b2c3d4e5f6";
+    // Test 4: Normalized ID (lowercase, no punctuation)
+    let normalized_events = vec![
+        MdEvent::Start(MdTag::Heading {
+            level: HeadingLevel::H2,
+            id: Some(CowStr::from("my-heading")), // normalized
+            classes: Vec::new(),
+            attrs: Vec::new(),
+        }),
+        MdEvent::Text(CowStr::from("My Heading")),
+        MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
+    ];
 
-        // No explicit ID, title collides → use Bref
-        let id = determine_node_id(None, "Details", bref, &existing_ids);
-        assert_eq!(id, bref, "Should use Bref when title collides");
-    }
+    let mut buf3 = String::new();
+    pulldown_cmark_to_cmark::cmark(normalized_events.iter(), &mut buf3).unwrap();
+    assert!(
+        buf3.contains("{ #my-heading }") || buf3.contains("{#my-heading}"),
+        "Should write normalized ID. Got: {buf3}"
+    );
+}
 
-    #[test]
-    fn test_determine_node_id_explicit_collision() {
-        let mut existing_ids = HashSet::new();
-        existing_ids.insert("my-section".to_string());
-        let bref = "a1b2c3d4e5f6";
+#[test]
+fn test_id_normalization_during_parse() {
+    // Test that IDs are normalized during parse (without explicit ID syntax)
+    use toml_edit::DocumentMut;
 
-        // Explicit ID collides → use Bref
-        let id = determine_node_id(Some("my-section"), "Different Title", bref, &existing_ids);
-        assert_eq!(id, bref, "Should use Bref even when explicit ID collides");
-    }
+    let markdown = "## My-Section!";
+    let mut codec = MdCodec::new();
 
-    #[test]
-    fn test_determine_node_id_normalization() {
-        let existing_ids = HashSet::new();
-        let bref = "a1b2c3d4e5f6";
+    let mut doc = DocumentMut::new();
+    doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
+    doc.insert("schema", value("Document"));
 
-        // Explicit ID with special chars gets normalized
-        let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
-        assert_eq!(
-            id, "section-one",
-            "Should normalize explicit ID using to_anchor()"
-        );
+    let proto = ProtoBeliefNode {
+        accumulator: None,
+        content: String::new(),
+        document: doc,
+        upstream: Vec::new(),
+        downstream: Vec::new(),
+        path: "test.md".to_string(),
+        kind: crate::properties::BeliefKindSet::default(),
+        errors: Vec::new(),
+        heading: 2,
+        id: None,
+    };
 
-        // Explicit ID with various special chars
-        let id = determine_node_id(Some("API & Reference"), "Title", bref, &existing_ids);
-        assert_eq!(
-            id, "api--reference",
-            "Should strip punctuation and normalize"
-        );
-    }
+    codec.parse(markdown.to_string(), proto).unwrap();
 
-    #[test]
-    fn test_determine_node_id_normalization_collision() {
-        let mut existing_ids = HashSet::new();
-        existing_ids.insert("section-one".to_string());
-        let bref = "a1b2c3d4e5f6";
+    // Verify ID was normalized from title during parse
+    let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
+    assert!(heading_node.is_some(), "Should have heading node");
+    let (proto, _) = heading_node.unwrap();
+    assert_eq!(
+        proto.id.as_deref(),
+        Some("my-section"),
+        "ID should be normalized to lowercase without punctuation"
+    );
+}
 
-        // Explicit ID normalizes to existing ID → collision → use Bref
-        let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
-        assert_eq!(
-            id, bref,
-            "Should detect collision after normalization and use Bref"
-        );
-    }
+#[test]
+fn test_id_collision_bref_fallback() {
+    // Test that Bref is used when collision is detected during parse
+    use toml_edit::DocumentMut;
 
-    #[test]
-    fn test_to_anchor_consistency() {
-        // Verify to_anchor() behavior for collision detection
-        assert_eq!(to_anchor("Details"), "details");
-        assert_eq!(to_anchor("Section One"), "section-one");
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
-        assert_eq!(to_anchor("My-Section!"), "my-section");
+    let markdown = "## Details\n\n## Details";
+    let mut codec = MdCodec::new();
 
-        // Case insensitivity
-        assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
-        assert_eq!(to_anchor("Section"), to_anchor("section"));
-    }
+    let mut doc = DocumentMut::new();
+    doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
+    doc.insert("schema", value("Document"));
+
+    let proto = ProtoBeliefNode {
+        accumulator: None,
+        content: String::new(),
+        document: doc,
+        upstream: Vec::new(),
+        downstream: Vec::new(),
+        path: "test.md".to_string(),
+        kind: crate::properties::BeliefKindSet::default(),
+        errors: Vec::new(),
+        heading: 2,
+        id: None,
+    };
+
+    codec.parse(markdown.to_string(), proto).unwrap();
+
+    // Verify first "Details" has title-derived ID, second has Bref
+    let heading_nodes: Vec<&(ProtoBeliefNode, MdEventQueue)> = codec
+        .current_events
+        .iter()
+        .filter(|(p, _)| p.heading > 2)
+        .collect();
+
+    assert_eq!(heading_nodes.len(), 2, "Should have 2 heading nodes");
+
+    // First should have title-derived ID
+    assert_eq!(
+        heading_nodes[0].0.id.as_deref(),
+        Some("details"),
+        "First 'Details' should have title-derived ID"
+    );
+
+    // Second should have Bref (12-char hex)
+    let second_id = heading_nodes[1].0.id.as_ref().unwrap();
+    assert_eq!(
+        second_id.len(),
+        12,
+        "Second 'Details' should have Bref (12 chars)"
+    );
+    assert!(
+        second_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "Bref should be hex digits"
+    );
+}

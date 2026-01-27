@@ -582,6 +582,9 @@ pub struct ProtoBeliefNode {
     pub kind: BeliefKindSet,
     pub errors: Vec<BuildonomyError>,
     pub heading: usize,
+    /// Explicit ID from heading anchor syntax (e.g., {#my-id})
+    /// This is the raw, unnormalized ID as parsed from markdown
+    pub id: Option<String>,
 }
 
 impl PartialEq for ProtoBeliefNode {
