@@ -431,6 +431,12 @@ impl From<EnumSet<BeliefKind>> for BeliefKindSet {
     }
 }
 
+impl From<BeliefKind> for BeliefKindSet {
+    fn from(kind: BeliefKind) -> Self {
+        BeliefKindSet(EnumSet::only(kind))
+    }
+}
+
 impl Display for BeliefKindSet {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)

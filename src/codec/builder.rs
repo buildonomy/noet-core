@@ -779,6 +779,53 @@ impl GraphBuilder {
         parent_info.unwrap_or((self.api().bid, None))
     }
 
+    /// Generate a speculative path for a section without mutating state.
+    /// Uses PathMap's speculative_path to compute what the path would be with collision detection.
+    fn speculative_section_path(
+        &self,
+        parsed_node: &BeliefNode,
+        parent_bid: Bid,
+        parent_path: &str,
+    ) -> Result<String, BuildonomyError> {
+        // Find the network by walking up the stack (network nodes have heading=1)
+        let parent_net = self
+            .stack
+            .iter()
+            .rev()
+            .find(|(_bid, _path, heading)| *heading == 1)
+            .map(|(bid, _path, _heading)| *bid)
+            .unwrap_or(self.repo());
+
+        // Generate a temporary BID for the speculative computation
+        let temp_bid = if parsed_node.bid.initialized() {
+            parsed_node.bid
+        } else {
+            Bid::new(&parent_bid)
+        };
+
+        // Get the PathMap for this network and compute speculative path
+        let path = {
+            let paths = self.doc_bb.paths();
+            let pathmap_arc = paths.get_map(&parent_net).ok_or_else(|| {
+                BuildonomyError::Codec(format!(
+                    "No PathMap found for network {} while computing path for '{}'",
+                    parent_net, parsed_node.title
+                ))
+            })?;
+
+            pathmap_arc
+                .speculative_path(&temp_bid, parent_path, None, &paths)
+                .ok_or_else(|| {
+                    BuildonomyError::Codec(format!(
+                        "Failed to generate speculative path for section '{}' under parent {} (path: {})",
+                        parsed_node.title, parent_bid, parent_path
+                    ))
+                })?
+        };
+
+        Ok(path)
+    }
+
     /// Update the parent stack, and update the stack cache with the node and its relations from the
     /// global cache.
     ///
@@ -809,7 +856,32 @@ impl GraphBuilder {
         // is balanced until we're out of phase 1 of parse_content.
 
         let mut parsed_node = BeliefNode::try_from(proto)?;
-        let mut keys = parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb());
+
+        // Generate keys based on node type
+        let mut keys = if proto.heading > 2 && !parsed_node.bid.initialized() {
+            // Section in Phase 1 (no BID yet): use speculative path computation to get collision-aware path
+            let speculative_path =
+                self.speculative_section_path(&parsed_node, parent_bid, &proto.path)?;
+            let parent_net = self
+                .doc_bb
+                .states()
+                .get(&parent_bid)
+                .map(|n| n.bid)
+                .unwrap_or(self.repo());
+
+            let section_keys = vec![NodeKey::Path {
+                net: parent_net,
+                path: speculative_path,
+            }];
+
+            // Note: We don't add ID key here because collision detection hasn't happened yet
+            // The ID might collide with siblings and would need to fall back to Bref
+
+            section_keys
+        } else {
+            // Document OR section in Phase 2+ (with BID): use existing logic
+            parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb())
+        };
 
         // On top of providing us with the old state of the node (if such a state exists), this will
         // also update our session_bb to include all the old relationships tied to this node. We

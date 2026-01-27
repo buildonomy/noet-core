@@ -559,7 +559,7 @@ fn generate_terminal_path(
 
 /// Generate a unique path name for a relation with collision detection.
 /// If the generated path collides with an existing path (for a different bid),
-/// prepend the index to make it unique.
+/// use the Bref (BID namespace) to make it unique.
 fn generate_path_name_with_collision_check(
     source: &Bid,
     sink: &Bid,
@@ -578,10 +578,11 @@ fn generate_path_name_with_collision_check(
         .any(|(path, bid, _)| path == &full_path && *bid != *source);
 
     if has_collision {
-        terminal_path = format!("{index}-{terminal_path}");
+        // Use Bref (BID namespace) as fallback for collision
+        terminal_path = source.namespace().to_string();
     }
     full_path = path_join(sink_path, &terminal_path, nets.is_anchor(source));
-    // Since the index is unique, this should guarantee we don't have any collisions
+    // Since the Bref is unique per BID, this should guarantee we don't have any collisions
     debug_assert!(!existing_map
         .iter()
         .any(|(path, bid, _)| path == &full_path && *bid != *source));
@@ -1122,6 +1123,52 @@ impl PathMap {
             nets,
             &self.map,
         )
+    }
+
+    /// Compute what path would be generated for a new node without mutating state.
+    /// Used for speculative path generation during cache_fetch key computation.
+    ///
+    /// # Arguments
+    /// * `source` - BID of the child node being added
+    /// * `parent_path` - Path of the parent node (e.g., "file.md" for document)
+    /// * `explicit_path` - Explicit path from weight metadata (if provided)
+    /// * `nets` - PathMapMap for looking up anchors and checking collisions
+    pub fn speculative_path(
+        &self,
+        source: &Bid,
+        parent_path: &str,
+        explicit_path: Option<&str>,
+        nets: &PathMapMap,
+    ) -> Option<String> {
+        // Use parent_path directly as the base, with empty order for sibling index computation
+        let sink_path = parent_path.to_string();
+        let sink_order: Vec<u16> = Vec::new();
+
+        // Determine the sort_key for this new child (would be max + 1)
+        // Find all existing children of this parent by matching path prefix
+        let new_index = self
+            .map
+            .iter()
+            .filter(|(path, _bid, _order)| {
+                // Find siblings: paths that start with parent_path
+                path.starts_with(&sink_path) && path != &sink_path
+            })
+            .count() as u16;
+
+        // Use existing collision detection logic
+        // Note: We use a dummy Bid::nil() for sink since we don't have the actual parent BID
+        // The sink parameter is only used for a special API check which won't apply to sections
+        let path = generate_path_name_with_collision_check(
+            source,
+            &Bid::nil(), // Dummy sink - only used for API special case which doesn't apply here
+            &sink_path,
+            explicit_path,
+            new_index,
+            nets,
+            &self.map,
+        );
+
+        Some(path)
     }
 
     /// Process a relation event and generate path mutations
