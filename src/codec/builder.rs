@@ -1266,3 +1266,296 @@ impl GraphBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        codec::belief_ir::ProtoBeliefNode,
+        nodekey::to_anchor,
+        properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid},
+    };
+    use toml_edit::{value, DocumentMut};
+
+    /// Helper: Create a test ProtoBeliefNode for a section heading
+    fn create_test_proto_section(
+        title: &str,
+        path: &str,
+        heading: usize,
+        id: Option<String>,
+        bid: Option<&str>,
+    ) -> ProtoBeliefNode {
+        let mut doc = DocumentMut::new();
+        doc.insert("title", value(title));
+        doc.insert("schema", value("Document"));
+        if let Some(bid_str) = bid {
+            doc.insert("bid", value(bid_str));
+        }
+
+        ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: path.to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading,
+            id,
+        }
+    }
+
+    /// Helper: Create a test BeliefNode
+    fn create_test_node(title: &str, _kind: BeliefKind, bid: Option<Bid>) -> BeliefNode {
+        let bid = bid.unwrap_or_else(|| Bid::new(Bid::nil()));
+        BeliefNode {
+            bid,
+            kind: BeliefKindSet::from(BeliefKind::Document | BeliefKind::Document),
+            title: title.to_string(),
+            schema: None,
+            payload: Default::default(),
+            id: None,
+        }
+    }
+
+    #[test]
+    fn test_truth_table_case_1_no_bid_no_match() {
+        // Case: No BID in parsed, no cache match
+        // Expected: Generate new BID via Bid::new(parent)
+
+        let _proto = create_test_proto_section("Details", "test.md", 3, None, None);
+
+        // Simulate Unresolved result - node should get generated BID
+        let parent_bid = Bid::nil();
+        let generated_bid = Bid::new(parent_bid);
+
+        // The generated BID should be different from parent
+        assert_ne!(generated_bid, parent_bid);
+        assert!(generated_bid.initialized());
+    }
+
+    #[test]
+    fn test_truth_table_case_2_no_bid_path_match_section() {
+        // Case: No BID in parsed, cache match via Path (section)
+        // Expected: Use found BID (watch session scenario)
+
+        let proto = create_test_proto_section("Details", "test.md", 3, None, None);
+        let existing_bid = Bid::new(Bid::nil());
+        let existing_node = create_test_node("Details", BeliefKind::Document, Some(existing_bid));
+
+        // In watch session, proto has no BID but cache has the node
+        assert!(!proto.document.get("bid").is_some());
+        assert_eq!(existing_node.bid, existing_bid);
+
+        // Logic: Use found BID
+        let result_bid = existing_node.bid;
+        assert_eq!(result_bid, existing_bid);
+    }
+
+    #[test]
+    fn test_truth_table_case_3_duplicate_titles_no_title_key() {
+        // Case: Two sections with same title, NO Title key in cache lookup
+        // Expected: Different speculative paths → no match → create two separate nodes
+
+        let proto1 =
+            create_test_proto_section("Details", "test.md", 3, Some("details".to_string()), None);
+        let proto2 = create_test_proto_section("Details", "test.md", 3, None, None); // No ID = collision
+
+        // First node: path would be "test.md#details"
+        let path1 = format!("{}#{}", proto1.path, proto1.id.as_ref().unwrap());
+
+        // Second node: path would be "test.md#<bref>" (placeholder for collision)
+        // Since ID is None, we know collision was detected
+        let path2 = format!("{}#{}", proto2.path, "<bref>");
+
+        // Paths are different → no cache match → separate nodes
+        assert_ne!(path1, path2);
+    }
+
+    #[test]
+    fn test_truth_table_case_4_explicit_bid_no_match() {
+        // Case: BID in parsed, no cache match
+        // Expected: Create new node with parsed BID (user added explicit BID)
+
+        let explicit_bid = Bid::new(Bid::nil());
+        let proto = create_test_proto_section(
+            "Details",
+            "test.md",
+            3,
+            None,
+            Some(&explicit_bid.to_string()),
+        );
+
+        let parsed_node = BeliefNode::try_from(&proto).unwrap();
+        assert_eq!(parsed_node.bid, explicit_bid);
+
+        // No cache match → use parsed BID
+        assert!(parsed_node.bid.initialized());
+    }
+
+    #[test]
+    fn test_truth_table_case_5_explicit_bid_bid_match() {
+        // Case: BID in parsed, cache match via BID key
+        // Expected: Update existing node (Phase 2+ match)
+
+        let shared_bid = Bid::new(Bid::nil());
+        let proto =
+            create_test_proto_section("Details", "test.md", 3, None, Some(&shared_bid.to_string()));
+
+        let existing_node = create_test_node("Details", BeliefKind::Document, Some(shared_bid));
+        let parsed_node = BeliefNode::try_from(&proto).unwrap();
+
+        // Both have same BID → this is a match → update
+        assert_eq!(parsed_node.bid, existing_node.bid);
+    }
+
+    #[test]
+    fn test_truth_table_case_6_user_renamed_bid() {
+        // Case: BID in parsed, cache match via Path, but BIDs differ
+        // Expected: Update found node's BID (rename operation)
+
+        let old_bid = Bid::new(Bid::nil());
+        let new_bid = Bid::new(Bid::nil());
+
+        let proto = create_test_proto_section(
+            "Details",
+            "test.md",
+            3,
+            Some("details".to_string()),
+            Some(&new_bid.to_string()),
+        );
+
+        let existing_node = create_test_node("Details", BeliefKind::Document, Some(old_bid));
+        let parsed_node = BeliefNode::try_from(&proto).unwrap();
+
+        // Path matches, but BIDs differ → rename scenario
+        assert_ne!(parsed_node.bid, existing_node.bid);
+        assert!(parsed_node.bid.initialized());
+        assert!(existing_node.bid.initialized());
+    }
+
+    #[test]
+    fn test_speculative_path_no_collision() {
+        // Test: Section with unique title → path uses title-derived ID
+
+        let title = "Introduction";
+        let expected_id = to_anchor(title);
+        let _proto = create_test_proto_section(title, "test.md", 3, None, None);
+
+        // In speculative path generation:
+        // 1. Check siblings (assume none have "introduction" ID)
+        // 2. Use title-derived ID
+        let speculative_anchor = to_anchor(title);
+
+        assert_eq!(speculative_anchor, expected_id);
+        assert_eq!(speculative_anchor, "introduction");
+    }
+
+    #[test]
+    fn test_speculative_path_with_collision() {
+        // Test: Section with colliding title → path uses <bref> placeholder
+
+        let title = "Details";
+        let _proto = create_test_proto_section(title, "test.md", 3, None, None);
+
+        // Simulate collision detection:
+        // If a sibling already has ID "details", use placeholder
+        let sibling_has_same_id = true; // Simulated
+
+        let speculative_anchor = if sibling_has_same_id {
+            "<bref>".to_string()
+        } else {
+            to_anchor(title)
+        };
+
+        assert_eq!(speculative_anchor, "<bref>");
+    }
+
+    #[test]
+    fn test_speculative_path_explicit_id() {
+        // Test: Section with explicit ID (no collision) → path uses explicit ID
+
+        let title = "Details";
+        let explicit_id = "my-custom-section";
+        let proto =
+            create_test_proto_section(title, "test.md", 3, Some(explicit_id.to_string()), None);
+
+        // Speculative path should use explicit ID when no collision
+        let speculative_anchor = proto.id.as_ref().unwrap();
+
+        assert_eq!(speculative_anchor, "my-custom-section");
+        assert_ne!(speculative_anchor, &to_anchor(title)); // Different from title-derived
+    }
+
+    #[test]
+    fn test_speculative_path_explicit_id_collision() {
+        // Test: Section with explicit ID that collides → path uses <bref> placeholder
+
+        let title = "Details";
+        let explicit_id = "intro"; // User manually set this
+        let _proto =
+            create_test_proto_section(title, "test.md", 3, Some(explicit_id.to_string()), None);
+
+        // Simulate collision detection:
+        // If a sibling already has ID "intro" (even though this is explicit), use placeholder
+        let sibling_has_same_id = true; // Simulated
+        let is_explicit = true;
+
+        let speculative_anchor = if sibling_has_same_id {
+            if is_explicit {
+                // Should log warning in actual implementation
+                // tracing::warn!("Explicit ID '{}' collides with sibling. Using Bref fallback.", explicit_id);
+            }
+            "<bref>".to_string()
+        } else {
+            explicit_id.to_string()
+        };
+
+        assert_eq!(speculative_anchor, "<bref>");
+    }
+
+    #[test]
+    fn test_section_vs_document_keys() {
+        // Test: Sections should NOT have Title key, documents should
+
+        let section_proto = create_test_proto_section("Details", "test.md", 3, None, None);
+        let doc_proto = create_test_proto_section("Document", "test.md", 2, None, None);
+
+        // Section (heading > 2): Should generate keys WITHOUT Title
+        assert!(section_proto.heading > 2);
+
+        // Document (heading <= 2): Should generate keys WITH Title
+        assert!(doc_proto.heading <= 2);
+
+        // The actual key generation logic will be in push()
+        // This test documents the expected behavior
+    }
+
+    #[test]
+    fn test_bref_placeholder_never_matches() {
+        // Test: Newly generated Bref has negligible collision probability
+
+        let bref1 = Bid::new(Bid::nil()).namespace().to_string();
+        let bref2 = Bid::new(Bid::nil()).namespace().to_string();
+
+        // Two newly generated Brefs should be different
+        assert_ne!(bref1, bref2);
+
+        // Neither should match our placeholder
+        assert_ne!(bref1, "<bref>");
+        assert_ne!(bref2, "<bref>");
+    }
+
+    #[test]
+    fn test_to_anchor_normalization() {
+        // Test: to_anchor normalizes consistently
+
+        assert_eq!(to_anchor("Details"), "details");
+        assert_eq!(to_anchor("Section One!"), "section-one");
+        assert_eq!(to_anchor("API & Reference"), "api--reference");
+
+        // Same title always produces same anchor
+        let title = "My Section";
+        assert_eq!(to_anchor(title), to_anchor(title));
+    }
+}

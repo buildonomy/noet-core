@@ -14,7 +14,8 @@ Enable TOML frontmatter `sections` field to provide metadata for markdown headin
 2. Match section metadata to heading-generated nodes (by BID/anchor/title)
 3. Enrich matched nodes with schema, custom fields (complexity, etc.)
 4. Ensure all markdown headings create nodes (enables cross-reference tracking)
-5. Maintain clean authority model: markdown = structure, sections = metadata
+5. Maintain 1:1 correspondence: all headings get sections entries (auto-generate ID if not pre-defined)
+6. Maintain clean authority model: markdown = structure, sections = metadata enrichment + synchronization
 
 ## Author Workflow
 

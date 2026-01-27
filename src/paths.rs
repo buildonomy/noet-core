@@ -100,52 +100,6 @@ impl IdMap {
     }
 }
 
-/// [PathMap] generates unique relative paths between [crate::properties::BeliefNode]s based on the
-/// graph structure for a particular [crate::properties::WeightKind] within a
-/// [crate::beliefbase::BeliefBase::relations] hypergraph.
-///
-/// Since [crate::beliefbase::BeliefBase::relations] storeas a [crate::beliefbase::BidGraph]
-/// hypergraph, there are multiple possible relational path structures within the object. A PathMap
-/// generates a [crate::properties::WeightKind]-specific tree structure from the BidGraph, and
-/// assigns each node within that tree a unique path. This helps source documents reference node
-/// relationships using relative links.
-///
-/// PathMap maintains the order of paths based on relationship weights and handles connections to
-/// sub-networks, which are themselves represented by other `PathMap` instances.
-///
-/// Each `PathMap` is built around a specific "net" [crate::properties::Bid], which acts as the root
-/// or entry point for the paths contained within this map. The `kind` field determines which type
-/// of relationship weights (e.g., Subsection, Epistemic) are used to construct the hierarchy.
-///
-/// The `map` field stores the primary path information: a vector of tuples, where each tuple
-/// contains a [String] (the path), a [crate::properties::Bid] (the belief node at that path), and a
-/// `Vec<u16>` representing the order of the node within the hierarchy.
-///
-/// `subnets` is a [BTreeMap] that links paths within this `PathMap` to the
-/// [crate::properties::Bid]s of other networks, allowing for navigation across different network
-/// segments.
-///
-/// `loops` keeps track of detected cycles in the underlying belief graph to prevent infinite
-/// recursion during path generation.
-///
-/// `PathMap` is primarily used by [PathMapMap] to manage and query the overall path structure of
-/// all known belief networks. It plays a crucial role in generating `BeliefRow`s for UI rendering
-/// and in propagating structural changes through `BeliefEvent`s.
-#[derive(Debug, Clone)]
-pub struct PathMap {
-    // usize is the order for path, such that when map.keys() is order by usize the map is
-    // ordered by relation weight.
-    map: Vec<(String, Bid, Vec<u16>)>,
-    bid_map: BTreeMap<Bid, Vec<usize>>,
-    path_map: BTreeMap<String, usize>,
-    id_map: IdMap,
-    title_map: IdMap,
-    kind: WeightKind,
-    net: Bid,
-    subnets: BTreeSet<Bid>,
-    pub loops: BTreeSet<(Bid, Bid)>,
-}
-
 /// [PathMapMap] serves as a central manager for all [PathMap] instances for a specific
 /// [crate::properties::WeightKind] within a [crate::beliefbase::BeliefBase].
 ///
@@ -646,6 +600,52 @@ fn pathmap_order(a: &(String, Bid, Vec<u16>), b: &(String, Bid, Vec<u16>)) -> Or
     } else {
         a.2.len().cmp(&b.2.len())
     }
+}
+
+/// [PathMap] generates unique relative paths between [crate::properties::BeliefNode]s based on the
+/// graph structure for a particular [crate::properties::WeightKind] within a
+/// [crate::beliefbase::BeliefBase::relations] hypergraph.
+///
+/// Since [crate::beliefbase::BeliefBase::relations] storeas a [crate::beliefbase::BidGraph]
+/// hypergraph, there are multiple possible relational path structures within the object. A PathMap
+/// generates a [crate::properties::WeightKind]-specific tree structure from the BidGraph, and
+/// assigns each node within that tree a unique path. This helps source documents reference node
+/// relationships using relative links.
+///
+/// PathMap maintains the order of paths based on relationship weights and handles connections to
+/// sub-networks, which are themselves represented by other `PathMap` instances.
+///
+/// Each `PathMap` is built around a specific "net" [crate::properties::Bid], which acts as the root
+/// or entry point for the paths contained within this map. The `kind` field determines which type
+/// of relationship weights (e.g., Subsection, Epistemic) are used to construct the hierarchy.
+///
+/// The `map` field stores the primary path information: a vector of tuples, where each tuple
+/// contains a [String] (the path), a [crate::properties::Bid] (the belief node at that path), and a
+/// `Vec<u16>` representing the order of the node within the hierarchy.
+///
+/// `subnets` is a [BTreeMap] that links paths within this `PathMap` to the
+/// [crate::properties::Bid]s of other networks, allowing for navigation across different network
+/// segments.
+///
+/// `loops` keeps track of detected cycles in the underlying belief graph to prevent infinite
+/// recursion during path generation.
+///
+/// `PathMap` is primarily used by [PathMapMap] to manage and query the overall path structure of
+/// all known belief networks. It plays a crucial role in generating `BeliefRow`s for UI rendering
+/// and in propagating structural changes through `BeliefEvent`s.
+#[derive(Debug, Clone)]
+pub struct PathMap {
+    // usize is the order for path, such that when map.keys() is order by usize the map is
+    // ordered by relation weight.
+    map: Vec<(String, Bid, Vec<u16>)>,
+    bid_map: BTreeMap<Bid, Vec<usize>>,
+    path_map: BTreeMap<String, usize>,
+    id_map: IdMap,
+    title_map: IdMap,
+    kind: WeightKind,
+    net: Bid,
+    subnets: BTreeSet<Bid>,
+    pub loops: BTreeSet<(Bid, Bid)>,
 }
 
 impl PathMap {

@@ -18,6 +18,13 @@ pub enum EventOrigin {
     /// BeliefBase must apply these events to synchronize state.
     #[default]
     Remote,
+
+    /// Speculative event for dry-run processing.
+    /// BeliefBase should process the event logic without mutating state,
+    /// returning what derivative events WOULD be generated.
+    /// Used for path speculation in GraphBuilder::push() to determine node position
+    /// before committing to cache_fetch.
+    Speculative,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

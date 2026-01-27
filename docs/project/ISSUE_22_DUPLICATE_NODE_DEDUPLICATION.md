@@ -7,7 +7,7 @@
 
 ## Summary
 
-Two markdown headings with the same title (e.g., `## Details` twice) incorrectly create only ONE node in BeliefBase instead of two separate nodes. This is caused by premature key speculation in `GraphBuilder::push()` that matches the second heading to the first heading's cached node before considering the unique BID.
+Two markdown headings with the same title (e.g., `## Details` twice) incorrectly create only ONE node in BeliefBase instead of two separate nodes. This is caused by premature key speculation in `GraphBuilder::push()` that matches the second heading to the first heading's cached node using the `Title` key before considering structural position.
 
 This bug blocks full verification of Issue 03's collision detection behavior, where two "Details" headings should create two nodes with different IDs (first: "details", second: Bref fallback).
 
@@ -28,8 +28,8 @@ More content...
 **Current Behavior**:
 - Only ONE node in BeliefBase.states()
 - Second "Details" heading overwrites/merges with first
-- Collision detection works correctly during parse
-- But nodes deduplicate during `GraphBuilder::push()`
+- Collision detection works correctly during parse (MdCodec correctly sets second ID to None)
+- But nodes deduplicate during `GraphBuilder::push()` due to Title key matching
 
 ## Root Cause
 
@@ -45,7 +45,7 @@ async fn push(...) -> Result<...> {
     // Line ~810: Generate keys from parsed node
     let mut keys = parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb());
     
-    // Line ~816: Cache fetch BEFORE considering BID uniqueness
+    // Line ~816: Cache fetch using ALL keys including Title
     let cache_fetch_result = self
         .cache_fetch(&keys, global_bb.clone(), true, missing_structure)
         .await?;
@@ -55,29 +55,26 @@ async fn push(...) -> Result<...> {
 **What Happens**:
 
 1. **First "Details" heading**:
-   - BID: `aaa` (unique)
+   - proto.bid: `None`
    - Title: "Details"
    - ID: "details" (title-derived)
-   - Keys: `[Bid{aaa}, Bref{...}, Id{net, "details"}, Title{net, "details"}, Path{...}]`
-   - `cache_fetch()`: No match (first occurrence) → creates new node
+   - Keys: `[Path{net, "doc.md#details"}, Title{net, "details"}, Id{net, "details"}]`
+   - `cache_fetch()`: No match → creates new node (BID=aaa)
    - ✅ Node inserted into session_bb
 
 2. **Second "Details" heading**:
-   - BID: `bbb` (unique, different from first!)
+   - proto.bid: `None`
    - Title: "Details" (same as first)
-   - ID: "a1b2c3d4e5f6" (Bref fallback due to collision)
-   - Keys: `[Bid{bbb}, Bref{...}, Id{net, "a1b2c3d4e5f6"}, Title{net, "details"}, Path{...}]`
+   - ID: `None` (collision detected by MdCodec)
+   - Keys: `[Path{net, "doc.md#<bref>"}, Title{net, "details"}, Id{net, "<none>"}]`
    - ⚠️ `cache_fetch(&keys, ...)`: **MATCHES on `Title{net, "details"}`**
    - Returns first node (BID=aaa)
-   - Second node's BID (bbb) ignored
-   - ❌ Nodes merge/overwrite instead of creating separate entry
+   - Second node merges into first instead of creating separate entry
+   - ❌ Only one "Details" node exists
 
-**The Bug**: `cache_fetch()` matches on `Title` key before we've validated that the BID is actually different. The second heading should create a new node with a different BID, but instead it matches the cached first heading.
+**The Bug**: `cache_fetch()` matches on `Title` key, which is **not structurally unique** for section headings. Two headings can have the same title but occupy different positions in the document hierarchy.
 
 ## Why This Is Tricky
-
-From the issue comment:
-> "This will be tricky to figure out."
 
 **The Challenge**:
 
@@ -86,26 +83,18 @@ At the point where we call `cache_fetch()` (line ~816), we **cannot reliably use
 - doc_bb is not balanced/complete yet
 - Comment on line ~808: "Can't use self.doc_bb.paths() to generate keys here, because we can't assume that self.doc_bb is balanced until we're out of phase 1 of parse_content."
 
-**Normally**: The only reliable key at this point is `NodeKey::Path` (filesystem path)
-
-**But**: For markdown headings (sections):
-- They don't have unique filesystem paths (multiple headings in same file)
-- They share titles (causing the collision we're trying to handle)
-- BID is the ONLY guaranteed unique identifier
-
-**The Catch-22**:
-1. We need to call `cache_fetch()` to find existing nodes
-2. But `cache_fetch()` uses `keys` which includes `Title`
-3. Title matches cause wrong cache hits
-4. We can't know if it's a wrong hit without checking BID first
-5. But if we already have the BID, why are we doing cache_fetch?
+**Key insight**: For markdown headings (sections):
+- Path is NOT unique (multiple headings in same file)
+- **Title is NOT unique** (duplicate headings are common) ← Root cause
+- BID is unique but not available during Phase 1
+- **Position in sibling order IS unique** ← Solution!
 
 ## Architecture Context
 
 **Multi-Pass Compilation Model**:
-- **Phase 1**: Parse all files, collect unresolved references
-- **Phase 2+**: Reparse with resolved dependencies, inject BIDs
-- During Phase 1, we don't have BIDs yet (they're auto-generated)
+- **Phase 1**: Parse all files, collect unresolved references, generate BIDs
+- **Phase 2+**: Reparse with resolved dependencies, inject BIDs into source
+- During Phase 1, nodes don't have BIDs in source yet (they're auto-generated)
 - During Phase 2+, we have BIDs and need to match against cached nodes
 
 **GraphBuilder Role**:
@@ -115,14 +104,14 @@ At the point where we call `cache_fetch()` (line ~816), we **cannot reliably use
 
 **The Speculation Problem**:
 We "speculate" keys before we know if the node exists. For documents (files), this works because:
-- Path is unique
+- Path is unique (one file = one document)
 - Title is typically unique
 - BID uniqueness is enforced
 
 For headings (sections), this breaks because:
-- Path is NOT unique (multiple headings in same file)
-- Title is NOT unique (duplicate headings are common)
-- BID is unique but we're speculating OTHER keys first
+- **Path includes anchor**, which depends on ID collision detection
+- **Title is NOT unique** (causes wrong cache hits)
+- Position in sibling order IS unique but not currently used
 
 ## Test Evidence
 
@@ -138,10 +127,13 @@ Unique title...
 
 ## Details
 Second occurrence - collision!
+
+## Testing
+Final section...
 ```
 
 **Expected**: 4 heading nodes (Details, Implementation, Details, Testing)  
-**Actual**: 3 heading nodes (Details is deduplicated)
+**Actual**: 3 heading nodes (second Details is deduplicated into first)
 
 **Test Output**:
 ```
@@ -152,228 +144,275 @@ Found 3 heading nodes
 Found 1 'Details' headings  # Should be 2!
 ```
 
-## Potential Solutions
+## Solution: Speculative Path with Position-Based Disambiguation
 
-### Option 1: BID-First Matching (Preferred)
+**Core Insight**: Remove `Title` key from cache_fetch lookups for sections. Use **speculative path** instead, which includes position-based information.
 
-**Idea**: If parsed node has a BID, check BID match BEFORE title match in cache_fetch.
+### Why This Works
 
-**Implementation**:
+A path encodes:
+1. Parent path (known from stack)
+2. Node position via sort_key (can speculate as max+1)
+3. Anchor (ID or Bref)
+
+For the anchor part:
+1. Determine candidate ID:
+   - If explicit ID in proto → use it (normalized via `to_anchor()`)
+   - Otherwise → use title-derived ID (via `to_anchor(title)`)
+2. Check collision with siblings:
+   - If candidate ID collides → use placeholder `"<bref>"` (log warning if explicit ID)
+   - Otherwise → use candidate ID
+
+**Key realization**: We don't need to know the actual Bref value! A placeholder like `"<bref>"` is sufficient because:
+- Newly-generated Brefs are **guaranteed not to match** existing nodes
+- `cache_fetch()` with path `"doc.md#<bref>"` will return `Unresolved`
+- We create a new node in the Unresolved branch
+- The real Bref gets generated there (via `Bid::new(parent_bid)`)
+
+### Algorithm
+
 ```rust
 async fn push(...) -> Result<...> {
     let mut parsed_node = BeliefNode::try_from(proto)?;
     
-    // If parsed node has a BID (Phase 2+), try BID-only lookup first
-    let cache_fetch_result = if parsed_node.bid.initialized() {
-        // Try exact BID match first
-        let bid_keys = vec![NodeKey::Bid { bid: parsed_node.bid }];
-        match self.cache_fetch(&bid_keys, global_bb.clone(), false, missing_structure).await? {
-            GetOrCreateResult::Resolved(node, src) => {
-                // Exact match - use it
-                GetOrCreateResult::Resolved(node, src)
-            }
-            GetOrCreateResult::Unresolved(_) => {
-                // No BID match - this is a NEW node, generate all keys
-                let keys = parsed_node.keys(...);
-                // Filter out Title key to prevent wrong matches?
-                self.cache_fetch(&keys, global_bb, true, missing_structure).await?
-            }
-        }
+    // 1. Generate speculative path (without relying on doc_bb.paths())
+    let speculative_path = if proto.heading > 2 {
+        // This is a section heading
+        speculative_section_path(proto, parent_bid, &self.session_bb)
     } else {
-        // Phase 1: no BID yet, use normal key speculation
-        let keys = parsed_node.keys(...);
-        self.cache_fetch(&keys, global_bb, true, missing_structure).await?
+        // Document node - use normal path
+        proto.path.clone()
     };
     
-    // ... rest of function
-}
-```
-
-**Pros**:
-- BID is guaranteed unique
-- Only matches when it's actually the same node
-- Preserves existing Phase 1 behavior
-
-**Cons**:
-- Changes fundamental matching semantics
-- May break forward references in subtle ways
-- Requires careful testing of multi-pass scenarios
-
-### Option 2: Filter Title Key for Headings
-
-**Idea**: Don't include `Title` key in speculation for heading nodes.
-
-**Implementation**:
-```rust
-async fn push(...) -> Result<...> {
-    let mut parsed_node = BeliefNode::try_from(proto)?;
-    let mut keys = parsed_node.keys(...);
-    
-    // For heading nodes (proto.heading > 2), remove Title key
-    if proto.heading > 2 {
-        keys.retain(|k| !matches!(k, NodeKey::Title { .. }));
-    }
-    
-    let cache_fetch_result = self.cache_fetch(&keys, ...).await?;
-    // ...
-}
-```
-
-**Pros**:
-- Minimal changes
-- Targeted fix for specific problem
-
-**Cons**:
-- Breaks legitimate title-based matching for headings
-- May need special handling for other keys too (ID, Anchor)
-- Doesn't address root cause
-
-### Option 3: Post-Match BID Validation
-
-**Idea**: After `cache_fetch()` match, validate that BID matches (if we have one).
-
-**Implementation**:
-```rust
-async fn push(...) -> Result<...> {
-    let mut parsed_node = BeliefNode::try_from(proto)?;
-    let mut keys = parsed_node.keys(...);
-    let cache_fetch_result = self.cache_fetch(&keys, ...).await?;
-    
-    let (mut node, source) = match cache_fetch_result {
-        GetOrCreateResult::Resolved(mut found_node, src) => {
-            // NEW: Validate BID if both nodes have one
-            if parsed_node.bid.initialized() && found_node.bid.initialized() {
-                if parsed_node.bid != found_node.bid {
-                    // Different BIDs - this is a WRONG match!
-                    // Treat as unresolved and create new node
-                    tracing::info!(
-                        "BID mismatch: parsed={}, found={}. Creating new node.",
-                        parsed_node.bid, found_node.bid
-                    );
-                    // Create new node with parsed_node's data
-                    (parsed_node, NodeSource::Generated)
-                } else {
-                    // Same BID - legitimate match
-                    (found_node, src)
-                }
+    // 2. Generate keys WITHOUT Title for sections
+    let mut keys = if proto.heading > 2 {
+        vec![
+            NodeKey::Path { net: parent_net, path: speculative_path },
+            // Include ID if present
+            proto.id.as_ref().map(|id| NodeKey::Id { net: parent_net, id: id.clone() }),
+            // Include BID if initialized (Phase 2+)
+            if parsed_node.bid.initialized() {
+                Some(NodeKey::Bid { bid: parsed_node.bid })
             } else {
-                // One or both nodes don't have BID - proceed with match
-                (found_node, src)
+                None
             }
-        }
-        GetOrCreateResult::Unresolved(_) => {
-            (parsed_node, NodeSource::Generated)
-        }
+        ].into_iter().flatten().collect()
+    } else {
+        // Document nodes: use all keys as before
+        parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb())
     };
+    
+    // 3. Cache fetch with position-aware keys
+    let cache_fetch_result = self
+        .cache_fetch(&keys, global_bb.clone(), true, missing_structure)
+        .await?;
     
     // ... rest of function
 }
+
+fn speculative_section_path(
+    proto: &ProtoBeliefNode,
+    parent_bid: Bid,
+    session_bb: &BeliefBase,
+) -> String {
+    // 1. Get parent node and its path
+    let parent_node = session_bb.states().get(&parent_bid).unwrap();
+    let parent_path = /* extract from parent_node */;
+    
+    // 2. Get siblings to check ID collision
+    let siblings = /* query session_bb.relations() for nodes with same parent */;
+    
+    // 3. Determine anchor with collision detection
+    let title = proto.document.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    
+    // Determine candidate ID (explicit or title-derived)
+    let (candidate_id, is_explicit) = if let Some(explicit_id) = &proto.id {
+        (to_anchor(explicit_id), true)
+    } else {
+        (to_anchor(title), false)
+    };
+    
+    // Check for collision with siblings
+    let id_collides = siblings.iter().any(|sib| {
+        sib.id() == Some(&candidate_id)
+    });
+    
+    let anchor = if id_collides {
+        if is_explicit {
+            tracing::warn!(
+                "Explicit ID '{}' collides with sibling. Using Bref fallback.",
+                candidate_id
+            );
+        }
+        "<bref>".to_string()  // Placeholder for collision case
+    } else {
+        candidate_id
+    };
+    
+    // 4. Construct path
+    format!("{}#{}", parent_path, anchor)
+}
 ```
 
-**Pros**:
-- Minimal invasive change
-- Preserves existing speculation logic
-- Only rejects matches that are provably wrong
+### How This Fixes the Bug
 
-**Cons**:
-- Might create duplicate entries in cache
-- Unclear how to "uncache" the wrong match
-- May need to update cache indices
+| Case | Speculative Path | Cache Match? | Result |
+|------|------------------|--------------|---------|
+| First "Details" | `doc.md#details` | No | Create new (BID=aaa) |
+| Second "Details" | `doc.md#<bref>` | No | Create new (BID=bbb) |
+| Phase 2 First "Details" | `doc.md#details` | **Yes** | Update existing (BID=aaa) |
+| Phase 2 Second "Details" | `doc.md#<bref-actual>` | No, but BID matches | Update via BID key |
 
-### Option 4: Defer Heading Node Creation
+**Critical**: Remove Title from keys for sections entirely. Path is sufficient and unambiguous.
 
-**Idea**: Don't call `push()` for heading nodes during Phase 1; wait until Phase 2+ when BIDs are known.
+## Truth Table for Node Resolution
 
-**Pros**:
-- Avoids speculation entirely for headings
+### Inputs:
+- **parsed_node.bid.initialized()**: Does proto have a BID?
+- **cache_fetch result**: Match found?
+- **Match key type**: What key caused the match?
+- **proto.heading**: Section (>2) or Document (≤2)?
 
-**Cons**:
-- Major architectural change
-- Breaks forward references to headings
-- Likely causes other issues
+### Cases:
 
-## Testing Strategy
+| Parsed BID | Cache Match | Match Key | Proto Type | Action | Final BID | Notes |
+|------------|-------------|-----------|------------|--------|-----------|-------|
+| No | No | - | Any | Create new | Generate via `Bid::new(parent)` | Phase 1 first encounter |
+| No | Yes | Path | Section | Update | Use found BID | Phase 1 reparse (shouldn't happen) |
+| No | Yes | Path | Document | Update | Use found BID | Watch session (--write=false) |
+| No | Yes | ~~Title~~ | Section | ~~Update~~ | ~~Use found~~ | **BUG - Remove Title key!** |
+| Yes | No | - | Any | Create new | Use parsed BID | User added explicit BID |
+| Yes | Yes | BID | Any | Update | Use parsed BID (may rename) | Phase 2+ match |
+| Yes | Yes | Path | Section | Check BID match | Depends | If BIDs differ: rename; else: update |
+| Yes | Yes | Path | Document | Update | Use parsed BID | Normal document update |
 
-**Unit Tests**:
-1. Test `cache_fetch()` with duplicate titles but different BIDs
-2. Test `push()` with two ProtoBeliefNodes with same title, different BIDs
-3. Test key speculation with and without initialized BIDs
+### Special Cases:
 
-**Integration Tests**:
-1. Parse document with duplicate heading titles
-2. Verify two separate nodes created in BeliefBase
-3. Verify both nodes have correct IDs (collision detection worked)
-4. Verify both nodes accessible by their respective BIDs
+**Case: User explicitly replaced BID**
+- Parsed: BID=newBID
+- Cache finds: oldBID node via Path
+- Action: Update found node's BID (rename operation)
 
-**Regression Tests**:
-1. Ensure forward references still work (Issue 01)
-2. Ensure multi-pass compilation still works
-3. Ensure BID injection still works
-4. Ensure sections metadata enrichment still works (Issue 02)
+**Case: Multiple conflicting titles, no ID match (THE BUG)**
+- Parsed: BID=None, Title="Details" (second occurrence)
+- ~~Cache matches: First "Details" via Title key~~ ← **REMOVED**
+- Cache matches: Nothing (different speculative paths)
+- Action: Create new node ✅
 
-## Success Criteria
-
-- [ ] Two "Details" headings create two separate nodes in BeliefBase
-- [ ] First "Details" has ID="details"
-- [ ] Second "Details" has ID=<bref> (Bref fallback)
-- [ ] Both nodes have different BIDs
-- [ ] Both nodes are independently accessible
-- [ ] All existing tests still pass (95 tests)
-- [ ] test_anchor_collision_detection can uncomment detailed assertions
-- [ ] test_anchor_selective_injection can verify two nodes
-
-## Risks
-
-**Risk**: Breaking forward reference resolution  
-**Mitigation**: Extensive testing of multi-pass compilation, particularly Issue 01 scenarios
-
-**Risk**: Performance impact from additional BID validation  
-**Mitigation**: Validation only runs when both nodes have BIDs (Phase 2+)
-
-**Risk**: Cache inconsistencies if we reject matches  
-**Mitigation**: Need careful design of how to "create new node" after rejecting cache match
-
-**Risk**: May surface other deduplication bugs  
-**Mitigation**: Comprehensive test coverage, start with Option 3 (least invasive)
+**Case: Section title matches parent document title**
+- Document: "Introduction" (heading=2)
+- Section: "## Introduction" (heading=3)
+- Both have Title="Introduction", same network
+- With Title key: Ambiguous match ❌
+- With Path key: Different paths, no collision ✅
 
 ## Implementation Plan
 
-### Phase 1: Investigation (0.5 days)
-1. Add extensive logging to `push()` and `cache_fetch()`
-2. Run test_anchor_collision_detection with tracing
-3. Confirm exact sequence of events causing duplication
-4. Document findings
+### Phase 1: Speculative Path Generation using EventOrigin::Speculative (1 day)
 
-### Phase 2: Prototype (1 day)
-1. Implement Option 3 (Post-Match BID Validation)
-2. Test with anchors_collision_test.md
-3. Verify two "Details" nodes created
-4. Check for cache issues or side effects
+**Approach**: Use `EventOrigin::Speculative` to speculatively insert the node and query the resulting PathMap for the actual path that would be generated.
 
-### Phase 3: Testing (0.5 days)
-1. Run full test suite
-2. Test multi-pass compilation scenarios
-3. Test forward references
-4. Ensure no regressions
+1. Create `fn speculative_section_path()` in builder.rs
+   - Create a speculative RelationInsert event with `EventOrigin::Speculative`
+   - Process event through session_bb (dry-run, no mutation)
+   - Query resulting PathMap for the generated path
+   - Extract anchor from path (ID or Bref)
+   - Return speculative path
 
-### Phase 4: Refinement (0.5-1 day)
-1. If Option 3 has issues, try Option 1 (BID-First Matching)
-2. Add diagnostic logging for BID mismatches
-3. Update documentation
-4. Clean up any temporary debugging code
+2. Modify `push()` to use speculative path for sections
+   - For proto.heading > 2: call `speculative_section_path()`
+   - Build keys WITHOUT Title: only Path, ID (if present), BID (if initialized)
+   - For proto.heading ≤ 2: use existing logic (documents)
+
+3. Implement EventOrigin::Speculative handling in BeliefBase
+   - ✅ Already added to event.rs
+   - Modify `BeliefBase::process_event()` to return derivative events without mutation when origin is Speculative
+   - PathMap should compute path normally but not update indices
+
+4. Unit tests for speculative_section_path()
+   - Test: No collision → path uses title-derived ID
+   - Test: Collision detected → path uses Bref
+   - Test: Explicit ID collision → path uses Bref with warning
+   - Test: Multiple speculation calls don't affect session_bb state
+
+**Benefits of this approach**:
+- ✅ Reuses existing PathMap logic (no duplication)
+- ✅ Guaranteed to match actual path generation
+- ✅ Handles all edge cases PathMap already handles
+- ✅ Less invasive than manual session_bb queries
+- ✅ Future-proof: PathMap changes automatically reflected
+
+### Phase 2: Integration and Testing (1 day)
+
+1. Run test_anchor_collision_detection
+   - Verify two "Details" nodes created
+   - Verify different BIDs and IDs
+
+2. Test multi-pass compilation
+   - Phase 1: Nodes created with generated BIDs
+   - Phase 2: Nodes matched via Path or BID keys
+   - Verify no duplicate creation
+
+3. Test watch session (--write=false)
+   - Parse without BID in proto
+   - Match existing node via Path
+   - Verify found BID used
+
+4. Regression tests
+   - All 95 existing tests pass
+   - Forward references still work
+   - Section metadata enrichment still works
+
+### Phase 3: Unit Tests for builder.rs (Complete ✅)
+
+Create `src/codec/builder.rs::tests` module:
+- Test speculative_section_path() logic
+- Test push() with duplicate titles
+- Test cache_fetch with/without Title key
+- Test BID resolution truth table cases
+
+## Success Criteria
+
+- [x] MdCodec collision detection sets second "Details" id to None ✅ (already works)
+- [ ] Two "Details" headings create two separate nodes in BeliefBase
+- [ ] First "Details" has ID="details"
+- [ ] Second "Details" has ID=<bref> (generated in inject_context)
+- [ ] Both nodes have different BIDs
+- [ ] Both nodes are independently accessible
+- [ ] All existing tests still pass (95 tests)
+- [ ] test_anchor_collision_detection passes with full assertions
+- [ ] New unit tests for builder.rs truth table cases
+
+## Risks
+
+**Risk**: Breaking document-level path matching  
+**Mitigation**: Only change section path logic (heading > 2), preserve document logic
+
+**Risk**: Speculative path differs from final path  
+**Mitigation**: Use same logic as PathMap for path generation, test extensively
+
+**Risk**: Performance impact from sibling queries  
+**Mitigation**: session_bb queries are fast (in-memory), only for sections
+
+**Risk**: Phase 2+ matching breaks  
+**Mitigation**: Keep BID key for Phase 2+ matching, test multi-pass scenarios
 
 ## References
 
 - Issue 03: Section Heading Anchor Management (blocked on this)
 - `src/codec/builder.rs:798-979` - GraphBuilder::push()
 - `src/codec/builder.rs:1175-1267` - GraphBuilder::cache_fetch()
+- `src/codec/md.rs:1083-1110` - MdCodec collision detection (already works)
+- `src/paths.rs` - PathMap path generation logic
 - `tests/codec_test.rs:605-628` - test_anchor_collision_detection
 - `tests/network_1/anchors_collision_test.md` - Test fixture
 
 ## Notes
 
-This is a subtle architectural bug that affects the fundamental node identity resolution during multi-pass compilation. The fix needs to be surgical to avoid breaking the carefully-designed forward reference resolution system.
+This solution is architecturally cleaner than BID validation because:
+1. **Title is not an identity key for sections** - it's just metadata
+2. **Path encodes structural position** - parent + order + anchor
+3. **No special-case logic** - just use the right keys from the start
+4. **Forward-compatible** - works with future PathMap enhancements
 
-The "tricky" part is that we're in a Catch-22: we need cache lookup to enable forward refs, but cache lookup can give wrong matches for duplicate titles. BID validation AFTER matching seems like the least invasive approach.
-
-**Recommendation**: Start with Option 3, gather data, iterate if needed.
+The key insight: **Position in document structure is what makes nodes unique, not their title.**

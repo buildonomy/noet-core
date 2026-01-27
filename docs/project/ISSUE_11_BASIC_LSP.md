@@ -355,7 +355,58 @@ async fn main() {
 - [ ] Test LSP works in Zed
 - [ ] Test LSP works in Neovim (if possible)
 
-### 7. Documentation and Examples (0.5 days)
+### 7. Audit and Convert Tracing Logs to Diagnostics (1-2 days)
+  
+**Goal**: Convert parse-time tracing logs to structured ParseDiagnostic for LSP integration.
+  
+**Pattern**: Use instrumentation design pattern from `docs/design/instrumentation_design.md`
+  
+**Tasks**:
+1. Audit codebase for `tracing::{warn, info, debug}` calls related to parsing:
+   - `src/codec/builder.rs` - BID mismatches, cache_fetch issues
+   - `src/codec/md.rs` - ID normalization, collision detection
+   - `src/paths.rs` - Title collisions in title_map
+   - `src/codec/belief_ir.rs` - TOML parsing errors
+  
+2. Create `DiagnosticCaptureLayer` following instrumentation pattern:
+   ```rust
+   struct DiagnosticCaptureLayer {
+       state: Arc<Mutex<DiagnosticState>>,
+   }
+   ```
+  
+3. Add `capture_diagnostic!` macro (similar to `capture_data!`):
+   ```rust
+   capture_diagnostic!(ParseDiagnostic::warning("...")
+       .with_location(line, column));
+   ```
+  
+4. Dual-emit during migration:
+   - Keep existing tracing for debugging
+   - Add structured diagnostic capture
+   - Remove tracing once LSP integration working
+  
+5. Modify DocCodec trait to return diagnostics:
+   ```rust
+   fn parse(...) -> Result<(Vec<ProtoBeliefNode>, Vec<ParseDiagnostic>)>
+   ```
+  
+**Integration Points**:
+- Use RoutingLayer pattern to separate diagnostic capture from logging
+- Zero-cost when disabled (crucial for performance)
+- Thread-safe via Arc<Mutex> (proven in instrumentation design)
+  
+**Examples from Issue 22**:
+- Title collision warnings
+- Explicit ID collision warnings  
+- BID mismatch diagnostics
+- Network-level ID collision warnings
+  
+**Related**:
+- `docs/design/instrumentation_design.md` - Proven pattern
+- Issue 22 - Uses tracing now, marked with TODO for conversion
+  
+### 8. Documentation and Examples (0.5 days)
 
 **Objective**: Enable users to set up and use LSP
 
@@ -380,6 +431,12 @@ async fn main() {
 - [ ] Test troubleshooting steps resolve common issues
 
 ## Testing Requirements
+ 
+### Diagnostic Capture Testing
+- Test `DiagnosticCaptureLayer` captures events correctly
+- Test diagnostics include accurate location information
+- Test zero-cost when disabled (benchmark parsing)
+- Test thread-safety under concurrent parse operations
 
 ### Unit Tests
 - Position tracking in parser returns correct ranges
@@ -498,6 +555,8 @@ async fn main() {
 - Decision: Start as subcommand (`noet lsp`), easy to split later if needed
 
 ## References
+ 
+- **Instrumentation Pattern**: `docs/design/instrumentation_design.md` - Proven tracing-based capture system
 
 - **Depends On**: [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - daemon must be working
 - **Enables**: [`ISSUE_12_ADVANCED_LSP.md`](./ISSUE_12_ADVANCED_LSP.md) - advanced LSP features

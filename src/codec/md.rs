@@ -544,6 +544,9 @@ fn merge_metadata_into_node(node: &mut ProtoBeliefNode, metadata: &toml_edit::Ta
     }
 }
 
+/// Determine node ID with collision detection.
+/// Priority: explicit ID > title-derived ID > bref (on collision)
+
 #[derive(Debug, Default, Clone)]
 pub struct MdCodec {
     current_events: Vec<ProtoNodeWithEvents>,
@@ -718,6 +721,25 @@ impl DocCodec for MdCodec {
                         proto_events.0.id = None;
                         id_changed = true;
                     }
+                }
+
+                // Generate Bref for collision cases where id was set to None at parse time
+                // At parse time, we detected collision but couldn't generate Bref (no BID yet)
+                // Now we have the real BID from push(), so generate the proper Bref
+                if proto_events.0.id.is_none() {
+                    let real_bref = ctx.node.bid.namespace().to_string();
+                    tracing::debug!(
+                        "Collision detected at parse time, generating Bref '{}' for heading '{}'",
+                        real_bref,
+                        proto_events
+                            .0
+                            .document
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<untitled>")
+                    );
+                    proto_events.0.id = Some(real_bref);
+                    id_changed = true;
                 }
             }
 
@@ -1040,23 +1062,31 @@ impl DocCodec for MdCodec {
                     // Only for section headings (heading > 2), not document nodes
                     if current.heading > 2 {
                         let explicit_id = current.id.as_deref();
-                        let bref = current
-                            .document
-                            .get("bid")
-                            .and_then(|v| v.as_str())
-                            .and_then(|bid_str| Bid::try_from(bid_str).ok())
-                            .map(|bid| bid.namespace().to_string())
-                            .unwrap_or_else(|| "000000000000".to_string());
 
-                        let final_id =
-                            determine_node_id(explicit_id, &title, &bref, &self.seen_ids);
+                        // Determine candidate ID (explicit or title-derived)
+                        let candidate = if let Some(id) = explicit_id {
+                            to_anchor(id)
+                        } else {
+                            to_anchor(&title)
+                        };
 
-                        // Track this ID to detect future collisions
-                        self.seen_ids.insert(final_id.clone());
+                        // Check for collision
+                        let final_id = if self.seen_ids.contains(&candidate) {
+                            // Collision detected! We can't generate Bref yet (no BID at parse time)
+                            // Use None to signal that inject_context() should generate the Bref
+                            None
+                        } else {
+                            Some(candidate.clone())
+                        };
+
+                        // Track this ID to detect future collisions (only if we assigned one)
+                        if let Some(ref id) = final_id {
+                            self.seen_ids.insert(id.clone());
+                        }
 
                         // Store final ID in node's id field
                         // Note: We store in document during inject_context to avoid spurious update events
-                        current.id = Some(final_id);
+                        current.id = final_id;
                     }
                 }
                 _ => {}
@@ -1497,275 +1527,174 @@ schema = "Document"
         let result = find_metadata_match(&node, &metadata);
         assert!(result.is_none());
     }
-}
 
-// ========================================================================
-// Issue 3: Anchor Management Tests
-// ========================================================================
+    // ========================================================================
+    #[test]
+    fn test_to_anchor_consistency() {
+        // Verify to_anchor() behavior for collision detection
+        assert_eq!(to_anchor("Details"), "details");
+        assert_eq!(to_anchor("Section One"), "section-one");
+        assert_eq!(to_anchor("API & Reference"), "api--reference");
+        assert_eq!(to_anchor("My-Section!"), "my-section");
 
-/// Determine node ID with collision detection.
-/// Priority: explicit ID > title-derived ID > bref (on collision)
-fn determine_node_id(
-    explicit_id: Option<&str>,
-    title: &str,
-    bref: &str,
-    existing_ids: &HashSet<String>,
-) -> String {
-    // Try explicit ID first, then title-derived ID
-    let candidate = if let Some(id) = explicit_id {
-        to_anchor(id)
-    } else {
-        to_anchor(title)
-    };
-
-    // Fallback to Bref if collision detected
-    if existing_ids.contains(&candidate) {
-        bref.to_string()
-    } else {
-        candidate
+        // Case insensitivity
+        assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
+        assert_eq!(to_anchor("Section"), to_anchor("section"));
     }
-}
 
-#[test]
-fn test_determine_node_id_no_collision() {
-    let existing_ids = HashSet::new();
-    let bref = "a1b2c3d4e5f6";
+    #[test]
+    fn test_pulldown_cmark_to_cmark_writes_heading_ids() {
+        // Verify that pulldown_cmark_to_cmark writes the `id` field from heading events
+        use pulldown_cmark::{Event as MdEvent, HeadingLevel, Tag as MdTag, TagEnd as MdTagEnd};
 
-    // No explicit ID, unique title
-    let id = determine_node_id(None, "Introduction", bref, &existing_ids);
-    assert_eq!(id, "introduction");
+        // Test 1: Parse heading with ID
+        let markdown = "## My Heading {#my-id}";
+        let parser = MdParser::new_ext(markdown, buildonomy_md_options());
+        let events: Vec<MdEvent> = parser.collect();
 
-    // Explicit ID, no collision
-    let id = determine_node_id(Some("custom-id"), "Introduction", bref, &existing_ids);
-    assert_eq!(id, "custom-id");
-}
+        // Verify ID was parsed
+        let has_id = events.iter().any(|e| {
+            if let MdEvent::Start(MdTag::Heading { id, .. }) = e {
+                id.as_ref().map(|s| s.as_ref()) == Some("my-id")
+            } else {
+                false
+            }
+        });
+        assert!(has_id, "Should parse heading ID");
 
-#[test]
-fn test_determine_node_id_title_collision() {
-    let mut existing_ids = HashSet::new();
-    existing_ids.insert("details".to_string());
-    let bref = "a1b2c3d4e5f6";
+        // Test 2: Write back with cmark
+        let mut buf = String::new();
+        pulldown_cmark_to_cmark::cmark(events.iter(), &mut buf).unwrap();
+        assert!(
+            buf.contains("{ #my-id }") || buf.contains("{#my-id}"),
+            "Should write heading ID back. Got: {buf}"
+        );
 
-    // No explicit ID, title collides → use Bref
-    let id = determine_node_id(None, "Details", bref, &existing_ids);
-    assert_eq!(id, bref, "Should use Bref when title collides");
-}
+        // Test 3: Modify ID and write
+        let modified_events = vec![
+            MdEvent::Start(MdTag::Heading {
+                level: HeadingLevel::H2,
+                id: Some(CowStr::from("new-id")),
+                classes: Vec::new(),
+                attrs: Vec::new(),
+            }),
+            MdEvent::Text(CowStr::from("My Heading")),
+            MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
+        ];
 
-#[test]
-fn test_determine_node_id_explicit_collision() {
-    let mut existing_ids = HashSet::new();
-    existing_ids.insert("my-section".to_string());
-    let bref = "a1b2c3d4e5f6";
+        let mut buf2 = String::new();
+        pulldown_cmark_to_cmark::cmark(modified_events.iter(), &mut buf2).unwrap();
+        assert!(
+            buf2.contains("{ #new-id }") || buf2.contains("{#new-id}"),
+            "Should write modified heading ID. Got: {buf2}"
+        );
 
-    // Explicit ID collides → use Bref
-    let id = determine_node_id(Some("my-section"), "Different Title", bref, &existing_ids);
-    assert_eq!(id, bref, "Should use Bref even when explicit ID collides");
-}
+        // Test 4: Normalized ID (lowercase, no punctuation)
+        let normalized_events = vec![
+            MdEvent::Start(MdTag::Heading {
+                level: HeadingLevel::H2,
+                id: Some(CowStr::from("my-heading")), // normalized
+                classes: Vec::new(),
+                attrs: Vec::new(),
+            }),
+            MdEvent::Text(CowStr::from("My Heading")),
+            MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
+        ];
 
-#[test]
-fn test_determine_node_id_normalization() {
-    let existing_ids = HashSet::new();
-    let bref = "a1b2c3d4e5f6";
+        let mut buf3 = String::new();
+        pulldown_cmark_to_cmark::cmark(normalized_events.iter(), &mut buf3).unwrap();
+        assert!(
+            buf3.contains("{ #my-heading }") || buf3.contains("{#my-heading}"),
+            "Should write normalized ID. Got: {buf3}"
+        );
+    }
 
-    // Explicit ID with special chars gets normalized
-    let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
-    assert_eq!(
-        id, "section-one",
-        "Should normalize explicit ID using to_anchor()"
-    );
+    #[test]
+    fn test_id_normalization_during_parse() {
+        // Test that IDs are normalized during parse (without explicit ID syntax)
+        use toml_edit::DocumentMut;
 
-    // Explicit ID with various special chars
-    let id = determine_node_id(Some("API & Reference"), "Title", bref, &existing_ids);
-    assert_eq!(
-        id, "api--reference",
-        "Should strip punctuation and normalize"
-    );
-}
+        let markdown = "## My-Section!";
+        let mut codec = MdCodec::new();
 
-#[test]
-fn test_determine_node_id_normalization_collision() {
-    let mut existing_ids = HashSet::new();
-    existing_ids.insert("section-one".to_string());
-    let bref = "a1b2c3d4e5f6";
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
+        doc.insert("schema", value("Document"));
 
-    // Explicit ID normalizes to existing ID → collision → use Bref
-    let id = determine_node_id(Some("Section One!"), "Title", bref, &existing_ids);
-    assert_eq!(
-        id, bref,
-        "Should detect collision after normalization and use Bref"
-    );
-}
+        let proto = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+            id: None,
+        };
 
-#[test]
-fn test_to_anchor_consistency() {
-    // Verify to_anchor() behavior for collision detection
-    assert_eq!(to_anchor("Details"), "details");
-    assert_eq!(to_anchor("Section One"), "section-one");
-    assert_eq!(to_anchor("API & Reference"), "api--reference");
-    assert_eq!(to_anchor("My-Section!"), "my-section");
+        codec.parse(markdown.to_string(), proto).unwrap();
 
-    // Case insensitivity
-    assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
-    assert_eq!(to_anchor("Section"), to_anchor("section"));
-}
+        // Verify ID was normalized from title during parse
+        let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
+        assert!(heading_node.is_some(), "Should have heading node");
+        let (proto, _) = heading_node.unwrap();
+        assert_eq!(
+            proto.id.as_deref(),
+            Some("my-section"),
+            "ID should be normalized to lowercase without punctuation"
+        );
+    }
 
-#[test]
-fn test_pulldown_cmark_to_cmark_writes_heading_ids() {
-    // Verify that pulldown_cmark_to_cmark writes the `id` field from heading events
-    use pulldown_cmark::{Event as MdEvent, HeadingLevel, Tag as MdTag, TagEnd as MdTagEnd};
+    #[test]
+    fn test_id_collision_bref_fallback() {
+        // Test that Bref is used when collision is detected during parse
+        use toml_edit::DocumentMut;
 
-    // Test 1: Parse heading with ID
-    let markdown = "## My Heading {#my-id}";
-    let parser = MdParser::new_ext(markdown, buildonomy_md_options());
-    let events: Vec<MdEvent> = parser.collect();
+        let markdown = "## Details\n\n## Details";
+        let mut codec = MdCodec::new();
 
-    // Verify ID was parsed
-    let has_id = events.iter().any(|e| {
-        if let MdEvent::Start(MdTag::Heading { id, .. }) = e {
-            id.as_ref().map(|s| s.as_ref()) == Some("my-id")
-        } else {
-            false
-        }
-    });
-    assert!(has_id, "Should parse heading ID");
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
+        doc.insert("schema", value("Document"));
 
-    // Test 2: Write back with cmark
-    let mut buf = String::new();
-    pulldown_cmark_to_cmark::cmark(events.iter(), &mut buf).unwrap();
-    assert!(
-        buf.contains("{ #my-id }") || buf.contains("{#my-id}"),
-        "Should write heading ID back. Got: {buf}"
-    );
+        let proto = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+            id: None,
+        };
 
-    // Test 3: Modify ID and write
-    let modified_events = vec![
-        MdEvent::Start(MdTag::Heading {
-            level: HeadingLevel::H2,
-            id: Some(CowStr::from("new-id")),
-            classes: Vec::new(),
-            attrs: Vec::new(),
-        }),
-        MdEvent::Text(CowStr::from("My Heading")),
-        MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
-    ];
+        codec.parse(markdown.to_string(), proto).unwrap();
 
-    let mut buf2 = String::new();
-    pulldown_cmark_to_cmark::cmark(modified_events.iter(), &mut buf2).unwrap();
-    assert!(
-        buf2.contains("{ #new-id }") || buf2.contains("{#new-id}"),
-        "Should write modified heading ID. Got: {buf2}"
-    );
+        // Verify first "Details" has title-derived ID, second has Bref
+        let heading_nodes: Vec<&(ProtoBeliefNode, MdEventQueue)> = codec
+            .current_events
+            .iter()
+            .filter(|(p, _)| p.heading > 2)
+            .collect();
 
-    // Test 4: Normalized ID (lowercase, no punctuation)
-    let normalized_events = vec![
-        MdEvent::Start(MdTag::Heading {
-            level: HeadingLevel::H2,
-            id: Some(CowStr::from("my-heading")), // normalized
-            classes: Vec::new(),
-            attrs: Vec::new(),
-        }),
-        MdEvent::Text(CowStr::from("My Heading")),
-        MdEvent::End(MdTagEnd::Heading(HeadingLevel::H2)),
-    ];
+        assert_eq!(heading_nodes.len(), 2, "Should have 2 heading nodes");
 
-    let mut buf3 = String::new();
-    pulldown_cmark_to_cmark::cmark(normalized_events.iter(), &mut buf3).unwrap();
-    assert!(
-        buf3.contains("{ #my-heading }") || buf3.contains("{#my-heading}"),
-        "Should write normalized ID. Got: {buf3}"
-    );
-}
+        // First should have title-derived ID
+        assert_eq!(
+            heading_nodes[0].0.id.as_deref(),
+            Some("details"),
+            "First 'Details' should have title-derived ID"
+        );
 
-#[test]
-fn test_id_normalization_during_parse() {
-    // Test that IDs are normalized during parse (without explicit ID syntax)
-    use toml_edit::DocumentMut;
-
-    let markdown = "## My-Section!";
-    let mut codec = MdCodec::new();
-
-    let mut doc = DocumentMut::new();
-    doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
-    doc.insert("schema", value("Document"));
-
-    let proto = ProtoBeliefNode {
-        accumulator: None,
-        content: String::new(),
-        document: doc,
-        upstream: Vec::new(),
-        downstream: Vec::new(),
-        path: "test.md".to_string(),
-        kind: crate::properties::BeliefKindSet::default(),
-        errors: Vec::new(),
-        heading: 2,
-        id: None,
-    };
-
-    codec.parse(markdown.to_string(), proto).unwrap();
-
-    // Verify ID was normalized from title during parse
-    let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
-    assert!(heading_node.is_some(), "Should have heading node");
-    let (proto, _) = heading_node.unwrap();
-    assert_eq!(
-        proto.id.as_deref(),
-        Some("my-section"),
-        "ID should be normalized to lowercase without punctuation"
-    );
-}
-
-#[test]
-fn test_id_collision_bref_fallback() {
-    // Test that Bref is used when collision is detected during parse
-    use toml_edit::DocumentMut;
-
-    let markdown = "## Details\n\n## Details";
-    let mut codec = MdCodec::new();
-
-    let mut doc = DocumentMut::new();
-    doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
-    doc.insert("schema", value("Document"));
-
-    let proto = ProtoBeliefNode {
-        accumulator: None,
-        content: String::new(),
-        document: doc,
-        upstream: Vec::new(),
-        downstream: Vec::new(),
-        path: "test.md".to_string(),
-        kind: crate::properties::BeliefKindSet::default(),
-        errors: Vec::new(),
-        heading: 2,
-        id: None,
-    };
-
-    codec.parse(markdown.to_string(), proto).unwrap();
-
-    // Verify first "Details" has title-derived ID, second has Bref
-    let heading_nodes: Vec<&(ProtoBeliefNode, MdEventQueue)> = codec
-        .current_events
-        .iter()
-        .filter(|(p, _)| p.heading > 2)
-        .collect();
-
-    assert_eq!(heading_nodes.len(), 2, "Should have 2 heading nodes");
-
-    // First should have title-derived ID
-    assert_eq!(
-        heading_nodes[0].0.id.as_deref(),
-        Some("details"),
-        "First 'Details' should have title-derived ID"
-    );
-
-    // Second should have Bref (12-char hex)
-    let second_id = heading_nodes[1].0.id.as_ref().unwrap();
-    assert_eq!(
-        second_id.len(),
-        12,
-        "Second 'Details' should have Bref (12 chars)"
-    );
-    assert!(
-        second_id.chars().all(|c| c.is_ascii_hexdigit()),
-        "Bref should be hex digits"
-    );
+        // Second should have None (collision detected, Bref will be generated in inject_context)
+        assert_eq!(
+            heading_nodes[1].0.id.as_deref(),
+            None,
+            "Second 'Details' should have None due to collision (Bref assigned in inject_context)"
+        );
+    }
 }
