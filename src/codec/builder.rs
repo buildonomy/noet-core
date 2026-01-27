@@ -800,7 +800,7 @@ impl GraphBuilder {
         let temp_bid = if parsed_node.bid.initialized() {
             parsed_node.bid
         } else {
-            Bid::new(&parent_bid)
+            Bid::new(parent_bid)
         };
 
         // Get the PathMap for this network and compute speculative path
@@ -1152,6 +1152,12 @@ impl GraphBuilder {
                     );
                     unresolved.self_net = owner_home_net;
                     unresolved.self_path = owner_home_path;
+                    tracing::debug!(
+                        "Unresolved relation at index {}: {:?} -> {:?}. Index gap preserved to track missing reference.",
+                        index,
+                        owner_bid,
+                        other_key
+                    );
                     return Ok(GetOrCreateResult::Unresolved(unresolved));
                 }
             }
@@ -1382,7 +1388,7 @@ mod tests {
         let bid = bid.unwrap_or_else(|| Bid::new(Bid::nil()));
         BeliefNode {
             bid,
-            kind: BeliefKindSet::from(BeliefKind::Document | BeliefKind::Document),
+            kind: BeliefKindSet::from(BeliefKind::Document),
             title: title.to_string(),
             schema: None,
             payload: Default::default(),
@@ -1416,7 +1422,7 @@ mod tests {
         let existing_node = create_test_node("Details", BeliefKind::Document, Some(existing_bid));
 
         // In watch session, proto has no BID but cache has the node
-        assert!(!proto.document.get("bid").is_some());
+        assert!(proto.document.get("bid").is_none());
         assert_eq!(existing_node.bid, existing_bid);
 
         // Logic: Use found BID

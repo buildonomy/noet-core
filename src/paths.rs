@@ -216,7 +216,12 @@ pub fn path_join(base: &str, end: &str, end_is_anchor: bool) -> String {
     }
 
     if end_is_anchor {
-        format!("{}#{}", get_doc_path(base), end)
+        let doc_path = get_doc_path(base);
+        // For anchors, also strip any nested anchors from end to get just the terminal anchor
+        // This ensures flat paths like "doc.md#anchor" instead of "doc.md#parent#child"
+        // Hierarchy is tracked via the order vector, not by nesting anchors in paths
+        let terminal_anchor = end.rfind('#').map(|idx| &end[idx + 1..]).unwrap_or(end);
+        format!("{doc_path}#{terminal_anchor}")
     } else {
         let path_base = trim_doc_path(base);
         if path_base.is_empty() {
@@ -1142,7 +1147,6 @@ impl PathMap {
     ) -> Option<String> {
         // Use parent_path directly as the base, with empty order for sibling index computation
         let sink_path = parent_path.to_string();
-        let sink_order: Vec<u16> = Vec::new();
 
         // Determine the sort_key for this new child (would be max + 1)
         // Find all existing children of this parent by matching path prefix
@@ -1294,10 +1298,12 @@ impl PathMap {
                 debug_assert!(*sink_bid == *sink);
                 let mut new_order = sink_order.clone();
                 new_order.push(new_idx);
+                // Strip anchor from sink_path to avoid double anchors when generating child paths
+                let sink_path_without_anchor = get_doc_path(sink_path);
                 let new_path = self.generate_path_name(
                     source,
                     sink,
-                    sink_path,
+                    sink_path_without_anchor,
                     new_weight.get::<String>(WEIGHT_DOC_PATH),
                     new_idx,
                     nets,
@@ -1317,21 +1323,7 @@ impl PathMap {
                     let last_entry_idx = sub_indices.last().copied().unwrap_or(*sink_index);
                     // Ensure we're inserting in the same order as our explicit WEIGHT_SORT_KEY
                     // suggests.
-                    if sub_indices.is_empty() {
-                        if new_idx != 0 {
-                            tracing::warn!("edge index is {}, expected 0", new_idx);
-                            // *new_entry.2.last_mut().unwrap() = 0;
-                        }
-                    } else {
-                        let (_path, _bid, order) = &self.map[last_entry_idx];
-                        let last_order = order[new_entry.2.len() - 1];
-                        if new_idx - 1 != last_order {
-                            tracing::warn!("edge index is {}, expected one greater than last index, which is {}",
-                              new_idx, last_order
-                            );
-                            // *new_entry.2.last_mut().unwrap() = last_order + 1;
-                        }
-                    }
+
                     derivatives.push(BeliefEvent::PathAdded(
                         self.net,
                         new_entry.0.clone(),

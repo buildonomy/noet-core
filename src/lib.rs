@@ -158,6 +158,21 @@
 //!
 //! BIDs provide stable references that survive file renames and enable graph merging.
 //!
+//! ### Canonical Link Format
+//!
+//! Cross-document links use a canonical format combining readable paths with stable Brefs:
+//!
+//! ```markdown
+//! [Tutorial](docs/intro.md "bref://abc123def456")
+//! ```
+//!
+//! Links survive file renames and moves via Bref-based resolution while remaining portable
+//! through relative paths. WikiLinks, standard markdown links, and same-document anchors are
+//! all automatically transformed to this format during parsing.
+//!
+//! See `docs/architecture.md` § 5 for conceptual overview and `docs/design/link_format.md`
+//! for complete specification.
+//!
 //! ### Hypergraph Structure
 //!
 //! The BeliefBase is a typed, weighted, directed hypergraph where:

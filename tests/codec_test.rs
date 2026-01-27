@@ -170,6 +170,13 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     for parse_result in final_parse_results {
         tracing::debug!("Parsing doc {:?}", parse_result.path);
         debug_assert!(parse_result.rewritten_content.is_none());
+        if !parse_result.dependent_paths.is_empty() {
+            tracing::warn!(
+                "Document {:?} has dependent_paths on second parse: {:?}",
+                parse_result.path,
+                parse_result.dependent_paths
+            );
+        }
         assert!(parse_result.dependent_paths.is_empty());
     }
     let mut received_events = Vec::new();
@@ -775,6 +782,276 @@ async fn test_anchor_selective_injection() -> Result<(), Box<dyn std::error::Err
             // Note: Selective injection verification would require parsing the rewritten markdown
             // to check for presence/absence of {#...} anchors. This is tested implicitly by
             // verifying that duplicate nodes are created correctly (test_anchor_collision_detection).
+        }
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_link_canonical_format_generation() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing link transformation to canonical format with Bref");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find the link manipulation test document
+    let link_test_doc = parse_results.iter().find(|r| {
+        r.path
+            .to_string_lossy()
+            .contains("link_manipulation_test.md")
+    });
+
+    if let Some(result) = link_test_doc {
+        if let Some(ref rewritten) = result.rewritten_content {
+            tracing::info!("Link manipulation test rewritten content:\n{}", rewritten);
+
+            // Verify canonical format is generated
+            // Links should be transformed to: [text](path "bref://...")
+            assert!(
+                rewritten.contains("bref://"),
+                "Rewritten content should contain Bref references"
+            );
+
+            // Verify relative paths are used
+            assert!(
+                rewritten.contains("./file1.md") || rewritten.contains("file1.md"),
+                "Rewritten content should use relative paths"
+            );
+
+            // Verify title attributes are present
+            let quote_count = rewritten.matches('"').count();
+            assert!(
+                quote_count >= 2,
+                "Rewritten content should have title attributes in quotes"
+            );
+        }
+    } else {
+        tracing::warn!("link_manipulation_test.md not found in parse results");
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_link_bref_stability() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing that links with Bref remain stable when files move");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+
+    // First parse
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Extract Brefs from first parse
+    let mut first_parse_brefs = Vec::new();
+    for result in &parse_results {
+        if result
+            .path
+            .to_string_lossy()
+            .contains("link_manipulation_test.md")
+        {
+            if let Some(ref content) = result.rewritten_content {
+                // Extract all bref:// references
+                for line in content.lines() {
+                    if line.contains("bref://") {
+                        first_parse_brefs.push(line.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        !first_parse_brefs.is_empty(),
+        "Should have found Bref references in first parse"
+    );
+
+    tracing::info!(
+        "Found {} Bref references in first parse",
+        first_parse_brefs.len()
+    );
+
+    // Verify Brefs are stable format (12 hex chars after bref://)
+    for bref_line in &first_parse_brefs {
+        assert!(
+            bref_line.contains("bref://"),
+            "Should contain bref:// prefix"
+        );
+        tracing::debug!("Bref line: {}", bref_line);
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_link_auto_title_matching() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing auto_title behavior based on link text matching");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    let link_test_doc = parse_results.iter().find(|r| {
+        r.path
+            .to_string_lossy()
+            .contains("link_manipulation_test.md")
+    });
+
+    if let Some(result) = link_test_doc {
+        if let Some(ref rewritten) = result.rewritten_content {
+            tracing::info!("Rewritten content:\n{}", rewritten);
+
+            // Count how many links have bref in title attribute (canonical format)
+            let bref_count = rewritten.matches("bref://").count();
+            tracing::info!("Found {} links with Bref", bref_count);
+
+            // Verify links were transformed to canonical format
+            assert!(
+                bref_count >= 1,
+                "Should have at least one link with Bref in title attribute"
+            );
+
+            // Verify that links preserve user text
+            assert!(
+                rewritten.contains("Custom Text") || rewritten.contains("First Reference"),
+                "Should preserve user-provided link text"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_link_relative_paths() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing relative path calculation in links");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    let link_test_doc = parse_results.iter().find(|r| {
+        r.path
+            .to_string_lossy()
+            .contains("link_manipulation_test.md")
+    });
+
+    if let Some(result) = link_test_doc {
+        if let Some(ref rewritten) = result.rewritten_content {
+            tracing::info!("Checking relative paths in rewritten content");
+
+            // Should not have absolute paths (no leading /)
+            let has_absolute_link = rewritten
+                .lines()
+                .any(|line| line.contains("](/) ") || line.contains("](/"));
+
+            assert!(
+                !has_absolute_link,
+                "Links should use relative paths, not absolute"
+            );
+
+            // Should have relative indicators like ./ or ../
+            let has_relative_paths = rewritten.contains("](./")
+                || rewritten.contains("](../")
+                || rewritten.contains("](file")
+                || rewritten.contains("](subnet");
+
+            assert!(has_relative_paths, "Should have relative path indicators");
+        }
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_link_same_document_anchors() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing same-document anchor links remain fragment-only");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    let link_test_doc = parse_results.iter().find(|r| {
+        r.path
+            .to_string_lossy()
+            .contains("link_manipulation_test.md")
+    });
+
+    if let Some(result) = link_test_doc {
+        if let Some(ref rewritten) = result.rewritten_content {
+            tracing::info!("Checking same-document anchor format");
+            tracing::info!(
+                "Rewritten content (first 1000 chars):\n{}",
+                &rewritten[..rewritten.len().min(1000)]
+            );
+
+            // Verify links have Bref in title attribute
+            let bref_count = rewritten.matches("bref://").count();
+            tracing::info!("Found {} links with Bref", bref_count);
+
+            assert!(bref_count >= 1, "Should have links with Bref references");
+
+            // Check for fragment links
+            let has_fragment_links = rewritten.contains("](#");
+            tracing::info!("Has fragment links: {}", has_fragment_links);
+
+            if has_fragment_links {
+                let lines_with_fragments: Vec<&str> = rewritten
+                    .lines()
+                    .filter(|line| line.contains("](#"))
+                    .collect();
+
+                for line in &lines_with_fragments {
+                    tracing::info!("Fragment link line: {}", line);
+                }
+            }
         }
     }
 

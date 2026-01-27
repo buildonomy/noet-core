@@ -44,7 +44,7 @@ pub fn to_anchor(title: &str) -> String {
 }
 
 pub fn get_doc_path(path: &str) -> &str {
-    let idx = path.rfind('#').unwrap_or(path.len());
+    let idx = path.find('#').unwrap_or(path.len());
     &path[..idx]
 }
 

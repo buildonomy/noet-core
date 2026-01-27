@@ -1685,20 +1685,10 @@ impl BeliefBase {
                 }
             }
             BeliefEvent::RelationRemoved(source, sink, _) => {
-                if let (Some(source_idx), Some(sink_idx)) =
-                    (self.bid_to_index(source), self.bid_to_index(sink))
-                {
-                    while self.relations.is_locked() {
-                        tracing::info!(
-                            "[BeliefBase::process_event] Waiting for write access to relations"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    let mut relations = self.relations.write_arc();
-                    if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
-                        relations.as_graph_mut().remove_edge(edge_idx);
-                    }
-                }
+                // Call update_relation with empty WeightSet to trigger proper reindexing
+                // of remaining edges on the sink, ensuring contiguous sort indices [0..N)
+                let mut reindex_events = self.update_relation(*source, *sink, WeightSet::default());
+                derivative_events.append(&mut reindex_events);
             }
             BeliefEvent::BalanceCheck => {
                 // Just run a quick check for balanceCheck operations, not a full built_in_test check

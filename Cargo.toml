@@ -26,6 +26,7 @@ notify = { version = "6.1.1", optional = true }
 notify-debouncer-full = { version = "0.3.1", default-features = false, optional = true }
 once_cell = "1.21.3"
 path-clean = "1.0.1"
+pathdiff = "0.2"
 orgize = "0.10.0-alpha"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 petgraph = { version = "0.6.5", features = ["serde-1"] }

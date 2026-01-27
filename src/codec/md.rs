@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::replace,
     ops::Range,
+    path::Path,
     result::Result,
     str::FromStr,
 };
@@ -23,8 +24,8 @@ use crate::{
         DocCodec,
     },
     error::BuildonomyError,
-    nodekey::{href_to_nodekey, to_anchor, NodeKey},
-    properties::{BeliefNode, Bid, Weight, WeightKind},
+    nodekey::{get_doc_path, href_to_nodekey, to_anchor, NodeKey},
+    properties::{BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
 pub use pulldown_cmark;
@@ -176,6 +177,163 @@ impl LinkAccumulator {
     }
 }
 
+/// Parsed components from a markdown link title attribute.
+///
+/// Title attribute format: `"bref://abc123 {\"auto_title\":true} User Words"`
+#[derive(Debug, Clone, PartialEq)]
+struct TitleAttributeParts {
+    /// Bref extracted from title attribute (e.g., "bref://abc123")
+    bref: Option<Bref>,
+    /// Whether link text should auto-update when target title changes
+    auto_title: bool,
+    /// Any additional user-provided words in the title attribute
+    user_words: Option<String>,
+}
+
+/// Parse a markdown link title attribute to extract Bref, config, and user words.
+///
+/// Format: `"bref://abc123 {\"auto_title\":true} User Description"`
+///
+/// # Examples
+///
+/// ```ignore
+/// let parts = parse_title_attribute("bref://abc123");
+/// assert_eq!(parts.bref, Some(Bref::from(...)));
+/// assert_eq!(parts.auto_title, false);
+/// assert_eq!(parts.user_words, None);
+///
+/// let parts = parse_title_attribute("bref://abc123 {\"auto_title\":true} My Note");
+/// assert_eq!(parts.auto_title, true);
+/// assert_eq!(parts.user_words, Some("My Note".to_string()));
+/// ```
+fn parse_title_attribute(title: &str) -> TitleAttributeParts {
+    let mut bref = None;
+    let mut auto_title = false;
+    let mut word_parts = Vec::new();
+    let mut in_json = false;
+    let mut json_buffer = String::new();
+
+    for word in title.split_whitespace() {
+        if word.starts_with("bref://") {
+            // Parse Bref from URL-style reference
+            let bref_str = word.trim_start_matches("bref://");
+            if let Ok(parsed_bref) = Bref::try_from(bref_str) {
+                bref = Some(parsed_bref);
+            }
+        } else if word.starts_with("bid://") {
+            // Parse Bref from BID URL-style reference
+            let bid_str = word.trim_start_matches("bid://");
+            if let Ok(parsed_bid) = Bid::try_from(bid_str) {
+                bref = Some(parsed_bid.namespace());
+            }
+        } else if word.starts_with('{') {
+            // Start of JSON config
+            in_json = true;
+            json_buffer.push_str(word);
+            if word.ends_with('}') {
+                // Single-word JSON object
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&json_buffer) {
+                    if let Some(auto_val) = config.get("auto_title") {
+                        auto_title = auto_val.as_bool().unwrap_or(false);
+                    }
+                }
+                in_json = false;
+                json_buffer.clear();
+            }
+        } else if in_json {
+            // Continuation of multi-word JSON
+            json_buffer.push(' ');
+            json_buffer.push_str(word);
+            if word.ends_with('}') {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&json_buffer) {
+                    if let Some(auto_val) = config.get("auto_title") {
+                        auto_title = auto_val.as_bool().unwrap_or(false);
+                    }
+                }
+                in_json = false;
+                json_buffer.clear();
+            }
+        } else {
+            // Regular word - part of user description
+            word_parts.push(word);
+        }
+    }
+
+    let user_words = if word_parts.is_empty() {
+        None
+    } else {
+        Some(word_parts.join(" "))
+    };
+
+    TitleAttributeParts {
+        bref,
+        auto_title,
+        user_words,
+    }
+}
+
+/// Build a title attribute string from components.
+///
+/// Format: `"bref://abc123 {\"auto_title\":true} User Words"`
+///
+/// # Examples
+///
+/// ```ignore
+/// let attr = build_title_attribute("bref://abc123", false, None);
+/// assert_eq!(attr, "bref://abc123");
+///
+/// let attr = build_title_attribute("bref://abc123", true, Some("My Note"));
+/// assert_eq!(attr, "bref://abc123 {\"auto_title\":true} My Note");
+/// ```
+fn build_title_attribute(bref: &str, auto_title: bool, user_words: Option<&str>) -> String {
+    let mut parts = vec![bref.to_string()];
+
+    if auto_title {
+        parts.push("{\"auto_title\":true}".to_string());
+    }
+
+    if let Some(words) = user_words {
+        parts.push(words.to_string());
+    }
+
+    parts.join(" ")
+}
+
+/// Calculate relative path from source document to target document.
+///
+/// # Arguments
+///
+/// * `from_path` - Path to source document (e.g., "docs/guide.md")
+/// * `to_path` - Path to target document (e.g., "docs/reference/api.md")
+///
+/// # Returns
+///
+/// Relative path from source to target (e.g., "reference/api.md")
+///
+/// # Examples
+///
+/// ```ignore
+/// let rel = make_relative_path("docs/guide.md", "docs/reference/api.md");
+/// assert_eq!(rel, "reference/api.md");
+///
+/// let rel = make_relative_path("docs/reference/types.md", "docs/guide.md");
+/// assert_eq!(rel, "../guide.md");
+/// ```
+fn make_relative_path(from_path: &str, to_path: &str) -> String {
+    // Get the directory containing the source document
+    let from_dir = Path::new(from_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+
+    let to = Path::new(to_path);
+
+    // Calculate relative path from source directory to target
+    pathdiff::diff_paths(to, from_dir)
+        .unwrap_or_else(|| to.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 #[tracing::instrument(skip_all)]
 fn check_for_link_and_push(
     events_in: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
@@ -189,9 +347,13 @@ fn check_for_link_and_push(
     while let Some((event, range)) = maybe_event.take() {
         let stop_event_match = stop_event.filter(|e| **e == event).is_some();
         let mut process_link = false;
-        if let MdEvent::Start(MdTag::Link { .. }) = &event {
+        let mut original_title_attr: Option<CowStr<'static>> = None;
+
+        if let MdEvent::Start(MdTag::Link { title, .. }) = &event {
             debug_assert!(collector.is_none());
             collector = LinkAccumulator::new(&event, &range);
+            // Store the original title attribute for parsing
+            original_title_attr = Some(title.clone().into_static());
         } else if let Some(link_accumulator) = collector.as_mut() {
             process_link = link_accumulator.push(&event, &range);
         }
@@ -204,83 +366,219 @@ fn check_for_link_and_push(
                 .take()
                 .expect("Process_link is only true if collector is some.");
 
-            let title = CowStr::from(link_data.title_string());
-            if let Some((key, mut has_manual_title)) = link_to_relation(
-                &link_data.link_type,
-                &link_data.dest_url,
-                &title,
-                &link_data.id,
-            ) {
-                // Regularize the key using the BeliefBase context, falling back to the original if it fails
-                let regularized = key
-                    .regularize(ctx.belief_set(), ctx.node.bid)
-                    .unwrap_or(key.clone());
-                let keys = vec![regularized];
-                // let mut has_pothole = false;
-                let sources = ctx.sources();
-                let maybe_keyed_relation = keys.iter().find_map(|link_key| {
-                    sources.iter().find(|rel| {
-                        rel.other
-                            .keys(Some(ctx.home_net), None, ctx.belief_set())
-                            .iter()
-                            .any(|ctx_source_key| ctx_source_key == link_key)
-                    })
+            let link_text = link_data.title_string();
+
+            // Parse the title attribute to check for existing Bref
+            let title_parts = original_title_attr
+                .as_ref()
+                .map(|t| parse_title_attribute(t.as_ref()))
+                .unwrap_or(TitleAttributeParts {
+                    bref: None,
+                    auto_title: false,
+                    user_words: None,
                 });
-                if let Some(relation) = maybe_keyed_relation {
-                    let bref_string = CowStr::from(String::from(relation.other.bid.namespace()));
-                    let doc_ref = relation.as_link_ref();
-                    let is_title_really_manual = format!("{bref_string}:{title}");
-                    if is_title_really_manual == doc_ref {
-                        has_manual_title = false;
-                    }
-                    let default_ref = CowStr::from(doc_ref);
-                    if !has_manual_title {
-                        link_data.title_events = vec![MdEvent::Text(default_ref.clone())];
-                        if link_data.dest_url != default_ref {
-                            changed = true;
-                            link_data.dest_url = default_ref;
-                        }
-                        // link_data.link_type = LinkType::WikiLink { has_pothole };
-                    } else if has_manual_title && link_data.dest_url != bref_string {
-                        // has_pothole = true;
-                        changed = true;
-                        link_data.dest_url = bref_string;
-                    } else {
-                        tracing::debug!("Link unchanged. Moving on");
-                    }
-                    // tracing::debug!(
-                    //     "Normalized refs:\n\
-                    //      \tmanual_title: {}\n\
-                    //      \tdest_url: {}\n\
-                    //      \ttitle: {}",
-                    //     has_manual_title,
-                    //     link_data.dest_url,
-                    //     title,
-                    // );
+
+            // Determine the key to use for matching
+            // If title attribute contains a Bref, prioritize it
+            let key = if let Some(bref) = &title_parts.bref {
+                NodeKey::Bref { bref: bref.clone() }
+            } else {
+                // Otherwise parse from dest_url as before
+                let title = CowStr::from(link_text.clone());
+                if let Some((parsed_key, _)) = link_to_relation(
+                    &link_data.link_type,
+                    &link_data.dest_url,
+                    &title,
+                    &link_data.id,
+                ) {
+                    parsed_key
                 } else {
-                    tracing::info!(
-                        "Returned context does not have any source edges matching potential link(s)\n\
-                         \tsource_links: {:?}.\n\
-                         \tctx sink links: {:?}",
-                        keys,
-                        ctx.sources().iter().flat_map(|extended_ref| extended_ref.other.keys(Some(ctx.home_net), None, ctx.belief_set())).collect::<Vec<NodeKey>>()
+                    // Can't parse - leave link unchanged
+                    link_data.link_type = match title.is_empty() || title == link_data.id {
+                        true => LinkType::Shortcut,
+                        false => LinkType::Reference,
+                    };
+                    events_out.push_back((
+                        MdEvent::Start(MdTag::Link {
+                            link_type: link_data.link_type,
+                            dest_url: link_data.dest_url,
+                            title: original_title_attr.unwrap_or(CowStr::from("")),
+                            id: link_data.id,
+                        }),
+                        None,
+                    ));
+                    for title_event in link_data.title_events.into_iter() {
+                        events_out.push_back((title_event, None));
+                    }
+
+                    let new_range = match (link_data.range, range) {
+                        (Some(link_range), Some(link_end_range)) => {
+                            Some(link_range.start..link_end_range.end)
+                        }
+                        (Some(link_range), _) => Some(link_range.clone()),
+                        (_, Some(link_end_range)) => Some(link_end_range.clone()),
+                        _ => None,
+                    };
+                    events_out.push_back((MdEvent::End(MdTagEnd::Link), new_range));
+
+                    if stop_event_match {
+                        break;
+                    }
+                    maybe_event = events_in.pop_front();
+                    continue;
+                }
+            };
+
+            // Regularize the key using the BeliefBase context
+            let regularized = key
+                .regularize(ctx.belief_set(), ctx.node.bid)
+                .unwrap_or(key.clone());
+
+            let keys = vec![regularized];
+            let sources = ctx.sources();
+            let maybe_keyed_relation = keys.iter().find_map(|link_key| {
+                sources.iter().find(|rel| {
+                    rel.other
+                        .keys(Some(ctx.home_net), None, ctx.belief_set())
+                        .iter()
+                        .any(|ctx_source_key| ctx_source_key == link_key)
+                })
+            });
+
+            if let Some(relation) = maybe_keyed_relation {
+                // Generate canonical format: [text](relative/path.md#anchor "bref://abc config")
+
+                tracing::debug!(
+                    "Found relation for link: title={}, id={:?}, home_path={}",
+                    relation.other.title,
+                    relation.other.id,
+                    relation.home_path
+                );
+
+                // 1. Calculate relative path from source to target
+                // Strip any existing anchor from home_path to avoid double anchors
+                let home_path_without_anchor = get_doc_path(&relation.home_path);
+                let ctx_home_doc_path = get_doc_path(&ctx.home_path);
+                let relative_path = make_relative_path(&ctx.home_path, home_path_without_anchor);
+
+                // 2. Add anchor if target is a heading node
+                // Extract anchor from relation.other.id or from home_path
+                let maybe_anchor = relation.other.id.as_deref().or_else(|| {
+                    // If id is not set, extract anchor from home_path
+                    relation
+                        .home_path
+                        .rfind('#')
+                        .map(|idx| &relation.home_path[idx + 1..])
+                });
+
+                // If source and target are in the same document, use fragment-only format
+                let dest_with_anchor = if let Some(anchor) = maybe_anchor {
+                    if home_path_without_anchor == ctx_home_doc_path {
+                        // Same document - use fragment-only format
+                        format!("#{anchor}")
+                    } else {
+                        // Different document - use relative path with anchor
+                        format!("{relative_path}#{anchor}")
+                    }
+                } else {
+                    relative_path
+                };
+
+                // 3. Build title attribute: "bref://abc123 {config} user words"
+                let bref_str = format!("bref://{}", relation.other.bid.namespace());
+
+                // Determine if auto_title should be enabled
+                // Default to false unless link text matches target title
+                let should_auto_title = if title_parts.auto_title {
+                    // User explicitly set auto_title
+                    true
+                } else if link_text == relation.other.title {
+                    // Link text matches target title - enable auto update
+                    true
+                } else {
+                    // User provided custom text - don't auto update
+                    false
+                };
+
+                let new_title_attr = build_title_attribute(
+                    &bref_str,
+                    should_auto_title,
+                    title_parts.user_words.as_deref(),
+                );
+
+                // 4. Determine link text
+                let new_link_text = if should_auto_title {
+                    // Use target's current title
+                    relation.other.title.clone()
+                } else {
+                    // Keep user's original text
+                    link_text.clone()
+                };
+
+                // 5. Check if link changed
+                let original_title_attr_str = original_title_attr
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+
+                if link_data.dest_url.as_ref() != dest_with_anchor
+                    || original_title_attr_str != new_title_attr
+                    || link_text != new_link_text
+                {
+                    changed = true;
+                    link_data.dest_url = CowStr::from(dest_with_anchor);
+                    link_data.title_events = vec![MdEvent::Text(CowStr::from(new_link_text))];
+
+                    tracing::debug!(
+                        "Transformed link to canonical format: dest={}, title_attr={}, text={}",
+                        link_data.dest_url,
+                        new_title_attr,
+                        link_data
+                            .title_events
+                            .first()
+                            .map(|e| format!("{e:?}"))
+                            .unwrap_or_default()
                     );
                 }
+
+                events_out.push_back((
+                    MdEvent::Start(MdTag::Link {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.dest_url,
+                        title: CowStr::from(new_title_attr),
+                        id: link_data.id,
+                    }),
+                    None,
+                ));
             } else {
-                link_data.link_type = match title.is_empty() || title == link_data.id {
-                    true => LinkType::Shortcut,
-                    false => LinkType::Reference,
-                };
+                // No matching relation found - leave link unchanged
+                tracing::info!(
+                    "Returned context does not have any source edges matching potential link(s)\n\
+                     \tsource_links: {:?}.\n\
+                     \tctx sink links: {:?}",
+                    keys,
+                    ctx.sources()
+                        .iter()
+                        .flat_map(|extended_ref| extended_ref.other.keys(
+                            Some(ctx.home_net),
+                            None,
+                            ctx.belief_set()
+                        ))
+                        .collect::<Vec<NodeKey>>()
+                );
+
+                events_out.push_back((
+                    MdEvent::Start(MdTag::Link {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.dest_url,
+                        title: original_title_attr.unwrap_or(CowStr::from("")),
+                        id: link_data.id,
+                    }),
+                    None,
+                ));
             }
-            events_out.push_back((
-                MdEvent::Start(MdTag::Link {
-                    link_type: link_data.link_type,
-                    dest_url: link_data.dest_url,
-                    title: title.clone(),
-                    id: link_data.id,
-                }),
-                None,
-            ));
+
+            // Push link text events
             for title_event in link_data.title_events.into_iter() {
                 events_out.push_back((title_event, None));
             }
@@ -1696,5 +1994,136 @@ schema = "Document"
             None,
             "Second 'Details' should have None due to collision (Bref assigned in inject_context)"
         );
+    }
+
+    // ========================================================================
+    // Link Manipulation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_title_attribute_bref_only() {
+        let parts = parse_title_attribute("bref://abc123456789");
+        assert!(parts.bref.is_some());
+        assert_eq!(parts.bref.unwrap().to_string(), "abc123456789");
+        assert!(!parts.auto_title);
+        assert_eq!(parts.user_words, None);
+    }
+
+    #[test]
+    fn test_parse_title_attribute_with_auto_title() {
+        let parts = parse_title_attribute("bref://abc123456789 {\"auto_title\":true}");
+        assert!(parts.bref.is_some());
+        assert!(parts.auto_title);
+        assert_eq!(parts.user_words, None);
+    }
+
+    #[test]
+    fn test_parse_title_attribute_with_user_words() {
+        let parts = parse_title_attribute("bref://abc123456789 My Custom Note");
+        assert!(parts.bref.is_some());
+        assert!(!parts.auto_title);
+        assert_eq!(parts.user_words, Some("My Custom Note".to_string()));
+    }
+
+    #[test]
+    fn test_parse_title_attribute_full() {
+        let parts = parse_title_attribute("bref://abc123456789 {\"auto_title\":true} My Note");
+        assert!(parts.bref.is_some());
+        assert_eq!(parts.bref.unwrap().to_string(), "abc123456789");
+        assert!(parts.auto_title);
+        assert_eq!(parts.user_words, Some("My Note".to_string()));
+    }
+
+    #[test]
+    fn test_parse_title_attribute_bid_format() {
+        let bid_str = "00000000-0000-0000-0000-000000000001";
+        let parts = parse_title_attribute(&format!("bid://{bid_str}"));
+        assert!(parts.bref.is_some());
+        // BID should be converted to Bref (namespace)
+        // The namespace is derived from the BID using a hash function
+        let expected_bref = Bid::try_from(bid_str).unwrap().namespace();
+        assert_eq!(parts.bref.unwrap().to_string(), expected_bref.to_string());
+    }
+
+    #[test]
+    fn test_parse_title_attribute_no_bref() {
+        let parts = parse_title_attribute("Just some words");
+        assert!(parts.bref.is_none());
+        assert!(!parts.auto_title);
+        assert_eq!(parts.user_words, Some("Just some words".to_string()));
+    }
+
+    #[test]
+    fn test_parse_title_attribute_empty() {
+        let parts = parse_title_attribute("");
+        assert!(parts.bref.is_none());
+        assert!(!parts.auto_title);
+        assert_eq!(parts.user_words, None);
+    }
+
+    #[test]
+    fn test_build_title_attribute_bref_only() {
+        let attr = build_title_attribute("bref://abc123456789", false, None);
+        assert_eq!(attr, "bref://abc123456789");
+    }
+
+    #[test]
+    fn test_build_title_attribute_with_auto_title() {
+        let attr = build_title_attribute("bref://abc123456789", true, None);
+        assert_eq!(attr, "bref://abc123456789 {\"auto_title\":true}");
+    }
+
+    #[test]
+    fn test_build_title_attribute_with_user_words() {
+        let attr = build_title_attribute("bref://abc123456789", false, Some("My Note"));
+        assert_eq!(attr, "bref://abc123456789 My Note");
+    }
+
+    #[test]
+    fn test_build_title_attribute_full() {
+        let attr = build_title_attribute("bref://abc123456789", true, Some("My Note"));
+        assert_eq!(attr, "bref://abc123456789 {\"auto_title\":true} My Note");
+    }
+
+    #[test]
+    fn test_make_relative_path_same_dir() {
+        let rel = make_relative_path("docs/guide.md", "docs/api.md");
+        assert_eq!(rel, "api.md");
+    }
+
+    #[test]
+    fn test_make_relative_path_nested() {
+        let rel = make_relative_path("docs/guide.md", "docs/reference/api.md");
+        assert_eq!(rel, "reference/api.md");
+    }
+
+    #[test]
+    fn test_make_relative_path_parent() {
+        let rel = make_relative_path("docs/reference/types.md", "docs/guide.md");
+        assert_eq!(rel, "../guide.md");
+    }
+
+    #[test]
+    fn test_make_relative_path_root_to_nested() {
+        let rel = make_relative_path("README.md", "docs/guide.md");
+        assert_eq!(rel, "docs/guide.md");
+    }
+
+    #[test]
+    fn test_make_relative_path_nested_to_root() {
+        let rel = make_relative_path("docs/guide.md", "README.md");
+        assert_eq!(rel, "../README.md");
+    }
+
+    #[test]
+    fn test_parse_build_roundtrip() {
+        let original = "bref://abc123456789 {\"auto_title\":true} Custom Text";
+        let parts = parse_title_attribute(original);
+        let rebuilt = build_title_attribute(
+            &format!("bref://{}", parts.bref.unwrap()),
+            parts.auto_title,
+            parts.user_words.as_deref(),
+        );
+        assert_eq!(original, rebuilt);
     }
 }

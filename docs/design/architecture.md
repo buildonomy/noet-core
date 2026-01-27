@@ -96,7 +96,47 @@ title = "Updated Document"
 
 **For detailed specifications** including collision detection, normalization rules, and implementation details, see [`design/beliefbase_architecture.md` § 2.2](./design/beliefbase_architecture.md#22-identity-management-bid-bref-and-nodekey).
 
-### 5. Relationship Types (WeightKind)
+### 5. Link Format: Readable + Resilient
+
+noet-core transforms markdown links to a **canonical format** that combines human-readable paths with stable Bref identifiers:
+
+```markdown
+[Link Text](relative/path.md#anchor "bref://abc123def456")
+```
+
+**Why this format?**
+
+Traditional markdown links break when files are renamed or moved. noet-core solves this by:
+- **Path**: Human-readable, portable relative path (updates automatically on moves)
+- **Bref**: Stable 12-character identifier (never changes, even if file renamed)
+- **Title attribute**: CommonMark-compliant storage (not a custom extension)
+
+**Example transformation**:
+```markdown
+<!-- User writes -->
+[Tutorial](./docs/intro.md)
+
+<!-- After compilation -->
+[Tutorial](docs/intro.md "bref://a1b2c3d4e5f6")
+```
+
+**Benefits**:
+- Links survive file renames and moves (Bref-based resolution)
+- Documents remain portable (relative paths)
+- Compatible with standard markdown tools (uses CommonMark title attribute)
+- Auto-updating link text (optional, via `auto_title` config)
+
+**Supported input formats**:
+- Standard markdown: `[text](path.md)`
+- WikiLinks: `[[Document Name]]`
+- Same-document anchors: `[text](#anchor)`
+- Explicit Bref: `[text](path.md "bref://abc123")`
+
+When files move or are renamed, noet-core automatically updates the paths while preserving the Bref, ensuring links never break.
+
+**For detailed specification** including title attribute processing, path generation, and link resolution algorithm, see [`design/link_format.md`](./link_format.md).
+
+### 6. Relationship Types (WeightKind)
 
 Edges are classified by infrastructure type:
 
@@ -106,7 +146,7 @@ Edges are classified by infrastructure type:
 
 Each relationship can carry a `payload` with custom metadata.
 
-### 6. Schema Extensibility
+### 7. Schema Extensibility
 
 Nodes have an optional `schema` field for domain classification:
 
