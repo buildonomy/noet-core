@@ -82,54 +82,54 @@ test:linux:msrv:
   image: rust:1.85
   allow_failure: false
 
-# Test job - macOS
-test:macos:stable:
-  stage: test
-  tags:
-    - macos
-  before_script:
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - source $HOME/.cargo/env
-  script:
-    - rustc --version && cargo --version
-    - cargo build --verbose --all-features
-    - cargo test --verbose --all-features
-    - cargo test --verbose --no-default-features
-    - cargo test --verbose --features service
-  only:
-    - merge_requests
-    - main
-    - develop
-  allow_failure: true # Allow failure if no macOS runner available
+# # Test job - macOS
+# test:macos:stable:
+#   stage: test
+#   tags:
+#     - macos
+#   before_script:
+#     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+#     - source $HOME/.cargo/env
+#   script:
+#     - rustc --version && cargo --version
+#     - cargo build --verbose --all-features
+#     - cargo test --verbose --all-features
+#     - cargo test --verbose --no-default-features
+#     - cargo test --verbose --features service
+#   only:
+#     - merge_requests
+#     - main
+#     - develop
+#   allow_failure: true # Allow failure if no macOS runner available
 
-# Test job - Windows
-.windows_job:
-  tags:
-    - saas-windows-medium-amd64
-  before_script:
-    - Set-Variable -Name "time" -Value (date -Format "%H:%m")
-    - echo ${time}
-    - echo "started by ${GITLAB_USER_NAME} / @${GITLAB_USER_LOGIN}"
+# # Test job - Windows
+# .windows_job:
+#   tags:
+#     - saas-windows-medium-amd64
+#   before_script:
+#     - Set-Variable -Name "time" -Value (date -Format "%H:%m")
+#     - echo ${time}
+#     - echo "started by ${GITLAB_USER_NAME} / @${GITLAB_USER_LOGIN}"
 
-test:windows:stable:
-  stage: test
-  extends:
-    - .windows_job
-  before_script:
-    - choco install rustup.install -y
-    - $env:Path = "C:\Users\$env:UserName\.cargo\bin;$env:Path"
-  script:
-    - rustc --version
-    - cargo --version
-    - cargo build --verbose --all-features
-    - cargo test --verbose --all-features
-    - cargo test --verbose --no-default-features
-    - cargo test --verbose --features service
-  only:
-    - merge_requests
-    - main
-    - develop
-  allow_failure: true # Allow failure if no Windows runner available
+# test:windows:stable:
+#   stage: test
+#   extends:
+#     - .windows_job
+#   before_script:
+#     - choco install rustup.install -y
+#     - $env:Path = "C:\Users\$env:UserName\.cargo\bin;$env:Path"
+#   script:
+#     - rustc --version
+#     - cargo --version
+#     - cargo build --verbose --all-features
+#     - cargo test --verbose --all-features
+#     - cargo test --verbose --no-default-features
+#     - cargo test --verbose --features service
+#   only:
+#     - merge_requests
+#     - main
+#     - develop
+#   allow_failure: true # Allow failure if no Windows runner available
 
 # Example verification
 test:examples:

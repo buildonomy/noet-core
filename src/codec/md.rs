@@ -1869,7 +1869,7 @@ schema = "Document"
         );
 
         // Test 3: Modify ID and write
-        let modified_events = vec![
+        let modified_events = [
             MdEvent::Start(MdTag::Heading {
                 level: HeadingLevel::H2,
                 id: Some(CowStr::from("new-id")),
@@ -1888,7 +1888,7 @@ schema = "Document"
         );
 
         // Test 4: Normalized ID (lowercase, no punctuation)
-        let normalized_events = vec![
+        let normalized_events = [
             MdEvent::Start(MdTag::Heading {
                 level: HeadingLevel::H2,
                 id: Some(CowStr::from("my-heading")), // normalized
