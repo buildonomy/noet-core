@@ -305,7 +305,7 @@ impl WatchService {
         event_tx: Sender<Event>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()?;
@@ -483,11 +483,19 @@ impl WatchService {
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
+        let work_notifier = network_syncer.work_notifier.clone();
+        let debouncer_paused = network_syncer.debouncer_paused.clone();
         let debouncer_codec_extensions = self.codecs.extensions();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
+                // Check if debouncer is paused (we're writing files)
+                if debouncer_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!("[Debouncer] Paused, ignoring events");
+                    return;
+                }
+
                 tracing::info!("[FileUpdateSyncer Debouncer] processing debounce event");
                 match result {
                     Ok(events) => {
@@ -521,12 +529,17 @@ impl WatchService {
 
                                     if !sync_paths.is_empty() {
                                         // Enqueue changed files for re-parsing
+                                        tracing::info!(
+                                            "[Debouncer] {} files to enqueue",
+                                            sync_paths.len()
+                                        );
                                         while compiler_ref.is_locked() {
                                             tracing::debug!(
                                                 "[Debouncer] Waiting for write access to compiler"
                                             );
                                             std::thread::sleep(Duration::from_millis(100));
                                         }
+                                        tracing::info!("[Debouncer] Acquired write lock");
                                         let mut compiler = compiler_ref.write();
                                         for path in sync_paths {
                                             tracing::info!(
@@ -537,6 +550,10 @@ impl WatchService {
                                             compiler.reset_processed(path);
                                             compiler.enqueue(path);
                                         }
+                                        tracing::info!("[Debouncer] Finished enqueuing, compiler.has_pending()={}", compiler.has_pending());
+
+                                        // Notify compiler thread that work is available
+                                        work_notifier.notify_one();
                                     }
                                 }
                                 _ => {}
@@ -576,6 +593,8 @@ pub(crate) struct FileUpdateSyncer {
     pub compiler: Arc<RwLock<DocumentCompiler>>,
     pub compiler_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
+    pub work_notifier: Arc<tokio::sync::Notify>,
+    pub debouncer_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FileUpdateSyncer {
@@ -591,6 +610,12 @@ impl FileUpdateSyncer {
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
+        // Create notification channel for waking up compiler thread
+        let work_notifier = Arc::new(tokio::sync::Notify::new());
+
+        // Flag to pause debouncer while we're writing files
+        let debouncer_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Create the compiler with the event channel
         let compiler = Arc::new(RwLock::new(DocumentCompiler::new(
             root,
@@ -600,6 +625,7 @@ impl FileUpdateSyncer {
         )?));
 
         let compiler_ref = compiler.clone();
+        let compiler_notifier = work_notifier.clone();
         let compiler_global_bb = global_bb.clone();
         let transaction_events = Arc::new(RwLock::new(accum_rx));
         let transaction_global_bb = global_bb.clone();
@@ -610,17 +636,34 @@ impl FileUpdateSyncer {
             tracing::info!("[DocumentCompiler] Starting compiler thread");
 
             loop {
-                // Check if there's work to do
-                let has_pending = {
-                    while compiler_ref.is_locked_exclusive() {
-                        tracing::debug!("[DocumentCompiler] Waiting for read access to compiler");
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                    let compiler_read = compiler_ref.read_arc();
-                    compiler_read.has_pending()
-                };
+                // Wait for notification that work is available
+                compiler_notifier.notified().await;
 
-                if has_pending {
+                tracing::info!(
+                    "[DocumentCompiler] Notification received, processing all pending work"
+                );
+
+                // Process all pending work in a loop (like parse_all does)
+                loop {
+                    // Log queue state before parsing
+                    {
+                        let mut compiler_write = compiler_ref.write_arc();
+                        let primary_empty = compiler_write.primary_queue_len() == 0;
+                        let reparse_pending = compiler_write.reparse_queue_len() > 0;
+
+                        tracing::info!(
+                            "[DocumentCompiler] Loop iteration - primary_queue: {}, reparse_queue: {}, total_parsed: {}",
+                            compiler_write.primary_queue_len(),
+                            compiler_write.reparse_queue_len(),
+                            compiler_write.stats().total_parses
+                        );
+
+                        // Mark start of reparse round if transitioning from primary to reparse queue
+                        if primary_empty && reparse_pending {
+                            compiler_write.start_reparse_round();
+                        }
+                    }
+
                     // Parse next document
                     let parse_result = {
                         while compiler_ref.is_locked() {
@@ -629,6 +672,7 @@ impl FileUpdateSyncer {
                             );
                             sleep(Duration::from_millis(100)).await;
                         }
+                        tracing::info!("[DocumentCompiler] Calling parse_next");
                         let mut compiler_write = compiler_ref.write_arc();
                         compiler_write.parse_next(compiler_global_bb.clone()).await
                     };
@@ -640,24 +684,38 @@ impl FileUpdateSyncer {
                                 result.path
                             );
 
-                            // Write rewritten content if needed
-                            if let Some(new_content) = result.rewritten_content {
-                                tracing::info!("Writing updated content to file {:?}", result.path);
-                                tokio::fs::write(&result.path, new_content).await?;
-                            }
+                            // Note: DocumentCompiler handles writing when created with write=true
+                            // We don't write here to avoid duplicate writes
 
                             // Note: dependent_paths are already enqueued by parse_next()
                             if !result.dependent_paths.is_empty() {
-                                tracing::debug!(
-                                    "Discovered {} dependent paths from {:?}",
+                                tracing::info!(
+                                    "[DocumentCompiler] Discovered {} dependent paths from {:?}: {:?}",
                                     result.dependent_paths.len(),
+                                    result.path,
+                                    result.dependent_paths.iter().map(|(p, _)| p).collect::<Vec<_>>()
+                                );
+                            } else {
+                                tracing::info!(
+                                    "[DocumentCompiler] No dependent paths discovered from {:?}",
                                     result.path
                                 );
                             }
+                            // Continue to next file in queue
                         }
                         Ok(None) => {
-                            tracing::debug!("[DocumentCompiler] Queue is empty");
-                            sleep(Duration::from_secs(1)).await;
+                            let stats = {
+                                let compiler_read = compiler_ref.read_arc();
+                                compiler_read.stats()
+                            };
+                            tracing::info!(
+                                "[DocumentCompiler] parse_next returned None - Queue is empty. Final stats: primary={}, reparse={}, total_parses={}",
+                                stats.primary_queue_len,
+                                stats.reparse_queue_len,
+                                stats.total_parses
+                            );
+                            // Break inner loop to wait for next notification
+                            break;
                         }
                         Err(e) => {
                             tracing::error!("[belief-compiler] Parse error: {}", e);
@@ -665,9 +723,6 @@ impl FileUpdateSyncer {
                             sleep(Duration::from_millis(500)).await;
                         }
                     }
-                } else {
-                    // No work, sleep
-                    sleep(Duration::from_secs(1)).await;
                 }
             }
         });
@@ -713,7 +768,13 @@ impl FileUpdateSyncer {
             compiler,
             compiler_handle,
             transaction_handle,
+            work_notifier: work_notifier.clone(),
+            debouncer_paused,
         };
+
+        // Trigger initial notification since files may already be enqueued
+        work_notifier.notify_one();
+
         Ok(syncer)
     }
 }

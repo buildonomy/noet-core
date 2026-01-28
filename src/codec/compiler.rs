@@ -7,11 +7,12 @@ use crate::{
     },
     error::BuildonomyError,
     event::BeliefEvent,
+    nodekey::NodeKey,
     properties::{BeliefKind, Bid},
     query::BeliefSource,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
 };
 use toml_edit::value;
@@ -107,9 +108,13 @@ pub struct DocumentCompiler {
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
-    pending_dependencies: BTreeMap<PathBuf, Vec<PathBuf>>,
-    processed: BTreeMap<PathBuf, usize>, // Track parse count per path
-    max_reparse_count: usize,            // Prevent infinite loops
+    pending_dependencies: HashMap<PathBuf, Vec<PathBuf>>,
+    processed: HashMap<PathBuf, usize>, // Track parse count per path
+    max_reparse_count: usize,           // Prevent infinite loops
+    /// Track BIDs of nodes updated since last reparse round
+    last_round_updates: HashSet<Bid>,
+    /// Whether reparse queue is stable (no new dependencies discovered)
+    reparse_stable: bool,
 }
 
 /// Result of parsing a single document
@@ -146,9 +151,11 @@ impl DocumentCompiler {
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
-            pending_dependencies: BTreeMap::new(),
-            processed: BTreeMap::new(),
+            pending_dependencies: HashMap::new(),
+            processed: HashMap::new(),
             max_reparse_count: max_reparse_count.unwrap_or(3),
+            last_round_updates: HashSet::new(),
+            reparse_stable: false,
         })
     }
 
@@ -169,9 +176,11 @@ impl DocumentCompiler {
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
-            pending_dependencies: BTreeMap::new(),
-            processed: BTreeMap::new(),
+            pending_dependencies: HashMap::new(),
+            processed: HashMap::new(),
             max_reparse_count: 3,
+            last_round_updates: HashSet::new(),
+            reparse_stable: false,
         })
     }
 
@@ -271,20 +280,22 @@ impl DocumentCompiler {
             self.max_reparse_count
         );
 
-        // 3. Try to read the file
-        let content = {
-            let file_path = if path.is_dir() {
-                // BeliefNetwork directories are enqueued as the directory, not the contained
-                // BeliefNetwork.json or BeliefNetwork.toml file.
-                if let Some((detected_path, _format)) = detect_network_file(&path) {
-                    detected_path
-                } else {
-                    // Default to first in NETWORK_CONFIG_NAMES (JSON)
-                    path.join(NETWORK_CONFIG_NAMES[0])
-                }
+        // 3. Determine the actual file path (may differ from path if path is a directory)
+        let file_path = if path.is_dir() {
+            // BeliefNetwork directories are enqueued as the directory, not the contained
+            // BeliefNetwork.json or BeliefNetwork.toml file.
+            if let Some((detected_path, _format)) = detect_network_file(&path) {
+                detected_path
             } else {
-                path.clone()
-            };
+                // Default to first in NETWORK_CONFIG_NAMES (JSON)
+                path.join(NETWORK_CONFIG_NAMES[0])
+            }
+        } else {
+            path.clone()
+        };
+
+        // 4. Try to read the file
+        let content = {
             match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -307,7 +318,7 @@ impl DocumentCompiler {
             }
         };
 
-        // 4. Try to parse the content
+        // 5. Try to parse the content
         let mut parse_result = match self
             .builder
             .parse_content(&path, content, global_bb.clone())
@@ -333,14 +344,14 @@ impl DocumentCompiler {
             }
         };
 
-        // 5. SUCCESS! Now we can safely remove from queues
+        // 6. SUCCESS! Now we can safely remove from queues
         self.remove_from_queues(&path);
 
-        // 6. Write rewritten content if available
+        // 7. Write rewritten content if available
         if let Some(contents) = parse_result.rewritten_content.as_ref() {
             // tracing::debug!("New content:\n\n{}\n", contents);
             if self.write {
-                if let Err(e) = tokio::fs::write(&path, contents).await {
+                if let Err(e) = tokio::fs::write(&file_path, contents).await {
                     // Write error - add as warning but continue
                     parse_result
                         .diagnostics
@@ -351,7 +362,7 @@ impl DocumentCompiler {
             }
         }
 
-        // 7. Extract dependent paths from SinkDependency diagnostics
+        // 8. Extract dependent paths from SinkDependency diagnostics
         let unresolved_references: Vec<&UnresolvedReference> = parse_result
             .diagnostics
             .iter()
@@ -366,6 +377,8 @@ impl DocumentCompiler {
             //     path
             // );
             self.reparse_queue.push_back(path.clone());
+            // New file with unresolved refs means reparse queue is not stable
+            self.reparse_stable = false;
         }
 
         // 9. Handle dependent paths (files that need this file)
@@ -472,9 +485,25 @@ impl DocumentCompiler {
     /// Peek at the next file from the reparse queue without removing it
     ///
     /// Files with the fewest unresolved dependencies are prioritized first.
-    fn peek_next_reparse_candidate(&self) -> Option<PathBuf> {
+    fn peek_next_reparse_candidate(&mut self) -> Option<PathBuf> {
         if self.reparse_queue.is_empty() {
             return None;
+        }
+
+        // If primary queue is empty and reparse queue was stable (no new dependencies
+        // discovered in last round), only reparse if we've seen new node updates
+        if self.primary_queue.is_empty() && self.reparse_stable {
+            if self.last_round_updates.is_empty() {
+                tracing::debug!(
+                    "[Compiler] Reparse queue stable and no new updates - skipping reparse round"
+                );
+                return None;
+            } else {
+                tracing::debug!(
+                    "[Compiler] Reparse queue stable but {} new updates detected - proceeding",
+                    self.last_round_updates.len()
+                );
+            }
         }
 
         // Find the file with the fewest unresolved dependencies
@@ -668,6 +697,67 @@ impl DocumentCompiler {
             processed_count: self.processed.len(),
             pending_dependencies_count: self.pending_dependencies.len(),
             total_parses: self.processed.values().sum(),
+        }
+    }
+
+    /// Notify compiler of belief events (e.g., from event stream)
+    ///
+    /// This allows the compiler to track when new nodes are created/updated,
+    /// enabling smarter reparse decisions. Only reparse if we've seen updates
+    /// that could resolve pending dependencies.
+    pub fn on_belief_event(&mut self, event: &BeliefEvent) {
+        match event {
+            BeliefEvent::NodeUpdate(keys, _, _) => {
+                // Extract BIDs from keys and track them
+                for key in keys {
+                    match key {
+                        NodeKey::Bid { bid } => {
+                            self.last_round_updates.insert(*bid);
+                        }
+                        NodeKey::Bref { .. } => {
+                            // Brefs don't have BIDs, skip
+                        }
+                        NodeKey::Path { net, .. }
+                        | NodeKey::Title { net, .. }
+                        | NodeKey::Id { net, .. } => {
+                            // Track network BID as a proxy for potential matches
+                            if *net != Bid::nil() {
+                                self.last_round_updates.insert(*net);
+                            }
+                        }
+                    }
+                }
+                // New updates mean reparse might be productive
+                self.reparse_stable = false;
+            }
+            BeliefEvent::PathAdded(_, _, bid, _, _) | BeliefEvent::PathUpdate(_, _, bid, _, _) => {
+                self.last_round_updates.insert(*bid);
+                self.reparse_stable = false;
+            }
+            BeliefEvent::NodesRemoved(bids, _) => {
+                for bid in bids {
+                    self.last_round_updates.remove(bid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark that we've completed a reparse round
+    ///
+    /// Call this when primary queue is empty and we're about to start a reparse round.
+    /// This allows tracking whether the reparse queue is stable (no new files discovered).
+    pub fn start_reparse_round(&mut self) {
+        if self.primary_queue.is_empty() && !self.reparse_queue.is_empty() {
+            let had_updates = !self.last_round_updates.is_empty();
+            self.last_round_updates.clear();
+
+            if !had_updates {
+                self.reparse_stable = true;
+                tracing::debug!("[Compiler] Reparse round starting with stable queue");
+            } else {
+                tracing::debug!("[Compiler] Reparse round starting with new updates");
+            }
         }
     }
 }

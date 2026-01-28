@@ -21,7 +21,7 @@ use crate::{
     },
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
-    nodekey::{trim_path_sep, NodeKey},
+    nodekey::{get_doc_path, to_anchor, trim_path_sep, NodeKey},
     paths::relative_path,
     properties::{
         buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight,
@@ -493,7 +493,6 @@ impl GraphBuilder {
                             updated_node.toml(),
                             EventOrigin::Remote,
                         ))?;
-                        tracing::debug!("phase 4 node update derivs: {:?}", _derivatives);
                     }
                 }
 
@@ -737,18 +736,16 @@ impl GraphBuilder {
 
         let events_is_empty = tx_events.is_empty();
         for event in tx_events.into_iter() {
-            tracing::debug!("{:?}", event);
             self.tx.send(event)?;
         }
         if !events_is_empty {
             // tracing::debug!("Ensuring our global_bb is balanced");
-            tracing::debug!("{:?}", balance_check);
             self.tx.send(balance_check)?;
         }
         Ok(())
     }
 
-    fn get_parent_from_stack(&mut self, proto: &ProtoBeliefNode) -> (Bid, Option<String>) {
+    fn get_parent_from_stack(&mut self, proto: &ProtoBeliefNode) -> (Bid, Option<String>, String) {
         let mut parent_info = None;
         let mut first_run = true;
         while !self.stack.is_empty() && parent_info.is_none() {
@@ -761,32 +758,36 @@ impl GraphBuilder {
                 .stack
                 .last()
                 .filter(|(_stack_bid, stack_path, stack_heading)| {
-                    (proto.path.starts_with(stack_path)
-                        && proto.path != *stack_path
+                    // Extract document path from stack_path (which may contain anchors for sections)
+                    let stack_doc_path = get_doc_path(stack_path);
+                    (proto.path.starts_with(stack_doc_path)
+                        && proto.path != stack_doc_path
                         && !proto
                             .kind
                             .intersection(BeliefKind::Network | BeliefKind::Document)
                             .is_empty())
-                        || (proto.path == *stack_path && *stack_heading < proto.heading)
+                        || (proto.path == stack_doc_path && *stack_heading < proto.heading)
                 })
                 .map(|(stack_bid, stack_path, _stack_heading)| {
-                    let path_info = relative_path(&proto.path, stack_path)
+                    let stack_doc_path = get_doc_path(stack_path);
+                    let path_info = relative_path(&proto.path, stack_doc_path)
                         .ok()
                         .filter(|rel_path| !rel_path.is_empty());
-                    (*stack_bid, path_info)
+                    (*stack_bid, path_info, stack_path.clone())
                 });
         }
-        parent_info.unwrap_or((self.api().bid, None))
+        parent_info.unwrap_or((self.api().bid, None, proto.path.clone()))
     }
 
     /// Generate a speculative path for a section without mutating state.
     /// Uses PathMap's speculative_path to compute what the path would be with collision detection.
+    /// Returns (network_bid, path).
     fn speculative_section_path(
         &self,
         parsed_node: &BeliefNode,
         parent_bid: Bid,
         parent_path: &str,
-    ) -> Result<String, BuildonomyError> {
+    ) -> Result<(Bid, String), BuildonomyError> {
         // Find the network by walking up the stack (network nodes have heading=1)
         let parent_net = self
             .stack
@@ -813,8 +814,16 @@ impl GraphBuilder {
                 ))
             })?;
 
+            // Use title-based anchor as explicit path if title is non-empty
+            // This prevents fallback to index-based anchors (#0, #1, etc.) for new nodes
+            let explicit_path = if !parsed_node.title.is_empty() {
+                Some(to_anchor(&parsed_node.title))
+            } else {
+                None
+            };
+
             pathmap_arc
-                .speculative_path(&temp_bid, parent_path, None, &paths)
+                .speculative_path(&temp_bid, parent_path, explicit_path.as_deref(), &paths)
                 .ok_or_else(|| {
                     BuildonomyError::Codec(format!(
                         "Failed to generate speculative path for section '{}' under parent {} (path: {})",
@@ -823,7 +832,7 @@ impl GraphBuilder {
                 })?
         };
 
-        Ok(path)
+        Ok((parent_net, path))
     }
 
     /// Update the parent stack, and update the stack cache with the node and its relations from the
@@ -850,7 +859,7 @@ impl GraphBuilder {
         event_queue: &mut Vec<BeliefEvent>,
         missing_structure: &mut BeliefGraph,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
-        let (parent_bid, path_info) = self.get_parent_from_stack(proto);
+        let (parent_bid, path_info, parent_full_path) = self.get_parent_from_stack(proto);
 
         // Can't use self.doc_bb.paths() to generate keys here, because we can't assume that self.doc_bb
         // is balanced until we're out of phase 1 of parse_content.
@@ -860,14 +869,8 @@ impl GraphBuilder {
         // Generate keys based on node type
         let mut keys = if proto.heading > 2 && !parsed_node.bid.initialized() {
             // Section in Phase 1 (no BID yet): use speculative path computation to get collision-aware path
-            let speculative_path =
-                self.speculative_section_path(&parsed_node, parent_bid, &proto.path)?;
-            let parent_net = self
-                .doc_bb
-                .states()
-                .get(&parent_bid)
-                .map(|n| n.bid)
-                .unwrap_or(self.repo());
+            let (parent_net, speculative_path) =
+                self.speculative_section_path(&parsed_node, parent_bid, &parent_full_path)?;
 
             let section_keys = vec![NodeKey::Path {
                 net: parent_net,
@@ -901,12 +904,6 @@ impl GraphBuilder {
                     if !keys.contains(&NodeKey::Bid {
                         bid: found_node.bid,
                     }) {
-                        tracing::debug!(
-                            "Adding cached node BID {} to old_keys for parsed node {}. Keys before: {:?}",
-                            found_node.bid,
-                            parsed_node.bid,
-                            keys
-                        );
                         keys.push(NodeKey::Bid {
                             bid: found_node.bid,
                         });
@@ -999,7 +996,21 @@ impl GraphBuilder {
             weight.clone(),
             EventOrigin::Remote,
         ));
-        self.stack.push((bid, proto.path.clone(), proto.heading));
+        // For sections, use the full path with anchor from the generated keys
+        // For documents/networks, use the document path
+        let stack_path = if proto.heading > 2 {
+            // Section: extract path from Path key
+            keys.iter()
+                .find_map(|k| match k {
+                    NodeKey::Path { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| proto.path.clone())
+        } else {
+            // Document or network: use document path
+            proto.path.clone()
+        };
+        self.stack.push((bid, stack_path, proto.heading));
 
         if node.kind.is_network() {
             // If the builder repo is nil, and this node is a network, and the
@@ -1252,7 +1263,7 @@ impl GraphBuilder {
 
     async fn cache_fetch<B: BeliefSource + Clone>(
         &mut self,
-        keys: &Vec<NodeKey>,
+        keys: &[NodeKey],
         global_bb: B,
         check_local: bool,
         missing_structure: &mut BeliefGraph,
@@ -1262,6 +1273,14 @@ impl GraphBuilder {
         for key in keys.iter() {
             if check_local {
                 if let Some(existing_state) = self.doc_bb.get(key) {
+                    // tracing::debug!(
+                    //     "cache_fetch: Found node in doc_bb with key {:?}. Node: bid={}, title='{}', id={:?}, kind={:?}",
+                    //     key,
+                    //     existing_state.bid,
+                    //     existing_state.title,
+                    //     existing_state.id,
+                    //     existing_state.kind
+                    // );
                     found_state = Some(existing_state);
                     source = NodeSource::SourceFile;
                     break;
@@ -1306,7 +1325,7 @@ impl GraphBuilder {
                         missing_structure.union_mut(&update);
                         source = NodeSource::GlobalCache;
                         break;
-                    } else if !cache_update.states().is_empty() {
+                    } else if !cache_update.is_empty() {
                         let pmm_guard = cache_update.paths();
                         tracing::warn!(
                             "Why didn't we get our node? The query returned results. \
@@ -1335,9 +1354,9 @@ impl GraphBuilder {
             // No cached state found - return Unresolved instead of creating ephemeral node
             // For now, we'll create an UnresolvedReference with basic info
             // The caller (push_relation) will provide proper context
-            tracing::debug!("Fetch miss! Keys: {:?}", keys);
+            // tracing::debug!("Fetch miss! Keys: {:?}", keys);
             Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
-                other_keys: keys.clone(),
+                other_keys: keys.into(),
                 ..Default::default()
             }))
         }
@@ -1634,5 +1653,235 @@ mod tests {
         // Same title always produces same anchor
         let title = "My Section";
         assert_eq!(to_anchor(title), to_anchor(title));
+    }
+
+    // ========================================================================
+    // Tests for get_parent_from_stack() - Fix #3 regression prevention
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_parent_from_stack_with_section_anchors() {
+        // Test that parent detection works when stack contains full section paths with anchors
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        // Simulate stack with document and section with anchor
+        let doc_bid = Bid::new(builder.api().bid);
+        let section1_bid = Bid::new(doc_bid);
+
+        builder.stack.push((doc_bid, "test.md".to_string(), 1));
+        builder
+            .stack
+            .push((section1_bid, "test.md#section-1".to_string(), 2));
+
+        // Create proto for a sibling section (same document, heading level 2)
+        let proto = create_test_proto_section("Section 2", "test.md", 2, None, None);
+
+        let (parent_bid, _path_info, parent_full_path) = builder.get_parent_from_stack(&proto);
+
+        // Should find the document as parent, not section-1
+        assert_eq!(
+            parent_bid, doc_bid,
+            "Parent should be document, not sibling section"
+        );
+        assert_eq!(
+            parent_full_path, "test.md",
+            "Parent path should be document path without anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_parent_from_stack_nested_sections() {
+        // Test nested sections (section within section)
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        let doc_bid = Bid::new(builder.api().bid);
+        let section1_bid = Bid::new(doc_bid);
+
+        builder.stack.push((doc_bid, "test.md".to_string(), 1));
+        builder
+            .stack
+            .push((section1_bid, "test.md#parent-section".to_string(), 2));
+
+        // Create proto for nested section (heading level 3)
+        let proto = create_test_proto_section("Child Section", "test.md", 3, None, None);
+
+        let (parent_bid, _path_info, parent_full_path) = builder.get_parent_from_stack(&proto);
+
+        // Should find section-1 as parent
+        assert_eq!(
+            parent_bid, section1_bid,
+            "Parent should be the parent section"
+        );
+        assert_eq!(
+            parent_full_path, "test.md#parent-section",
+            "Parent path should include anchor for nested section"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_parent_from_stack_multiple_sections_same_level() {
+        // Test that stack correctly identifies parent when multiple sections at same level
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        let doc_bid = Bid::new(builder.api().bid);
+        let section1_bid = Bid::new(doc_bid);
+        let section2_bid = Bid::new(doc_bid);
+
+        builder.stack.push((doc_bid, "test.md".to_string(), 1));
+        builder
+            .stack
+            .push((section1_bid, "test.md#section-1".to_string(), 2));
+        builder
+            .stack
+            .push((section2_bid, "test.md#section-2".to_string(), 2));
+
+        // Create proto for another sibling section
+        let proto = create_test_proto_section("Section 3", "test.md", 2, None, None);
+
+        let (parent_bid, _path_info, _parent_full_path) = builder.get_parent_from_stack(&proto);
+
+        // Should find document as parent (pops siblings until finding parent with lower heading)
+        assert_eq!(
+            parent_bid, doc_bid,
+            "Should pop sibling sections to find document parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_detection_from_stack() {
+        // Test that network BID is correctly identified from stack
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        // Setup: network (heading=1) and document (heading=2)
+        let network_bid = Bid::new(builder.api().bid);
+        let doc_bid = Bid::new(network_bid);
+
+        builder.stack.push((network_bid, "test".to_string(), 1)); // heading=1 = network
+        builder.stack.push((doc_bid, "test/doc.md".to_string(), 2));
+
+        // Find network by walking stack backwards looking for heading=1
+        let found_network = builder
+            .stack
+            .iter()
+            .rev()
+            .find(|(_bid, _path, heading)| *heading == 1)
+            .map(|(bid, _path, _heading)| *bid);
+
+        assert_eq!(
+            found_network,
+            Some(network_bid),
+            "Should find network BID from stack (heading=1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_network_detection() {
+        // Test nested network scenario - should find closest network
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        // Root network > Subnet > Document
+        let root_net = Bid::new(builder.api().bid);
+        let subnet = Bid::new(root_net);
+        let doc_bid = Bid::new(subnet);
+
+        builder.stack.push((root_net, "root".to_string(), 1));
+        builder.stack.push((subnet, "root/subnet".to_string(), 1)); // nested network
+        builder
+            .stack
+            .push((doc_bid, "root/subnet/doc.md".to_string(), 2));
+
+        // Find closest network (should be subnet, not root)
+        let found_network = builder
+            .stack
+            .iter()
+            .rev()
+            .find(|(_bid, _path, heading)| *heading == 1)
+            .map(|(bid, _path, _heading)| *bid);
+
+        assert_eq!(
+            found_network,
+            Some(subnet),
+            "Should find closest network (subnet) from stack"
+        );
+        assert_ne!(found_network, Some(root_net), "Should not use root network");
+    }
+
+    // ========================================================================
+    // Edge cases and regression tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_parent_from_stack_empty_stack() {
+        // Test behavior when stack is empty
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        // Empty stack
+        assert!(builder.stack.is_empty());
+
+        let proto = create_test_proto_section("Section", "test.md", 2, None, None);
+        let (parent_bid, _path_info, _parent_full_path) = builder.get_parent_from_stack(&proto);
+
+        // Should default to API node
+        assert_eq!(
+            parent_bid,
+            builder.api().bid,
+            "Empty stack should default to API node"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_parent_from_stack_pops_until_valid_parent() {
+        // Test that stack pops siblings until finding valid parent
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
+
+        let doc_bid = Bid::new(builder.api().bid);
+        let sibling1 = Bid::new(doc_bid);
+        let sibling2 = Bid::new(doc_bid);
+        let sibling3 = Bid::new(doc_bid);
+
+        builder.stack.push((doc_bid, "test.md".to_string(), 1));
+        builder.stack.push((sibling1, "test.md#s1".to_string(), 2));
+        builder.stack.push((sibling2, "test.md#s2".to_string(), 2));
+        builder.stack.push((sibling3, "test.md#s3".to_string(), 2));
+
+        let initial_stack_len = builder.stack.len();
+
+        let proto = create_test_proto_section("Section 4", "test.md", 2, None, None);
+        let (parent_bid, _path_info, _parent_full_path) = builder.get_parent_from_stack(&proto);
+
+        // Should have popped siblings to find document parent
+        assert_eq!(parent_bid, doc_bid, "Should find document as parent");
+        assert!(
+            builder.stack.len() < initial_stack_len,
+            "Should have popped sibling sections from stack"
+        );
     }
 }

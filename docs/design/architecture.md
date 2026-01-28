@@ -160,14 +160,122 @@ BeliefNode {
 
 **noet-core is schema-agnostic** - you define what schemas mean in your application.
 
+### 8. Metadata Format Flexibility
+
+Document metadata (frontmatter) supports **three formats with automatic fallback**:
+
+```yaml
+# YAML (default, markdown ecosystem standard)
+bid: "01234567-89ab-cdef-0123-456789abcdef"
+schema: "intention_lattice.intention"
+title: "My Document"
+```
+
+```json
+// JSON (web/programmatic use)
+{
+  "bid": "01234567-89ab-cdef-0123-456789abcdef",
+  "schema": "intention_lattice.intention",
+  "title": "My Document"
+}
+```
+
+```toml
+# TOML (Hugo compatibility)
+bid = "01234567-89ab-cdef-0123-456789abcdef"
+schema = "intention_lattice.intention"
+title = "My Document"
+```
+
+**How it works**:
+- **Priority order**: YAML → JSON → TOML (tries formats in sequence)
+- **Extension synonyms**: `.yaml`/`.yml`, `.json`/`.jsn`, `.toml`/`.tml`
+- **Automatic fallback**: If parsing fails in one format, tries the next
+- **Network files**: `BeliefNetwork.yaml`, `.json`, or `.toml` all supported
+- **Full compatibility**: Existing JSON/TOML documents continue to work
+
+This enables smooth adoption: start with familiar formats (JSON for web developers, TOML for Hugo users) and optionally migrate to YAML for markdown ecosystem alignment.
+
+**Implementation**: See `src/codec/belief_ir.rs` for three-way parsing logic.
+
+### 9. The API Node: Version Management and Entry Point
+
+Every BeliefBase has a special **API node** that serves two critical purposes:
+
+1. **Version Management**: Like Cargo's version system, the API node tracks which version of noet-core's schema/format the graph uses. This enables:
+   - Older noet-core versions to parse newer document trees (forward compatibility)
+   - Schema evolution tracking across library updates
+   - Migration paths when the data model changes
+
+2. **Graph Entry Point**: The API node acts as the root for graph traversal:
+   - All network nodes relate to the API node (Network → API)
+   - PathMapMap uses it as the starting point for path resolution
+   - Provides a universal anchor for distributed graphs
+
+**Reserved Namespace**: The API node uses a reserved BID namespace to prevent collision with user nodes:
+
+```rust
+// API node BID is deterministic per version
+let api_bid = buildonomy_api_bid("0.0.0");  // e.g., "5a29441c-37d2-5f41-b61b-5f62adeb9a44"
+
+// Check if a BID is reserved
+if bid.is_reserved() {
+    // This BID is in the system namespace (API, href tracking, etc.)
+}
+```
+
+**How it works**: All system BIDs have reserved namespace bytes (octets 10-15) that match `UUID_NAMESPACE_BUILDONOMY`. User files cannot use BIDs in this namespace - parsing will fail with a clear error.
+
+**For detailed specification** including namespace checking algorithm and reserved identifier validation, see [`beliefbase_architecture.md` § 2.7](./beliefbase_architecture.md#27-the-api-node-versioning-and-reserved-namespace).
+
+### 10. Extensible Document Parsing (DocCodec)
+
+noet-core supports **multiple document formats** through a pluggable codec system:
+
+```rust
+pub trait DocCodec {
+    fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError>;
+    fn nodes(&self) -> Vec<ProtoBeliefNode>;
+    fn inject_context(&mut self, node: &ProtoBeliefNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn generate_source(&self) -> Option<String>;
+}
+```
+
+**Built-in codecs**:
+- **MdCodec** (`.md`) - Markdown with frontmatter, extracts heading hierarchy
+- **TomlCodec** (`.toml`) - Standalone TOML files, schema-aware
+
+**Register custom codecs** via the global `CODECS` registry:
+
+```rust
+use noet_core::codec::{CODECS, DocCodec};
+
+#[derive(Default, Clone)]
+struct OrgModeCodec;
+
+impl DocCodec for OrgModeCodec {
+    // Implement trait methods...
+}
+
+// Register for .org files
+CODECS.insert::<OrgModeCodec>("org".to_string());
+```
+
+**Key principle**: Codecs handle **syntax only** (parsing documents into `ProtoBeliefNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity).
+
+**Example**: MdCodec parses headings into a stack-based hierarchy, but doesn't resolve cross-document links. The builder later matches `[[Document Name]]` references to actual BIDs during multi-pass compilation.
+
+**For detailed specification** including the document stack algorithm and codec implementation details, see [`beliefbase_architecture.md` § 3.5-3.6](./beliefbase_architecture.md#35-doccodec-the-frontend-interface).
+
 ## Architecture Overview
 
 ### Components
 
 **[`beliefbase`](../src/beliefbase.rs)**: Core hypergraph data structures
-- `BeliefBase`: Full-featured graph with indices and query operations
+- `BeliefBase`: Full-featured graph with indices, query operations, and API node
 - `BeliefGraph`: Lightweight transport structure (states + relations only)
 - `BidGraph`: Underlying petgraph representation
+- API node: Version management and graph entry point (automatically managed)
 
 **[`codec`](../src/codec/mod.rs)**: Document parsing and synchronization
 - `DocCodec` trait: Pluggable parsers for different formats

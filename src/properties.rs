@@ -109,6 +109,35 @@ pub fn href_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_HREF)
 }
 
+/// Generate a versioned API BID within the Buildonomy namespace
+///
+/// This creates a deterministic BID by:
+/// 1. Generating a UUID v5 from the version string
+/// 2. Replacing octets 10-15 with BUILDONOMY_NAMESPACE_BYTES
+///
+/// This approach:
+/// - Makes each version's BID deterministic (same version = same BID)
+/// - Keeps the namespace bytes in the standard location (octets 10-15)
+/// - Allows is_reserved() to detect all API BIDs by checking those bytes
+///
+/// # Example
+/// ```
+/// # use noet_core::properties::buildonomy_api_bid;
+/// let api_v0 = buildonomy_api_bid("0.0.0");
+/// assert!(api_v0.is_reserved());
+/// ```
+pub fn buildonomy_api_bid(version: &str) -> Bid {
+    // Generate a UUID v5 for deterministic versioning
+    let uuid = Uuid::new_v5(&UUID_NAMESPACE_BUILDONOMY, version.as_bytes());
+
+    // Replace octets 10-15 with Buildonomy namespace bytes
+    // This makes the BID detectable as reserved while keeping it deterministic
+    let mut bytes = *uuid.as_bytes();
+    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes());
+
+    Bid(Uuid::from_bytes(bytes))
+}
+
 pub const BID_NAMESPACE_NIL: [u8; 6] = [0; 6];
 
 /// Create a [Uuid::new_v5] using an input UUID mixed with the [UUID_NAMESPACE_BUILDONOMY]. The
@@ -158,6 +187,22 @@ impl Bid {
         self_bytes[10..16].copy_from_slice(&parent.namespace_bytes());
         let _ = replace(&mut self.0, Uuid::from_bytes(self_bytes));
         *self
+    }
+
+    /// Check if this BID falls within the reserved Buildonomy API namespace
+    ///
+    /// Returns true if the BID's parent namespace bytes match UUID_NAMESPACE_BUILDONOMY's namespace bytes.
+    /// User files must not use BIDs in this namespace - they are reserved for system use.
+    ///
+    /// This works because:
+    /// - All system BIDs (API versions, href tracking, etc.) are derived from UUID_NAMESPACE_BUILDONOMY
+    /// - When creating BIDs via `Bid::new()` or similar, the parent's namespace becomes the child's
+    ///   parent_namespace_bytes (octets 10-15)
+    /// - We check if those bytes match the Buildonomy namespace (octets 10-15 of UUID_NAMESPACE_BUILDONOMY)
+    /// - User-generated BIDs will have different parent namespace bytes
+    pub fn is_reserved(&self) -> bool {
+        self.parent_namespace_bytes()
+            == Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
     }
 
     /// Similar to [Self::parent_namespace_bytes], return the least significant 6 bytes of the Bid
@@ -828,7 +873,7 @@ impl BeliefNode {
             Value::String("UNLICENSED".to_string()),
         );
         BeliefNode {
-            bid: Bid::from(UUID_NAMESPACE_BUILDONOMY),
+            bid: buildonomy_api_bid(env!("CARGO_PKG_VERSION")),
             title: format!("Buildonomy API v{}", env!("CARGO_PKG_VERSION")),
             schema: Some("api".to_string()),
             payload: table,
@@ -1292,7 +1337,53 @@ pub struct AsRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_log::test;
+
+    #[test]
+    fn test_reserved_namespace_checking() {
+        // Test that UUID_NAMESPACE_BUILDONOMY itself is reserved
+        let namespace_bid = Bid::from(UUID_NAMESPACE_BUILDONOMY);
+        assert!(
+            namespace_bid.is_reserved(),
+            "UUID_NAMESPACE_BUILDONOMY should be reserved"
+        );
+
+        // Test that API BIDs generated via buildonomy_api_bid are reserved
+        let api_v0 = buildonomy_api_bid("0.0.0");
+        println!("API v0.0.0 BID: {}", api_v0);
+        println!(
+            "API v0.0.0 parent_namespace_bytes: {:?}",
+            api_v0.parent_namespace_bytes()
+        );
+        println!(
+            "Expected namespace bytes: {:?}",
+            Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
+        );
+        assert!(api_v0.is_reserved(), "API v0.0.0 BID should be reserved");
+
+        let api_v1 = buildonomy_api_bid("1.0.0");
+        assert!(api_v1.is_reserved(), "API v1.0.0 BID should be reserved");
+
+        // Test that href namespace is reserved
+        let href_bid = href_namespace();
+        assert!(
+            href_bid.is_reserved(),
+            "href_namespace BID should be reserved"
+        );
+
+        // Test that a random BID is NOT reserved
+        let random_bid = Bid::nil();
+        assert!(
+            !random_bid.is_reserved(),
+            "Random BID should not be reserved"
+        );
+
+        // Test that a user-created BID with different namespace is NOT reserved
+        let user_bid = Bid(uuid::Uuid::from_bytes([
+            0xa0, 0x65, 0xd8, 0x2c, 0x9d, 0x68, 0x44, 0x70, 0xbe, 0x02, 0x02, 0x8f, 0xb6, 0xc5,
+            0x07, 0xc0,
+        ]));
+        assert!(!user_bid.is_reserved(), "User BID should not be reserved");
+    }
 
     #[test]
     fn test_bid_creation_and_adoption() {

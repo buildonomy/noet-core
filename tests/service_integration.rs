@@ -100,7 +100,6 @@ fn test_watch_service_enable_disable_network_syncer() {
 }
 
 #[test]
-#[ignore = "File watching can be timing-sensitive in test environments"]
 #[cfg(feature = "service")]
 fn test_file_modification_triggers_reparse() {
     // Test that modifying a file triggers automatic reparsing
@@ -144,8 +143,8 @@ With new content.
         event_count += 1;
     }
 
-    // Note: If this fails, it may be a timing issue rather than a real bug
-    // Run manually with: cargo test --features service test_file_modification_triggers_reparse -- --ignored --nocapture
+    // Note: With debounce (2s) + processing time, 7s sleep should be sufficient
+    // If this fails, check logs for debouncer/compiler activity
     assert!(
         event_count > 0,
         "Expected to receive events after file modification, got {event_count}. \

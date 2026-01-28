@@ -40,7 +40,7 @@ impl<'a> Transaction<'a> {
 
     pub async fn execute(&mut self, connection: &Pool<Sqlite>) -> Result<(), BuildonomyError> {
         let query = self.qb.build();
-        tracing::debug!("Executing SQL for {} events", self.staged);
+        // tracing::debug!("Executing SQL for {} events", self.staged);
         // tracing::debug!("SQL:\n{}", query.sql());
         query.execute(connection).await?;
         self.qb.reset();
@@ -55,7 +55,6 @@ impl<'a> Transaction<'a> {
         // - is it because this isn't in place that UI get query wasn't returning any nodes? or
         //   is it a different reason?
         // - why didn't I see subpaths in the raw DB for net-> doc links
-        tracing::debug!("Transaction::add_event {:?}", event);
         match event {
             BeliefEvent::NodeUpdate(_bid, yaml_str, _) => {
                 let node = BeliefNode::try_from(&yaml_str[..])?;
@@ -109,14 +108,15 @@ impl<'a> Transaction<'a> {
 
     fn update_node(&mut self, belief: &BeliefNode) {
         self.qb
-            .push("INSERT OR REPLACE INTO beliefs(bid, bref, kind, title, schema, payload) ");
+            .push("INSERT OR REPLACE INTO beliefs(bid, bref, kind, title, schema, payload, id) ");
         self.qb.push_values(vec![belief], |mut b, belief| {
             b.push_bind::<String>(belief.bid.into())
                 .push_bind::<String>(belief.bid.namespace().into())
                 .push_bind(belief.kind.as_u32())
                 .push_bind::<String>(belief.title.clone())
                 .push_bind::<Option<String>>(belief.schema.clone())
-                .push_bind::<String>(belief.payload.to_string());
+                .push_bind::<String>(belief.payload.to_string())
+                .push_bind::<Option<String>>(belief.id.clone());
         });
         self.qb.push("; ");
         self.staged += 1;
@@ -450,8 +450,23 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
     }
     let options = SqliteConnectOptions::from_str(&fqdb)?
         .read_only(false)
-        .disable_statement_logging();
-    let pool = Pool::<Sqlite>::connect_with(options).await?;
+        .disable_statement_logging()
+        .create_if_missing(true);
+
+    // Use PoolOptions with after_connect to register regexp on each connection
+    use sqlx::pool::PoolOptions;
+    let pool = PoolOptions::<Sqlite>::new()
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Register the regexp function for this connection
+                sqlx::query("SELECT sqlite_compileoption_used('ENABLE_DBSTAT_VTAB')")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await?;
 
     let migrations = MigrationList(vec![
         // Define your migrations here
@@ -459,7 +474,7 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
             version: 1,
             description: "create_initial_tables",
             sql: "\
-            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT); \
+            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
             CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, subsection TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
             CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path));",
             kind: MigrationType::ReversibleUp,

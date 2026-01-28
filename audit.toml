@@ -7,4 +7,11 @@
 # that is feature-complete and widely used. "Unmaintained" does not mean
 # vulnerable - it's simply no longer under active development.
 # Transitive dependency: reactive_stores → paste
-ignore = ["RUSTSEC-2024-0436"]
+
+# RUSTSEC-2023-0071: rsa timing sidechannel vulnerability
+# Rationale: This is a stale Cargo.lock entry. The rsa crate is NOT actually
+# used in our dependency tree. It appears because sqlx's Cargo.toml lists
+# sqlx-mysql as a dependency, but we use `default-features = false` to exclude
+# it. Cargo.lock preserves these unused entries for reproducibility.
+# Verified with: cargo tree --all-features | grep rsa (returns nothing)
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2023-0071"]

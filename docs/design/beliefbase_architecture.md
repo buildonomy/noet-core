@@ -399,6 +399,226 @@ BeliefNode {
 Infrastructure asks: "Is this external? Does it have a file? Can I access its contents? Do I have a comprehensive map of its relationships?"
 Domain asks: "What schema defines this node's structure?"
 
+### 2.7. The API Node: Versioning and Reserved Namespace
+
+Every `BeliefBase` contains a special **API node** that serves dual purposes: version management and graph entry point. Understanding the API node is critical for distributed synchronization, schema evolution, and preventing BID collisions.
+
+#### Purpose and Architecture
+
+**1. Version Management (Like Cargo)**
+
+The API node tracks which version of noet-core's data model the BeliefBase uses:
+
+```rust
+pub fn api_state() -> BeliefNode {
+    BeliefNode {
+        bid: buildonomy_api_bid(env!("CARGO_PKG_VERSION")),  // Deterministic per version
+        title: format!("Buildonomy API v{}", env!("CARGO_PKG_VERSION")),
+        schema: Some("api".to_string()),
+        kind: BeliefKindSet(BeliefKind::API | BeliefKind::Trace),
+        id: Some("buildonomy_api".to_string()),
+        payload: {
+            "package": "noet-core",
+            "version": "0.0.0",
+            "authors": "...",
+            // ... metadata fields
+        },
+    }
+}
+```
+
+**Why versioning matters:**
+- Future noet-core versions may change the graph schema (new WeightKinds, payload formats, etc.)
+- Older library versions can detect newer schemas via API node version
+- Enables graceful degradation or migration prompts
+- Similar to how Cargo handles lockfile version compatibility
+
+**2. Graph Entry Point**
+
+The API node serves as the universal root for graph operations:
+
+```rust
+pub struct BeliefBase {
+    states: BTreeMap<Bid, BeliefNode>,
+    relations: Arc<RwLock<BidGraph>>,
+    // ... other fields ...
+    api: BeliefNode,  // Immutable reference, set at construction
+}
+```
+
+**Structural role:**
+- All Network nodes create a relation: `Network → API` (Section weight, source-owned)
+- PathMapMap uses API node as root for path resolution
+- Queries can start from API node to traverse entire graph
+- Provides consistent entry point across distributed systems
+
+#### Reserved BID Namespace
+
+To prevent collisions between system nodes and user nodes, all system BIDs fall within a **reserved namespace**.
+
+**Namespace Design:**
+
+```rust
+// The root namespace constant (like DNS, URL namespaces in UUID spec)
+pub const UUID_NAMESPACE_BUILDONOMY: Uuid = Uuid::from_bytes([
+    0x6b, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 
+    0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
+]);
+
+// Generate versioned API BID (deterministic)
+pub fn buildonomy_api_bid(version: &str) -> Bid {
+    // 1. Generate UUID v5 from version string (deterministic)
+    let mut uuid = Uuid::new_v5(&UUID_NAMESPACE_BUILDONOMY, version.as_bytes());
+    
+    // 2. Replace octets 10-15 with namespace bytes from UUID_NAMESPACE_BUILDONOMY
+    let mut bytes = *uuid.as_bytes();
+    bytes[10..16].copy_from_slice(
+        &Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
+    );
+    
+    Bid(Uuid::from_bytes(bytes))
+}
+```
+
+**How namespace checking works:**
+
+Following the same pattern as `Bid::new()` (which uses UUID v7 with namespace in octets 10-15):
+
+```rust
+impl Bid {
+    pub fn is_reserved(&self) -> bool {
+        self.parent_namespace_bytes() 
+            == Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
+    }
+}
+```
+
+**Key properties:**
+- **Deterministic**: Same version always produces same API BID
+- **Checkable**: Namespace bytes in standard location (octets 10-15)
+- **Collision-free**: User BIDs cannot accidentally use reserved namespace
+
+**Example:**
+```rust
+let api_bid = buildonomy_api_bid("0.0.0");
+// Result: "5a29441c-37d2-5f41-b61b-5f62adeb9a44"
+//         ↑ First 10 bytes from UUID v5 hash
+//                                  ↑ Last 6 bytes = reserved namespace
+
+assert!(api_bid.is_reserved());  // true
+
+let user_bid = Bid::new(&some_parent);
+assert!(!user_bid.is_reserved());  // false (different namespace)
+```
+
+#### Reserved Identifiers Validation
+
+User files **cannot** use reserved identifiers. Parsing fails with clear errors:
+
+**Reserved BIDs:**
+- `UUID_NAMESPACE_BUILDONOMY` itself
+- `UUID_NAMESPACE_HREF` (for external link tracking)
+- Any BID with `parent_namespace_bytes()` matching the Buildonomy namespace
+
+**Reserved IDs:**
+- `"buildonomy_api"` - API node identifier
+- `"buildonomy_href_network"` - Href tracking network
+- Any ID starting with `"buildonomy_"` prefix
+
+**Validation in `ProtoBeliefNode::from_str_with_format()`:**
+
+```rust
+// Check reserved BID
+if let Some(bid_str) = proto.document.get("bid").and_then(|v| v.as_str()) {
+    if let Ok(bid) = Bid::try_from(bid_str) {
+        if bid.is_reserved() {
+            return Err(BuildonomyError::Codec(
+                "BID '{}' is reserved for system use. \
+                 Please remove 'bid' field or use different UUID."
+            ));
+        }
+    }
+}
+
+// Check reserved ID
+if let Some(id_str) = proto.document.get("id").and_then(|v| v.as_str()) {
+    if id_str.starts_with("buildonomy_") {
+        return Err(BuildonomyError::Codec(
+            "ID '{}' uses reserved 'buildonomy_' prefix."
+        ));
+    }
+}
+```
+
+**Error example:**
+
+```toml
+# user_file.toml - This will FAIL to parse
+bid = "6b3d2154-c0a9-437b-9324-5f62adeb9a44"  # This is UUID_NAMESPACE_BUILDONOMY!
+title = "My Document"
+```
+
+Error: `BID '6b3d2154-c0a9-437b-9324-5f62adeb9a44' is reserved for system use...`
+
+#### API Node Lifecycle
+
+**Creation:**
+- API node created in `BeliefBase::empty()` via `BeliefNode::api_state()`
+- BID is deterministic per noet-core version
+- Stored in immutable `api` field on `BeliefBase`
+
+**Insertion into graph:**
+- Added to `doc_bb` during `GraphBuilder::initialize_stack()`
+- Also added to `session_bb` and `global_bb` if not present
+- Ensures all caches share the same API node
+
+**Relations:**
+- Network nodes create `Network → API` edges during `push()` (builder.rs:1003)
+- Edge type: `WeightKind::Section`, source-owned (`"owned_by": "source"`)
+- PathMapMap registers API node for path resolution
+
+**Immutability:**
+- API node BID never changes for a given noet-core version
+- `BeliefBase.api` field is read-only (no setter methods)
+- If API node gets merged/replaced during parsing (bug), it causes issues
+  - This was the root cause of Issue 24 (test file used reserved BID)
+  - Now prevented by validation in `ProtoBeliefNode` parsing
+
+#### Implementation Details
+
+**Location:** `src/properties.rs:808-839` (`api_state()` function)
+
+**Reserved namespace checking:** `src/properties.rs:192-208` (`Bid::is_reserved()` method)
+
+**Validation:** `src/codec/belief_ir.rs:1081-1125` (reserved identifier checks)
+
+**Builder integration:** `src/codec/builder.rs:556-559` (API node initialization)
+
+**Tests:** `src/properties.rs:1330-1380` (reserved namespace checking)
+
+#### Future Extensions
+
+**Multi-version graphs:**
+When older noet-core versions encounter newer schemas:
+1. Check API node version against library version
+2. If newer, optionally reject or warn user
+3. Enables controlled migration paths
+
+**Schema migrations:**
+API node version can trigger migration logic:
+```rust
+match api_node.payload.get("version") {
+    "0.1.0" => migrate_v0_1_to_v0_2(belief_base),
+    "0.2.0" => /* current version */,
+    unknown => warn!("Unknown schema version: {}", unknown),
+}
+```
+
+**Distributed sync:**
+Multiple devices can detect API version mismatches:
+- Device A: noet-core v0.1.0 → creates API v0.1.0 node
+- Device B: noet-core v0.2.0 → detects older schema, prompts upgrade
+
 ### 2.4. Graph Structure and Invariants
 
 The BeliefBase maintains a **typed, weighted, directed acyclic graph (DAG)** where:

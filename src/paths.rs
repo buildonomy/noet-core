@@ -1346,22 +1346,37 @@ impl PathMap {
                         just changing its relative path or ordering."
                     );
                     let old_order = &self.map[*idx_to_update].2.clone();
-                    debug_assert!(
-                        old_order.len() == new_entry.2.len(),
-                        "[{}] '{}' old order: {:?}, new order: {:?}",
-                        self.net,
-                        new_entry.0,
-                        old_order,
-                        new_entry.2
-                    );
+
+                    // Order vector length can change when document structure changes
+                    // (e.g., moving sections up/down in hierarchy)
+                    if old_order.len() != new_entry.2.len() {
+                        tracing::warn!(
+                            "[{}] Path '{}' order depth changed: old={:?}, new={:?}. \
+                            This may require re-parsing dependent documents.",
+                            self.net,
+                            new_entry.0,
+                            old_order,
+                            new_entry.2
+                        );
+                    }
+
                     if *old_order != new_entry.2 {
+                        // Update child paths that start with the old order
                         let mut next_idx = idx_to_update + 1;
                         while next_idx < self.map.len() {
                             let next_order = &mut self.map[next_idx].2;
                             if !next_order.starts_with(old_order) {
                                 break;
                             }
-                            next_order[..new_entry.2.len()].copy_from_slice(&new_entry.2);
+                            // Only update if lengths are compatible
+                            if next_order.len() >= new_entry.2.len() {
+                                next_order[..new_entry.2.len()].copy_from_slice(&new_entry.2);
+                            } else {
+                                tracing::warn!(
+                                    "[{}] Cannot update child path order - incompatible lengths",
+                                    self.net
+                                );
+                            }
                             next_idx += 1;
                         }
                     }

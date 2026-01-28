@@ -512,6 +512,33 @@ Before proposing implementations or writing detailed code in issues:
 - Check context for available information before querying
 - Use exact values when user specifies them
 
+### Git Operations
+
+**CRITICAL: Agent must NEVER perform git commit or push operations.**
+
+**Prohibited commands:**
+- `git commit` (in any form)
+- `git push` (in any form)
+- `git revert`
+- `git reset --hard`
+- Any other destructive git operations
+
+**Why:**
+- Human controls what gets committed and when
+- Commit messages reflect human's understanding and intent
+- Push operations affect shared repositories
+- Agent doesn't have full context for commit decisions
+
+**Agent should instead:**
+- Make code changes and let human review
+- Suggest commit messages in chat if helpful
+- State "Changes ready to commit" when work is complete
+- Let human decide when to commit and push
+
+**Exception: git status, git diff, git log**
+- Read-only git commands are fine for understanding state
+- Use these to check what's changed or current branch
+
 ### Test Failures and Recovery
 
 **When tests fail after a change:**
@@ -525,7 +552,6 @@ Before proposing implementations or writing detailed code in issues:
 **Never:**
 - Get caught in a loop trying to fix failing tests
 - Make multiple speculative changes hoping something works
-- Run `git revert` or other destructive git commands
 - Try to "fix" things when unsure of the root cause
 
 **If caught in a bad state:**

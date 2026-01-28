@@ -413,12 +413,15 @@ impl AsSql for StatePred {
             }
             // TODO/FIXME this doesn't do any filtering based on containing network
             StatePred::Title(_net, re) => {
+                // TODO: Switch back to REGEXP once regexp function registration is fixed
+                // For now, using LIKE with wildcards as a workaround
+                let pattern = format!("%{}%", re.0.as_str());
                 if match_pred {
-                    qb.push("title regexp ");
+                    qb.push("title LIKE ");
                 } else {
-                    qb.push("title NOT regexp ");
+                    qb.push("title NOT LIKE ");
                 }
-                qb.push_bind(re.0.as_str().to_string());
+                qb.push_bind(pattern);
             }
             StatePred::Payload(_key, _re_val) => {
                 tracing::warn!(

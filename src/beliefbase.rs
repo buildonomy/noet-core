@@ -1729,7 +1729,13 @@ impl BeliefBase {
             }
         }
         to_replace.remove(&node.bid);
-        // tracing::debug!("to_replace: {:?}", to_replace);
+        if !to_replace.is_empty() {
+            tracing::debug!(
+                "insert_state: Node bid={}, id={:?}, kind={:?} will REPLACE nodes: {:?}. Merge keys: {:?}",
+                node.bid, node.id, node.kind, to_replace, merge
+            );
+        }
+
         let mut updated = false;
         let is_new_node = !self.states.contains_key(&node.bid);
         if is_new_node {

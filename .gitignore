@@ -76,3 +76,6 @@ secrets/
 
 # CI/CD
 .cache/
+
+# noet-core test files
+belief_cache.db*

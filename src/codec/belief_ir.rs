@@ -26,11 +26,20 @@ use walkdir::{DirEntry, WalkDir};
 pub enum MetadataFormat {
     Json,
     Toml,
+    Yaml,
 }
 
 /// Standard filenames designating a directory as the root of a BeliefNetwork.
-/// JSON is preferred for cross-platform compatibility.
-pub const NETWORK_CONFIG_NAMES: &[&str] = &["BeliefNetwork.json", "BeliefNetwork.toml"];
+/// Priority order: YAML → JSON → TOML for consistency with metadata parsing.
+/// Supports extension synonyms: .yaml/.yml, .json/.jsn, .toml/.tml
+pub const NETWORK_CONFIG_NAMES: &[&str] = &[
+    "BeliefNetwork.yaml",
+    "BeliefNetwork.yml",
+    "BeliefNetwork.json",
+    "BeliefNetwork.jsn",
+    "BeliefNetwork.toml",
+    "BeliefNetwork.tml",
+];
 
 /// Iterates through a directory subtree, filtering to return a sorted list of network directories
 /// (directories containing a BeliefNetwork.json or BeliefNetwork.toml file), as well as file paths
@@ -243,6 +252,21 @@ fn parse_toml_to_document(toml_str: &str) -> Result<DocumentMut, BuildonomyError
         .map_err(|e| BuildonomyError::Codec(format!("Failed to parse TOML: {e}")))
 }
 
+/// Parse content as YAML and convert to TOML DocumentMut
+fn parse_yaml_to_document(yaml_str: &str) -> Result<DocumentMut, BuildonomyError> {
+    // Parse YAML string to serde_json::Value (serde_yaml::Value is compatible)
+    let yaml_value: serde_json::Value = serde_yaml::from_str(yaml_str)
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to parse YAML: {e}")))?;
+
+    // Convert YAML (as JSON Value) to TOML via intermediate serialization
+    let toml_string = json_to_toml_string(&yaml_value)?;
+
+    // Parse as TOML DocumentMut
+    toml_string
+        .parse::<DocumentMut>()
+        .map_err(|e| BuildonomyError::Codec(format!("Failed to convert YAML to TOML: {e}")))
+}
+
 /// Convert JSON value to TOML string
 fn json_to_toml_string(json: &serde_json::Value) -> Result<String, BuildonomyError> {
     // Convert JSON to TOML via toml::Value
@@ -290,7 +314,7 @@ fn json_value_to_toml_value(json: &serde_json::Value) -> Result<toml::Value, Bui
     }
 }
 
-/// Parse content with format preference and fallback
+/// Parse content with format preference and three-way fallback
 fn parse_with_fallback(
     content: &str,
     primary: MetadataFormat,
@@ -304,12 +328,21 @@ fn parse_with_fallback(
                     Ok(doc)
                 }
                 Err(json_err) => {
-                    tracing::debug!("JSON parsing failed, trying TOML fallback");
-                    match parse_toml_to_document(content) {
-                        Ok(doc) => Ok(doc),
-                        Err(toml_err) => Err(BuildonomyError::Codec(format!(
-                            "Failed to parse as JSON or TOML.\nJSON: {json_err}\nTOML: {toml_err}"
-                        ))),
+                    // tracing::debug!("JSON parsing failed, trying YAML fallback");
+                    match parse_yaml_to_document(content) {
+                        Ok(doc) => {
+                            tracing::debug!("Parsed as YAML");
+                            Ok(doc)},
+                        Err(yaml_err) => {
+                            match parse_toml_to_document(content) {
+                                Ok(doc) => {
+                                    tracing::debug!("Parsed as TOML");
+                                    Ok(doc)},
+                                Err(toml_err) => Err(BuildonomyError::Codec(format!(
+                                    "Failed to parse as JSON, YAML, or TOML.\nJSON: {json_err}\nYAML: {yaml_err}\nTOML: {toml_err}"
+                                ))),
+                            }
+                        }
                     }
                 }
             }
@@ -322,12 +355,45 @@ fn parse_with_fallback(
                     Ok(doc)
                 }
                 Err(toml_err) => {
-                    tracing::debug!("TOML parsing failed, trying JSON fallback");
+                    match parse_yaml_to_document(content) {
+                        Ok(doc) => {
+                            tracing::debug!("Parsed as YAML");
+                            Ok(doc)},
+                        Err(yaml_err) => {
+                            match parse_json_to_document(content) {
+                                Ok(doc) => {
+                                    tracing::debug!("Parsed as JSON");
+                                    Ok(doc)
+                                },
+                                Err(json_err) => Err(BuildonomyError::Codec(format!(
+                                    "Failed to parse as TOML, YAML, or JSON.\nTOML: {toml_err}\nYAML: {yaml_err}\nJSON: {json_err}"
+                                ))),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MetadataFormat::Yaml => {
+            // Try YAML first
+            match parse_yaml_to_document(content) {
+                Ok(doc) => {
+                    tracing::debug!("Parsed as YAML");
+                    Ok(doc)
+                }
+                Err(yaml_err) => {
+                    tracing::debug!("YAML parsing failed, trying JSON fallback");
                     match parse_json_to_document(content) {
                         Ok(doc) => Ok(doc),
-                        Err(json_err) => Err(BuildonomyError::Codec(format!(
-                            "Failed to parse as TOML or JSON.\nTOML: {toml_err}\nJSON: {json_err}"
-                        ))),
+                        Err(json_err) => {
+                            tracing::debug!("JSON parsing failed, trying TOML fallback");
+                            match parse_toml_to_document(content) {
+                                Ok(doc) => Ok(doc),
+                                Err(toml_err) => Err(BuildonomyError::Codec(format!(
+                                    "Failed to parse as YAML, JSON, or TOML.\nYAML: {yaml_err}\nJSON: {json_err}\nTOML: {toml_err}"
+                                ))),
+                            }
+                        }
                     }
                 }
             }
@@ -337,18 +403,30 @@ fn parse_with_fallback(
 
 /// Detect network file in directory and return (path, format)
 ///
-/// Prefers BeliefNetwork.json over BeliefNetwork.toml when both exist.
+/// Priority order: YAML → JSON → TOML (consistent with metadata parsing)
+/// Supports extension synonyms for all three formats.
 pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
-    // Try BeliefNetwork.json first (default)
-    let json_path = dir.join(NETWORK_CONFIG_NAMES[0]);
-    if json_path.exists() {
-        return Some((json_path, MetadataFormat::Json));
-    }
+    // Helper to map extension to format
+    let extension_to_format = |ext: &str| -> Option<MetadataFormat> {
+        match ext {
+            "json" | "jsn" => Some(MetadataFormat::Json),
+            "yaml" | "yml" => Some(MetadataFormat::Yaml),
+            "toml" | "tml" => Some(MetadataFormat::Toml),
+            _ => None,
+        }
+    };
 
-    // Fallback to BeliefNetwork.toml
-    let toml_path = dir.join(NETWORK_CONFIG_NAMES[1]);
-    if toml_path.exists() {
-        return Some((toml_path, MetadataFormat::Toml));
+    // Check each network config name in priority order
+    for filename in NETWORK_CONFIG_NAMES {
+        let path = dir.join(filename);
+        if path.exists() {
+            // Extract extension and map to format
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some(format) = extension_to_format(ext) {
+                    return Some((path, format));
+                }
+            }
+        }
     }
 
     None
@@ -1006,6 +1084,43 @@ impl ProtoBeliefNode {
         // Parse with format preference and fallback
         proto.document = parse_with_fallback(&proto.content, preferred_format)?;
 
+        // Validate reserved BIDs - user files cannot use BIDs in the Buildonomy API namespace
+        if let Some(bid_value) = proto.document.get("bid") {
+            if let Some(bid_str) = bid_value.as_str() {
+                if let Ok(bid) = crate::properties::Bid::try_from(bid_str) {
+                    if bid.is_reserved() {
+                        return Err(BuildonomyError::Codec(format!(
+                            "BID '{}' is reserved for system use (falls within Buildonomy API namespace) and cannot be used in user files. \
+                             Reserved BIDs include UUID_NAMESPACE_BUILDONOMY, UUID_NAMESPACE_HREF, and all BIDs derived from the Buildonomy namespace. \
+                             Please remove the 'bid' field to auto-generate a unique BID, or use a different UUID outside the reserved namespace.",
+                            bid_str
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Validate reserved IDs
+        if let Some(id_value) = proto.document.get("id") {
+            if let Some(id_str) = id_value.as_str() {
+                if id_str == "buildonomy_api" {
+                    return Err(BuildonomyError::Codec("ID 'buildonomy_api' is reserved for the system API node and cannot be used in user files. \
+                         Please choose a different ID that does not start with 'buildonomy_'.".to_string()));
+                }
+                if id_str == "buildonomy_href_network" {
+                    return Err(BuildonomyError::Codec("ID 'buildonomy_href_network' is reserved for the system href tracking network and cannot be used in user files. \
+                         Please choose a different ID that does not start with 'buildonomy_'.".to_string()));
+                }
+                if id_str.starts_with("buildonomy_") {
+                    return Err(BuildonomyError::Codec(format!(
+                        "ID '{}' uses the reserved 'buildonomy_' prefix which is reserved for system use. \
+                         Please choose a different ID that does not start with 'buildonomy_'.",
+                        id_str
+                    )));
+                }
+            }
+        }
+
         // Remove/translate BeliefNode fields into a proto node format.
         proto.document.remove("kind");
         if let Some(mut payload) = proto.document.remove("payload") {
@@ -1244,7 +1359,29 @@ schema = "noet.network_config"
     }
 
     #[test]
-    fn test_detect_network_file_prefers_json() {
+    fn test_detect_network_file_prefers_yaml() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let yaml_path = temp_dir.path().join("BeliefNetwork.yaml");
+        let json_path = temp_dir.path().join("BeliefNetwork.json");
+        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+
+        fs::write(&yaml_path, r#"bid: "yaml""#).unwrap();
+        fs::write(&json_path, r#"{"bid": "json"}"#).unwrap();
+        fs::write(&toml_path, r#"bid = "toml""#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, yaml_path, "Should prefer YAML when all three exist");
+        assert_eq!(format, MetadataFormat::Yaml);
+    }
+
+    #[test]
+    fn test_detect_network_file_prefers_json_over_toml() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -1259,20 +1396,219 @@ schema = "noet.network_config"
         assert!(result.is_some());
 
         let (path, format) = result.unwrap();
-        assert_eq!(path, json_path, "Should prefer JSON when both exist");
+        assert_eq!(
+            path, json_path,
+            "Should prefer JSON over TOML when YAML absent"
+        );
         assert_eq!(format, MetadataFormat::Json);
     }
 
     #[test]
-    fn test_parse_fallback_both_formats_invalid() {
-        let invalid_content = "this is not valid JSON or TOML {]";
+    fn test_parse_fallback_all_formats_invalid() {
+        let invalid_content = "this is not valid YAML, JSON or TOML {]";
 
         let result = ProtoBeliefNode::from_str(invalid_content);
         assert!(result.is_err());
 
         let err = result.unwrap_err();
         let err_msg = format!("{err}");
+        // Should mention all three formats in error message
+        assert!(err_msg.contains("YAML") || err_msg.contains("yaml"));
         assert!(err_msg.contains("JSON") || err_msg.contains("json"));
         assert!(err_msg.contains("TOML") || err_msg.contains("toml"));
+    }
+
+    #[test]
+    fn test_detect_network_file_yml_extension() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let yml_path = temp_dir.path().join("BeliefNetwork.yml");
+
+        fs::write(&yml_path, r#"bid: "yaml-synonym""#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, yml_path, ".yml extension should be recognized");
+        assert_eq!(format, MetadataFormat::Yaml);
+    }
+
+    #[test]
+    fn test_detect_network_file_jsn_extension() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let jsn_path = temp_dir.path().join("BeliefNetwork.jsn");
+
+        fs::write(&jsn_path, r#"{"bid": "json-synonym"}"#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, jsn_path, ".jsn extension should be recognized");
+        assert_eq!(format, MetadataFormat::Json);
+    }
+
+    #[test]
+    fn test_detect_network_file_tml_extension() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let tml_path = temp_dir.path().join("BeliefNetwork.tml");
+
+        fs::write(&tml_path, r#"bid = "toml-synonym""#).unwrap();
+
+        let result = detect_network_file(temp_dir.path());
+        assert!(result.is_some());
+
+        let (path, format) = result.unwrap();
+        assert_eq!(path, tml_path, ".tml extension should be recognized");
+        assert_eq!(format, MetadataFormat::Toml);
+    }
+    #[test]
+    fn test_reserved_bid_namespace_buildonomy() {
+        let toml = r#"
+    bid = "6b3d2154-c0a9-437b-9324-5f62adeb9a44"
+    id = "test-node"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+        assert!(err_msg.contains("Buildonomy API namespace"));
+    }
+
+    #[test]
+    fn test_reserved_bid_namespace_href() {
+        let toml = r#"
+    bid = "5b3d2154-c0a9-437b-9324-5f62adeb9a44"
+    id = "test-node"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+    }
+
+    #[test]
+    fn test_reserved_bid_derived_from_namespace() {
+        // Test that a BID derived via buildonomy_api_bid() is also rejected
+        let derived_bid = crate::properties::buildonomy_api_bid("0.1.0");
+        let toml = format!(
+            r#"
+    bid = "{}"
+    id = "test-node"
+    title = "Test"
+    "#,
+            derived_bid
+        );
+        let result = ProtoBeliefNode::from_str(&toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+    }
+
+    #[test]
+    fn test_reserved_id_buildonomy_api() {
+        let toml = r#"
+    id = "buildonomy_api"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+        assert!(err_msg.contains("buildonomy_api"));
+    }
+
+    #[test]
+    fn test_reserved_id_buildonomy_href_network() {
+        let toml = r#"
+    id = "buildonomy_href_network"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+    }
+
+    #[test]
+    fn test_reserved_id_buildonomy_prefix() {
+        let toml = r#"
+    id = "buildonomy_custom"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("reserved"));
+        assert!(err_msg.contains("buildonomy_"));
+    }
+
+    #[test]
+    fn test_non_reserved_ids_allowed() {
+        let toml = r#"
+    id = "my-custom-node"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_non_reserved_bids_allowed() {
+        let toml = r#"
+    bid = "a065d82c-9d68-4470-be02-028fb6c507c0"
+    id = "my-custom-node"
+    title = "Test"
+    "#;
+        let result = ProtoBeliefNode::from_str(toml);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_yaml_format() {
+        let yaml_content = r#"
+bid: "12345678-1234-1234-1234-123456789abc"
+schema: "intention_lattice.intention"
+title: "Test YAML Node"
+parent_connections: []
+"#;
+
+        let result = ProtoBeliefNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
+        assert!(result.is_ok(), "YAML parsing should succeed");
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("title").and_then(|v| v.as_str()),
+            Some("Test YAML Node")
+        );
+    }
+
+    #[test]
+    fn test_parse_with_format_yaml_first() {
+        let yaml_content = r#"
+bid: "yaml-test"
+schema: "test.schema"
+title: "YAML First Test"
+"#;
+
+        let result = ProtoBeliefNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
+        assert!(result.is_ok());
+
+        let proto = result.unwrap();
+        assert_eq!(
+            proto.document.get("bid").and_then(|v| v.as_str()),
+            Some("yaml-test")
+        );
     }
 }
