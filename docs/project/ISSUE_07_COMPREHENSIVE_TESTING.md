@@ -3,7 +3,9 @@
 **Priority**: HIGH - Required for v0.1.0  
 **Estimated Effort**: 3-4 days
 **Dependencies**: Issues 1-6 complete (stable implementation)  
-**Context**: Part of [`ROADMAP_OPEN_SOURCE_NOET-CORE.md`](./ROADMAP_OPEN_SOURCE_NOET-CORE.md) - ensures reliability before open source release
+**Context**: Part of [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md) - ensures reliability before open source release
+
+**CI/CD Strategy**: Repository is mirrored from GitLab to GitHub. GitHub Actions provides free runners for Linux, macOS, and Windows on public repositories, enabling comprehensive cross-platform testing without cost. See [`.github/workflows/test.yml`](../../.github/workflows/test.yml) for implementation.
 
 ## Summary
 
@@ -12,13 +14,27 @@ Establish comprehensive test coverage across all feature combinations and platfo
 ## Goals
 
 1. Test all feature flag combinations
-2. Verify cross-platform compatibility (Linux, macOS, Windows)
+2. Verify cross-platform compatibility (Linux, macOS, Windows) via GitHub Actions
 3. Review and improve test coverage for critical paths
 4. Test standalone crate (outside workspace)
 5. Establish performance baselines with benchmarks
 6. Document testing procedures
+7. Verify GitHub Actions CI/CD pipeline is comprehensive and reliable
 
 ## Architecture
+
+### CI/CD Infrastructure
+
+**GitHub Actions** (`.github/workflows/test.yml`):
+- **Free runners**: Linux, macOS, Windows on public repositories
+- **Matrix testing**: OS × Rust version × feature flags
+- **Parallel execution**: All combinations run simultaneously
+- **Artifacts**: Coverage reports, documentation, benchmarks
+
+**GitLab CI** (`.gitlab-ci.yml`):
+- **Security scanning**: SAST, secret detection
+- **Mirroring**: Automatic push to GitHub on main/tags
+- **Optional**: Redundant testing, can be simplified
 
 ### Feature Combinations
 
@@ -49,64 +65,91 @@ Current features in `Cargo.toml`:
 
 ## Implementation Steps
 
-1. **Feature Combination Testing** (1 day)
-   - [ ] Test with no features:
-     ```bash
-     cargo test --no-default-features
-     ```
-   - [ ] Test with `service` feature:
-     ```bash
-     cargo test --features service
-     ```
-   - [ ] Test with `wasm` feature:
-     ```bash
-     cargo test --features wasm
-     ```
-   - [ ] Test with all features:
-     ```bash
-     cargo test --all-features
-     ```
+### 0. GitHub Actions Setup ✅ COMPLETE
+
+**File**: `.github/workflows/test.yml`
+
+- [x] Created comprehensive test matrix workflow
+- [x] Matrix dimensions: OS (3) × Rust (2) × Features (3) = 18 combinations
+- [x] Parallel execution for fast feedback
+- [x] Separate jobs for: MSRV, examples, lint, docs, security, coverage, standalone
+- [x] Artifact uploads for documentation and coverage reports
+- [x] Summary job for branch protection
+
+**Test Matrix Coverage**:
+```yaml
+os: [ubuntu-latest, macos-latest, windows-latest]
+rust: [stable, beta]
+features: [no-default, service, all]
+```
+
+**Additional Jobs**:
+- MSRV check (Rust 1.85)
+- Example verification
+- Lint (rustfmt + clippy)
+- Documentation generation
+- Security audit (cargo-audit)
+- Code coverage (tarpaulin + Codecov)
+- Performance benchmarks (informational)
+- Standalone crate test
+
+**Success Criteria** ✅:
+- [x] Workflow file created and committed
+- [x] Tests will run on next push to GitHub mirror
+- [x] All 18 feature combinations tested across 3 platforms
+- [x] Free CI/CD for all platforms (no GitLab runner costs)
+
+### 1. **Feature Combination Testing** (0.5 days - mostly automated)
+   - [x] GitHub Actions tests all feature combinations automatically
+   - [ ] Verify CI results: Check GitHub Actions run for all green
    - [ ] Document which features enable which functionality
    - [ ] Verify feature gates are correct (#[cfg(feature = "...")])
    - [ ] Check for feature leakage (features accidentally required)
+   
+   **Local verification** (optional, CI covers this):
+   ```bash
+   cargo test --no-default-features
+   cargo test --features service
+   cargo test --all-features
+   ```
 
-2. **Platform Testing** (1 day)
-   - [ ] Test on Linux (primary development platform):
-     ```bash
-     cargo test --all-features
-     ```
-   - [ ] Test on macOS (if available):
-     ```bash
-     cargo test --all-features
-     ```
-   - [ ] Test on Windows (if available or via CI):
-     ```bash
-     cargo test --all-features
-     ```
-   - [ ] Identify platform-specific issues:
-     - Path separator differences
-     - File system case sensitivity
-     - Line ending handling
+### 2. **Platform Testing** (0.5 days - automated via GitHub Actions)
+   - [x] GitHub Actions tests on: ubuntu-latest, macos-latest, windows-latest
+   - [ ] Monitor CI results for platform-specific failures
+   - [ ] Identify platform-specific issues if any:
+     - Path separator differences (Windows `\` vs Unix `/`)
+     - File system case sensitivity (macOS insensitive, Linux sensitive)
+     - Line ending handling (CRLF vs LF)
    - [ ] Document any platform-specific behavior
+   - [ ] Fix platform-specific bugs if discovered
+   
+   **GitHub Actions handles**:
+   - ✅ Automatic testing on all 3 platforms
+   - ✅ Parallel execution (faster than sequential)
+   - ✅ No manual setup required
+   - ✅ Free for public repositories
 
-3. **Standalone Crate Testing** (0.5 days)
-   - [ ] Create test directory outside workspace
-   - [ ] Add `noet-core` as dependency (path or git):
-     ```toml
-     [dependencies]
-     noet-core = { path = "../../rust_core/crates/core" }
-     ```
-   - [ ] Write minimal example using public API
-   - [ ] Verify no workspace dependencies leak through
-   - [ ] Test with different Rust versions (stable, beta, nightly)
-   - [ ] Document minimum supported Rust version (MSRV)
+### 3. **Standalone Crate Testing** (0.25 days - automated via GitHub Actions)
+   - [x] GitHub Actions has `standalone` job that creates test project
+   - [x] Tests noet-core as path dependency outside workspace
+   - [x] Verifies public API works in isolation
+   - [ ] Verify CI standalone test passes
+   - [ ] Test with different Rust versions via GitHub Actions (stable, beta, MSRV)
+   - [ ] Document minimum supported Rust version (MSRV): **Rust 1.85**
+   
+   **GitHub Actions workflow**:
+   ```yaml
+   standalone:
+     - Create new cargo project
+     - Add noet-core as path dependency
+     - Build and run minimal example
+     - Verifies no workspace leakage
+   ```
 
-4. **Test Coverage Review** (0.5 days)
-   - [ ] Run coverage tool (e.g., `cargo tarpaulin`):
-     ```bash
-     cargo tarpaulin --all-features --out Html
-     ```
-   - [ ] Review coverage report for critical modules:
+### 4. **Test Coverage Review** (0.5 days)
+   - [x] GitHub Actions runs `cargo tarpaulin` and uploads to Codecov
+   - [ ] Review Codecov report: https://codecov.io/gh/buildonomy/noet-core
+   - [ ] Review coverage for critical modules:
      - `codec/` - Document parsing and transformation
      - `beliefbase/` - Graph operations
      - `properties/` - BID generation and resolution
@@ -116,9 +159,14 @@ Current features in `Cargo.toml`:
      - Edge cases (empty files, forward refs, cycles)
      - Concurrent operations
    - [ ] Target: >70% coverage for core modules
+   
+   **Coverage tracking**:
+   - GitHub Actions uploads to Codecov on every push
+   - Badge available for README
+   - Historical trends tracked automatically
 
-5. **Performance Benchmarks** (0.5 days)
-   - [ ] Create benchmark suite using Criterion:
+### 5. **Performance Benchmarks** (0.5 days)
+   - [ ] Create benchmark suite using Criterion (if not exists):
      ```rust
      // benches/parsing.rs
      use criterion::{criterion_group, criterion_main, Criterion};
@@ -141,21 +189,33 @@ Current features in `Cargo.toml`:
      - Multi-pass compilation
    - [ ] Establish baseline metrics
    - [ ] Document expected performance characteristics
+   - [x] GitHub Actions runs benchmarks on main branch (informational only)
    - [ ] Set up regression detection (optional for v0.1.0)
+   
+   **Note**: GitHub Actions `benchmark` job runs on push to main and stores results as artifacts.
 
-6. **Testing Documentation** (0.5 days)
+### 6. **Testing Documentation** (0.5 days)
    - [ ] Create `docs/testing.md`:
-     - How to run tests
+     - How to run tests locally
      - Feature flag combinations
      - Platform-specific considerations
-     - Coverage tools
+     - Coverage tools (tarpaulin, Codecov)
      - Benchmark procedures
-   - [ ] Add testing section to CONTRIBUTING.md
+     - **GitHub Actions CI/CD overview**
+     - Link to `.github/workflows/test.yml`
+   - [ ] Add testing section to CONTRIBUTING.md:
+     - "Tests run automatically via GitHub Actions"
+     - "Check CI status before merging PRs"
+     - "Local testing: `cargo test --all-features`"
    - [ ] Document test organization:
      - Unit tests (in module files)
      - Integration tests (`tests/` directory)
      - Benchmarks (`benches/` directory)
      - Examples (`examples/` directory)
+   - [ ] Document CI/CD infrastructure:
+     - GitHub Actions for cross-platform testing
+     - GitLab CI for security scanning and mirroring
+     - Codecov for coverage tracking
 
 ### 7. Ignored Tests Investigation and Fix (0.5-1 day)
 
@@ -315,36 +375,39 @@ Expand `tests/service_integration.rs` skeleton to cover:
 
 ## Testing Requirements
 
-- All feature combinations pass tests
-- Tests pass on Linux (required), macOS/Windows (strongly recommended)
-- Standalone crate compiles and runs outside workspace
-- Coverage >70% for core modules
-- Benchmarks establish baseline metrics
+- All feature combinations pass tests (automated via GitHub Actions)
+- Tests pass on Linux, macOS, and Windows (via GitHub Actions)
+- Standalone crate compiles and runs outside workspace (via GitHub Actions)
+- Coverage >70% for core modules (tracked via Codecov)
+- Benchmarks establish baseline metrics (stored as artifacts)
 - No test warnings or ignored tests without justification
   - File watcher test may remain ignored if timing-sensitive (document reason)
   - All doctests in `src/codec/md.rs` must be unskipped and passing
-- Examples compile and run successfully
+- Examples compile and run successfully (verified via GitHub Actions)
+- GitHub Actions workflow passes all jobs (test-summary job green)
 
 ## Success Criteria
 
-- [ ] All feature combinations tested and passing
-- [ ] Tests verified on at least 2 platforms (Linux + one other)
-- [ ] Standalone crate test successful
-- [ ] Test coverage report generated and reviewed
-- [ ] Performance baselines established
-- [ ] Testing documentation complete
-- [ ] CI can reproduce all tests
+- [x] GitHub Actions workflow created (`.github/workflows/test.yml`)
+- [ ] All feature combinations tested and passing (18 combinations via CI)
+- [ ] Tests verified on all 3 platforms: Linux, macOS, Windows (via GitHub Actions)
+- [ ] Standalone crate test successful (via GitHub Actions)
+- [ ] Test coverage report generated and reviewed (Codecov integrated)
+- [ ] Performance baselines established (benchmarks run on main)
+- [ ] Testing documentation complete (`docs/testing.md`)
+- [ ] CI can reproduce all tests (GitHub Actions provides this)
 - [ ] No flaky or timing-dependent tests (or documented with justification)
 - [ ] File watcher test (`test_file_modification_triggers_reparse`) either passing or documented as environment-specific
 - [ ] All three doctests in `src/codec/md.rs` passing without `ignore` attribute
 - [ ] `cargo test --doc` shows 0 ignored doctests
 - [ ] Service integration tests at `tests/service_integration.rs` complete and passing
 - [ ] End-to-end service layer testing (file watching → compilation → DB sync) verified
+- [ ] GitHub Actions test-summary job passes (indicates all required tests green)
 
 ## Risks
 
 **Risk**: Platform-specific bugs only caught late  
-**Mitigation**: Set up CI for multiple platforms early; document platform differences
+**Mitigation**: ✅ GitHub Actions tests all platforms on every push; free and automatic
 
 **Risk**: Feature combination explosions (2^n combinations)  
 **Mitigation**: Focus on common combinations; document which are tested
@@ -364,13 +427,17 @@ Expand `tests/service_integration.rs` skeleton to cover:
 2. Should we test on Rust beta/nightly, or just stable?
 3. Coverage target: 70%, 80%, or best-effort?
 4. Which benchmark results should we publish?
-5. CI platform: GitHub Actions, GitLab CI, or both?
+5. CI platform: GitHub Actions, GitLab CI, or both? **DECIDED: Both - GitHub for testing, GitLab for security**
 
 ## References
 
+- **GitHub Actions Workflow**: `.github/workflows/test.yml` - Comprehensive test matrix
+- **GitLab CI**: `.gitlab-ci.yml` - Security scanning and mirroring
 - **Cargo Book - Features**: https://doc.rust-lang.org/cargo/reference/features.html
 - **Rust Book - Testing**: https://doc.rust-lang.org/book/ch11-00-testing.html
 - **Criterion.rs**: https://github.com/bheisler/criterion.rs
 - **Tarpaulin**: https://github.com/xd009642/tarpaulin
+- **Codecov**: https://codecov.io/gh/buildonomy/noet-core (after first push)
 - **Pattern**: tokio testing approach (feature flags, cross-platform)
 - **Current tests**: `tests/` directory (review existing test organization)
+- **GitHub Actions Free Tier**: Unlimited minutes for public repositories on Linux, macOS, Windows

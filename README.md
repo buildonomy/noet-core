@@ -2,7 +2,8 @@
 
 A Rust library for parsing interconnected documents into a queryable hypergraph with bidirectional synchronization.
 
-[![pipeline status](https://gitlab.com/buildonomy/noet-core/badges/main/pipeline.svg)](https://gitlab.com/buildonomy/noet-core/-/commits/main)
+[![CI](https://github.com/buildonomy/noet-core/actions/workflows/test.yml/badge.svg)](https://github.com/buildonomy/noet-core/actions)
+[![codecov](https://codecov.io/gh/buildonomy/noet-core/branch/main/graph/badge.svg)](https://codecov.io/gh/buildonomy/noet-core)
 
 ## What is noet-core?
 

@@ -1,12 +1,12 @@
 # HTML Rendering Roadmap
 
-**Status**: In Progress  
-**Target**: v0.1.0 (Pre-Open Source - Required)  
+**Status**: Phase 1 Complete, Phase 2 In Progress  
+**Target**: v0.1.0 (Required for Announcement)  
 **Owner**: Andrew  
 **Created**: 2025-01-15  
-**Updated**: 2025-01-15
+**Updated**: 2025-01-28
 
-**CRITICAL**: This work must be completed BEFORE open sourcing. Clean HTML rendering is essential for the value proposition to be clear.
+**CRITICAL**: Issue 6 (HTML Generation) must be completed BEFORE v0.1.0 announcement. Clean HTML rendering is essential for the value proposition to be clear.
 
 ## Executive Summary
 
@@ -51,54 +51,49 @@ Current BID injection uses YAML blocks under headings, which:
 
 ## Critical Path
 
-### Phase 0: Pre-Work ✅ COMPLETE
+### Phase 0: Pre-Work ✅ COMPLETE (2025-01-15)
 
 - [x] Document current state and plan migration
 - [x] Research anchor syntax support across renderers
 - [x] Design frontmatter + anchor approach
 - [x] Decide on type inference approach (no prefixes)
 
-### Phase 1: Core Migration (v0.1.0, ~2 weeks) - **REQUIRED FOR OPEN SOURCE**
+### Phase 1: Core Migration ✅ COMPLETE (2025-01-28)
 
 **Objective**: Migrate to frontmatter + NodeKey URL anchors for clean rendering
 
-**Issues**:
-- **[@ISSUE_01_SCHEMA_REGISTRY.md](./ISSUE_01_SCHEMA_REGISTRY.md)** (3-4 days, CRITICAL)
-  - Refactor to singleton pattern matching `CodecMap`
-  - Enables downstream schema registration
-  - Blocks Issues 2, 3, 4
+**Completed Issues**:
+- **[Issue 1: Schema Registry](./completed/ISSUE_01_SCHEMA_REGISTRY.md)** ✅ COMPLETE
+  - Refactored to singleton pattern matching `CodecMap`
+  - Enabled downstream schema registration
 
-- **[@ISSUE_02_MULTINODE_TOML_PARSING.md](./ISSUE_02_MULTINODE_TOML_PARSING.md)** (4-5 days, CRITICAL)
+- **[Issue 2: Multi-Node TOML Parsing](./completed/ISSUE_02_MULTINODE_TOML_PARSING.md)** ✅ COMPLETE
   - Parse frontmatter with `sections` map for per-heading metadata
   - Match section metadata to heading-generated nodes
   - Apply schema-typed payloads to sections
-  - Requires Issue 1
 
-- **[@ISSUE_03_HEADING_ANCHORS.md](./ISSUE_03_HEADING_ANCHORS.md)** (2-3 days, CRITICAL)
+- **[Issue 3: Heading Anchors](./completed/ISSUE_03_HEADING_ANCHORS.md)** ✅ COMPLETE
   - Parse title-based anchors from headings: `{#introduction}`
   - Track BID-to-anchor mappings internally (not in markdown)
   - Generate title slugs when needed
-  - Prioritize cross-renderer compatibility
-  - Indirect dependency on Issues 1 & 2
+  - Cross-renderer compatibility achieved
 
-- **[@ISSUE_04_LINK_MANIPULATION.md](./ISSUE_04_LINK_MANIPULATION.md)** (3-4 days, CRITICAL)
+- **[Issue 4: Link Manipulation](./completed/ISSUE_04_LINK_MANIPULATION.md)** ✅ COMPLETE
   - Parse links with NodeKey attributes: `[text](./path.md){#bid://abc123}`
   - Generate relative paths from NodeKey resolution
   - Auto-update paths when targets move (preserve NodeKey)
-  - Requires Issues 1, 2, 3
 
-- **[@ISSUE_21_JSON_FALLBACK_PARSING.md](./ISSUE_21_JSON_FALLBACK_PARSING.md)** (3-4 days, MEDIUM)
+- **[Issue 21: JSON/TOML Dual-Format Support](./completed/ISSUE_21_JSON_FALLBACK_PARSING.md)** ✅ COMPLETE
   - JSON as default format (cross-platform compatibility)
   - Support both BeliefNetwork.json and BeliefNetwork.toml
   - Network configuration schema for repo-wide format preferences
   - Bidirectional JSON/TOML conversion for uniform handling
-  - Requires Issue 1
 
-**Additional Phase 1 Work** (not yet in dedicated issue):
-- **Migration Tool** (2 days): Convert existing YAML-block documents to new format
-  - CLI: `noet migrate <directory>`
-  - Backward compatibility checks
-  - Migration report generation
+**Migration Tool**:
+- **[Issue 20: CLI Write-Back Support](./completed/ISSUE_20_CLI_WRITE_BACK.md)** ✅ COMPLETE
+  - Implemented `noet write` command for updating documents
+  - Supports frontmatter injection and metadata updates
+  - Enables migration workflows
 
 **Dependencies**:
 ```
@@ -115,11 +110,11 @@ Issue 2 (Multi-Node TOML) ← Issue 3 (Heading Anchors)
                   v0.1.0 RELEASE
 ```
 
-### Phase 2: HTML Generation (v0.2.0 → v0.3.0, ~2 weeks)
+### Phase 2: HTML Generation (v0.1.0, ~2 weeks) - **IN PROGRESS**
 
 **Objective**: Add optional HTML generation capability with interactive features
 
-**[@ISSUE_06_HTML_GENERATION.md](./ISSUE_06_HTML_GENERATION.md)** (to be created):
+**[Issue 6: HTML Generation](./ISSUE_06_HTML_GENERATION.md)** (8-10 days, HIGH) - **CURRENT WORK**:
 - Extend `DocCodec` trait with `generate_html()` method
 - Implement HTML generation for `MdCodec`
 - Create JavaScript viewer script for interactive features
@@ -134,21 +129,33 @@ Issue 2 (Multi-Node TOML) ← Issue 3 (Heading Anchors)
 - Browser-side NodeKey resolution
 - Optional API-based cross-document resolution
 
-**Dependencies**: Phase 1 complete (v0.1.0 released)
+**Status**: Phase 1 complete ✅, Issue 6 in progress
 
-### Phase 3: Documentation & Examples (v0.3.0, ~1 week)
+**[Issue 13: HTML CLI Integration](./ISSUE_13_HTML_CLI_INTEGRATION.md)** (2-3 days):
+- Add `--html <output_dir>` to `noet parse` and `noet watch`
+- Integrate HTML generation into FileUpdateSyncer
+- Live reload server (optional)
+- Static site generation workflow
+- Requires Issue 6 complete
 
-**[@ISSUE_05_DOCUMENTATION.md](./ISSUE_05_DOCUMENTATION.md)** (3-4 days, HIGH priority)
+### Phase 3: Documentation & Examples ✅ COMPLETE (2025-01-24)
+
+**[Issue 5: Core Library Documentation](./completed/ISSUE_05_DOCUMENTATION.md)** ✅ COMPLETE
 - Architecture overview
 - Codec implementation tutorial
 - BID system deep dive
 - Working examples
 - FAQ
 
-**Additional Documentation**:
-- HTML generation guide (2 days)
-- Renderer compatibility matrix (1 day)
-- Sample documents showcasing features (1 day)
+**[Issue 10: Daemon Testing & Library Pattern Extraction](./completed/ISSUE_10_DAEMON_TESTING.md)** ✅ COMPLETE
+- Comprehensive tutorial docs with 4 doctests
+- Full orchestration example: `examples/watch_service.rs`
+- Threading model documented
+
+**Remaining Documentation**:
+- [ ] HTML generation guide (part of Issue 6)
+- [ ] Renderer compatibility matrix (part of Issue 6)
+- [ ] Sample HTML documents showcasing features (part of Issue 6)
 
 ### Phase 4: Testing & Validation (Ongoing)
 
@@ -159,43 +166,43 @@ Issue 2 (Multi-Node TOML) ← Issue 3 (Heading Anchors)
 
 ## Success Metrics
 
-### Phase 1 Complete (v0.1.0 - REQUIRED):
-- [ ] All markdown documents use frontmatter + NodeKey URL anchors
-- [ ] No visible YAML blocks in GitHub/GitLab preview
-- [ ] Clean HTML IDs (no prefixes, type inferred)
-- [ ] Migration tool successfully converts old format
-- [ ] Issues 1-4 complete and tested
-- [ ] Compatibility verified: GitHub, GitLab, Obsidian
+### Phase 1 Complete ✅ (2025-01-28):
+- [x] All markdown documents use frontmatter + NodeKey URL anchors
+- [x] No visible YAML blocks in GitHub/GitLab preview
+- [x] Clean HTML IDs (no prefixes, type inferred)
+- [x] Migration tool available (`noet write` command)
+- [x] Issues 1-4, 21 complete and tested
+- [x] Compatibility verified: GitHub, GitLab, Obsidian
 
-### Phase 2 Complete (v0.2.0):
-- [ ] `generate_html()` implemented for `MdCodec`
-- [ ] Viewer script provides interactive features
-- [ ] CLI command generates static sites
-- [ ] Issue 6 complete
+### Phase 2 Complete (BLOCKING v0.1.0):
+- [ ] `generate_html()` implemented for `MdCodec` (Issue 6)
+- [ ] Viewer script provides interactive features (Issue 6)
+- [ ] CLI command generates static sites (Issue 13)
+- [ ] HTML generation documented (Issue 6)
 
-### Phase 3 Complete (v0.3.0):
-- [ ] Issue 5 complete (core library docs)
-- [ ] HTML generation documented
-- [ ] Examples demonstrate all features
-- [ ] Compatibility tested across 8+ renderers
+### Phase 3 Complete ✅ (2025-01-24):
+- [x] Issue 5 complete (core library docs)
+- [x] Issue 10 complete (comprehensive examples)
+- [x] Compatibility tested across major renderers
+- [ ] HTML generation examples (pending Issue 6)
 
 ## Timeline
 
 ```
-Week 0-1:  Phase 1 - Issues 1-4 (Frontmatter + Anchors) - CRITICAL
-Week 1-2:  Phase 1 - Migration Tool + Testing
+✅ COMPLETE: Week 0-1:  Phase 1 - Issues 1-4, 21 (Frontmatter + Anchors)
+✅ COMPLETE: Week 1-2:  Phase 1 - Migration Tool + Testing
+✅ COMPLETE: Week 2:    Phase 3 - Issue 5, 10 (Documentation)
+✅ COMPLETE: Week 3:    SOFT OPEN SOURCE (repository public, no announcement)
            ↓
-           v0.1.0 RELEASE & OPEN SOURCE
+→ CURRENT:   Week 4-5:  Phase 2 - Issue 6 (HTML Generation) - BLOCKING v0.1.0
+→ NEXT:      Week 5:    Phase 2 - Issue 13 (HTML CLI Integration)
            ↓
-Week 2-3:  Phase 2 - Issue 6 (HTML Generation)
-Week 3-4:  Phase 2 - Viewer Script + CSS
-Week 4-5:  Phase 3 - Issue 5 (Documentation) + HTML docs
-Ongoing:   Phase 4 - Testing & validation
+           v0.1.0 ANNOUNCEMENT & CRATES.IO PUBLICATION
 ```
 
-**Critical Milestone**: v0.1.0 (Phase 1 complete) - Required before open sourcing  
-**Target**: v0.1.0 release in 2 weeks, then open source  
-**Target**: v0.2.0 (HTML generation) 3-4 weeks after open source
+**Critical Milestone**: Issue 6 (HTML Generation) - **BLOCKS v0.1.0 announcement**  
+**Current Status**: Phase 1 complete ✅, Phase 3 complete ✅, Phase 2 in progress
+**Target**: v0.1.0 announcement after Issue 6 + Issue 13 complete
 
 ## Future Enhancements (Post-v0.3.0)
 
@@ -256,6 +263,8 @@ Mitigation: Thorough testing, backup before migration, provide rollback tool.
 
 ---
 
-**Next Step**: Begin Issue 1 (Schema Registry) immediately - this is blocking open source.
+**Current Step**: Complete Issue 6 (HTML Generation) - this is blocking v0.1.0 announcement.
 
-**Critical Path**: Issue 1 → Issues 2,3 → Issue 4 → Migration Tool → v0.1.0 → Open Source → Issue 6 → v0.2.0
+**Critical Path Completed** ✅: Issue 1 → Issues 2,3 → Issue 4 → Issue 21 → Migration Tool (Issue 20)
+
+**Critical Path Remaining**: Issue 6 (HTML Generation) → Issue 13 (HTML CLI) → v0.1.0 ANNOUNCEMENT

@@ -1,0 +1,398 @@
+# GitHub Actions Workflow for noet-core
+# Comprehensive cross-platform testing (Linux, macOS, Windows)
+# Tests multiple Rust versions and feature flag combinations
+# Provides free CI/CD for platform testing per Issue 7
+
+name: Comprehensive Testing
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Feature combination testing across platforms
+  test-matrix:
+    name: Test (${{ matrix.os }}, ${{ matrix.rust }}, ${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        features:
+          - "no-default"
+          - "service"
+          - "all"
+        exclude:
+          # Reduce matrix: only test beta on Linux
+          - os: macos-latest
+            rust: beta
+          - os: windows-latest
+            rust: beta
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ matrix.features }}-
+            ${{ runner.os }}-${{ matrix.rust }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Build (no default features)
+        if: matrix.features == 'no-default'
+        run: cargo build --verbose --no-default-features
+
+      - name: Build (service feature)
+        if: matrix.features == 'service'
+        run: cargo build --verbose --features service
+
+      - name: Build (all features)
+        if: matrix.features == 'all'
+        run: cargo build --verbose --all-features
+
+      - name: Test (no default features)
+        if: matrix.features == 'no-default'
+        run: cargo test --verbose --no-default-features
+
+      - name: Test (service feature)
+        if: matrix.features == 'service'
+        run: cargo test --verbose --features service
+
+      - name: Test (all features)
+        if: matrix.features == 'all'
+        run: cargo test --verbose --all-features
+
+      - name: Doc tests (no default features)
+        if: matrix.features == 'no-default'
+        run: cargo test --doc --no-default-features
+
+      - name: Doc tests (service feature)
+        if: matrix.features == 'service'
+        run: cargo test --doc --features service
+
+      - name: Doc tests (all features)
+        if: matrix.features == 'all'
+        run: cargo test --doc --all-features
+
+  # MSRV (Minimum Supported Rust Version) check
+  msrv:
+    name: MSRV Check (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check MSRV
+        run: |
+          cargo build --all-features
+          cargo test --all-features
+
+  # Example verification
+  examples:
+    name: Verify Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: examples-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build examples
+        run: cargo build --examples --all-features
+
+      - name: Run basic_usage example
+        run: cargo run --example basic_usage --features service
+
+  # Linting
+  lint:
+    name: Lint (rustfmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  # Documentation generation
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: docs-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: target/doc
+          retention-days: 7
+
+  # Security audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
+  # Code coverage
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage
+        run: cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: cobertura.xml
+          retention-days: 7
+
+  # Benchmark baseline (informational only)
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benchmarks
+        run: |
+          if [ -d "benches" ]; then
+            cargo bench --all-features -- --output-format bencher | tee output.txt
+          else
+            echo "No benchmarks found, skipping"
+          fi
+
+      - name: Upload benchmark results
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: output.txt
+          retention-days: 30
+
+  # Standalone crate test (Issue 7 requirement)
+  standalone:
+    name: Standalone Crate Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: noet-core
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create standalone test project
+        run: |
+          mkdir -p standalone-test
+          cd standalone-test
+          cargo init --name standalone_test
+
+          # Add noet-core as path dependency
+          cat >> Cargo.toml << EOF
+
+          [dependencies]
+          noet-core = { path = "../noet-core", features = ["service"] }
+          EOF
+
+          # Create minimal example using public API
+          cat > src/main.rs << 'EOF'
+          use noet_core::beliefbase::BeliefBase;
+
+          fn main() {
+              let bb = BeliefBase::default();
+              println!("BeliefBase created: {} nodes", bb.node_count());
+          }
+          EOF
+
+      - name: Build standalone project
+        run: |
+          cd standalone-test
+          cargo build --verbose
+
+      - name: Run standalone project
+        run: |
+          cd standalone-test
+          cargo run
+
+  # Summary job (required for branch protection)
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-matrix, msrv, examples, lint, docs, security, standalone]
+    if: always()
+    steps:
+      - name: Check test results
+        run: |
+          if [ "${{ needs.test-matrix.result }}" != "success" ]; then
+            echo "❌ Test matrix failed"
+            exit 1
+          fi
+          if [ "${{ needs.msrv.result }}" != "success" ]; then
+            echo "❌ MSRV check failed"
+            exit 1
+          fi
+          if [ "${{ needs.examples.result }}" != "success" ]; then
+            echo "❌ Examples failed"
+            exit 1
+          fi
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "❌ Lint failed"
+            exit 1
+          fi
+          if [ "${{ needs.docs.result }}" != "success" ]; then
+            echo "❌ Documentation failed"
+            exit 1
+          fi
+          if [ "${{ needs.security.result }}" != "success" ]; then
+            echo "⚠️  Security audit failed (non-blocking)"
+          fi
+          if [ "${{ needs.standalone.result }}" != "success" ]; then
+            echo "❌ Standalone crate test failed"
+            exit 1
+          fi
+          echo "✅ All required tests passed"
+
+  # Mirror to GitLab (namespace reservation and backup)
+  mirror-to-gitlab:
+    name: Mirror to GitLab
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    needs: [test-summary]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for mirror
+
+      - name: Mirror to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+        run: |
+          git remote add gitlab https://oauth2:${GITLAB_TOKEN}@gitlab.com/buildonomy/noet-core.git || true
+          git push --mirror gitlab

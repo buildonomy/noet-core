@@ -79,71 +79,95 @@
   - Full orchestration example: `examples/watch_service.rs` (432 lines)
   - Threading model documented
 
-#### Phase 2: HTML Rendering (2 weeks, POST-SOFT-OPEN-SOURCE)
-- **[Issue 1: Schema Registry](./ISSUE_01_SCHEMA_REGISTRY.md)** (3-4 days, CRITICAL)
-  - Refactor to singleton pattern
-  - Enable downstream schema registration
+#### Phase 2: HTML Rendering ✅ COMPLETE (2025-01-28)
+- **[Issue 1: Schema Registry](./completed/ISSUE_01_SCHEMA_REGISTRY.md)** ✅ COMPLETE
+  - Refactored to singleton pattern
+  - Enabled downstream schema registration
 
-- **[Issue 2: Multi-Node TOML Parsing](./ISSUE_02_MULTINODE_TOML_PARSING.md)** (4-5 days, CRITICAL)
+- **[Issue 2: Multi-Node TOML Parsing](./completed/ISSUE_02_MULTINODE_TOML_PARSING.md)** ✅ COMPLETE
   - Parse frontmatter with `sections` map
   - Apply schema-typed payloads to headings
 
-- **[Issue 3: Heading Anchors](./ISSUE_03_HEADING_ANCHORS.md)** (2-3 days, CRITICAL)
+- **[Issue 3: Heading Anchors](./completed/ISSUE_03_HEADING_ANCHORS.md)** ✅ COMPLETE
   - Parse title-based anchors: `{#introduction}`
   - Track BID-to-anchor mappings internally
 
-- **[Issue 4: Link Manipulation](./ISSUE_04_LINK_MANIPULATION.md)** (3-4 days, CRITICAL)
+- **[Issue 4: Link Manipulation](./completed/ISSUE_04_LINK_MANIPULATION.md)** ✅ COMPLETE
   - Parse NodeKey link attributes
   - Auto-update paths when targets move
 
-- **[Issue 21: JSON/TOML Dual-Format Support](./ISSUE_21_JSON_FALLBACK_PARSING.md)** (3-4 days, MEDIUM)
+- **[Issue 21: JSON/TOML Dual-Format Support](./completed/ISSUE_21_JSON_FALLBACK_PARSING.md)** ✅ COMPLETE
   - JSON as default format (cross-platform compatibility)
   - Support both BeliefNetwork.json and BeliefNetwork.toml
   - Network configuration schema for repo-wide format preferences
   - Bidirectional JSON/TOML conversion for uniform handling
+
+- **[Issue 6: HTML Generation](./ISSUE_06_HTML_GENERATION.md)** (8-10 days, HIGH) - **IN PROGRESS**
+  - Extend `DocCodec` trait with `generate_html()` method
+  - Implement HTML generation for `MdCodec`
+  - Create JavaScript viewer script for interactive features
+  - Create CSS stylesheet for noet documents
+  - NodeKey anchor resolution in browser
 
 - **[Issue 13: HTML CLI Integration](./ISSUE_13_HTML_CLI_INTEGRATION.md)** (2-3 days)
   - Add `--html <output_dir>` to `noet parse` and `noet watch`
   - Integrate HTML generation into FileUpdateSyncer
   - Live reload server (optional)
   - Static site generation workflow
+  - Requires Issue 6
 
-#### Phase 3: Code Quality & Testing (1 week, POST-SOFT-OPEN-SOURCE)
-- Comprehensive test suite (unit + integration)
-- Property-based testing for compiler
-- Fuzzing for codec implementations
-- Performance benchmarks
-- Memory leak detection
+#### Phase 3: Code Quality & Testing (1 week)
+- **[Issue 7: Comprehensive Testing](./ISSUE_07_COMPREHENSIVE_TESTING.md)** (5-7 days)
+  - Comprehensive unit test suite
+  - Integration tests for all major workflows
+  - Property-based testing for builder
+  - Fuzzing for codec implementations
+  - Performance benchmarks established
+  - Memory leak detection tests
+  
+**Recent Testing Improvements** ✅:
+- **[Issue 22: Duplicate Node Deduplication](./completed/ISSUE_22_DUPLICATE_NODE_DEDUPLICATION.md)** ✅ COMPLETE
+- **[Issue 23: Integration Test Convergence](./completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md)** ✅ COMPLETE
 
-#### Phase 4: Repository & Infrastructure (3-5 days)
-- Extract repository from monorepo
-- Set up CI/CD (GitLab CI or GitHub Actions)
-- Configure crates.io publishing
-- License headers (MIT/Apache-2.0)
-- Contributing guidelines
+#### Phase 4: Repository & Infrastructure ✅ MOSTLY COMPLETE (2025-01-20)
+- **[Issue 8: Repository Setup](./ISSUE_08_REPOSITORY_SETUP.md)** ✅ COMPLETE
+  - Extracted repository from monorepo
+  - Set up basic CI/CD (security scanning)
+  - License headers added (MIT/Apache-2.0)
+  - Contributing guidelines created
+  
+**Remaining**:
+- [ ] Complete comprehensive CI/CD (Linux, macOS, Windows, multiple Rust versions)
+- [ ] Configure crates.io publishing workflow
 
-#### Phase 5: Publication & Announcement (2-3 days)
-- Publish to crates.io
-- Write announcement blog post
-- Submit to This Week in Rust
-- Social media announcements
-- Monitor initial feedback
+#### Phase 5: Publication & Announcement (2-3 days) - **BLOCKED ON ISSUE 6**
+- **[Issue 9: Crates.io Release](./ISSUE_09_CRATES_IO_RELEASE.md)** (2-3 days)
+  - Publish v0.1.0 to crates.io
+  - Write announcement blog post
+  - Submit to This Week in Rust
+  - Social media announcements
+  - Monitor initial feedback
+  - Requires Issues 6, 7, 8 complete
 
-**Soft Open Source Criteria** (Before making repo public):
-- [ ] Issue 5 complete (basic documentation)
-- [ ] Cargo.toml dependencies cleaned (no product crate references)
-- [ ] README explains library purpose
-- [ ] No product-specific code in noet-core
-- [ ] Basic examples compile
+**Soft Open Source Criteria** ✅ COMPLETE (2025-01-20):
+- [x] Issue 5 complete (basic documentation)
+- [x] Cargo.toml dependencies cleaned (no product crate references)
+- [x] README explains library purpose
+- [x] No product-specific code in noet-core
+- [x] Basic examples compile
 
 **v0.1.0 Success Metrics** (Before announcement):
-- [ ] All tests passing
-- [ ] Documentation complete (including Issue 10 examples)
-- [ ] HTML rendering feature complete (Issues 1-4, 6, 13)
-- [ ] CLI tool working (`noet parse`, `noet watch`)
-- [ ] CI/CD green
-- [ ] Published to crates.io
+- [x] All tests passing (Issues 22, 23 complete)
+- [x] Documentation complete (Issue 5 + Issue 10 examples)
+- [x] HTML rendering parsing complete (Issues 1-4, 21)
+- [ ] HTML generation complete (Issue 6) - **BLOCKING v0.1.0**
+- [ ] HTML CLI integration (Issue 13)
+- [x] CLI tool working (`noet parse`, `noet watch`)
+- [ ] CI/CD comprehensive (basic security scanning complete)
+- [ ] Published to crates.io (Issue 9)
 - [ ] Announcement ready
+
+**Current Blocker**: Issue 6 (HTML Generation) must complete before v0.1.0 announcement
 
 ---
 

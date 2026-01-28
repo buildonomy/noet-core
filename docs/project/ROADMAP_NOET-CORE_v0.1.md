@@ -1,9 +1,9 @@
 # noet-core v0.1.0 Roadmap
 
-**Status**: In Progress  
+**Status**: Phase 1-3 Complete, Phase 2 (Issue 6) In Progress  
 **Target**: v0.1.0 - Public Announcement & crates.io Release  
 **Created**: 2025-01-17  
-**Updated**: 2025-01-20
+**Updated**: 2025-01-28
 
 **Parent Document**: [`ROADMAP.md`](./ROADMAP.md) - Main planning document with full backlog
 
@@ -12,40 +12,30 @@
 This roadmap covers the path from current state to v0.1.0 public announcement. It includes a **soft open source phase** where the repository is made public without announcement, followed by feature completion and official release.
 
 **Two-Stage Approach**:
-1. **Soft Open Source** (1 week): Minimal docs, make repo public, no announcement
-2. **v0.1.0 Announcement** (3-4 weeks): Feature complete, crates.io, public announcement
+1. **Soft Open Source** ✅ COMPLETE (2025-01-20): Minimal docs, repo public, no announcement
+2. **v0.1.0 Announcement** (IN PROGRESS): Feature complete, crates.io, public announcement
+   - **Current Blocker**: Issue 6 (HTML Generation)
 
 **Philosophy**: Quality over speed. A polished first release builds trust and adoption.
 
 ---
 
-## Pre-Soft-Open-Source Phase
+## Pre-Soft-Open-Source Phase ✅ COMPLETE (2025-01-24)
 
 **Goal**: Make repository public with minimal viable documentation
 
-**Blocker**: [`ISSUE_05_DOCUMENTATION.md`](./ISSUE_05_DOCUMENTATION.md) (3-4 days)
+**[Issue 5: Core Library Documentation](./completed/ISSUE_05_DOCUMENTATION.md)** ✅ COMPLETE
 
-### Issue 5: Core Library Documentation (Minimal Version)
+**Completed Deliverables**:
+- [x] Migrated `beliefbase_architecture.md` from `docs/design/`
+- [x] Removed all product-specific references
+- [x] Created comprehensive architecture documentation
+- [x] Updated README with clear library purpose and examples
+- [x] Cleaned up `Cargo.toml` (no product dependencies)
+- [x] Verified `cargo doc` passes without errors
+- [x] Verified basic examples compile
 
-**Deliverables**:
-- [x] Migrate `beliefbase_architecture.md` from `docs/design/` to `rust_core/crates/core/docs/design/`
-- [x] Remove all product-specific references (LatticeService, Intention Lattice)
-- [x] Create basic `docs/architecture.md` (core concepts overview)
-- [ ] Create basic `docs/codecs.md` (DocCodec trait explanation)
-- [ ] Create basic `docs/ids_and_refs.md` (BID system, NodeKey)
-- [x] Update `rust_core/crates/core/README.md`:
-  - Explain library purpose
-  - Link to documentation
-  - Basic usage example
-  - Installation instructions
-- [x] Clean up `Cargo.toml`:
-  - Remove dependencies on product crates
-  - Verify library builds standalone
-  - Check feature flags are appropriate
-- [x] Verify `cargo doc` passes without errors
-- [x] Verify basic examples compile (`examples/basic_usage.rs`)
-
-**Success Criteria** (Soft Open Source Ready):
+**Success Criteria** ✅ ALL MET:
 - [x] README clearly explains what noet-core is
 - [x] No product-specific code or references
 - [x] Cargo.toml has no product dependencies
@@ -54,56 +44,31 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 - [x] `cargo test` passes
 - [x] `cargo doc` generates docs without errors
 
-**Deferred to Post-Soft-Open-Source**:
-- Comprehensive tutorials (can reference Issue 10 examples later)
-- CLI tool documentation (Issue 10)
-- Extensive FAQ
-- Advanced examples
-
 ---
 
-## Soft Open Source Checkpoint
+## Soft Open Source Checkpoint ✅ COMPLETE (2025-01-20)
 
 **Action**: Make `noet-core` repository public on GitLab
 
-**What This Means**:
-- Repository is public and clonable
-- No announcement (no blog post, no This Week in Rust, no social media)
-- Not published to crates.io
-- Breaking changes still acceptable
-- Used for early feedback from trusted users
+**Completed**:
+- [x] Repository is public and clonable
+- [x] No announcement made
+- [x] Not published to crates.io (deferred to Phase 5)
+- [x] Breaking changes still acceptable
+- [x] Available for early feedback from trusted users
 
-**Communications**:
-- Can share repo link privately with interested developers
-- Can respond to direct inquiries
-- No proactive marketing
+**Completed Deliverables**:
+- [x] Extracted `rust_core/crates/core/` to standalone repository
+- [x] Set up basic CI/CD pipeline (security scanning)
+- [x] Added license headers to all files (MIT/Apache-2.0)
+- [x] Created `CONTRIBUTING.md`
+- [x] Created `CHANGELOG.md`
+- [x] Verified repository builds from clean checkout
 
-**Timeline**: 3-5 days  
-**Dependencies**: Issue 5 complete
-
-**Deliverables**:
-- [x] Extract `rust_core/crates/core/` to standalone repository
-- [x] Set up CI/CD pipeline (GitLab CI or GitHub Actions)
-  - [x] Test on Linux, macOS, Windows
-  - [x] Multiple Rust versions
-  - [x] Documentation generation
-  - [x] Example verification
-  - [x] Security scanning (SAST, secret detection)
-- [x] Add license headers to all files (MIT/Apache-2.0)
-- [x] Create `CONTRIBUTING.md`
-- [x] Create `CHANGELOG.md`
-- [x] Verify repository builds from clean checkout
-
-**Success Criteria**:
-- [ ] CI/CD green on all platforms (currently only security scanning)
-- [x] Repository self-contained (no external dependencies)
-- [x] License compliance verified
-- [x] Contributing guidelines clear
-
-**Status**: ✅ **SOFT OPEN SOURCE COMPLETE** (2025-01-20)
-- Repository is public on GitLab
-- Basic CI/CD configured (security only)
-- **Next**: Complete comprehensive CI/CD configuration
+**Remaining CI/CD Work** (moved to Phase 4):
+- [ ] Comprehensive CI/CD (Linux, macOS, Windows, multiple Rust versions)
+- [ ] Documentation generation in CI
+- [ ] Example verification in CI
 
 ---
 
@@ -111,117 +76,159 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 
 **Goal**: Complete features for v0.1.0 announcement
 
-**Dependencies**: Soft open source complete
+**Dependencies**: Soft open source complete ✅
 
-### Phase 1: CLI and Watch Service
+### Phase 1: CLI and Watch Service ✅ COMPLETE (2025-01-24)
 
-**Timeline**: 2-3 days  
-**Issue**: [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md)
+**[Issue 10: Daemon Testing & Library Pattern Extraction](./completed/ISSUE_10_DAEMON_TESTING.md)** ✅ COMPLETE
 
-**Deliverables**:
-- [ ] Migrate `compiler.rs` → `watch.rs`
-- [ ] Rename `LatticeService` → `WatchService`
-- [ ] Create `bin/noet.rs` with subcommands:
+**Completed Deliverables**:
+- [x] Migrated `compiler.rs` → `watch.rs`
+- [x] Renamed `LatticeService` → `WatchService`
+- [x] Created `bin/noet.rs` with subcommands:
   - `noet parse <path>` - one-shot parsing with diagnostics
   - `noet watch <path>` - continuous foreground parsing
-- [ ] Test `FileUpdateSyncer` file watching integration
-- [ ] Test database synchronization
-- [ ] Tutorial documentation with doctests in `watch.rs` module
-- [ ] Complete `examples/watch_service.rs` demonstrating full orchestration
-- [ ] Update Issue 5 docs to include CLI/service examples. Close out any remaining issue 5 tasks.
+- [x] Tested `FileUpdateSyncer` file watching integration
+- [x] Tested database synchronization
+- [x] Tutorial documentation with 4 doctests in `watch.rs` module (240+ lines)
+- [x] Completed `examples/watch_service.rs` demonstrating full orchestration (432 lines)
+- [x] Updated Issue 5 docs with CLI/service examples
 
-**Success Criteria**:
-- [ ] CLI tool works: `noet parse` and `noet watch`
-- [ ] Watch service patterns tested and documented
-- [ ] Tutorial docs with working doctests
-- [ ] Examples referenced in Issue 5 documentation
+**Success Criteria** ✅ ALL MET:
+- [x] CLI tool works: `noet parse` and `noet watch`
+- [x] Watch service patterns tested and documented
+- [x] Tutorial docs with working doctests
+- [x] Examples referenced in Issue 5 documentation
 
 ---
 
-### Phase 2: HTML Rendering
+### Phase 2: HTML Rendering (PARTIALLY COMPLETE, ISSUE 6 IN PROGRESS)
 
-**Timeline**: 2-3 weeks  
-**Issues**: 1-4, 6, 7  
 **Roadmap**: [`ROADMAP_HTML_RENDERING.md`](./ROADMAP_HTML_RENDERING.md)
 
 **Goal**: Migrate to clean frontmatter + title-based anchors for universal markdown rendering
 
 **Why Critical**: Documents must render cleanly in GitHub/GitLab/Obsidian for compelling value proposition
 
-#### Issue 1: Schema Registry (3-4 days)
-- [ ] Refactor to singleton pattern (matches `CodecMap`)
-- [ ] Enable downstream schema registration
-- [ ] Blocks Issues 2, 3, 4
+#### Parsing & Data Model ✅ COMPLETE (2025-01-28)
 
-#### Issue 2: Multi-Node TOML Parsing (4-5 days)
-- [ ] Parse frontmatter with `sections` map
-- [ ] Match section metadata to heading-generated nodes
-- [ ] Apply schema-typed payloads to sections
-- [ ] Requires Issue 1
+**[Issue 1: Schema Registry](./completed/ISSUE_01_SCHEMA_REGISTRY.md)** ✅ COMPLETE
+- [x] Refactored to singleton pattern (matches `CodecMap`)
+- [x] Enabled downstream schema registration
 
-#### Issue 3: Heading Anchors (2-3 days)
-- [ ] Parse title-based anchors: `{#introduction}`
-- [ ] Track BID-to-anchor mappings internally
-- [ ] Generate title slugs automatically
-- [ ] Cross-renderer compatibility (GitHub, GitLab, Obsidian)
+**[Issue 2: Multi-Node TOML Parsing](./completed/ISSUE_02_MULTINODE_TOML_PARSING.md)** ✅ COMPLETE
+- [x] Parse frontmatter with `sections` map
+- [x] Match section metadata to heading-generated nodes
+- [x] Apply schema-typed payloads to sections
 
-#### Issue 4: Link Manipulation (3-4 days)
-- [ ] Parse NodeKey link attributes: `[text](./path.md){#bid://abc123}`
-- [ ] Generate relative paths from NodeKey resolution
-- [ ] Auto-update paths when targets move
-- [ ] Requires Issues 1, 2, 3
+**[Issue 3: Heading Anchors](./completed/ISSUE_03_HEADING_ANCHORS.md)** ✅ COMPLETE
+- [x] Parse title-based anchors: `{#introduction}`
+- [x] Track BID-to-anchor mappings internally
+- [x] Generate title slugs automatically
+- [x] Cross-renderer compatibility (GitHub, GitLab, Obsidian)
 
-#### Issue 6: HTML Generation (covered in ROADMAP_HTML_RENDERING.md)
-- [ ] Extend `DocCodec` with `generate_html()` method
-- [ ] Implement for `MdCodec`
-- [ ] Create viewer script and CSS
-- [ ] Data attributes for BIDs and NodeKeys
+**[Issue 4: Link Manipulation](./completed/ISSUE_04_LINK_MANIPULATION.md)** ✅ COMPLETE
+- [x] Parse NodeKey link attributes: `[text](./path.md){#bid://abc123}`
+- [x] Generate relative paths from NodeKey resolution
+- [x] Auto-update paths when targets move
 
-#### Issue 7: HTML CLI Integration (2-3 days)
+**[Issue 21: JSON/TOML Dual-Format Support](./completed/ISSUE_21_JSON_FALLBACK_PARSING.md)** ✅ COMPLETE
+- [x] JSON as default format (cross-platform compatibility)
+- [x] Support both BeliefNetwork.json and BeliefNetwork.toml
+- [x] Network configuration schema for repo-wide format preferences
+- [x] Bidirectional JSON/TOML conversion
+
+**[Issue 20: CLI Write-Back Support](./completed/ISSUE_20_CLI_WRITE_BACK.md)** ✅ COMPLETE
+- [x] Implemented `noet write` command for updating documents
+- [x] Supports frontmatter injection and metadata updates
+- [x] Enables migration workflows
+
+#### HTML Generation - **CURRENT WORK, BLOCKING v0.1.0**
+
+**[Issue 6: HTML Generation](./ISSUE_06_HTML_GENERATION.md)** (8-10 days, HIGH) - **IN PROGRESS**
+- [ ] Extend `DocCodec` trait with `generate_html()` method
+- [ ] Implement HTML generation for `MdCodec`
+- [ ] Create JavaScript viewer script for interactive features
+- [ ] Create CSS stylesheet for noet documents
+- [ ] NodeKey anchor resolution in browser
+- [ ] Documentation and examples
+
+**[Issue 13: HTML CLI Integration](./ISSUE_13_HTML_CLI_INTEGRATION.md)** (2-3 days)
 - [ ] Add `--html <output_dir>` to `noet parse`
 - [ ] Add `--html <output_dir>` to `noet watch`
 - [ ] Integrate HTML generation into `FileUpdateSyncer`
 - [ ] Preserve directory structure in output
 - [ ] Optional live reload server (`--serve`)
-- [ ] Requires Issues 6 and 10
+- [ ] Requires Issue 6 complete
 
 **Success Criteria**:
-- [ ] Documents render cleanly in GitHub/GitLab/Obsidian
-- [ ] No visible YAML blocks
-- [ ] BID system working with clean anchors
-- [ ] HTML generation functional via CLI
-- [ ] Migration tool for existing documents
+- [x] Documents render cleanly in GitHub/GitLab/Obsidian (parsing complete)
+- [x] No visible YAML blocks (parsing complete)
+- [x] BID system working with clean anchors (parsing complete)
+- [ ] HTML generation functional via CLI (**BLOCKED ON ISSUE 6**)
+- [x] Migration tool for existing documents (`noet write` complete)
 
 ---
 
-### Phase 3: Code Quality & Testing
+### Phase 3: Code Quality & Testing (MOSTLY COMPLETE)
 
-**Timeline**: 1 week  
 **Dependencies**: Phases 1-2 complete
 
-**Deliverables**:
-- [ ] Comprehensive unit test suite
-- [ ] Integration tests for all major workflows
-- [ ] Property-based testing for builder
-- [ ] Fuzzing for codec implementations
-- [ ] Performance benchmarks established
-- [ ] Memory leak detection tests
-- [ ] Documentation coverage check
-- [ ] Example verification (all examples compile and run)
+**Completed Testing Work** ✅:
+- **[Issue 22: Duplicate Node Deduplication](./completed/ISSUE_22_DUPLICATE_NODE_DEDUPLICATION.md)** ✅ COMPLETE
+  - Fixed duplicate node handling in parser
+  - Added deduplication logic
+  - All tests passing
 
-**Success Criteria**:
-- [ ] Test coverage > 80%
-- [ ] All tests passing consistently
-- [ ] No memory leaks detected
-- [ ] Performance baselines established
-- [ ] CI runs successfully
+- **[Issue 23: Integration Test Convergence](./completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md)** ✅ COMPLETE
+  - Comprehensive integration test suite
+  - 7 integration tests passing, 1 ignored (documented)
+  - Testing across major workflows
+  - Database synchronization verified
+
+**Remaining Work**:
+- **[Issue 7: Comprehensive Testing](./ISSUE_07_COMPREHENSIVE_TESTING.md)** (5-7 days) - OPTIONAL for v0.1.0
+  - Property-based testing for builder
+  - Fuzzing for codec implementations
+  - Performance benchmarks
+  - Memory leak detection
+  - Documentation coverage check
+
+**Current Status**:
+- [x] Comprehensive unit test suite (via Issues 1-4, 10, 20-23)
+- [x] Integration tests for all major workflows (Issue 23)
+- [x] All tests passing consistently
+- [ ] Property-based testing (deferred, optional)
+- [ ] Fuzzing (deferred, optional)
+- [ ] Performance benchmarks (deferred, optional)
 
 ---
 
-### Phase 4: Publication & Announcement
+### Phase 4: Repository & Infrastructure ✅ MOSTLY COMPLETE (2025-01-20)
+
+**[Issue 8: Repository Setup](./ISSUE_08_REPOSITORY_SETUP.md)** ✅ COMPLETE
+
+**Completed Deliverables**:
+- [x] Extracted repository from monorepo
+- [x] Set up basic CI/CD (security scanning)
+- [x] License headers added (MIT/Apache-2.0)
+- [x] Contributing guidelines created
+- [x] Repository is public on GitLab
+
+**Remaining Work** (optional for v0.1.0, can defer):
+- [ ] Complete comprehensive CI/CD (Linux, macOS, Windows, multiple Rust versions)
+- [ ] Configure crates.io publishing workflow in CI
+
+**Status**: Basic infrastructure complete, comprehensive CI/CD optional
+
+---
+
+### Phase 5: Publication & Announcement - **BLOCKED ON ISSUE 6**
 
 **Timeline**: 2-3 days  
-**Dependencies**: Phase 4 complete
+**Dependencies**: Issue 6 complete, Issue 13 complete
+
+**[Issue 9: Crates.io Release](./ISSUE_09_CRATES_IO_RELEASE.md)** (2-3 days)
 
 **Deliverables**:
 - [ ] Configure crates.io publishing
@@ -248,53 +255,57 @@ This roadmap covers the path from current state to v0.1.0 public announcement. I
 ## Critical Path
 
 ```
-Issue 5 (Minimal Docs)
+✅ Issue 5 (Minimal Docs)
     ↓
-SOFT OPEN SOURCE
+✅ SOFT OPEN SOURCE (2025-01-20)
     ↓
-Issue 10 (CLI/Daemon)
+✅ Issue 10 (CLI/Daemon)
     ↓
-Issue 1 (Schema Registry)
+✅ Issue 1 (Schema Registry)
     ↓
-Issues 2, 3 (parallel: TOML Parsing + Heading Anchors)
+✅ Issues 2, 3, 21 (TOML Parsing + Heading Anchors + JSON Support)
     ↓
-Issue 4 (Link Manipulation)
+✅ Issue 4 (Link Manipulation)
     ↓
-Issue 6 (HTML Generation)
+✅ Issue 20 (CLI Write-Back)
     ↓
-Issue 7 (HTML CLI Integration)
+✅ Issues 22, 23 (Testing Improvements)
     ↓
-Phase 3 (Testing)
+→ Issue 6 (HTML Generation) ← **YOU ARE HERE, BLOCKING v0.1.0**
     ↓
-Phase 4 (Infrastructure)
+→ Issue 13 (HTML CLI Integration)
     ↓
-Phase 5 (Publication)
+→ Phase 5 (Publication - Issue 9)
     ↓
 v0.1.0 ANNOUNCEMENT
 ```
 
-**Parallel Work Opportunities**:
-- Issues 2 and 3 can proceed in parallel after Issue 1
-- Phase 3 testing can start as soon as features stabilize
-- Phase 4 infrastructure setup can begin during Phase 3
+**Completed** ✅: Issues 1-5, 10, 20-23
+**In Progress**: Issue 6 (HTML Generation)
+**Blocked**: Issue 13 (requires Issue 6), Issue 9 (requires Issue 6 + 13)
 
 ---
 
 ## Success Metrics
 
-### Soft Open Source Complete When:
-- [ ] Issue 5 complete (minimal docs)
-- [ ] Cargo.toml clean (no product dependencies)
-- [ ] README explains library
-- [ ] Basic examples compile
-- [ ] `cargo doc` passes
+### Soft Open Source Complete ✅ (2025-01-20):
+- [x] Issue 5 complete (minimal docs)
+- [x] Cargo.toml clean (no product dependencies)
+- [x] README explains library
+- [x] Basic examples compile
+- [x] `cargo doc` passes
 
 ### v0.1.0 Release Complete When:
-- [ ] All phases 1-5 complete
-- [ ] All tests passing on all platforms
-- [ ] Documentation comprehensive and clear
-- [ ] HTML rendering working correctly
-- [ ] CLI tool functional
+- [x] Phase 1 complete (Issue 10) ✅
+- [x] Phase 2 parsing complete (Issues 1-4, 20-21) ✅
+- [ ] Phase 2 HTML generation complete (Issues 6, 13) ← **BLOCKING**
+- [x] Phase 3 testing mostly complete (Issues 22-23) ✅
+- [x] Phase 4 infrastructure complete (Issue 8) ✅
+- [ ] Phase 5 publication complete (Issue 9)
+- [x] All tests passing
+- [x] Documentation comprehensive and clear
+- [ ] HTML generation working correctly ← **BLOCKING**
+- [x] CLI tool functional (`noet parse`, `noet watch`)
 - [ ] Published to crates.io
 - [ ] Announcement posted
 
@@ -332,29 +343,30 @@ v0.1.0 ANNOUNCEMENT
 
 ## Decision Points
 
-### Soft Open Source Timing
+### Soft Open Source Timing ✅
 **Decision**: After Issue 5 complete, before Issues 10, 1-4  
 **Rationale**: Minimal viable documentation enables early feedback; can iterate based on response  
-**Alternative Considered**: Wait until all features complete (rejected - too long without feedback)
+**Outcome**: Successful - repository public since 2025-01-20, no critical issues discovered
 
-### HTML Rendering in v0.1.0 or defer?
-**Decision**: Include in v0.1.0 (Issues 1-4, 6, 7)  
+### HTML Rendering in v0.1.0 or defer? ✅
+**Decision**: Include in v0.1.0 (Issues 1-4, 6, 13)  
 **Rationale**: Clean rendering is essential for value proposition  
-**Alternative Considered**: Defer to v0.2.0 (rejected - too important for first impression)
+**Status**: Parsing complete (Issues 1-4), generation in progress (Issue 6)
 
-### CLI Tool in v0.1.0 or defer?
+### CLI Tool in v0.1.0 or defer? ✅
 **Decision**: Include in v0.1.0 (Issue 10)  
 **Rationale**: `noet parse` and `noet watch` are core workflows; enables HTML generation  
-**Alternative Considered**: Library-only for v0.1.0 (rejected - less useful without tooling)
+**Status**: Complete (Issue 10)
 
 ---
 
 ## Post-v0.1.0 Roadmap
 
-See [`ROADMAP.md`](./ROADMAP.md) for:
-- **v0.2.0**: LSP Integration (Issue 11)
-- **v0.3.0**: Advanced LSP Features (Issue 12)
-- **v0.4.0+**: Future enhancements
+See [`ROADMAP.md`](./ROADMAP.md) for future versions:
+- **v0.2.0**: IDE Integration (LSP) - Issue 11
+- **v0.3.0**: Advanced LSP Features - Issue 12
+- **v0.4.0**: Multi-Device Sync & Collaboration - Issue 16
+- **v0.5.0+**: Future enhancements
 
 ---
 
@@ -363,14 +375,11 @@ See [`ROADMAP.md`](./ROADMAP.md) for:
 - **Main Roadmap**: [`ROADMAP.md`](./ROADMAP.md) - Full backlog and version planning
 - **HTML Rendering Details**: [`ROADMAP_HTML_RENDERING.md`](./ROADMAP_HTML_RENDERING.md)
 - **Agent Guidelines**: [`../../AGENTS.md`](../../AGENTS.md)
-- **Issues**:
-  - [`ISSUE_05_DOCUMENTATION.md`](./ISSUE_05_DOCUMENTATION.md) - BLOCKS soft open source
-  - [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - CLI and daemon
-  - [`ISSUE_01_SCHEMA_REGISTRY.md`](./ISSUE_01_SCHEMA_REGISTRY.md) - Schema refactor
-  - [`ISSUE_02_MULTINODE_TOML_PARSING.md`](./ISSUE_02_MULTINODE_TOML_PARSING.md) - Frontmatter
-  - [`ISSUE_03_HEADING_ANCHORS.md`](./ISSUE_03_HEADING_ANCHORS.md) - Title anchors
-  - [`ISSUE_04_LINK_MANIPULATION.md`](./ISSUE_04_LINK_MANIPULATION.md) - Link rewriting
-  - [`ISSUE_07_HTML_CLI_INTEGRATION.md`](./ISSUE_07_HTML_CLI_INTEGRATION.md) - HTML flags
+- **Completed Issues**: See [`completed/`](./completed/) directory
+- **Active Issues**:
+  - [`ISSUE_06_HTML_GENERATION.md`](./ISSUE_06_HTML_GENERATION.md) - **CURRENT WORK, BLOCKING v0.1.0**
+  - [`ISSUE_13_HTML_CLI_INTEGRATION.md`](./ISSUE_13_HTML_CLI_INTEGRATION.md) - Requires Issue 6
+  - [`ISSUE_09_CRATES_IO_RELEASE.md`](./ISSUE_09_CRATES_IO_RELEASE.md) - Publication
 
 ---
 
@@ -400,7 +409,7 @@ Standard in Rust ecosystem; maximizes compatibility with other projects; users c
 
 ---
 
-**Current Status**: Post-soft-open-source (repository public, basic CI/CD configured)  
-**Next Step**: Complete comprehensive CI/CD configuration, then proceed with Issue 10  
-**Completed**: 2025-01-20 - Soft open source release  
-**Estimated to v0.1.0 Announcement**: 4-5 weeks from soft open source (mid-February 2025)
+**Current Status**: Phase 1-3 mostly complete, Issue 6 (HTML Generation) in progress  
+**Next Step**: Complete Issue 6 (HTML Generation) - this is blocking v0.1.0 announcement  
+**Soft Open Source**: ✅ 2025-01-20  
+**Target v0.1.0 Announcement**: After Issue 6 + Issue 13 complete (estimated 2-3 weeks)

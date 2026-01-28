@@ -1,150 +1,16 @@
 # GitLab CI/CD Pipeline for noet-core
-# Tests on multiple platforms (Linux, macOS, Windows) and Rust versions
-# Includes documentation generation, example verification, and security scanning
+# Minimal configuration - GitHub is primary CI/CD
+# GitLab role: Security scanning and namespace reservation
 
 stages:
-  - lint
-  - test
   - security
   - docs
-  - deploy
 
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   RUST_BACKTRACE: "1"
 
-# Cache cargo dependencies
-.cache_template: &cache_template
-  cache:
-    key:
-      files:
-        - Cargo.lock
-      prefix: $CI_JOB_NAME
-    paths:
-      - .cargo/
-      - target/
-
-# Lint jobs
-fmt:
-  stage: lint
-  image: rust:latest
-  script:
-    - rustup component add rustfmt
-    - cargo fmt --all -- --check
-  only:
-    - merge_requests
-    - main
-    - develop
-
-clippy:
-  stage: lint
-  image: rust:latest
-  <<: *cache_template
-  script:
-    - rustup component add clippy
-    - cargo clippy --all-features --all-targets -- -D warnings
-  only:
-    - merge_requests
-    - main
-    - develop
-
-# Test jobs - Linux (multiple Rust versions)
-.test_linux_template: &test_linux_template
-  stage: test
-  <<: *cache_template
-  script:
-    - rustc --version && cargo --version
-    - cargo build --verbose --all-features
-    - cargo test --verbose --all-features
-    - cargo test --verbose --no-default-features
-    - cargo test --verbose --features service
-  only:
-    - merge_requests
-    - main
-    - develop
-  artifacts:
-    reports:
-      junit: target/test-results.xml
-    when: always
-    expire_in: 1 week
-
-test:linux:stable:
-  <<: *test_linux_template
-  image: rust:latest
-
-test:linux:nightly:
-  <<: *test_linux_template
-  image: rustlang/rust:nightly
-  allow_failure: true
-
-test:linux:msrv:
-  <<: *test_linux_template
-  image: rust:1.85
-  allow_failure: false
-
-# # Test job - macOS
-# test:macos:stable:
-#   stage: test
-#   tags:
-#     - macos
-#   before_script:
-#     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-#     - source $HOME/.cargo/env
-#   script:
-#     - rustc --version && cargo --version
-#     - cargo build --verbose --all-features
-#     - cargo test --verbose --all-features
-#     - cargo test --verbose --no-default-features
-#     - cargo test --verbose --features service
-#   only:
-#     - merge_requests
-#     - main
-#     - develop
-#   allow_failure: true # Allow failure if no macOS runner available
-
-# # Test job - Windows
-# .windows_job:
-#   tags:
-#     - saas-windows-medium-amd64
-#   before_script:
-#     - Set-Variable -Name "time" -Value (date -Format "%H:%m")
-#     - echo ${time}
-#     - echo "started by ${GITLAB_USER_NAME} / @${GITLAB_USER_LOGIN}"
-
-# test:windows:stable:
-#   stage: test
-#   extends:
-#     - .windows_job
-#   before_script:
-#     - choco install rustup.install -y
-#     - $env:Path = "C:\Users\$env:UserName\.cargo\bin;$env:Path"
-#   script:
-#     - rustc --version
-#     - cargo --version
-#     - cargo build --verbose --all-features
-#     - cargo test --verbose --all-features
-#     - cargo test --verbose --no-default-features
-#     - cargo test --verbose --features service
-#   only:
-#     - merge_requests
-#     - main
-#     - develop
-#   allow_failure: true # Allow failure if no Windows runner available
-
-# Example verification
-test:examples:
-  stage: test
-  image: rust:latest
-  <<: *cache_template
-  script:
-    - cargo build --examples --all-features
-    - cargo run --example basic_usage --features service
-  only:
-    - merge_requests
-    - main
-    - develop
-
-# Security scanning
+# Security scanning (GitLab's strength)
 sast:
   stage: security
   allow_failure: false
@@ -157,7 +23,7 @@ include:
   - template: Security/SAST.gitlab-ci.yml
   - template: Security/Secret-Detection.gitlab-ci.yml
 
-# Dependency audit
+# Dependency audit (backup to GitHub's Dependabot)
 audit:
   stage: security
   image: rust:latest
@@ -171,70 +37,18 @@ audit:
     - develop
   allow_failure: true # Advisory notices shouldn't block CI
 
-# Documentation generation
-docs:
-  stage: docs
-  image: rust:latest
-  <<: *cache_template
-  script:
-    - cargo doc --no-deps --all-features
-  artifacts:
-    paths:
-      - target/doc
-    expire_in: 1 week
-  only:
-    - merge_requests
-    - main
-    - develop
-
-# Documentation check (ensure no warnings)
-docs:check:
-  stage: docs
-  image: rust:latest
-  <<: *cache_template
-  script:
-    - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-  only:
-    - merge_requests
-    - main
-    - develop
-
-# Code coverage (optional, requires tarpaulin)
-coverage:
-  stage: test
-  image: rust:latest
-  <<: *cache_template
-  before_script:
-    - cargo install cargo-tarpaulin
-  script:
-    - cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out Xml
-  coverage: '/\d+\.\d+% coverage/'
-  artifacts:
-    reports:
-      coverage_report:
-        coverage_format: cobertura
-        path: cobertura.xml
-  only:
-    - main
-    - develop
-  allow_failure: true
-
-# Publish to crates.io (manual trigger only)
-publish:crates-io:
-  stage: deploy
-  image: rust:latest
-  script:
-    - cargo publish --token $CRATES_IO_TOKEN
-  only:
-    - tags
-  when: manual
-  allow_failure: false
-
-# Pages deployment (for documentation hosting)
+# Optional: GitLab Pages for documentation backup
 pages:
-  stage: deploy
+  stage: docs
   image: rust:latest
-  <<: *cache_template
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: $CI_JOB_NAME
+    paths:
+      - .cargo/
+      - target/
   script:
     - cargo doc --no-deps --all-features
     - mv target/doc public
@@ -244,3 +58,7 @@ pages:
       - public
   only:
     - main
+  allow_failure: true
+
+# Note: Mirroring is handled by GitHub Actions
+# GitHub pushes to GitLab on main/tags for backup and namespace reservation
