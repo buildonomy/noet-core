@@ -1,7 +1,7 @@
 # Issue 7: Comprehensive Testing
 
 **Priority**: HIGH - Required for v0.1.0  
-**Estimated Effort**: 2-3 days  
+**Estimated Effort**: 3-4 days
 **Dependencies**: Issues 1-6 complete (stable implementation)  
 **Context**: Part of [`ROADMAP_OPEN_SOURCE_NOET-CORE.md`](./ROADMAP_OPEN_SOURCE_NOET-CORE.md) - ensures reliability before open source release
 
@@ -157,7 +157,9 @@ Current features in `Cargo.toml`:
      - Benchmarks (`benches/` directory)
      - Examples (`examples/` directory)
 
-### 7. File Watcher Integration Test (from Issue 19) (0.5-1 day)
+### 7. Ignored Tests Investigation and Fix (0.5-1 day)
+
+**File Watcher Integration Test (from Issue 19)**
 
 **Context**: Test `test_file_modification_triggers_reparse` is currently ignored due to timing sensitivity.
 
@@ -169,6 +171,29 @@ Current features in `Cargo.toml`:
 - [ ] Document platform-specific behavior if needed
 
 **Decision: If manual CLI testing passes**, treat as test infrastructure issue and use mocking or extended timeouts. Don't spend >1 day on this - file watcher tests are inherently flaky in CI.
+
+**Ignored Doctests in `src/codec/md.rs`**
+
+**Context**: Three doctests are marked with `ignore` because they use incomplete examples or placeholders.
+
+- [ ] `parse_title_attribute` (line 199):
+  - Currently uses placeholder `Bref::from(...)`
+  - Fix: Use proper `Bref::try_from("abc123").unwrap()` syntax
+  - Add test for JSON parsing: `{"auto_title":true}`
+  - Add test for user words extraction
+- [ ] `build_title_attribute` (line 281):
+  - Uses string literals instead of actual Bref objects
+  - Fix: Import Bref type, use proper construction
+  - Test all three formats: bref-only, with auto_title, with user words
+- [ ] `make_relative_path` (line 315):
+  - Examples look complete, might just need `ignore` removed
+  - Verify examples compile and pass
+  - Test edge cases: same directory, parent directory, nested paths
+
+**Success Criteria**:
+- [ ] All three doctests compile without `ignore` attribute
+- [ ] Examples demonstrate actual API usage (not placeholders)
+- [ ] `cargo test --doc` passes with 0 ignored tests in `md.rs`
 
 
 **Critical first step**: Verify if `noet watch` actually works in real usage.
@@ -233,6 +258,61 @@ echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
    - Check: https://github.com/notify-rs/notify/issues
    - Version: currently using notify-debouncer-full v0.3.1
 
+### 8. Service Testing Infrastructure (from Issue 10) (1-1.5 days)
+
+**Context**: Core library is well-tested. Service layer (`watch.rs`, feature = "service") has comprehensive rustdoc examples but minimal integration tests. Test skeleton exists at `tests/service_integration.rs`.
+
+**WatchService API Testing**
+
+- [ ] Review `WatchService` API and ensure it implements library operations (not product-specific)
+- [ ] Verify rustdoc examples are comprehensive (currently 4 doctests, 240+ lines)
+- [ ] Document operation semantics in module-level rustdoc
+- [ ] Test `WatchService::new()` initialization with various configurations
+- [ ] Test `enable_network_syncer()` / `disable_network_syncer()` lifecycle
+
+**FileUpdateSyncer Integration Tests**
+
+Expand `tests/service_integration.rs` skeleton to cover:
+
+- [ ] Test: Initialize `FileUpdateSyncer` with temp directory
+- [ ] Test: Create/modify file, verify compiler thread processes it
+- [ ] Test: Verify `BeliefEvent`s flow correctly to transaction thread
+- [ ] Test: Verify database sync completes (query DB to confirm)
+- [ ] Test: Multiple file changes in quick succession, verify all processed
+- [ ] Test: Handle parse errors gracefully (malformed markdown, invalid TOML)
+- [ ] Test: Shutdown and cleanup (abort handles, drop resources)
+- [ ] Document threading model and synchronization points in module doc
+
+**File Watching Integration Tests**
+
+- [ ] Test: `enable_network_syncer()` sets up file watcher correctly
+- [ ] Test: File modification triggers debouncer callback
+- [ ] Test: Debouncer filters dot files correctly (`.hidden`, `.git/`)
+- [ ] Test: Debouncer filters by codec extensions (only `.md`, `.toml`, `.json`)
+- [ ] Test: Compiler queue gets updated when file changes
+- [ ] Test: `disable_network_syncer()` tears down watcher cleanly
+- [ ] Verify no race conditions between debouncer and compiler thread
+- [ ] Test platform-specific behavior (Linux inotify vs macOS FSEvents)
+
+**Database Synchronization Tests**
+
+- [ ] Test: `perform_transaction()` batches multiple events correctly
+- [ ] Test: Events update SQLite database with correct data
+- [ ] Test: Transaction errors are handled gracefully (DB locked, disk full)
+- [ ] Test: Event channel backpressure handling (if applicable)
+- [ ] Test: Database state matches `builder.doc_bb()` cache after sync
+- [ ] Document transaction boundaries and consistency guarantees
+- [ ] Test concurrent read operations during write transactions
+
+**Success Criteria**:
+- [ ] Integration test suite at `tests/service_integration.rs` passes
+- [ ] Coverage for all major `WatchService` operations
+- [ ] File watcher, compiler, and transaction threads tested end-to-end
+- [ ] Database sync verified with actual queries
+- [ ] Threading model and sync points documented
+- [ ] Tests pass with `--features service` flag
+- [ ] No race conditions or flaky behavior
+
 ## Testing Requirements
 
 - All feature combinations pass tests
@@ -241,6 +321,8 @@ echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
 - Coverage >70% for core modules
 - Benchmarks establish baseline metrics
 - No test warnings or ignored tests without justification
+  - File watcher test may remain ignored if timing-sensitive (document reason)
+  - All doctests in `src/codec/md.rs` must be unskipped and passing
 - Examples compile and run successfully
 
 ## Success Criteria
@@ -252,7 +334,12 @@ echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
 - [ ] Performance baselines established
 - [ ] Testing documentation complete
 - [ ] CI can reproduce all tests
-- [ ] No flaky or timing-dependent tests
+- [ ] No flaky or timing-dependent tests (or documented with justification)
+- [ ] File watcher test (`test_file_modification_triggers_reparse`) either passing or documented as environment-specific
+- [ ] All three doctests in `src/codec/md.rs` passing without `ignore` attribute
+- [ ] `cargo test --doc` shows 0 ignored doctests
+- [ ] Service integration tests at `tests/service_integration.rs` complete and passing
+- [ ] End-to-end service layer testing (file watching → compilation → DB sync) verified
 
 ## Risks
 

@@ -1306,7 +1306,6 @@ impl GraphBuilder {
                         missing_structure.union_mut(&update);
                         source = NodeSource::GlobalCache;
                         break;
-                        // tracing::debug!("source: {:?}", source);
                     } else if !cache_update.states().is_empty() {
                         let pmm_guard = cache_update.paths();
                         tracing::warn!(

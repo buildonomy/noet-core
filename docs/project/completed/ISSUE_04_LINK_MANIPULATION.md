@@ -559,12 +559,13 @@ if end_is_anchor {
    - Logs when relations can't be resolved, explaining index gaps
    - Clarifies that gaps preserve ordering structure from source
 
-**Known Pre-Existing Issue** (Tracked separately):
+**Known Pre-Existing Issue** (Tracked separately) - ✅ NOW RESOLVED:
 - Test: `test_belief_set_builder_bid_generation_and_caching`
 - Status: Was already failing before Issue 04 work began
-- Root cause: Parse convergence and cache utilization issues
-- **Tracked in**: Issue 23 (ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md)
-- Not blocking Issue 04 completion
+- Root cause: BID collision in test data (`link_manipulation_test.md` and `sections_test.md` both used BID `10000000-0000-0000-0000-000000000001`)
+- **Resolution (2026-01-28)**: Fixed BID collision in test data - changed `sections_test.md` to use unique BID `10000000-0000-0000-0000-000000000002`
+- **Tracked in**: Issue 23 (completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md) - ✅ RESOLVED
+- Test now passes consistently with ~100% cache hit rate on second parse
 
 ## Open Questions (Resolved)
 

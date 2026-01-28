@@ -132,6 +132,8 @@ See `DOCUMENTATION_STRATEGY.md` for the full documentation hierarchy (lib.rs →
 
 ## Session Management
 
+This project follows a structured **issue resolution workflow** (see § Project-Specific Context → Issue Resolution Workflow, or `docs/project/README.md` for full details). Session management aligns with this workflow:
+
 ### Starting New Sessions
 When beginning work, agent should:
 - Ask "What are we working on today?" if not immediately clear
@@ -143,6 +145,7 @@ When beginning work, agent should:
 - **Review existing code** before proposing solutions (search for related files/functions)
 - **Check scratchpad** for session notes from previous work (`.scratchpad/`)
 - Confirm understanding before proposing solutions
+- **Identify workflow stage**: Investigation? Implementation? Testing? Completion?
 
 ### Mid-Session Context
 - Track open decisions and park them explicitly
@@ -153,14 +156,17 @@ When beginning work, agent should:
 ### Ending Sessions
 
 **Agent should**:
-- Update scratchpad with final status
+- Update issue document with progress (not just scratchpad)
+- Mark completed checkboxes in issue success criteria
 - Note remaining work and blockers
+- Identify unresolved items (new issue? backlog? deferred?)
 - Clean up old scratchpad files if no longer needed
 
 **Human should explicitly state**:
 - What got done
 - What's next
 - Open questions to resume with
+- Decision: Continue in new session or mark issue complete?
 
 ### Context Management (Token Efficiency)
 
@@ -189,6 +195,10 @@ When beginning work, agent should:
 - Creating documents that duplicate existing information
 
 ## Issues and Roadmaps
+
+**For complete issue lifecycle and resolution workflow**, see `docs/project/README.md` - Issue Resolution Process (creation → investigation → implementation → completion → archiving).
+
+This section covers **how to write** issues and roadmaps effectively. The workflow README covers **when and why** to perform each step.
 
 ### Core Principle: Succinct and Reviewable
 
@@ -330,6 +340,8 @@ How do we know we're done?
 - Step-by-step instructions (emerge during implementation)
 
 ## Iterative Collaboration Pattern
+
+**Note**: See `docs/project/README.md` for the full issue resolution workflow. This section focuses on **within-session collaboration** on issue/roadmap content.
 
 ### Workflow
 
@@ -597,11 +609,32 @@ Agent should explicitly state:
 
 ## Project-Specific Context
 
+### Issue Resolution Workflow
+
+This project follows a structured issue resolution process for human-AI collaboration:
+
+1. **Create and Plan**: Write issue, assign priority, map to roadmap
+2. **Investigate**: TDD scaffolding, understand existing code, refine approach
+3. **Check Context Budget**: Implement now or defer to new session
+4. **Implement and Test**: Incremental changes, test frequently, halt on complex failures
+5. **Update Issue**: Document completion, mark checkboxes, capture learnings
+6. **Identify Unresolved Items**: Large items → new issues, small items → backlog
+7. **Check for Orphaned Actions**: All critical work tracked elsewhere?
+8. **Move to Completed**: No orphaned actions → mark complete, move to `completed/`
+
+**Full workflow documentation**: See `docs/project/README.md` for comprehensive process guide including:
+- Step-by-step workflow with decision points
+- Issue templates and examples
+- Common patterns and anti-patterns
+- Integration with these agent guidelines
+
 ### File Conventions
-- Issues: `docs/project/ISSUE_XX_*.md`
+- Issues: `docs/project/ISSUE_XX_*.md` (active work)
+- Completed: `docs/project/completed/ISSUE_XX_*.md` (resolved, no orphaned actions)
 - Design docs: `docs/design/*.md` with semantic versioning
 - Trade studies: `docs/project/trades/*.md` (for complex analyses)
 - Roadmaps: Project root or `docs/project/ROADMAP_XX_*.md`
+- Backlog: `docs/project/BACKLOG.md` (optional enhancements from completed issues)
 
 ### Document Naming Conventions
 

@@ -306,10 +306,7 @@ fn parse_with_fallback(
                 Err(json_err) => {
                     tracing::debug!("JSON parsing failed, trying TOML fallback");
                     match parse_toml_to_document(content) {
-                        Ok(doc) => {
-                            tracing::info!("Parsed with fallback format TOML");
-                            Ok(doc)
-                        }
+                        Ok(doc) => Ok(doc),
                         Err(toml_err) => Err(BuildonomyError::Codec(format!(
                             "Failed to parse as JSON or TOML.\nJSON: {json_err}\nTOML: {toml_err}"
                         ))),
@@ -327,10 +324,7 @@ fn parse_with_fallback(
                 Err(toml_err) => {
                     tracing::debug!("TOML parsing failed, trying JSON fallback");
                     match parse_json_to_document(content) {
-                        Ok(doc) => {
-                            tracing::info!("Parsed with fallback format JSON");
-                            Ok(doc)
-                        }
+                        Ok(doc) => Ok(doc),
                         Err(json_err) => Err(BuildonomyError::Codec(format!(
                             "Failed to parse as TOML or JSON.\nTOML: {toml_err}\nJSON: {json_err}"
                         ))),

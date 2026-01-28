@@ -42,42 +42,16 @@ This file tracks optional enhancements and future work extracted from completed 
 
 ## Service Testing Infrastructure (from Issue 10)
 
-**Priority**: MEDIUM - Testing gaps in service layer (feature = "service")
+**Status**: MOVED TO ISSUE 07 (Section 8)
 
-**Context**: Core library is well-tested. Service layer (`watch.rs`) has comprehensive rustdoc examples but minimal integration tests.
+**Context**: Service layer testing was backlogged but is now integrated into comprehensive testing for v0.1.0 release.
 
-### WatchService API Testing
-- Update `WatchService` to implement library operations (vs product-specific ops)
-- Document operation semantics in rustdoc
-- **Current Status**: WatchService documented with 4 comprehensive doctests (240+ lines)
-
-### FileUpdateSyncer Integration Tests
-- Test: Initialize `FileUpdateSyncer` with temp directory
-- Test: Modify file, verify compiler thread processes it
-- Test: Verify `BeliefEvent`s flow to transaction thread
-- Test: Verify database sync completes
-- Test: Multiple file changes, verify all processed
-- Test: Handle parse errors gracefully
-- Test: Shutdown and cleanup (abort handles)
-- Document threading model and synchronization points in module doc
-- **Note**: Integration test skeleton created at `tests/service_integration.rs`
-
-### File Watching Integration Tests
-- Test: `enable_network_syncer()` sets up watcher
-- Test: File modification triggers debouncer callback
-- Test: Debouncer filters dot files correctly
-- Test: Debouncer filters by codec extensions
-- Test: Compiler queue gets updated on file change
-- Test: `disable_network_syncer()` tears down cleanly
-- Verify no race conditions between debouncer and compiler thread
-
-### Database Synchronization Tests
-- Test: `perform_transaction()` batches multiple events
-- Test: Events update database correctly
-- Test: Transaction errors are handled gracefully
-- Test: Event channel backpressure (if applicable)
-- Verify database state matches builder cache after sync
-- Document transaction boundaries and consistency guarantees
+**See**: `docs/project/ISSUE_07_COMPREHENSIVE_TESTING.md` Section 8 for:
+- WatchService API Testing
+- FileUpdateSyncer Integration Tests
+- File Watching Integration Tests
+- Database Synchronization Tests
+- Integration test expansion at `tests/service_integration.rs`
 
 ## Anchor Injection Enhancement (from Issue 03)
 
