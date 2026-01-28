@@ -214,6 +214,7 @@ jobs:
           retention-days: 7
 
   # Security audit
+  # Configuration in audit.toml ignores acceptable advisories (e.g., unmaintained but not vulnerable crates)
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -313,12 +314,8 @@ jobs:
           cd standalone-test
           cargo init --name standalone_test
 
-          # Add noet-core as path dependency
-          cat >> Cargo.toml << EOF
-
-          [dependencies]
-          noet-core = { path = "../noet-core", features = ["service"] }
-          EOF
+          # Add noet-core as path dependency using cargo add
+          cargo add noet-core --path ../noet-core --features service
 
           # Create minimal example using public API
           cat > src/main.rs << 'EOF'

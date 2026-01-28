@@ -1,0 +1,10 @@
+# cargo-audit configuration
+# Ignores known advisories that are acceptable for this project
+
+[advisories]
+# RUSTSEC-2024-0436: paste crate declared unmaintained
+# Rationale: paste is a proc-macro by dtolnay (highly trusted maintainer)
+# that is feature-complete and widely used. "Unmaintained" does not mean
+# vulnerable - it's simply no longer under active development.
+# Transitive dependency: reactive_stores → paste
+ignore = ["RUSTSEC-2024-0436"]

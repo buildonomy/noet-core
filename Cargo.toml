@@ -5,7 +5,7 @@ authors = ["Andrew Lyjak"]
 description = "A hypergraph-based knowledge management system with three-way synchronization between documents, cache, and database"
 documentation = "https://docs.rs/noet-core"
 license = "MIT OR Apache-2.0"
-repository = "https://gitlab.com/buildonomy/noet"
+repository = "https://github.com/buildonomy/noet-core"
 edition = "2021"
 rust-version = "1.85"
 readme = "README.md"
@@ -32,19 +32,20 @@ parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 petgraph = { version = "0.6.5", features = ["serde-1"] }
 pulldown-cmark = { version = "0.13.0" }
 pulldown-cmark-to-cmark = { git = "https://github.com/alyjak/pulldown-cmark-to-cmark.git", branch = "upgrade_to_cmark_v0.13" }
-reactive_stores = { version = "0.1.0" }
+reactive_stores = { version = "0.3" }
 regex = "1.10.5"
 serde_json = "1.0.117"
 serde-wasm-bindgen = { version = "0.6", optional = true }
 serde = { version = "1.0", features = ["derive"] }
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "regexp",
     "runtime-tokio",
     "json",
     "time",
     "uuid",
-    "time",
+    "macros",
+    "migrate",
 ], optional = true }
 thiserror = "1.0.63"
 tokio = { version = "1.40", features = ["fs", "sync", "time", "rt", "macros"] }

@@ -308,7 +308,9 @@ fn build_title_attribute(bref: &str, auto_title: bool, user_words: Option<&str>)
 ///
 /// # Returns
 ///
-/// Relative path from source to target (e.g., "reference/api.md")
+/// Relative path from source to target with forward slashes (e.g., "reference/api.md").
+/// Path separators are always normalized to forward slashes for cross-platform
+/// Markdown/URL compatibility, regardless of the host OS.
 ///
 /// # Examples
 ///
@@ -328,10 +330,13 @@ fn make_relative_path(from_path: &str, to_path: &str) -> String {
     let to = Path::new(to_path);
 
     // Calculate relative path from source directory to target
-    pathdiff::diff_paths(to, from_dir)
+    let relative = pathdiff::diff_paths(to, from_dir)
         .unwrap_or_else(|| to.to_path_buf())
         .to_string_lossy()
-        .to_string()
+        .to_string();
+
+    // Normalize to forward slashes for Markdown/URL compatibility across platforms
+    relative.replace('\\', "/")
 }
 
 #[tracing::instrument(skip_all)]
