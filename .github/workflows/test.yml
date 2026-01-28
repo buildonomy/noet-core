@@ -323,7 +323,7 @@ jobs:
 
           fn main() {
               let bb = BeliefBase::default();
-              println!("BeliefBase created: {} nodes", bb.node_count());
+              println!("BeliefBase created: {} nodes and {} edges", bb.states().len(), bb.relations().as_graph().edge_count());
           }
           EOF
 

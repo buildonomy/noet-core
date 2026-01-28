@@ -32,7 +32,7 @@ parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 petgraph = { version = "0.6.5", features = ["serde-1"] }
 pulldown-cmark = { version = "0.13.0" }
 pulldown-cmark-to-cmark = { git = "https://github.com/alyjak/pulldown-cmark-to-cmark.git", branch = "upgrade_to_cmark_v0.13" }
-reactive_stores = { version = "0.3" }
+reactive_stores = { version = "0.1" }
 regex = "1.10.5"
 serde_json = "1.0.117"
 serde-wasm-bindgen = { version = "0.6", optional = true }
