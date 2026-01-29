@@ -47,7 +47,11 @@ Implement static site generation with progressive enhancement via WASM-powered B
 │  1. Load HTML (fast, works immediately)                     │
 │  2. Load WASM + belief-network.json (progressive)           │
 │  3. Instantiate BeliefBase in browser memory                │
-│  4. Enable rich interactive features:                       │
+│  4. Install SPA navigation handler (CRITICAL)               │
+│     → Intercept internal link clicks                        │
+│     → Fetch HTML fragments, swap content                    │
+│     → Keep WASM in memory (avoid reload cost)               │
+│  5. Enable rich interactive features:                       │
 │     - Real-time NodeKey validation                          │
 │     - Client-side search across all documents               │
 │     - Relationship graph visualization                      │
@@ -59,6 +63,7 @@ Implement static site generation with progressive enhancement via WASM-powered B
 **Key Benefits**:
 - **Fast Initial Load**: Static HTML renders immediately (SEO, no JS required)
 - **Rich Interactivity**: WASM provides full query power client-side
+- **No WASM Reload**: SPA navigation keeps BeliefBase in memory across page transitions
 - **Offline Capable**: Once loaded, works without server connection
 - **Progressive Enhancement**: Core content accessible, features enhance experience
 
@@ -289,12 +294,17 @@ impl BeliefBaseWasm {
 - [ ] Load WASM module and belief network data:
   - `await init('noet-wasm.wasm')`
   - `beliefBase = BeliefBaseWasm.from_json(networkData)`
+- [ ] **Install SPA navigation to prevent WASM reload**:
+  - Intercept all internal link clicks (`<a href="/...">`)
+  - Fetch HTML via `fetch()`, parse with `DOMParser`
+  - Swap content in place, keep WASM in memory
+  - Update browser history with `pushState`
+  - Handle browser back/forward with `popstate` listener
 - [ ] Graceful fallback if WASM unavailable (DOM-only mode)
 - [ ] Attach click handlers to `[data-bid]` elements
 - [ ] Copy BID to clipboard on click
 - [ ] Parse NodeKey URL anchors from `window.location.hash`
 - [ ] Resolve NodeKeys via WASM (fast, local queries)
-- [ ] Cross-document navigation without page reloads
 - [ ] Show unresolved reference warnings
 - [ ] Metadata tooltip on hover (query WASM for full node data)
 - [ ] Client-side search across all documents
@@ -303,17 +313,19 @@ impl BeliefBaseWasm {
 - [ ] Auto-initialize on DOMContentLoaded
 
 **Core Methods**:
-- `async loadBeliefBase(wasmPath, dataPath)` - Initialize WASM + data
+- `async init()` - Initialize WASM + data, install SPA navigation
+- `installSPANavigation()` - Intercept links, handle history (CRITICAL for performance)
+- `async navigateTo(url)` - Fetch and swap content without WASM reload
+- `isInternalLink(url)` - Check if link should use SPA navigation
 - `isNodeKeyUrl(url)` - Check if URL uses NodeKey schema
 - `resolveNodeKey(nodekey)` - Query WASM for node location
-- `navigateToNode(nodekey)` - Cross-document navigation
 - `copyBidToClipboard(bid)` - Copy BID on click
 - `showMetadataTooltip(bid)` - Query WASM, display rich metadata
 - `searchDocuments(query)` - Client-side full-text search
 - `renderBacklinks(bid)` - Show "What links here?" panel
 - `renderRelationshipGraph(bid)` - Visualize node relationships
 
-**WASM Integration Example**:
+**WASM Integration with SPA Navigation**:
 ```javascript
 class NoetViewer {
   async init() {
@@ -324,11 +336,52 @@ class NoetViewer {
     const response = await fetch('./belief-network.json');
     const data = await response.text();
     
-    // Instantiate BeliefBase in browser
+    // Instantiate BeliefBase in browser (stays in memory)
     this.beliefBase = BeliefBaseWasm.from_json(data);
+    
+    // CRITICAL: Install SPA navigation to avoid WASM reload
+    this.installSPANavigation();
     
     // Enable interactive features
     this.attachEventHandlers();
+  }
+  
+  installSPANavigation() {
+    // Intercept all internal link clicks
+    document.body.addEventListener('click', async (e) => {
+      const link = e.target.closest('a');
+      if (!link || !this.isInternalLink(link.href)) return;
+      
+      e.preventDefault();
+      await this.navigateTo(link.href);
+    });
+    
+    // Handle browser back/forward buttons
+    window.addEventListener('popstate', (e) => {
+      if (e.state?.path) {
+        this.loadContent(e.state.path);
+      }
+    });
+  }
+  
+  async navigateTo(url) {
+    // Fetch HTML, extract content, swap in-place
+    const html = await fetch(url).then(r => r.text());
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    
+    // Swap content (WASM stays in memory)
+    const newContent = doc.querySelector('.document');
+    document.querySelector('.document').replaceWith(newContent);
+    
+    // Re-attach handlers to new content
+    this.attachEventHandlers();
+    
+    // Update browser history
+    history.pushState({path: url}, '', url);
+  }
+  
+  isInternalLink(url) {
+    return url.startsWith('/') || url.startsWith(window.location.origin);
   }
   
   resolveNodeKey(nodekey) {
@@ -488,6 +541,15 @@ Defer to Phase 3 - WASM approach handles most use cases client-side.
 - Round-trip compatibility (markdown → HTML → readable)
 
 ## Success Criteria
+
+### Phase 0: Dogfooding Setup (Immediate After MVP)
+
+- [ ] Add GitHub Actions workflow to export `docs/design/` to HTML on every push to main
+- [ ] Deploy exported HTML to GitHub Pages or upload as artifact
+- [ ] Validate browsable documentation at `https://buildonomy.github.io/noet-core/`
+- [ ] Ensure CI fails if HTML export fails (validates feature keeps working)
+
+**Rationale**: Dogfooding validates the feature works in production, provides browsable docs, and ensures regressions are caught immediately.
 
 ### Phase 1: Static HTML (MVP)
 - [ ] `generate_html()` implemented for `MdCodec`
