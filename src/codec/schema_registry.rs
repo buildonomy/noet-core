@@ -13,10 +13,6 @@ use toml::Value as TomlValue;
 /// Global singleton schema registry with built-in schemas
 pub static SCHEMAS: Lazy<SchemaRegistry> = Lazy::new(SchemaRegistry::create);
 
-/// List of all known schema names that have graph field definitions.
-/// Used by detect_schema_from_path to match path components.
-pub const KNOWN_SCHEMAS: &[(&str, &str)] = &[("intentions", "intention_lattice.intention")];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeDirection {
     Upstream,

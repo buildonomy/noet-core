@@ -18,7 +18,8 @@ use crate::{
     event::{BeliefEvent, EventOrigin},
     nodekey::{get_doc_path, to_anchor, trim_doc_path, trim_joiners, trim_path_sep, TRIM},
     properties::{
-        BeliefKind, BeliefNode, Bid, WeightKind, WeightSet, WEIGHT_DOC_PATH, WEIGHT_SORT_KEY,
+        asset_namespace, href_namespace, BeliefKind, BeliefNode, Bid, WeightKind, WeightSet,
+        WEIGHT_SORT_KEY,
     },
     query::WrappedRegex,
 };
@@ -306,6 +307,8 @@ impl PathMapMap {
         }
         // Ensure the api net is always present
         pmm.nets.insert(pmm.api());
+        pmm.nets.insert(asset_namespace());
+        pmm.nets.insert(href_namespace());
 
         pmm.map.clear();
         for net in pmm.nets.iter() {
@@ -437,6 +440,42 @@ impl PathMapMap {
             })
     }
 
+    #[tracing::instrument(skip(self))]
+    pub fn asset_map(&self) -> ArcRwLockReadGuard<RawRwLock, PathMap> {
+        self.map
+            .get(&asset_namespace())
+            .map(|pm_lock| pm_lock.read_arc())
+            .unwrap_or_else(|| {
+                tracing::warn!("asset map called on empty pathmap!");
+                let epm = PathMap::new(
+                    WeightKind::Section,
+                    asset_namespace(),
+                    self,
+                    self.relations.clone(),
+                );
+                let ephemeral_map = Arc::new(RwLock::new(epm));
+                ephemeral_map.read_arc()
+            })
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn href_map(&self) -> ArcRwLockReadGuard<RawRwLock, PathMap> {
+        self.map
+            .get(&href_namespace())
+            .map(|pm_lock| pm_lock.read_arc())
+            .unwrap_or_else(|| {
+                tracing::warn!("asset map called on empty pathmap!");
+                let epm = PathMap::new(
+                    WeightKind::Section,
+                    href_namespace(),
+                    self,
+                    self.relations.clone(),
+                );
+                let ephemeral_map = Arc::new(RwLock::new(epm));
+                ephemeral_map.read_arc()
+            })
+    }
+
     /// Process a queue of events and generate path mutation events
     /// This is the main entry point for updating PathMaps based on BeliefBase events
     pub fn process_event_queue(
@@ -470,10 +509,10 @@ impl PathMapMap {
                         path_events.append(&mut pm.process_event(event, self));
                     }
                 }
-                // A relationInsert results in a derivative RelationUpdate if it materially changes
+                // A RelationChange results in a derivative RelationUpdate if it materially changes
                 // the sets relations. Therefore, only handle the relation update to remove
                 // redundant processing.
-                // BeliefEvent::RelationInsert(source, sink, kind, weight, _) => {}
+                // BeliefEvent::RelationChange(source, sink, kind, weight, _) => {}
                 // PathsAdded/PathsRemoved are derivative events - we don't process them
                 // NodeRenamed, RelationRemoved, BalanceCheck - handled elsewhere or ignored
                 _ => {}
@@ -594,6 +633,8 @@ fn generate_path_name_with_collision_check(
     full_path
 }
 
+/// We want to ensure a consistent ordering of pathmaps: first order by the order element, and
+/// equality order by the path string lexical order.
 fn pathmap_order(a: &(String, Bid, Vec<u16>), b: &(String, Bid, Vec<u16>)) -> Ordering {
     if let Some(order) = a.2.iter().zip(b.2.iter()).find_map(|(sub_a, sub_b)| {
         let cmp = sub_a.cmp(sub_b);
@@ -604,7 +645,11 @@ fn pathmap_order(a: &(String, Bid, Vec<u16>), b: &(String, Bid, Vec<u16>)) -> Or
     }) {
         order
     } else {
-        a.2.len().cmp(&b.2.len())
+        let len_order = a.2.len().cmp(&b.2.len());
+        match &len_order {
+            Ordering::Equal => a.0.cmp(&b.0),
+            _ => len_order,
+        }
     }
 }
 
@@ -670,7 +715,8 @@ impl PathMap {
             let relations = relations.read_arc();
             relations.as_subgraph(kind, true)
         };
-        let mut stack = BTreeMap::<Bid, (BTreeSet<Bid>, BTreeMap<Bid, (Vec<u16>, String)>)>::new();
+        let mut stack =
+            BTreeMap::<Bid, (BTreeSet<Bid>, BTreeMap<Bid, (Vec<u16>, Vec<String>)>)>::new();
         let mut loops = BTreeSet::<(Bid, Bid)>::new();
         let mut subnets = BTreeSet::<Bid>::new();
         depth_first_search(&tree_graph, vec![net], |event| {
@@ -691,19 +737,19 @@ impl PathMap {
                     if let DfsEvent::BackEdge(_, _) = event {
                         loops.insert((sink, source));
                     }
-                    let (weight, maybe_sub_path) = tree_graph.edge_weight(sink, source).expect(
+                    let (weight, paths) = tree_graph.edge_weight(sink, source).expect(
                         "Edge weight should exist since we received a DfsEvent for this relation",
                     );
 
-                    let sub_path = generate_terminal_path(
-                        &source,
-                        &sink,
-                        maybe_sub_path.as_deref(),
-                        *weight,
-                        nets,
-                    );
+                    // Handle multiple paths per relation
+                    // Store ALL paths for this source in the sink's sub_paths
+                    let all_paths = if !paths.is_empty() {
+                        paths.clone()
+                    } else {
+                        vec![generate_terminal_path(&source, &sink, None, *weight, nets)]
+                    };
 
-                    let sub_path_info = (vec![*weight], sub_path);
+                    let sub_path_info = (vec![*weight], all_paths);
 
                     stack.get_mut(&sink).map(|path_info| {
                         path_info.1.insert(source, sub_path_info);
@@ -762,25 +808,28 @@ impl PathMap {
                                 .get_mut(sink)
                                 .expect("To have all sinks still present in the stack");
 
-                            let (source_base_order, source_base_path) =
+                            let (source_base_order, source_base_paths) =
                                 sink_paths.get(&source).cloned().expect(
                                     "To have already mapped source to sink's sub-paths \
                                      during the DFS.",
                                 );
-                            for (bid, (path_order, sub_path)) in source_sub_paths.iter() {
+                            for (bid, (path_order, sub_paths)) in source_sub_paths.iter() {
                                 let mut sub_path_order = source_base_order.clone();
                                 sub_path_order.extend(path_order);
-                                sink_paths.insert(
-                                    *bid,
-                                    (
-                                        sub_path_order,
-                                        path_join(
-                                            &source_base_path,
-                                            &sub_path.clone(),
+
+                                // For each base path, join with each sub path
+                                let mut joined_paths = Vec::new();
+                                for base_path in source_base_paths.iter() {
+                                    for sub_path in sub_paths.iter() {
+                                        joined_paths.push(path_join(
+                                            base_path,
+                                            sub_path,
                                             nets.is_anchor(bid),
-                                        ),
-                                    ),
-                                );
+                                        ));
+                                    }
+                                }
+
+                                sink_paths.insert(*bid, (sub_path_order, joined_paths));
                             }
                         }
                     }
@@ -797,12 +846,19 @@ impl PathMap {
         let mut map = Vec::from_iter(
             vec![(String::from(""), net, Vec::<u16>::default())]
                 .into_iter()
-                .chain(inverted_path_map.into_iter().map(|(bid, (order, path))| {
-                    if nets.nets().contains(&bid) && bid != net && !subnets.contains(&bid) {
-                        subnets.insert(bid);
-                    }
-                    (path, bid, order)
-                })),
+                .chain(
+                    inverted_path_map
+                        .into_iter()
+                        .flat_map(|(bid, (order, paths))| {
+                            if nets.nets().contains(&bid) && bid != net && !subnets.contains(&bid) {
+                                subnets.insert(bid);
+                            }
+                            // Generate a separate map entry for each path to this bid
+                            paths
+                                .into_iter()
+                                .map(move |path| (path, bid, order.clone()))
+                        }),
+                ),
         );
         map.sort_by(pathmap_order);
         let mut bid_map = BTreeMap::new();
@@ -1058,7 +1114,7 @@ impl PathMap {
         }
     }
 
-    // Return a list of all paths connected to this subnet
+    /// Return a list of all paths connected to this subnet
     pub fn all_paths(&self, nets: &PathMapMap, visited: &mut BTreeSet<Bid>) -> Vec<String> {
         let mut paths = Vec::default();
         if visited.contains(&self.net) {
@@ -1078,6 +1134,47 @@ impl PathMap {
                 }
             } else {
                 paths.push(a_path.clone());
+            }
+        }
+
+        paths
+    }
+
+    /// Return a list of all networks connected to this subnet (always includes self as ("", self.net))
+    pub fn all_net_paths(
+        &self,
+        nets: &PathMapMap,
+        visited: &mut BTreeSet<Bid>,
+    ) -> Vec<(String, Bid)> {
+        let mut paths = Vec::default();
+        if visited.contains(&self.net) {
+            return paths;
+        }
+        visited.insert(self.net);
+        let mut subnet_idxs = self
+            .subnets()
+            .iter()
+            .map(|net_bid| {
+                let idx_vec = self
+                    .bid_map
+                    .get(net_bid)
+                    .expect("All nets to be in bid_map by construction");
+                idx_vec[0]
+            })
+            .collect::<Vec<usize>>();
+        subnet_idxs.sort();
+        paths.push(("".to_string(), self.net));
+        for subnet_idx in subnet_idxs.iter() {
+            let (ref base, subnet_bid, _) = self.map[*subnet_idx];
+            let sub_subs = nets
+                .get_map(&subnet_bid)
+                .map(|pm| pm.all_net_paths(nets, visited))
+                .expect("all identified subnets to be registered with the pathmapmap");
+            for (sub_sub_path, sub_sub_bid) in sub_subs.iter() {
+                paths.push((
+                    path_join(base, sub_sub_path, nets.is_anchor(sub_sub_bid)),
+                    *sub_sub_bid,
+                ));
             }
         }
 
@@ -1293,23 +1390,46 @@ impl PathMap {
         // destroy our index mappings while we mutate the map.
         for (sink_index, sub_indices) in sink_sub_indices.iter().rev() {
             // Clone this so we don't keep a nonmutable reference into self.map;
-            let (new_path, new_order) = {
+            let (mut new_paths, new_order) = {
                 let (sink_path, sink_bid, sink_order) = &self.map[*sink_index];
                 debug_assert!(*sink_bid == *sink);
                 let mut new_order = sink_order.clone();
                 new_order.push(new_idx);
                 // Strip anchor from sink_path to avoid double anchors when generating child paths
                 let sink_path_without_anchor = get_doc_path(sink_path);
-                let new_path = self.generate_path_name(
-                    source,
-                    sink,
-                    sink_path_without_anchor,
-                    new_weight.get::<String>(WEIGHT_DOC_PATH),
-                    new_idx,
-                    nets,
-                );
-                (new_path, new_order)
+                // Get all paths from the weight (new format supports multiple paths)
+                let paths = new_weight.get_doc_paths();
+
+                // Generate a path for each doc_path in the weight
+                let new_paths: Vec<String> = if paths.is_empty() {
+                    // No explicit paths, generate from anchor/index
+                    vec![self.generate_path_name(
+                        source,
+                        sink,
+                        sink_path_without_anchor,
+                        None,
+                        new_idx,
+                        nets,
+                    )]
+                } else {
+                    // Generate a unique path for each doc_path
+                    paths
+                        .iter()
+                        .map(|p| {
+                            self.generate_path_name(
+                                source,
+                                sink,
+                                sink_path_without_anchor,
+                                Some(p.clone()),
+                                new_idx,
+                                nets,
+                            )
+                        })
+                        .collect()
+                };
+                (new_paths, new_order)
             };
+            new_paths.sort();
 
             let source_sub_indices = sub_indices
                 .iter()
@@ -1317,60 +1437,59 @@ impl PathMap {
                 .filter(|&idx| self.map[*idx].1 == *source)
                 .copied()
                 .collect::<Vec<usize>>();
-            let new_entry = (new_path, *source, new_order);
+
             match source_sub_indices.is_empty() {
                 true => {
-                    let last_entry_idx = sub_indices.last().copied().unwrap_or(*sink_index);
-                    // Ensure we're inserting in the same order as our explicit WEIGHT_SORT_KEY
-                    // suggests.
-
-                    derivatives.push(BeliefEvent::PathAdded(
-                        self.net,
-                        new_entry.0.clone(),
-                        *source,
-                        new_entry.2.clone(),
-                        EventOrigin::Local,
-                    ));
-                    self.map.insert(last_entry_idx + 1, new_entry);
+                    // No existing entries for this source - add all paths as new entries
+                    let mut insert_idx = sub_indices.last().copied().unwrap_or(*sink_index) + 1;
+                    for new_path in new_paths {
+                        let new_entry = (new_path.clone(), *source, new_order.clone());
+                        derivatives.push(BeliefEvent::PathAdded(
+                            self.net,
+                            new_entry.0.clone(),
+                            *source,
+                            new_entry.2.clone(),
+                            EventOrigin::Local,
+                        ));
+                        self.map.insert(insert_idx, new_entry);
+                        insert_idx += 1;
+                    }
                 }
                 false => {
-                    // There should never be a case where we have duplicate sink<-source edges
-                    // within the same WeightKind subgraph.
-                    debug_assert!(source_sub_indices.len() == 1);
-                    let idx_to_update = source_sub_indices
-                        .first()
-                        .expect("We know this vec is of len 1");
-                    debug_assert!(
-                        &self.map[*idx_to_update].1 == source,
-                        "We shouldn't ever be overwriting a path to another bid, \
-                        just changing its relative path or ordering."
-                    );
-                    let old_order = &self.map[*idx_to_update].2.clone();
+                    // Update existing entries. Handle case where number of paths changed.
+                    let old_entries: Vec<(usize, String, Vec<u16>)> = source_sub_indices
+                        .iter()
+                        .map(|idx| (*idx, self.map[*idx].0.clone(), self.map[*idx].2.clone()))
+                        .collect();
+
+                    // Get the old order from the first entry (all should have same order)
+                    let old_order = &old_entries[0].2;
 
                     // Order vector length can change when document structure changes
-                    // (e.g., moving sections up/down in hierarchy)
-                    if old_order.len() != new_entry.2.len() {
+                    if old_order.len() != new_order.len() {
                         tracing::warn!(
-                            "[{}] Path '{}' order depth changed: old={:?}, new={:?}. \
+                            "[{}] Path order depth changed for source {}: old={:?}, new={:?}. \
                             This may require re-parsing dependent documents.",
                             self.net,
-                            new_entry.0,
+                            source,
                             old_order,
-                            new_entry.2
+                            new_order
                         );
                     }
 
-                    if *old_order != new_entry.2 {
-                        // Update child paths that start with the old order
-                        let mut next_idx = idx_to_update + 1;
+                    // Handle child path order updates if order changed
+                    if *old_order != new_order {
+                        // Find the first existing entry index
+                        let first_idx = source_sub_indices[0];
+                        let mut next_idx = first_idx + 1;
                         while next_idx < self.map.len() {
                             let next_order = &mut self.map[next_idx].2;
                             if !next_order.starts_with(old_order) {
                                 break;
                             }
                             // Only update if lengths are compatible
-                            if next_order.len() >= new_entry.2.len() {
-                                next_order[..new_entry.2.len()].copy_from_slice(&new_entry.2);
+                            if next_order.len() >= new_order.len() {
+                                next_order[..new_order.len()].copy_from_slice(&new_order);
                             } else {
                                 tracing::warn!(
                                     "[{}] Cannot update child path order - incompatible lengths",
@@ -1380,14 +1499,79 @@ impl PathMap {
                             next_idx += 1;
                         }
                     }
-                    derivatives.push(BeliefEvent::PathUpdate(
-                        self.net,
-                        new_entry.0.clone(),
-                        *source,
-                        new_entry.2.clone(),
-                        EventOrigin::Local,
-                    ));
-                    self.map[*idx_to_update] = new_entry;
+
+                    // Compare old paths vs new paths
+                    let old_paths: std::collections::BTreeSet<String> =
+                        old_entries.iter().map(|(_, p, _)| p.clone()).collect();
+                    let new_paths_set: std::collections::BTreeSet<String> =
+                        new_paths.iter().cloned().collect();
+
+                    // Paths to remove: in old but not in new
+                    let paths_to_remove: Vec<String> =
+                        old_paths.difference(&new_paths_set).cloned().collect();
+
+                    // Paths to add: in new but not in old
+                    let paths_to_add: Vec<String> =
+                        new_paths_set.difference(&old_paths).cloned().collect();
+
+                    // Remove old paths (in reverse to preserve indices)
+                    for path_to_remove in paths_to_remove.iter() {
+                        if let Some(_idx) = old_entries
+                            .iter()
+                            .find(|(_, p, _)| p == path_to_remove)
+                            .map(|(i, _, _)| *i)
+                        {
+                            derivatives.push(BeliefEvent::PathsRemoved(
+                                self.net,
+                                vec![path_to_remove.clone()],
+                                EventOrigin::Local,
+                            ));
+                        }
+                    }
+
+                    // Update existing paths that are kept (order or path may have changed)
+                    for (old_idx, old_path, _) in old_entries.iter() {
+                        if new_paths_set.contains(old_path) {
+                            // Path is kept, update the order
+                            self.map[*old_idx].2 = new_order.clone();
+                            derivatives.push(BeliefEvent::PathUpdate(
+                                self.net,
+                                old_path.clone(),
+                                *source,
+                                new_order.clone(),
+                                EventOrigin::Local,
+                            ));
+                        }
+                    }
+
+                    // Add new paths
+                    if !paths_to_add.is_empty() {
+                        let last_old_idx = source_sub_indices.last().copied().unwrap();
+                        let mut insert_idx = last_old_idx + 1;
+                        for new_path in paths_to_add {
+                            let new_entry = (new_path.clone(), *source, new_order.clone());
+                            derivatives.push(BeliefEvent::PathAdded(
+                                self.net,
+                                new_path,
+                                *source,
+                                new_order.clone(),
+                                EventOrigin::Local,
+                            ));
+                            self.map.insert(insert_idx, new_entry);
+                            insert_idx += 1;
+                        }
+                    }
+
+                    // Remove entries marked for removal (reverse order to maintain indices)
+                    for path_to_remove in paths_to_remove.iter().rev() {
+                        if let Some(pos) = self
+                            .map
+                            .iter()
+                            .position(|(p, b, _)| p == path_to_remove && b == source)
+                        {
+                            self.map.remove(pos);
+                        }
+                    }
                 }
             }
         }

@@ -216,6 +216,18 @@ impl GraphBuilder {
         &self.session_bb
     }
 
+    pub fn session_bb_mut(&mut self) -> &mut BeliefBase {
+        &mut self.session_bb
+    }
+
+    pub fn doc_bb_mut(&mut self) -> &mut BeliefBase {
+        &mut self.doc_bb
+    }
+
+    pub fn tx(&self) -> &UnboundedSender<BeliefEvent> {
+        &self.tx
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
@@ -564,6 +576,35 @@ impl GraphBuilder {
             self.tx.send(api_node_event)?;
         }
 
+        // Fetch asset_namespace from global_bb to populate session_bb with known assets
+        // This enables asset content change detection by populating PathMap with existing paths
+        use crate::properties::asset_namespace;
+        let asset_ns_key = NodeKey::Bid {
+            bid: asset_namespace(),
+        };
+        if let Some(asset_ns_node) = global_bb.get_async(&asset_ns_key).await? {
+            // Process asset namespace node into session_bb
+            let asset_ns_event = BeliefEvent::NodeUpdate(
+                vec![asset_ns_key.clone()],
+                asset_ns_node.toml(),
+                EventOrigin::Remote,
+            );
+            self.session_bb.process_event(&asset_ns_event)?;
+
+            // Fetch all assets connected to this namespace
+            // Use eval to get the namespace and its relations
+            let asset_expr = Expression::from(&asset_ns_key);
+            let asset_graph = global_bb.eval(&asset_expr).await?;
+
+            // Merge the fetched asset graph into session_bb
+            self.session_bb.merge(&asset_graph);
+
+            tracing::debug!(
+                "[initialize_stack] Loaded {} assets from global cache",
+                asset_graph.states.len().saturating_sub(1) // -1 for namespace node itself
+            );
+        }
+
         let initial = ProtoBeliefNode::new(self.repo_root.as_ref(), path.as_ref())?;
 
         let mut parent_path = PathBuf::from(&initial.path);
@@ -709,7 +750,7 @@ impl GraphBuilder {
                     BeliefEvent::NodeUpdate(_, _, _) => node_update_count += 1,
                     BeliefEvent::NodesRemoved(nids, _) => node_removed_count += nids.len(),
                     BeliefEvent::NodeRenamed(_, _, _) => node_renamed_count += 1,
-                    BeliefEvent::RelationInsert(_, _, _, _, _) => relation_insert_count += 1,
+                    BeliefEvent::RelationChange(_, _, _, _, _) => relation_insert_count += 1,
                     BeliefEvent::RelationRemoved(_, _, _) => relation_removed_count += 1,
                     BeliefEvent::RelationUpdate(_, _, _, _) => relation_update_count += 1,
                     BeliefEvent::PathAdded(..) | BeliefEvent::PathUpdate(..) => {
@@ -721,7 +762,7 @@ impl GraphBuilder {
                 }
             }
             tracing::info!(
-                "Diff events ({}): NodeUpdate({}), NodeRemoved({}), NodeRenamed({}), RelationInsert({}), RelationRemoved({}), RelationUpdate({}), PathsAdded({}), PathsRemoved({})",
+                "Diff events ({}): NodeUpdate({}), NodeRemoved({}), NodeRenamed({}), RelationChange({}), RelationRemoved({}), RelationUpdate({}), PathsAdded({}), PathsRemoved({})",
                 tx_events.len(),
                 node_update_count,
                 node_removed_count,
@@ -977,7 +1018,7 @@ impl GraphBuilder {
             payload: TomlTable::new(),
         };
         if let Some(path) = path_info {
-            weight.set(crate::properties::WEIGHT_DOC_PATH, path).ok();
+            weight.set_doc_paths(vec![path]).ok();
         }
         // There's no one-source-of-truth for api linking, so that's the only case where the source
         // owns the edge.
@@ -989,11 +1030,11 @@ impl GraphBuilder {
         weight
             .set(crate::properties::WEIGHT_OWNED_BY, weight_owner)
             .ok();
-        event_queue.push(BeliefEvent::RelationInsert(
+        event_queue.push(BeliefEvent::RelationChange(
             bid,
             parent_bid,
             WeightKind::Section,
-            weight.clone(),
+            Some(weight.clone()),
             EventOrigin::Remote,
         ));
         // For sections, use the full path with anchor from the generated keys
@@ -1032,11 +1073,11 @@ impl GraphBuilder {
                 api_weight
                     .set(crate::properties::WEIGHT_OWNED_BY, "source")
                     .ok();
-                event_queue.push(BeliefEvent::RelationInsert(
+                event_queue.push(BeliefEvent::RelationChange(
                     bid,
                     self.api().bid,
                     WeightKind::Section,
-                    api_weight,
+                    Some(api_weight),
                     EventOrigin::Remote,
                 ));
             }
@@ -1077,10 +1118,37 @@ impl GraphBuilder {
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
 
+        // DEBUG: Log asset-related push_relation calls
+        use crate::properties::asset_namespace;
+        if let NodeKey::Path { net, path } = other_key {
+            if *net == asset_namespace() {
+                tracing::info!(
+                    "[push_relation] Asset reference detected: owner={}, path={}, direction={:?}",
+                    owner_bid,
+                    path,
+                    direction
+                );
+            }
+        }
+
         let other_key_regularized = other_key.regularize(&self.doc_bb, *owner_bid).expect(
             "parse_content Phase 1 parsing ensures that we have a valid subsection \
             structure to get paths from for all our parsed nodes",
         );
+
+        // DEBUG: Log regularized key for assets
+        match &other_key_regularized {
+            NodeKey::Path { net, path } if *net == asset_namespace() => {
+                tracing::info!(
+                    "[push_relation] Asset key regularized to Path: path={}",
+                    path
+                );
+            }
+            NodeKey::Id { net, id } if *net == asset_namespace() => {
+                tracing::info!("[push_relation] Asset key regularized to Id: id={}", id);
+            }
+            _ => {}
+        }
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
         weight.set(WEIGHT_SORT_KEY, index as u16)?;
@@ -1093,6 +1161,30 @@ impl GraphBuilder {
         let cache_fetch_result = self
             .cache_fetch(&other_keys, global_bb.clone(), true, missing_structure)
             .await?;
+
+        // DEBUG: Log cache_fetch result for assets
+        let is_asset = match &other_key_regularized {
+            NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => *net == asset_namespace(),
+            _ => false,
+        };
+
+        if is_asset {
+            match &cache_fetch_result {
+                GetOrCreateResult::Resolved(node, source) => {
+                    tracing::info!(
+                        "[push_relation] Asset RESOLVED: bid={}, source={:?}",
+                        node.bid,
+                        source
+                    );
+                }
+                GetOrCreateResult::Unresolved(unresolved) => {
+                    tracing::info!(
+                        "[push_relation] Asset UNRESOLVED: keys={:?}",
+                        unresolved.other_keys
+                    );
+                }
+            }
+        }
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
                 // Mark these nodes as traces -- we're not guaranteeing that we have all their
@@ -1101,11 +1193,11 @@ impl GraphBuilder {
                 (other_node, other_node_source)
             }
             GetOrCreateResult::Unresolved(ref unresolved_initial) => {
-                // Special handling of external scheme links
-                if let Some(href) = match other_key_regularized {
+                // Special handling of external scheme links (http/https)
+                if let Some(href) = match &other_key_regularized {
                     NodeKey::Id { net, id } => {
-                        if net == href_namespace() {
-                            Some(id)
+                        if *net == href_namespace() {
+                            Some(id.clone())
                         } else {
                             None
                         }
@@ -1121,11 +1213,11 @@ impl GraphBuilder {
                             href_net_node.toml(),
                             EventOrigin::Remote,
                         ));
-                        update_queue.push(BeliefEvent::RelationInsert(
+                        update_queue.push(BeliefEvent::RelationChange(
                             href_namespace(),
                             buildonomy_namespace(),
                             WeightKind::Section,
-                            Weight::default(),
+                            Some(Weight::default()),
                             EventOrigin::Remote,
                         ));
                     }
@@ -1143,11 +1235,11 @@ impl GraphBuilder {
                         href_node.toml(),
                         EventOrigin::Remote,
                     ));
-                    update_queue.push(BeliefEvent::RelationInsert(
+                    update_queue.push(BeliefEvent::RelationChange(
                         href_node.bid,
                         href_namespace(),
                         WeightKind::Section,
-                        weight.clone(),
+                        Some(weight.clone()),
                         EventOrigin::Remote,
                     ));
                     (href_node, NodeSource::Generated)
@@ -1251,13 +1343,24 @@ impl GraphBuilder {
             }
         };
 
-        update_queue.push(BeliefEvent::RelationInsert(
+        update_queue.push(BeliefEvent::RelationChange(
             source_bid,
             sink_bid,
             *kind,
-            weight,
+            Some(weight),
             EventOrigin::Remote,
         ));
+
+        // DEBUG: Log relation creation for assets
+        if is_asset {
+            tracing::info!(
+                "[push_relation] Created RelationChange: source={}, sink={}, kind={:?}",
+                source_bid,
+                sink_bid,
+                kind
+            );
+        }
+
         Ok(GetOrCreateResult::Resolved(other_node, other_node_source))
     }
 

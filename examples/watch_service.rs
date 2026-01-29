@@ -355,8 +355,8 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
                 origin
             );
         }
-        BeliefEvent::RelationInsert(source, sink, kind, _weight, origin) => {
-            println!("  [RelationInsert] {source} -> {sink} ({kind:?}), origin: {origin:?}");
+        BeliefEvent::RelationChange(source, sink, kind, _weight, origin) => {
+            println!("  [RelationChange] {source} -> {sink} ({kind:?}), origin: {origin:?}");
         }
         BeliefEvent::RelationRemoved(source, sink, origin) => {
             println!("  [RelationRemoved] {source} -> {sink}, origin: {origin:?}");

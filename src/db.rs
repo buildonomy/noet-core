@@ -81,10 +81,8 @@ impl<'a> Transaction<'a> {
             BeliefEvent::NodeRenamed(from, to, _) => {
                 self.rename_node(from, to);
             }
-            BeliefEvent::RelationInsert(source, sink, kind, payload, _) => {
-                let mut weight_set = WeightSet::empty();
-                weight_set.set(*kind, payload.clone());
-                self.update_relation(source, sink, &weight_set);
+            BeliefEvent::RelationChange(..) => {
+                // Don't process these, wait to get the resolved entire RelationUpdate event
             }
             BeliefEvent::RelationUpdate(source, sink, weight_set, _) => {
                 self.update_relation(source, sink, weight_set);

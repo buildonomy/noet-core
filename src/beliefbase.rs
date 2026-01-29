@@ -4,7 +4,7 @@ use crate::{
     paths::{PathMap, PathMapMap},
     properties::{
         BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref, WeightKind,
-        WeightSet, WEIGHT_DOC_PATH, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
+        WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, RelationPred, ResultsPage, SetOp, StatePred, DEFAULT_LIMIT},
     BuildonomyError,
@@ -28,7 +28,7 @@ use std::{
 };
 use url::Url;
 
-pub type BidSubGraph = GraphMap<Bid, (u16, Option<String>), Directed>;
+pub type BidSubGraph = GraphMap<Bid, (u16, Vec<String>), Directed>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BidGraph(pub petgraph::Graph<Bid, WeightSet>);
@@ -127,12 +127,12 @@ impl BidGraph {
             let sink = self.as_graph()[edge.target()];
             let weight = edge.weight.get(&kind);
             weight.map(|w| {
-                let maybe_path: Option<String> = w.get(WEIGHT_DOC_PATH);
+                let paths: Vec<String> = w.get_doc_paths();
                 let sort_key: u16 = w.get(WEIGHT_SORT_KEY).unwrap_or(0);
                 if reverse {
-                    (sink, source, (sort_key, maybe_path))
+                    (sink, source, (sort_key, paths))
                 } else {
-                    (source, sink, (sort_key, maybe_path))
+                    (source, sink, (sort_key, paths))
                 }
             })
         });
@@ -1178,7 +1178,7 @@ impl BeliefBase {
     /// 2. NodeUpdate - transmit events for modified nodes
     /// 3. RelationRemoved - clean up removed edges
     /// 4. RelationUpdate - add events for edges that are completely new
-    /// 5. RelationInsert - update edges that are changed
+    /// 5. RelationChange - update edges that are changed
     ///
     /// Note: To get path updates, run the diff events through old set and collect the derived
     /// path events.
@@ -1378,11 +1378,11 @@ impl BeliefBase {
                         .filter(|old_weight| **old_weight == *new_weight)
                         .is_none();
                     if insert {
-                        events.push(BeliefEvent::RelationInsert(
+                        events.push(BeliefEvent::RelationChange(
                             key.0,
                             key.1,
                             *kind,
-                            new_weight.clone(),
+                            Some(new_weight.clone()),
                             EventOrigin::Remote,
                         ));
                     }
@@ -1672,7 +1672,7 @@ impl BeliefBase {
                 let mut reindex_events = self.update_relation(*source, *sink, weight_set.clone());
                 derivative_events.append(&mut reindex_events);
             }
-            BeliefEvent::RelationInsert(..) => {
+            BeliefEvent::RelationChange(..) => {
                 if let Some(relation_mutated_event) = self.generate_edge_update(event) {
                     let &BeliefEvent::RelationUpdate(source, sink, ref weight_set, _) =
                         &relation_mutated_event
@@ -1833,7 +1833,7 @@ impl BeliefBase {
 
     fn generate_edge_update(&self, event: &BeliefEvent) -> Option<BeliefEvent> {
         self.index_sync(false);
-        let BeliefEvent::RelationInsert(source, sink, kind, weight, origin) = event else {
+        let BeliefEvent::RelationChange(source, sink, kind, maybe_weight, origin) = event else {
             return None;
         };
 
@@ -1847,50 +1847,107 @@ impl BeliefBase {
         } else {
             None
         };
-        let mut new_weights = present_weight.clone().unwrap_or(WeightSet::from(*kind));
-        let mut changed = present_weight.is_none();
-        let new_weight = new_weights
-            .weights
-            .entry(*kind)
-            .and_modify(|e| {
-                for (k, new_v) in weight.payload.iter() {
-                    if let Some(present_v) = e.payload.get(k) {
-                        if new_v != present_v {
-                            e.payload.insert(k.to_string(), new_v.clone());
-                            changed = true;
+        let mut new_weights = present_weight.clone().unwrap_or(WeightSet::default());
+        let mut changed = false;
+        if let Some(weight) = maybe_weight {
+            let new_weight = new_weights
+                .weights
+                .entry(*kind)
+                .and_modify(|e| {
+                    for (k, new_v) in weight.payload.iter() {
+                        // Special handling for path merging
+                        if k == WEIGHT_DOC_PATHS || k == "doc_path" {
+                            // Get existing paths
+                            let existing_paths = e.get_doc_paths();
+
+                            // Get incoming paths (handle both old and new formats)
+                            let incoming_paths = if k == WEIGHT_DOC_PATHS {
+                                // New format: Vec<String>
+                                new_v.clone().try_into::<Vec<String>>().unwrap_or_default()
+                            } else {
+                                // Old format: String
+                                if let Ok(path) = new_v.clone().try_into::<String>() {
+                                    vec![path]
+                                } else {
+                                    vec![]
+                                }
+                            };
+
+                            // Merge intelligently: deduplicate and append
+                            let mut merged: std::collections::BTreeSet<String> =
+                                existing_paths.into_iter().collect();
+                            let before_len = merged.len();
+                            merged.extend(incoming_paths);
+
+                            if merged.len() != before_len {
+                                // Convert back to Vec and set using new format
+                                let merged_vec: Vec<String> = merged.into_iter().collect();
+                                if let Ok(()) = e.set_doc_paths(merged_vec) {
+                                    changed = true;
+                                }
+                            }
+                            // Skip the default insert logic below for path keys
+                            continue;
                         }
-                    } else {
-                        e.payload.insert(k.to_string(), new_v.clone());
-                        changed = true
+
+                        // Standard merge logic for non-path keys
+                        if let Some(present_v) = e.payload.get(k) {
+                            if new_v != present_v {
+                                e.payload.insert(k.to_string(), new_v.clone());
+                                changed = true;
+                            }
+                        } else {
+                            e.payload.insert(k.to_string(), new_v.clone());
+                            changed = true
+                        }
                     }
-                }
-            })
-            .or_insert(weight.clone());
-        if new_weight.payload.get(WEIGHT_SORT_KEY).is_none() {
-            let sink_kind_max_weight: Option<u16> = if let Some(sink_idx) = self.bid_to_index(sink)
-            {
-                self.relations()
-                    .as_graph()
-                    .edges_directed(sink_idx, Direction::Incoming)
-                    .filter_map(|edge| {
-                        // So long as we always insert an edge with a sort_key, we know that source->sink is
-                        // not in this set.
-                        debug_assert!(self.relations().as_graph()[edge.source()] != *source);
-                        edge.weight()
-                            .get(kind)
-                            .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
-                    })
-                    .max()
-            } else {
-                None
-            };
-            new_weight
-                .set(
-                    WEIGHT_SORT_KEY,
-                    sink_kind_max_weight.map(|w: u16| w + 1).unwrap_or(0),
-                )
-                .expect("To be able to put a u16 in as a toml_edit value");
-            changed = true;
+                })
+                .or_insert_with(|| {
+                    changed = true;
+                    let mut normalized_weight = weight.clone();
+                    // Normalize old format to new format for new edges
+                    #[allow(deprecated)]
+                    if normalized_weight.payload.contains_key("doc_path") {
+                        if let Some(path) = normalized_weight.get::<String>("doc_path") {
+                            normalized_weight.payload.remove("doc_path");
+                            let _ = normalized_weight.set_doc_paths(vec![path]);
+                        }
+                    }
+                    normalized_weight
+                });
+            // If this is a new edge entirely (no present_weight), always mark as changed
+            if present_weight.is_none() {
+                changed = true;
+            }
+            if new_weight.payload.get(WEIGHT_SORT_KEY).is_none() {
+                let sink_kind_max_weight: Option<u16> = if let Some(sink_idx) =
+                    self.bid_to_index(sink)
+                {
+                    self.relations()
+                        .as_graph()
+                        .edges_directed(sink_idx, Direction::Incoming)
+                        .filter_map(|edge| {
+                            // So long as we always insert an edge with a sort_key, we know that source->sink is
+                            // not in this set.
+                            debug_assert!(self.relations().as_graph()[edge.source()] != *source);
+                            edge.weight()
+                                .get(kind)
+                                .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
+                        })
+                        .max()
+                } else {
+                    None
+                };
+                new_weight
+                    .set(
+                        WEIGHT_SORT_KEY,
+                        sink_kind_max_weight.map(|w: u16| w + 1).unwrap_or(0),
+                    )
+                    .expect("To be able to put a u16 in as a toml_edit value");
+                changed = true;
+            }
+        } else {
+            changed = new_weights.remove(kind).is_some();
         }
 
         if changed {

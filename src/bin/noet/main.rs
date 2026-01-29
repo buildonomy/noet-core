@@ -24,6 +24,8 @@ compile_error!(
 
 use clap::{Parser, Subcommand};
 #[cfg(feature = "service")]
+mod dev_server;
+#[cfg(feature = "service")]
 use noet_core::watch::WatchService;
 use noet_core::{codec::compiler::DocumentCompiler, event::Event};
 use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
@@ -50,6 +52,10 @@ enum Commands {
         /// Write normalized/updated content back to source files (default: read-only)
         #[arg(short, long)]
         write: bool,
+
+        /// Optional output directory for HTML generation
+        #[arg(long)]
+        html_output: Option<PathBuf>,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -68,6 +74,18 @@ enum Commands {
         /// Write normalized/updated content back to source files (default: read-only)
         #[arg(short, long)]
         write: bool,
+
+        /// Optional output directory for HTML generation
+        #[arg(long)]
+        html_output: Option<PathBuf>,
+
+        /// Start HTTP server for viewing HTML output (requires --html-output)
+        #[arg(long)]
+        serve: bool,
+
+        /// Port for dev server (default: 9037)
+        #[arg(long, default_value = "9037")]
+        port: u16,
     },
 }
 
@@ -87,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path,
             verbose,
             write,
+            html_output,
         } => {
             if verbose {
                 println!("Parsing: {path:?}");
@@ -97,8 +116,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Create a compiler with write flag
-            let compiler = DocumentCompiler::new(&path, None, None, write)?;
+            // Create a compiler with write flag and optional HTML output
+            let compiler = if let Some(ref html_dir) = html_output {
+                std::fs::create_dir_all(html_dir)?;
+                DocumentCompiler::with_html_output(
+                    &path,
+                    None,
+                    None,
+                    write,
+                    Some(html_dir.clone()),
+                )?
+            } else {
+                DocumentCompiler::new(&path, None, None, write)?
+            };
 
             // Parse all documents
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -109,6 +139,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Use the accumulated BeliefBase as cache for parsing
                 let cache = compiler.builder().doc_bb().clone();
                 compiler.parse_all(cache).await?;
+
+                // Generate network index pages if HTML output is enabled
+                if html_output.is_some() {
+                    compiler.generate_network_indices().await?;
+                }
 
                 // Get final stats
                 let stats = compiler.stats();
@@ -124,6 +159,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\n=== Write Results ===");
                     println!("Files processed: {}", stats.processed_count);
                     println!("Note: Only modified files are written back");
+                }
+
+                if let Some(ref html_dir) = html_output {
+                    println!("\n=== HTML Export Results ===");
+                    println!("HTML output: {}", html_dir.display());
                 }
 
                 // TODO: Display diagnostics from accumulated cache
@@ -144,6 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             verbose,
             config,
             write,
+            html_output,
+            serve,
+            port,
         } => {
             #[cfg(not(feature = "service"))]
             {
@@ -154,6 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(feature = "service")]
             {
+                // Validate: --serve requires --html-output
+                if serve && html_output.is_none() {
+                    eprintln!("Error: --serve requires --html-output to be specified");
+                    std::process::exit(1);
+                }
+
                 if verbose {
                     println!("Watching: {path:?}");
                     if let Some(ref cfg) = config {
@@ -163,6 +212,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Write-back: ENABLED (files will be modified on change)");
                     } else {
                         println!("Write-back: disabled (read-only mode)");
+                    }
+                    if let Some(ref html_dir) = html_output {
+                        println!("HTML output: {}", html_dir.display());
+                    }
+                    if serve {
+                        println!("Dev server: enabled on port {}", port);
                     }
                 }
 
@@ -189,8 +244,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
 
-                // Create watch service with write flag
-                let service = WatchService::new(root_dir, tx, write)?;
+                // Set NOET_DEV_MODE environment variable if serving
+                if serve {
+                    std::env::set_var("NOET_DEV_MODE", "1");
+                }
+
+                // Create watch service with write flag and optional HTML output
+                let service = if let Some(ref html_dir) = html_output {
+                    std::fs::create_dir_all(html_dir)?;
+                    WatchService::with_html_output(
+                        root_dir.clone(),
+                        tx,
+                        write,
+                        Some(html_dir.clone()),
+                    )?
+                } else {
+                    WatchService::new(root_dir.clone(), tx, write)?
+                };
 
                 // Enable network syncer for the path
                 service.enable_network_syncer(&path)?;
@@ -209,6 +279,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     r.store(false, std::sync::atomic::Ordering::SeqCst);
                 })?;
 
+                // Start dev server if --serve flag is set
+                let server_handle = if serve {
+                    let html_dir = html_output.clone().unwrap(); // Safe: validated above
+                    let running_clone = running.clone();
+
+                    Some(std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("Failed to create tokio runtime for dev server");
+
+                        rt.block_on(async {
+                            let dev_server = dev_server::DevServer::new(html_dir, port);
+
+                            // Shutdown signal based on running flag
+                            let shutdown = async move {
+                                while running_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            };
+
+                            if let Err(e) = dev_server.serve(shutdown).await {
+                                eprintln!("Dev server error: {}", e);
+                            }
+                        });
+                    }))
+                } else {
+                    None
+                };
+
                 // Keep running until Ctrl-C
                 while running.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(100));
@@ -218,6 +318,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 service.disable_network_syncer(&path)?;
                 drop(service);
                 drop(event_handle);
+
+                if let Some(handle) = server_handle {
+                    let _ = handle.join();
+                }
 
                 println!("Shutdown complete");
 

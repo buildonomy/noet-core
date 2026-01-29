@@ -297,6 +297,7 @@ pub struct WatchService {
     runtime: Runtime,
     config_provider: Arc<dyn crate::config::LatticeConfigProvider>,
     write: bool,
+    html_output_dir: Option<PathBuf>,
 }
 
 impl WatchService {
@@ -304,6 +305,15 @@ impl WatchService {
         root_dir: PathBuf,
         event_tx: Sender<Event>,
         write: bool,
+    ) -> Result<Self, BuildonomyError> {
+        Self::with_html_output(root_dir, event_tx, write, None)
+    }
+
+    pub fn with_html_output(
+        root_dir: PathBuf,
+        event_tx: Sender<Event>,
+        write: bool,
+        html_output_dir: Option<PathBuf>,
     ) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -333,6 +343,7 @@ impl WatchService {
             runtime,
             config_provider,
             write,
+            html_output_dir,
         })
     }
 
@@ -480,6 +491,7 @@ impl WatchService {
             true,
             &self.runtime,
             self.write,
+            self.html_output_dir.clone(),
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
@@ -599,6 +611,7 @@ pub(crate) struct FileUpdateSyncer {
 
 impl FileUpdateSyncer {
     #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         _codecs: CodecMap,
         global_bb: &DbConnection,
@@ -607,6 +620,7 @@ impl FileUpdateSyncer {
         notify: bool,
         runtime: &Runtime,
         write: bool,
+        html_output_dir: Option<PathBuf>,
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
@@ -616,13 +630,23 @@ impl FileUpdateSyncer {
         // Flag to pause debouncer while we're writing files
         let debouncer_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Create the compiler with the event channel
-        let compiler = Arc::new(RwLock::new(DocumentCompiler::new(
-            root,
-            Some(accum_tx),
-            Some(3), // max_reparse_count
-            write,   // write rewritten content back to files
-        )?));
+        // Create the compiler with the event channel and optional HTML output
+        let compiler = Arc::new(RwLock::new(if let Some(html_dir) = html_output_dir {
+            DocumentCompiler::with_html_output(
+                root,
+                Some(accum_tx),
+                Some(3), // max_reparse_count
+                write,   // write rewritten content back to files
+                Some(html_dir),
+            )?
+        } else {
+            DocumentCompiler::new(
+                root,
+                Some(accum_tx),
+                Some(3), // max_reparse_count
+                write,   // write rewritten content back to files
+            )?
+        }));
 
         let compiler_ref = compiler.clone();
         let compiler_notifier = work_notifier.clone();

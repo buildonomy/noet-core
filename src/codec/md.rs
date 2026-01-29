@@ -119,6 +119,7 @@ struct LinkAccumulator {
     id: CowStr<'static>,
     range: Option<Range<usize>>,
     title_events: Vec<MdEvent<'static>>,
+    is_image: bool,
 }
 
 impl LinkAccumulator {
@@ -135,15 +136,31 @@ impl LinkAccumulator {
                 id: id.clone().into_static(),
                 range: range.clone(),
                 title_events: vec![],
+                is_image: false,
+            }),
+            MdEvent::Start(MdTag::Image {
+                link_type,
+                dest_url,
+                id,
+                ..
+            }) => Some(LinkAccumulator {
+                link_type: *link_type,
+                dest_url: dest_url.clone().into_static(),
+                id: id.clone().into_static(),
+                range: range.clone(),
+                title_events: vec![],
+                is_image: true,
             }),
             _ => None,
         }
     }
 
-    // Returns whether event is a [MdTagEnd::Link]
+    // Returns whether event is a [MdTagEnd::Link] or [MdTagEnd::Image]
     fn push(&mut self, event: &MdEvent<'_>, range: &Option<Range<usize>>) -> bool {
-        if let MdEvent::End(MdTagEnd::Link) = event {
-            return true;
+        match event {
+            MdEvent::End(MdTagEnd::Link) if !self.is_image => return true,
+            MdEvent::End(MdTagEnd::Image) if self.is_image => return true,
+            _ => {}
         }
         self.title_events.push(event.clone().into_static());
         if self.range.is_none() {
@@ -369,6 +386,11 @@ fn check_for_link_and_push(
             collector = LinkAccumulator::new(&event, &range);
             // Store the original title attribute for parsing
             original_title_attr = Some(title.clone().into_static());
+        } else if let MdEvent::Start(MdTag::Image { title, .. }) = &event {
+            debug_assert!(collector.is_none());
+            collector = LinkAccumulator::new(&event, &range);
+            // Store the original title attribute for parsing (though images use alt text)
+            original_title_attr = Some(title.clone().into_static());
         } else if let Some(link_accumulator) = collector.as_mut() {
             process_link = link_accumulator.push(&event, &range);
         }
@@ -408,20 +430,27 @@ fn check_for_link_and_push(
                 ) {
                     parsed_key
                 } else {
-                    // Can't parse - leave link unchanged
+                    // Can't parse - leave link/image unchanged
                     link_data.link_type = match title.is_empty() || title == link_data.id {
                         true => LinkType::Shortcut,
                         false => LinkType::Reference,
                     };
-                    events_out.push_back((
+                    let start_event = if link_data.is_image {
+                        MdEvent::Start(MdTag::Image {
+                            link_type: link_data.link_type,
+                            dest_url: link_data.dest_url,
+                            title: original_title_attr.unwrap_or(CowStr::from("")),
+                            id: link_data.id,
+                        })
+                    } else {
                         MdEvent::Start(MdTag::Link {
                             link_type: link_data.link_type,
                             dest_url: link_data.dest_url,
                             title: original_title_attr.unwrap_or(CowStr::from("")),
                             id: link_data.id,
-                        }),
-                        None,
-                    ));
+                        })
+                    };
+                    events_out.push_back((start_event, None));
                     for title_event in link_data.title_events.into_iter() {
                         events_out.push_back((title_event, None));
                     }
@@ -434,7 +463,12 @@ fn check_for_link_and_push(
                         (_, Some(link_end_range)) => Some(link_end_range.clone()),
                         _ => None,
                     };
-                    events_out.push_back((MdEvent::End(MdTagEnd::Link), new_range));
+                    let end_event = if link_data.is_image {
+                        MdEvent::End(MdTagEnd::Image)
+                    } else {
+                        MdEvent::End(MdTagEnd::Link)
+                    };
+                    events_out.push_back((end_event, new_range));
 
                     if stop_event_match {
                         break;
@@ -450,6 +484,33 @@ fn check_for_link_and_push(
                 .unwrap_or(key.clone());
 
             let keys = vec![regularized];
+
+            // DEBUG: Asset link tracing
+            use crate::properties::asset_namespace;
+            let is_asset = if let NodeKey::Path { net, path } = &key {
+                if *net == asset_namespace() {
+                    tracing::info!(
+                        "[check_for_link_and_push] Asset link detected: path={}, is_image={}",
+                        path,
+                        link_data.is_image
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_asset {
+                if let NodeKey::Path { net: _, path } = &keys[0] {
+                    tracing::info!(
+                        "[check_for_link_and_push] Asset key regularized to: path={}",
+                        path
+                    );
+                }
+            }
+
             let sources = ctx.sources();
             let maybe_keyed_relation = keys.iter().find_map(|link_key| {
                 sources.iter().find(|rel| {
@@ -459,6 +520,18 @@ fn check_for_link_and_push(
                         .any(|ctx_source_key| ctx_source_key == link_key)
                 })
             });
+
+            if is_asset {
+                if maybe_keyed_relation.is_some() {
+                    tracing::info!("[check_for_link_and_push] Asset link FOUND in sources");
+                } else {
+                    tracing::info!("[check_for_link_and_push] Asset link NOT FOUND in sources");
+                    tracing::info!(
+                        "[check_for_link_and_push] Available sources: {}",
+                        sources.len()
+                    );
+                }
+            }
 
             if let Some(relation) = maybe_keyed_relation {
                 // Generate canonical format: [text](relative/path.md#anchor "bref://abc config")
@@ -556,15 +629,22 @@ fn check_for_link_and_push(
                     );
                 }
 
-                events_out.push_back((
+                let start_event = if link_data.is_image {
+                    MdEvent::Start(MdTag::Image {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.dest_url,
+                        title: CowStr::from(new_title_attr),
+                        id: link_data.id,
+                    })
+                } else {
                     MdEvent::Start(MdTag::Link {
                         link_type: link_data.link_type,
                         dest_url: link_data.dest_url,
                         title: CowStr::from(new_title_attr),
                         id: link_data.id,
-                    }),
-                    None,
-                ));
+                    })
+                };
+                events_out.push_back((start_event, None));
             } else {
                 // No matching relation found - leave link unchanged
                 tracing::info!(
@@ -582,15 +662,22 @@ fn check_for_link_and_push(
                         .collect::<Vec<NodeKey>>()
                 );
 
-                events_out.push_back((
+                let start_event = if link_data.is_image {
+                    MdEvent::Start(MdTag::Image {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.dest_url,
+                        title: original_title_attr.unwrap_or(CowStr::from("")),
+                        id: link_data.id,
+                    })
+                } else {
                     MdEvent::Start(MdTag::Link {
                         link_type: link_data.link_type,
                         dest_url: link_data.dest_url,
                         title: original_title_attr.unwrap_or(CowStr::from("")),
                         id: link_data.id,
-                    }),
-                    None,
-                ));
+                    })
+                };
+                events_out.push_back((start_event, None));
             }
 
             // Push link text events
@@ -606,7 +693,12 @@ fn check_for_link_and_push(
                 (_, Some(link_end_range)) => Some(link_end_range.clone()),
                 _ => None,
             };
-            events_out.push_back((MdEvent::End(MdTagEnd::Link), new_range));
+            let end_event = if link_data.is_image {
+                MdEvent::End(MdTagEnd::Image)
+            } else {
+                MdEvent::End(MdTagEnd::Link)
+            };
+            events_out.push_back((end_event, new_range));
         }
 
         if stop_event_match {
@@ -1162,6 +1254,169 @@ impl DocCodec for MdCodec {
             .iter()
             .flat_map(|(_p, events)| events.iter().cloned());
         Self::events_to_text(&self.content, events)
+    }
+
+    fn generate_html(&self) -> Result<Option<String>, BuildonomyError> {
+        use serde_json::json;
+
+        // Check if dev mode is enabled (for live reload script injection)
+        let dev_mode = std::env::var("NOET_DEV_MODE").is_ok();
+
+        /// Rewrite .md links to .html for HTML output
+        /// Only transforms links that have bref:// in title attribute (part of BeliefBase)
+        fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
+            match event {
+                MdEvent::Start(MdTag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => {
+                    // Only rewrite if this is a BeliefBase link (has bref:// in title)
+                    let should_rewrite = title.contains("bref://");
+
+                    let new_url = if should_rewrite {
+                        if dest_url.ends_with(".md") {
+                            // Replace .md extension with .html
+                            CowStr::from(dest_url.replace(".md", ".html"))
+                        } else if dest_url.contains(".md#") {
+                            // Replace .md# with .html# (preserves anchors)
+                            CowStr::from(dest_url.replace(".md#", ".html#"))
+                        } else {
+                            dest_url
+                        }
+                    } else {
+                        dest_url
+                    };
+
+                    MdEvent::Start(MdTag::Link {
+                        link_type,
+                        dest_url: new_url,
+                        title,
+                        id,
+                    })
+                }
+                _ => event,
+            }
+        }
+
+        // Extract document BID from first node (document node)
+        let doc_bid = self
+            .current_events
+            .first()
+            .and_then(|(proto, _)| proto.document.get("bid"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                BuildonomyError::Codec("Document missing BID for HTML generation".to_string())
+            })?;
+
+        let doc_title = self
+            .current_events
+            .first()
+            .and_then(|(proto, _)| proto.document.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+
+        // Build sections map: anchor_id -> section_bid
+        // Only include sections that have explicit BIDs (heading > 2)
+        let mut sections = serde_json::Map::new();
+        for (proto, _) in self.current_events.iter().skip(1) {
+            // Skip document node
+            if proto.heading > 2 {
+                if let (Some(id), Some(bid)) = (
+                    proto.id.as_ref(),
+                    proto.document.get("bid").and_then(|v| v.as_str()),
+                ) {
+                    sections.insert(id.clone(), json!(bid));
+                }
+            }
+        }
+
+        // Build metadata JSON
+        let metadata = json!({
+            "document": {
+                "bid": doc_bid
+            },
+            "sections": sections
+        });
+
+        // Generate HTML body from markdown events, rewriting .md links to .html
+        let events = self
+            .current_events
+            .iter()
+            .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
+            .map(rewrite_md_links_to_html);
+
+        let mut html_body = String::new();
+        pulldown_cmark::html::push_html(&mut html_body, events);
+
+        // Build live reload script if in dev mode
+        let live_reload = if dev_mode {
+            r#"
+<script>
+(function() {
+    'use strict';
+
+    console.log('[noet] Connecting to dev server...');
+
+    const eventSource = new EventSource('/events');
+
+    eventSource.addEventListener('reload', function(e) {
+        console.log('[noet] File change detected, reloading...');
+        window.location.reload();
+    });
+
+    eventSource.addEventListener('open', function(e) {
+        console.log('[noet] Connected to dev server');
+    });
+
+    eventSource.addEventListener('error', function(e) {
+        if (e.target.readyState === EventSource.CLOSED) {
+            console.log('[noet] Connection closed');
+        } else if (e.target.readyState === EventSource.CONNECTING) {
+            console.log('[noet] Reconnecting...');
+        } else {
+            console.error('[noet] Connection error:', e);
+        }
+    });
+
+    // Clean up on page unload
+    window.addEventListener('beforeunload', function() {
+        eventSource.close();
+    });
+})();
+</script>"#
+        } else {
+            ""
+        };
+
+        // Wrap in HTML5 structure with embedded metadata
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <link rel="stylesheet" href="assets/default-theme.css">
+  <script type="application/json" id="noet-metadata">
+{metadata}
+  </script>{live_reload}
+</head>
+<body>
+  <article>
+    <h1 class="document-title">{title}</h1>
+{body}
+  </article>
+</body>
+</html>"#,
+            title = doc_title,
+            metadata = serde_json::to_string_pretty(&metadata)
+                .map_err(|e| BuildonomyError::Codec(format!("JSON serialization failed: {}", e)))?,
+            body = html_body,
+            live_reload = live_reload
+        );
+
+        Ok(Some(html))
     }
 
     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
@@ -2176,4 +2431,178 @@ More content.
         // The actual test is that update_or_insert_frontmatter doesn't panic or warn
         // This is implicitly tested by the watch service integration tests
     }
+
+    #[test]
+    fn test_generate_html_basic() {
+        use crate::codec::DocCodec;
+
+        let markdown = r#"---
+bid = "01234567-89ab-cdef-0123-456789abcdef"
+title = "Test Document"
+---
+
+# Getting Started
+
+This is a test document.
+
+## Installation {#a1b2c3d4e5f6}
+
+Install the software.
+"#;
+
+        let mut codec = MdCodec::new();
+        let mut proto = ProtoBeliefNode::default();
+        proto
+            .document
+            .insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
+        proto.document.insert("title", value("Test Document"));
+
+        codec
+            .parse(markdown.to_string(), proto)
+            .expect("Parse failed");
+
+        let html = codec.generate_html().expect("HTML generation failed");
+        assert!(html.is_some(), "HTML should be generated");
+
+        let html_content = html.unwrap();
+
+        // Verify HTML structure
+        assert!(html_content.contains("<!DOCTYPE html>"), "Missing DOCTYPE");
+        assert!(html_content.contains("<html>"), "Missing html tag");
+        assert!(
+            html_content.contains("<title>Test Document</title>"),
+            "Missing or wrong title"
+        );
+        assert!(
+            html_content.contains("noet-metadata"),
+            "Missing metadata script"
+        );
+        assert!(html_content.contains("<article>"), "Missing article tag");
+
+        // Verify metadata JSON structure
+        assert!(
+            html_content.contains("\"document\""),
+            "Missing document in metadata"
+        );
+        assert!(html_content.contains("\"bid\""), "Missing bid in metadata");
+        assert!(
+            html_content.contains("01234567-89ab-cdef-0123-456789abcdef"),
+            "Wrong document BID"
+        );
+        assert!(
+            html_content.contains("\"sections\""),
+            "Missing sections in metadata"
+        );
+
+        // Verify markdown content was converted to HTML
+        assert!(html_content.contains("<h1"), "Missing h1 heading");
+        assert!(
+            html_content.contains("Getting Started"),
+            "Missing heading text"
+        );
+        assert!(html_content.contains("<h2"), "Missing h2 heading");
+        assert!(
+            html_content.contains("Installation"),
+            "Missing subheading text"
+        );
+        assert!(html_content.contains("<p>"), "Missing paragraph tag");
+    }
+
+    #[test]
+    fn test_generate_html_minimal_metadata() {
+        use crate::codec::DocCodec;
+
+        let markdown = r#"---
+bid = "12345678-1234-5678-1234-567812345678"
+title = "Minimal Doc"
+---
+
+# Simple Heading
+
+Content here.
+
+## Section Without BID
+
+This section has no explicit BID.
+"#;
+
+        let mut codec = MdCodec::new();
+        let mut proto = ProtoBeliefNode::default();
+        proto
+            .document
+            .insert("bid", value("12345678-1234-5678-1234-567812345678"));
+        proto.document.insert("title", value("Minimal Doc"));
+
+        codec
+            .parse(markdown.to_string(), proto)
+            .expect("Parse failed");
+
+        let html = codec.generate_html().expect("HTML generation failed");
+        assert!(html.is_some());
+
+        let html_content = html.unwrap();
+
+        // Parse the metadata JSON to verify structure
+        let metadata_start = html_content
+            .find("\"document\"")
+            .expect("No metadata found");
+        assert!(metadata_start > 0);
+
+        // Verify document BID is present
+        assert!(html_content.contains("12345678-1234-5678-1234-567812345678"));
+
+        // Sections map should be present but might be empty (sections without explicit BIDs)
+        assert!(html_content.contains("\"sections\""));
+    }
+
+    #[test]
+    fn test_generate_html_link_rewriting() {
+        use crate::codec::DocCodec;
+
+        let markdown = r#"---
+bid = "12345678-1234-5678-1234-567812345678"
+title = "Link Test"
+---
+
+# Links Test
+
+Link to [another doc](./other.md "bref://doc123 auto title").
+Link with anchor [section link](docs/page.md#section-1 "bref://doc456").
+External .md link without bref [external](https://example.com/doc.md).
+Already HTML [html link](./page.html "bref://doc789").
+"#;
+
+        let mut codec = MdCodec::new();
+        let mut proto = ProtoBeliefNode::default();
+        proto
+            .document
+            .insert("bid", value("12345678-1234-5678-1234-567812345678"));
+        proto.document.insert("title", value("Link Test"));
+
+        codec
+            .parse(markdown.to_string(), proto)
+            .expect("Parse failed");
+
+        let html = codec.generate_html().expect("HTML generation failed");
+        assert!(html.is_some());
+
+        let html_content = html.unwrap();
+
+        // Verify .md links WITH bref:// are rewritten to .html
+        assert!(html_content.contains("href=\"./other.html\""));
+        assert!(html_content.contains("href=\"docs/page.html#section-1\""));
+
+        // Verify external .md links WITHOUT bref:// are NOT rewritten
+        assert!(html_content.contains("href=\"https://example.com/doc.md\""));
+
+        // Verify already-.html links with bref:// are unchanged
+        assert!(html_content.contains("href=\"./page.html\""));
+
+        // Verify only BeliefBase .md links were rewritten
+        assert!(!html_content.contains("href=\"./other.md\""));
+        assert!(!html_content.contains("href=\"docs/page.md#"));
+    }
+
+    // Note: Integration test for static asset tracking needed with full GraphBuilder flow
+    // MdCodec::parse only creates ProtoBeliefNodes; relations are created by GraphBuilder
 }

@@ -785,7 +785,7 @@ pub async fn parse_content(...) -> Result<ParseContentResult, BuildonomyError>
 
 2. **Propagation**: Compiler-driven resolution checking
    - After parsing each file, check if it resolves any tracked unresolved refs
-   - If resolved: create relation via `RelationInsert` event
+   - If resolved: create relation via `RelationChange` event
    - If NodeKey type requires rewrite (Path, Title): enqueue source file for reparse
    - Queue managed by `DocumentCompiler` with priority ordering
 
@@ -815,7 +815,7 @@ Parse File B → creates node with BID and title "File B Title"
 
 Compiler checks unresolved refs → finds B now resolvable
   → can_resolve_key(Path("B")) → true
-  → create_resolved_relation() → emits RelationInsert event
+  → create_resolved_relation() → emits RelationChange event
   → should_rewrite_for_key(unresolved) → checks auto_title=true → YES
   → Enqueue A for reparse
 

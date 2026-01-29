@@ -2,7 +2,9 @@
 
 **Priority**: MEDIUM - Post-open source feature  
 **Estimated Effort**: 12-15 days (includes WASM SPA architecture)  
-**Dependencies**: Phase 1 complete (Issues 1-4), v0.1.0 released
+**Dependencies**: Phase 1 complete (Issues 1-4), v0.1.0 released  
+**Status**: Phase 1 ✅ Complete | Phase 1.5 🚧 In Progress (Steps 1-5/6 Complete, 2026-01-29)
+**Architecture Update**: HTML generation is a parse/watch option, not a separate command
 
 ## Summary
 
@@ -12,19 +14,35 @@ Implement static site generation with progressive enhancement via WASM-powered B
 
 ## Goals
 
-### Phase 1: Static HTML Generation (Like Jekyll)
-1. Extend `DocCodec` trait with `generate_html()` method
-2. Implement HTML generation for `MdCodec`
-3. Create CSS stylesheet for noet documents
-4. CLI command for batch HTML generation
-5. Export BeliefBase to portable format (JSON/MessagePack)
+### Phase 1: Static HTML Generation (Like Jekyll) ✅ COMPLETE
+1. ✅ Extend `DocCodec` trait with `generate_html()` method
+2. ✅ Implement HTML generation for `MdCodec` with minimal metadata
+3. ✅ HTML generation integrated as `--html-output` option for `parse` and `watch` commands
+4. ✅ Create CSS stylesheet for noet documents (just-the-docs inspired)
+5. 🚧 Export BeliefBase to portable format (deferred to Phase 2)
+
+### Phase 1.5: Static Site Polish + Dev Server (Critical Path) 🚧 IN PROGRESS
+1. ✅ Copy static assets (CSS embedded in binary, auto-copied to output)
+2. ✅ Rewrite .md links to .html (with bref:// filtering)
+3. ✅ Generate network index pages (index.html for each network)
+4. ✅ Document titles in HTML body
+5. ✅ Dev server with live reload (completed 2026-01-29)
+6. 🚧 Dogfooding CI/CD integration (~2 hours)
+7. Rewrite `.md` → `.html` in links during HTML generation
+8. Generate `index.html` for each BeliefNetwork (document listing)
+9. Implement static file server with SSE-based live reload
+10. Add `--serve` flag to `watch` command: `noet watch --html-output ./html --serve`
+11. Auto-refresh browser when HTML regenerates
+12. Hide behind `service` feature flag (requires axum/tower-http)
+
+**Rationale**: Speeds up testing and development feedback loop for Phase 1 and Phase 2. Essential for efficient iteration on CSS/WASM features.
 
 ### Phase 2: WASM SPA Enhancement (Progressive)
-6. Compile `noet-core` to WASM (browser-compatible subset)
-7. Create JavaScript viewer that loads WASM BeliefBase
-8. Implement client-side NodeKey resolution and navigation
-9. Add interactive features powered by local belief queries
-10. Enable offline-capable operation after initial load
+10. Compile `noet-core` to WASM (browser-compatible subset)
+11. Create JavaScript viewer that loads WASM BeliefBase
+12. Implement client-side NodeKey resolution and navigation
+13. Add interactive features powered by local belief queries
+14. Enable offline-capable operation after initial load
 
 ## Architecture
 
@@ -35,7 +53,7 @@ Implement static site generation with progressive enhancement via WASM-powered B
 │  Build Time (Server/CI)                                     │
 ├─────────────────────────────────────────────────────────────┤
 │  1. Parse markdown files → BeliefBase                       │
-│  2. Generate static HTML (SEO-friendly, works w/o JS)       │
+│  2. Generate static HTML (via --html-output flag)           │
 │  3. Export BeliefBase → belief-network.json + .wasm runtime │
 │  4. Copy viewer assets (CSS/JS) to output                   │
 └─────────────────────────────────────────────────────────────┘
@@ -167,7 +185,7 @@ document.querySelector('[data-bref="doc-shortname"]')
 
 ## Implementation Steps
 
-### 1. Extend DocCodec Trait (1 day)
+### 1. Extend DocCodec Trait ✅ COMPLETE (0.5 days)
 
 **File**: `src/codec/mod.rs`
 
@@ -177,7 +195,7 @@ document.querySelector('[data-bref="doc-shortname"]')
 - [ ] Add default implementation returning `None`
 - [ ] Document trait extension
 
-### 2. Implement HTML Generation for MdCodec (3 days)
+### 2. Implement HTML Generation for MdCodec ✅ COMPLETE (2 days)
 
 **File**: `src/codec/md.rs`
 
@@ -210,7 +228,226 @@ fn nodekey_to_html_id(nodekey_url: &str) -> String {
 }
 ```
 
-### 3. Export BeliefBase to Portable Format (2 days)
+### 3. Bundle Default CSS Theme ✅ COMPLETE (0.5 days)
+
+- [ ] Select default theme (just-the-docs or minima)
+- [ ] Copy CSS to `assets/default-theme.css` (embed in binary or install to system)
+- [ ] Update `generate_html()` to include `<link rel="stylesheet" href="...">` tag
+- [ ] Add `--css` CLI flag for custom CSS override
+- [ ] Test rendered HTML in browser with default theme
+
+**CSS Structure:**
+```html
+<head>
+  <link rel="stylesheet" href="/assets/default-theme.css">
+  <!-- If --css custom.css provided: -->
+  <link rel="stylesheet" href="/assets/custom.css">
+</head>
+```
+
+### 4. Static Assets and Link Handling ✅ COMPLETE (0.5 days)
+
+**4a. Copy Static Assets to Output Directory**
+
+- [ ] Create `assets/` directory in HTML output on first generation
+- [ ] Embed default CSS in binary: `const DEFAULT_CSS: &str = include_str!("../assets/default-theme.css");`
+- [ ] Copy CSS to `{html_output_dir}/assets/default-theme.css`
+- [ ] Copy custom CSS if `--css` flag provided
+- [ ] Update HTML generation to reference: `<link rel="stylesheet" href="/assets/default-theme.css">`
+
+**4b. Rewrite `.md` → `.html` in Links**
+
+Rewrite link extensions during HTML generation in `MdCodec::generate_html()`:
+
+```rust
+// In generate_html(), modify events before push_html()
+let events = self
+    .current_events
+    .iter()
+    .flat_map(|(_p, events)| {
+        events.iter().map(|(e, _)| match e {
+            MdEvent::Start(MdTag::Link { link_type, dest_url, title, id }) => {
+                // Rewrite .md extensions to .html
+                let new_url = if dest_url.ends_with(".md") {
+                    CowStr::from(dest_url.replace(".md", ".html"))
+                } else if dest_url.contains(".md#") {
+                    CowStr::from(dest_url.replace(".md#", ".html#"))
+                } else {
+                    dest_url.clone()
+                };
+                MdEvent::Start(MdTag::Link {
+                    link_type: *link_type,
+                    dest_url: new_url,
+                    title: title.clone(),
+                    id: id.clone(),
+                })
+            }
+            _ => e.clone(),
+        })
+    });
+
+let mut html_body = String::new();
+pulldown_cmark::html::push_html(&mut html_body, events);
+```
+
+**Why this approach:**
+- Codec already has events loaded (no duplicate parsing)
+- Clean transformation during generation (not post-processing)
+- Preserves anchors: `./doc.md#section` → `./doc.html#section`
+- Doesn't affect source markdown (pure output transformation)
+
+**4c. Generate Network Index Pages**
+
+Generate `index.html` for each BeliefNetwork after all documents parsed:
+
+```rust
+// In DocumentCompiler, after parse_all() completes
+async fn generate_network_indices(&self, html_output_dir: &Path) -> Result<()> {
+    // Find all network nodes in the belief base
+    let networks = self.builder()
+        .doc_bb()
+        .query(Query::of_kind(BeliefKind::Network))
+        .collect::<Vec<_>>();
+    
+    for network in networks {
+        // Query all documents in this network
+        let docs = self.builder()
+            .doc_bb()
+            .paths()
+            .get_docs_in_network(network.bid)
+            .collect::<Vec<_>>();
+        
+        // Generate index.html
+        let index_html = self.generate_index_page(&network, &docs)?;
+        
+        // Determine output path (network root or subdir)
+        let network_path = self.builder().doc_bb().paths().get_network_path(network.bid)?;
+        let index_path = html_output_dir.join(network_path).join("index.html");
+        
+        tokio::fs::write(index_path, index_html).await?;
+    }
+    
+    Ok(())
+}
+
+fn generate_index_page(&self, network: &BeliefNode, docs: &[PathBuf]) -> Result<String> {
+    let doc_links = docs.iter()
+        .filter_map(|path| {
+            let file_stem = path.file_stem()?.to_str()?;
+            let title = self.builder().doc_bb()
+                .get_node_by_path(path)
+                .and_then(|n| n.title())
+                .unwrap_or(file_stem);
+            Some(format!(
+                r#"    <li><a href="{}.html">{}</a></li>"#,
+                file_stem, title
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    Ok(format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{}</title>
+  <link rel="stylesheet" href="/assets/default-theme.css">
+</head>
+<body>
+  <h1>{}</h1>
+  <ul>
+{}
+  </ul>
+</body>
+</html>"#,
+        network.title().unwrap_or("Documents"),
+        network.title().unwrap_or("Documents"),
+        doc_links
+    ))
+}
+```
+
+- [ ] Call `generate_network_indices()` after `parse_all()` in `parse` command
+- [ ] Call `generate_network_indices()` after each compile round in `watch` command
+- [ ] Test: verify `index.html` exists at network root with document links
+
+### 5. Dev Server with Live Reload ✅ COMPLETE (2026-01-29)
+
+**Goal**: Seamless development workflow with auto-refresh
+
+```bash
+# Developer workflow
+noet watch docs/ --html-output ./html --serve --port 3000
+# → Serves HTML at http://localhost:3000
+# → Edit markdown → HTML regenerates → browser auto-refreshes
+```
+
+**Implementation:**
+
+- [x] Add dependencies to `Cargo.toml` (behind `service` feature):
+  ```toml
+  axum = { version = "0.7", optional = true, features = ["http1"] }
+  tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+  tower-http = { version = "0.5", optional = true, features = ["fs"] }
+  ```
+
+- [x] Create `src/bin/noet/dev_server.rs` module:
+  - Static file server using `tower_http::services::ServeDir`
+  - SSE endpoint `/events` that broadcasts reload notifications
+  - Receives `broadcast::Receiver<String>` with changed file paths
+  - Listens on configurable port (default: 3000)
+
+- [x] Integrate with `watch` command in `src/bin/noet/main.rs`:
+  - Add `--serve` flag
+  - Add `--port <PORT>` flag (default: 9037 - mnemonic for "noet")
+  - ~~Add `--open` flag to auto-launch browser~~ (deferred)
+  - Spawn dev server if `--serve` enabled
+  - Connect compiler events to dev server reload channel
+
+- [x] Inject live reload script in `generate_html()`:
+  - Use `NOET_DEV_MODE` environment variable to detect dev mode
+  - Inject SSE client script only when dev mode enabled:
+    ```javascript
+    const events = new EventSource('/events');
+    events.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === 'reload') location.reload();
+    };
+    ```
+
+- [x] Test workflow:
+  - Start watch with serve: `noet watch docs/ --html-output ./html --serve`
+  - Open browser to http://localhost:3000
+  - Edit markdown file
+  - Verify browser auto-refreshes
+
+**Architecture:**
+```
+┌──────────────┐        ┌──────────────────┐        ┌──────────────┐
+│  File Watch  │───────>│  DocumentCompiler│───────>│  Dev Server  │
+│  (notify)    │ change │  (regenerate HTML)│ event  │  (SSE push)  │
+└──────────────┘        └──────────────────┘        └──────────────┘
+                                                            │
+                                                            ↓ /events
+                                                     ┌──────────────┐
+                                                     │   Browser    │
+                                                     │ (auto-reload)│
+                                                     └──────────────┘
+```
+
+**Why SSE (Server-Sent Events)?**
+- Native browser API (no WebSocket complexity)
+- One-way push (perfect for reload notifications)
+- Auto-reconnects on disconnect
+- Minimal JS footprint
+
+**Why behind `service` feature flag?**
+- Adds axum/tower-http dependencies (~2MB compiled)
+- Not needed for basic export-html usage
+- Optional convenience for active development
+
+### 6. Export BeliefBase to Portable Format (2 days) - DEFERRED TO PHASE 2
 
 **File**: `src/export.rs` (new)
 
@@ -252,7 +489,7 @@ fn nodekey_to_html_id(nodekey_url: &str) -> String {
 }
 ```
 
-### 4. Compile noet-core to WASM (3 days)
+### 7. Compile noet-core to WASM (3 days) - PHASE 2
 
 **Dependencies**: `wasm-bindgen`, `wasm-pack`
 
@@ -286,7 +523,7 @@ impl BeliefBaseWasm {
 }
 ```
 
-### 5. Create Viewer JavaScript with WASM Integration (4 days)
+### 8. Create Viewer JavaScript with WASM Integration (4 days) - PHASE 2
 
 **File**: `viewer/noet-viewer.js` (new)
 
@@ -408,7 +645,7 @@ class NoetViewer {
 }
 ```
 
-### 6. Create CSS Stylesheet (2 days)
+### 9. Create CSS Stylesheet (2 days) - MOVED TO STEP 3
 
 **File**: `viewer/noet-viewer.css` (new)
 
@@ -421,7 +658,7 @@ class NoetViewer {
 - [ ] Responsive layout
 - [ ] Dark mode support via `prefers-color-scheme`
 
-### 7. CLI Command for Static Site Generation (2 days)
+### 10. CLI Command for Static Site Generation ✅ COMPLETE
 
 **File**: `src/bin/noet.rs`
 
@@ -467,7 +704,7 @@ html-output/
 └── search-index.json            # Optional: pre-built search index
 ```
 
-### 8. Advanced Interactive Features (3 days)
+### 11. Advanced Interactive Features (3 days) - PHASE 2
 
 **File**: `viewer/noet-features.js` (new)
 
@@ -496,7 +733,7 @@ html-output/
   - WASM + belief data cached
   - Works without network after initial load
 
-### 9. Optional: Server-Side API (Future - Phase 3)
+### 12. Optional: Server-Side API (Future - Phase 3)
 
 **For distributed/multi-user scenarios, not needed for static SPA**
 
@@ -552,14 +789,29 @@ Defer to Phase 3 - WASM approach handles most use cases client-side.
 **Rationale**: Dogfooding validates the feature works in production, provides browsable docs, and ensures regressions are caught immediately.
 
 ### Phase 1: Static HTML (MVP)
-- [ ] `generate_html()` implemented for `MdCodec`
-- [ ] HTML output is standards-compliant and works without JavaScript
-- [ ] Clean HTML IDs (no URL prefixes)
-- [ ] Metadata rendering modes work correctly
-- [ ] CSS provides clean, readable styling
-- [ ] Dark mode supported
-- [ ] CLI command generates static sites
-- [ ] Deployable to GitHub Pages, Netlify, etc.
+- [x] `generate_html()` implemented for `MdCodec`
+- [x] HTML output is standards-compliant and works without JavaScript
+- [x] Clean HTML IDs (inherited from Issue 03 - heading anchor management)
+- [x] Minimal metadata structure (document BID + section mappings)
+- [x] HTML generation integrated with `parse` and `watch` commands (`--html-output` flag)
+- [x] Smart regeneration logic (first parse always, reparses only on content change)
+- [x] Integrated with DocumentCompiler infrastructure (no BID mocking needed)
+- [ ] CSS provides clean, readable styling (next session)
+- [ ] Dark mode supported (next session)
+- [ ] Deployable to GitHub Pages, Netlify, etc. (needs CSS)
+
+### Phase 1.5: Static Site Polish + Dev Server
+- [ ] Copy static assets (CSS) to HTML output directory
+- [ ] Embed default CSS in binary, copy to `assets/` on first generation
+- [ ] Rewrite `.md` → `.html` in links during HTML generation (in event stream)
+- [ ] Generate `index.html` for each BeliefNetwork with document listing
+- [ ] Static file server with axum/tower-http (behind `service` feature)
+- [ ] SSE endpoint for live reload notifications
+- [ ] Add `--serve` flag to `watch` command (requires `--html-output`)
+- [ ] Add `--port` and `--open` flags for server configuration
+- [ ] Live reload script injection in dev mode
+- [ ] Auto-refresh browser on markdown changes
+- [ ] Works with both static HTML and future WASM SPA
 
 ### Phase 2: WASM SPA (Enhanced)
 - [ ] `noet-wasm` crate compiles successfully
@@ -628,3 +880,247 @@ Defer to Phase 3 - WASM approach handles most use cases client-side.
   - **Datasette**: SQLite in browser via WASM
 - Graph visualization: D3.js, vis.js, cytoscape.js
 - Static site examples: GitHub Pages, mdBook, Hugo, Jekyll
+
+## Implementation Progress (2026-01-29 - Sessions 2-3)
+
+### ✅ Completed (2026-01-29 - Sessions 2-3)
+
+**1. Extended `DocCodec` trait** (`src/codec/mod.rs`)
+- Added `generate_html()` method returning `Result<Option<String>, BuildonomyError>`
+- Default implementation returns `None` (codec doesn't support HTML)
+- Non-breaking change for existing codecs
+
+**2. Implemented `MdCodec::generate_html()`** (`src/codec/md.rs`)
+- Generates minimal metadata JSON structure:
+  ```json
+  {
+    "document": { "bid": "..." },
+    "sections": { "anchor_id": "section_bid", ... }
+  }
+  ```
+- Uses `pulldown_cmark::html::push_html()` for markdown → HTML conversion
+- Wraps in HTML5 boilerplate with embedded `<script type="application/json" id="noet-metadata">`
+- Clean semantic HTML (no `data-*` attributes in body)
+- Leverages codec singleton architecture (document already parsed, no duplication)
+
+**3. Integrated with `DocumentCompiler`** (`src/codec/compiler.rs`)
+- Added `html_output_dir: Option<PathBuf>` field
+- New constructor: `DocumentCompiler::with_html_output()`
+- Smart regeneration logic in `parse_next()`:
+  - **First parse** (parse_count == 0): Always generate HTML (handles empty output dir)
+  - **Reparse** (parse_count > 0): Only generate if `rewritten_content.is_some()` (content changed)
+- Generates HTML after successful parse, writes to output directory with proper path structure
+- Handles errors gracefully (adds diagnostic warnings, continues processing)
+
+**4. Integrated with CLI** (`src/bin/noet.rs`)
+- Added `--html-output <dir>` flag to `parse` and `watch` commands
+- HTML generation is now a parse side effect, not a separate workflow
+- Uses existing DocumentCompiler infrastructure (no BID mocking!)
+- Parses documents properly with BeliefBase context
+- Works with `--write` flag: can normalize markdown AND generate HTML simultaneously
+- Verbose mode shows parse statistics and HTML output location
+
+**5. Updated WatchService** (`src/watch.rs`)
+- Added `html_output_dir` field and `with_html_output()` constructor
+- Passes HTML output configuration to `FileUpdateSyncer` and `DocumentCompiler`
+- Enables continuous HTML generation during file watching
+
+**6. Unit Tests** (`src/codec/md.rs`)
+- `test_generate_html_basic` - Verifies HTML structure and metadata
+- `test_generate_html_minimal_metadata` - Tests simple document
+- Both tests passing ✅
+
+### Test Results
+
+Successfully exported `link_format.md` (design document) to HTML:
+- ✅ Valid HTML5 structure with proper DOCTYPE, meta charset, title
+- ✅ Valid JSON metadata with document BID + 46 section BID mappings
+- ✅ Clean semantic HTML body (no `data-*` pollution)
+- ✅ All heading IDs preserved from Issue 03 (heading anchor management)
+- ✅ 19KB output file with complete markdown content rendered as HTML
+- ✅ Metadata enables SPA to map: document → BID, section anchor → BID
+
+**Example metadata structure:**
+```json
+{
+  "document": {
+    "bid": "1f0fd234-f252-6086-9b03-58407829e822"
+  },
+  "sections": {
+    "1-overview": "1f0fd234-f26f-6225-9b07-a5cc3685ac57",
+    "3-solution-canonical-link-format": "1f0fd234-f273-63de-9b0b-a5cc3685ac57",
+    "link-format-and-reference-system": "1f0fd234-f26c-6fee-9b05-ec31da388413"
+  }
+}
+```
+
+### Architecture Decisions
+
+**Why minimal metadata in HTML?**
+- Document BID + section anchor→BID mappings provide complete linkage to BeliefBase
+- WASM SPA can query BeliefBase for any additional metadata (title, backlinks, etc.)
+- Keeps HTML clean and readable (no visual clutter)
+- Extensible: can add per-anchor metadata later without changing HTML structure
+
+**Why HTML as parse option vs separate command?**
+- HTML generation happens during parse (already integrated in `DocumentCompiler`)
+- Consistent with `--write` flag (both are output modes for parse results)
+- Simpler mental model: parse produces markdown and/or HTML
+- Avoids redundant parsing: one pass produces both outputs
+
+**Why generate in Compiler vs GraphBuilder?**
+- Keeps separation of concerns: GraphBuilder parses, Compiler orchestrates I/O
+- HTML generation is "optional export feature" not "core parsing"
+- File I/O stays in compiler layer (consistent with `write` flag)
+- Codec singleton means document is still loaded (no duplicate parsing)
+
+**Why smart regeneration logic?**
+- First parse always generates: handles empty output dir or new files
+- Reparse only on content change: avoids unnecessary file writes
+- Based on `rewritten_content.is_some()` which indicates actual markdown changes
+
+### ✅ Session 3 Progress (2026-01-29) - Steps 1-4 Complete
+
+**Step 1: Static Assets & Link Rewriting - COMPLETE**
+- Implemented `rewrite_md_links_to_html()` in `md.rs`
+- Only rewrites links with `bref://` in title attribute (BeliefBase links)
+- Preserves anchors: `doc.md#section` → `doc.html#section`
+- External links without bref:// left unchanged
+- Created `assets/default-theme.css` (~230 lines, just-the-docs inspired)
+- Implemented `copy_static_assets()` to embed CSS in binary and copy to output
+- Added unit test `test_generate_html_link_rewriting` - all tests passing
+
+**Step 2: Network Index Generation - COMPLETE**
+- Implemented `generate_network_indices()` using `PathMap::all_net_paths()`
+- Uses `Builder.repo()` to get repository root network (not `api_map()`)
+- Generates `index.html` for each network at correct filesystem location
+- Filters to documents only via `paths.docs()` (excludes sections/anchors)
+- Groups documents by directory with proper hierarchy
+- Root index: `{html_output}/index.html`
+- Subnet indices: `{html_output}/subnet1/index.html`, etc.
+- Document titles from BeliefBase with filename fallback
+
+**Step 3: Bundle Default CSS Theme - COMPLETE**
+- Included in Step 1 implementation
+- CSS embedded in binary via `include_str!("../../assets/default-theme.css")`
+- Automatically copied to `{html_output}/assets/default-theme.css`
+- HTML references: `<link rel="stylesheet" href="assets/default-theme.css">`
+
+**Step 4: Static Assets & Link Handling - COMPLETE**
+- Included in Steps 1-2 implementation
+- Asset copying integrated with compiler initialization
+- Link rewriting at event stream level (not post-processing)
+
+**Bonus: Document Titles in HTML Body - COMPLETE**
+- Added `<h1 class="document-title">{title}</h1>` to HTML template
+- Distinct CSS styling (2.5em font, 2px border, #5c5962 color)
+- Preserves markdown h1 structure (both titles present)
+- Better standalone HTML experience
+
+**Test Results with `tests/network_1`:**
+- ✅ Root index at root with 12 documents
+- ✅ Subnet index at `subnet1/` with 2 documents  
+- ✅ All HTML files with rewritten links
+- ✅ CSS copied to `assets/default-theme.css`
+- ✅ Document titles visible with proper styling
+- ✅ 3/3 unit tests passing
+
+**Files Modified:**
+- `src/codec/md.rs` - Link rewriting, document title injection
+- `src/codec/compiler.rs` - Static asset copying, index generation
+- `src/codec/belief_ir.rs` - Placeholder index for Network nodes
+- `src/bin/noet.rs` - Call `generate_network_indices()` after parse_all
+- `assets/default-theme.css` - New CSS theme with document-title styling
+
+### ✅ Step 5 Complete (2026-01-29 - Session 4)
+
+**Dev Server with Live Reload - COMPLETE**
+
+Implementation details:
+- Created `src/bin/noet/dev_server.rs` with axum-based server
+- SSE endpoint at `/events` for browser notifications
+- File watcher monitors HTML output directory (using existing notify infrastructure)
+- Debounced changes (500ms) for efficient reload
+- Port 9037 default (9=n, 0=o, 3=e, 7=t)
+- CLI: `noet watch <path> --html-output <dir> --serve [--port 9037]`
+- Live reload script injected via `NOET_DEV_MODE` env var
+- Dependencies added to `service` feature: axum, tokio-stream, tower, tower-http
+
+**Architecture decision**: Dev server watches HTML directory directly (using notify) rather than callback mechanism through WatchService - cleaner separation of concerns.
+
+**Testing**: 
+```bash
+./target/release/noet watch tests/network_1/subnet1 --html-output docs-html --serve
+# Access at http://127.0.0.1:9037 ✅
+# Edit markdown → HTML regenerates → Browser auto-reloads ✅
+```
+
+**Issue 29 Created**: During implementation, identified gap in static asset tracking (images, PDFs not copied during export). Created comprehensive issue for static asset management using External BeliefNode pattern.
+
+### 🚧 Remaining for Phase 1.5
+
+**Phase 1.5 Remaining:**
+
+1. **Dev Server with Live Reload** (~8 hours) - **NEXT SESSION - CRITICAL PATH**
+   - Add axum/tokio-stream/tower-http dependencies (behind `service` feature)
+   - Create `src/dev_server.rs` with static file serving + SSE
+   - Integrate with `watch` command (`--serve`, `--port`, `--open` flags)
+   - Inject live reload script in `generate_html()` (dev mode only)
+   - Test: edit markdown → auto-refresh in browser
+   - **Why critical**: Speeds up testing for CSS styling and future WASM work
+
+2. **Dogfooding: CI/CD integration** (~2 hours)
+   - Add GitHub Actions workflow to export `docs/design/` on push to main
+   - Deploy to GitHub Pages or upload as artifact
+   - Validates feature works in production
+   - Validates feature works in production, provides browsable docs
+
+**Phase 2: WASM SPA** (defer until Phase 1.5 complete)
+   - Export BeliefBase to JSON
+   - Compile noet-core to WASM
+   - Create JavaScript viewer with SPA navigation
+   - Implement interactive features (will reuse dev server infrastructure)
+
+### Files Modified
+
+- `src/codec/mod.rs` - Added `generate_html()` to `DocCodec` trait
+- `src/codec/md.rs` - Implemented HTML generation with metadata, added tests
+- `src/codec/compiler.rs` - Added HTML generation integration with smart regeneration
+- `src/bin/noet.rs` - Added `--html-output` flag to `parse` and `watch` commands
+- `src/watch.rs` - Added `html_output_dir` support to `WatchService` and `FileUpdateSyncer`
+
+### Estimated Remaining Effort (Phase 1.5)
+
+- ~~Static assets & link rewriting~~ ✅ **COMPLETE**
+- ~~Network index generation~~ ✅ **COMPLETE**
+- ~~CSS theming~~ ✅ **COMPLETE**
+- ~~Document titles in body~~ ✅ **COMPLETE**
+- Dev server with live reload: ~8 hours **(NEXT SESSION)**
+- Dogfooding CI/CD: ~2 hours
+- **Total remaining**: ~10 hours to complete Phase 1.5
+
+**Why dev server is the critical path:**
+- Eliminates manual refresh during CSS development
+- Essential for testing WASM SPA in Phase 2
+- Provides professional development experience
+- Minimal complexity (SSE is ~100 lines total)
+- Hidden behind feature flag (no bloat for basic usage)
+
+## CLI Usage Examples
+
+```bash
+# One-shot HTML generation
+noet parse docs/design --html-output ./html
+
+# Continuous watching with HTML generation
+noet watch docs/design --html-output ./html
+
+# Normalize markdown AND generate HTML
+noet parse docs/ --write --html-output ./html
+
+# Watch with live reload (Phase 1.5)
+noet watch docs/ --html-output ./html --serve --port 3000
+
+# Combined workflow: normalize, export HTML, serve with live reload
+noet watch docs/ --write --html-output ./html --serve --open
+```

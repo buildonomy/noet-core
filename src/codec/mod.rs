@@ -167,6 +167,22 @@ pub trait DocCodec: Sync {
     }
 
     fn generate_source(&self) -> Option<String>;
+
+    /// Generate HTML representation of the document with embedded metadata.
+    ///
+    /// Returns an HTML string with:
+    /// - Document structure (head, body, article)
+    /// - Embedded JSON metadata mapping document/section IDs to BIDs
+    /// - Clean semantic HTML from markdown (pulldown-cmark output)
+    ///
+    /// The metadata enables WASM SPA to map HTML elements to BeliefBase nodes:
+    /// - `metadata.document.bid` - Document node BID
+    /// - `metadata.sections[anchor_id]` - Section node BIDs (only for explicit section nodes)
+    ///
+    /// Default implementation returns None (codec doesn't support HTML generation).
+    fn generate_html(&self) -> Result<Option<String>, BuildonomyError> {
+        Ok(None)
+    }
 }
 
 // It is better to express the complexity of the singleton than hide it. Also the CodecMap methods

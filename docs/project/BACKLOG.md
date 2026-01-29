@@ -122,6 +122,41 @@ This file tracks optional enhancements and future work extracted from completed 
 - Consider type aliases for gradual migration
 - **Current Status**: Renames complete, but no migration guide written
 
+## PathMap Multi-Path Query Issue (from Issue 29)
+
+**Priority**: MEDIUM - PathMap queries should work for all asset paths
+
+**Context**: Issue 29 implemented static asset tracking with multi-path support (same content at multiple file paths gets same BID). The WEIGHT_DOC_PATHS relation correctly stores multiple paths, but PathMap queries via `asset_map().get(path)` fail to find the paths.
+
+### Current Behavior
+- Assets with same content correctly get same BID (content-addressed) ✓
+- Multiple paths accumulate in WEIGHT_DOC_PATHS relation ✓
+- Warning: "Setting 2 paths for single relation (expected 1)" appears
+- PathMap construction creates separate entries for each path (lines 854-859 in `paths.rs`) ✓
+- But `asset_map().get("assets/test.png")` returns `None` even when path exists ✗
+
+### Investigation Needed
+1. Verify PathMapMap is being rebuilt after asset events processed into global_bb
+2. Check if asset_namespace node itself is in states (required for PathMap construction)
+3. Verify relations with WEIGHT_DOC_PATHS are correctly indexed into PathMap
+4. Test if issue is specific to asset_namespace or affects all multi-path relations
+5. Consider if PathMap construction needs special handling for multi-path weights
+
+### Workaround
+`asset_manifest` (populated during compilation) provides reliable path→BID queries and is sufficient for Issue 29's requirements (HTML output hardlinking).
+
+### Test Case
+`tests/codec_test.rs::test_multi_path_asset_tracking` currently uses asset_manifest instead of PathMap queries. Update test to use PathMap queries once fixed.
+
+**Status**: Discovered during Issue 29 implementation, deferred as non-blocking for asset tracking functionality.
+
+## Should asset bids really be derived from their hash?
+
+We could put this information into the asset node, that would trigger a node update, which
+downstream consumers would be notified of. It would result in less document churn as well, because
+we wouldn't need to regenerate reference "brefs" all over the place.
+
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

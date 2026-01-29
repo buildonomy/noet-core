@@ -6,7 +6,7 @@ use crate::{
     },
     error::BuildonomyError,
     nodekey::{trim_path_sep, NodeKey},
-    properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind, WEIGHT_DOC_PATH},
+    properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind},
 };
 
 use std::{
@@ -623,16 +623,14 @@ pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
 /// This function searches path components (directory names) for matches against
 /// known schema names from the registry. It looks for the closest/most specific
 /// match by checking each path component.
-pub fn detect_schema_from_path(path: &str) -> Option<&'static str> {
-    use crate::codec::schema_registry::KNOWN_SCHEMAS;
-
+pub fn detect_schema_from_path(path: &str) -> Option<String> {
     // Split path into components and search for matches
     let mut path_components: Vec<&str> = path.split('/').collect();
 
     while let Some(path_part) = path_components.pop() {
         // Check each known schema to see if any of its parts match path components
-        for (dir_name, schema_name) in KNOWN_SCHEMAS {
-            if path_part == *dir_name {
+        for schema_name in SCHEMAS.list_schemas().into_iter() {
+            if path_part == schema_name {
                 return Some(schema_name);
             }
         }
@@ -788,7 +786,7 @@ impl ProtoBeliefNode {
                             path: path_str.clone(),
                         };
                         let mut weight = Weight::default();
-                        weight.set::<String>(WEIGHT_DOC_PATH, path_str).ok();
+                        weight.set_doc_paths(vec![path_str]).ok();
                         proto
                             .upstream
                             .push((node_key, WeightKind::Section, Some(weight)));
@@ -1169,6 +1167,43 @@ impl DocCodec for ProtoBeliefNode {
 
     fn generate_source(&self) -> Option<String> {
         Some(self.document.to_string())
+    }
+
+    fn generate_html(&self) -> Result<Option<String>, BuildonomyError> {
+        // Only generate index.html for Network nodes
+        if !self.kind.contains(BeliefKind::Network) {
+            return Ok(None);
+        }
+
+        // Get network title from document
+        let network_title = self
+            .document
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Network Index");
+
+        // For now, generate a placeholder index.html
+        // The actual document listing will be populated by the compiler
+        // after all documents are parsed, using PathMap to get relative paths
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{}</title>
+  <link rel="stylesheet" href="assets/default-theme.css">
+</head>
+<body>
+  <article>
+    <h1>{}</h1>
+    <p>Network index will be generated after parsing completes.</p>
+  </article>
+</body>
+</html>"#,
+            network_title, network_title
+        );
+
+        Ok(Some(html))
     }
 
     fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError> {

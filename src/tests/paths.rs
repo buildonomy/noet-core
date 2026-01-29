@@ -113,14 +113,11 @@ fn test_parent_reindex_updates_child_order_vectors() {
     let mut grandchild_weights = WeightSet::empty();
     grandchild_weights.set(WeightKind::Section, grandchild_weight);
 
-    let insert_relation_event = BeliefEvent::RelationInsert(
+    let insert_relation_event = BeliefEvent::RelationChange(
         grandchild_bid,
         child3.bid,
         WeightKind::Section,
-        grandchild_weights
-            .get(&WeightKind::Section)
-            .unwrap()
-            .clone(),
+        grandchild_weights.get(&WeightKind::Section).cloned(),
         crate::event::EventOrigin::Remote,
     );
     set.process_event(&insert_relation_event).unwrap();
@@ -268,5 +265,105 @@ fn test_event_driven_pathmap_matches_constructor() {
         paths_event.anchors().len(),
         paths_constructor.anchors().len(),
         "anchors metadata should match"
+    );
+}
+
+#[test]
+fn test_pathmap_multiple_paths_per_relation() {
+    // Create a BeliefBase with a relation that has multiple paths
+    let mut set = create_balanced_test_beliefbase();
+
+    // Get the parent document and child from the balanced set
+    let parent_doc = set
+        .get(&NodeKey::Title {
+            net: Bid::nil(),
+            title: "Parent Document".to_string(),
+        })
+        .unwrap()
+        .clone();
+
+    let child = set
+        .get(&NodeKey::Title {
+            net: Bid::nil(),
+            title: "Child 1".to_string(),
+        })
+        .unwrap()
+        .clone();
+
+    // Update the existing relation with multiple paths (simulating symlinks or multiple references)
+    let mut weight = Weight::default();
+    weight.set(WEIGHT_SORT_KEY, 0u16).unwrap();
+    weight
+        .set_doc_paths(vec![
+            "path_a.txt".to_string(),
+            "sym_link_to_a.txt".to_string(),
+            "another_ref_to_a.txt".to_string(),
+        ])
+        .unwrap();
+
+    // Use RelationChange (not RelationUpdate) so that generate_edge_update merges paths correctly
+    let event = BeliefEvent::RelationChange(
+        child.bid,
+        parent_doc.bid,
+        WeightKind::Section,
+        Some(weight),
+        crate::event::EventOrigin::Remote,
+    );
+    set.process_event(&event).unwrap();
+
+    // Get the network that the parent_doc belongs to
+    let network = set
+        .get(&NodeKey::Title {
+            net: Bid::nil(),
+            title: "Test Network".to_string(),
+        })
+        .unwrap();
+
+    // Get the PathMap for the Test Network (where parent_doc is a member)
+    let paths = set.paths();
+    let path_map = paths.get_map(&network.bid).unwrap();
+
+    // Verify that all three paths exist in the PathMap
+    let child_entries: Vec<_> = path_map
+        .map()
+        .iter()
+        .filter(|(_, bid, _)| *bid == child.bid)
+        .collect();
+
+    assert_eq!(
+        child_entries.len(),
+        3,
+        "PathMap should contain 3 entries for the same child with different paths. Found {} entries",
+        child_entries.len()
+    );
+
+    // Verify each path is unique and contains our expected paths
+    let paths_set: BTreeSet<String> = child_entries.iter().map(|(p, _, _)| (*p).clone()).collect();
+    assert_eq!(
+        paths_set.len(),
+        3,
+        "All three paths should be unique in the PathMap"
+    );
+
+    // Verify the paths contain our expected values (with parent prefix)
+    assert!(
+        paths_set.contains("parent-document/path_a.txt"),
+        "PathMap should contain parent-document/path_a.txt"
+    );
+    assert!(
+        paths_set.contains("parent-document/sym_link_to_a.txt"),
+        "PathMap should contain parent-document/sym_link_to_a.txt"
+    );
+    assert!(
+        paths_set.contains("parent-document/another_ref_to_a.txt"),
+        "PathMap should contain parent-document/another_ref_to_a.txt"
+    );
+
+    // Verify all entries have the same order (since they're from the same relation)
+    let orders: BTreeSet<Vec<u16>> = child_entries.iter().map(|(_, _, o)| (*o).clone()).collect();
+    assert_eq!(
+        orders.len(),
+        1,
+        "All paths for the same relation should have the same order vector"
     );
 }

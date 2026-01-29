@@ -34,7 +34,7 @@ pub enum BeliefEvent {
     /// Source, Sink, WeightSet, EventOrigin)
     RelationUpdate(Bid, Bid, WeightSet, EventOrigin),
     /// Source, Sink, WeightKind, weight_payload, event origin
-    RelationInsert(Bid, Bid, WeightKind, Weight, EventOrigin),
+    RelationChange(Bid, Bid, WeightKind, Option<Weight>, EventOrigin),
     /// Source, Sink relation removed
     RelationRemoved(Bid, Bid, EventOrigin),
     /// A signal that the BeliefBase should be balanced at this point.
@@ -66,8 +66,8 @@ impl PartialEq for BeliefEvent {
                 l0 == r0 && l1 == r1 && l2 == r2 && l3 == r3
             }
             (
-                Self::RelationInsert(l0, l1, l2, l3, l4),
-                Self::RelationInsert(r0, r1, r2, r3, r4),
+                Self::RelationChange(l0, l1, l2, l3, l4),
+                Self::RelationChange(r0, r1, r2, r3, r4),
             ) => l0 == r0 && l1 == r1 && l2 == r2 && l3 == r3 && l4 == r4,
             (Self::RelationRemoved(l0, l1, l2), Self::RelationRemoved(r0, r1, r2)) => {
                 l0 == r0 && l1 == r1 && l2 == r2
@@ -90,7 +90,7 @@ impl BeliefEvent {
             BeliefEvent::PathUpdate(_, _, _, _, origin) => Some(*origin),
             BeliefEvent::PathsRemoved(_, _, origin) => Some(*origin),
             BeliefEvent::RelationUpdate(_, _, _, origin) => Some(*origin),
-            BeliefEvent::RelationInsert(_, _, _, _, origin) => Some(*origin),
+            BeliefEvent::RelationChange(_, _, _, _, origin) => Some(*origin),
             BeliefEvent::RelationRemoved(_, _, origin) => Some(*origin),
             BeliefEvent::BalanceCheck => None,
             BeliefEvent::BuiltInTest => None,
@@ -111,8 +111,8 @@ impl BeliefEvent {
             BeliefEvent::RelationUpdate(s, k, w, _) => {
                 BeliefEvent::RelationUpdate(s, k, w, new_origin)
             }
-            BeliefEvent::RelationInsert(s, k, wk, p, _) => {
-                BeliefEvent::RelationInsert(s, k, wk, p, new_origin)
+            BeliefEvent::RelationChange(s, k, wk, p, _) => {
+                BeliefEvent::RelationChange(s, k, wk, p, new_origin)
             }
             BeliefEvent::RelationRemoved(s, k, _) => BeliefEvent::RelationRemoved(s, k, new_origin),
             BeliefEvent::BalanceCheck => BeliefEvent::BalanceCheck,
@@ -131,7 +131,7 @@ impl Display for BeliefEvent {
             BeliefEvent::PathUpdate(_, _, _, _, _) => write!(f, "PathUpdate"),
             BeliefEvent::PathsRemoved(_, _, _) => write!(f, "PathsRemoved"),
             BeliefEvent::RelationUpdate(_, _, _, _) => write!(f, "RelationUpdate"),
-            BeliefEvent::RelationInsert(_, _, _, _, _) => write!(f, "RelationInsert"),
+            BeliefEvent::RelationChange(_, _, _, _, _) => write!(f, "RelationChange"),
             BeliefEvent::RelationRemoved(_, _, _) => write!(f, "RelationRemoved"),
             BeliefEvent::BalanceCheck => write!(f, "BalanceCheck"),
             BeliefEvent::BuiltInTest => write!(f, "BuiltInTest"),

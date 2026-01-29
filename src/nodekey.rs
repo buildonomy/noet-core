@@ -18,7 +18,7 @@ uniffi::custom_type!(Url, String, {
 
 use crate::{
     beliefbase::BeliefBase,
-    properties::{href_namespace, Bid, Bref},
+    properties::{asset_namespace, href_namespace, Bid, Bref},
     query::{BeliefSource, Expression, StatePred},
     BuildonomyError,
 };
@@ -88,27 +88,38 @@ impl NodeKey {
                 net: link_base,
                 path: link_path,
             } => {
-                if *link_base == Bid::nil() {
-                    let mut regularized_path = PathBuf::from(home_doc_path);
+                // First, handle relative path resolution for all networks
+                let resolved_path = if link_path.starts_with("./") || link_path.starts_with("../") {
+                    // Relative path - convert to absolute
+                    let mut regularized_path = PathBuf::from(&home_doc_path);
                     if regularized_path.extension().is_some() && !link_path.starts_with('#') {
                         // Pop off Document names from home_path before joining.
                         regularized_path.pop();
                     }
-                    let full_path = if link_path.starts_with('#') {
-                        format!("{}{}", regularized_path.to_string_lossy(), link_path)
-                    } else {
-                        clean_path(regularized_path.join(link_path))
-                            .to_string_lossy()
-                            .to_string()
-                    };
+                    clean_path(regularized_path.join(link_path))
+                        .to_string_lossy()
+                        .to_string()
+                } else if link_path.starts_with('#') {
+                    // Fragment/anchor path - prepend home path
+                    let regularized_path = PathBuf::from(&home_doc_path);
+                    format!("{}{}", regularized_path.to_string_lossy(), link_path)
+                } else {
+                    // Already absolute or network-relative
+                    link_path.to_string()
+                };
+
+                // Now handle network-specific logic
+                if *link_base == Bid::nil() {
+                    // Nil network - use home network
                     NodeKey::Path {
                         net: home_net,
-                        path: full_path,
+                        path: resolved_path,
                     }
                 } else {
+                    // Non-nil network - keep as Path with resolved path
                     NodeKey::Path {
                         net: *link_base,
-                        path: link_path.to_string(),
+                        path: resolved_path,
                     }
                 }
             }
@@ -474,10 +485,28 @@ impl FromStr for NodeKey {
 
         // Check for path-like patterns
         if !s.contains(char::is_whitespace) {
+            // Helper to determine network based on file extension
+            let path_network = |path: &str| -> Bid {
+                use crate::codec::CODECS;
+                use std::path::Path;
+
+                // Check if this is a static asset (non-parsable file)
+                if let Some(ext) = Path::new(path).extension() {
+                    let ext_str = ext.to_string_lossy().to_lowercase();
+                    // If extension is NOT registered in CODECS, it's a static asset
+                    if !CODECS.extensions().contains(&ext_str) {
+                        return asset_namespace();
+                    }
+                }
+                // Default to nil (home network) for parsable documents or no extension
+                nil
+            };
+
             // Relative paths with ./ or ../
             if s.starts_with("./") || s.starts_with("../") {
+                let net = path_network(s);
                 return Ok(NodeKey::Path {
-                    net: nil,
+                    net,
                     path: s.to_string(),
                 });
             }
@@ -496,8 +525,9 @@ impl FromStr for NodeKey {
                 while rel_link.starts_with('/') {
                     rel_link = &rel_link[1..];
                 }
+                let net = path_network(rel_link);
                 return Ok(NodeKey::Path {
-                    net: nil,
+                    net,
                     path: rel_link.to_string(),
                 });
             } else {

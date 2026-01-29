@@ -99,6 +99,12 @@ pub const UUID_NAMESPACE_HREF: Uuid = Uuid::from_bytes([
     0x5b, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
 ]);
 
+/// The 'asset' namespace UUID. This is used to create a universal network location for tracking
+/// assets (images, CSS, fonts, etc.) referenced within source documents.
+pub const UUID_NAMESPACE_ASSET: Uuid = Uuid::from_bytes([
+    0x4b, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
+]);
+
 #[uniffi::export]
 pub fn buildonomy_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_BUILDONOMY)
@@ -107,6 +113,11 @@ pub fn buildonomy_namespace() -> Bid {
 #[uniffi::export]
 pub fn href_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_HREF)
+}
+
+#[uniffi::export]
+pub fn asset_namespace() -> Bid {
+    Bid::from(UUID_NAMESPACE_ASSET)
 }
 
 /// Generate a versioned API BID within the Buildonomy namespace
@@ -134,6 +145,30 @@ pub fn buildonomy_api_bid(version: &str) -> Bid {
     // This makes the BID detectable as reserved while keeping it deterministic
     let mut bytes = *uuid.as_bytes();
     bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes());
+
+    Bid(Uuid::from_bytes(bytes))
+}
+
+pub fn buildonomy_asset_bid(hash_str: &str) -> Bid {
+    // Generate a UUID v5 for deterministic versioning
+    let uuid = Uuid::new_v5(&UUID_NAMESPACE_ASSET, hash_str.as_bytes());
+
+    // Replace octets 10-15 with Buildonomy namespace bytes
+    // This makes the BID detectable as reserved while keeping it deterministic
+    let mut bytes = *uuid.as_bytes();
+    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_ASSET).parent_namespace_bytes());
+
+    Bid(Uuid::from_bytes(bytes))
+}
+
+pub fn buildonomy_href_bid(hash_str: &str) -> Bid {
+    // Generate a UUID v5 for deterministic versioning
+    let uuid = Uuid::new_v5(&UUID_NAMESPACE_HREF, hash_str.as_bytes());
+
+    // Replace octets 10-15 with Buildonomy namespace bytes
+    // This makes the BID detectable as reserved while keeping it deterministic
+    let mut bytes = *uuid.as_bytes();
+    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_HREF).parent_namespace_bytes());
 
     Bid(Uuid::from_bytes(bytes))
 }
@@ -402,7 +437,7 @@ pub enum BeliefKind {
     /// A Handle to source material that encodes one or more beliefs
     Document,
     /// Denotes that the Bid wraps an external reference -- it is a link to a source we don't have
-    /// native read/write access to.
+    /// native parsing capability for (no read/write access, binary format, external api, etc.).
     External,
     /// Marks a node whose relations are partially loaded, enabling partial hypergraph loading while
     /// maintaining structural integrity. When a node has BeliefKind::Trace, it signals that the
@@ -454,6 +489,11 @@ impl BeliefKindSet {
     /// Defines if this node is colored as containing complete content and relationships
     pub fn is_complete(&self) -> bool {
         !self.0.contains(BeliefKind::Trace)
+    }
+
+    /// Defines if this node is colored as external to our read/write authority
+    pub fn is_external(&self) -> bool {
+        self.0.contains(BeliefKind::External)
     }
 }
 
@@ -507,8 +547,12 @@ pub const WEIGHT_OWNED_BY: &str = "owned_by";
 /// Key for storing sort/index value in Weight payload (typically for Subsection relationships)
 pub const WEIGHT_SORT_KEY: &str = "sort_key";
 
-/// Key for storing document path in Weight payload
+/// Key for storing document path in Weight payload (deprecated - use WEIGHT_DOC_PATHS)
+#[deprecated(since = "0.1.0", note = "Use WEIGHT_DOC_PATHS instead")]
 pub const WEIGHT_DOC_PATH: &str = "doc_path";
+
+/// Key for storing document paths in Weight payload (supports multiple paths per relation)
+pub const WEIGHT_DOC_PATHS: &str = "doc_paths";
 
 impl Weight {
     pub fn full() -> Weight {
@@ -540,6 +584,37 @@ impl Weight {
     /// Check if payload contains a key
     pub fn contains_key(&self, key: &str) -> bool {
         self.payload.contains_key(key)
+    }
+
+    /// Get document paths with backward compatibility.
+    /// Tries WEIGHT_DOC_PATHS first (Vec<String>), falls back to WEIGHT_DOC_PATH (String).
+    /// Returns empty vec if neither is present.
+    pub fn get_doc_paths(&self) -> Vec<String> {
+        // Try new format first
+        if let Some(paths) = self.get::<Vec<String>>(WEIGHT_DOC_PATHS) {
+            return paths;
+        }
+
+        // Fall back to old format
+        #[allow(deprecated)]
+        if let Some(path) = self.get::<String>(WEIGHT_DOC_PATH) {
+            return vec![path];
+        }
+
+        vec![]
+    }
+
+    /// Set document paths (always uses new WEIGHT_DOC_PATHS format).
+    /// Warns if setting more than 1 path (unusual case).
+    pub fn set_doc_paths(&mut self, paths: Vec<String>) -> Result<(), toml::ser::Error> {
+        if paths.len() > 1 {
+            tracing::warn!(
+                "Setting {} paths for single relation (expected 1). Paths: {:?}",
+                paths.len(),
+                paths
+            );
+        }
+        self.set(WEIGHT_DOC_PATHS, paths)
     }
 }
 
@@ -745,6 +820,10 @@ impl WeightSet {
         self.weights.insert(kind, weight);
     }
 
+    pub fn remove(&mut self, kind: &WeightKind) -> Option<Weight> {
+        self.weights.remove(kind)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.weights.is_empty()
     }
@@ -903,6 +982,27 @@ impl BeliefNode {
             // API node is _always_ also a Trace, as we never can assume we have all api relations
             kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
             id: Some("buildonomy_href_network".to_string()),
+        }
+    }
+
+    /// Creates a BeliefNode for the asset tracking network
+    pub fn asset_network() -> BeliefNode {
+        let mut table = Table::new();
+        table.insert(
+            "api".to_string(),
+            Value::String(buildonomy_namespace().to_string()),
+        );
+        BeliefNode {
+            bid: asset_namespace(),
+            title: format!(
+                "Buildonomy asset tracking network v{}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            schema: Some("api".to_string()),
+            payload: table,
+            // Asset network is always a Trace as we track external resources
+            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
+            id: Some("buildonomy_asset_network".to_string()),
         }
     }
 
@@ -1415,8 +1515,8 @@ mod tests {
 
         let mut table = toml::value::Table::new();
         table.insert(
-            WEIGHT_DOC_PATH.to_string(),
-            toml::Value::String("path1".to_string()),
+            WEIGHT_DOC_PATHS.to_string(),
+            toml::Value::Array(vec![toml::Value::String("path1".to_string())]),
         );
         let mut weight2 = Weight { payload: table };
         weight2.set(WEIGHT_SORT_KEY, 2u16).ok();
@@ -1478,7 +1578,84 @@ mod tests {
         let diff_ws_path = diff_ws
             .weights
             .get(&WeightKind::Section)
-            .filter(|w| w.get(WEIGHT_DOC_PATH) == Some("path1".to_string()));
+            .filter(|w| w.get_doc_paths() == vec!["path1".to_string()]);
         assert!(diff_ws_path.is_some());
+    }
+
+    #[test]
+    fn test_weight_doc_paths() {
+        // Test new format
+        let mut weight = Weight::default();
+        weight
+            .set_doc_paths(vec!["path1".to_string(), "path2".to_string()])
+            .unwrap();
+        assert_eq!(
+            weight.get_doc_paths(),
+            vec!["path1".to_string(), "path2".to_string()]
+        );
+
+        // Test backward compatibility - reading old format
+        let mut old_weight = Weight::default();
+        #[allow(deprecated)]
+        old_weight
+            .set(WEIGHT_DOC_PATH, "old_path".to_string())
+            .unwrap();
+        assert_eq!(old_weight.get_doc_paths(), vec!["old_path".to_string()]);
+
+        // Test empty case
+        let empty_weight = Weight::default();
+        assert_eq!(empty_weight.get_doc_paths(), Vec::<String>::new());
+
+        // Test single path (common case - should not warn in test, but would in production)
+        let mut single_weight = Weight::default();
+        single_weight
+            .set_doc_paths(vec!["single_path".to_string()])
+            .unwrap();
+        assert_eq!(
+            single_weight.get_doc_paths(),
+            vec!["single_path".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_weight_doc_paths_multiple() {
+        // Test setting multiple paths (e.g., for assets referenced from multiple locations)
+        let mut weight = Weight::default();
+        let paths = vec![
+            "images/logo.png".to_string(),
+            "guide/../images/logo.png".to_string(),
+            "docs/assets/logo.png".to_string(),
+        ];
+        weight.set_doc_paths(paths.clone()).unwrap();
+        assert_eq!(weight.get_doc_paths(), paths);
+
+        // Test that get_doc_paths returns empty vec when no paths are set
+        let empty_weight = Weight::default();
+        assert!(empty_weight.get_doc_paths().is_empty());
+
+        // Test backward compatibility: old format should convert to vec
+        let mut old_format_weight = Weight::default();
+        #[allow(deprecated)]
+        old_format_weight
+            .set(WEIGHT_DOC_PATH, "old/path.md".to_string())
+            .unwrap();
+        assert_eq!(
+            old_format_weight.get_doc_paths(),
+            vec!["old/path.md".to_string()]
+        );
+
+        // Test that new format takes precedence over old format if both exist
+        let mut mixed_weight = Weight::default();
+        #[allow(deprecated)]
+        mixed_weight
+            .set(WEIGHT_DOC_PATH, "old_path.md".to_string())
+            .unwrap();
+        mixed_weight
+            .set_doc_paths(vec!["new_path1.md".to_string(), "new_path2.md".to_string()])
+            .unwrap();
+        assert_eq!(
+            mixed_weight.get_doc_paths(),
+            vec!["new_path1.md".to_string(), "new_path2.md".to_string()]
+        );
     }
 }

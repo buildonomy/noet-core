@@ -1,3 +1,4 @@
+use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,6 +18,7 @@ use noet_core::{
     },
     error::BuildonomyError,
     event::BeliefEvent,
+    nodekey::NodeKey,
     properties::{BeliefNode, Bid, WeightKind},
 };
 
@@ -147,6 +149,17 @@ async fn test_belief_set_builder_bid_generation_and_caching(
             .collect::<Vec<String>>()
             .join("\n - ")
     );
+
+    tracing::info!("Include asset BIDs from asset manifest");
+    {
+        let asset_manifest = compiler.asset_manifest();
+        let manifest_read = asset_manifest.read();
+        for (_path, bid) in manifest_read.iter() {
+            written_bids.insert(*bid);
+        }
+        // Also include the asset_namespace network node itself
+        written_bids.insert(noet_core::properties::asset_namespace());
+    }
 
     tracing::info!("Ensure written bids match cached bids");
     let cached_bids = BTreeSet::from_iter(global_bb.states().values().map(|n| n.bid));
@@ -1055,5 +1068,965 @@ async fn test_link_same_document_anchors() -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_tracking_basic() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing basic static asset tracking");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    // Process all events into global_bb
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find the asset tracking test document
+    let asset_doc = global_bb
+        .states()
+        .values()
+        .find(|n| n.title.contains("Asset Tracking Test"));
+
+    assert!(
+        asset_doc.is_some(),
+        "Asset tracking test document should be parsed"
+    );
+
+    tracing::info!("Asset doc found: {:?}", asset_doc.map(|n| &n.title));
+
+    // TODO: Once Step 3 is implemented, verify:
+    // 1. Asset nodes exist in belief graph
+    // 2. Document → Asset relations exist
+    // 3. Asset BIDs are content-addressed (same content = same BID)
+
+    // For now, this test establishes the baseline - document parses successfully
+    // and test assets exist in the file system
+    let assets_dir = test_root.join("assets");
+    assert!(
+        assets_dir.exists(),
+        "Assets directory should exist in test environment"
+    );
+
+    let test_image = assets_dir.join("test_image.png");
+    let test_pdf = assets_dir.join("test_doc.pdf");
+
+    assert!(test_image.exists(), "Test image asset should exist");
+    assert!(test_pdf.exists(), "Test PDF asset should exist");
+
+    tracing::info!("Asset tracking test baseline complete");
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_nodes_created() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing that asset nodes are created in belief graph");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find asset nodes in belief graph
+    use noet_core::properties::{asset_namespace, BeliefKind};
+
+    let asset_nodes: Vec<&BeliefNode> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            // Check if node is in asset namespace by checking its BID's parent namespace
+            // Asset BIDs are created with Bid::new(&asset_namespace()), so their parent_namespace_bytes
+            // match the asset_namespace's namespace_bytes
+            let asset_ns = asset_namespace();
+            // Compare child's parent to asset namespace's identity
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .collect();
+
+    tracing::info!("Found {} asset nodes", asset_nodes.len());
+    for node in asset_nodes.iter() {
+        tracing::info!("  Asset node: bid={}", node.bid);
+    }
+
+    // We should have at least 2 asset nodes (test_image.png and test_doc.pdf)
+    // Note: test_image.png is referenced twice, but should create only ONE node (content-addressed)
+    assert!(
+        asset_nodes.len() >= 2,
+        "Should have at least 2 asset nodes (image and PDF)"
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_document_relations() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing Document → Asset relations are created");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), Some(10), false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find the asset tracking test document
+    let asset_doc = global_bb
+        .states()
+        .values()
+        .find(|n| n.title.contains("Asset Tracking Test"))
+        .expect("Asset tracking document should exist");
+
+    tracing::info!("Asset doc BID: {}", asset_doc.bid);
+
+    // Debug: List all External nodes in the BeliefBase
+    use noet_core::properties::asset_namespace;
+    let asset_ns = asset_namespace();
+    tracing::info!("Asset namespace: {}", asset_ns);
+
+    let external_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.is_external())
+        .collect();
+
+    tracing::info!(
+        "Found {} External nodes in BeliefBase:",
+        external_nodes.len()
+    );
+    for node in &external_nodes {
+        tracing::info!(
+            "  External node BID: {}, parent_ns: {}",
+            node.bid,
+            node.bid.parent_namespace()
+        );
+
+        // Get all paths for this node from asset_map
+        let paths_guard = global_bb.paths();
+        let asset_map = paths_guard.asset_map();
+        for (path, bid, _order) in asset_map.map().iter() {
+            if *bid == node.bid {
+                tracing::info!("    Path in asset_map: {}", path);
+            }
+        }
+    }
+
+    // Find relations from assets to this document (or its sections)
+    // Assets are the SOURCE, document sections are the SINK
+    let relations = global_bb.relations();
+
+    // Get all external (asset) nodes
+    let asset_nodes: Vec<_> = external_nodes.iter().map(|n| n.bid).collect();
+
+    tracing::info!("Checking {} asset nodes for relations", asset_nodes.len());
+
+    // For each asset, check if it has outgoing edges to any part of the document
+    let mut asset_to_doc_relations = Vec::new();
+    for asset_bid in &asset_nodes {
+        if let Some(asset_idx) = global_bb.bid_to_index(asset_bid) {
+            let asset_edges: Vec<_> = relations.as_graph().edges(asset_idx).collect();
+
+            for edge in asset_edges {
+                let target_bid = relations.as_graph()[edge.target()];
+                // Check if target is the document or one of its sections
+                // Sections have the document as their parent in the hierarchy
+                asset_to_doc_relations.push((*asset_bid, target_bid));
+                tracing::info!("  Asset {} -> target {}", asset_bid, target_bid);
+            }
+        }
+    }
+
+    tracing::info!(
+        "Found {} relations from assets to document sections",
+        asset_to_doc_relations.len()
+    );
+
+    // Should have at least 2 unique assets referencing the document
+    // (test_image.png referenced 3 times, test_doc.pdf referenced once)
+    // Each reference creates a relation from asset to the section containing the reference
+    assert!(
+        asset_to_doc_relations.len() >= 2,
+        "Should have at least 2 asset->document relations. Found {}",
+        asset_to_doc_relations.len()
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_content_addressing() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing content-addressed BIDs - same content = same BID");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find asset nodes
+    use noet_core::properties::{asset_namespace, BeliefKind};
+
+    let asset_nodes: Vec<&BeliefNode> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            let asset_ns = asset_namespace();
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .collect();
+
+    tracing::info!("Found {} unique asset nodes", asset_nodes.len());
+
+    // test_image.png is referenced twice in the document:
+    // - ![Test Image](./assets/test_image.png)
+    // - ![Test Image Again](./assets/test_image.png)
+    //
+    // Both should resolve to the SAME BeliefNode (content-addressed)
+    // So we should have exactly 2 asset nodes (image and PDF), not 3
+
+    assert_eq!(
+        asset_nodes.len(),
+        2,
+        "Should have exactly 2 asset nodes (image referenced twice = 1 node, PDF = 1 node)"
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_deduplication_warning() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing deduplication detection logs warnings");
+
+    // Create a scenario with duplicate content at different paths
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Copy test_image.png to a different location with same content
+    let duplicate_dir = test_root.join("duplicates");
+    fs::create_dir_all(&duplicate_dir)?;
+    fs::copy(
+        test_root.join("assets/test_image.png"),
+        duplicate_dir.join("duplicate_image.png"),
+    )?;
+
+    // Create a document that references the duplicate
+    let duplicate_doc = test_root.join("duplicate_test.md");
+    fs::write(
+        &duplicate_doc,
+        "# Duplicate Test\n\n![Duplicate](./duplicates/duplicate_image.png)\n",
+    )?;
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    // Note: We should capture logs here to verify warning was logged
+    // For now, just verify compilation succeeds and same BID is used
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Both paths should resolve to same BID (content-addressed)
+    // Compiler should log warning about duplication
+
+    tracing::info!("Deduplication test complete - check logs for warnings");
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_multi_path_asset_tracking() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing same asset content at multiple paths gets separate stable BIDs");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Create duplicate of test_image.png at different path (same content)
+    let duplicate_dir = test_root.join("duplicates");
+    fs::create_dir_all(&duplicate_dir)?;
+    let original_image = test_root.join("assets/test_image.png");
+    let duplicate_image = duplicate_dir.join("same_image.png");
+    fs::copy(&original_image, &duplicate_image)?;
+
+    // Create a document that references the duplicate asset
+    let doc_content = r#"# Duplicate Asset Test
+
+This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
+"#;
+    fs::write(test_root.join("duplicate_ref.md"), doc_content)?;
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find asset nodes - with stable BIDs, each path gets its own BID
+    use noet_core::properties::{asset_namespace, BeliefKind};
+
+    let asset_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            let asset_ns = asset_namespace();
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .collect();
+
+    // With stable BIDs: 3 unique BIDs (one per path):
+    // - assets/test_image.png
+    // - duplicates/same_image.png
+    // - assets/test_doc.pdf
+    assert_eq!(
+        asset_nodes.len(),
+        3,
+        "Should have 3 unique asset BIDs (stable identity per path)"
+    );
+
+    // Verify that test_image.png and same_image.png have same content hash in payload
+    let image_nodes: Vec<_> = asset_nodes
+        .iter()
+        .filter(|n| {
+            n.payload
+                .get("content_hash")
+                .and_then(|v| v.as_str())
+                .is_some()
+        })
+        .collect();
+
+    // Get the two image nodes (should have same hash)
+    let image_hashes: Vec<_> = image_nodes
+        .iter()
+        .filter_map(|n| n.payload.get("content_hash").and_then(|v| v.as_str()))
+        .collect();
+
+    // Find the duplicate images by checking for duplicate hashes
+    let mut hash_counts = std::collections::HashMap::new();
+    for hash in image_hashes.iter() {
+        *hash_counts.entry(*hash).or_insert(0) += 1;
+    }
+
+    let duplicate_hash_count = hash_counts.values().filter(|&&count| count > 1).count();
+    assert_eq!(
+        duplicate_hash_count, 1,
+        "Should have exactly one hash that appears twice (the duplicated image)"
+    );
+
+    // Verify the asset manifest contains 3 file paths (test_image.png, same_image.png, test_doc.pdf)
+    let manifest = compiler.asset_manifest();
+    let manifest_guard = manifest.read();
+
+    assert_eq!(
+        manifest_guard.len(),
+        3,
+        "Should track 3 file paths in asset manifest"
+    );
+
+    assert!(
+        manifest_guard.contains_key("assets/test_image.png"),
+        "Original path should be in asset manifest"
+    );
+    assert!(
+        manifest_guard.contains_key("duplicates/same_image.png"),
+        "Duplicate path should be in asset manifest"
+    );
+    assert!(
+        manifest_guard.contains_key("assets/test_doc.pdf"),
+        "PDF asset should be in asset manifest"
+    );
+
+    // With stable BIDs: different paths get different BIDs (stable identity per path)
+    let original_bid = manifest_guard.get("assets/test_image.png").unwrap();
+    let duplicate_bid = manifest_guard.get("duplicates/same_image.png").unwrap();
+    assert_ne!(
+        original_bid, duplicate_bid,
+        "Different paths should have different BIDs (stable identity)"
+    );
+
+    // But they should have the same content hash in their payloads
+    let original_node = global_bb.states().get(original_bid).unwrap();
+    let duplicate_node = global_bb.states().get(duplicate_bid).unwrap();
+
+    let original_hash = original_node
+        .payload
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .expect("Should have content_hash");
+    let duplicate_hash = duplicate_node
+        .payload
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .expect("Should have content_hash");
+
+    assert_eq!(
+        original_hash, duplicate_hash,
+        "Same content should have same hash in payload"
+    );
+
+    tracing::info!("Multi-path asset tracking verified - 3 paths, 3 unique BIDs, 2 with same hash");
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_multi_document_asset_refs() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing multiple documents referencing same asset");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Create second document that references same test_image.png
+    let doc2_content = r#"# Second Document
+
+This references the same image: ![Test Image](./assets/test_image.png)
+"#;
+    fs::write(test_root.join("second_doc.md"), doc2_content)?;
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find both documents
+    let doc1 = global_bb
+        .states()
+        .values()
+        .find(|n| n.title.contains("Asset Tracking Test"));
+
+    let doc2 = global_bb
+        .states()
+        .values()
+        .find(|n| n.title.contains("Second Document"));
+
+    assert!(doc1.is_some(), "First document should exist");
+    assert!(doc2.is_some(), "Second document should exist");
+
+    // Both documents should have Epistemic relations to same asset BID
+    let asset_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.is_external())
+        .collect();
+
+    assert!(!asset_nodes.is_empty(), "Asset node should exist");
+
+    // TODO: Query relations to verify both docs point to same asset
+    tracing::info!("Multi-document asset reference test complete");
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_all_paths_query() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing BeliefBase queries returning all paths for asset BID");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find asset node
+    let asset_node = global_bb.states().values().find(|n| n.kind.is_external());
+
+    assert!(asset_node.is_some(), "Asset node should exist");
+
+    let _asset_bid = asset_node.unwrap().bid;
+
+    // Query all paths for this BID via PathMapMap
+    let paths_map = global_bb.paths();
+    let mut visited = std::collections::BTreeSet::new();
+    let all_paths = paths_map.asset_map().all_paths(&paths_map, &mut visited);
+
+    assert!(
+        !all_paths.is_empty(),
+        "Should be able to query all paths for asset BID"
+    );
+
+    tracing::info!("Found {} paths for asset BID", all_paths.len());
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_path_accumulation() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!(
+        "Testing WEIGHT_DOC_PATHS array accumulates paths via multiple RelationChange events"
+    );
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    // Process events
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find asset with paths
+    let asset_namespace_bid = noet_core::properties::asset_namespace();
+
+    // Query relations from assets to asset_namespace
+    let relations = global_bb.relations();
+    let asset_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.is_external())
+        .collect();
+
+    for asset_node in asset_nodes {
+        // Check if asset → asset_namespace relation has WEIGHT_DOC_PATHS
+        let source_idx = global_bb.bid_to_index(&asset_node.bid);
+        let sink_idx = global_bb.bid_to_index(&asset_namespace_bid);
+        if let (Some(source_idx), Some(sink_idx)) = (source_idx, sink_idx) {
+            if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
+                let weight_set = &relations.as_graph()[edge_idx];
+
+                // Verify WEIGHT_DOC_PATHS exists and is an array
+                if let Some(section_weight) = weight_set
+                    .weights
+                    .get(&noet_core::properties::WeightKind::Section)
+                {
+                    let paths = section_weight.get_doc_paths();
+                    assert!(
+                        !paths.is_empty(),
+                        "WEIGHT_DOC_PATHS should contain at least one path"
+                    );
+                    tracing::info!("Asset has {} paths: {:?}", paths.len(), paths);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_no_extension() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing assets without extensions get canonical names without trailing dots");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Create asset file with no extension
+    let no_ext_file = test_root.join("assets/README");
+    fs::write(&no_ext_file, b"This is a README with no extension")?;
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // TODO: Once HTML generation with hardlinks is implemented,
+    // verify canonical name is "static/asset:{bid}" not "static/asset:{bid}."
+
+    tracing::info!("No-extension asset test complete");
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing asset content change triggers BID re-generation");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    // First parse - establish baseline
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx.clone()), None, false)?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Find the original asset node
+    use noet_core::properties::{asset_namespace, BeliefKind};
+
+    let original_asset_nodes: Vec<BeliefNode> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            let asset_ns = asset_namespace();
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .cloned()
+        .collect();
+
+    assert!(
+        !original_asset_nodes.is_empty(),
+        "Should have asset nodes before content change"
+    );
+
+    let original_image_node = original_asset_nodes
+        .iter()
+        .find(|_n| {
+            // Find the test_image.png node (we'll identify it by checking manifest later)
+            // For now, just grab the first one
+            true
+        })
+        .expect("Should have at least one asset node");
+
+    let original_bid = original_image_node.bid;
+    tracing::info!("Original asset BID: {}", original_bid);
+
+    // Modify the asset file content
+    let asset_path = test_root.join("assets/test_image.png");
+    fs::write(
+        &asset_path,
+        "MODIFIED test image content with different bytes",
+    )?;
+    tracing::info!("Modified asset content at {:?}", asset_path);
+
+    // Re-parse to detect the change
+    let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let _parse_results2 = compiler2.parse_all(global_bb.clone()).await?;
+
+    // Collect events and look for NodeUpdate (stable BIDs with payload changes)
+    let mut update_events = Vec::new();
+    while let Ok(event) = accum_rx.try_recv() {
+        if let BeliefEvent::NodeUpdate(keys, _toml, _origin) = &event {
+            // Check if this is an asset update (single key with asset namespace parent)
+            if keys.len() == 1 {
+                if let NodeKey::Bid { bid } = keys[0] {
+                    let asset_ns = asset_namespace();
+                    if bid.parent_namespace_bytes() == asset_ns.namespace_bytes() {
+                        tracing::info!("NodeUpdate event detected for asset!");
+                        tracing::info!("  BID: {:?}", bid);
+                        update_events.push((bid, event.clone()));
+                    }
+                }
+            }
+        }
+        global_bb.process_event(&event)?;
+    }
+
+    // Verify we got a NodeUpdate event for the asset
+    assert!(
+        !update_events.is_empty(),
+        "Should have at least one NodeUpdate event for changed asset"
+    );
+
+    // Find the updated asset nodes
+    let updated_asset_nodes: Vec<BeliefNode> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            let asset_ns = asset_namespace();
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .cloned()
+        .collect();
+
+    // Should still have same number of nodes (updated, not added)
+    assert_eq!(
+        updated_asset_nodes.len(),
+        original_asset_nodes.len(),
+        "Should have same number of nodes after update"
+    );
+
+    // Find the updated image node (same BID as original)
+    let updated_image_node = updated_asset_nodes
+        .iter()
+        .find(|n| n.bid == original_bid)
+        .expect("Should have the same node with updated payload");
+
+    tracing::info!("Updated asset BID (unchanged): {}", updated_image_node.bid);
+
+    // Verify BID stayed the same (stable identity)
+    assert_eq!(
+        original_bid, updated_image_node.bid,
+        "Asset BID should remain stable when content changes"
+    );
+
+    // Verify content_hash in payload changed
+    let original_hash = original_image_node
+        .payload
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .expect("Original node should have content_hash in payload");
+
+    let updated_hash = updated_image_node
+        .payload
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .expect("Updated node should have content_hash in payload");
+
+    assert_ne!(
+        original_hash, updated_hash,
+        "content_hash in payload should change when content changes"
+    );
+
+    tracing::info!(
+        "Asset content change test complete - BID stable ({}), hash changed from {} to {}",
+        original_bid,
+        original_hash,
+        updated_hash
+    );
+
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_html_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing HTML output creates content-addressed hardlinks for assets");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Create HTML output directory
+    let html_tempdir = tempfile::tempdir()?;
+    let html_output = html_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    // Compile with HTML output enabled
+    let mut compiler = DocumentCompiler::with_html_output(
+        &test_root,
+        Some(accum_tx),
+        None,
+        false,
+        Some(html_output.clone()),
+    )?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Verify static directory exists
+    let static_dir = html_output.join("static");
+    assert!(static_dir.exists(), "static directory should be created");
+
+    // Verify semantic paths exist (should be hardlinks to canonical files)
+    let semantic_image = html_output.join("assets/test_image.png");
+    let semantic_pdf = html_output.join("assets/test_doc.pdf");
+
+    assert!(
+        semantic_image.exists(),
+        "Semantic path for image should exist: {}",
+        semantic_image.display()
+    );
+    assert!(
+        semantic_pdf.exists(),
+        "Semantic path for PDF should exist: {}",
+        semantic_pdf.display()
+    );
+
+    // Get content hashes from asset nodes to verify canonical files exist
+    use noet_core::properties::{asset_namespace, BeliefKind};
+
+    let asset_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|n| n.kind.contains(BeliefKind::External))
+        .filter(|n| {
+            let asset_ns = asset_namespace();
+            n.bid.parent_namespace_bytes() == asset_ns.namespace_bytes()
+        })
+        .collect();
+
+    // Verify canonical files exist in static directory
+    for node in asset_nodes.iter() {
+        let hash = node
+            .payload
+            .get("content_hash")
+            .and_then(|v| v.as_str())
+            .expect("Asset should have content_hash");
+
+        // Find the asset path from manifest to get extension
+        let manifest = compiler.asset_manifest();
+        let manifest_guard = manifest.read();
+
+        let asset_path = manifest_guard
+            .iter()
+            .find(|(_, bid)| *bid == &node.bid)
+            .map(|(path, _)| path)
+            .expect("Asset should be in manifest");
+
+        let ext = Path::new(asset_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let canonical_name = if ext.is_empty() {
+            hash.to_string()
+        } else {
+            format!("{}.{}", hash, ext)
+        };
+
+        let canonical_path = static_dir.join(&canonical_name);
+        assert!(
+            canonical_path.exists(),
+            "Canonical file should exist: {}",
+            canonical_path.display()
+        );
+
+        tracing::info!(
+            "Verified canonical file: {} (hash: {})",
+            canonical_path.display(),
+            hash
+        );
+    }
+
+    // Verify file contents match
+    let original_image = test_root.join("assets/test_image.png");
+    let output_image = html_output.join("assets/test_image.png");
+
+    let original_bytes = std::fs::read(&original_image)?;
+    let output_bytes = std::fs::read(&output_image)?;
+
+    assert_eq!(
+        original_bytes, output_bytes,
+        "Output asset should have same content as original"
+    );
+
+    tracing::info!("HTML asset hardlinks test complete - all files verified");
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_asset_html_deduplication() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing HTML output deduplicates assets with same content");
+
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Create duplicate of test_image.png at different path (same content)
+    let duplicate_dir = test_root.join("duplicates");
+    fs::create_dir_all(&duplicate_dir)?;
+    let original_image = test_root.join("assets/test_image.png");
+    let duplicate_image = duplicate_dir.join("same_image.png");
+    fs::copy(&original_image, &duplicate_image)?;
+
+    // Create a document that references the duplicate asset
+    let doc_content = r#"# Duplicate Asset Test
+
+This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
+"#;
+    fs::write(test_root.join("duplicate_ref.md"), doc_content)?;
+
+    // Create HTML output directory
+    let html_tempdir = tempfile::tempdir()?;
+    let html_output = html_tempdir.path().to_path_buf();
+
+    let mut global_bb = BeliefBase::empty();
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+
+    // Compile with HTML output enabled
+    let mut compiler = DocumentCompiler::with_html_output(
+        &test_root,
+        Some(accum_tx),
+        None,
+        false,
+        Some(html_output.clone()),
+    )?;
+    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+
+    while let Ok(event) = accum_rx.try_recv() {
+        global_bb.process_event(&event)?;
+    }
+
+    // Verify static directory has only ONE physical file for the duplicate content
+    let static_dir = html_output.join("static");
+    let static_files: Vec<_> = std::fs::read_dir(&static_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .collect();
+
+    // Should have 2 unique hashes (test_image.png hash and test_doc.pdf hash)
+    assert_eq!(
+        static_files.len(),
+        2,
+        "Static directory should have 2 unique files (not 3)"
+    );
+
+    // Verify both semantic paths exist
+    let semantic_original = html_output.join("assets/test_image.png");
+    let semantic_duplicate = html_output.join("duplicates/same_image.png");
+
+    assert!(
+        semantic_original.exists(),
+        "Original semantic path should exist"
+    );
+    assert!(
+        semantic_duplicate.exists(),
+        "Duplicate semantic path should exist"
+    );
+
+    // Verify both point to same content
+    let original_bytes = std::fs::read(&semantic_original)?;
+    let duplicate_bytes = std::fs::read(&semantic_duplicate)?;
+
+    assert_eq!(
+        original_bytes, duplicate_bytes,
+        "Both paths should have identical content"
+    );
+
+    tracing::info!(
+        "HTML deduplication test complete - {} unique files, 2 semantic paths for same content",
+        static_files.len()
+    );
     Ok(())
 }

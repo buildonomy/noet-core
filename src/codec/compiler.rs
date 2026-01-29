@@ -3,17 +3,23 @@ use crate::{
     codec::{
         belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
         builder::GraphBuilder,
-        UnresolvedReference,
+        UnresolvedReference, CODECS,
     },
     error::BuildonomyError,
     event::BeliefEvent,
     nodekey::NodeKey,
-    properties::{BeliefKind, Bid},
+    properties::{
+        asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Weight, WeightKind,
+        WEIGHT_DOC_PATHS,
+    },
     query::BeliefSource,
 };
+use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use toml_edit::value;
 
@@ -105,6 +111,8 @@ use toml_edit::value;
 /// - No contention between reader and writer
 pub struct DocumentCompiler {
     write: bool,
+    /// Optional output directory for HTML generation
+    html_output_dir: Option<PathBuf>,
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
@@ -115,6 +123,14 @@ pub struct DocumentCompiler {
     last_round_updates: HashSet<Bid>,
     /// Whether reparse queue is stable (no new dependencies discovered)
     reparse_stable: bool,
+    /// Asset tracking for file watcher integration.
+    /// Maps repo-relative asset paths to content-addressed BIDs.
+    /// Values may be identical for symlinks/copies (same content = same BID).
+    ///
+    /// Wrapped in Arc<RwLock<_>> for cross-thread access:
+    /// - DocumentCompiler writes during compilation
+    /// - FileWatcher reads to determine if filesystem events are relevant
+    asset_manifest: Arc<RwLock<BTreeMap<String, Bid>>>,
 }
 
 /// Result of parsing a single document
@@ -140,6 +156,21 @@ impl DocumentCompiler {
         max_reparse_count: Option<usize>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
+        Self::with_html_output(entry_point, tx, max_reparse_count, write, None)
+    }
+
+    /// Create a new compiler with HTML output enabled
+    pub fn with_html_output(
+        entry_point: impl AsRef<Path>,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<BeliefEvent>>,
+        max_reparse_count: Option<usize>,
+        write: bool,
+        html_output_dir: Option<PathBuf>,
+    ) -> Result<Self, BuildonomyError> {
+        // Copy static assets (CSS) to HTML output directory if configured
+        if let Some(ref html_dir) = html_output_dir {
+            Self::copy_static_assets(html_dir)?;
+        }
         let entry_path = entry_point.as_ref().canonicalize()?;
 
         let builder = GraphBuilder::new(&entry_path, tx)?;
@@ -148,6 +179,7 @@ impl DocumentCompiler {
 
         Ok(Self {
             write,
+            html_output_dir,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -156,6 +188,7 @@ impl DocumentCompiler {
             max_reparse_count: max_reparse_count.unwrap_or(3),
             last_round_updates: HashSet::new(),
             reparse_stable: false,
+            asset_manifest: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -173,6 +206,7 @@ impl DocumentCompiler {
 
         Ok(Self {
             write: false,
+            html_output_dir: None,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -181,6 +215,7 @@ impl DocumentCompiler {
             max_reparse_count: 3,
             last_round_updates: HashSet::new(),
             reparse_stable: false,
+            asset_manifest: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -240,8 +275,85 @@ impl DocumentCompiler {
         } else if let Some(p) = self.peek_next_reparse_candidate() {
             p.clone()
         } else {
-            // Both queues empty
-            return Ok(None);
+            // Both queues empty - regenerate asset_manifest from BeliefBase
+            // and enqueue any unparsed assets for content change detection
+            tracing::debug!("[Compiler] Both queues empty, checking assets for content changes");
+
+            let asset_map = self.builder.session_bb().paths().asset_map();
+            let assets: Vec<(String, Bid)> = asset_map
+                .map()
+                .iter()
+                .filter_map(|(path, bid, _order)| {
+                    // Verify this is actually an External node (asset)
+                    self.builder
+                        .session_bb()
+                        .states()
+                        .get(bid)
+                        .filter(|n| n.kind.is_external())
+                        .map(|_| (path.clone(), *bid))
+                })
+                .collect();
+
+            // Check each asset - if not yet processed, enqueue it for content verification
+            let mut newly_enqueued = 0;
+            for (repo_relative_path, _bid) in assets.iter() {
+                // Reconstruct absolute path from repo-relative path
+                let asset_absolute_path = self.builder.repo_root().join(repo_relative_path);
+
+                // If we haven't processed this path yet, enqueue it to check for content changes
+                if !self.processed.contains_key(&asset_absolute_path) {
+                    tracing::debug!(
+                        "[Compiler] Enqueuing unparsed asset for content check: {:?}",
+                        asset_absolute_path
+                    );
+                    self.primary_queue.push_back(asset_absolute_path);
+                    newly_enqueued += 1;
+                }
+            }
+
+            if newly_enqueued > 0 {
+                tracing::info!(
+                    "[Compiler] Enqueued {} unparsed assets for content verification",
+                    newly_enqueued
+                );
+                // Continue processing - don't return yet since we just added to queue
+            } else {
+                // Update asset_manifest with current state
+                {
+                    let mut manifest = self.asset_manifest.write();
+                    manifest.clear();
+                    for (path, bid) in assets.iter() {
+                        manifest.insert(path.clone(), *bid);
+                    }
+                }
+
+                // Check for duplicate BIDs (same content at multiple paths) and log at debug level
+                let mut bid_to_paths: BTreeMap<Bid, Vec<String>> = BTreeMap::new();
+                for (path, bid) in assets.iter() {
+                    bid_to_paths.entry(*bid).or_default().push(path.clone());
+                }
+
+                for (bid, paths) in bid_to_paths.iter() {
+                    if paths.len() > 1 {
+                        tracing::debug!(
+                            "[Compiler] Duplicate asset BID {} found at {} paths: {:?}",
+                            bid,
+                            paths.len(),
+                            paths
+                        );
+                    }
+                }
+
+                tracing::info!(
+                    "[Compiler] Asset manifest regenerated with {} unique assets",
+                    assets.len()
+                );
+
+                return Ok(None);
+            }
+
+            // Fall through to process newly enqueued assets
+            self.primary_queue.front().unwrap().clone()
         };
 
         // 2a. Check parse count before attempting
@@ -293,6 +405,209 @@ impl DocumentCompiler {
         } else {
             path.clone()
         };
+
+        // 3a. Check if this is an asset file (not a known document codec extension)
+        if !file_path.is_dir() {
+            if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+                if CODECS.get(ext).is_none() {
+                    // This is an asset file - process it as a static asset
+                    tracing::info!("[Compiler] Detected asset file: {:?}", file_path);
+
+                    // Read file bytes and compute SHA256 hash
+                    let file_bytes = match tokio::fs::read(&file_path).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[Compiler] Failed to read asset {:?}: {}",
+                                file_path,
+                                e
+                            );
+                            self.remove_from_queues(&path);
+                            return Ok(Some(ParseResult {
+                                path: path.clone(),
+                                rewritten_content: None,
+                                dependent_paths: Vec::new(),
+                                diagnostics: vec![crate::codec::ParseDiagnostic::parse_error(
+                                    format!("Failed to read asset file: {e}"),
+                                    parse_count + 1,
+                                )],
+                            }));
+                        }
+                    };
+
+                    // Compute SHA256 hash of file content
+                    let mut hasher = Sha256::new();
+                    hasher.update(&file_bytes);
+                    let hash_bytes = hasher.finalize();
+                    let hash_str = format!("{:x}", hash_bytes);
+
+                    // Get repo-relative path for this asset
+                    let repo_relative_path = file_path
+                        .strip_prefix(self.builder.repo_root())
+                        .unwrap_or(&file_path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+
+                    // Check if asset already tracked at this path
+                    // session_bb is now populated with assets from global_bb via initialize_stack
+                    let maybe_existing = self
+                        .builder
+                        .session_bb()
+                        .paths()
+                        .net_get_from_path(&asset_namespace(), &repo_relative_path)
+                        .map(|(_, bid)| {
+                            let node = self.builder.session_bb().states().get(&bid);
+                            let existing_hash = node
+                                .and_then(|n| n.payload.get("content_hash"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            (bid, existing_hash.to_string())
+                        });
+
+                    // Determine if we need to update based on hash comparison
+                    let (asset_bid, needs_update) = match maybe_existing {
+                        Some((bid, existing_hash)) if existing_hash == hash_str => {
+                            // Path exists with SAME hash → Skip (no change)
+                            tracing::debug!(
+                                "[Compiler] Asset unchanged: {:?} (BID: {})",
+                                repo_relative_path,
+                                bid
+                            );
+                            (bid, false)
+                        }
+                        Some((bid, existing_hash)) => {
+                            // Path exists with DIFFERENT hash → Content changed
+                            tracing::info!(
+                                "[Compiler] Asset content changed: {:?} (BID: {}, old hash: {}, new hash: {})",
+                                repo_relative_path,
+                                bid,
+                                existing_hash,
+                                hash_str
+                            );
+                            (bid, true)
+                        }
+                        None => {
+                            // Path doesn't exist → New asset, generate stable UUID
+                            let new_bid = Bid::new(asset_namespace());
+                            tracing::info!(
+                                "[Compiler] New asset discovered: {:?} (BID: {})",
+                                repo_relative_path,
+                                new_bid
+                            );
+                            (new_bid, true)
+                        }
+                    };
+
+                    if needs_update {
+                        // Create asset BeliefNode with content_hash in payload
+                        let mut payload = toml::Table::new();
+                        payload.insert("content_hash".to_string(), toml::Value::String(hash_str));
+
+                        let asset_node = BeliefNode {
+                            bid: asset_bid,
+                            kind: BeliefKind::External.into(),
+                            payload,
+                            ..Default::default()
+                        };
+
+                        // Build NodeKey array - single BID for update (not rename)
+                        let node_keys = vec![NodeKey::Bid { bid: asset_bid }];
+
+                        let mut update_queue = Vec::new();
+
+                        // Ensure asset_namespace network node exists before creating relations
+                        if !self
+                            .builder
+                            .session_bb()
+                            .states()
+                            .contains_key(&asset_namespace())
+                        {
+                            let asset_net_node = BeliefNode::asset_network();
+                            update_queue.push(BeliefEvent::NodeUpdate(
+                                asset_net_node.keys(
+                                    Some(buildonomy_namespace()),
+                                    None,
+                                    self.builder.session_bb(),
+                                ),
+                                asset_net_node.toml(),
+                                crate::event::EventOrigin::Remote,
+                            ));
+                            update_queue.push(BeliefEvent::RelationChange(
+                                asset_namespace(),
+                                buildonomy_namespace(),
+                                WeightKind::Section,
+                                None,
+                                crate::event::EventOrigin::Remote,
+                            ));
+                        }
+
+                        update_queue.push(BeliefEvent::NodeUpdate(
+                            node_keys,
+                            asset_node.toml(),
+                            crate::event::EventOrigin::Remote,
+                        ));
+
+                        // Create Section relation to asset_namespace with repo-relative path
+                        let mut edge_payload = toml::Table::new();
+                        edge_payload.insert(
+                            WEIGHT_DOC_PATHS.to_string(),
+                            toml::Value::Array(vec![toml::Value::String(
+                                repo_relative_path.clone(),
+                            )]),
+                        );
+                        let weight = Weight {
+                            payload: edge_payload,
+                        };
+
+                        update_queue.push(BeliefEvent::RelationChange(
+                            asset_bid,
+                            asset_namespace(),
+                            WeightKind::Section,
+                            Some(weight),
+                            crate::event::EventOrigin::Remote,
+                        ));
+
+                        // Process into session_bb
+                        let mut derivatives = Vec::new();
+                        for event in update_queue.iter() {
+                            derivatives
+                                .append(&mut self.builder.session_bb_mut().process_event(event)?);
+                        }
+                        update_queue.append(&mut derivatives);
+
+                        // Process into doc_bb so assets are available for cache lookups
+                        for event in update_queue.iter() {
+                            self.builder.doc_bb_mut().process_event(event)?;
+                        }
+
+                        // Send to global cache via tx
+                        for event in update_queue.into_iter() {
+                            self.builder.tx().send(event)?;
+                        }
+
+                        // Update asset manifest
+                        {
+                            let mut manifest = self.asset_manifest.write();
+                            manifest.insert(repo_relative_path.clone(), asset_bid);
+                        }
+
+                        tracing::info!(
+                            "[Compiler] Asset processed successfully: {:?}",
+                            repo_relative_path
+                        );
+                    }
+
+                    // Remove from queues and return success
+                    self.remove_from_queues(&path);
+                    return Ok(Some(ParseResult {
+                        path: path.clone(),
+                        rewritten_content: None,
+                        dependent_paths: Vec::new(),
+                        diagnostics: Vec::new(),
+                    }));
+                }
+            }
+        }
 
         // 4. Try to read the file
         let content = {
@@ -360,6 +675,32 @@ impl DocumentCompiler {
                         )));
                 }
             }
+
+            // 7a. Generate HTML if output directory is configured
+            // Only regenerate on content changes (rewritten_content exists)
+            if let Some(ref html_dir) = self.html_output_dir {
+                if let Err(e) = self.generate_html_for_path(&path, html_dir).await {
+                    // HTML generation error - add as warning but continue
+                    parse_result
+                        .diagnostics
+                        .push(crate::codec::ParseDiagnostic::warning(format!(
+                            "Failed to generate HTML: {e}"
+                        )));
+                }
+            }
+        } else if parse_count == 0 {
+            // 7b. First successful parse with no content changes - still generate HTML
+            // (handles case where HTML output dir is empty but repo is valid)
+            if let Some(ref html_dir) = self.html_output_dir {
+                if let Err(e) = self.generate_html_for_path(&path, html_dir).await {
+                    // HTML generation error - add as warning but continue
+                    parse_result
+                        .diagnostics
+                        .push(crate::codec::ParseDiagnostic::warning(format!(
+                            "Failed to generate HTML: {e}"
+                        )));
+                }
+            }
         }
 
         // 8. Extract dependent paths from SinkDependency diagnostics
@@ -383,6 +724,104 @@ impl DocumentCompiler {
 
         // 9. Handle dependent paths (files that need this file)
         for unresolved in unresolved_references.iter() {
+            // 9a. Check if this is an asset reference (NodeKey::Path with net == asset_namespace)
+            let is_asset_reference = unresolved.other_keys.iter().any(|key| {
+                if let NodeKey::Path { net, .. } = key {
+                    *net == asset_namespace()
+                } else {
+                    false
+                }
+            });
+
+            if is_asset_reference {
+                // Extract asset path from NodeKey
+                let asset_path_key = unresolved.other_keys.iter().find_map(|key| {
+                    if let NodeKey::Path { net, path } = key {
+                        if *net == asset_namespace() {
+                            Some(path.as_str())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(asset_relative_path) = asset_path_key {
+                    // Resolve relative markdown link to absolute filesystem path
+                    let doc_dir = path.parent().unwrap_or(&path);
+                    let asset_absolute_path = doc_dir.join(asset_relative_path).canonicalize();
+
+                    match asset_absolute_path {
+                        Ok(absolute_path) => {
+                            // Check if asset already tracked via asset_map
+                            let repo_relative_asset = absolute_path
+                                .strip_prefix(self.builder.repo_root())
+                                .unwrap_or(&absolute_path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+
+                            // Always enqueue asset files to check for content changes
+                            // even if already tracked in session_bb
+                            if !self.processed.contains_key(&absolute_path)
+                                && !self.primary_queue.contains(&absolute_path)
+                                && !self.reparse_queue.contains(&absolute_path)
+                            {
+                                tracing::debug!(
+                                    "[Compiler] Queueing asset file for content check: {:?}",
+                                    absolute_path
+                                );
+                                self.primary_queue.push_back(absolute_path.clone());
+                            }
+
+                            // Check if asset already tracked via BeliefBase
+                            let asset_already_tracked = self
+                                .builder
+                                .session_bb()
+                                .paths()
+                                .net_get_from_path(&asset_namespace(), &repo_relative_asset)
+                                .is_some();
+
+                            if !asset_already_tracked {
+                                // Asset not yet in session_bb - document needs reparse after asset loads
+                                tracing::info!(
+                                    "[Compiler] Document {:?} references untracked asset: {:?}",
+                                    path,
+                                    absolute_path
+                                );
+
+                                // Add document to reparse queue (will reparse after asset is processed)
+                                if !self.reparse_queue.contains(&path) {
+                                    tracing::debug!(
+                                        "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
+                                        path
+                                    );
+                                    self.reparse_queue.push_back(path.clone());
+                                    self.reparse_stable = false;
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "[Compiler] Asset already tracked: {:?}",
+                                    repo_relative_asset
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[Compiler] Cannot resolve asset path {:?} from document {:?}: {}",
+                                asset_relative_path,
+                                path,
+                                e
+                            );
+                            // Asset file doesn't exist - leave as unresolved reference
+                        }
+                    }
+                }
+
+                // Skip normal dependency handling for asset references
+                continue;
+            }
+
             let Some((net_dep_path_str, net)) = unresolved.as_sink_dependency() else {
                 continue;
             };
@@ -473,6 +912,14 @@ impl DocumentCompiler {
 
         while let Some(result) = self.parse_next(global_bb.clone()).await? {
             results.push(result);
+        }
+
+        // After all documents parsed, create asset hardlinks if HTML output is configured
+        if let Some(ref html_dir) = self.html_output_dir {
+            if let Err(e) = self.create_asset_hardlinks(html_dir).await {
+                tracing::warn!("[Compiler] Failed to create asset hardlinks: {}", e);
+                // Don't fail the entire parse - assets are supplementary
+            }
         }
 
         Ok(results)
@@ -674,6 +1121,14 @@ impl DocumentCompiler {
         &self.builder
     }
 
+    /// Get a clone of the asset manifest Arc for file watcher integration
+    ///
+    /// This allows the file watcher to check if filesystem events correspond to tracked assets.
+    /// The Arc can be cloned cheaply and the RwLock allows concurrent read access.
+    pub fn asset_manifest(&self) -> Arc<RwLock<BTreeMap<String, Bid>>> {
+        Arc::clone(&self.asset_manifest)
+    }
+
     /// Get a mutable reference to the underlying builder
     pub fn builder_mut(&mut self) -> &mut GraphBuilder {
         &mut self.builder
@@ -741,6 +1196,400 @@ impl DocumentCompiler {
             }
             _ => {}
         }
+    }
+
+    /// Generate index.html for each BeliefNetwork after parsing completes
+    pub async fn generate_network_indices(&self) -> Result<(), BuildonomyError> {
+        let html_dir = match &self.html_output_dir {
+            Some(dir) => dir,
+            None => return Ok(()), // No HTML output configured
+        };
+
+        let bb = self.builder.session_bb();
+        let paths = bb.paths();
+
+        // Get repository root network's PathMap to start traversal
+        let repo_bid = self.builder.repo();
+        let root_pm = match paths.get_map(&repo_bid) {
+            Some(pm) => pm,
+            None => return Ok(()), // No repository root network
+        };
+
+        // Get all networks in the hierarchy
+        let mut visited = std::collections::BTreeSet::new();
+        let all_networks = root_pm.all_net_paths(&paths, &mut visited);
+
+        // Generate index for each network
+        for (net_rel_path, net_bid) in all_networks {
+            let network_pm = match paths.get_map(&net_bid) {
+                Some(pm) => pm,
+                None => continue,
+            };
+
+            // Get network node for title
+            let network_node = bb.get(&NodeKey::Bid { bid: net_bid });
+            let network_title = network_node
+                .as_ref()
+                .map(|n| {
+                    if n.title.is_empty() {
+                        "Network Index"
+                    } else {
+                        n.title.as_str()
+                    }
+                })
+                .unwrap_or("Network Index");
+
+            // Get all local paths (documents) in this network
+            let local_paths = network_pm.map();
+            let all_docs = paths.docs();
+            let mut docs_with_paths: Vec<(String, String)> = Vec::new();
+
+            for (doc_path, doc_bid, _order) in local_paths.iter() {
+                // Only include actual documents, not sections/anchors
+                if !all_docs.contains(doc_bid) {
+                    continue;
+                }
+                // Convert .md to .html
+                let html_path = if doc_path.ends_with(".md") {
+                    doc_path.replace(".md", ".html")
+                } else {
+                    doc_path.clone()
+                };
+
+                // Get document title
+                let doc_title = bb
+                    .get(&NodeKey::Bid { bid: *doc_bid })
+                    .map(|n| {
+                        if n.title.is_empty() {
+                            // Fallback to path filename
+                            std::path::Path::new(&html_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Untitled")
+                                .to_string()
+                        } else {
+                            n.title.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&html_path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Untitled")
+                            .to_string()
+                    });
+
+                docs_with_paths.push((html_path, doc_title));
+            }
+
+            if docs_with_paths.is_empty() {
+                continue; // Skip empty networks
+            }
+
+            // Sort by path
+            docs_with_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Generate index HTML
+            let index_html = Self::generate_index_page(network_title, &docs_with_paths)?;
+
+            // Determine output directory
+            let index_dir = if net_rel_path.is_empty() {
+                html_dir.to_path_buf()
+            } else {
+                html_dir.join(&net_rel_path)
+            };
+
+            tokio::fs::create_dir_all(&index_dir).await?;
+            let index_path = index_dir.join("index.html");
+            tokio::fs::write(&index_path, index_html).await?;
+
+            tracing::info!("Generated network index: {}", index_path.display());
+        }
+
+        Ok(())
+    }
+
+    /// Generate HTML content for network index page
+    fn generate_index_page(
+        network_title: &str,
+        docs: &[(String, String)], // (html_path, title)
+    ) -> Result<String, BuildonomyError> {
+        use std::collections::BTreeMap;
+
+        // Group documents by directory for better organization
+        let mut by_dir: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+
+        for (html_path, title) in docs {
+            // Get directory part (or "." for root files)
+            let dir = std::path::Path::new(html_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or(".")
+                .to_string();
+
+            by_dir
+                .entry(dir)
+                .or_default()
+                .push((html_path.clone(), title.clone()));
+        }
+
+        // Build HTML
+        let mut html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{}</title>
+  <link rel="stylesheet" href="assets/default-theme.css">
+</head>
+<body>
+  <article>
+    <h1>{}</h1>
+    <p>Total documents: {}</p>
+"#,
+            network_title,
+            network_title,
+            docs.len()
+        );
+
+        for (dir, mut files) in by_dir {
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            if dir != "." {
+                html.push_str(&format!("    <h2>{}</h2>\n", dir));
+            }
+            html.push_str("    <ul>\n");
+            for (path, title) in files {
+                html.push_str(&format!(
+                    "      <li><a href=\"{}\">{}</a></li>\n",
+                    path, title
+                ));
+            }
+            html.push_str("    </ul>\n");
+        }
+
+        html.push_str(
+            r#"  </article>
+</body>
+</html>"#,
+        );
+
+        Ok(html)
+    }
+
+    /// Generate HTML for a parsed document
+    /// Copy static assets (CSS, etc.) to HTML output directory
+    fn copy_static_assets(html_output_dir: &Path) -> Result<(), BuildonomyError> {
+        const DEFAULT_CSS: &str = include_str!("../../assets/default-theme.css");
+
+        let assets_dir = html_output_dir.join("assets");
+        std::fs::create_dir_all(&assets_dir)?;
+
+        let css_path = assets_dir.join("default-theme.css");
+        std::fs::write(&css_path, DEFAULT_CSS)?;
+
+        tracing::info!("Copied static assets to {}", assets_dir.display());
+        Ok(())
+    }
+
+    async fn generate_html_for_path(
+        &self,
+        source_path: &Path,
+        html_output_dir: &Path,
+    ) -> Result<(), BuildonomyError> {
+        // Get file extension
+        let ext = source_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                BuildonomyError::Codec(format!(
+                    "Source file has no extension: {}",
+                    source_path.display()
+                ))
+            })?;
+
+        // Get codec for this file type
+        let codec_arc = CODECS.get(ext).ok_or_else(|| {
+            BuildonomyError::Codec(format!("No codec available for .{} files", ext))
+        })?;
+
+        // Generate HTML (drop lock before await)
+        let html_opt = {
+            let codec = codec_arc.lock();
+            codec.generate_html()?
+        };
+
+        if let Some(html) = html_opt {
+            // Compute output path relative to repo root
+            let relative_path = source_path
+                .strip_prefix(self.builder.repo_root())
+                .unwrap_or(source_path);
+
+            let mut html_path = html_output_dir.join(relative_path);
+            html_path.set_extension("html");
+
+            // Create parent directories
+            if let Some(parent) = html_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            // Write HTML file
+            tokio::fs::write(&html_path, html).await?;
+
+            tracing::info!("Generated HTML: {}", html_path.display());
+        }
+
+        Ok(())
+    }
+
+    /// Create content-addressed hardlinks for all tracked assets in HTML output directory
+    ///
+    /// This method:
+    /// 1. Copies each unique asset (by content hash) to `static/{hash}.{ext}`
+    /// 2. Creates hardlinks from semantic paths to the canonical location
+    /// 3. Deduplicates automatically - same content = same physical file
+    ///
+    /// # Arguments
+    /// * `html_output_dir` - Base directory for HTML output
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(BuildonomyError)` if filesystem operations fail
+    pub async fn create_asset_hardlinks(
+        &self,
+        html_output_dir: &Path,
+    ) -> Result<(), BuildonomyError> {
+        use std::collections::HashSet;
+
+        // Clone manifest data to avoid holding lock across await points
+        let manifest_data: BTreeMap<String, Bid> = {
+            let manifest = self.asset_manifest.read();
+            if manifest.is_empty() {
+                return Ok(());
+            }
+
+            tracing::info!(
+                "[Compiler] Creating asset hardlinks for {} assets",
+                manifest.len()
+            );
+
+            manifest.clone()
+        }; // Lock is dropped here
+
+        let mut copied_canonical: HashSet<PathBuf> = HashSet::new();
+
+        for (asset_path, asset_bid) in manifest_data.iter() {
+            // Get asset node to extract content hash from payload
+            let asset_node = self
+                .builder
+                .session_bb()
+                .states()
+                .get(asset_bid)
+                .ok_or_else(|| {
+                    BuildonomyError::Codec(format!("Asset node not found for BID: {}", asset_bid))
+                })?;
+
+            let content_hash = asset_node
+                .payload
+                .get("content_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    BuildonomyError::Codec(format!(
+                        "Asset missing content_hash in payload: {}",
+                        asset_bid
+                    ))
+                })?;
+
+            // Get file extension from asset path
+            let ext = Path::new(asset_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+
+            // Content-addressed canonical location: static/{hash}.{ext} or static/{hash}
+            let canonical_name = if ext.is_empty() {
+                content_hash.to_string()
+            } else {
+                format!("{}.{}", content_hash, ext)
+            };
+            let canonical = html_output_dir.join("static").join(&canonical_name);
+
+            // Copy to canonical location (once per content hash)
+            if !copied_canonical.contains(&canonical) {
+                let repo_full_path = self.builder.repo_root().join(asset_path);
+
+                // Verify source file exists
+                if !repo_full_path.exists() {
+                    tracing::warn!(
+                        "[Compiler] Asset source file not found, skipping: {}",
+                        repo_full_path.display()
+                    );
+                    continue;
+                }
+
+                // Create static directory if needed
+                if let Some(parent) = canonical.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+
+                // Copy file to canonical location
+                tokio::fs::copy(&repo_full_path, &canonical).await?;
+                copied_canonical.insert(canonical.clone());
+
+                tracing::debug!(
+                    "[Compiler] Copied asset to canonical: {} -> {}",
+                    repo_full_path.display(),
+                    canonical.display()
+                );
+            } else {
+                tracing::debug!(
+                    "[Compiler] Duplicate content detected: {} (hash: {}) - reusing canonical {}",
+                    asset_path,
+                    content_hash,
+                    canonical.display()
+                );
+            }
+
+            // Create hardlink at semantic path
+            let html_full_path = html_output_dir.join(asset_path);
+
+            // Create parent directories for semantic path
+            if let Some(parent) = html_full_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            // Remove existing file/link if present
+            if html_full_path.exists() {
+                tokio::fs::remove_file(&html_full_path).await?;
+            }
+
+            // Try to create hardlink, fall back to copy if hardlink fails
+            match tokio::fs::hard_link(&canonical, &html_full_path).await {
+                Ok(_) => {
+                    tracing::debug!(
+                        "[Compiler] Hardlinked asset: {} -> {}",
+                        html_full_path.display(),
+                        canonical.display()
+                    );
+                }
+                Err(e) => {
+                    // Hardlink failed (maybe filesystem doesn't support it), fall back to copy
+                    tracing::debug!(
+                        "[Compiler] Hardlink failed ({}), copying instead: {}",
+                        e,
+                        html_full_path.display()
+                    );
+                    tokio::fs::copy(&canonical, &html_full_path).await?;
+                }
+            }
+        }
+
+        tracing::info!(
+            "[Compiler] Asset hardlinks created: {} unique files, {} total paths",
+            copied_canonical.len(),
+            manifest_data.len()
+        );
+
+        Ok(())
     }
 
     /// Mark that we've completed a reparse round
