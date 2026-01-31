@@ -1415,12 +1415,19 @@ impl GraphBuilder {
                     let mut cache_update =
                         BeliefBase::from(global_bb.eval_query(&query, false).await?);
 
-                    // tracing::debug!(
-                    //     "global_bb result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
-                    //     cache_update.states().len(),
-                    //     cache_update.relations().as_graph().edge_count(),
-                    //     cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")
-                    // );
+                    tracing::debug!(
+                        "[cache_fetch] global_bb result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
+                        cache_update.states().len(),
+                        cache_update.relations().as_graph().edge_count(),
+                        cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")
+                    );
+
+                    // Log PathMap state before attempting get
+                    tracing::debug!(
+                        "[cache_fetch] PathMap networks: {:?}",
+                        cache_update.paths().nets()
+                    );
+
                     if let Some(cached_state) = cache_update.get(key) {
                         found_state = Some(cached_state);
                         let update = cache_update.consume();
@@ -1430,14 +1437,43 @@ impl GraphBuilder {
                         break;
                     } else if !cache_update.is_empty() {
                         let pmm_guard = cache_update.paths();
+
+                        // Detailed PathMap diagnostics
+                        let node_details = cache_update
+                            .states()
+                            .values()
+                            .map(|n| {
+                                format!(
+                                    "BID: {}, Title: {}, ID: {:?}, Kind: {:?}",
+                                    n.bid, n.title, n.id, n.kind
+                                )
+                            })
+                            .collect::<Vec<String>>()
+                            .join("\n\t");
+
+                        let path_map_details = pmm_guard
+                            .map()
+                            .iter()
+                            .map(|(net_bid, pm_arc)| {
+                                let pm = pm_arc.read();
+                                format!("Network {}: {} entries", net_bid, pm.map().len())
+                            })
+                            .collect::<Vec<String>>()
+                            .join("\n\t");
+
                         tracing::warn!(
-                            "Why didn't we get our node? The query returned results. \
-                            our key: {:?}. query result paths:\n\t{}",
+                            "[cache_fetch FAILED] Why didn't we get our node? The query returned results.\n\
+                            Search key: {:?}\n\
+                            Cached nodes ({}):\n\t{}\n\
+                            PathMap networks: {:?}\n\
+                            PathMap details:\n\t{}\n\
+                            Relations edge count: {}",
                             key,
-                            pmm_guard
-                                .api_map()
-                                .all_paths(&pmm_guard, &mut BTreeSet::default())
-                                .join("\n\t")
+                            cache_update.states().len(),
+                            node_details,
+                            pmm_guard.nets(),
+                            path_map_details,
+                            cache_update.relations().as_graph().edge_count()
                         );
                     }
                 }

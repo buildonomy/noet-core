@@ -516,26 +516,45 @@ impl WatchService {
                                 EventKind::Create(_)
                                 | EventKind::Modify(_)
                                 | EventKind::Remove(_) => {
-                                    // Filter paths to only valid document files
+                                    // Filter paths to only include:
+                                    // 1. Files with registered codec extensions (e.g., .md)
+                                    // 2. Files tracked in the asset manifest
                                     let sync_paths: Vec<&PathBuf> = event
                                         .paths
                                         .iter()
                                         .filter(|&p| {
-                                            !p.file_name()
-                                                .map(|file_name| {
-                                                    file_name
-                                                        .to_str()
-                                                        .map(|s| s.starts_with('.'))
-                                                        .unwrap_or(false)
-                                                })
-                                                .unwrap_or(false)
-                                                && p.extension()
-                                                    .map(|ext| {
-                                                        debouncer_codec_extensions
-                                                            .iter()
-                                                            .any(|ce| ce.as_str() == ext)
-                                                    })
-                                                    .unwrap_or(false)
+                                            // Only watch files, not directories
+                                            if !p.is_file() {
+                                                return false;
+                                            }
+
+                                            // Check if extension is a registered codec
+                                            if let Some(ext) = p.extension() {
+                                                let ext_str = ext.to_str().unwrap_or("");
+                                                if debouncer_codec_extensions
+                                                    .iter()
+                                                    .any(|ce| ce.as_str() == ext_str)
+                                                {
+                                                    return true;
+                                                }
+                                            }
+
+                                            // Check if this file is in the asset manifest
+                                            // Need to acquire read lock to check
+                                            while compiler_ref.is_locked() {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(10),
+                                                );
+                                            }
+                                            let compiler = compiler_ref.read();
+                                            let manifest_arc = compiler.asset_manifest();
+                                            let manifest = manifest_arc.read();
+
+                                            // Check if absolute path is in manifest
+                                            // Manifest keys are repo-relative, so we need to check both
+                                            manifest
+                                                .keys()
+                                                .any(|asset_path| p.ends_with(asset_path))
                                         })
                                         .collect();
 
@@ -738,6 +757,19 @@ impl FileUpdateSyncer {
                                 stats.reparse_queue_len,
                                 stats.total_parses
                             );
+
+                            // After queue empties, run post-parse cleanup
+                            {
+                                while compiler_ref.is_locked() {
+                                    tracing::debug!(
+                                        "[DocumentCompiler] Waiting for write access for post-parse cleanup"
+                                    );
+                                    sleep(Duration::from_millis(100)).await;
+                                }
+                                let compiler_read = compiler_ref.read_arc();
+                                compiler_read.finish_parse_session().await;
+                            }
+
                             // Break inner loop to wait for next notification
                             break;
                         }

@@ -1,5 +1,6 @@
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
+use sqlx::Row;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -16,6 +17,7 @@ use noet_core::{
         belief_ir::{detect_network_file, NETWORK_CONFIG_NAMES},
         DocumentCompiler, CODECS,
     },
+    db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
     event::BeliefEvent,
     nodekey::NodeKey,
@@ -202,6 +204,99 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     );
 
     // Cleanup is handled by tempdir dropping
+    Ok(())
+}
+
+#[test(tokio::test)]
+async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Testing cache stability with DbConnection (Issue 34)");
+    let test_tempdir = generate_test_root("network_1")?;
+    let test_root = test_tempdir.path().to_path_buf();
+
+    // Initialize DB in test directory
+    let db_path = test_root.join("belief_cache.db");
+    let db_pool = db_init(db_path).await?;
+    let db = DbConnection(db_pool);
+
+    tracing::info!("First parse with DbConnection as global cache");
+    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+
+    // First parse - should populate DB
+    let parse_results = compiler.parse_all(db.clone()).await?;
+    tracing::info!("First parse completed: {} documents", parse_results.len());
+
+    // Commit events to DB
+    let mut transaction = Transaction::default();
+    let mut event_count = 0;
+    while let Ok(event) = accum_rx.try_recv() {
+        transaction.add_event(&event);
+        event_count += 1;
+    }
+    tracing::info!(
+        "First parse generated {} events, committing to DB",
+        event_count
+    );
+    transaction.execute(&db.0).await?;
+    tracing::info!("Events committed to DB successfully");
+
+    // Verify DB contents after commit
+    let verify_count = sqlx::query("SELECT COUNT(*) as count FROM beliefs")
+        .fetch_one(&db.0)
+        .await?;
+    let node_count: i64 = verify_count.get("count");
+    let verify_edges = sqlx::query("SELECT COUNT(*) as count FROM relations")
+        .fetch_one(&db.0)
+        .await?;
+    let edge_count: i64 = verify_edges.get("count");
+    let verify_paths = sqlx::query("SELECT COUNT(*) as count FROM paths")
+        .fetch_one(&db.0)
+        .await?;
+    let path_count: i64 = verify_paths.get("count");
+    tracing::info!(
+        "DB verification after commit: {} nodes, {} edges, {} paths",
+        node_count,
+        edge_count,
+        path_count
+    );
+
+    // Second parse - should use cached nodes
+    tracing::info!("Second parse with same DbConnection");
+    let (accum_tx2, mut accum_rx2) = unbounded_channel::<BeliefEvent>();
+    compiler = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
+
+    let parse_results2 = compiler.parse_all(db.clone()).await?;
+
+    // Check for issues
+    for parse_result in parse_results2 {
+        tracing::debug!("Second parse - doc {:?}", parse_result.path);
+        if parse_result.rewritten_content.is_some() {
+            tracing::warn!(
+                "Document {:?} has rewritten content on second parse - indicates BID instability",
+                parse_result.path
+            );
+        }
+        // This assertion will fail if the cache lookup is broken
+        assert!(
+            parse_result.rewritten_content.is_none(),
+            "Second parse should not rewrite content for {:?}",
+            parse_result.path
+        );
+    }
+
+    // Check no new events generated
+    let mut second_event_count = 0;
+    while let Ok(event) = accum_rx2.try_recv() {
+        tracing::warn!("Unexpected event on second parse: {:?}", event);
+        second_event_count += 1;
+    }
+
+    assert_eq!(
+        second_event_count, 0,
+        "Second parse should not generate events, but got {}",
+        second_event_count
+    );
+
     Ok(())
 }
 

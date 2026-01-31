@@ -317,6 +317,11 @@ impl BeliefSource for DbConnection {
     #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         let states = self.get_states(expr).await?;
+        tracing::debug!(
+            "[DbConnection.eval_unbalanced] Query returned {} states for expr: {:?}",
+            states.len(),
+            expr
+        );
         let relations = match !states.is_empty() {
             false => BidGraph::default(),
             true => {
@@ -357,10 +362,21 @@ impl BeliefSource for DbConnection {
                     e
                 })?;
                 relation_vec.append(&mut source_side);
-                BidGraph::from_edges(relation_vec.into_iter())
+                let relations_graph = BidGraph::from_edges(relation_vec.into_iter());
+                tracing::debug!(
+                    "[DbConnection.eval_unbalanced] Loaded {} edges from DB for {} states",
+                    relations_graph.0.edge_count(),
+                    states.len()
+                );
+                relations_graph
             }
         };
 
+        tracing::debug!(
+            "[DbConnection.eval_unbalanced] Returning BeliefGraph with {} states, {} edges",
+            states.len(),
+            relations.0.edge_count()
+        );
         Ok(BeliefGraph { states, relations })
     }
     async fn eval_trace(

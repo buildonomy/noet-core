@@ -3,8 +3,8 @@ use crate::{
     nodekey::NodeKey,
     paths::{PathMap, PathMapMap},
     properties::{
-        BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref, WeightKind,
-        WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
+        asset_namespace, href_namespace, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation,
+        Bid, Bref, WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, RelationPred, ResultsPage, SetOp, StatePred, DEFAULT_LIMIT},
     BuildonomyError,
@@ -859,7 +859,18 @@ pub struct BeliefBase {
 
 impl From<BeliefGraph> for BeliefBase {
     fn from(beliefs: BeliefGraph) -> Self {
-        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false)
+        tracing::debug!(
+            "[BeliefBase::from(BeliefGraph)] Creating BeliefBase with {} states, {} edges",
+            beliefs.states.len(),
+            beliefs.relations.0.edge_count()
+        );
+        let result = BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false);
+        tracing::debug!(
+            "[BeliefBase::from(BeliefGraph)] PathMapMap created with {} network maps, {} total nets",
+            result.paths().map().len(),
+            result.paths().nets().len()
+        );
+        result
     }
 }
 
@@ -1403,8 +1414,17 @@ impl BeliefBase {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.states().is_empty()
-            || self.states.len() == 1 && self.states.contains_key(&self.api().bid)
+        let mut content_len = self.states.len();
+        if self.states.contains_key(&self.api().bid) {
+            content_len -= 1;
+        }
+        if self.states.contains_key(&asset_namespace()) {
+            content_len -= 1;
+        }
+        if self.states.contains_key(&href_namespace()) {
+            content_len -= 1;
+        }
+        content_len == 0
     }
 
     /// Validates that a Local event matches the current internal state.
@@ -2603,5 +2623,325 @@ impl BeliefSource for &BeliefBase {
         weight_filter: WeightSet,
     ) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression_as_trace(expr, weight_filter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodekey::NodeKey;
+    use crate::properties::{BeliefKind, BeliefKindSet, Weight, WeightKind, WeightSet};
+
+    /// Test for Issue 34: Relations referencing nodes not in states
+    ///
+    /// This simulates what happens when DbConnection.eval_unbalanced returns
+    /// a BeliefGraph with incomplete data - the relations reference BIDs that
+    /// aren't included in the states map.
+    #[test]
+    fn test_beliefgraph_with_orphaned_edges() {
+        // Create three nodes
+        let net_bid = Bid::new(Bid::nil());
+        let node_a_bid = Bid::new(net_bid);
+        let node_b_bid = Bid::new(net_bid);
+
+        let node_a = BeliefNode {
+            bid: net_bid,
+            title: "Network".to_string(),
+            kind: BeliefKindSet(BeliefKind::Network.into()),
+            ..Default::default()
+        };
+
+        let node_b = BeliefNode {
+            bid: node_a_bid,
+            title: "Doc A".to_string(),
+            kind: BeliefKindSet(BeliefKind::Document.into()),
+            id: Some("doc-a".to_string()),
+            ..Default::default()
+        };
+
+        let _node_c = BeliefNode {
+            bid: node_b_bid,
+            title: "Doc B".to_string(),
+            kind: BeliefKindSet(BeliefKind::Document.into()),
+            id: Some("doc-b".to_string()),
+            ..Default::default()
+        };
+
+        // Create a BeliefGraph with only node_a and node_b in states,
+        // but with relations that reference node_c (which is missing)
+        let mut states = BTreeMap::new();
+        states.insert(net_bid, node_a.clone());
+        states.insert(node_a_bid, node_b.clone());
+        // node_c is NOT in states!
+
+        // Create relations that include edges to the missing node_c
+        let mut relations = petgraph::Graph::new();
+        let net_idx = relations.add_node(net_bid);
+        let a_idx = relations.add_node(node_a_bid);
+        let b_idx = relations.add_node(node_b_bid); // References missing node!
+
+        let mut weights = WeightSet::empty();
+        weights.set(WeightKind::Section, Weight::default());
+
+        relations.add_edge(a_idx, net_idx, weights.clone());
+        relations.add_edge(b_idx, net_idx, weights.clone()); // Orphaned edge!
+
+        let bg = BeliefGraph {
+            states,
+            relations: BidGraph(relations),
+        };
+
+        // Convert to BeliefBase - this should trigger PathMap reconstruction
+        // with the incomplete data
+        let bs = BeliefBase::from(bg);
+
+        // The PathMapMap should warn about nodes in relations but not in states
+        // This is the symptom we're detecting
+        let _paths = bs.paths();
+
+        // Check for orphaned edges - this is the Issue 34 symptom
+        let states_bids: BTreeSet<Bid> = bs.states().keys().copied().collect();
+        let mut relation_bids = BTreeSet::new();
+        {
+            let rel_guard = bs.relations();
+            for idx in rel_guard.as_graph().node_indices() {
+                relation_bids.insert(rel_guard.as_graph()[idx]);
+            }
+        }
+        let orphaned: Vec<_> = relation_bids.difference(&states_bids).collect();
+
+        assert!(
+            orphaned.is_empty(),
+            "ISSUE 34: Found {} orphaned edges in relations but not in states: {:?}. \
+             This breaks cache_fetch and causes duplicate BIDs!",
+            orphaned.len(),
+            orphaned
+        );
+    }
+
+    /// Test for Issue 34: BeliefBase::get() failing when PathMap is incomplete
+    ///
+    /// When relations have dangling references, PathMap construction may fail
+    /// or produce incomplete results, breaking Path/Title/Id lookups.
+    #[test]
+    fn test_pathmap_with_incomplete_relations() {
+        // Create a minimal network with proper structure
+        let net_bid = Bid::new(Bid::nil());
+        let doc_bid = Bid::new(net_bid);
+        let section_bid = Bid::new(doc_bid);
+        let orphan_bid = Bid::new(net_bid); // This will be in relations but not states
+
+        let network = BeliefNode {
+            bid: net_bid,
+            title: "Test Network".to_string(),
+            kind: BeliefKindSet(BeliefKind::Network.into()),
+            ..Default::default()
+        };
+
+        let doc = BeliefNode {
+            bid: doc_bid,
+            title: "Test Doc".to_string(),
+            kind: BeliefKindSet(BeliefKind::Document.into()),
+            id: Some("test-doc".to_string()),
+            ..Default::default()
+        };
+
+        let section = BeliefNode {
+            bid: section_bid,
+            title: "Test Section".to_string(),
+            kind: BeliefKindSet(BeliefKind::Symbol.into()),
+            ..Default::default()
+        };
+
+        // States includes network, doc, and section but NOT orphan
+        let mut states = BTreeMap::new();
+        states.insert(net_bid, network);
+        states.insert(doc_bid, doc);
+        states.insert(section_bid, section);
+
+        // Relations includes an edge to the orphan node
+        let mut relations = petgraph::Graph::new();
+        let net_idx = relations.add_node(net_bid);
+        let doc_idx = relations.add_node(doc_bid);
+        let section_idx = relations.add_node(section_bid);
+        let orphan_idx = relations.add_node(orphan_bid); // Orphaned!
+
+        let mut weights = WeightSet::empty();
+        weights.set(WeightKind::Section, Weight::default());
+
+        relations.add_edge(doc_idx, net_idx, weights.clone());
+        relations.add_edge(section_idx, doc_idx, weights.clone());
+        relations.add_edge(orphan_idx, net_idx, weights.clone()); // Dangling reference!
+
+        let bg = BeliefGraph {
+            states,
+            relations: BidGraph(relations),
+        };
+
+        // This should not panic despite the incomplete relations
+        let bs = BeliefBase::from(bg);
+
+        // Check for orphaned edges
+        let states_bids: BTreeSet<Bid> = bs.states().keys().copied().collect();
+        let mut relation_bids = BTreeSet::new();
+        {
+            let rel_guard = bs.relations();
+            for idx in rel_guard.as_graph().node_indices() {
+                relation_bids.insert(rel_guard.as_graph()[idx]);
+            }
+        }
+        let orphaned: Vec<_> = relation_bids.difference(&states_bids).collect();
+
+        assert!(
+            orphaned.is_empty(),
+            "ISSUE 34: Found {} orphaned edges. This causes PathMap to fail and breaks cache_fetch!",
+            orphaned.len()
+        );
+
+        // If we get here, test that lookups work
+        assert!(bs.get(&NodeKey::Bid { bid: doc_bid }).is_some());
+        assert!(bs.get(&NodeKey::Bid { bid: section_bid }).is_some());
+
+        let by_id = bs.get(&NodeKey::Id {
+            net: net_bid,
+            id: "test-doc".to_string(),
+        });
+        assert!(
+            by_id.is_some(),
+            "Should find node by ID when no orphaned edges exist"
+        );
+    }
+
+    /// Test detecting orphaned edges in relations
+    ///
+    /// Helper to identify when a BeliefGraph has relations referencing
+    /// nodes that don't exist in states.
+    #[test]
+    fn test_detect_orphaned_edges() {
+        let net_bid = Bid::new(Bid::nil());
+        let node_a = Bid::new(net_bid);
+        let node_b = Bid::new(net_bid);
+        let orphan = Bid::new(net_bid);
+
+        // States only has net, node_a and node_b
+        let mut states = BTreeMap::new();
+        states.insert(
+            net_bid,
+            BeliefNode {
+                bid: net_bid,
+                title: "Net".to_string(),
+                kind: BeliefKindSet(BeliefKind::Network.into()),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            node_a,
+            BeliefNode {
+                bid: node_a,
+                title: "A".to_string(),
+                kind: BeliefKindSet(BeliefKind::Document.into()),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            node_b,
+            BeliefNode {
+                bid: node_b,
+                title: "B".to_string(),
+                kind: BeliefKindSet(BeliefKind::Document.into()),
+                ..Default::default()
+            },
+        );
+
+        // Relations includes edge to orphan
+        let mut relations = petgraph::Graph::new();
+        let net_idx = relations.add_node(net_bid);
+        let a_idx = relations.add_node(node_a);
+        let b_idx = relations.add_node(node_b);
+        let orphan_idx = relations.add_node(orphan); // Not in states!
+
+        let mut weights = WeightSet::empty();
+        weights.set(WeightKind::Section, Weight::default());
+
+        relations.add_edge(a_idx, net_idx, weights.clone());
+        relations.add_edge(b_idx, net_idx, weights.clone());
+        relations.add_edge(orphan_idx, net_idx, weights.clone()); // Orphaned!
+
+        // Detect orphaned edges
+        let states_bids: BTreeSet<Bid> = states.keys().copied().collect();
+        let mut relation_bids = BTreeSet::new();
+        for idx in relations.node_indices() {
+            relation_bids.insert(relations[idx]);
+        }
+
+        let orphaned: Vec<_> = relation_bids.difference(&states_bids).collect();
+
+        assert_eq!(orphaned.len(), 1, "Should detect 1 orphaned edge");
+        assert_eq!(*orphaned[0], orphan, "Should identify the orphan BID");
+    }
+
+    /// Test documenting that orphaned edges may not be caught by is_balanced()
+    ///
+    /// This test documents current behavior - is_balanced() may or may not
+    /// detect orphaned edges depending on implementation. The primary symptom
+    /// detection should happen when PathMap is constructed, not in is_balanced().
+    #[test]
+    fn test_orphaned_edges_behavior() {
+        let net_bid = Bid::new(Bid::nil());
+        let doc_bid = Bid::new(net_bid);
+        let orphan_bid = Bid::new(net_bid);
+
+        let mut states = BTreeMap::new();
+        states.insert(
+            net_bid,
+            BeliefNode {
+                bid: net_bid,
+                title: "Net".to_string(),
+                kind: BeliefKindSet(BeliefKind::Network.into()),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            doc_bid,
+            BeliefNode {
+                bid: doc_bid,
+                title: "Doc".to_string(),
+                kind: BeliefKindSet(BeliefKind::Document.into()),
+                ..Default::default()
+            },
+        );
+
+        let mut relations = petgraph::Graph::new();
+        let net_idx = relations.add_node(net_bid);
+        let doc_idx = relations.add_node(doc_bid);
+        let orphan_idx = relations.add_node(orphan_bid);
+
+        let mut weights = WeightSet::empty();
+        weights.set(WeightKind::Section, Weight::default());
+
+        relations.add_edge(doc_idx, net_idx, weights.clone());
+        relations.add_edge(orphan_idx, net_idx, weights.clone());
+
+        // Create BeliefBase with orphaned edge
+        let bs = BeliefBase::new_unbalanced(states, BidGraph(relations), true);
+
+        // Check for orphaned edges - Issue 34 symptom
+        let states_bids: BTreeSet<Bid> = bs.states().keys().copied().collect();
+        let mut relation_bids = BTreeSet::new();
+        {
+            let rel_guard = bs.relations();
+            for idx in rel_guard.as_graph().node_indices() {
+                relation_bids.insert(rel_guard.as_graph()[idx]);
+            }
+        }
+        let orphaned: Vec<_> = relation_bids.difference(&states_bids).collect();
+
+        assert!(
+            orphaned.is_empty(),
+            "ISSUE 34: BeliefBase has {} orphaned edges in relations but not in states: {:?}. \
+             This is the root cause of cache instability!",
+            orphaned.len(),
+            orphaned
+        );
     }
 }

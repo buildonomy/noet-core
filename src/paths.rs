@@ -284,6 +284,11 @@ pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, Buildonom
 impl PathMapMap {
     #[tracing::instrument(skip(states, relations))]
     pub fn new(states: &BTreeMap<Bid, BeliefNode>, relations: Arc<RwLock<BidGraph>>) -> PathMapMap {
+        tracing::debug!(
+            "[PathMapMap::new] Creating PathMapMap with {} states, {} relations",
+            states.len(),
+            relations.read_arc().as_graph().edge_count()
+        );
         let mut pmm = PathMapMap {
             relations: relations.clone(),
             ..Default::default()
@@ -310,13 +315,57 @@ impl PathMapMap {
         pmm.nets.insert(asset_namespace());
         pmm.nets.insert(href_namespace());
 
+        tracing::debug!(
+            "[PathMapMap::new] Found {} networks: {:?}",
+            pmm.nets.len(),
+            pmm.nets
+        );
+
+        // Check for states vs relations mismatch
+        let states_bids: std::collections::BTreeSet<_> = states.keys().copied().collect();
+        let mut relation_bids = std::collections::BTreeSet::new();
+        {
+            let rel_guard = relations.read_arc();
+            for idx in rel_guard.as_graph().node_indices() {
+                relation_bids.insert(rel_guard.as_graph()[idx]);
+            }
+        }
+
+        let in_states_not_relations: Vec<_> = states_bids.difference(&relation_bids).collect();
+        let in_relations_not_states: Vec<_> = relation_bids.difference(&states_bids).collect();
+
+        if !in_states_not_relations.is_empty() {
+            tracing::warn!(
+                "[PathMapMap::new] {} nodes in states but NOT in relations graph: {:?}",
+                in_states_not_relations.len(),
+                in_states_not_relations.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+        if !in_relations_not_states.is_empty() {
+            tracing::warn!(
+                "[PathMapMap::new] {} nodes in relations but NOT in states: {:?}",
+                in_relations_not_states.len(),
+                in_relations_not_states.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
         pmm.map.clear();
         for net in pmm.nets.iter() {
             if !pmm.map.contains_key(net) {
                 let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
+                tracing::debug!(
+                    "[PathMapMap::new] Created PathMap for network {}: {} entries",
+                    net,
+                    pm.map().len()
+                );
                 pmm.map.insert(*net, Arc::new(RwLock::new(pm)));
             }
         }
+
+        tracing::debug!(
+            "[PathMapMap::new] Completed PathMapMap with {} network maps",
+            pmm.map.len()
+        );
         pmm
     }
 
@@ -537,7 +586,7 @@ impl PathMapMap {
             let pm = PathMap::new(WeightKind::Section, node.bid, self, relations.clone());
             self.map.insert(node.bid, Arc::new(RwLock::new(pm)));
         }
-        if node.kind.is_document() {
+        if node.kind.is_document() || node.kind.is_external() {
             self.docs.insert(node.bid);
         }
     }
@@ -713,7 +762,26 @@ impl PathMap {
         // before inserting those stacks into the tree.
         let tree_graph = {
             let relations = relations.read_arc();
-            relations.as_subgraph(kind, true)
+            let subgraph = relations.as_subgraph(kind, true);
+
+            // Check if the network node is in the relations graph
+            let net_in_graph = relations
+                .as_graph()
+                .node_indices()
+                .any(|idx| relations.as_graph()[idx] == net);
+
+            tracing::debug!(
+                "[PathMap::new] Building PathMap for network {}, kind={:?}. Relations graph has {} total edges, subgraph has {} nodes and {} edges. Network node {} in graph: {}",
+                net,
+                kind,
+                relations.as_graph().edge_count(),
+                subgraph.node_count(),
+                subgraph.edge_count(),
+                net,
+                net_in_graph
+            );
+
+            subgraph
         };
         let mut stack =
             BTreeMap::<Bid, (BTreeSet<Bid>, BTreeMap<Bid, (Vec<u16>, Vec<String>)>)>::new();
@@ -842,6 +910,13 @@ impl PathMap {
         let (_sinks, inverted_path_map) = stack
             .remove(&net)
             .expect("To always discover the PathMap net in the DFS search");
+
+        tracing::debug!(
+            "[PathMap::new] DFS completed for network {}. Found {} paths in inverted_path_map, {} loops detected",
+            net,
+            inverted_path_map.len(),
+            loops.len()
+        );
 
         let mut map = Vec::from_iter(
             vec![(String::from(""), net, Vec::<u16>::default())]

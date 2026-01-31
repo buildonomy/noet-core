@@ -586,9 +586,9 @@ impl Weight {
         self.payload.contains_key(key)
     }
 
-    /// Get document paths with backward compatibility.
-    /// Tries WEIGHT_DOC_PATHS first (Vec<String>), falls back to WEIGHT_DOC_PATH (String).
-    /// Returns empty vec if neither is present.
+    /// Get document paths with backward compatibility. Tries [WEIGHT_DOC_PATHS] first
+    /// (`Vec<String>`), falls back to [WEIGHT_DOC_PATH] (String). Returns empty vec if neither is
+    /// present.
     pub fn get_doc_paths(&self) -> Vec<String> {
         // Try new format first
         if let Some(paths) = self.get::<Vec<String>>(WEIGHT_DOC_PATHS) {

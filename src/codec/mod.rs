@@ -209,7 +209,7 @@ impl CodecMap {
 
     pub fn insert<T: DocCodec + Clone + Default + Send + Sync + 'static>(&self, extension: String) {
         while self.0.is_locked() {
-            tracing::info!("[CodecMap::insert] Waiting for write access to the codec map");
+            tracing::debug!("[CodecMap::insert] Waiting for write access to the codec map");
             std::thread::sleep(Duration::from_millis(100));
         }
         let mut writer = self.0.write_arc();
@@ -222,7 +222,7 @@ impl CodecMap {
 
     pub fn get(&self, ext: &str) -> Option<Arc<Mutex<dyn DocCodec + Send>>> {
         while self.0.is_locked_exclusive() {
-            tracing::info!("[CodecMap::insert] Waiting for read access to the codec map");
+            tracing::debug!("[CodecMap::insert] Waiting for read access to the codec map");
             std::thread::sleep(Duration::from_millis(100));
         }
         let reader = self.0.read_arc();
@@ -235,7 +235,7 @@ impl CodecMap {
 
     pub fn extensions(&self) -> Vec<String> {
         while self.0.is_locked_exclusive() {
-            tracing::info!("[CodecMap::insert] Waiting for read access to the codec map");
+            tracing::debug!("[CodecMap::insert] Waiting for read access to the codec map");
             std::thread::sleep(Duration::from_millis(100));
         }
         let reader = self.0.read_arc();

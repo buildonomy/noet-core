@@ -1366,6 +1366,11 @@ impl DocCodec for MdCodec {
         window.location.reload();
     });
 
+    eventSource.addEventListener('close', function(e) {
+        console.log('[noet] Server shutting down, closing connection...');
+        eventSource.close();
+    });
+
     eventSource.addEventListener('open', function(e) {
         console.log('[noet] Connected to dev server');
     });

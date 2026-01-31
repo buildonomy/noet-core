@@ -192,6 +192,11 @@ impl DocumentCompiler {
         })
     }
 
+    /// Get the HTML output directory if configured
+    pub fn html_output_dir(&self) -> Option<&Path> {
+        self.html_output_dir.as_deref()
+    }
+
     /// Create a new compiler with an entry point (file or directory) and default arguments: no
     /// receiver of BeliefEvents, default reparse count, and write=false.
     ///
@@ -914,13 +919,8 @@ impl DocumentCompiler {
             results.push(result);
         }
 
-        // After all documents parsed, create asset hardlinks if HTML output is configured
-        if let Some(ref html_dir) = self.html_output_dir {
-            if let Err(e) = self.create_asset_hardlinks(html_dir).await {
-                tracing::warn!("[Compiler] Failed to create asset hardlinks: {}", e);
-                // Don't fail the entire parse - assets are supplementary
-            }
-        }
+        // Run post-parse cleanup
+        self.finish_parse_session().await;
 
         Ok(results)
     }
@@ -1439,6 +1439,31 @@ impl DocumentCompiler {
         }
 
         Ok(())
+    }
+
+    /// Perform cleanup tasks after a parse session completes (queue is empty)
+    ///
+    /// This includes:
+    /// - Generating network index pages for HTML output
+    /// - Creating asset hardlinks for HTML output
+    /// - Any other post-parse finalization tasks
+    ///
+    /// Note: Asset manifest regeneration happens automatically in parse_next when queues empty
+    pub async fn finish_parse_session(&self) {
+        // Only run if HTML output is configured
+        if let Some(html_dir) = self.html_output_dir() {
+            // Generate network index pages
+            if let Err(e) = self.generate_network_indices().await {
+                tracing::warn!("[Compiler] Failed to generate network indices: {}", e);
+                // Don't fail - continue with other tasks
+            }
+
+            // Create asset hardlinks
+            if let Err(e) = self.create_asset_hardlinks(html_dir).await {
+                tracing::warn!("[Compiler] Failed to create asset hardlinks: {}", e);
+                // Don't fail - assets are supplementary
+            }
+        }
     }
 
     /// Create content-addressed hardlinks for all tracked assets in HTML output directory

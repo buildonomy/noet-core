@@ -140,11 +140,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cache = compiler.builder().doc_bb().clone();
                 compiler.parse_all(cache).await?;
 
-                // Generate network index pages if HTML output is enabled
-                if html_output.is_some() {
-                    compiler.generate_network_indices().await?;
-                }
-
                 // Get final stats
                 let stats = compiler.stats();
 
@@ -320,7 +315,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drop(event_handle);
 
                 if let Some(handle) = server_handle {
-                    let _ = handle.join();
+                    // Try to join with timeout - if it doesn't complete in 3 seconds, just move on
+                    // The thread will be orphaned but the process is exiting anyway
+                    let join_result = std::thread::spawn(move || handle.join());
+
+                    let timeout_duration = Duration::from_secs(3);
+                    let start = std::time::Instant::now();
+
+                    loop {
+                        if start.elapsed() > timeout_duration {
+                            eprintln!("Warning: Dev server shutdown timed out after 3s");
+                            break;
+                        }
+
+                        if join_result.is_finished() {
+                            break;
+                        }
+
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
 
                 println!("Shutdown complete");
