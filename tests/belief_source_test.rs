@@ -123,27 +123,28 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
     );
 
     // Build relations: doc1 -> section1, doc2 -> section2, net -> doc1, net -> doc2
-    let mut edges = Vec::new();
-    edges.push(BeliefRelation {
-        source: doc1_bid,
-        sink: section1_bid,
-        weights: WeightSet::from(WeightKind::Section),
-    });
-    edges.push(BeliefRelation {
-        source: doc2_bid,
-        sink: section2_bid,
-        weights: WeightSet::from(WeightKind::Section),
-    });
-    edges.push(BeliefRelation {
-        source: net_bid,
-        sink: doc1_bid,
-        weights: WeightSet::from(WeightKind::Section),
-    });
-    edges.push(BeliefRelation {
-        source: net_bid,
-        sink: doc2_bid,
-        weights: WeightSet::from(WeightKind::Section),
-    });
+    let edges = vec![
+        BeliefRelation {
+            source: doc1_bid,
+            sink: section1_bid,
+            weights: WeightSet::from(WeightKind::Section),
+        },
+        BeliefRelation {
+            source: doc2_bid,
+            sink: section2_bid,
+            weights: WeightSet::from(WeightKind::Section),
+        },
+        BeliefRelation {
+            source: net_bid,
+            sink: doc1_bid,
+            weights: WeightSet::from(WeightKind::Section),
+        },
+        BeliefRelation {
+            source: net_bid,
+            sink: doc2_bid,
+            weights: WeightSet::from(WeightKind::Section),
+        },
+    ];
 
     let relations = BidGraph::from_edges(edges);
     let test_bb = BeliefBase::new(states, relations)?;

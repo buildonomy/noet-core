@@ -1386,31 +1386,70 @@ impl DocCodec for MdCodec {
         for (section_proto, _) in self.current_events.iter().skip(1) {
             // Skip document node (index 0), collect section nodes (heading > 2)
             if section_proto.heading > 2 {
-                if let Some(section_id) = section_proto.id.as_ref() {
-                    let mut section_metadata = toml_edit::Table::new();
-
-                    // Always include BID (required)
-                    if let Some(bid) = section_proto.document.get("bid") {
-                        section_metadata.insert("bid", bid.clone());
-                    }
-
-                    // Include ID (for lookup)
-                    section_metadata.insert("id", value(section_id.clone()));
-
-                    // Include schema if present
-                    if let Some(schema) = section_proto.document.get("schema") {
-                        section_metadata.insert("schema", schema.clone());
-                    }
-
-                    // Include any other metadata fields (excluding internal fields)
-                    for (key, val) in section_proto.document.iter() {
-                        if !matches!(key, "bid" | "id" | "title" | "text" | "schema" | "heading") {
-                            section_metadata.insert(key, val.clone());
+                // Get or generate section ID
+                // Sections without IDs are collision cases where Bref should be used
+                let section_id = if let Some(id) = section_proto.id.as_ref() {
+                    id.clone()
+                } else {
+                    // Generate Bref from BID for sections without IDs (collision cases)
+                    if let Some(bid_value) = section_proto.document.get("bid") {
+                        if let Some(bid_str) = bid_value.as_str() {
+                            if let Ok(bid) = crate::properties::Bid::try_from(bid_str) {
+                                let bref = bid.namespace().to_string();
+                                tracing::debug!(
+                                    "finalize() - Generated Bref '{}' for section without ID: title={:?}",
+                                    bref,
+                                    section_proto.document.get("title").and_then(|v| v.as_str())
+                                );
+                                bref
+                            } else {
+                                tracing::warn!(
+                                    "finalize() - Section has invalid BID, skipping: title={:?}",
+                                    section_proto.document.get("title").and_then(|v| v.as_str())
+                                );
+                                continue;
+                            }
+                        } else {
+                            tracing::warn!(
+                                "finalize() - Section BID is not a string, skipping: title={:?}",
+                                section_proto.document.get("title").and_then(|v| v.as_str())
+                            );
+                            continue;
                         }
+                    } else {
+                        tracing::warn!(
+                            "finalize() - Section has no BID, skipping: title={:?}",
+                            section_proto.document.get("title").and_then(|v| v.as_str())
+                        );
+                        continue;
                     }
+                };
 
-                    sections_table.insert(section_id, toml_edit::Item::Table(section_metadata));
+                let mut section_metadata = toml_edit::Table::new();
+
+                // Always include BID (required)
+                if let Some(bid) = section_proto.document.get("bid") {
+                    section_metadata.insert("bid", bid.clone());
                 }
+
+                // Include ID (for lookup)
+                section_metadata.insert("id", value(section_id.clone()));
+
+                // Include schema if present
+                if let Some(schema) = section_proto.document.get("schema") {
+                    section_metadata.insert("schema", schema.clone());
+                }
+
+                // Include any other metadata fields (excluding internal fields)
+                for (key, val) in section_proto.document.iter() {
+                    if !matches!(key, "bid" | "id" | "title" | "text" | "schema" | "heading") {
+                        section_metadata.insert(key, val.clone());
+                    }
+                }
+
+                // Use NodeKey format for section table key (e.g., "id://background")
+                let section_key = format!("id://{}", section_id);
+                sections_table.insert(&section_key, toml_edit::Item::Table(section_metadata));
             }
         }
 
@@ -1419,13 +1458,23 @@ impl DocCodec for MdCodec {
         if let Some(doc_proto) = self.current_events.first_mut() {
             // Compare built sections table with existing sections in frontmatter
             let existing_sections = doc_proto.0.document.get("sections");
+
             let needs_update = if !sections_table.is_empty() {
                 match existing_sections {
                     Some(existing) => {
-                        // Compare by converting to strings
-                        let existing_str = existing.to_string();
-                        let new_str = toml_edit::Item::Table(sections_table.clone()).to_string();
-                        existing_str != new_str
+                        // Compare table contents directly
+                        if let Some(existing_table) = existing.as_table() {
+                            // Check if keys match
+                            let existing_keys: std::collections::HashSet<&str> =
+                                existing_table.iter().map(|(k, _)| k).collect();
+                            let new_keys: std::collections::HashSet<&str> =
+                                sections_table.iter().map(|(k, _)| k).collect();
+
+                            existing_keys != new_keys
+                        } else {
+                            // existing is not a table, need to replace
+                            true
+                        }
                     }
                     None => true, // No existing sections, need to add
                 }

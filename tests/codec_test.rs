@@ -230,7 +230,7 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
     let mut transaction = Transaction::default();
     let mut event_count = 0;
     while let Ok(event) = accum_rx.try_recv() {
-        transaction.add_event(&event);
+        transaction.add_event(&event).ok();
         event_count += 1;
     }
     tracing::info!(
@@ -526,13 +526,7 @@ async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Er
                 !has_unmatched,
                 "Unmatched section should be garbage collected by finalize()"
             );
-            // TODO: Auto-generation of sections entries for new headings (future enhancement)
-            // assert!(has_untracked, "New heading should get sections entry added");
-            tracing::info!("Frontmatter contains 'unmatched': {}", has_unmatched);
-            tracing::info!(
-                "Frontmatter contains 'untracked-section': {}",
-                has_untracked
-            );
+            assert!(has_untracked, "New heading should get sections entry added");
         } else {
             tracing::info!("sections_test.md was NOT rewritten (finalize() made no changes or not implemented yet)");
         }
