@@ -179,8 +179,11 @@ pub trait DocCodec: Sync {
     /// - `metadata.document.bid` - Document node BID
     /// - `metadata.sections[anchor_id]` - Section node BIDs (only for explicit section nodes)
     ///
+    /// # Parameters
+    /// - `script`: Optional JavaScript to inject into the HTML (e.g., live reload for dev mode)
+    ///
     /// Default implementation returns None (codec doesn't support HTML generation).
-    fn generate_html(&self) -> Result<Option<String>, BuildonomyError> {
+    fn generate_html(&self, _script: Option<&str>) -> Result<Option<String>, BuildonomyError> {
         Ok(None)
     }
 }

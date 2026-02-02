@@ -113,6 +113,8 @@ pub struct DocumentCompiler {
     write: bool,
     /// Optional output directory for HTML generation
     html_output_dir: Option<PathBuf>,
+    /// Optional JavaScript to inject into generated HTML (e.g., live reload script)
+    html_script: Option<String>,
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
@@ -156,7 +158,7 @@ impl DocumentCompiler {
         max_reparse_count: Option<usize>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(entry_point, tx, max_reparse_count, write, None)
+        Self::with_html_output(entry_point, tx, max_reparse_count, write, None, None)
     }
 
     /// Create a new compiler with HTML output enabled
@@ -166,6 +168,7 @@ impl DocumentCompiler {
         max_reparse_count: Option<usize>,
         write: bool,
         html_output_dir: Option<PathBuf>,
+        html_script: Option<String>,
     ) -> Result<Self, BuildonomyError> {
         // Copy static assets (CSS) to HTML output directory if configured
         if let Some(ref html_dir) = html_output_dir {
@@ -180,6 +183,7 @@ impl DocumentCompiler {
         Ok(Self {
             write,
             html_output_dir,
+            html_script,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -212,6 +216,7 @@ impl DocumentCompiler {
         Ok(Self {
             write: false,
             html_output_dir: None,
+            html_script: None,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -1415,7 +1420,7 @@ impl DocumentCompiler {
         // Generate HTML (drop lock before await)
         let html_opt = {
             let codec = codec_arc.lock();
-            codec.generate_html()?
+            codec.generate_html(self.html_script.as_deref())?
         };
 
         if let Some(html) = html_opt {

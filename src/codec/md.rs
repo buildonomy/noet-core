@@ -1253,11 +1253,8 @@ impl DocCodec for MdCodec {
         Self::events_to_text(&self.content, events)
     }
 
-    fn generate_html(&self) -> Result<Option<String>, BuildonomyError> {
+    fn generate_html(&self, script: Option<&str>) -> Result<Option<String>, BuildonomyError> {
         use serde_json::json;
-
-        // Check if dev mode is enabled (for live reload script injection)
-        let dev_mode = std::env::var("NOET_DEV_MODE").is_ok();
 
         /// Rewrite .md links to .html for HTML output
         /// Only transforms links that have bref:// in title attribute (part of BeliefBase)
@@ -1347,50 +1344,8 @@ impl DocCodec for MdCodec {
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
 
-        // Build live reload script if in dev mode
-        let live_reload = if dev_mode {
-            r#"
-<script>
-(function() {
-    'use strict';
-
-    console.log('[noet] Connecting to dev server...');
-
-    const eventSource = new EventSource('/events');
-
-    eventSource.addEventListener('reload', function(e) {
-        console.log('[noet] File change detected, reloading...');
-        window.location.reload();
-    });
-
-    eventSource.addEventListener('close', function(e) {
-        console.log('[noet] Server shutting down, closing connection...');
-        eventSource.close();
-    });
-
-    eventSource.addEventListener('open', function(e) {
-        console.log('[noet] Connected to dev server');
-    });
-
-    eventSource.addEventListener('error', function(e) {
-        if (e.target.readyState === EventSource.CLOSED) {
-            console.log('[noet] Connection closed');
-        } else if (e.target.readyState === EventSource.CONNECTING) {
-            console.log('[noet] Reconnecting...');
-        } else {
-            console.error('[noet] Connection error:', e);
-        }
-    });
-
-    // Clean up on page unload
-    window.addEventListener('beforeunload', function() {
-        eventSource.close();
-    });
-})();
-</script>"#
-        } else {
-            ""
-        };
+        // Format script if provided
+        let script_tag = script.map(|s| format!("\n{}", s)).unwrap_or_default();
 
         // Wrap in HTML5 structure with embedded metadata
         let html = format!(
@@ -1402,7 +1357,7 @@ impl DocCodec for MdCodec {
   <link rel="stylesheet" href="assets/default-theme.css">
   <script type="application/json" id="noet-metadata">
 {metadata}
-  </script>{live_reload}
+  </script>{script}
 </head>
 <body>
   <article>
@@ -1415,7 +1370,7 @@ impl DocCodec for MdCodec {
             metadata = serde_json::to_string_pretty(&metadata)
                 .map_err(|e| BuildonomyError::Codec(format!("JSON serialization failed: {}", e)))?,
             body = html_body,
-            live_reload = live_reload
+            script = script_tag
         );
 
         Ok(Some(html))
@@ -2489,7 +2444,7 @@ Install the software.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html().expect("HTML generation failed");
+        let html = codec.generate_html(None).expect("HTML generation failed");
         assert!(html.is_some(), "HTML should be generated");
 
         let html_content = html.unwrap();
@@ -2565,7 +2520,7 @@ This section has no explicit BID.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html().expect("HTML generation failed");
+        let html = codec.generate_html(None).expect("HTML generation failed");
         assert!(html.is_some());
 
         let html_content = html.unwrap();
@@ -2611,7 +2566,7 @@ Already HTML [html link](./page.html "bref://doc789").
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html().expect("HTML generation failed");
+        let html = codec.generate_html(None).expect("HTML generation failed");
         assert!(html.is_some());
 
         let html_content = html.unwrap();

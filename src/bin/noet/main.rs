@@ -125,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     write,
                     Some(html_dir.clone()),
+                    None, // No live reload script for parse command
                 )?
             } else {
                 DocumentCompiler::new(&path, None, None, write)?
@@ -239,10 +240,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
 
-                // Set NOET_DEV_MODE environment variable if serving
-                if serve {
-                    std::env::set_var("NOET_DEV_MODE", "1");
-                }
+                // Build live reload script if serving
+                let live_reload_script = if serve {
+                    Some(
+                        r#"
+<script>
+(function() {
+    'use strict';
+
+    console.log('[noet] Connecting to dev server...');
+
+    const eventSource = new EventSource('/events');
+
+    eventSource.addEventListener('reload', function(e) {
+        console.log('[noet] File change detected, reloading...');
+        window.location.reload();
+    });
+
+    eventSource.addEventListener('close', function(e) {
+        console.log('[noet] Server shutting down, closing connection...');
+        eventSource.close();
+    });
+
+    eventSource.addEventListener('open', function(e) {
+        console.log('[noet] Connected to dev server');
+    });
+
+    eventSource.addEventListener('error', function(e) {
+        if (e.target.readyState === EventSource.CLOSED) {
+            console.log('[noet] Connection closed');
+        } else if (e.target.readyState === EventSource.CONNECTING) {
+            console.log('[noet] Reconnecting...');
+        } else {
+            console.error('[noet] Connection error:', e);
+        }
+    });
+
+    // Clean up on page unload
+    window.addEventListener('beforeunload', function() {
+        eventSource.close();
+    });
+})();
+</script>"#
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
 
                 // Create watch service with write flag and optional HTML output
                 let service = if let Some(ref html_dir) = html_output {
@@ -252,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tx,
                         write,
                         Some(html_dir.clone()),
+                        live_reload_script,
                     )?
                 } else {
                     WatchService::new(root_dir.clone(), tx, write)?

@@ -295,9 +295,10 @@ pub struct WatchService {
     codecs: CodecMap,
     event_tx: Sender<Event>,
     runtime: Runtime,
-    config_provider: Arc<dyn crate::config::LatticeConfigProvider>,
+    config_provider: Arc<dyn LatticeConfigProvider>,
     write: bool,
     html_output_dir: Option<PathBuf>,
+    html_script: Option<String>,
 }
 
 impl WatchService {
@@ -306,7 +307,7 @@ impl WatchService {
         event_tx: Sender<Event>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(root_dir, event_tx, write, None)
+        Self::with_html_output(root_dir, event_tx, write, None, None)
     }
 
     pub fn with_html_output(
@@ -314,6 +315,7 @@ impl WatchService {
         event_tx: Sender<Event>,
         write: bool,
         html_output_dir: Option<PathBuf>,
+        html_script: Option<String>,
     ) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -344,6 +346,7 @@ impl WatchService {
             config_provider,
             write,
             html_output_dir,
+            html_script,
         })
     }
 
@@ -492,6 +495,7 @@ impl WatchService {
             &self.runtime,
             self.write,
             self.html_output_dir.clone(),
+            self.html_script.clone(),
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
@@ -640,6 +644,7 @@ impl FileUpdateSyncer {
         runtime: &Runtime,
         write: bool,
         html_output_dir: Option<PathBuf>,
+        html_script: Option<String>,
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
@@ -657,6 +662,7 @@ impl FileUpdateSyncer {
                 Some(3), // max_reparse_count
                 write,   // write rewritten content back to files
                 Some(html_dir),
+                html_script,
             )?
         } else {
             DocumentCompiler::new(
