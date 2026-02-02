@@ -39,7 +39,7 @@ async fn main() -> Result<(), BuildonomyError> {
     let mut compiler = DocumentCompiler::simple(docs_path)?;
 
     // Initial parse - this will do multiple passes to resolve forward references
-    let mut parse_results = compiler.parse_all(BeliefBase::default()).await?;
+    let mut parse_results = compiler.parse_all(BeliefBase::default(), false).await?;
     let diagnostics: Vec<ParseDiagnostic> = parse_results
         .drain(..)
         .flat_map(|pr| pr.diagnostics)

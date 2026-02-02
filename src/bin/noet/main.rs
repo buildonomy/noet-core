@@ -14,6 +14,19 @@
 //!
 //! **Warning**: The `--write` flag modifies files in place. Ensure you have backups or are
 //! using version control before enabling write-back.
+//!
+//! ### Write-Back Implementation Details
+//!
+//! **Parse command**: Writes all modified files after parsing completes. Uses atomic write
+//! operations (temp file + rename) to prevent partial writes on failure.
+//!
+//! **Watch command**: Writes files immediately after each parse. To prevent re-parse loops,
+//! the file watcher uses path-specific ignoring:
+//! - After writing a file, adds it to an ignore set for 3 seconds
+//! - File system events for ignored paths are filtered out by the debouncer
+//! - After 3 seconds, the path is removed from the ignore set
+//! - This allows the compiler's own writes to be ignored while detecting legitimate user edits
+//!   to other files immediately
 
 // Compile-time check for service feature (required for watch command)
 #[cfg(all(not(feature = "service"), not(doc)))]
@@ -53,6 +66,10 @@ enum Commands {
         #[arg(short, long)]
         write: bool,
 
+        /// Force re-parse all files, ignoring cache
+        #[arg(long)]
+        force: bool,
+
         /// Optional output directory for HTML generation
         #[arg(long)]
         html_output: Option<PathBuf>,
@@ -71,7 +88,8 @@ enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// Write normalized/updated content back to source files (default: read-only)
+        /// Write normalized/updated content back to source files (default: read-only).
+        /// The watch service ignores its own writes for 3 seconds to prevent re-parse loops.
         #[arg(short, long)]
         write: bool,
 
@@ -105,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path,
             verbose,
             write,
+            force,
             html_output,
         } => {
             if verbose {
@@ -139,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut compiler = compiler;
                 // Use the accumulated BeliefBase as cache for parsing
                 let cache = compiler.builder().doc_bb().clone();
-                compiler.parse_all(cache).await?;
+                compiler.parse_all(cache, force).await?;
 
                 // Get final stats
                 let stats = compiler.stats();
@@ -157,9 +176,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Note: Only modified files are written back");
                 }
 
+                // Complete HTML generation if output directory specified
                 if let Some(ref html_dir) = html_output {
+                    // Generate network index pages
+                    if let Err(e) = compiler.generate_network_indices().await {
+                        eprintln!("Warning: Failed to generate network indices: {}", e);
+                    }
+
+                    // Create asset hardlinks
+                    // Get asset manifest from session_bb (contains all parsed content)
+                    use noet_core::properties::asset_namespace;
+                    use noet_core::query::BeliefSource;
+                    let asset_manifest: std::collections::BTreeMap<
+                        String,
+                        noet_core::properties::Bid,
+                    > = compiler
+                        .builder()
+                        .session_bb()
+                        .get_network_paths(asset_namespace())
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(path, _)| !path.is_empty()) // Skip network node itself
+                        .collect();
+
+                    if let Err(e) = compiler
+                        .create_asset_hardlinks(html_dir, &asset_manifest)
+                        .await
+                    {
+                        eprintln!("Warning: Failed to create asset hardlinks: {}", e);
+                    }
+
                     println!("\n=== HTML Export Results ===");
                     println!("HTML output: {}", html_dir.display());
+                    println!("Asset hardlinks: {} assets", asset_manifest.len());
                 }
 
                 // TODO: Display diagnostics from accumulated cache

@@ -14,12 +14,13 @@ use crate::{
     },
     query::BeliefSource,
 };
-use parking_lot::RwLock;
+
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    time::SystemTime,
 };
 use toml_edit::value;
 
@@ -125,14 +126,6 @@ pub struct DocumentCompiler {
     last_round_updates: HashSet<Bid>,
     /// Whether reparse queue is stable (no new dependencies discovered)
     reparse_stable: bool,
-    /// Asset tracking for file watcher integration.
-    /// Maps repo-relative asset paths to content-addressed BIDs.
-    /// Values may be identical for symlinks/copies (same content = same BID).
-    ///
-    /// Wrapped in Arc<RwLock<_>> for cross-thread access:
-    /// - DocumentCompiler writes during compilation
-    /// - FileWatcher reads to determine if filesystem events are relevant
-    asset_manifest: Arc<RwLock<BTreeMap<String, Bid>>>,
 }
 
 /// Result of parsing a single document
@@ -192,7 +185,6 @@ impl DocumentCompiler {
             max_reparse_count: max_reparse_count.unwrap_or(3),
             last_round_updates: HashSet::new(),
             reparse_stable: false,
-            asset_manifest: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -225,7 +217,6 @@ impl DocumentCompiler {
             max_reparse_count: 3,
             last_round_updates: HashSet::new(),
             reparse_stable: false,
-            asset_manifest: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -285,35 +276,33 @@ impl DocumentCompiler {
         } else if let Some(p) = self.peek_next_reparse_candidate() {
             p.clone()
         } else {
-            // Both queues empty - regenerate asset_manifest from BeliefBase
-            // and enqueue any unparsed assets for content change detection
-            tracing::debug!("[Compiler] Both queues empty, checking assets for content changes");
+            // Both queues empty - check if there are cached assets to verify
+            tracing::info!("[Compiler] Both queues empty, checking for cached assets");
 
-            let asset_map = self.builder.session_bb().paths().asset_map();
-            let assets: Vec<(String, Bid)> = asset_map
-                .map()
-                .iter()
-                .filter_map(|(path, bid, _order)| {
-                    // Verify this is actually an External node (asset)
-                    self.builder
-                        .session_bb()
-                        .states()
-                        .get(bid)
-                        .filter(|n| n.kind.is_external())
-                        .map(|_| (path.clone(), *bid))
-                })
-                .collect();
+            // Query session_bb for assets discovered during this parse session
+            // (mtime-based invalidation via check_stale_files handles cached assets)
+            let assets: Vec<(String, Bid)> = self
+                .builder
+                .session_bb()
+                .get_network_paths(asset_namespace())
+                .await
+                .unwrap_or_default();
 
-            // Check each asset - if not yet processed, enqueue it for content verification
+            tracing::info!("[Compiler] Found {} cached assets to check", assets.len());
+
+            // Enqueue any assets not yet processed in this session
             let mut newly_enqueued = 0;
             for (repo_relative_path, _bid) in assets.iter() {
-                // Reconstruct absolute path from repo-relative path
+                // Skip empty path (represents the network node itself, not an asset file)
+                if repo_relative_path.is_empty() {
+                    continue;
+                }
+
                 let asset_absolute_path = self.builder.repo_root().join(repo_relative_path);
 
-                // If we haven't processed this path yet, enqueue it to check for content changes
                 if !self.processed.contains_key(&asset_absolute_path) {
-                    tracing::debug!(
-                        "[Compiler] Enqueuing unparsed asset for content check: {:?}",
+                    tracing::info!(
+                        "[Compiler] Enqueuing cached asset for content check: {:?}",
                         asset_absolute_path
                     );
                     self.primary_queue.push_back(asset_absolute_path);
@@ -323,47 +312,15 @@ impl DocumentCompiler {
 
             if newly_enqueued > 0 {
                 tracing::info!(
-                    "[Compiler] Enqueued {} unparsed assets for content verification",
+                    "[Compiler] Enqueued {} cached assets for content verification",
                     newly_enqueued
                 );
-                // Continue processing - don't return yet since we just added to queue
+                // Continue to process the newly enqueued assets
+                self.primary_queue.front().unwrap().clone()
             } else {
-                // Update asset_manifest with current state
-                {
-                    let mut manifest = self.asset_manifest.write();
-                    manifest.clear();
-                    for (path, bid) in assets.iter() {
-                        manifest.insert(path.clone(), *bid);
-                    }
-                }
-
-                // Check for duplicate BIDs (same content at multiple paths) and log at debug level
-                let mut bid_to_paths: BTreeMap<Bid, Vec<String>> = BTreeMap::new();
-                for (path, bid) in assets.iter() {
-                    bid_to_paths.entry(*bid).or_default().push(path.clone());
-                }
-
-                for (bid, paths) in bid_to_paths.iter() {
-                    if paths.len() > 1 {
-                        tracing::debug!(
-                            "[Compiler] Duplicate asset BID {} found at {} paths: {:?}",
-                            bid,
-                            paths.len(),
-                            paths
-                        );
-                    }
-                }
-
-                tracing::info!(
-                    "[Compiler] Asset manifest regenerated with {} unique assets",
-                    assets.len()
-                );
-
+                tracing::info!("[Compiler] No cached assets to verify, parsing complete");
                 return Ok(None);
             }
-
-            // Fall through to process newly enqueued assets
-            self.primary_queue.front().unwrap().clone()
         };
 
         // 2a. Check parse count before attempting
@@ -595,11 +552,10 @@ impl DocumentCompiler {
                             self.builder.tx().send(event)?;
                         }
 
-                        // Update asset manifest
-                        {
-                            let mut manifest = self.asset_manifest.write();
-                            manifest.insert(repo_relative_path.clone(), asset_bid);
-                        }
+                        // Emit FileParsed event for mtime tracking
+                        self.builder
+                            .tx()
+                            .send(BeliefEvent::FileParsed(path.clone()))?;
 
                         tracing::info!(
                             "[Compiler] Asset processed successfully: {:?}",
@@ -672,10 +628,20 @@ impl DocumentCompiler {
         // 6. SUCCESS! Now we can safely remove from queues
         self.remove_from_queues(&path);
 
+        // 6a. Track file mtime for cache invalidation
+        self.builder
+            .tx()
+            .send(crate::event::BeliefEvent::FileParsed(file_path.clone()))?;
+
         // 7. Write rewritten content if available
         if let Some(contents) = parse_result.rewritten_content.as_ref() {
-            // tracing::debug!("New content:\n\n{}\n", contents);
+            tracing::debug!(
+                "[Compiler] Rewritten content available for {:?}, write={}",
+                file_path,
+                self.write
+            );
             if self.write {
+                tracing::info!("[Compiler] Writing rewritten content to {:?}", file_path);
                 if let Err(e) = tokio::fs::write(&file_path, contents).await {
                     // Write error - add as warning but continue
                     parse_result
@@ -683,7 +649,14 @@ impl DocumentCompiler {
                         .push(crate::codec::ParseDiagnostic::warning(format!(
                             "Failed to write rewritten content: {e}"
                         )));
+                } else {
+                    tracing::debug!("[Compiler] Successfully wrote file: {:?}", file_path);
                 }
+            } else {
+                tracing::debug!(
+                    "[Compiler] Write disabled, skipping file write for {:?}",
+                    file_path
+                );
             }
 
             // 7a. Generate HTML if output directory is configured
@@ -711,6 +684,8 @@ impl DocumentCompiler {
                         )));
                 }
             }
+        } else {
+            tracing::debug!("[Compiler] No rewritten content for {:?}", file_path);
         }
 
         // 8. Extract dependent paths from SinkDependency diagnostics
@@ -903,6 +878,120 @@ impl DocumentCompiler {
         }))
     }
 
+    /// Check for stale files by comparing cached mtimes with filesystem mtimes
+    ///
+    /// # Arguments
+    /// * `cache` - The belief cache to query for cached mtimes
+    /// * `force` - If true, treat all files as stale (force re-parse)
+    ///
+    /// # Returns
+    /// * `Ok(Vec<PathBuf>)` - List of files that need to be re-parsed
+    pub async fn check_stale_files<B: BeliefSource>(
+        &self,
+        cache: &B,
+        force: bool,
+    ) -> Result<Vec<PathBuf>, BuildonomyError> {
+        // Query cached mtimes to determine which files to check
+        let cached_mtimes = cache.get_file_mtimes().await?;
+
+        tracing::debug!(
+            "[Compiler] Checking stale files: found {} cached mtime entries",
+            cached_mtimes.len()
+        );
+
+        let mut doc_paths = Vec::new();
+
+        // Extract document paths from cached mtimes (these are files we've parsed before)
+        for (path, cached_mtime) in cached_mtimes.iter() {
+            // Filter to document paths only (no anchors)
+            if !path.to_string_lossy().contains('#') {
+                tracing::trace!(
+                    "[Compiler] Found cached path: {} (mtime: {})",
+                    path.display(),
+                    cached_mtime
+                );
+                doc_paths.push(path.clone());
+            }
+        }
+
+        tracing::debug!(
+            "[Compiler] Extracted {} document paths from cache (filtered out anchors)",
+            doc_paths.len()
+        );
+
+        let mut stale_files = if force {
+            tracing::info!(
+                "Force re-parse enabled, will re-parse {} files",
+                doc_paths.len()
+            );
+            doc_paths
+        } else {
+            // Query cached mtimes
+            let cached_mtimes = cache.get_file_mtimes().await?;
+            let mut stale = Vec::new();
+
+            for path in doc_paths {
+                // Check current filesystem mtime
+                match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        let current_mtime = metadata
+                            .modified()
+                            .map_err(|e| {
+                                BuildonomyError::Io(format!("Failed to get mtime: {}", e))
+                            })?
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map_err(|e| BuildonomyError::Io(format!("SystemTimeError: {}", e)))?
+                            .as_secs() as i64;
+
+                        if let Some(cached_mtime) = cached_mtimes.get(&path) {
+                            if current_mtime > *cached_mtime {
+                                tracing::info!(
+                                    "File modified: {} (cached: {}, current: {})",
+                                    path.display(),
+                                    cached_mtime,
+                                    current_mtime
+                                );
+                                stale.push(path);
+                            } else if current_mtime < 0 {
+                                // Clock skew: future mtime
+                                tracing::warn!("File has future mtime: {}", path.display());
+                                stale.push(path); // Safe: re-parse on suspicious mtime
+                            }
+                        } else {
+                            // No cached mtime - file never parsed
+                            tracing::debug!("No cached mtime for: {}", path.display());
+                            stale.push(path);
+                        }
+                    }
+                    Err(_) => {
+                        // File deleted since cache - need to update network
+                        tracing::warn!("Cached file no longer exists: {}", path.display());
+
+                        // Parse parent directory to find containing network
+                        // Network will re-scan and discover file is gone
+                        let mut parent = path.as_path();
+                        while let Some(p) = parent.parent() {
+                            if ProtoBeliefNode::from_file(p).is_ok() {
+                                tracing::info!(
+                                    "Enqueueing parent network for deleted file: {}",
+                                    p.display()
+                                );
+                                stale.push(p.to_path_buf());
+                                break;
+                            }
+                            parent = p;
+                        }
+                    }
+                }
+            }
+            stale
+        };
+
+        stale_files.sort();
+        stale_files.dedup();
+        Ok(stale_files)
+    }
+
     /// Parse all items in the queue until empty or error
     ///
     /// This method will continue parsing until both the primary and reparse queues are empty,
@@ -910,6 +999,7 @@ impl DocumentCompiler {
     ///
     /// # Arguments
     /// * `global_bb` - The belief cache to query during parsing
+    /// * `force` - If true, force re-parse all files ignoring cache
     ///
     /// # Returns
     /// * `Ok(Vec<ParseResult>)` - All successfully parsed documents
@@ -917,15 +1007,29 @@ impl DocumentCompiler {
     pub async fn parse_all<B: BeliefSource + Clone>(
         &mut self,
         global_bb: B,
+        force: bool,
     ) -> Result<Vec<ParseResult>, BuildonomyError> {
+        // Check for stale files (or all files if force=true)
+        let stale_files = self.check_stale_files(&global_bb, force).await?;
+
+        if !stale_files.is_empty() {
+            let action = if force {
+                "force re-parse"
+            } else {
+                "modified/deleted files, will re-parse"
+            };
+            tracing::info!("Found {} files to {}", stale_files.len(), action);
+
+            for path in stale_files {
+                self.enqueue(path);
+            }
+        }
+
         let mut results = Vec::new();
 
         while let Some(result) = self.parse_next(global_bb.clone()).await? {
             results.push(result);
         }
-
-        // Run post-parse cleanup
-        self.finish_parse_session().await;
 
         Ok(results)
     }
@@ -1124,14 +1228,6 @@ impl DocumentCompiler {
     /// Get a reference to the underlying builder
     pub fn builder(&self) -> &GraphBuilder {
         &self.builder
-    }
-
-    /// Get a clone of the asset manifest Arc for file watcher integration
-    ///
-    /// This allows the file watcher to check if filesystem events correspond to tracked assets.
-    /// The Arc can be cloned cheaply and the RwLock allows concurrent read access.
-    pub fn asset_manifest(&self) -> Arc<RwLock<BTreeMap<String, Bid>>> {
-        Arc::clone(&self.asset_manifest)
     }
 
     /// Get a mutable reference to the underlying builder
@@ -1446,31 +1542,6 @@ impl DocumentCompiler {
         Ok(())
     }
 
-    /// Perform cleanup tasks after a parse session completes (queue is empty)
-    ///
-    /// This includes:
-    /// - Generating network index pages for HTML output
-    /// - Creating asset hardlinks for HTML output
-    /// - Any other post-parse finalization tasks
-    ///
-    /// Note: Asset manifest regeneration happens automatically in parse_next when queues empty
-    pub async fn finish_parse_session(&self) {
-        // Only run if HTML output is configured
-        if let Some(html_dir) = self.html_output_dir() {
-            // Generate network index pages
-            if let Err(e) = self.generate_network_indices().await {
-                tracing::warn!("[Compiler] Failed to generate network indices: {}", e);
-                // Don't fail - continue with other tasks
-            }
-
-            // Create asset hardlinks
-            if let Err(e) = self.create_asset_hardlinks(html_dir).await {
-                tracing::warn!("[Compiler] Failed to create asset hardlinks: {}", e);
-                // Don't fail - assets are supplementary
-            }
-        }
-    }
-
     /// Create content-addressed hardlinks for all tracked assets in HTML output directory
     ///
     /// This method:
@@ -1480,6 +1551,7 @@ impl DocumentCompiler {
     ///
     /// # Arguments
     /// * `html_output_dir` - Base directory for HTML output
+    /// * `manifest_data` - Map of asset paths to their BIDs
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -1487,23 +1559,18 @@ impl DocumentCompiler {
     pub async fn create_asset_hardlinks(
         &self,
         html_output_dir: &Path,
+        manifest_data: &BTreeMap<String, Bid>,
     ) -> Result<(), BuildonomyError> {
         use std::collections::HashSet;
 
-        // Clone manifest data to avoid holding lock across await points
-        let manifest_data: BTreeMap<String, Bid> = {
-            let manifest = self.asset_manifest.read();
-            if manifest.is_empty() {
-                return Ok(());
-            }
+        if manifest_data.is_empty() {
+            return Ok(());
+        }
 
-            tracing::info!(
-                "[Compiler] Creating asset hardlinks for {} assets",
-                manifest.len()
-            );
-
-            manifest.clone()
-        }; // Lock is dropped here
+        tracing::info!(
+            "[Compiler] Creating asset hardlinks for {} assets",
+            manifest_data.len()
+        );
 
         let mut copied_canonical: HashSet<PathBuf> = HashSet::new();
 

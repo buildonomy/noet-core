@@ -103,7 +103,7 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     written_bids.insert(compiler.builder().api().bid);
 
     tracing::info!("Run compiler.parse_all()");
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     let mut writes = BTreeMap::<String, usize>::default();
     for parse_result in parse_results {
@@ -154,13 +154,15 @@ async fn test_belief_set_builder_bid_generation_and_caching(
 
     tracing::info!("Include asset BIDs from asset manifest");
     {
-        let asset_manifest = compiler.asset_manifest();
-        let manifest_read = asset_manifest.read();
-        for (_path, bid) in manifest_read.iter() {
-            written_bids.insert(*bid);
+        // Query asset BIDs from global_bb instead of compiler.asset_manifest()
+        use noet_core::properties::{asset_namespace, BeliefKind};
+        for (bid, node) in global_bb.states().iter() {
+            if node.kind.contains(BeliefKind::External) {
+                written_bids.insert(*bid);
+            }
         }
         // Also include the asset_namespace network node itself
-        written_bids.insert(noet_core::properties::asset_namespace());
+        written_bids.insert(asset_namespace());
     }
 
     tracing::info!("Ensure written bids match cached bids");
@@ -180,7 +182,7 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     written_bids.insert(compiler.builder().api().bid);
 
     tracing::info!("Re-running compiler.parse_all()");
-    let final_parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let final_parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     for parse_result in final_parse_results {
         tracing::debug!("Parsing doc {:?}", parse_result.path);
@@ -196,11 +198,14 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     }
     let mut received_events = Vec::new();
     while let Ok(event) = accum_rx.try_recv() {
-        received_events.push(event);
+        // Filter out FileParsed events (metadata-only, don't affect graph)
+        if !matches!(event, noet_core::event::BeliefEvent::FileParsed(_)) {
+            received_events.push(event);
+        }
     }
     debug_assert!(
         received_events.is_empty(),
-        "Expected no events. Received: {received_events:?}"
+        "Expected no graph-modifying events. Received: {received_events:?}"
     );
 
     // Cleanup is handled by tempdir dropping
@@ -223,7 +228,7 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
 
     // First parse - should populate DB
-    let parse_results = compiler.parse_all(db.clone()).await?;
+    let parse_results = compiler.parse_all(db.clone(), false).await?;
     tracing::info!("First parse completed: {} documents", parse_results.len());
 
     // Commit events to DB
@@ -265,7 +270,7 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
     let (accum_tx2, mut accum_rx2) = unbounded_channel::<BeliefEvent>();
     compiler = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
 
-    let parse_results2 = compiler.parse_all(db.clone()).await?;
+    let parse_results2 = compiler.parse_all(db.clone(), false).await?;
 
     // Check for issues
     for parse_result in parse_results2 {
@@ -284,16 +289,19 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
         );
     }
 
-    // Check no new events generated
+    // Check no new events generated (excluding FileParsed which is metadata-only)
     let mut second_event_count = 0;
     while let Ok(event) = accum_rx2.try_recv() {
-        tracing::warn!("Unexpected event on second parse: {:?}", event);
-        second_event_count += 1;
+        // FileParsed events are metadata-only (for mtime tracking), don't count them
+        if !matches!(event, noet_core::event::BeliefEvent::FileParsed(_)) {
+            tracing::warn!("Unexpected event on second parse: {:?}", event);
+            second_event_count += 1;
+        }
     }
 
     assert_eq!(
         second_event_count, 0,
-        "Second parse should not generate events, but got {}",
+        "Second parse should not generate graph-modifying events, but got {}",
         second_event_count
     );
 
@@ -314,7 +322,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
 
     tracing::info!("Parse all documents including sections_test.md");
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     // Process events to build up global_bb
     while let Ok(event) = accum_rx.try_recv() {
@@ -494,7 +502,7 @@ async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Er
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -546,7 +554,7 @@ async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Err
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    compiler.parse_all(global_bb.clone()).await?;
+    compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -618,7 +626,7 @@ async fn test_sections_round_trip_preservation() -> Result<(), Box<dyn std::erro
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let first_parse = compiler.parse_all(global_bb.clone()).await?;
+    let first_parse = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -643,7 +651,7 @@ async fn test_sections_round_trip_preservation() -> Result<(), Box<dyn std::erro
     // Second parse should NOT rewrite (no changes)
     let (accum_tx2, mut accum_rx2) = unbounded_channel::<BeliefEvent>();
     let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
-    let second_parse = compiler2.parse_all(global_bb.clone()).await?;
+    let second_parse = compiler2.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx2.try_recv() {
         global_bb.process_event(&event)?;
@@ -682,7 +690,7 @@ async fn test_anchor_collision_detection() -> Result<(), Box<dyn std::error::Err
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -755,7 +763,7 @@ async fn test_explicit_anchor_preservation() -> Result<(), Box<dyn std::error::E
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -813,7 +821,7 @@ async fn test_anchor_normalization() -> Result<(), Box<dyn std::error::Error>> {
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -861,7 +869,7 @@ async fn test_anchor_selective_injection() -> Result<(), Box<dyn std::error::Err
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -901,7 +909,7 @@ async fn test_link_canonical_format_generation() -> Result<(), Box<dyn std::erro
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -958,7 +966,7 @@ async fn test_link_bref_stability() -> Result<(), Box<dyn std::error::Error>> {
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
 
     // First parse
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1016,7 +1024,7 @@ async fn test_link_auto_title_matching() -> Result<(), Box<dyn std::error::Error
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1064,7 +1072,7 @@ async fn test_link_relative_paths() -> Result<(), Box<dyn std::error::Error>> {
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1114,7 +1122,7 @@ async fn test_link_same_document_anchors() -> Result<(), Box<dyn std::error::Err
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1171,7 +1179,7 @@ async fn test_asset_tracking_basic() -> Result<(), Box<dyn std::error::Error>> {
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     // Process all events into global_bb
     while let Ok(event) = accum_rx.try_recv() {
@@ -1226,7 +1234,7 @@ async fn test_asset_nodes_created() -> Result<(), Box<dyn std::error::Error>> {
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1275,7 +1283,7 @@ async fn test_asset_document_relations() -> Result<(), Box<dyn std::error::Error
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), Some(10), false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1375,7 +1383,7 @@ async fn test_asset_content_addressing() -> Result<(), Box<dyn std::error::Error
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1441,7 +1449,7 @@ async fn test_asset_deduplication_warning() -> Result<(), Box<dyn std::error::Er
     // Note: We should capture logs here to verify warning was logged
     // For now, just verify compilation succeeds and same BID is used
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1480,11 +1488,26 @@ This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
-    while let Ok(event) = accum_rx.try_recv() {
-        global_bb.process_event(&event)?;
-    }
+    // Build asset manifest from PathAdded events
+    let asset_manifest = {
+        let mut manifest: std::collections::BTreeMap<String, noet_core::properties::Bid> =
+            std::collections::BTreeMap::new();
+        let asset_ns = noet_core::properties::asset_namespace();
+
+        while let Ok(event) = accum_rx.try_recv() {
+            if let noet_core::event::BeliefEvent::PathAdded(net_bid, path, node_bid, _, _) = &event
+            {
+                if *net_bid == asset_ns && !path.is_empty() {
+                    manifest.insert(path.clone(), *node_bid);
+                }
+            }
+            global_bb.process_event(&event)?;
+        }
+
+        manifest
+    };
 
     // Find asset nodes - with stable BIDs, each path gets its own BID
     use noet_core::properties::{asset_namespace, BeliefKind};
@@ -1539,39 +1562,46 @@ This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
     );
 
     // Verify the asset manifest contains 3 file paths (test_image.png, same_image.png, test_doc.pdf)
-    let manifest = compiler.asset_manifest();
-    let manifest_guard = manifest.read();
-
     assert_eq!(
-        manifest_guard.len(),
+        asset_manifest.len(),
         3,
         "Should track 3 file paths in asset manifest"
     );
 
     assert!(
-        manifest_guard.contains_key("assets/test_image.png"),
+        asset_manifest.contains_key("assets/test_image.png"),
         "Original path should be in asset manifest"
     );
     assert!(
-        manifest_guard.contains_key("duplicates/same_image.png"),
+        asset_manifest.contains_key("duplicates/same_image.png"),
         "Duplicate path should be in asset manifest"
     );
     assert!(
-        manifest_guard.contains_key("assets/test_doc.pdf"),
+        asset_manifest.contains_key("assets/test_doc.pdf"),
         "PDF asset should be in asset manifest"
     );
 
     // With stable BIDs: different paths get different BIDs (stable identity per path)
-    let original_bid = manifest_guard.get("assets/test_image.png").unwrap();
-    let duplicate_bid = manifest_guard.get("duplicates/same_image.png").unwrap();
+    let original_bid = asset_manifest
+        .get("assets/test_image.png")
+        .expect("Should find original image");
+    let duplicate_bid = asset_manifest
+        .get("duplicates/same_image.png")
+        .expect("Should find duplicate image");
     assert_ne!(
         original_bid, duplicate_bid,
         "Different paths should have different BIDs (stable identity)"
     );
 
     // But they should have the same content hash in their payloads
-    let original_node = global_bb.states().get(original_bid).unwrap();
-    let duplicate_node = global_bb.states().get(duplicate_bid).unwrap();
+    let original_node = global_bb
+        .states()
+        .get(original_bid)
+        .expect("Should find original node");
+    let duplicate_node = global_bb
+        .states()
+        .get(duplicate_bid)
+        .expect("Should find duplicate node");
 
     let original_hash = original_node
         .payload
@@ -1611,7 +1641,7 @@ This references the same image: ![Test Image](./assets/test_image.png)
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1656,7 +1686,7 @@ async fn test_asset_all_paths_query() -> Result<(), Box<dyn std::error::Error>> 
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1696,7 +1726,7 @@ async fn test_asset_path_accumulation() -> Result<(), Box<dyn std::error::Error>
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     // Process events
     while let Ok(event) = accum_rx.try_recv() {
@@ -1756,7 +1786,7 @@ async fn test_asset_no_extension() -> Result<(), Box<dyn std::error::Error>> {
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
     while let Ok(event) = accum_rx.try_recv() {
         global_bb.process_event(&event)?;
@@ -1771,21 +1801,30 @@ async fn test_asset_no_extension() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test(tokio::test)]
 async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Testing asset content change triggers BID re-generation");
+    tracing::info!("Testing asset content change detection with stable BIDs");
 
     let test_tempdir = generate_test_root("network_1")?;
     let test_root = test_tempdir.path().to_path_buf();
 
+    // Use DbConnection for proper mtime tracking, plus BeliefBase for querying
+    let db_path = test_root.join("belief_cache.db");
+    let db_pool = db_init(db_path).await?;
+    let db = DbConnection(db_pool);
     let mut global_bb = BeliefBase::empty();
+
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
 
     // First parse - establish baseline
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx.clone()), None, false)?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(db.clone(), false).await?;
 
+    // Process events into both db and global_bb
+    let mut transaction = Transaction::new();
     while let Ok(event) = accum_rx.try_recv() {
+        transaction.add_event(&event)?;
         global_bb.process_event(&event)?;
     }
+    transaction.execute(&db.0).await?;
 
     // Find the original asset node
     use noet_core::properties::{asset_namespace, BeliefKind};
@@ -1826,12 +1865,13 @@ async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> 
     )?;
     tracing::info!("Modified asset content at {:?}", asset_path);
 
-    // Re-parse to detect the change
+    // Re-parse to detect the change (mtime-based invalidation will detect the change)
     let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
-    let _parse_results2 = compiler2.parse_all(global_bb.clone()).await?;
+    let _parse_results2 = compiler2.parse_all(db.clone(), false).await?;
 
     // Collect events and look for NodeUpdate (stable BIDs with payload changes)
     let mut update_events = Vec::new();
+    let mut transaction2 = Transaction::new();
     while let Ok(event) = accum_rx.try_recv() {
         if let BeliefEvent::NodeUpdate(keys, _toml, _origin) = &event {
             // Check if this is an asset update (single key with asset namespace parent)
@@ -1846,8 +1886,10 @@ async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
         }
+        transaction2.add_event(&event)?;
         global_bb.process_event(&event)?;
     }
+    transaction2.execute(&db.0).await?;
 
     // Verify we got a NodeUpdate event for the asset
     assert!(
@@ -1855,7 +1897,6 @@ async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> 
         "Should have at least one NodeUpdate event for changed asset"
     );
 
-    // Find the updated asset nodes
     let updated_asset_nodes: Vec<BeliefNode> = global_bb
         .states()
         .values()
@@ -1892,13 +1933,13 @@ async fn test_asset_content_changed() -> Result<(), Box<dyn std::error::Error>> 
     let original_hash = original_image_node
         .payload
         .get("content_hash")
-        .and_then(|v| v.as_str())
+        .and_then(|v: &toml::Value| v.as_str())
         .expect("Original node should have content_hash in payload");
 
     let updated_hash = updated_image_node
         .payload
         .get("content_hash")
-        .and_then(|v| v.as_str())
+        .and_then(|v: &toml::Value| v.as_str())
         .expect("Updated node should have content_hash in payload");
 
     assert_ne!(
@@ -1939,11 +1980,35 @@ async fn test_asset_html_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
         Some(html_output.clone()),
         None, // No live reload script for tests
     )?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
-    while let Ok(event) = accum_rx.try_recv() {
-        global_bb.process_event(&event)?;
-    }
+    // Build asset manifest from PathAdded events (keep outside scope for later use)
+    let asset_manifest = {
+        let mut manifest: std::collections::BTreeMap<String, noet_core::properties::Bid> =
+            std::collections::BTreeMap::new();
+        let asset_ns = noet_core::properties::asset_namespace();
+
+        while let Ok(event) = accum_rx.try_recv() {
+            if let noet_core::event::BeliefEvent::PathAdded(net_bid, path, node_bid, _, _) = &event
+            {
+                if *net_bid == asset_ns && !path.is_empty() {
+                    manifest.insert(path.clone(), *node_bid);
+                }
+            }
+            global_bb.process_event(&event)?;
+        }
+
+        tracing::info!(
+            "Built asset manifest from events: {} assets",
+            manifest.len()
+        );
+        manifest
+    };
+
+    // Create asset hardlinks after events are processed
+    compiler
+        .create_asset_hardlinks(&html_output, &asset_manifest)
+        .await?;
 
     // Verify static directory exists
     let static_dir = html_output.join("static");
@@ -1986,14 +2051,11 @@ async fn test_asset_html_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Asset should have content_hash");
 
         // Find the asset path from manifest to get extension
-        let manifest = compiler.asset_manifest();
-        let manifest_guard = manifest.read();
-
-        let asset_path = manifest_guard
+        let asset_path = asset_manifest
             .iter()
-            .find(|(_, bid)| *bid == &node.bid)
+            .find(|(_path, bid)| **bid == node.bid)
             .map(|(path, _)| path)
-            .expect("Asset should be in manifest");
+            .expect("Asset BID should be in manifest");
 
         let ext = Path::new(asset_path)
             .extension()
@@ -2073,11 +2135,31 @@ This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
         Some(html_output.clone()),
         None, // No live reload script for tests
     )?;
-    let _parse_results = compiler.parse_all(global_bb.clone()).await?;
+    let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
-    while let Ok(event) = accum_rx.try_recv() {
-        global_bb.process_event(&event)?;
-    }
+    // Build asset manifest from PathAdded events
+    let asset_manifest = {
+        let mut manifest: std::collections::BTreeMap<String, noet_core::properties::Bid> =
+            std::collections::BTreeMap::new();
+        let asset_ns = noet_core::properties::asset_namespace();
+
+        while let Ok(event) = accum_rx.try_recv() {
+            if let noet_core::event::BeliefEvent::PathAdded(net_bid, path, node_bid, _, _) = &event
+            {
+                if *net_bid == asset_ns && !path.is_empty() {
+                    manifest.insert(path.clone(), *node_bid);
+                }
+            }
+            global_bb.process_event(&event)?;
+        }
+
+        manifest
+    };
+
+    // Create asset hardlinks after events are processed
+    compiler
+        .create_asset_hardlinks(&html_output, &asset_manifest)
+        .await?;
 
     // Verify static directory has only ONE physical file for the duplicate content
     let static_dir = html_output.join("static");

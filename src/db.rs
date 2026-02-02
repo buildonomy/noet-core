@@ -15,13 +15,19 @@ use sqlx::{
 };
 use sqlx::{migrate::MigrationType, Pool, QueryBuilder};
 use std::{collections::BTreeMap, fmt::Debug, result::Result};
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::SystemTime,
+};
 
 pub const BELIEF_CACHE_DB: &str = "sqlite:belief_cache.db";
 
 pub struct Transaction<'a> {
     qb: QueryBuilder<'a, Sqlite>,
     pub staged: usize,
+    mtime_updates: BTreeMap<PathBuf, i64>,
 }
 
 impl<'a> Default for Transaction<'a> {
@@ -35,6 +41,7 @@ impl<'a> Transaction<'a> {
         Transaction {
             qb: QueryBuilder::<Sqlite>::new(""),
             staged: 0,
+            mtime_updates: BTreeMap::new(),
         }
     }
 
@@ -44,6 +51,31 @@ impl<'a> Transaction<'a> {
         // tracing::debug!("SQL:\n{}", query.sql());
         query.execute(connection).await?;
         self.qb.reset();
+
+        // Batch insert mtime updates
+        if !self.mtime_updates.is_empty() {
+            let mut mtime_qb =
+                QueryBuilder::<Sqlite>::new("INSERT OR REPLACE INTO file_mtimes (path, mtime) ");
+            mtime_qb.push_values(self.mtime_updates.iter(), |mut b, (path, mtime)| {
+                b.push_bind(path.to_string_lossy().to_string())
+                    .push_bind(*mtime);
+            });
+            mtime_qb.build().execute(connection).await?;
+            self.mtime_updates.clear();
+        }
+
+        Ok(())
+    }
+
+    pub fn track_file_mtime(&mut self, path: &Path) -> Result<(), BuildonomyError> {
+        let metadata = fs::metadata(path)?;
+        let mtime = metadata
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| BuildonomyError::Io(format!("SystemTimeError: {}", e)))?
+            .as_secs() as i64;
+
+        self.mtime_updates.insert(path.to_path_buf(), mtime);
         Ok(())
     }
 
@@ -89,6 +121,9 @@ impl<'a> Transaction<'a> {
             }
             BeliefEvent::RelationRemoved(source, sink, _) => {
                 self.remove_relation(source, sink);
+            }
+            BeliefEvent::FileParsed(path) => {
+                self.track_file_mtime(path)?;
             }
             BeliefEvent::BalanceCheck => {
                 tracing::debug!(
@@ -251,7 +286,6 @@ impl DbConnection {
         qb.push(") GROUP BY bid");
         let state_query = qb.build_query_as::<BeliefNode>();
         let state_sql = state_query.sql();
-        tracing::debug!("[get_states] SQL: {}", state_sql);
 
         let results = state_query
             .fetch_all(&self.0)
@@ -269,11 +303,11 @@ impl DbConnection {
             .map(|s| (s.bid, s))
             .collect::<BTreeMap<Bid, BeliefNode>>();
 
-        tracing::debug!(
-            "[get_states] Query for {:?} returned {} results",
-            expr,
-            results.len()
-        );
+        // tracing::debug!(
+        //     "[get_states] Query for {:?} returned {} results",
+        //     expr,
+        //     results.len()
+        // );
 
         Ok(results)
     }
@@ -317,20 +351,52 @@ impl DbConnection {
 
         bs.is_balanced()
     }
+
+    pub async fn get_file_mtimes(&self) -> Result<BTreeMap<PathBuf, i64>, BuildonomyError> {
+        let rows = sqlx::query_as::<_, (String, i64)>("SELECT path, mtime FROM file_mtimes")
+            .fetch_all(&self.0)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(path, mtime)| (PathBuf::from(path), mtime))
+            .collect())
+    }
+
+    pub async fn get_network_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        let rows =
+            sqlx::query_as::<_, (String, String)>("SELECT path, target FROM paths WHERE net = ?")
+                .bind(network_bid.to_string())
+                .fetch_all(&self.0)
+                .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(path, target)| Bid::try_from(target.as_str()).ok().map(|bid| (path, bid)))
+            .collect())
+    }
 }
 
 impl BeliefSource for DbConnection {
+    /// Get cached file modification times for cache invalidation.
+    async fn get_file_mtimes(&self) -> Result<BTreeMap<PathBuf, i64>, BuildonomyError> {
+        self.get_file_mtimes().await
+    }
+
     /// db eval sets should return the state of all relationships of the primary query --- both
     /// incoming or outgoing. This provides user's bidirectional awareness of how each belief is
     /// using and is used by other beliefs.
     #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         let mut states = self.get_states(expr).await?;
-        tracing::debug!(
-            "[DbConnection.eval_unbalanced] Query returned {} states for expr: {:?}",
-            states.len(),
-            expr
-        );
+        // tracing::debug!(
+        //     "[DbConnection.eval_unbalanced] Query returned {} states for expr: {:?}",
+        //     states.len(),
+        //     expr
+        // );
 
         // For RelationIn queries, mark all nodes as Trace (matches BeliefBase behavior)
         // because we don't guarantee complete relation sets for returned nodes
@@ -367,13 +433,7 @@ impl BeliefSource for DbConnection {
                         );
                         e
                     })?;
-                let relations_graph = BidGraph::from_edges(relation_vec.into_iter());
-                tracing::debug!(
-                    "[DbConnection.eval_unbalanced] Loaded {} edges from DB for {} states",
-                    relations_graph.0.edge_count(),
-                    states.len()
-                );
-                relations_graph
+                BidGraph::from_edges(relation_vec.into_iter())
             }
         };
 
@@ -385,10 +445,10 @@ impl BeliefSource for DbConnection {
         let missing = temp_graph.find_orphaned_edges();
 
         if !missing.is_empty() {
-            tracing::debug!(
-                "[DbConnection.eval_unbalanced] Loading {} missing nodes to complete graph",
-                missing.len()
-            );
+            // tracing::debug!(
+            //     "[DbConnection.eval_unbalanced] Loading {} missing nodes to complete graph",
+            //     missing.len()
+            // );
             let missing_expr = Expression::StateIn(StatePred::Bid(missing));
             let mut missing_states = self.get_states(&missing_expr).await?;
 
@@ -400,11 +460,11 @@ impl BeliefSource for DbConnection {
             states.extend(missing_states);
         }
 
-        tracing::debug!(
-            "[DbConnection.eval_unbalanced] Returning BeliefGraph with {} states, {} edges",
-            states.len(),
-            relations.0.edge_count()
-        );
+        // tracing::debug!(
+        //     "[DbConnection.eval_unbalanced] Returning BeliefGraph with {} states, {} edges",
+        //     states.len(),
+        //     relations.0.edge_count()
+        // );
         Ok(BeliefGraph { states, relations })
     }
     async fn eval_trace(
@@ -467,10 +527,10 @@ impl BeliefSource for DbConnection {
             .collect();
 
         if !missing_sinks.is_empty() {
-            tracing::debug!(
-                "[DbConnection.eval_trace] Loading {} missing sink nodes to complete graph",
-                missing_sinks.len()
-            );
+            // tracing::debug!(
+            //     "[DbConnection.eval_trace] Loading {} missing sink nodes to complete graph",
+            //     missing_sinks.len()
+            // );
             let missing_expr = Expression::StateIn(StatePred::Bid(missing_sinks));
             let mut missing_states = self.get_states(&missing_expr).await?;
 
@@ -483,6 +543,13 @@ impl BeliefSource for DbConnection {
         }
 
         Ok(BeliefGraph { states, relations })
+    }
+
+    async fn get_network_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        self.get_network_paths(network_bid).await
     }
 }
 
@@ -552,7 +619,8 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
             sql: "\
             CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
             CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, section TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
-            CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path));",
+            CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path)); \
+            CREATE TABLE file_mtimes (path TEXT PRIMARY KEY, mtime INTEGER NOT NULL);",
             kind: MigrationType::ReversibleUp,
         }
     ]);

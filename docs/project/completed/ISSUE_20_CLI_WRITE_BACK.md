@@ -232,6 +232,46 @@ Add `--write` flag to `noet parse` and `noet watch` subcommands to enable writin
 - Rationale: Examples demonstrate full functionality, tests need predictable read-only behavior
 - Impact: Examples show realistic usage, tests are safer and more isolated
 
+**Decision 6: Path-Specific Debouncer Write Ignoring**
+- Date: 2025-01-27
+- Context: Initial implementation paused entire debouncer for 2.5s after writes, blocking all user edits
+- Problem: Compiler writes to files trigger filesystem events that would re-queue files for parsing
+- Decision: Implement path-specific ignore set instead of global pause
+- Implementation:
+  - Added `ignored_write_paths: Arc<Mutex<HashSet<PathBuf>>>` to `FileUpdateSyncer`
+  - After successful parse, normalize path with `canonicalize()` and add to ignore set for 3 seconds
+  - Debouncer normalizes incoming event paths before checking ignore set
+  - Async task removes normalized path from ignore set after delay
+  - Removed global `debouncer_paused` AtomicBool
+- Path Normalization (2025-02-02):
+  - File watcher events may contain `./`, `..`, or other path variations
+  - Both insertion and lookup use `path.canonicalize()` to normalize paths
+  - Handles cases like `/home/user/./BeliefNetwork.toml` vs `/home/user/BeliefNetwork.toml`
+  - Falls back to raw path if canonicalization fails (file doesn't exist yet)
+- BeliefNetwork Directory Resolution (2025-02-02):
+  - BeliefNetwork files are referenced by their directory path (e.g., `/path/to/network`)
+  - Compiler returns directory path in `result.path`, not the actual file path
+  - Must resolve directory to actual file (e.g., `BeliefNetwork.toml`) before adding to ignore set
+  - Uses `detect_network_file()` to find the actual network file in directory
+  - Without this, debouncer checks file paths but ignore set contains directories (no match)
+- Rationale: 
+  - Surgical ignoring: Only ignore files we just wrote
+  - No user edit lag: Other files detected immediately
+  - 3-second window: Long enough to catch debouncer delay (2s) + buffer
+  - Path normalization ensures reliable matching across filesystem variations
+  - Directory resolution handles BeliefNetwork file convention
+- Impact: 
+  - Better UX for users actively editing multiple files during watch
+  - Prevents spurious re-parses of files compiler just wrote
+  - Clean async cleanup with path-specific control
+  - Reliable ignore matching regardless of path representation
+  - Fixes BeliefNetwork files being re-parsed after compiler writes them
+- Code locations:
+  - `src/watch.rs` lines 641-643: Create ignored paths set
+  - `src/watch.rs` lines 739-777: Resolve BeliefNetwork dirs, normalize, add to ignore set, spawn cleanup task
+  - `src/watch.rs` lines 530-546: Normalize event path and check ignore set in debouncer
+  - `src/watch.rs` line 246: Import `detect_network_file` for directory resolution
+
 ## References
 
 - **Extends**: [Issue 10: Daemon Testing](./completed/ISSUE_10_DAEMON_TESTING.md) - CLI tool foundation

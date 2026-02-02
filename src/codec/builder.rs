@@ -757,6 +757,7 @@ impl GraphBuilder {
                         path_update_count += 1
                     }
                     BeliefEvent::PathsRemoved(_, paths, _) => path_removed_count += paths.len(),
+                    BeliefEvent::FileParsed(_) => {} // Metadata only, handled by Transaction
                     BeliefEvent::BalanceCheck => {}
                     BeliefEvent::BuiltInTest => {}
                 }
@@ -1415,18 +1416,18 @@ impl GraphBuilder {
                     let mut cache_update =
                         BeliefBase::from(global_bb.eval_query(&query, false).await?);
 
-                    tracing::debug!(
-                        "[cache_fetch] global_bb result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
-                        cache_update.states().len(),
-                        cache_update.relations().as_graph().edge_count(),
-                        cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")
-                    );
+                    // tracing::debug!(
+                    //     "[cache_fetch] global_bb result has {} nodes and {} relations. About to check its balance. Nodes:\n\t{}",
+                    //     cache_update.states().len(),
+                    //     cache_update.relations().as_graph().edge_count(),
+                    //     cache_update.states().values().map(|n| format!("[{} - {}]", n.bid, n.title)).collect::<Vec<String>>().join("\n\t")
+                    // );
 
                     // Log PathMap state before attempting get
-                    tracing::debug!(
-                        "[cache_fetch] PathMap networks: {:?}",
-                        cache_update.paths().nets()
-                    );
+                    // tracing::debug!(
+                    //     "[cache_fetch] PathMap networks: {:?}",
+                    //     cache_update.paths().nets()
+                    // );
 
                     if let Some(cached_state) = cache_update.get(key) {
                         found_state = Some(cached_state);

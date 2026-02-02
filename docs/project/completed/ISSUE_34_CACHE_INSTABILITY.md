@@ -195,7 +195,7 @@ async fn eval_trace(&self, expr: &Expression, weight_filter: WeightSet)
 - All 5 equivalence tests passing
 - `cargo test --test belief_source_test` shows 5/5 passed
 
-### Phase 7: Manual Validation (~1 hour)
+### Phase 7: Manual Validation (~1 hour) Complete
 
 **Goal**: Verify cache stability in real-world usage
 
@@ -247,7 +247,7 @@ async fn eval_trace(&self, expr: &Expression, weight_filter: WeightSet)
 - [x] **StateIn equivalence**: Tests 1-3 all passing ✅
 - [x] **RelationIn equivalence**: Test 4 passing ✅
 - [x] **eval_trace equivalence**: Test 5 passing - schema column fix applied (Phase 6 ✅)
-- [ ] **Manual validation**: Stable cache with zero warnings (Phase 7 - REMAINING)
+- [ ] **Manual validation**: Stable cache with zero warnings (Phase 7 - ✅)
 
 ## Open Questions
 
@@ -268,18 +268,15 @@ async fn eval_trace(&self, expr: &Expression, weight_filter: WeightSet)
 - B) Add `noet cache validate --repair` command
 - C) Document "delete .noet/ if you see warnings"
 
-**Recommendation**: Option C for v0.1 (simple), Option B for v1.0 (production-ready).
+**Recommendation**: No action. There are no other users than the initial developer at the moment.
 
 ### Q3: Should BeliefGraph::is_balanced check for orphaned edges?
 
 **Context**: Currently `is_balanced()` only checks for external sinks
 
-**Recommendation**: Yes, add orphaned edge check:
-```rust
-pub fn is_balanced(&self) -> bool {
-    self.build_balance_expr().is_none() && self.find_orphaned_edges().is_empty()
-}
-```
+**Recommendation**: Yes, check_path_invariants checks this, and more.
+
+**Status** Complete, built_in_test checks for orphans now.
 
 ## Implementation Estimate
 
@@ -472,7 +469,7 @@ The planned implementation (load all relations, filter in-memory) was correct ar
 
 ## Next Session Plan
 
-### Phase 7: Manual Validation (~1 hour)
+### Phase 7: Manual Validation (~1 hour) (complete)
 
 **Goal**: Verify cache stability in real-world usage
 

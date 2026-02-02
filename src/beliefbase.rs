@@ -558,11 +558,11 @@ impl BeliefGraph {
             if self.states.contains_key(&source) || self.states.contains_key(&sink) {
                 if let BTreeEntry::Vacant(e) = self.states.entry(sink) {
                     if let Some(rhs_state) = rhs.states.get(&sink) {
-                        tracing::debug!(
-                            "Adding source {} {} to lhs",
-                            rhs_state.bid,
-                            rhs_state.display_title()
-                        );
+                        // tracing::debug!(
+                        //     "Adding source {} {} to lhs",
+                        //     rhs_state.bid,
+                        //     rhs_state.display_title()
+                        // );
                         e.insert(rhs_state.clone());
                     } else {
                         tracing::warn!("neither lhs or rhs contains node with sink id: {}", sink,);
@@ -570,11 +570,11 @@ impl BeliefGraph {
                 }
                 if let BTreeEntry::Vacant(e) = self.states.entry(source) {
                     if let Some(rhs_state) = rhs.states.get(&source) {
-                        tracing::debug!(
-                            "Adding source {} {} to lhs",
-                            rhs_state.bid,
-                            rhs_state.display_title()
-                        );
+                        // tracing::debug!(
+                        //     "Adding source {} {} to lhs",
+                        //     rhs_state.bid,
+                        //     rhs_state.display_title()
+                        // );
                         e.insert(rhs_state.clone());
                     } else {
                         tracing::warn!(
@@ -878,18 +878,12 @@ pub struct BeliefBase {
 
 impl From<BeliefGraph> for BeliefBase {
     fn from(beliefs: BeliefGraph) -> Self {
-        tracing::debug!(
-            "[BeliefBase::from(BeliefGraph)] Creating BeliefBase with {} states, {} edges",
-            beliefs.states.len(),
-            beliefs.relations.0.edge_count()
-        );
-        let result = BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false);
-        tracing::debug!(
-            "[BeliefBase::from(BeliefGraph)] PathMapMap created with {} network maps, {} total nets",
-            result.paths().map().len(),
-            result.paths().nets().len()
-        );
-        result
+        // tracing::debug!(
+        //     "[BeliefBase::from(BeliefGraph)] Creating BeliefBase with {} states, {} edges",
+        //     beliefs.states.len(),
+        //     beliefs.relations.0.edge_count()
+        // );
+        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false)
     }
 }
 
@@ -945,14 +939,15 @@ impl Clone for BeliefBase {
 ///   local path, title, bid, content summary, version control state, belief type
 /// - Creates typed belief-to-belief directional relationships between belief objects
 ///
-/// Static Invariants for a balanced BeliefBase (checked by BeliefBase::built_in_test):
+/// Static Invariants for a balanced BeliefBase (checked by [BeliefBase::built_in_test] and
+/// BeliefBase::check_path_invariants):
 ///
 /// 0. Each BeliefRelationKind sub-graph forms a directed acyclic graph. sub-graph cycles are not
 ///    supported.
 ///
-/// 1. All 'sinks' within the subsection sub-graph have:
+/// 1. All nodes within the relation hyper-graph have:
 ///
-///    0. A corresponding node and,
+///    0. A corresponding state ([crate::properties::BeliefNode]) and,
 ///
 ///    1. A corresponding API path.
 ///
@@ -967,10 +962,10 @@ impl Clone for BeliefBase {
 /// 1. The holder of a link is a 'sink' whereas the resource its accessing is the source. Parent ==
 ///    sink, child == source. In non-parent-child relationships this is intuitive, but it also makes
 ///    sense for subsections. In as the child contains its self state (source), and the parent is
-///    indexing its child relationships, so 'sinking'/consuming data from the child nodes.
+///    indexing its child relationships, so 'sinking'/consuming data from the child nodes. Think
+///    about the direction the information is flowing.
 ///
-/// 2. PathMaps identify how to acquire the source starting from
-///    known network locations.
+/// 2. PathMaps identify how to acquire the source starting from known network locations.
 impl BeliefBase {
     #[tracing::instrument]
     pub fn empty() -> BeliefBase {
@@ -1122,29 +1117,6 @@ impl BeliefBase {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.relations.read_arc()
-    }
-
-    /// Find BIDs referenced in relations but not present in states.
-    /// Returns a sorted, deduplicated list of orphaned BIDs.
-    ///
-    /// This is useful for detecting incomplete BeliefGraphs (e.g., from DbConnection)
-    /// where relations reference nodes that weren't loaded into states.
-    pub fn find_orphaned_edges(&self) -> Vec<Bid> {
-        let mut missing = Vec::new();
-        let relations = self.relations();
-        for edge in relations.as_graph().raw_edges() {
-            let source = relations.as_graph()[edge.source()];
-            let sink = relations.as_graph()[edge.target()];
-            if !self.states.contains_key(&source) {
-                missing.push(source);
-            }
-            if !self.states.contains_key(&sink) {
-                missing.push(sink);
-            }
-        }
-        missing.sort();
-        missing.dedup();
-        missing
     }
 
     pub fn get(&self, key: &NodeKey) -> Option<BeliefNode> {
@@ -1546,17 +1518,15 @@ impl BeliefBase {
             .filter_map(|b| self.paths().get_map(b))
             .collect::<Vec<ArcRwLockReadGuard<_, PathMap>>>();
 
-        let mut pathless_sinks = BTreeSet::default();
-        let mut nodeless_sinks = BTreeSet::default();
-        for (_source, sink, weight) in relations.as_graph().raw_edges().iter().map(|edge| {
-            (
-                relations.as_graph()[edge.source()],
-                relations.as_graph()[edge.target()],
-                &edge.weight,
-            )
-        }) {
-            if weight.get(&WeightKind::Section).is_some() && !self.states().contains_key(&sink) {
-                nodeless_sinks.insert(sink);
+        let mut pathless_nodes = BTreeSet::default();
+        let mut stateless_nodes = BTreeSet::default();
+        for bid in relations
+            .as_graph()
+            .node_indices()
+            .map(|node_idx| relations.as_graph()[node_idx])
+        {
+            if !self.states().contains_key(&bid) {
+                stateless_nodes.insert(bid);
             }
 
             // Check if this sink has a path to ANY API node (across all path maps)
@@ -1564,30 +1534,31 @@ impl BeliefBase {
             let paths_guard = self.paths();
             let has_api_path = api_net_guards
                 .iter()
-                .any(|pm_lock| pm_lock.path(&sink, &paths_guard).is_some());
+                .any(|pm_lock| pm_lock.path(&bid, &paths_guard).is_some());
 
             if !has_api_path {
-                pathless_sinks.insert(sink);
+                pathless_nodes.insert(bid);
             }
         }
-        if !nodeless_sinks.is_empty() {
+        if !stateless_nodes.is_empty() {
             errors.push(format!(
-                "[BeliefBase.built_in_test: invariant 1.0] subsection sinks must map to \
-                 a belief node. Nodes for the following sinks are missing:\n\t{}",
-                nodeless_sinks
+                "[BeliefBase.built_in_test: invariant 1.0] relation nodes must map to \
+                 a belief node. States for the following BIDs are missing:\n\t{}",
+                stateless_nodes
                     .iter()
                     .map(|b| b.to_string())
                     .collect::<Vec<String>>()
                     .join("\n\t")
             ));
         }
-        if !pathless_sinks.is_empty() {
+        if !pathless_nodes.is_empty() {
             errors.push(format!(
-                "[BeliefBase.built_in_test: invariant 1.1] relation sinks must have a path to \
-                 an API node (or be an API node themselves). Paths for the following sinks are missing:\n\
+                "[BeliefBase.built_in_test: invariant 1.1] relation nodes must have a path to \
+                 an API node (or be an API node themselves). Paths for the following nodes are \
+                 missing:\n\
                  \t{}\n\
                  set:\n{}",
-                pathless_sinks
+                pathless_nodes
                     .iter()
                     .map(|b| b.to_string())
                     .collect::<Vec<String>>()
@@ -1751,6 +1722,9 @@ impl BeliefBase {
                 // of remaining edges on the sink, ensuring contiguous sort indices [0..N)
                 let mut reindex_events = self.update_relation(*source, *sink, WeightSet::default());
                 derivative_events.append(&mut reindex_events);
+            }
+            BeliefEvent::FileParsed(_) => {
+                // Metadata only, handled by Transaction for mtime tracking
             }
             BeliefEvent::BalanceCheck => {
                 // Just run a quick check for balanceCheck operations, not a full built_in_test check
@@ -2369,6 +2343,21 @@ impl BeliefBase {
                         .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
                 )
             }
+            StatePred::NetPathIn(net) => {
+                let paths_guard = self.paths();
+                let path_bid_pairs = paths_guard
+                    .get_map(net)
+                    .map(|pm| {
+                        pm.all_net_paths(&paths_guard, &mut std::collections::BTreeSet::new())
+                    })
+                    .unwrap_or_default();
+                // Extract just the bids from (path, bid) tuples
+                let bids: Vec<Bid> = path_bid_pairs.iter().map(|(_path, bid)| *bid).collect();
+                BTreeMap::from_iter(
+                    bids.iter()
+                        .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
+                )
+            }
             StatePred::Title(net, title) => {
                 let paths_guard = self.paths();
                 let maybe_bid = paths_guard.get_map(net).and_then(|pm| {
@@ -2642,6 +2631,20 @@ impl BeliefSource for BeliefBase {
         Ok(self.evaluate_expression(expr))
     }
 
+    /// Get all paths for a network as (path, target_bid) pairs.
+    /// Useful for querying asset manifests or all documents in a network.
+    /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
+    async fn get_network_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        Ok(self
+            .paths()
+            .get_map(&network_bid)
+            .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
+            .unwrap_or_default())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn eval_trace(
         &self,
@@ -2656,6 +2659,17 @@ impl BeliefSource for &BeliefBase {
     #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
+    }
+
+    async fn get_network_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        Ok(self
+            .paths()
+            .get_map(&network_bid)
+            .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
+            .unwrap_or_default())
     }
 
     #[tracing::instrument(skip(self))]

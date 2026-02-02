@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
 use crate::{
     nodekey::NodeKey,
@@ -37,6 +38,8 @@ pub enum BeliefEvent {
     RelationChange(Bid, Bid, WeightKind, Option<Weight>, EventOrigin),
     /// Source, Sink relation removed
     RelationRemoved(Bid, Bid, EventOrigin),
+    /// File successfully parsed - track mtime for cache invalidation
+    FileParsed(PathBuf),
     /// A signal that the BeliefBase should be balanced at this point.
     BalanceCheck,
     /// A signal to run a full built in test.
@@ -72,6 +75,7 @@ impl PartialEq for BeliefEvent {
             (Self::RelationRemoved(l0, l1, l2), Self::RelationRemoved(r0, r1, r2)) => {
                 l0 == r0 && l1 == r1 && l2 == r2
             }
+            (Self::FileParsed(l0), Self::FileParsed(r0)) => l0 == r0,
             _ => false,
         }
     }
@@ -92,6 +96,7 @@ impl BeliefEvent {
             BeliefEvent::RelationUpdate(_, _, _, origin) => Some(*origin),
             BeliefEvent::RelationChange(_, _, _, _, origin) => Some(*origin),
             BeliefEvent::RelationRemoved(_, _, origin) => Some(*origin),
+            BeliefEvent::FileParsed(_) => None,
             BeliefEvent::BalanceCheck => None,
             BeliefEvent::BuiltInTest => None,
         }
@@ -115,6 +120,7 @@ impl BeliefEvent {
                 BeliefEvent::RelationChange(s, k, wk, p, new_origin)
             }
             BeliefEvent::RelationRemoved(s, k, _) => BeliefEvent::RelationRemoved(s, k, new_origin),
+            BeliefEvent::FileParsed(p) => BeliefEvent::FileParsed(p),
             BeliefEvent::BalanceCheck => BeliefEvent::BalanceCheck,
             BeliefEvent::BuiltInTest => BeliefEvent::BuiltInTest,
         }
@@ -133,6 +139,7 @@ impl Display for BeliefEvent {
             BeliefEvent::RelationUpdate(_, _, _, _) => write!(f, "RelationUpdate"),
             BeliefEvent::RelationChange(_, _, _, _, _) => write!(f, "RelationChange"),
             BeliefEvent::RelationRemoved(_, _, _) => write!(f, "RelationRemoved"),
+            BeliefEvent::FileParsed(_) => write!(f, "FileParsed"),
             BeliefEvent::BalanceCheck => write!(f, "BalanceCheck"),
             BeliefEvent::BuiltInTest => write!(f, "BuiltInTest"),
         }

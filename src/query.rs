@@ -4,6 +4,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     ops::Deref,
+    path::PathBuf,
 };
 
 use enumset::EnumSet;
@@ -311,6 +312,8 @@ pub enum StatePred {
     Kind(EnumSet<BeliefKind>),
     // Return node of the specified network path
     NetPath(Bid, String),
+    // Return all paths within a network
+    NetPathIn(Bid),
     // Return nodes containing a path that equals one of the predicate values
     Path(Vec<String>),
     // Return nodes who's payload or title matches the regex. Bid is the containing network.
@@ -337,6 +340,8 @@ impl StatePred {
             StatePred::Path(..) => false,
             // Path search needs to be handled separately
             StatePred::NetPath(..) => false,
+            // Path search needs to be handled separately
+            StatePred::NetPathIn(..) => false,
             // Title search needs to be handled separately
             StatePred::Title(..) => false,
             StatePred::Payload(key, re) => {
@@ -354,7 +359,7 @@ impl StatePred {
 impl AsSql for StatePred {
     fn build_query(&self, match_pred: bool, qb: &mut QueryBuilder<Sqlite>) {
         match self {
-            StatePred::Path(..) | StatePred::NetPath(..) => {
+            StatePred::Path(..) | StatePred::NetPath(..) | StatePred::NetPathIn(..) => {
                 qb.push(
                     "SELECT DISTINCT target as bid \
                      FROM paths \
@@ -406,6 +411,10 @@ impl AsSql for StatePred {
                 qb.push("path = ");
                 qb.push_bind(path.clone());
                 qb.push(" AND net = ");
+                qb.push_bind(net.to_string());
+            }
+            StatePred::NetPathIn(net) => {
+                qb.push("net = ");
                 qb.push_bind(net.to_string());
             }
             StatePred::Path(path_vec) => {
@@ -540,6 +549,14 @@ pub trait BeliefSource: Sync {
         expr: &Expression,
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
 
+    /// Get all paths for a network as (path, target_bid) pairs.
+    /// Useful for querying asset manifests or all documents in a network.
+    /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
+    fn get_network_paths(
+        &self,
+        _network_bid: Bid,
+    ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send;
+
     /// Evaluate an expression as a trace, marking nodes as Trace and only returning
     /// relations matching the provided weight filter. This prevents pulling in the
     /// entire graph during balance operations.
@@ -548,6 +565,16 @@ pub trait BeliefSource: Sync {
         expr: &Expression,
         weight_filter: WeightSet,
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
+
+    /// Get cached file modification times for cache invalidation.
+    /// Default implementation returns empty map (no cache invalidation support).
+    fn get_file_mtimes(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BTreeMap<PathBuf, i64>, BuildonomyError>> + Send
+    {
+        tracing::warn!("This BeliefSource impl does not have a get_file_mtime implementation!");
+        async { Ok(BTreeMap::new()) }
+    }
 
     fn eval_balanced(
         &self,

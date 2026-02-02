@@ -55,7 +55,8 @@
 //!     let cache = BeliefBase::default();
 //!
 //!     // Parse all documents (handles multi-pass resolution automatically)
-//!     let results = compiler.parse_all(cache).await?;
+//!     let force = false;
+//!     let results = compiler.parse_all(cache, force).await?;
 //!
 //!     // Access the accumulated graph
 //!     let belief_set = compiler.builder().session_bb();
@@ -79,7 +80,8 @@
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let mut compiler = DocumentCompiler::simple("./docs")?;
 //! # let cache = BeliefBase::default();
-//! # let results = compiler.parse_all(cache).await?;
+//! # let force = false;
+//! # let results = compiler.parse_all(cache, force).await?;
 //! for result in results {
 //!     for diagnostic in result.diagnostics {
 //!         match diagnostic {
@@ -115,7 +117,8 @@
 //! let mut compiler = DocumentCompiler::new("./docs", Some(tx), None, true)?;
 //!
 //! // Initial parse
-//! compiler.parse_all(cache.clone()).await?;
+//! let force = false;
+//! compiler.parse_all(cache.clone(), force).await?;
 //!
 //! // Watch for file changes
 //! watcher.watch(&PathBuf::from("./docs"), RecursiveMode::Recursive)?;

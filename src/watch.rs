@@ -243,7 +243,11 @@
 
 use crate::{
     beliefbase::BeliefGraph,
-    codec::{belief_ir::ProtoBeliefNode, compiler::DocumentCompiler, CodecMap},
+    codec::{
+        belief_ir::{detect_network_file, ProtoBeliefNode},
+        compiler::DocumentCompiler,
+        CodecMap,
+    },
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
@@ -500,18 +504,13 @@ impl WatchService {
 
         let compiler_ref = network_syncer.compiler.clone();
         let work_notifier = network_syncer.work_notifier.clone();
-        let debouncer_paused = network_syncer.debouncer_paused.clone();
+
+        let ignored_write_paths = network_syncer.ignored_write_paths.clone();
         let debouncer_codec_extensions = self.codecs.extensions();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
-                // Check if debouncer is paused (we're writing files)
-                if debouncer_paused.load(std::sync::atomic::Ordering::Relaxed) {
-                    tracing::debug!("[Debouncer] Paused, ignoring events");
-                    return;
-                }
-
                 tracing::info!("[FileUpdateSyncer Debouncer] processing debounce event");
                 match result {
                     Ok(events) => {
@@ -520,9 +519,8 @@ impl WatchService {
                                 EventKind::Create(_)
                                 | EventKind::Modify(_)
                                 | EventKind::Remove(_) => {
-                                    // Filter paths to only include:
-                                    // 1. Files with registered codec extensions (e.g., .md)
-                                    // 2. Files tracked in the asset manifest
+                                    // Filter paths to only include files with registered codec extensions
+                                    // Note: Assets are discovered and tracked during document parsing
                                     let sync_paths: Vec<&PathBuf> = event
                                         .paths
                                         .iter()
@@ -530,6 +528,26 @@ impl WatchService {
                                             // Only watch files, not directories
                                             if !p.is_file() {
                                                 return false;
+                                            }
+
+                                            // Skip paths we're currently writing to
+                                            // Normalize path to handle ./ and other variations
+                                            {
+                                                let normalized = match p.canonicalize() {
+                                                    Ok(canonical) => {
+                                                        tracing::trace!("[Debouncer] Normalized {:?} -> {:?}", p, canonical);
+                                                        canonical
+                                                    },
+                                                    Err(_) => {
+                                                        tracing::trace!("[Debouncer] Failed to normalize {:?}, using as-is", p);
+                                                        p.clone() // File might not exist yet, use as-is
+                                                    }
+                                                };
+                                                let ignored = ignored_write_paths.lock().unwrap();
+                                                if ignored.contains(&normalized) {
+                                                    tracing::debug!("[Debouncer] Ignoring write to {:?} (normalized: {:?}, compiler is writing)", p, normalized);
+                                                    return false;
+                                                }
                                             }
 
                                             // Check if extension is a registered codec
@@ -543,22 +561,7 @@ impl WatchService {
                                                 }
                                             }
 
-                                            // Check if this file is in the asset manifest
-                                            // Need to acquire read lock to check
-                                            while compiler_ref.is_locked() {
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(10),
-                                                );
-                                            }
-                                            let compiler = compiler_ref.read();
-                                            let manifest_arc = compiler.asset_manifest();
-                                            let manifest = manifest_arc.read();
-
-                                            // Check if absolute path is in manifest
-                                            // Manifest keys are repo-relative, so we need to check both
-                                            manifest
-                                                .keys()
-                                                .any(|asset_path| p.ends_with(asset_path))
+                                            false
                                         })
                                         .collect();
 
@@ -629,7 +632,7 @@ pub(crate) struct FileUpdateSyncer {
     pub compiler_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub work_notifier: Arc<tokio::sync::Notify>,
-    pub debouncer_paused: Arc<std::sync::atomic::AtomicBool>,
+    pub ignored_write_paths: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl FileUpdateSyncer {
@@ -651,8 +654,8 @@ impl FileUpdateSyncer {
         // Create notification channel for waking up compiler thread
         let work_notifier = Arc::new(tokio::sync::Notify::new());
 
-        // Flag to pause debouncer while we're writing files
-        let debouncer_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Set of paths to ignore in debouncer (files we're currently writing)
+        let ignored_write_paths = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
         // Create the compiler with the event channel and optional HTML output
         let compiler = Arc::new(RwLock::new(if let Some(html_dir) = html_output_dir {
@@ -676,6 +679,9 @@ impl FileUpdateSyncer {
         let compiler_ref = compiler.clone();
         let compiler_notifier = work_notifier.clone();
         let compiler_global_bb = global_bb.clone();
+
+        let compiler_ignored_paths = ignored_write_paths.clone();
+        let compiler_runtime = runtime.handle().clone();
         let transaction_events = Arc::new(RwLock::new(accum_rx));
         let transaction_global_bb = global_bb.clone();
         let transaction_tx = tx.clone();
@@ -683,6 +689,29 @@ impl FileUpdateSyncer {
         // doc_compiler thread
         let compiler_handle = runtime.spawn(async move {
             tracing::info!("[DocumentCompiler] Starting compiler thread");
+
+            // Check for stale files before starting the main loop
+            // This ensures modified files are re-parsed on watch service startup
+            {
+                let mut compiler_write = compiler_ref.write_arc();
+                match compiler_write.check_stale_files(&compiler_global_bb, false).await {
+                    Ok(stale_files) => {
+                        if !stale_files.is_empty() {
+                            tracing::info!(
+                                "[DocumentCompiler] Found {} stale files to re-parse",
+                                stale_files.len()
+                            );
+                            for stale_file in stale_files {
+                                compiler_write.reset_processed(&stale_file);
+                                compiler_write.enqueue(&stale_file);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[DocumentCompiler] Failed to check stale files: {}", e);
+                    }
+                }
+            }
 
             loop {
                 // Wait for notification that work is available
@@ -733,6 +762,54 @@ impl FileUpdateSyncer {
                                 result.path
                             );
 
+                            // Add this path to ignore list temporarily (we may have written to it)
+                            // Normalize path to handle ./ and other variations in file watcher events
+                            // For BeliefNetwork directories, resolve to the actual file path
+                            {
+                                let mut path_to_ignore = result.path.clone();
+
+                                // If path is a directory, it might be a BeliefNetwork directory
+                                if path_to_ignore.is_dir() {
+                                    if let Some((network_file_path, _format)) = detect_network_file(&path_to_ignore) {
+                                        tracing::trace!("[DocumentCompiler] Resolved BeliefNetwork directory {:?} -> file {:?}", path_to_ignore, network_file_path);
+                                        path_to_ignore = network_file_path;
+                                    }
+                                }
+
+                                let normalized_path = match path_to_ignore.canonicalize() {
+                                    Ok(canonical) => {
+                                        tracing::trace!("[DocumentCompiler] Normalized {:?} -> {:?}", path_to_ignore, canonical);
+                                        canonical
+                                    },
+                                    Err(_) => {
+                                        tracing::trace!("[DocumentCompiler] Failed to normalize {:?}, using as-is", path_to_ignore);
+                                        path_to_ignore.clone() // File might not exist, use as-is
+                                    }
+                                };
+                                let mut ignored = compiler_ignored_paths.lock().unwrap();
+                                ignored.insert(normalized_path.clone());
+                                tracing::debug!("[DocumentCompiler] Ignoring writes to {:?} (normalized from {:?}) for 3s", normalized_path, result.path);
+                            }
+
+                            // Spawn task to remove path from ignore list after delay
+                            let mut path_for_removal = result.path.clone();
+                            if path_for_removal.is_dir() {
+                                if let Some((network_file_path, _format)) = detect_network_file(&path_for_removal) {
+                                    path_for_removal = network_file_path;
+                                }
+                            }
+                            let path_to_remove = match path_for_removal.canonicalize() {
+                                Ok(canonical) => canonical,
+                                Err(_) => path_for_removal,
+                            };
+                            let ignored_paths_clone = compiler_ignored_paths.clone();
+                            compiler_runtime.spawn(async move {
+                                sleep(Duration::from_millis(3000)).await;
+                                let mut ignored = ignored_paths_clone.lock().unwrap();
+                                ignored.remove(&path_to_remove);
+                                tracing::debug!("[DocumentCompiler] No longer ignoring writes to {:?}", path_to_remove);
+                            });
+
                             // Note: DocumentCompiler handles writing when created with write=true
                             // We don't write here to avoid duplicate writes
 
@@ -773,7 +850,27 @@ impl FileUpdateSyncer {
                                     sleep(Duration::from_millis(100)).await;
                                 }
                                 let compiler_read = compiler_ref.read_arc();
-                                compiler_read.finish_parse_session().await;
+
+                                // Generate network index pages
+                                if let Err(e) = compiler_read.generate_network_indices().await {
+                                    tracing::warn!("[WatchService] Failed to generate network indices: {}", e);
+                                }
+
+                                // Create asset hardlinks if HTML output is configured
+                                if let Some(html_dir) = compiler_read.html_output_dir() {
+                                    // Query cache for asset manifest
+                                    let asset_manifest: std::collections::BTreeMap<String, crate::properties::Bid> =
+                                        compiler_global_bb
+                                            .get_network_paths(crate::properties::asset_namespace())
+                                            .await
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .collect();
+
+                                    if let Err(e) = compiler_read.create_asset_hardlinks(html_dir, &asset_manifest).await {
+                                        tracing::warn!("[WatchService] Failed to create asset hardlinks: {}", e);
+                                    }
+                                }
                             }
 
                             // Break inner loop to wait for next notification
@@ -831,7 +928,7 @@ impl FileUpdateSyncer {
             compiler_handle,
             transaction_handle,
             work_notifier: work_notifier.clone(),
-            debouncer_paused,
+            ignored_write_paths,
         };
 
         // Trigger initial notification since files may already be enqueued

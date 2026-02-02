@@ -364,6 +364,9 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
         BeliefEvent::BalanceCheck => {
             println!("  [BalanceCheck]");
         }
+        BeliefEvent::FileParsed(path) => {
+            println!("  [FileParse] {:?}", path);
+        }
         BeliefEvent::BuiltInTest => {
             println!("  [BuiltInTest]");
         }

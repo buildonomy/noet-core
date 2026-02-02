@@ -284,11 +284,11 @@ pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, Buildonom
 impl PathMapMap {
     #[tracing::instrument(skip(states, relations))]
     pub fn new(states: &BTreeMap<Bid, BeliefNode>, relations: Arc<RwLock<BidGraph>>) -> PathMapMap {
-        tracing::debug!(
-            "[PathMapMap::new] Creating PathMapMap with {} states, {} relations",
-            states.len(),
-            relations.read_arc().as_graph().edge_count()
-        );
+        // tracing::debug!(
+        //     "[PathMapMap::new] Creating PathMapMap with {} states, {} relations",
+        //     states.len(),
+        //     relations.read_arc().as_graph().edge_count()
+        // );
         let mut pmm = PathMapMap {
             relations: relations.clone(),
             ..Default::default()
@@ -314,12 +314,6 @@ impl PathMapMap {
         pmm.nets.insert(pmm.api());
         pmm.nets.insert(asset_namespace());
         pmm.nets.insert(href_namespace());
-
-        tracing::debug!(
-            "[PathMapMap::new] Found {} networks: {:?}",
-            pmm.nets.len(),
-            pmm.nets
-        );
 
         // Check for states vs relations mismatch
         let states_bids: std::collections::BTreeSet<_> = states.keys().copied().collect();
@@ -355,19 +349,19 @@ impl PathMapMap {
         for net in pmm.nets.iter() {
             if !pmm.map.contains_key(net) {
                 let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
-                tracing::debug!(
-                    "[PathMapMap::new] Created PathMap for network {}: {} entries",
-                    net,
-                    pm.map().len()
-                );
+                // tracing::debug!(
+                //     "[PathMapMap::new] Created PathMap for network {}: {} entries",
+                //     net,
+                //     pm.map().len()
+                // );
                 pmm.map.insert(*net, Arc::new(RwLock::new(pm)));
             }
         }
 
-        tracing::debug!(
-            "[PathMapMap::new] Completed PathMapMap with {} network maps",
-            pmm.map.len()
-        );
+        // tracing::debug!(
+        //     "[PathMapMap::new] Completed PathMapMap with {} network maps",
+        //     pmm.map.len()
+        // );
         pmm
     }
 
@@ -764,26 +758,7 @@ impl PathMap {
         // before inserting those stacks into the tree.
         let tree_graph = {
             let relations = relations.read_arc();
-            let subgraph = relations.as_subgraph(kind, true);
-
-            // Check if the network node is in the relations graph
-            let net_in_graph = relations
-                .as_graph()
-                .node_indices()
-                .any(|idx| relations.as_graph()[idx] == net);
-
-            tracing::debug!(
-                "[PathMap::new] Building PathMap for network {}, kind={:?}. Relations graph has {} total edges, subgraph has {} nodes and {} edges. Network node {} in graph: {}",
-                net,
-                kind,
-                relations.as_graph().edge_count(),
-                subgraph.node_count(),
-                subgraph.edge_count(),
-                net,
-                net_in_graph
-            );
-
-            subgraph
+            relations.as_subgraph(kind, true)
         };
         let mut stack =
             BTreeMap::<Bid, (BTreeSet<Bid>, BTreeMap<Bid, (Vec<u16>, Vec<String>)>)>::new();
@@ -913,12 +888,12 @@ impl PathMap {
             .remove(&net)
             .expect("To always discover the PathMap net in the DFS search");
 
-        tracing::debug!(
-            "[PathMap::new] DFS completed for network {}. Found {} paths in inverted_path_map, {} loops detected",
-            net,
-            inverted_path_map.len(),
-            loops.len()
-        );
+        // tracing::debug!(
+        //     "[PathMap::new] DFS completed for network {}. Found {} paths in inverted_path_map, {} loops detected",
+        //     net,
+        //     inverted_path_map.len(),
+        //     loops.len()
+        // );
 
         let mut map = Vec::from_iter(
             vec![(String::from(""), net, Vec::<u16>::default())]
