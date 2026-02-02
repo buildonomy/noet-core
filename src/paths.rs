@@ -342,11 +342,13 @@ impl PathMapMap {
             );
         }
         if !in_relations_not_states.is_empty() {
-            tracing::warn!(
-                "[PathMapMap::new] {} nodes in relations but NOT in states: {:?}",
+            tracing::error!(
+                "[PathMapMap::new] ISSUE 34 VIOLATION: {} nodes in relations but NOT in states! \
+                 DbConnection.eval_unbalanced/eval_trace should have loaded these. Sample: {:?}",
                 in_relations_not_states.len(),
                 in_relations_not_states.iter().take(5).collect::<Vec<_>>()
             );
+            // Continue with graceful degradation - PathMap will skip orphaned nodes
         }
 
         pmm.map.clear();

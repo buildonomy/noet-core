@@ -2,8 +2,8 @@ use crate::{
     beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     error::BuildonomyError,
     event::BeliefEvent,
-    properties::{BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
-    query::{push_string_expr, AsSql, BeliefSource, Expression},
+    properties::{BeliefKind, BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
+    query::{push_string_expr, AsSql, BeliefSource, Expression, StatePred},
 };
 use futures_core::future::BoxFuture;
 use sqlx::Execute;
@@ -199,7 +199,7 @@ impl<'a> Transaction<'a> {
         } else {
             self.qb.push(
                 "INSERT OR REPLACE INTO relations \
-                 (sink, source, epistemic, subsection, pragmatic) ",
+                 (sink, source, epistemic, section, pragmatic) ",
             );
             self.qb.push_values(
                 vec![(source, sink, weight_set)],
@@ -251,13 +251,14 @@ impl DbConnection {
         qb.push(") GROUP BY bid");
         let state_query = qb.build_query_as::<BeliefNode>();
         let state_sql = state_query.sql();
-        // tracing::debug!("SQL: {}", state_sql);
-        Ok(state_query
+        tracing::debug!("[get_states] SQL: {}", state_sql);
+
+        let results = state_query
             .fetch_all(&self.0)
             .await
             .map_err(|e| {
                 tracing::error!(
-                    "[DbConnection.eval_unbalanced] SQL error processing \
+                    "[DbConnection.get_states] SQL error processing \
                     state_query '{}'\n\terror: {}",
                     state_sql,
                     e
@@ -266,7 +267,15 @@ impl DbConnection {
             })?
             .into_iter()
             .map(|s| (s.bid, s))
-            .collect::<BTreeMap<Bid, BeliefNode>>())
+            .collect::<BTreeMap<Bid, BeliefNode>>();
+
+        tracing::debug!(
+            "[get_states] Query for {:?} returned {} results",
+            expr,
+            results.len()
+        );
+
+        Ok(results)
     }
 
     pub async fn is_db_balanced(&self) -> Result<(), BuildonomyError> {
@@ -316,27 +325,39 @@ impl BeliefSource for DbConnection {
     /// using and is used by other beliefs.
     #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
-        let states = self.get_states(expr).await?;
+        let mut states = self.get_states(expr).await?;
         tracing::debug!(
             "[DbConnection.eval_unbalanced] Query returned {} states for expr: {:?}",
             states.len(),
             expr
         );
+
+        // For RelationIn queries, mark all nodes as Trace (matches BeliefBase behavior)
+        // because we don't guarantee complete relation sets for returned nodes
+        let is_relation_query = matches!(expr, Expression::RelationIn(_));
+        if is_relation_query {
+            for node in states.values_mut() {
+                node.kind.insert(BeliefKind::Trace);
+            }
+        }
+
         let relations = match !states.is_empty() {
             false => BidGraph::default(),
             true => {
-                // start the query builder over
+                // ISSUE 34 FIX: Use single query with OR to avoid duplicates
+                // Previously used two separate queries (sink IN + source IN) and appended,
+                // which caused duplicates when both source and sink were in result set
                 let state_set = states
                     .keys()
                     .map(|bid| format!("\"{bid}\""))
                     .collect::<Vec<String>>()
                     .join(", ");
                 let mut qb = QueryBuilder::new(&format!(
-                    "SELECT * FROM relations WHERE sink IN ({state_set});"
+                    "SELECT * FROM relations WHERE sink IN ({state_set}) OR source IN ({state_set});"
                 ));
                 let relation_query = qb.build_query_as::<BeliefRelation>();
                 let relation_sql = relation_query.sql();
-                let mut relation_vec: Vec<BeliefRelation> =
+                let relation_vec: Vec<BeliefRelation> =
                     relation_query.fetch_all(&self.0).await.map_err(|e| {
                         tracing::error!(
                             "[DbConnection.eval_unbalanced] SQL error processing \
@@ -346,22 +367,6 @@ impl BeliefSource for DbConnection {
                         );
                         e
                     })?;
-
-                qb = QueryBuilder::new(&format!(
-                    "SELECT * FROM relations WHERE source IN ({state_set});"
-                ));
-                let relation_query = qb.build_query_as::<BeliefRelation>();
-                let relation_sql = relation_query.sql();
-                let mut source_side = relation_query.fetch_all(&self.0).await.map_err(|e| {
-                    tracing::error!(
-                        "[DbConnection.eval_unbalanced] SQL error processing \
-                        relation_query '{}'\n\terror: {}",
-                        relation_sql,
-                        e
-                    );
-                    e
-                })?;
-                relation_vec.append(&mut source_side);
                 let relations_graph = BidGraph::from_edges(relation_vec.into_iter());
                 tracing::debug!(
                     "[DbConnection.eval_unbalanced] Loaded {} edges from DB for {} states",
@@ -371,6 +376,29 @@ impl BeliefSource for DbConnection {
                 relations_graph
             }
         };
+
+        // ISSUE 34 FIX: Check for orphaned edges and load missing nodes
+        let temp_graph = BeliefGraph {
+            states: states.clone(),
+            relations: relations.clone(),
+        };
+        let missing = temp_graph.find_orphaned_edges();
+
+        if !missing.is_empty() {
+            tracing::debug!(
+                "[DbConnection.eval_unbalanced] Loading {} missing nodes to complete graph",
+                missing.len()
+            );
+            let missing_expr = Expression::StateIn(StatePred::Bid(missing));
+            let mut missing_states = self.get_states(&missing_expr).await?;
+
+            // Mark missing nodes as Trace (incomplete relation set)
+            for node in missing_states.values_mut() {
+                node.kind.insert(BeliefKind::Trace);
+            }
+
+            states.extend(missing_states);
+        }
 
         tracing::debug!(
             "[DbConnection.eval_unbalanced] Returning BeliefGraph with {} states, {} edges",
@@ -384,7 +412,13 @@ impl BeliefSource for DbConnection {
         expr: &Expression,
         weight_filter: WeightSet,
     ) -> Result<BeliefGraph, BuildonomyError> {
-        let states = self.get_states(expr).await?;
+        let mut states = self.get_states(expr).await?;
+
+        // Mark all queried states as Trace (matches BeliefBase::evaluate_expression_as_trace)
+        for node in states.values_mut() {
+            node.kind.insert(BeliefKind::Trace);
+        }
+
         let relations = match !states.is_empty() {
             false => BidGraph::default(),
             true => {
@@ -400,7 +434,7 @@ impl BeliefSource for DbConnection {
                     kind_q.push(format!("{column_name} IS NOT NULL",));
                 }
                 let mut qb = QueryBuilder::new(&format!(
-                    "SELECT * FROM relations WHERE sink IN ({}) AND {};",
+                    "SELECT * FROM relations WHERE source IN ({}) AND {};",
                     state_set,
                     kind_q.join(" AND ")
                 ));
@@ -419,6 +453,34 @@ impl BeliefSource for DbConnection {
                 BidGraph::from_edges(relation_vec.into_iter())
             }
         };
+
+        // ISSUE 34 FIX: Load missing sink nodes (matches BeliefBase::evaluate_expression_as_trace)
+        // eval_trace only loads downstream relations (WHERE source IN), so we need to add missing sinks
+        let missing_sinks: Vec<Bid> = relations
+            .as_graph()
+            .raw_edges()
+            .iter()
+            .map(|edge| relations.as_graph()[edge.target()])
+            .filter(|bid| !states.contains_key(bid))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        if !missing_sinks.is_empty() {
+            tracing::debug!(
+                "[DbConnection.eval_trace] Loading {} missing sink nodes to complete graph",
+                missing_sinks.len()
+            );
+            let missing_expr = Expression::StateIn(StatePred::Bid(missing_sinks));
+            let mut missing_states = self.get_states(&missing_expr).await?;
+
+            // Mark missing nodes as Trace
+            for node in missing_states.values_mut() {
+                node.kind.insert(BeliefKind::Trace);
+            }
+
+            states.extend(missing_states);
+        }
 
         Ok(BeliefGraph { states, relations })
     }
@@ -489,7 +551,7 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
             description: "create_initial_tables",
             sql: "\
             CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
-            CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, subsection TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
+            CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, section TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
             CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path));",
             kind: MigrationType::ReversibleUp,
         }

@@ -1179,15 +1179,12 @@ impl DocCodec for MdCodec {
             }
         }
 
-        if frontmatter_changed.is_some() || sections_metadata_merged || id_changed {
-            let metadata_string = if current_events
-                .iter()
-                .any(|e| matches!(e.0, MdEvent::Start(MdTag::Heading { .. })))
-            {
-                proto_events.0.as_subsection()
-            } else {
-                proto_events.0.as_frontmatter()
-            };
+        // Only update frontmatter for document nodes (heading == 2), never for section nodes (heading > 2)
+        // Section metadata stays in document-level "sections" table (Issue 02)
+        if (frontmatter_changed.is_some() || sections_metadata_merged || id_changed)
+            && proto_events.0.heading == 2
+        {
+            let metadata_string = proto_events.0.as_frontmatter();
             update_or_insert_frontmatter(&mut current_events, &metadata_string)?;
         }
 
@@ -1427,61 +1424,87 @@ impl DocCodec for MdCodec {
     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
         let mut modified_nodes = Vec::new();
 
+        // Step 1: Build sections table from all section nodes (heading > 2)
+        // This happens AFTER all inject_context() calls, so sections have BIDs
+        let mut sections_table = toml_edit::Table::new();
+
+        for (section_proto, _) in self.current_events.iter().skip(1) {
+            // Skip document node (index 0), collect section nodes (heading > 2)
+            if section_proto.heading > 2 {
+                if let Some(section_id) = section_proto.id.as_ref() {
+                    let mut section_metadata = toml_edit::Table::new();
+
+                    // Always include BID (required)
+                    if let Some(bid) = section_proto.document.get("bid") {
+                        section_metadata.insert("bid", bid.clone());
+                    }
+
+                    // Include ID (for lookup)
+                    section_metadata.insert("id", value(section_id.clone()));
+
+                    // Include schema if present
+                    if let Some(schema) = section_proto.document.get("schema") {
+                        section_metadata.insert("schema", schema.clone());
+                    }
+
+                    // Include any other metadata fields (excluding internal fields)
+                    for (key, val) in section_proto.document.iter() {
+                        if !matches!(key, "bid" | "id" | "title" | "text" | "schema" | "heading") {
+                            section_metadata.insert(key, val.clone());
+                        }
+                    }
+
+                    sections_table.insert(section_id, toml_edit::Item::Table(section_metadata));
+                }
+            }
+        }
+
+        // Step 2: Update document's sections field and handle garbage collection
         // Access document node (always at index 0) to check for unmatched sections
         if let Some(doc_proto) = self.current_events.first_mut() {
-            if let Some(sections_item) = doc_proto.0.document.get("sections") {
-                // Collect all section keys from the frontmatter (both NodeKey and original string)
-                let mut all_section_keys = HashMap::new();
-                if let Some(table) = sections_item.as_table() {
-                    for (key_str, _) in table.iter() {
-                        if let Ok(node_key) = NodeKey::from_str(key_str) {
-                            all_section_keys.insert(node_key, key_str.to_string());
-                        }
+            // Compare built sections table with existing sections in frontmatter
+            let existing_sections = doc_proto.0.document.get("sections");
+            let needs_update = if !sections_table.is_empty() {
+                match existing_sections {
+                    Some(existing) => {
+                        // Compare by converting to strings
+                        let existing_str = existing.to_string();
+                        let new_str = toml_edit::Item::Table(sections_table.clone()).to_string();
+                        existing_str != new_str
                     }
+                    None => true, // No existing sections, need to add
+                }
+            } else {
+                // No sections in markdown, check if we need to remove existing sections
+                existing_sections.is_some()
+            };
+
+            if needs_update {
+                // Update or remove sections field
+                if !sections_table.is_empty() {
+                    doc_proto
+                        .0
+                        .document
+                        .insert("sections", toml_edit::Item::Table(sections_table));
+                } else {
+                    // No sections in markdown, remove sections field
+                    doc_proto.0.document.remove("sections");
                 }
 
-                // Calculate unmatched sections (keys in frontmatter but not matched to headings)
-                let unmatched: Vec<(NodeKey, String)> = all_section_keys
-                    .iter()
-                    .filter(|(node_key, _)| !self.matched_sections.contains(node_key))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                // Update the frontmatter events with the modified document
+                let metadata_string = doc_proto.0.as_frontmatter();
+                update_or_insert_frontmatter(&mut doc_proto.1, &metadata_string)?;
 
-                // Log and remove unmatched sections (garbage collection)
-                if !unmatched.is_empty() {
-                    for (unmatched_key, _) in &unmatched {
-                        tracing::info!(
-                            "Garbage collecting unmatched section (heading removed from markdown): {:?}",
-                            unmatched_key
+                // Document was modified, need to create updated BeliefNode
+                match BeliefNode::try_from(&doc_proto.0) {
+                    Ok(updated_node) => {
+                        modified_nodes.push((doc_proto.0.clone(), updated_node));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to convert modified document node to BeliefNode: {:?}",
+                            e
                         );
-                    }
-
-                    // Remove unmatched sections from the document's sections table
-                    // Use the original TOML key string, not NodeKey::to_string()
-                    if let Some(sections_table) = doc_proto.0.document.get_mut("sections") {
-                        if let Some(table) = sections_table.as_table_mut() {
-                            for (_unmatched_key, original_key_str) in &unmatched {
-                                table.remove(original_key_str);
-                            }
-                        }
-                    }
-
-                    // Update the frontmatter events with the modified document
-                    let metadata_string = doc_proto.0.as_frontmatter();
-                    update_or_insert_frontmatter(&mut doc_proto.1, &metadata_string)?;
-
-                    // Document was modified, need to create updated BeliefNode
-                    // Convert ProtoBeliefNode to BeliefNode for the modified document
-                    match BeliefNode::try_from(&doc_proto.0) {
-                        Ok(updated_node) => {
-                            modified_nodes.push((doc_proto.0.clone(), updated_node));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to convert modified document node to BeliefNode: {:?}",
-                                e
-                            );
-                        }
                     }
                 }
             }

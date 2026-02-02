@@ -156,6 +156,94 @@ We could put this information into the asset node, that would trigger a node upd
 downstream consumers would be notified of. It would result in less document churn as well, because
 we wouldn't need to regenerate reference "brefs" all over the place.
 
+## BeliefBase Trait Abstraction for Zero-Copy Graph Operations
+
+**Priority**: LOW - Code quality improvement
+
+**Context**: `BeliefBase` has `states` (direct field) and `relations` (behind `Arc<RwLock<>>`). Currently, to call `BeliefGraph` methods on a `BeliefBase`, we clone via `From<&BeliefBase> for BeliefGraph`. This is wasteful for read-only operations like `find_orphaned_edges()`.
+
+### Option 1: Direct Implementation (Current Workaround)
+- Duplicate methods on both `BeliefBase` and `BeliefGraph`
+- Simple but violates DRY principle
+- Example: `find_orphaned_edges()` duplicated across both types
+
+### Option 2: Trait-Based Abstraction (Recommended)
+Define a trait that both types implement with default implementations:
+
+```rust
+pub trait HasBeliefData {
+    fn get_states(&self) -> &BTreeMap<Bid, BeliefNode>;
+    fn get_relations_graph(&self) -> impl Deref<Target = BidGraph>;
+    
+    // Default implementations for shared methods
+    fn find_orphaned_edges(&self) -> Vec<Bid> { /* ... */ }
+    fn is_empty(&self) -> bool { /* ... */ }
+    fn build_balance_expr(&self) -> Option<Expression> { /* ... */ }
+    // etc.
+}
+
+impl HasBeliefData for BeliefGraph { /* ... */ }
+impl HasBeliefData for BeliefBase { /* ... */ }
+```
+
+**Benefits**:
+- Zero-copy access to graph operations from BeliefBase
+- No code duplication for read-only graph methods
+- Single source of truth for shared algorithms
+- Can be used in generic contexts: `fn analyze<T: HasBeliefData>(data: &T)`
+
+**Considerations**:
+- Requires Rust 1.75+ for `impl Trait` in trait return position
+- Trait methods slightly less discoverable than direct methods
+- Need to import trait to use default methods
+
+**Alternative Considered**: `BeliefGraphRef<'a>` wrapper type with borrowed data - rejected as more complex with limited benefit over trait approach.
+
+**Related**: Used in `built_in_test()` to check for orphaned edges without cloning entire graph.
+
+## beliefbase.rs Module Splitting
+
+**Priority**: MEDIUM - Code maintainability improvement
+
+**Context**: `src/beliefbase.rs` is 3000+ lines and contains multiple distinct concerns. Should be split into separate module files for better organization.
+
+### Suggested Module Structure
+
+```
+src/beliefbase/
+├── mod.rs           - Public API, re-exports
+├── graph.rs         - BidGraph, BidRefGraph, BeliefGraph (lines 31-843)
+├── base.rs          - BeliefBase implementation (lines 868-2614)
+├── context.rs       - BeliefContext, ExtendedRelation (lines 281-385)
+├── ops.rs           - Set operations (union, intersection, etc.)
+├── query.rs         - Expression evaluation (evaluate_expression, etc.)
+└── tests.rs         - Test module (lines 2649-3003)
+```
+
+**Logical Groupings**:
+1. **Graph types** (`graph.rs`): BidGraph, BidRefGraph, BeliefGraph - pure data structures
+2. **Base implementation** (`base.rs`): BeliefBase with indices and synchronization
+3. **Context types** (`context.rs`): View types for navigating belief relationships
+4. **Operations** (`ops.rs`): Set algebra methods (union, diff, etc.)
+5. **Query evaluation** (`query.rs`): Expression evaluation and filtering
+6. **Tests** (`tests.rs`): Module tests
+
+**Benefits**:
+- Easier navigation and comprehension
+- Clearer separation of concerns
+- Faster compile times (parallel compilation of modules)
+- Reduced merge conflicts when multiple people work on beliefbase
+- Better test organization
+
+**Migration Path**:
+1. Create `src/beliefbase/` directory
+2. Move logical sections to separate files
+3. Use `pub(crate)` for internal APIs
+4. Update `mod.rs` with `pub use` re-exports to maintain API compatibility
+5. Verify all tests pass
+6. Update documentation references
+
+**Similar**: Other large modules to consider splitting: `codec/builder.rs` (1800+ lines), `paths.rs` (1100+ lines)
 
 ## Notes
 
