@@ -880,6 +880,13 @@ impl ProtoBeliefNode {
             changed = true;
         }
 
+        // Merge id field - this is critical for collision detection
+        // If other.id is None, it means the ID was cleared due to collision
+        if self.id != other.id {
+            self.id = other.id.clone();
+            changed = true;
+        }
+
         changed
     }
 

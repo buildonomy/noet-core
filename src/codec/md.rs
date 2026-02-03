@@ -1102,48 +1102,34 @@ impl DocCodec for MdCodec {
         let mut id_changed = false;
         if proto_events.0.heading > 2 {
             // This is a heading node (not document)
-            if let Some(current_id) = proto_events.0.id.as_ref() {
-                // Check for network-level collision
-                let net = ctx.home_net;
+            // Use ctx.node.id (which has collision-corrected value from push)
+            // Fall back to Bref if None (collision detected)
+            let final_id = ctx
+                .node
+                .id
+                .clone()
+                .unwrap_or_else(|| ctx.node.bid.namespace().to_string());
 
-                // Check if this ID already exists in the network PathMap
-                if let Some(existing_bid) =
-                    ctx.belief_set().paths().net_get_from_id(&net, current_id)
-                {
-                    // Collision detected if the existing node is different from current node
-                    if existing_bid.1 != ctx.node.bid {
-                        tracing::info!(
-                            "Network-level ID collision detected: '{}' already used by another node. Removing ID.",
-                            current_id
-                        );
-                        proto_events.0.id = None;
-                        id_changed = true;
-                    }
-                }
-
-                // Generate Bref for collision cases where id was set to None at parse time
-                // At parse time, we detected collision but couldn't generate Bref (no BID yet)
-                // Now we have the real BID from push(), so generate the proper Bref
-                if proto_events.0.id.is_none() {
-                    let real_bref = ctx.node.bid.namespace().to_string();
-                    tracing::debug!(
-                        "Collision detected at parse time, generating Bref '{}' for heading '{}'",
-                        real_bref,
-                        proto_events
-                            .0
-                            .document
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<untitled>")
-                    );
-                    proto_events.0.id = Some(real_bref);
-                    id_changed = true;
-                }
+            // Store the final ID in the proto
+            if proto_events.0.id.as_deref() != Some(&final_id) {
+                tracing::debug!(
+                    "Setting section ID: proto.id={:?} -> final_id='{}' for title='{}'",
+                    proto_events.0.id,
+                    final_id,
+                    proto_events
+                        .0
+                        .document
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<untitled>")
+                );
+                proto_events.0.id = Some(final_id);
+                id_changed = true;
             }
 
             // Inject ID into heading event if it differs from original
-            // Find the original ID from the heading event
-            let original_event_id = proto_events.1.iter().find_map(|(event, _)| {
+            // Find the original ID from the heading event (check current_events, not proto_events.1)
+            let original_event_id = current_events.iter().find_map(|(event, _)| {
                 if let MdEvent::Start(MdTag::Heading { id, .. }) = event {
                     id.as_ref().map(|s| s.to_string())
                 } else {
@@ -1152,22 +1138,21 @@ impl DocCodec for MdCodec {
             });
 
             // Determine if we need to inject
-            let needs_injection = if proto_events.0.id.as_ref() != original_event_id.as_ref() {
-                // ID changed (normalized, collision-resolved, or added)
-                true
-            } else {
-                false
-            };
+            let needs_injection = proto_events.0.id.as_ref() != original_event_id.as_ref();
 
             if needs_injection {
-                // Mutate heading event to inject final ID
-                for (event, _range) in proto_events.1.iter_mut() {
+                // Mutate heading event to inject final ID and clear range
+                // Clearing the range forces cmark_resume to use event data instead of source
+                // IMPORTANT: Modify current_events, not proto_events.1 (which was taken via mem::take)
+                for (event, range) in current_events.iter_mut() {
                     if let MdEvent::Start(MdTag::Heading { id, .. }) = event {
                         *id = proto_events.0.id.as_ref().map(|s| CowStr::from(s.clone()));
-                        id_changed = true;
+                        *range = None; // Clear range to force writing modified ID
                         break;
                     }
                 }
+                // Set id_changed after injection to trigger text regeneration
+                id_changed = true;
             }
 
             // Store ID in document for BeliefNode conversion
@@ -1602,7 +1587,7 @@ impl DocCodec for MdCodec {
                         }
                     };
                 }
-                MdEvent::Text(cow_str) => {
+                MdEvent::Text(cow_str) | MdEvent::InlineHtml(cow_str) | MdEvent::Code(cow_str) => {
                     if !current.document.contains_key("title") || current.content.is_empty() {
                         if let Some(accum_string_ref) = current.accumulator.as_mut() {
                             *accum_string_ref += " ";
@@ -2462,6 +2447,173 @@ More content.
 
         // The actual test is that update_or_insert_frontmatter doesn't panic or warn
         // This is implicitly tested by the watch service integration tests
+    }
+
+    #[test]
+    fn test_inline_html_code_in_heading_generates_id() {
+        use crate::codec::DocCodec;
+        use toml_edit::DocumentMut;
+
+        let markdown = r#"### <Method Title>
+
+Content under method title.
+
+### Using `code` in Title
+
+Content under code title.
+
+### Mixed <HTML> and `code` Content
+
+Mixed content.
+"#;
+
+        let mut codec = MdCodec::new();
+
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
+        doc.insert("title", value("Test Document"));
+
+        let proto = ProtoBeliefNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+            id: None,
+        };
+
+        codec.parse(markdown.to_string(), proto).unwrap();
+        let nodes = codec.nodes();
+
+        // Should have 4 nodes: document + 3 sections
+        assert_eq!(
+            nodes.len(),
+            4,
+            "Expected 4 nodes (1 doc + 3 sections), got {}",
+            nodes.len()
+        );
+
+        // Find the section nodes (heading > 2)
+        let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
+        assert_eq!(sections.len(), 3, "Expected 3 section nodes");
+
+        // Check that InlineHtml heading generated proper ID
+        let method_section = sections
+            .iter()
+            .find(|s| {
+                s.document
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.contains("Method Title"))
+                    .unwrap_or(false)
+            })
+            .expect("Should find <Method Title> section");
+
+        let method_id = method_section.id.as_ref().expect("Should have ID");
+        assert_eq!(
+            method_id, "method-title",
+            "InlineHtml should contribute to ID"
+        );
+
+        // Check that Code heading generated proper ID
+        let code_section = sections
+            .iter()
+            .find(|s| {
+                s.document
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.contains("Using") && t.contains("code"))
+                    .unwrap_or(false)
+            })
+            .expect("Should find code section");
+
+        let code_id = code_section.id.as_ref().expect("Should have ID");
+        assert_eq!(
+            code_id, "using--code--in-title",
+            "Code should contribute to ID (backticks become spaces)"
+        );
+
+        // Check mixed content
+        let mixed_section = sections
+            .iter()
+            .find(|s| {
+                s.document
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.contains("Mixed"))
+                    .unwrap_or(false)
+            })
+            .expect("Should find mixed section");
+
+        let mixed_id = mixed_section.id.as_ref().expect("Should have ID");
+        assert_eq!(
+            mixed_id, "mixed--html--and--code--content",
+            "Mixed InlineHtml and Code should contribute to ID (backticks become spaces)"
+        );
+    }
+
+    #[test]
+    fn test_heading_id_round_trip_with_cmark_resume() {
+        // Test that heading IDs are written back using cmark_resume_with_source_range_and_options
+        use pulldown_cmark::{Event as MdEvent, Tag as MdTag};
+        use pulldown_cmark_to_cmark::cmark_resume_with_source_range_and_options;
+
+        let markdown = "## My Heading";
+        let parser = MdParser::new_ext(markdown, buildonomy_md_options());
+        let events: Vec<(MdEvent, Option<Range<usize>>)> = parser
+            .into_offset_iter()
+            .map(|(e, r)| (e, Some(r)))
+            .collect();
+
+        // Modify the heading to add an ID
+        let modified_events: Vec<(MdEvent, Option<Range<usize>>)> = events
+            .into_iter()
+            .map(|(e, r)| {
+                if let MdEvent::Start(MdTag::Heading {
+                    level,
+                    id: _,
+                    classes,
+                    attrs,
+                }) = e
+                {
+                    // Clear the range so cmark_resume uses the event data instead of source
+                    (
+                        MdEvent::Start(MdTag::Heading {
+                            level,
+                            id: Some(CowStr::from("my-heading")),
+                            classes,
+                            attrs,
+                        }),
+                        None, // Clear range to force using modified event
+                    )
+                } else {
+                    (e, r)
+                }
+            })
+            .collect();
+
+        // Write back using cmark_resume
+        let mut buf = String::new();
+        let options = CmarkToCmarkOptions::default();
+        let events_with_refs = modified_events.iter().map(|(e, r)| (e, r.clone()));
+        cmark_resume_with_source_range_and_options(
+            events_with_refs,
+            markdown,
+            &mut buf,
+            None,
+            options,
+        )
+        .unwrap();
+
+        // Verify ID was written
+        assert!(
+            buf.contains("{ #my-heading }") || buf.contains("{#my-heading}"),
+            "Should write heading ID when range is cleared. Got: {buf}"
+        );
     }
 
     #[test]

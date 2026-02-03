@@ -975,6 +975,108 @@ impl GraphBuilder {
         };
         let bid = node.bid;
 
+        // Network-level ID collision detection (Issue 37, Fix 2)
+        // Generate ID from title if not set, then check for collision
+        // This happens AFTER the main cache_fetch so we have the node's BID
+        if proto.heading > 2 {
+            // Step 1: Generate ID from title if not already set
+            if node.id.is_none() && !node.title.is_empty() {
+                node.id = Some(to_anchor(&node.title));
+                tracing::debug!(
+                    "Generated ID '{}' from title '{}' for node {}",
+                    node.id.as_ref().unwrap(),
+                    node.title,
+                    bid
+                );
+            }
+
+            // Step 2: Check for collision if ID is set
+            if let Some(section_id) = node.id.clone() {
+                // Get the network from the stack (or use repo as fallback)
+                let net = self
+                    .stack
+                    .iter()
+                    .rev()
+                    .find(|(_bid, _path, heading)| *heading == 1)
+                    .map(|(bid, _path, _heading)| *bid)
+                    .unwrap_or(self.repo);
+
+                let id_key = NodeKey::Id {
+                    net,
+                    id: section_id.clone(),
+                };
+
+                // Check if this ID already exists in the network (cache + database)
+                let mut id_missing_structure = BeliefGraph::default();
+                let id_fetch_result = self
+                    .cache_fetch(
+                        &[id_key],
+                        global_bb.clone(),
+                        true, // check doc_bb first
+                        &mut id_missing_structure,
+                    )
+                    .await?;
+
+                // Merge any missing structure from ID fetch
+                if !id_missing_structure.is_empty() {
+                    for (bid, node) in id_missing_structure.states {
+                        missing_structure.states.insert(bid, node);
+                    }
+                    for edge in id_missing_structure.relations.0.raw_edges() {
+                        let source_bid = id_missing_structure.relations.0[edge.source()];
+                        let target_bid = id_missing_structure.relations.0[edge.target()];
+                        if let Some(source_idx) = missing_structure
+                            .relations
+                            .0
+                            .node_indices()
+                            .find(|&idx| missing_structure.relations.0[idx] == source_bid)
+                        {
+                            if let Some(target_idx) = missing_structure
+                                .relations
+                                .0
+                                .node_indices()
+                                .find(|&idx| missing_structure.relations.0[idx] == target_bid)
+                            {
+                                missing_structure.relations.0.add_edge(
+                                    source_idx,
+                                    target_idx,
+                                    edge.weight.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let GetOrCreateResult::Resolved(existing_node, existing_source) = id_fetch_result
+                {
+                    // Only check collision if node was actually found (not generated)
+                    if matches!(
+                        existing_source,
+                        NodeSource::SourceFile | NodeSource::StackCache
+                    ) {
+                        // Collision if existing node has different BID
+                        if existing_node.bid != bid {
+                            tracing::info!(
+                                "Network-level ID collision detected: '{}' already used by node {} (title='{}'). Assigning Bref to current node {} (title='{}')",
+                                section_id,
+                                existing_node.bid,
+                                existing_node.title,
+                                bid,
+                                proto.document.get("title").and_then(|v| v.as_str()).unwrap_or("<untitled>")
+                            );
+                            // First-one-wins: Clear the ID so inject_context generates Bref
+                            node.id = None;
+                            tracing::debug!(
+                                "Cleared colliding ID '{}' for node {} - Bref will be generated",
+                                section_id,
+                                bid
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // We want parsed_node to be the source of truth for title, summary, and path. But we
         // want cache_fetch node to be source of truth for bid If source is non-session
         // cache.
