@@ -2653,6 +2653,11 @@ impl BeliefSource for BeliefBase {
     ) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression_as_trace(expr, weight_filter))
     }
+
+    async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {
+        // Clone and consume the entire BeliefBase to get complete BeliefGraph
+        Ok(self.clone().consume())
+    }
 }
 
 impl BeliefSource for &BeliefBase {
@@ -2679,6 +2684,11 @@ impl BeliefSource for &BeliefBase {
         weight_filter: WeightSet,
     ) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression_as_trace(expr, weight_filter))
+    }
+
+    async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {
+        // Clone and consume the entire BeliefBase to get complete BeliefGraph
+        Ok((*self).clone().consume())
     }
 }
 

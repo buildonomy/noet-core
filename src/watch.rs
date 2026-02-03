@@ -870,6 +870,19 @@ impl FileUpdateSyncer {
                                     if let Err(e) = compiler_read.create_asset_hardlinks(html_dir, &asset_manifest).await {
                                         tracing::warn!("[WatchService] Failed to create asset hardlinks: {}", e);
                                     }
+
+                                    // Export BeliefGraph to JSON for client-side use
+                                    use crate::query::BeliefSource;
+                                    match compiler_global_bb.export_beliefgraph().await {
+                                        Ok(graph) => {
+                                            if let Err(e) = compiler_read.export_beliefbase_json(graph).await {
+                                                tracing::warn!("[WatchService] Failed to export beliefbase.json: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("[WatchService] Failed to export BeliefGraph: {}", e);
+                                        }
+                                    }
                                 }
                             }
 

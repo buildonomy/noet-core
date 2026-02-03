@@ -551,6 +551,45 @@ impl BeliefSource for DbConnection {
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         self.get_network_paths(network_bid).await
     }
+
+    async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {
+        // Get all states from database
+        let state_query = sqlx::query_as::<_, BeliefNode>("SELECT * FROM beliefs");
+        let states: BTreeMap<Bid, BeliefNode> = state_query
+            .fetch_all(&self.0)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "[DbConnection.export_beliefgraph] Failed to fetch beliefs: {}",
+                    e
+                );
+                e
+            })?
+            .into_iter()
+            .map(|node| (node.bid, node))
+            .collect();
+
+        // Get all relations from database
+        let relation_query = sqlx::query_as::<_, BeliefRelation>("SELECT * FROM relations");
+        let relation_vec: Vec<BeliefRelation> =
+            relation_query.fetch_all(&self.0).await.map_err(|e| {
+                tracing::error!(
+                    "[DbConnection.export_beliefgraph] Failed to fetch relations: {}",
+                    e
+                );
+                e
+            })?;
+
+        let relations = BidGraph::from_edges(relation_vec.into_iter());
+
+        tracing::info!(
+            "Exported BeliefGraph from database: {} states, {} relations",
+            states.len(),
+            relations.0.edge_count()
+        );
+
+        Ok(BeliefGraph { states, relations })
+    }
 }
 
 /// A migration definition.

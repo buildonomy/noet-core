@@ -207,6 +207,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Warning: Failed to create asset hardlinks: {}", e);
                     }
 
+                    // Export BeliefGraph to JSON for client-side use
+                    let beliefgraph = compiler.builder().session_bb().export_beliefgraph().await?;
+                    if let Err(e) = compiler.export_beliefbase_json(beliefgraph).await {
+                        eprintln!("Warning: Failed to export beliefbase.json: {}", e);
+                    }
+
                     println!("\n=== HTML Export Results ===");
                     println!("HTML output: {}", html_dir.display());
                     println!("Asset hardlinks: {} assets", asset_manifest.len());

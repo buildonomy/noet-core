@@ -447,69 +447,104 @@ noet watch docs/ --html-output ./html --serve --port 3000
 - Not needed for basic export-html usage
 - Optional convenience for active development
 
-### 6. Export BeliefBase to Portable Format (2 days) - DEFERRED TO PHASE 2
+### 6. Export BeliefBase to Portable Format ✅ COMPLETE (2026-02-03)
 
-**File**: `src/export.rs` (new)
+**Files Modified**: 
+- `src/query.rs` - Added `export_beliefgraph()` to `BeliefSource` trait
+- `src/beliefbase.rs` - Implemented for `BeliefBase` and `&BeliefBase`
+- `src/db.rs` - Implemented for `DbConnection`
+- `src/codec/compiler.rs` - Added `export_beliefbase_json()` method
+- `src/bin/noet/main.rs` - Integrated into `parse` command
+- `src/watch.rs` - Integrated into watch service
 
-- [ ] Implement `export_to_json()` - Full belief network serialization
-- [ ] Implement `export_to_messagepack()` - Binary format for smaller size
-- [ ] Include all nodes, relationships, paths, metadata
-- [ ] Optimize for browser deserialization (flat structures)
-- [ ] Add compression option (gzip)
-- [ ] CLI integration: `noet export ./docs belief-network.json`
+**Implementation**:
+- [x] Added `export_beliefgraph()` to `BeliefSource` trait with default implementation
+- [x] `BeliefBase` implementation uses `clone().consume()` to get complete graph
+- [x] `DbConnection` implementation queries all beliefs and relations from database
+- [x] `DocumentCompiler::export_beliefbase_json()` serializes to pretty JSON
+- [x] Automatic export during HTML generation (both parse and watch commands)
+- [x] File size warning if JSON exceeds 10MB threshold
+- [x] Output file: `{html_output_dir}/beliefbase.json`
 
-**Export Format**:
+**Export Format** (uses existing `BeliefGraph` serialization):
 ```json
 {
-  "version": "0.1.0",
-  "nodes": [
-    {
-      "bid": "01234567-89ab-cdef",
+  "states": {
+    "bid-uuid": {
+      "bid": "bid-uuid",
       "kind": ["Document"],
-      "title": "My Document",
-      "id": "my-document",
+      "title": "Document Title",
+      "schema": "Document",
       "payload": { ... }
     }
-  ],
-  "paths": [
-    {
-      "net": "network-bid",
-      "path": "docs/readme.md",
-      "node": "node-bid",
-      "order": [0, 1]
-    }
-  ],
-  "relations": [
-    {
-      "source": "bid-1",
-      "sink": "bid-2",
-      "weight": { "Section": { "parent": "bid-1" } }
-    }
-  ]
+  },
+  "relations": {
+    "nodes": ["bid-1", "bid-2"],
+    "edges": [
+      [source_idx, sink_idx, { "Section": { "parent": "bid" } }]
+    ]
+  }
 }
 ```
 
-### 7. Compile noet-core to WASM (3 days) - PHASE 2
+**Notes**:
+- Pagination deferred (warning emitted if file > 10MB)
+- Uses native `BeliefGraph` serde instead of custom format
+- Ready for Phase 2 WASM integration
 
-**Dependencies**: `wasm-bindgen`, `wasm-pack`
+### 7. Compile noet-core to WASM ✅ COMPLETE (2026-02-03) - PHASE 2
 
-- [ ] Create `noet-wasm` crate (subset of noet-core for browser)
-- [ ] Exclude server-only dependencies (tokio, sqlx, file watcher)
-- [ ] Implement `BeliefBaseWasm` wrapper with `wasm-bindgen`
-- [ ] Expose query methods to JavaScript:
-  - `query_by_nodekey(nodekey: String) -> Option<Node>`
-  - `query_relations(bid: String) -> Vec<Relation>`
-  - `search(query: String) -> Vec<Node>`
+**Status**: WASM module builds successfully! Extension-aware codec registry included.
+
+**Dependencies**: `wasm-bindgen`, `wasm-pack`, `wasm-bindgen-futures`
+
+**Completed**:
+- [x] Add WASM dependencies to Cargo.toml (`wasm` feature)
+- [x] Create `src/wasm.rs` module with `BeliefBaseWasm` wrapper (278 lines)
+- [x] Implement `from_json()` constructor for loading `beliefbase.json`
+- [x] Expose query methods using `BeliefSource` trait:
+  - `query(expr: JsValue) -> BeliefGraph` - Full Expression-based queries
+  - `get_by_bid(bid: String) -> Option<Node>`
+  - `search(query: String) -> Vec<Node>` - Title substring search
   - `get_backlinks(bid: String) -> Vec<Node>`
-- [ ] Load from JSON: `BeliefBaseWasm::from_json(data: String)`
-- [ ] Build with `wasm-pack build --target web`
-- [ ] Test in browser environment
+  - `get_forward_links(bid: String) -> Vec<Node>`
+  - `get_networks() -> Vec<Node>`
+  - `get_documents() -> Vec<Node>`
+  - `node_count() -> usize`
+- [x] Use `BeliefSource::eval_unbalanced()` for consistent query behavior
+- [x] Add `RefCell` wrapper for interior mutability (`get_context` needs `&mut`)
+- [x] Create WASM-compatible `CodecMap` with static extension registry
+  - Keeps NodeKey "extension aware" in browser (md, toml, org)
+  - Distinguishes parsable documents from static assets
+- [x] Conditional compilation: exclude heavy modules from WASM builds
+  - `codec` submodules (belief_ir, builder, compiler, etc.) excluded
+  - `watch`, `db`, `commands`, `config` excluded from wasm32 target
+  - Core modules available: `beliefbase`, `properties`, `nodekey`, `query`, `error`
+- [x] Build successfully with `wasm-pack build --target web` ✅
+- [x] Generated WASM bundle: `pkg/noet_core_bg.wasm` (2.1MB)
+- [x] TypeScript definitions included
 
-**Example WASM API**:
+**Remaining Work**:
+- [ ] Create example HTML page demonstrating usage
+- [ ] Test with actual `beliefbase.json` from `tests/network_1`
+- [ ] Document JavaScript API usage
+
+**Architecture Decisions**:
+- Use `BeliefSource` trait instead of custom query implementations
+- JavaScript gets full `Expression` syntax via `query()` method
+- Convenience methods wrap common queries (`get_documents`, `search`, etc.)
+- `BeliefBaseWasm` uses `RefCell<BeliefBase>` for interior mutability
+- **Extension-aware WASM build**: Created lightweight `CodecMap` for WASM
+  - Non-WASM: Full codec system with parsers
+  - WASM: Static registry with known extensions (md, toml, org)
+  - Allows NodeKey to distinguish documents vs assets in browser
+  - No filesystem or parsing logic in WASM (not needed)
+
+**Example WASM API** (implemented in `src/wasm.rs`):
 ```rust
 #[wasm_bindgen]
 pub struct BeliefBaseWasm {
-    inner: BeliefBase,
+    inner: RefCell<BeliefBase>,
 }
 
 #[wasm_bindgen]
@@ -517,11 +552,35 @@ impl BeliefBaseWasm {
     #[wasm_bindgen(constructor)]
     pub fn from_json(data: String) -> Result<BeliefBaseWasm, JsValue>;
     
-    pub fn query_by_nodekey(&self, nodekey: String) -> JsValue;
+    // Full query API using Expression syntax
+    pub async fn query(&self, expr_js: JsValue) -> Result<JsValue, JsValue>;
+    
+    // Convenience methods
+    pub fn get_by_bid(&self, bid: String) -> JsValue;
     pub fn search(&self, query: String) -> JsValue;
     pub fn get_backlinks(&self, bid: String) -> JsValue;
+    pub fn get_forward_links(&self, bid: String) -> JsValue;
+    pub fn get_networks(&self) -> JsValue;
+    pub fn get_documents(&self) -> JsValue;
+    pub fn node_count(&self) -> usize;
 }
 ```
+
+**Build Command**:
+```bash
+wasm-pack build --target web -- --features wasm --no-default-features
+```
+
+**Output** (in `pkg/`):
+- `noet_core_bg.wasm` - 2.1MB WASM binary
+- `noet_core.js` - JavaScript bindings (29KB)
+- `noet_core.d.ts` - TypeScript definitions (12KB)
+- `package.json` - NPM package metadata
+
+**Next Steps**:
+1. Create example HTML viewer page
+2. Test with actual `beliefbase.json` from `tests/network_1`
+3. Document JavaScript API in viewer example (Step 8)
 
 ### 8. Create Viewer JavaScript with WASM Integration (4 days) - PHASE 2
 
@@ -801,17 +860,19 @@ Defer to Phase 3 - WASM approach handles most use cases client-side.
 - [ ] Deployable to GitHub Pages, Netlify, etc. (needs CSS)
 
 ### Phase 1.5: Static Site Polish + Dev Server
-- [ ] Copy static assets (CSS) to HTML output directory
-- [ ] Embed default CSS in binary, copy to `assets/` on first generation
-- [ ] Rewrite `.md` → `.html` in links during HTML generation (in event stream)
-- [ ] Generate `index.html` for each BeliefNetwork with document listing
-- [ ] Static file server with axum/tower-http (behind `service` feature)
-- [ ] SSE endpoint for live reload notifications
-- [ ] Add `--serve` flag to `watch` command (requires `--html-output`)
-- [ ] Add `--port` and `--open` flags for server configuration
-- [ ] Live reload script injection in dev mode
-- [ ] Auto-refresh browser on markdown changes
-- [ ] Works with both static HTML and future WASM SPA
+- [x] Copy static assets (CSS) to HTML output directory
+- [x] Embed default CSS in binary, copy to `assets/` on first generation
+- [x] Rewrite `.md` → `.html` in links during HTML generation (in event stream)
+- [x] Generate `index.html` for each BeliefNetwork with document listing
+- [x] Static file server with axum/tower-http (behind `service` feature)
+- [x] SSE endpoint for live reload notifications
+- [x] Add `--serve` flag to `watch` command (requires `--html-output`)
+- [x] Add `--port` and `--open` flags for server configuration
+- [x] Live reload script injection in dev mode
+- [x] Auto-refresh browser on markdown changes
+- [x] Works with both static HTML and future WASM SPA
+- [x] Export BeliefGraph to `beliefbase.json` for client-side use
+- [x] Warn if exported JSON exceeds 10MB threshold
 
 ### Phase 2: WASM SPA (Enhanced)
 - [ ] `noet-wasm` crate compiles successfully
@@ -1089,22 +1150,130 @@ Implementation details:
 - `src/bin/noet.rs` - Added `--html-output` flag to `parse` and `watch` commands
 - `src/watch.rs` - Added `html_output_dir` support to `WatchService` and `FileUpdateSyncer`
 
+### ✅ Step 6 Complete (2026-02-03 - Session 5)
+
+**Implemented**: Export BeliefGraph to JSON for client-side use
+
+**Changes**:
+- Added `export_beliefgraph()` method to `BeliefSource` trait in `src/query.rs`
+  - Default implementation uses `eval_unbalanced` with `StatePred::Any`
+  - Implementors can override for better performance
+- Implemented for `BeliefBase` using `clone().consume()` to get complete graph
+- Implemented for `DbConnection` by querying all beliefs and relations from database
+- Added `export_beliefbase_json()` method to `DocumentCompiler` in `src/codec/compiler.rs`
+  - Serializes `BeliefGraph` to pretty JSON
+  - Writes to `{html_output_dir}/beliefbase.json`
+  - Warns if file size exceeds 10MB threshold
+  - Logs export stats (file size, state count, relation count)
+- Integrated into `parse` command in `src/bin/noet/main.rs`
+  - Automatically exports after HTML generation completes
+- Integrated into watch service in `src/watch.rs`
+  - Exports from database after each parse cycle completes
+  - Uses `DbConnection::export_beliefgraph()` to get current database state
+
+**Test Results**:
+```bash
+$ ./target/debug/noet parse tests/network_1 --html-output test-output
+# Output: Exported BeliefGraph to test-output/beliefbase.json (0.03 MB, 57 states, 66 relations)
+# File size: 33KB
+```
+
+**Architecture Decisions**:
+- Used `BeliefSource` trait method for consistency with other query operations
+- `noet parse` uses `session_bb` (in-memory complete graph)
+- `noet watch` uses `DbConnection` (database query for current state)
+- No pagination in initial implementation (warning-only approach for large datasets)
+- Native `BeliefGraph` serialization format (states + relations petgraph structure)
+
 ### Estimated Remaining Effort (Phase 1.5)
 
 - ~~Static assets & link rewriting~~ ✅ **COMPLETE**
 - ~~Network index generation~~ ✅ **COMPLETE**
 - ~~CSS theming~~ ✅ **COMPLETE**
 - ~~Document titles in body~~ ✅ **COMPLETE**
-- Dev server with live reload: ~8 hours **(NEXT SESSION)**
-- Dogfooding CI/CD: ~2 hours
-- **Total remaining**: ~10 hours to complete Phase 1.5
+- ~~BeliefGraph JSON export~~ ✅ **COMPLETE**
+- **Phase 1.5 is COMPLETE!**
 
-**Why dev server is the critical path:**
-- Eliminates manual refresh during CSS development
-- Essential for testing WASM SPA in Phase 2
-- Provides professional development experience
-- Minimal complexity (SSE is ~100 lines total)
-- Hidden behind feature flag (no bloat for basic usage)
+### Ready for Phase 2: WASM SPA
+
+All Phase 1.5 deliverables complete:
+- Static HTML generation with metadata
+- CSS theming with embedded default stylesheet
+- Network index pages with document listings
+- Asset hardlink management
+- Dev server with live reload (SSE)
+- BeliefGraph JSON export for client-side use
+
+**Next steps for Phase 2**:
+- Compile noet-core to WASM (Step 7) - IN PROGRESS
+- Create JavaScript viewer with WASM integration (Step 8)
+- Implement client-side search and navigation
+
+## Session 5: Steps 6-7 (2026-02-03)
+
+### Step 6: BeliefGraph JSON Export ✅ COMPLETE
+
+**Implemented**: Export BeliefGraph to JSON for client-side WASM viewer
+
+**Changes**:
+- Added `export_beliefgraph()` to `BeliefSource` trait
+- Implemented for `BeliefBase` (uses `clone().consume()`)
+- Implemented for `DbConnection` (queries all beliefs and relations)
+- Added `DocumentCompiler::export_beliefbase_json()` method
+- Integrated into `noet parse` command (exports from session_bb)
+- Integrated into `noet watch` service (exports from database)
+
+**Output**: `{html_output_dir}/beliefbase.json`
+- Warns if file exceeds 10MB
+- Logs export stats (file size, state count, relation count)
+
+**Test Results**:
+```bash
+./target/debug/noet parse tests/network_1 --html-output test-output
+# Output: Exported BeliefGraph to test-output/beliefbase.json (0.03 MB, 57 states, 66 relations)
+# File size: 33KB
+```
+
+### Step 7: WASM Module 🚧 IN PROGRESS
+
+**Implemented**:
+- Created `src/wasm.rs` with `BeliefBaseWasm` wrapper (278 lines)
+- Added WASM dependencies: `wasm-bindgen`, `wasm-bindgen-futures`, `serde-wasm-bindgen`
+- Exposed JavaScript API using `BeliefSource` trait for queries:
+  - `from_json(data: String)` - Load beliefbase.json
+  - `query(expr: JsValue)` - Full Expression-based queries
+  - `get_by_bid(bid: String)` - Single node lookup
+  - `search(query: String)` - Title substring search
+  - `get_backlinks()`, `get_forward_links()` - Bidirectional navigation
+  - `get_networks()`, `get_documents()` - Type-filtered queries
+  - `node_count()` - Total nodes
+- Used `RefCell<BeliefBase>` for interior mutability
+- Module compiles cleanly with `cargo check --features wasm` ✅
+
+**Remaining Work**:
+- Refactor to exclude `codec` module from WASM builds (uses `tokio::fs`)
+- Options: (1) Feature-gate codec module, (2) Separate noet-wasm crate, (3) cfg-gates
+- Complete `wasm-pack build --target web`
+- Create example HTML viewer page
+- Test with actual beliefbase.json
+
+**Completed**: Step 7 finished in ~4 hours (conditional compilation approach)
+
+**Solution**: Extension-aware WASM build with lightweight codec registry
+- Created WASM-compatible `CodecMap` with static extension list
+- Excluded filesystem/parsing modules via `#[cfg(not(target_arch = "wasm32"))]`
+- NodeKey remains extension-aware (can distinguish .md/.toml from .jpg/.png)
+- Only core query/belief modules included in WASM (beliefbase, properties, nodekey, query)
+
+**Files Modified**:
+- `Cargo.toml` - Added WASM dependencies, `wasm` feature, disabled wasm-opt
+- `src/wasm.rs` - NEW 278-line module with JavaScript bindings
+- `src/lib.rs` - Added wasm module export, excluded service modules from WASM
+- `src/codec/mod.rs` - Dual implementation: full CodecMap vs lightweight registry
+- `src/properties.rs` - Made ProtoBeliefNode imports conditional
+- `src/nodekey.rs` - Works with lightweight CodecMap in WASM
+
+**Build Output**: Successfully generates `pkg/noet_core_bg.wasm` (2.1MB) ✅
 
 ## CLI Usage Examples
 

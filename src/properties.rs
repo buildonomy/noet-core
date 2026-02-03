@@ -41,11 +41,13 @@ use sqlx::{sqlite::SqliteRow, FromRow, Row};
 
 use crate::{
     beliefbase::BeliefBase,
-    codec::belief_ir::ProtoBeliefNode,
     error::BuildonomyError,
     nodekey::{to_anchor, NodeKey},
     paths::path_join,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::codec::belief_ir::ProtoBeliefNode;
 
 pub(crate) mod enumset_list {
     // Copied from enumset_derive/src/lib.rs SerdeRepr::List (line 475 in version 0.10.1)
@@ -1182,6 +1184,7 @@ impl TryFrom<&str> for BeliefNode {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TryFrom<&ProtoBeliefNode> for BeliefNode {
     type Error = BuildonomyError;
 

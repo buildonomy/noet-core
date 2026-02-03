@@ -237,11 +237,11 @@
 
 pub mod beliefbase;
 pub mod codec;
-#[cfg(feature = "service")]
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod commands;
-#[cfg(feature = "service")]
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod config;
-#[cfg(feature = "service")]
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod db;
 pub mod error;
 pub mod event;
@@ -251,7 +251,9 @@ pub mod properties;
 pub mod query;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "service")]
+#[cfg(feature = "wasm")]
+pub mod wasm;
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod watch;
 
 pub use error::*;

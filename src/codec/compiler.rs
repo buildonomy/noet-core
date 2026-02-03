@@ -1410,6 +1410,56 @@ impl DocumentCompiler {
         Ok(())
     }
 
+    /// Export BeliefGraph to JSON file for client-side use
+    ///
+    /// # Arguments
+    /// * `graph` - BeliefGraph to export (from session_bb or database)
+    ///
+    /// # File Size Warning
+    /// Emits warning if exported JSON exceeds 10MB
+    pub async fn export_beliefbase_json(
+        &self,
+        graph: crate::beliefbase::BeliefGraph,
+    ) -> Result<(), BuildonomyError> {
+        let html_dir = match &self.html_output_dir {
+            Some(dir) => dir,
+            None => return Ok(()), // No HTML output configured
+        };
+
+        let json_path = html_dir.join("beliefbase.json");
+
+        // Serialize to JSON
+        let json_string = serde_json::to_string_pretty(&graph)
+            .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
+
+        let file_size_bytes = json_string.len();
+        let file_size_mb = file_size_bytes as f64 / (1024.0 * 1024.0);
+
+        // Warn if file is large
+        const SIZE_WARNING_THRESHOLD_MB: f64 = 10.0;
+        if file_size_mb > SIZE_WARNING_THRESHOLD_MB {
+            tracing::warn!(
+                "BeliefGraph export is {:.2} MB (exceeds {} MB threshold). \
+                 Consider implementing pagination for large datasets.",
+                file_size_mb,
+                SIZE_WARNING_THRESHOLD_MB
+            );
+        }
+
+        // Write to file
+        tokio::fs::write(&json_path, json_string).await?;
+
+        tracing::info!(
+            "Exported BeliefGraph to {} ({:.2} MB, {} states, {} relations)",
+            json_path.display(),
+            file_size_mb,
+            graph.states.len(),
+            graph.relations.0.edge_count()
+        );
+
+        Ok(())
+    }
+
     /// Generate HTML content for network index page
     fn generate_index_page(
         network_title: &str,

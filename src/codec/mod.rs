@@ -109,24 +109,38 @@
 //!
 
 use once_cell::sync::Lazy;
+
+#[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{Mutex, RwLock};
-/// Utilities for parsing various document types into BeliefBases
+#[cfg(not(target_arch = "wasm32"))]
 use std::{result::Result, sync::Arc, time::Duration};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod belief_ir;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod builder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod compiler;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod diagnostic;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod md;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schema_registry;
 
 // Re-export for backward compatibility
+#[cfg(not(target_arch = "wasm32"))]
 pub use belief_ir::ProtoBeliefNode;
+#[cfg(not(target_arch = "wasm32"))]
 pub use builder::GraphBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 pub use compiler::DocumentCompiler;
+#[cfg(not(target_arch = "wasm32"))]
 pub use diagnostic::{ParseDiagnostic, UnresolvedReference};
+#[cfg(not(target_arch = "wasm32"))]
 pub use schema_registry::SCHEMAS;
 
 /// Global singleton codec map with builtin codecs (md, toml)
@@ -137,6 +151,7 @@ pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 /// [ ] Need to write doc to buffer
 /// [ ] Be able to publish markdown snippets -- with or without: anchors, revised src/hrefs, widget
 ///     configuration toml
+#[cfg(not(target_arch = "wasm32"))]
 pub trait DocCodec: Sync {
     fn parse(
         &mut self,
@@ -190,15 +205,18 @@ pub trait DocCodec: Sync {
 
 // It is better to express the complexity of the singleton than hide it. Also the CodecMap methods
 // are used to properly unwrap this structure.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::type_complexity)]
 pub struct CodecMap(Arc<RwLock<Vec<(String, Arc<Mutex<dyn DocCodec + Send>>)>>>);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Clone for CodecMap {
     fn clone(&self) -> Self {
         CodecMap(self.0.clone())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl CodecMap {
     pub fn create() -> Self {
         CodecMap(Arc::new(RwLock::new(vec![
@@ -246,5 +264,33 @@ impl CodecMap {
             .iter()
             .map(|(codec_ext, _value)| codec_ext.clone())
             .collect::<Vec<String>>()
+    }
+}
+
+// WASM-compatible version: lightweight extension registry only
+#[cfg(target_arch = "wasm32")]
+pub struct CodecMap {
+    extensions: &'static [&'static str],
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Clone for CodecMap {
+    fn clone(&self) -> Self {
+        CodecMap {
+            extensions: self.extensions,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl CodecMap {
+    pub fn create() -> Self {
+        CodecMap {
+            extensions: &["md", "toml", "org"],
+        }
+    }
+
+    pub fn extensions(&self) -> Vec<String> {
+        self.extensions.iter().map(|s| s.to_string()).collect()
     }
 }

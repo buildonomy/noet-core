@@ -576,6 +576,23 @@ pub trait BeliefSource: Sync {
         async { Ok(BTreeMap::new()) }
     }
 
+    /// Export entire BeliefGraph for serialization (e.g., to JSON for client-side use).
+    ///
+    /// For BeliefBase: Returns consumed clone of the entire belief set.
+    /// For DbConnection: Queries all beliefs and relations from database.
+    ///
+    /// Default implementation uses eval_unbalanced with StatePred::Any, which may not
+    /// be comprehensive for all implementations.
+    fn export_beliefgraph(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+        async {
+            // Default: query all states - implementors should override for better performance
+            self.eval_unbalanced(&Expression::StateIn(StatePred::Any))
+                .await
+        }
+    }
+
     fn eval_balanced(
         &self,
         expr: &Expression,
