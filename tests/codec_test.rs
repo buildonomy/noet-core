@@ -1978,7 +1978,8 @@ async fn test_asset_html_hardlinks() -> Result<(), Box<dyn std::error::Error>> {
         None,
         false,
         Some(html_output.clone()),
-        None, // No live reload script for tests
+        None,  // No live reload script for tests
+        false, // use_cdn
     )?;
     let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 
@@ -2133,7 +2134,8 @@ This references the duplicate: ![Duplicate Image](./duplicates/same_image.png)
         None,
         false,
         Some(html_output.clone()),
-        None, // No live reload script for tests
+        None,  // No live reload script for tests
+        false, // use_cdn
     )?;
     let _parse_results = compiler.parse_all(global_bb.clone(), false).await?;
 

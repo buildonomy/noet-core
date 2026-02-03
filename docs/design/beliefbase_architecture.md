@@ -399,9 +399,9 @@ BeliefNode {
 Infrastructure asks: "Is this external? Does it have a file? Can I access its contents? Do I have a comprehensive map of its relationships?"
 Domain asks: "What schema defines this node's structure?"
 
-### 2.7. The API Node: Versioning and Reserved Namespace
+### 2.7. The API Node and System Network Namespaces
 
-Every `BeliefBase` contains a special **API node** that serves dual purposes: version management and graph entry point. Understanding the API node is critical for distributed synchronization, schema evolution, and preventing BID collisions.
+Every `BeliefBase` contains a special **API node** and uses **three system-defined network namespaces** for tracking special categories of references. Understanding these reserved namespaces is critical for distributed synchronization, schema evolution, and preventing BID collisions.
 
 #### Purpose and Architecture
 
@@ -451,6 +451,35 @@ pub struct BeliefBase {
 - PathMapMap uses API node as root for path resolution
 - Queries can start from API node to traverse entire graph
 - Provides consistent entry point across distributed systems
+
+**3. System Network Namespaces**
+
+Beyond the API node, noet-core defines two additional **system-managed networks** that automatically track references across document collections:
+
+```rust
+// properties.rs
+pub const UUID_NAMESPACE_BUILDONOMY: Uuid = /* 0x6b3d2154... */;  // API node
+pub const UUID_NAMESPACE_HREF: Uuid      = /* 0x5b3d2154... */;  // External links
+pub const UUID_NAMESPACE_ASSET: Uuid     = /* 0x4b3d2154... */;  // Images/attachments
+
+pub fn buildonomy_namespace() -> Bid { Bid::from(UUID_NAMESPACE_BUILDONOMY) }
+pub fn href_namespace() -> Bid { Bid::from(UUID_NAMESPACE_HREF) }
+pub fn asset_namespace() -> Bid { Bid::from(UUID_NAMESPACE_ASSET) }
+```
+
+**Href Namespace**: A software-defined network (`BeliefKind::Network`) that collects all external HTTP/HTTPS links:
+- When parser encounters `[text](https://example.com)`, creates node in href network
+- Enables "find all documents referencing this external URL" queries
+- Tracks citation sources and external dependencies
+- Title field contains the URL string
+
+**Asset Namespace**: A software-defined network for unparsable embedded resources:
+- Images, PDFs, CSS files, fonts referenced in documents
+- Enables "which documents use this image?" queries
+- Tracks asset dependencies for migration/publishing
+- Title field contains relative path to asset
+
+**Why networks?** Networks are **graph entry points** - they enable efficient "find all references to X" queries by maintaining explicit relations rather than scanning all nodes. User-defined networks represent repositories/projects; system networks represent cross-cutting reference tracking.
 
 #### Reserved BID Namespace
 

@@ -228,7 +228,81 @@ if bid.is_reserved() {
 
 **For detailed specification** including namespace checking algorithm and reserved identifier validation, see [`beliefbase_architecture.md` § 2.7](./beliefbase_architecture.md#27-the-api-node-versioning-and-reserved-namespace).
 
-### 10. Extensible Document Parsing (DocCodec)
+### 10. System Network Namespaces
+
+Beyond the API node, noet-core defines **three system-managed network namespaces** that track special categories of references across your entire document collection:
+
+```rust
+pub const UUID_NAMESPACE_BUILDONOMY: Uuid = /* API node */;
+pub const UUID_NAMESPACE_HREF: Uuid      = /* External links */;
+pub const UUID_NAMESPACE_ASSET: Uuid     = /* Images/attachments */;
+```
+
+#### 1. Buildonomy Namespace (API Node)
+
+The API node itself (see § 9) - tracks schema version and serves as the graph entry point.
+
+#### 2. Href Namespace (External Hyperlinks)
+
+A **software-defined network** that collects all external HTTP/HTTPS links encountered during parsing:
+
+```markdown
+<!-- In your documents -->
+See [Rust Book](https://doc.rust-lang.org/book/)
+Check [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt)
+
+<!-- System creates nodes in href network -->
+Node { bid: href_namespace(), kind: Network, ... }
+  ├─→ Node { title: "https://doc.rust-lang.org/book/", ... }
+  └─→ Node { title: "https://www.ietf.org/rfc/rfc2119.txt", ... }
+```
+
+**Why?** This enables:
+- **Backlink queries**: "Which of my documents reference this external URL?"
+- **Link rot detection**: Track all external dependencies
+- **Citation analysis**: Understand your knowledge sources
+- **Offline mode**: Identify documents that need internet access
+
+#### 3. Asset Namespace (Unparsable Content)
+
+A **software-defined network** for embedded resources that noet-core cannot parse as structured documents:
+
+```markdown
+<!-- In your documents -->
+![Architecture Diagram](./images/system.png)
+[Download PDF](./assets/whitepaper.pdf)
+
+<!-- System creates nodes in asset network -->
+Node { bid: asset_namespace(), kind: Network, ... }
+  ├─→ Node { title: "images/system.png", ... }
+  └─→ Node { title: "assets/whitepaper.pdf", ... }
+```
+
+**Why?** This enables:
+- **Asset tracking**: Find all images/PDFs referenced in your docs
+- **Usage analysis**: "Which documents use this image?"
+- **Migration**: Update asset paths when restructuring
+- **Completeness checking**: Detect missing assets before publishing
+
+#### Network as Graph Entry Point
+
+All three namespaces are **Network nodes** (BeliefKind::Network) that serve as entry points for graph traversal:
+
+```rust
+// User-defined networks (repositories, projects)
+Network("my-project") → Documents → Sections
+
+// System-defined networks (tracking namespaces)
+Network(href_namespace()) → External URLs
+Network(asset_namespace()) → Images/PDFs
+Network(buildonomy_namespace()) → API versioning
+```
+
+**Key insight**: Networks aren't just containers - they're **indexing structures** that enable efficient "find all references to X" queries across your entire knowledge base.
+
+**For implementation details** including BID generation and reserved namespace validation, see [`beliefbase_architecture.md` § 2.7](./beliefbase_architecture.md#27-the-api-node-versioning-and-reserved-namespace).
+
+### 11. Extensible Document Parsing (DocCodec)
 
 noet-core supports **multiple document formats** through a pluggable codec system:
 

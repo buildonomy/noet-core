@@ -73,6 +73,10 @@ enum Commands {
         /// Optional output directory for HTML generation
         #[arg(long)]
         html_output: Option<PathBuf>,
+
+        /// Use CDN for Open Props (smaller output, requires internet)
+        #[arg(long)]
+        cdn: bool,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -96,6 +100,10 @@ enum Commands {
         /// Optional output directory for HTML generation
         #[arg(long)]
         html_output: Option<PathBuf>,
+
+        /// Use CDN for Open Props (smaller output, requires internet)
+        #[arg(long)]
+        cdn: bool,
 
         /// Start HTTP server for viewing HTML output (requires --html-output)
         #[arg(long)]
@@ -125,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write,
             force,
             html_output,
+            cdn,
         } => {
             if verbose {
                 println!("Parsing: {path:?}");
@@ -145,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     write,
                     Some(html_dir.clone()),
                     None, // No live reload script for parse command
+                    cdn,
                 )?
             } else {
                 DocumentCompiler::new(&path, None, None, write)?
@@ -237,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             write,
             html_output,
+            cdn,
             serve,
             port,
         } => {
@@ -353,6 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         write,
                         Some(html_dir.clone()),
                         live_reload_script,
+                        cdn,
                     )?
                 } else {
                     WatchService::new(root_dir.clone(), tx, write)?

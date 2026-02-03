@@ -20,6 +20,7 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
+        assets::Layout,
         belief_ir::{detect_schema_from_path, ProtoBeliefNode},
         DocCodec,
     },
@@ -1238,11 +1239,21 @@ impl DocCodec for MdCodec {
         Self::events_to_text(&self.content, events)
     }
 
-    fn generate_html(&self, script: Option<&str>) -> Result<Option<String>, BuildonomyError> {
+    fn generate_html(
+        &self,
+        script: Option<&str>,
+        use_cdn: bool,
+    ) -> Result<Option<String>, BuildonomyError> {
         use serde_json::json;
 
-        /// Rewrite .md links to .html for HTML output
-        /// Only transforms links that have bref:// in title attribute (part of BeliefBase)
+        /// Rewrite document links to .html for HTML output
+        ///
+        /// This implements the link normalization requirement from the DocCodec trait:
+        /// All registered codec extensions (md, toml, org, etc.) must be converted to .html
+        /// for browser navigation. This handles both resolved links (with bref://) and
+        /// unresolved links (graceful degradation).
+        ///
+        /// See: DocCodec::generate_html() trait documentation for requirements
         fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
                 MdEvent::Start(MdTag::Link {
@@ -1251,19 +1262,36 @@ impl DocCodec for MdCodec {
                     title,
                     id,
                 }) => {
-                    // Only rewrite if this is a BeliefBase link (has bref:// in title)
-                    let should_rewrite = title.contains("bref://");
+                    // Get list of registered codec extensions
+                    let codec_extensions = crate::codec::CODECS.extensions();
+
+                    // Rewrite if this is a BeliefBase link OR an unresolved document link
+                    let is_beliefbase_link = title.contains("bref://");
+                    let is_unresolved_doc_link = codec_extensions.iter().any(|ext| {
+                        dest_url.ends_with(&format!(".{}", ext))
+                            || dest_url.contains(&format!(".{}#", ext))
+                    });
+
+                    let should_rewrite = is_beliefbase_link || is_unresolved_doc_link;
 
                     let new_url = if should_rewrite {
-                        if dest_url.ends_with(".md") {
-                            // Replace .md extension with .html
-                            CowStr::from(dest_url.replace(".md", ".html"))
-                        } else if dest_url.contains(".md#") {
-                            // Replace .md# with .html# (preserves anchors)
-                            CowStr::from(dest_url.replace(".md#", ".html#"))
-                        } else {
-                            dest_url
+                        let mut url = dest_url.to_string();
+
+                        // Replace any codec extension with .html
+                        for ext in codec_extensions.iter() {
+                            // Handle .ext at end of URL
+                            if url.ends_with(&format!(".{}", ext)) {
+                                url = url.replace(&format!(".{}", ext), ".html");
+                                break;
+                            }
+                            // Handle .ext# (with anchor)
+                            if url.contains(&format!(".{}#", ext)) {
+                                url = url.replace(&format!(".{}#", ext), ".html#");
+                                break;
+                            }
                         }
+
+                        CowStr::from(url)
                     } else {
                         dest_url
                     };
@@ -1295,6 +1323,9 @@ impl DocCodec for MdCodec {
             .and_then(|(proto, _)| proto.document.get("title"))
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
+
+        // Always use responsive template for interactive SPA
+        // (layout field is deprecated - all documents use same interactive viewer)
 
         // Build sections map: anchor_id -> section_bid
         // Only include sections that have explicit BIDs (heading > 2)
@@ -1329,34 +1360,33 @@ impl DocCodec for MdCodec {
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
 
-        // Format script if provided
-        let script_tag = script.map(|s| format!("\n{}", s)).unwrap_or_default();
+        // Always use responsive template for interactive SPA
+        let template = crate::codec::assets::get_template(Layout::Responsive);
 
-        // Wrap in HTML5 structure with embedded metadata
-        let html = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{title}</title>
-  <link rel="stylesheet" href="assets/default-theme.css">
-  <script type="application/json" id="noet-metadata">
-{metadata}
-  </script>{script}
-</head>
-<body>
-  <article>
-    <h1 class="document-title">{title}</h1>
-{body}
-  </article>
-</body>
-</html>"#,
-            title = doc_title,
-            metadata = serde_json::to_string_pretty(&metadata)
-                .map_err(|e| BuildonomyError::Codec(format!("JSON serialization failed: {}", e)))?,
-            body = html_body,
-            script = script_tag
-        );
+        // Get stylesheet URLs based on use_cdn parameter
+        let stylesheet_urls = crate::codec::assets::get_stylesheet_urls(use_cdn);
+
+        // Format script tag if provided
+        let script_tag = script
+            .map(|s| format!("<script>{}</script>", s))
+            .unwrap_or_default();
+
+        // Substitute template placeholders
+        let html = template
+            .replace("{{TITLE}}", doc_title)
+            .replace("{{CONTENT}}", &html_body)
+            .replace(
+                "{{METADATA}}",
+                &serde_json::to_string_pretty(&metadata).map_err(|e| {
+                    BuildonomyError::Codec(format!("JSON serialization failed: {}", e))
+                })?,
+            )
+            .replace("{{STYLESHEET_OPEN_PROPS}}", &stylesheet_urls.open_props)
+            .replace("{{STYLESHEET_NORMALIZE}}", &stylesheet_urls.normalize)
+            .replace("{{STYLESHEET_THEME_LIGHT}}", &stylesheet_urls.theme_light)
+            .replace("{{STYLESHEET_THEME_DARK}}", &stylesheet_urls.theme_dark)
+            .replace("{{STYLESHEET_LAYOUT}}", &stylesheet_urls.layout)
+            .replace("{{SCRIPT}}", &script_tag);
 
         Ok(Some(html))
     }
@@ -2645,14 +2675,16 @@ Install the software.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html(None).expect("HTML generation failed");
+        let html = codec
+            .generate_html(None, false)
+            .expect("HTML generation failed");
         assert!(html.is_some(), "HTML should be generated");
 
         let html_content = html.unwrap();
 
-        // Verify HTML structure
-        assert!(html_content.contains("<!DOCTYPE html>"), "Missing DOCTYPE");
-        assert!(html_content.contains("<html>"), "Missing html tag");
+        // Verify HTML structure (responsive template uses lowercase doctype)
+        assert!(html_content.contains("<!doctype html>"), "Missing DOCTYPE");
+        assert!(html_content.contains("<html"), "Missing html tag");
         assert!(
             html_content.contains("<title>Test Document</title>"),
             "Missing or wrong title"
@@ -2721,7 +2753,9 @@ This section has no explicit BID.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html(None).expect("HTML generation failed");
+        let html = codec
+            .generate_html(None, false)
+            .expect("HTML generation failed");
         assert!(html.is_some());
 
         let html_content = html.unwrap();
@@ -2767,7 +2801,9 @@ Already HTML [html link](./page.html "bref://doc789").
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec.generate_html(None).expect("HTML generation failed");
+        let html = codec
+            .generate_html(None, false)
+            .expect("HTML generation failed");
         assert!(html.is_some());
 
         let html_content = html.unwrap();

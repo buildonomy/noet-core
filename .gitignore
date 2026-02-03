@@ -34,6 +34,11 @@ Desktop.ini
 *.tmp
 .env
 .env.local
+docs-html/
+
+# Test output (standardized location for all test artifacts)
+test-output/
+test-wasm-output/  # Legacy, can be removed after migration
 
 # Code coverage
 *.profraw

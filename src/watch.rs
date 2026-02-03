@@ -303,6 +303,7 @@ pub struct WatchService {
     write: bool,
     html_output_dir: Option<PathBuf>,
     html_script: Option<String>,
+    use_cdn: bool,
 }
 
 impl WatchService {
@@ -311,7 +312,7 @@ impl WatchService {
         event_tx: Sender<Event>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(root_dir, event_tx, write, None, None)
+        Self::with_html_output(root_dir, event_tx, write, None, None, false)
     }
 
     pub fn with_html_output(
@@ -320,6 +321,7 @@ impl WatchService {
         write: bool,
         html_output_dir: Option<PathBuf>,
         html_script: Option<String>,
+        use_cdn: bool,
     ) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -351,6 +353,7 @@ impl WatchService {
             write,
             html_output_dir,
             html_script,
+            use_cdn,
         })
     }
 
@@ -500,6 +503,7 @@ impl WatchService {
             self.write,
             self.html_output_dir.clone(),
             self.html_script.clone(),
+            self.use_cdn,
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
@@ -648,6 +652,7 @@ impl FileUpdateSyncer {
         write: bool,
         html_output_dir: Option<PathBuf>,
         html_script: Option<String>,
+        use_cdn: bool,
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
@@ -666,6 +671,7 @@ impl FileUpdateSyncer {
                 write,   // write rewritten content back to files
                 Some(html_dir),
                 html_script,
+                use_cdn,
             )?
         } else {
             DocumentCompiler::new(

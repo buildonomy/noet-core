@@ -13,7 +13,7 @@ keywords = ["knowledge-management", "hypergraph", "markdown", "sync", "graph"]
 categories = ["data-structures", "parsing", "database"]
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = false  # Disabled: wasm-opt v108 fails with "Only 1 table definition allowed in MVP"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
@@ -26,6 +26,7 @@ enumset = { version = "1.1.5", features = ["serde"] }
 futures = { version = "0.3.30", optional = true }
 futures-core = { version = "0.3.30", optional = true }
 http = { version = "1.1.0" }
+include_dir = "0.7"
 log = "0.4"
 notify = { version = "6.1.1", optional = true }
 notify-debouncer-full = { version = "0.3.1", default-features = false, optional = true }
@@ -45,6 +46,7 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["console"], optional = true }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
@@ -82,7 +84,7 @@ trybuild = "1.0"
 default = ["bin"]
 bin = ["service", "clap", "ctrlc", "tracing-subscriber"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
-wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "uuid/js", "futures"]
+wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "uuid/js", "futures"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.40", features = ["fs", "time", "rt", "rt-multi-thread"] }

@@ -111,6 +111,9 @@
 use once_cell::sync::Lazy;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub use assets::Layout;
+
+#[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{Mutex, RwLock};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{result::Result, sync::Arc, time::Duration};
@@ -118,6 +121,8 @@ use std::{result::Result, sync::Arc, time::Duration};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod assets;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod belief_ir;
 #[cfg(not(target_arch = "wasm32"))]
@@ -194,11 +199,34 @@ pub trait DocCodec: Sync {
     /// - `metadata.document.bid` - Document node BID
     /// - `metadata.sections[anchor_id]` - Section node BIDs (only for explicit section nodes)
     ///
+    /// # Link Normalization
+    ///
+    /// **Implementations MUST normalize document links to `.html` extension:**
+    /// - Convert all registered codec extensions (`.md`, `.toml`, `.org`, etc.) to `.html`
+    /// - Handle both resolved links (with `bref://`) and unresolved links (graceful degradation)
+    /// - Preserve anchors: `.md#section` → `.html#section`
+    /// - Use `CODECS.extensions()` to get the list of registered extensions
+    ///
+    /// Example:
+    /// ```ignore
+    /// let codec_extensions = crate::codec::CODECS.extensions();
+    /// for ext in codec_extensions.iter() {
+    ///     url = url.replace(&format!(".{}", ext), ".html");
+    ///     url = url.replace(&format!(".{}#", ext), ".html#");
+    /// }
+    /// ```
+    ///
     /// # Parameters
     /// - `script`: Optional JavaScript to inject into the HTML (e.g., live reload for dev mode)
+    /// - `use_cdn`: Whether to use CDN for Open Props (requires internet, smaller output)
     ///
+    /// Always uses responsive template for interactive SPA viewer.
     /// Default implementation returns None (codec doesn't support HTML generation).
-    fn generate_html(&self, _script: Option<&str>) -> Result<Option<String>, BuildonomyError> {
+    fn generate_html(
+        &self,
+        _script: Option<&str>,
+        _use_cdn: bool,
+    ) -> Result<Option<String>, BuildonomyError> {
         Ok(None)
     }
 }

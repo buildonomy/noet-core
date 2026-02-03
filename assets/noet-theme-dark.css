@@ -1,0 +1,65 @@
+/**
+ * Noet Dark Theme
+ *
+ * Design tokens for dark mode using Open Props variables.
+ * This file defines the --noet-* custom properties that are used
+ * throughout the layout CSS.
+ */
+
+@import url('open-props/normalize.min.css');
+@import url('open-props/open-props.min.css');
+
+:root {
+  color-scheme: dark;
+
+  /* Background colors */
+  --noet-bg-primary: var(--gray-9);
+  --noet-bg-secondary: var(--gray-8);
+  --noet-bg-tertiary: var(--gray-7);
+  --noet-bg-overlay: var(--gray-9);
+
+  /* Text colors */
+  --noet-text-primary: var(--gray-1);
+  --noet-text-secondary: var(--gray-3);
+  --noet-text-tertiary: var(--gray-4);
+  --noet-text-inverse: var(--gray-9);
+
+  /* Border colors */
+  --noet-border-primary: var(--gray-6);
+  --noet-border-secondary: var(--gray-7);
+  --noet-border-focus: var(--blue-4);
+
+  /* Interactive colors */
+  --noet-link: var(--blue-4);
+  --noet-link-hover: var(--blue-3);
+  --noet-link-visited: var(--purple-4);
+
+  /* UI element colors */
+  --noet-button-bg: var(--gray-7);
+  --noet-button-bg-hover: var(--gray-6);
+  --noet-button-text: var(--gray-1);
+
+  /* Accent colors */
+  --noet-accent-primary: var(--blue-4);
+  --noet-accent-secondary: var(--cyan-4);
+  --noet-success: var(--green-4);
+  --noet-warning: var(--orange-4);
+  --noet-error: var(--red-4);
+
+  /* Shadows */
+  --noet-shadow-small: var(--shadow-2);
+  --noet-shadow-medium: var(--shadow-3);
+  --noet-shadow-large: var(--shadow-4);
+
+  /* Backdrop */
+  --noet-backdrop: rgba(0, 0, 0, 0.6);
+
+  /* Graph visualization colors (for future use) */
+  --noet-graph-node-bg: var(--gray-8);
+  --noet-graph-node-border: var(--gray-5);
+  --noet-graph-node-selected: var(--blue-8);
+  --noet-graph-edge: var(--gray-5);
+}
+
+/* Import shared layout CSS */
+@import url('noet-layout.css');

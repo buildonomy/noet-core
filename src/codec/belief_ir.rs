@@ -1176,7 +1176,11 @@ impl DocCodec for ProtoBeliefNode {
         Some(self.document.to_string())
     }
 
-    fn generate_html(&self, _script: Option<&str>) -> Result<Option<String>, BuildonomyError> {
+    fn generate_html(
+        &self,
+        _script: Option<&str>,
+        _use_cdn: bool,
+    ) -> Result<Option<String>, BuildonomyError> {
         // Only generate index.html for Network nodes
         if !self.kind.contains(BeliefKind::Network) {
             return Ok(None);

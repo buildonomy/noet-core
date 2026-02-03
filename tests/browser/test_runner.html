@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Noet WASM Test Runner</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+
+        .test-section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .test-result {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+        }
+
+        .test-result.pass {
+            background: #e8f5e9;
+            border-left: 4px solid #4CAF50;
+        }
+
+        .test-result.fail {
+            background: #ffebee;
+            border-left: 4px solid #f44336;
+        }
+
+        .test-result.info {
+            background: #e3f2fd;
+            border-left: 4px solid #2196F3;
+        }
+
+        .summary {
+            font-size: 18px;
+            font-weight: bold;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+
+        .summary.success {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .summary.failure {
+            background: #f44336;
+            color: white;
+        }
+
+        pre {
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #2196F3;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <h1></h1>🧪 Noet WASM Test Runner</h1>
+
+    <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <p>Loading WASM module and beliefbase.json...</p>
+    </div>
+
+    <div id="results" style="display: none;"></div>
+
+    <script type="module">
+        // Test results container
+        const results = document.getElementById('results');
+        const loading = document.getElementById('loading');
+        let testsPassed = 0;
+        let testsFailed = 0;
+
+        function log(message, type = 'info') {
+            const div = document.createElement('div');
+            div.className = `test-result ${type}`;
+            div.textContent = message;
+            results.appendChild(div);
+
+            if (type === 'pass') testsPassed++;
+            if (type === 'fail') testsFailed++;
+
+            console.log(`[${type.toUpperCase()}] ${message}`);
+        }
+
+        function assert(condition, message) {
+            if (condition) {
+                log(`✅ PASS: ${message}`, 'pass');
+            } else {
+                log(`❌ FAIL: ${message}`, 'fail');
+                throw new Error(`Assertion failed: ${message}`);
+            }
+        }
+
+        function assertEqual(actual, expected, message) {
+            if (actual === expected) {
+                log(`✅ PASS: ${message} (got ${actual})`, 'pass');
+            } else {
+                log(`❌ FAIL: ${message} (expected ${expected}, got ${actual})`, 'fail');
+                throw new Error(`Assertion failed: ${message}`);
+            }
+        }
+
+        function createSection(title) {
+            const section = document.createElement('div');
+            section.className = 'test-section';
+            const heading = document.createElement('h2');
+            heading.textContent = title;
+            section.appendChild(heading);
+            results.appendChild(section);
+            return section;
+        }
+
+        async function runTests() {
+            try {
+                // Hide loading, show results
+                loading.style.display = 'none';
+                results.style.display = 'block';
+
+                log('Starting WASM tests...', 'info');
+
+                // Import WASM module
+                log('Importing WASM module from ../../pkg/noet_core.js', 'info');
+                const { default: init, BeliefBaseWasm } = await import('../../pkg/noet_core.js');
+
+                // Initialize WASM
+                log('Initializing WASM...', 'info');
+                await init();
+                log('✅ WASM initialized successfully', 'pass');
+
+                // Load beliefbase.json
+                log('Fetching beliefbase.json...', 'info');
+                const response = await fetch('./test-output/beliefbase.json');
+                assert(response.ok, 'beliefbase.json exists and is accessible');
+
+                const json = await response.text();
+                log(`Loaded ${(json.length / 1024).toFixed(2)} KB of JSON data`, 'info');
+
+                // Create BeliefBase from JSON
+                log('Creating BeliefBaseWasm from JSON...', 'info');
+                const bb = new BeliefBaseWasm(json);
+                log('✅ BeliefBaseWasm created successfully', 'pass');
+
+                // Test 1: Node count
+                createSection('Test 1: Basic Queries');
+                const nodeCount = bb.node_count();
+                assert(nodeCount > 0, `Node count is positive (${nodeCount} nodes)`);
+                log(`Loaded ${nodeCount} nodes total`, 'info');
+
+                // Test 2: Get documents
+                createSection('Test 2: Document Queries');
+                const documents = bb.get_documents();
+                assert(Array.isArray(documents), 'get_documents() returns array');
+                assert(documents.length > 0, `Found ${documents.length} documents`);
+                log(`Documents: ${documents.map(d => d.title).join(', ')}`, 'info');
+
+                // Test 3: Get networks
+                createSection('Test 3: Network Queries');
+                const networks = bb.get_networks();
+                assert(Array.isArray(networks), 'get_networks() returns array');
+                assert(networks.length > 0, `Found ${networks.length} networks`);
+                log(`Networks: ${networks.map(n => n.title).join(', ')}`, 'info');
+
+                // Test 4: Get node by BID
+                createSection('Test 4: Node Retrieval');
+                if (documents.length > 0) {
+                    const firstDoc = documents[0];
+                    log(`Testing get_by_bid() with document: ${firstDoc.title}`, 'info');
+
+                    const retrieved = bb.get_by_bid(firstDoc.bid);
+                    assert(retrieved !== null, 'Retrieved node is not null');
+                    assertEqual(retrieved.bid, firstDoc.bid, 'Retrieved node has correct BID');
+                    assertEqual(retrieved.title, firstDoc.title, 'Retrieved node has correct title');
+                }
+
+                // Test 5: Search
+                createSection('Test 5: Search Functionality');
+                const searchResults = bb.search('test');
+                assert(Array.isArray(searchResults), 'search() returns array');
+                log(`Search for "test" returned ${searchResults.length} results`, 'info');
+
+                // Test 6: Backlinks
+                createSection('Test 6: Backlinks');
+                if (documents.length > 0) {
+                    const doc = documents[0];
+                    const backlinks = bb.get_backlinks(doc.bid);
+                    assert(Array.isArray(backlinks), 'get_backlinks() returns array');
+                    log(`Document "${doc.title}" has ${backlinks.length} backlinks`, 'info');
+                }
+
+                // Test 7: Forward links
+                createSection('Test 7: Forward Links');
+                if (documents.length > 0) {
+                    const doc = documents[0];
+                    const forwardLinks = bb.get_forward_links(doc.bid);
+                    assert(Array.isArray(forwardLinks), 'get_forward_links() returns array');
+                    log(`Document "${doc.title}" has ${forwardLinks.length} forward links`, 'info');
+                }
+
+                // Test 8: Invalid BID handling
+                createSection('Test 8: Error Handling');
+                const invalidNode = bb.get_by_bid('invalid-bid-format');
+                assertEqual(invalidNode, null, 'Invalid BID returns null');
+
+                const invalidBacklinks = bb.get_backlinks('invalid-bid');
+                assert(Array.isArray(invalidBacklinks), 'Invalid BID backlinks returns empty array');
+                assertEqual(invalidBacklinks.length, 0, 'Invalid BID backlinks array is empty');
+
+                // Test 9: Namespace functions
+                createSection('Test 9: System Namespaces');
+                const hrefNs = BeliefBaseWasm.href_namespace();
+                assert(typeof hrefNs === 'string', 'href_namespace() returns string');
+                assert(hrefNs.length > 0, 'href_namespace() returns non-empty string');
+                log(`Href namespace: ${hrefNs}`, 'info');
+
+                const assetNs = BeliefBaseWasm.asset_namespace();
+                assert(typeof assetNs === 'string', 'asset_namespace() returns string');
+                assert(assetNs.length > 0, 'asset_namespace() returns non-empty string');
+                log(`Asset namespace: ${assetNs}`, 'info');
+
+                const apiNs = BeliefBaseWasm.buildonomy_namespace();
+                assert(typeof apiNs === 'string', 'buildonomy_namespace() returns string');
+                assert(apiNs.length > 0, 'buildonomy_namespace() returns non-empty string');
+                log(`API namespace: ${apiNs}`, 'info');
+
+                // Test 10: NodeContext
+                createSection('Test 10: NodeContext');
+                if (documents.length > 0) {
+                    const doc = documents[0];
+                    log(`Getting context for document: ${doc.title}`, 'info');
+
+                    const ctx = bb.get_context(doc.bid);
+                    assert(ctx !== null, 'get_context() returns non-null value');
+                    assert(ctx.node !== undefined, 'NodeContext has node field');
+                    assertEqual(ctx.node.bid, doc.bid, 'NodeContext.node has correct BID');
+
+                    assert(typeof ctx.home_path === 'string', 'NodeContext has home_path string');
+                    log(`Home path: ${ctx.home_path}`, 'info');
+
+                    assert(typeof ctx.home_net === 'string', 'NodeContext has home_net string');
+                    log(`Home network: ${ctx.home_net}`, 'info');
+
+                    assert(typeof ctx.related_nodes === 'object', 'NodeContext.related_nodes is object');
+                    assert(!Array.isArray(ctx.related_nodes), 'NodeContext.related_nodes is not array (it is a map)');
+                    const relatedCount = Object.keys(ctx.related_nodes).length;
+                    log(`Related nodes: ${relatedCount}`, 'info');
+
+                    // Verify we can lookup nodes by BID
+                    if (relatedCount > 0) {
+                        const firstBid = Object.keys(ctx.related_nodes)[0];
+                        const relatedNode = ctx.related_nodes[firstBid];
+                        assert(relatedNode !== undefined, 'Can lookup related node by BID');
+                        assert(relatedNode.bid === firstBid, 'Related node has correct BID');
+                        log(`  Sample related node: ${relatedNode.title || relatedNode.bid}`, 'info');
+                    }
+
+                    assert(ctx.graph !== undefined, 'NodeContext has graph field');
+                    assert(typeof ctx.graph === 'object', 'NodeContext.graph is object');
+                    log(`Graph contains ${Object.keys(ctx.graph).length} weight kinds`, 'info');
+
+                    // Check graph structure (HashMap<WeightKind, (Vec<Bid>, Vec<Bid>)>)
+                    for (const [weightKind, [sources, sinks]] of Object.entries(ctx.graph)) {
+                        assert(Array.isArray(sources), `Graph[${weightKind}].sources is array`);
+                        assert(Array.isArray(sinks), `Graph[${weightKind}].sinks is array`);
+                        log(`  ${weightKind}: ${sources.length} sources, ${sinks.length} sinks`, 'info');
+                    }
+                }
+
+                // Test 11: get_paths() - Navigation tree data
+                log('Test 11: get_paths() - Navigation tree data', 'info');
+                {
+                    const paths = beliefbase.get_paths();
+                    assert(paths !== null && paths !== undefined, 'get_paths() returns data');
+                    assert(typeof paths === 'object', 'get_paths() returns object');
+
+                    const networkBids = Object.keys(paths);
+                    assert(networkBids.length > 0, 'At least one network in paths');
+                    log(`Found ${networkBids.length} networks`, 'info');
+
+                    // Check structure: network_bid → Vec<(path, bid, order_indices)>
+                    for (const netBid of networkBids) {
+                        const pathData = paths[netBid];
+                        assert(Array.isArray(pathData), `Network ${netBid} has array of paths`);
+                        log(`  Network ${netBid}: ${pathData.length} paths`, 'info');
+
+                        // Check first path entry structure
+                        if (pathData.length > 0) {
+                            const [path, bid, order] = pathData[0];
+                            assert(typeof path === 'string', 'Path is string');
+                            assert(typeof bid === 'string', 'BID is string');
+                            assert(Array.isArray(order), 'Order indices is array');
+                            log(`    Example: "${path}" → ${bid} [${order.join(', ')}]`, 'info');
+                        }
+                    }
+
+                    // Log statistics
+                    const totalPaths = networkBids.reduce((sum, bid) => sum + paths[bid].length, 0);
+                    log(`Total paths across all networks: ${totalPaths}`, 'info');
+                }
+
+                // Summary
+                const summary = document.createElement('div');
+                summary.className = `summary ${testsFailed === 0 ? 'success' : 'failure'}`;
+                summary.textContent = `Test Results: ${testsPassed} passed, ${testsFailed} failed`;
+                results.appendChild(summary);
+
+                if (testsFailed === 0) {
+                    log('🎉 All tests passed!', 'pass');
+                    console.log('%c✅ ALL TESTS PASSED', 'color: green; font-size: 20px; font-weight: bold;');
+                } else {
+                    log(`⚠️ ${testsFailed} test(s) failed`, 'fail');
+                    console.error(`❌ ${testsFailed} TESTS FAILED`);
+                }
+
+            } catch (error) {
+                log(`💥 FATAL ERROR: ${error.message}`, 'fail');
+                console.error('Test runner error:', error);
+
+                const summary = document.createElement('div');
+                summary.className = 'summary failure';
+                summary.innerHTML = `
+                    <strong>Test Runner Failed</strong><br>
+                    ${error.message}<br>
+                    <pre>${error.stack}</pre>
+                `;
+                results.appendChild(summary);
+            }
+        }
+
+        // Run tests on page load
+        runTests();
+    </script>
+</body>
+</html>

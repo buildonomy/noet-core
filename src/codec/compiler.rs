@@ -116,6 +116,8 @@ pub struct DocumentCompiler {
     html_output_dir: Option<PathBuf>,
     /// Optional JavaScript to inject into generated HTML (e.g., live reload script)
     html_script: Option<String>,
+    /// Use CDN for Open Props (requires internet, smaller output)
+    use_cdn: bool,
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
@@ -151,7 +153,7 @@ impl DocumentCompiler {
         max_reparse_count: Option<usize>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(entry_point, tx, max_reparse_count, write, None, None)
+        Self::with_html_output(entry_point, tx, max_reparse_count, write, None, None, false)
     }
 
     /// Create a new compiler with HTML output enabled
@@ -162,10 +164,11 @@ impl DocumentCompiler {
         write: bool,
         html_output_dir: Option<PathBuf>,
         html_script: Option<String>,
+        use_cdn: bool,
     ) -> Result<Self, BuildonomyError> {
-        // Copy static assets (CSS) to HTML output directory if configured
+        // Copy static assets (CSS, JS, templates) to HTML output directory if configured
         if let Some(ref html_dir) = html_output_dir {
-            Self::copy_static_assets(html_dir)?;
+            Self::copy_static_assets(html_dir, use_cdn)?;
         }
         let entry_path = entry_point.as_ref().canonicalize()?;
 
@@ -177,6 +180,7 @@ impl DocumentCompiler {
             write,
             html_output_dir,
             html_script,
+            use_cdn,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -209,6 +213,7 @@ impl DocumentCompiler {
             write: false,
             html_output_dir: None,
             html_script: None,
+            use_cdn: false,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -1527,18 +1532,20 @@ impl DocumentCompiler {
         Ok(html)
     }
 
-    /// Generate HTML for a parsed document
-    /// Copy static assets (CSS, etc.) to HTML output directory
-    fn copy_static_assets(html_output_dir: &Path) -> Result<(), BuildonomyError> {
-        const DEFAULT_CSS: &str = include_str!("../../assets/default-theme.css");
+    /// Copy static assets (CSS, JS, templates) to HTML output directory
+    ///
+    /// Extracts all vendored assets using the asset management module.
+    /// When use_cdn is true, skips Open Props extraction (uses CDN instead).
+    fn copy_static_assets(html_output_dir: &Path, use_cdn: bool) -> Result<(), BuildonomyError> {
+        // Extract vendored assets (CSS, JS, templates)
+        crate::codec::assets::extract_assets(html_output_dir, use_cdn)?;
 
-        let assets_dir = html_output_dir.join("assets");
-        std::fs::create_dir_all(&assets_dir)?;
-
-        let css_path = assets_dir.join("default-theme.css");
-        std::fs::write(&css_path, DEFAULT_CSS)?;
-
-        tracing::info!("Copied static assets to {}", assets_dir.display());
+        let mode = if use_cdn { "CDN" } else { "local" };
+        tracing::info!(
+            "Extracted static assets to {}/assets (mode: {})",
+            html_output_dir.display(),
+            mode
+        );
         Ok(())
     }
 
@@ -1566,7 +1573,7 @@ impl DocumentCompiler {
         // Generate HTML (drop lock before await)
         let html_opt = {
             let codec = codec_arc.lock();
-            codec.generate_html(self.html_script.as_deref())?
+            codec.generate_html(self.html_script.as_deref(), self.use_cdn)?
         };
 
         if let Some(html) = html_opt {

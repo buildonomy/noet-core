@@ -1,0 +1,656 @@
+/**
+ * Noet Layout CSS
+ *
+ * Responsive layout using CSS Grid and Open Props design tokens.
+ * Mobile-first approach with progressive enhancement for tablet/desktop.
+ *
+ * Layout Structure:
+ * - Header: Fixed top bar with branding and theme switcher
+ * - Nav: Left sidebar (desktop) / Hamburger menu (mobile/tablet)
+ * - Content: Main document area (scrollable)
+ * - Metadata: Right sidebar (desktop) / Bottom drawer (mobile/tablet)
+ * - Graph: Graph visualization area
+ *
+ * Responsive Breakpoints (Open Props defaults):
+ * - Mobile: < 640px
+ * - Tablet: 640px - 1024px
+ * - Desktop: > 1024px
+ */
+
+/* =========================================================================
+   Base Styles
+   ========================================================================= */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html {
+    font-family: var(--font-sans);
+    font-size: var(--font-size-fluid-0);
+    line-height: var(--font-lineheight-3);
+}
+
+body {
+    background-color: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    overflow: hidden; /* Prevent body scroll, use internal scrolling */
+}
+
+/* =========================================================================
+   Main Grid Layout
+   ========================================================================= */
+
+.noet-container {
+    display: grid;
+    height: 100vh;
+    width: 100vw;
+
+    /* Mobile layout: single column with header and footer */
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas:
+        "header"
+        "content"
+        "footer";
+}
+
+/* Tablet: Still single column with footer */
+@media (min-width: 640px) {
+    .noet-container {
+        grid-template-areas:
+            "header"
+            "content"
+            "footer";
+    }
+}
+
+/* Desktop: Three-column layout with footer */
+@media (min-width: 1024px) {
+    .noet-container {
+        grid-template-columns: 280px 1fr 320px;
+        grid-template-rows: auto 1fr auto;
+        grid-template-areas:
+            "header header header"
+            "nav content metadata"
+            "footer footer footer";
+    }
+}
+
+/* =========================================================================
+   Header
+   ========================================================================= */
+
+.noet-header {
+    grid-area: header;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--size-3);
+    background-color: var(--noet-bg-secondary);
+    border-bottom: 1px solid var(--noet-border-primary);
+    z-index: 100;
+}
+
+.noet-header-left {
+    display: flex;
+    align-items: center;
+    gap: var(--size-3);
+}
+
+.noet-header-right {
+    display: flex;
+    align-items: center;
+    gap: var(--size-2);
+}
+
+.noet-site-title {
+    font-size: var(--font-size-3);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-primary);
+    margin: 0;
+}
+
+@media (min-width: 640px) {
+    .noet-site-title {
+        font-size: var(--font-size-4);
+        font-weight: var(--font-weight-7);
+    }
+}
+
+.noet-header__brand {
+    font-size: var(--font-size-4);
+    font-weight: var(--font-weight-7);
+    color: var(--noet-text-primary);
+    text-decoration: none;
+}
+
+.noet-header__actions {
+    display: flex;
+    gap: var(--size-2);
+    align-items: center;
+}
+
+/* Hamburger menu button (mobile/tablet only) */
+.noet-hamburger {
+    display: block;
+    background: none;
+    border: none;
+    font-size: var(--font-size-5);
+    cursor: pointer;
+    padding: var(--size-2);
+    color: var(--noet-text-primary);
+}
+
+@media (min-width: 1024px) {
+    .noet-hamburger {
+        display: none;
+    }
+}
+
+/* Metadata toggle button (mobile/tablet only) */
+.noet-metadata-toggle {
+    display: block;
+    background: var(--noet-button-bg);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    padding: var(--size-2) var(--size-3);
+    font-size: var(--font-size-1);
+    cursor: pointer;
+    color: var(--noet-button-text);
+}
+
+.noet-metadata-toggle:hover {
+    background: var(--noet-button-bg-hover);
+}
+
+@media (min-width: 1024px) {
+    .noet-metadata-toggle {
+        display: none;
+    }
+}
+
+/* =========================================================================
+   Navigation Sidebar / Menu
+   ========================================================================= */
+
+.noet-nav {
+    grid-area: nav;
+    background-color: var(--noet-bg-secondary);
+    border-right: 1px solid var(--noet-border-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Mobile/Tablet: Off-canvas slide-in menu */
+@media (max-width: 1023px) {
+    .noet-nav {
+        position: fixed;
+        top: 0;
+        left: -100%;
+        width: 280px;
+        height: 100vh;
+        z-index: 200;
+        transition: left 0.3s var(--ease-out-3);
+        box-shadow: var(--noet-shadow-large);
+    }
+
+    .noet-nav.is-open {
+        left: 0;
+    }
+}
+
+/* Desktop: Always visible */
+@media (min-width: 1024px) {
+    .noet-nav {
+        position: relative;
+    }
+}
+
+.noet-nav__content {
+    flex: 1;
+    padding: var(--size-4);
+    overflow-y: auto;
+}
+
+.noet-nav__footer {
+    padding: var(--size-3);
+    border-top: 1px solid var(--noet-border-primary);
+    background-color: var(--noet-bg-tertiary);
+}
+
+/* Theme selector in nav footer */
+.noet-nav__footer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--size-2);
+}
+
+.noet-nav__footer label {
+    font-size: var(--font-size-0);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+}
+
+.noet-theme-select {
+    width: 100%;
+    padding: var(--size-2) var(--size-3);
+    background-color: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    color: var(--noet-text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-1);
+    cursor: pointer;
+    transition: border-color 0.2s var(--ease-2);
+}
+
+.noet-theme-select:hover {
+    border-color: var(--noet-border-focus);
+}
+
+.noet-theme-select:focus {
+    outline: none;
+    border-color: var(--noet-border-focus);
+    box-shadow: 0 0 0 2px var(--noet-bg-tertiary);
+}
+
+/* =========================================================================
+   Content Area
+   ========================================================================= */
+
+.noet-content {
+    grid-area: content;
+    overflow-y: auto;
+    padding: var(--size-5);
+    background-color: var(--noet-bg-primary);
+}
+
+/* Constrain content width for readability */
+.noet-content__inner {
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+/* =========================================================================
+   Metadata Panel / Drawer
+   ========================================================================= */
+
+.noet-metadata {
+    grid-area: metadata;
+    background-color: var(--noet-bg-secondary);
+    border-left: 1px solid var(--noet-border-primary);
+    overflow-y: auto;
+    padding: var(--size-4);
+}
+
+/* Mobile/Tablet: Bottom drawer */
+@media (max-width: 1023px) {
+    .noet-metadata {
+        position: fixed;
+        bottom: -100%;
+        left: 0;
+        right: 0;
+        height: 60vh;
+        max-height: 600px;
+        z-index: 150;
+        transition: bottom 0.3s var(--ease-out-3);
+        box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.2);
+        border-left: none;
+        border-top: 1px solid var(--noet-border-primary);
+        border-radius: var(--radius-3) var(--radius-3) 0 0;
+    }
+
+    .noet-metadata.is-open {
+        bottom: 0;
+    }
+
+    /* Drawer handle for swipe gesture */
+    .noet-metadata::before {
+        content: "";
+        display: block;
+        width: 40px;
+        height: 4px;
+        background-color: var(--noet-border-primary);
+        border-radius: var(--radius-round);
+        margin: 0 auto var(--size-3);
+    }
+}
+
+/* Desktop: Always visible */
+@media (min-width: 1024px) {
+    .noet-metadata {
+        position: relative;
+    }
+}
+
+/* =========================================================================
+   Graph Visualization Area
+   ========================================================================= */
+
+.noet-graph {
+    display: none; /* Hidden until Step 4 implementation */
+    background-color: var(--noet-bg-tertiary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    padding: var(--size-3);
+    margin-top: var(--size-4);
+}
+
+/* =========================================================================
+   Footer
+   ========================================================================= */
+
+.noet-footer {
+    grid-area: footer;
+    padding: var(--size-3);
+    background-color: var(--noet-bg-secondary);
+    border-top: 1px solid var(--noet-border-primary);
+    text-align: center;
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+}
+
+.noet-footer a {
+    color: var(--noet-link);
+    text-decoration: none;
+}
+
+.noet-footer a:hover {
+    text-decoration: underline;
+}
+
+/* =========================================================================
+   Backdrop Overlay
+   ========================================================================= */
+
+.noet-backdrop {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background-color: var(--noet-backdrop);
+    z-index: 100;
+    cursor: pointer;
+}
+
+.noet-backdrop.is-visible {
+    display: block;
+}
+
+/* =========================================================================
+   Navigation Tree
+   ========================================================================= */
+
+.noet-nav-tree {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.noet-nav-tree__item {
+    margin-bottom: var(--size-1);
+}
+
+.noet-nav-tree__item.has-children {
+    display: flex;
+    flex-direction: column;
+}
+
+.noet-nav-tree__item.has-children > :first-child {
+    display: flex;
+    align-items: center;
+    gap: var(--size-1);
+}
+
+/* Toggle button for collapsible sections */
+.noet-nav-tree__toggle {
+    background: none;
+    border: none;
+    padding: var(--size-1);
+    cursor: pointer;
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-2);
+    line-height: 1;
+    transition: transform 0.2s var(--ease-2);
+    flex-shrink: 0;
+}
+
+.noet-nav-tree__toggle:hover {
+    color: var(--noet-text-primary);
+}
+
+.noet-nav-tree__item.is-expanded > :first-child > .noet-nav-tree__toggle {
+    transform: rotate(90deg);
+}
+
+.noet-nav-tree__link {
+    display: block;
+    padding: var(--size-2) var(--size-3);
+    color: var(--noet-text-primary);
+    text-decoration: none;
+    border-radius: var(--radius-2);
+    transition: background-color 0.2s var(--ease-2);
+    flex: 1;
+}
+
+.noet-nav-tree__link:hover {
+    background-color: var(--noet-bg-tertiary);
+}
+
+.noet-nav-tree__link.is-active {
+    background-color: var(--noet-accent-primary);
+    color: var(--noet-text-inverse);
+    font-weight: var(--font-weight-6);
+}
+
+/* Nested navigation children */
+.noet-nav-tree__children {
+    display: none;
+    padding-left: var(--size-5);
+    margin-top: var(--size-1);
+}
+
+.noet-nav-tree__item.is-expanded > .noet-nav-tree__children {
+    display: block;
+}
+
+.noet-nav-tree__children .noet-nav-tree {
+    margin-top: var(--size-1);
+}
+
+/* =========================================================================
+   Metadata Panel Content (Placeholder for Step 2)
+   ========================================================================= */
+
+.noet-metadata__title {
+    font-size: var(--font-size-3);
+    font-weight: var(--font-weight-7);
+    margin-bottom: var(--size-3);
+    color: var(--noet-text-primary);
+}
+
+.noet-metadata__section {
+    margin-bottom: var(--size-4);
+}
+
+.noet-metadata__section-title {
+    font-size: var(--font-size-1);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: var(--size-2);
+}
+
+.noet-metadata__field {
+    display: flex;
+    justify-content: space-between;
+    padding: var(--size-2) 0;
+    border-bottom: 1px solid var(--noet-border-secondary);
+}
+
+.noet-metadata__field-label {
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+}
+
+.noet-metadata__field-value {
+    color: var(--noet-text-primary);
+}
+
+/* =========================================================================
+   Typography & Content Styles
+   ========================================================================= */
+
+.noet-content h1,
+.noet-content h2,
+.noet-content h3,
+.noet-content h4,
+.noet-content h5,
+.noet-content h6 {
+    margin-top: var(--size-5);
+    margin-bottom: var(--size-3);
+    font-weight: var(--font-weight-7);
+    line-height: var(--font-lineheight-1);
+}
+
+.noet-content h1 {
+    font-size: var(--font-size-6);
+}
+
+.noet-content h2 {
+    font-size: var(--font-size-5);
+}
+
+.noet-content h3 {
+    font-size: var(--font-size-4);
+}
+
+.noet-content p {
+    margin-bottom: var(--size-4);
+}
+
+.noet-content a {
+    color: var(--noet-link);
+    text-decoration: underline;
+    transition: color 0.2s var(--ease-2);
+}
+
+.noet-content a:hover {
+    color: var(--noet-link-hover);
+}
+
+.noet-content a:visited {
+    color: var(--noet-link-visited);
+}
+
+.noet-content code {
+    background-color: var(--noet-bg-tertiary);
+    padding: var(--size-1) var(--size-2);
+    border-radius: var(--radius-2);
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+}
+
+.noet-content pre {
+    background-color: var(--noet-bg-tertiary);
+    padding: var(--size-3);
+    border-radius: var(--radius-2);
+    overflow-x: auto;
+    margin-bottom: var(--size-4);
+}
+
+.noet-content pre code {
+    background-color: transparent;
+    padding: 0;
+}
+
+.noet-content blockquote {
+    border-left: 4px solid var(--noet-border-primary);
+    padding-left: var(--size-4);
+    margin: var(--size-4) 0;
+    color: var(--noet-text-secondary);
+    font-style: italic;
+}
+
+.noet-content ul,
+.noet-content ol {
+    margin-bottom: var(--size-4);
+    padding-left: var(--size-5);
+}
+
+.noet-content li {
+    margin-bottom: var(--size-2);
+}
+
+.noet-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: var(--size-4);
+}
+
+.noet-content th,
+.noet-content td {
+    padding: var(--size-2) var(--size-3);
+    border: 1px solid var(--noet-border-primary);
+    text-align: left;
+}
+
+.noet-content th {
+    background-color: var(--noet-bg-secondary);
+    font-weight: var(--font-weight-6);
+}
+
+/* =========================================================================
+   Utility Classes
+   ========================================================================= */
+
+.is-hidden {
+    display: none !important;
+}
+
+.is-visible {
+    display: block !important;
+}
+
+/* Smooth scrolling */
+@media (prefers-reduced-motion: no-preference) {
+    html {
+        scroll-behavior: smooth;
+    }
+}
+
+/* Focus styles for accessibility */
+*:focus-visible {
+    outline: 2px solid var(--noet-border-focus);
+    outline-offset: 2px;
+}
+
+/* =========================================================================
+   Print Styles
+   ========================================================================= */
+
+@media print {
+    .noet-header,
+    .noet-nav,
+    .noet-metadata,
+    .noet-backdrop {
+        display: none !important;
+    }
+
+    .noet-container {
+        display: block;
+    }
+
+    .noet-content {
+        padding: 0;
+        overflow: visible;
+    }
+}

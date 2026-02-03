@@ -46,7 +46,28 @@ Example: `feat: add YAML codec support`
 **Testing**: Write tests for new code
 - Unit tests: Same file as code in `#[cfg(test)]` module
 - Integration tests: `tests/` directory
+- Test output: Use `tests/*/test-output/` (gitignored, see below)
 - See [Rust Book - Testing](https://doc.rust-lang.org/book/ch11-00-testing.html)
+
+**Test Output Convention**:
+```bash
+# Standardized test output locations (all gitignored)
+tests/browser/test-output/    # Browser test artifacts
+tests/integration/test-output/ # Integration test output
+test-output/                   # Ad-hoc testing at project root
+
+# Generate test HTML/artifacts
+./target/debug/noet parse tests/network_1 --html-output tests/browser/test-output
+
+# Browser tests (automated)
+./tests/browser/run.sh  # Uses tests/browser/test-output/
+```
+
+**Why standardized locations?**
+- Single `.gitignore` rule: `test-output/`
+- Predictable cleanup: `find tests -name test-output -type d -exec rm -rf {} +`
+- CI can cache test artifacts by known paths
+- Documentation examples use consistent paths
 
 **Documentation**: Document public items
 - See [DOCUMENTATION_STRATEGY.md](docs/project/DOCUMENTATION_STRATEGY.md) for organization
@@ -74,13 +95,64 @@ src/
 ├── properties.rs       # Node/edge types, BIDs
 └── ...
 
+assets/                 # UI assets (CSS, JS, fonts) - vendored in binary
+├── package.json        # UI dependencies (npm)
+├── node_modules/       # Downloaded dependencies (gitignored)
+├── open-props/         # Vendored CSS framework (~38KB)
+├── *.css               # Theme and layout styles (~24KB)
+└── *.js                # Browser scripts
+
 tests/                  # Integration tests
+├── browser/            # WASM browser tests
+│   └── README.md       # Browser testing guide
 examples/               # Usage examples
 benches/                # Performance benchmarks
 docs/
 ├── architecture.md     # Conceptual overview
 └── design/             # Technical specs
 ```
+
+## UI Asset Workflow
+
+The `assets/` directory contains CSS, JavaScript, and other UI resources for the HTML viewer. These assets are **always embedded in the binary** using `include_dir`, making the binary self-contained and offline-first. Assets are managed via npm but vendored at compile time.
+
+### Working with UI Assets
+
+```bash
+# Install/update UI dependencies
+cd assets
+npm install
+
+# Vendor Open Props CSS framework
+npm run copy:open-props
+
+# Verify vendored assets
+ls -lh open-props/
+# Should see: normalize.min.css (~9KB), open-props.min.css (~29KB)
+```
+
+**Key Points:**
+- Assets are embedded in binary at compile time (~40KB overhead)
+- `node_modules/` is gitignored (only needed during development)
+- `open-props/` is committed (vendored and embedded)
+- Theme CSS files (`noet-theme-*.css`, `noet-layout.css`) are committed and embedded
+- Users can optionally use `--cdn` flag to reference Open Props from CDN
+- See [`tests/browser/README.md`](tests/browser/README.md) for browser testing
+
+**Binary Size Impact:**
+- Base binary: ~2MB
+- With embedded assets: ~2.04MB (+40KB, 2% increase)
+- Negligible overhead for offline-first capability
+
+### Adding New UI Dependencies
+
+1. Update `assets/package.json` with new dependency
+2. Run `npm install` in `assets/`
+3. Add vendor script to `package.json` to copy files from `node_modules/`
+4. Commit vendored files to `assets/` (they will be embedded in binary)
+5. Do not commit `node_modules/` (gitignored)
+
+**Note:** All committed files in `assets/` are embedded in the binary at compile time via `include_dir!`. Keep vendored assets minimal to avoid binary bloat.
 
 ## Getting Help
 

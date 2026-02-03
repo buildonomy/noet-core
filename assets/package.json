@@ -1,0 +1,19 @@
+{
+  "name": "noet-ui-assets",
+  "version": "0.0.0",
+  "description": "UI dependencies for noet-core HTML viewer",
+  "private": true,
+  "scripts": {
+    "install:vendor": "npm install && npm run copy:open-props",
+    "copy:open-props": "mkdir -p open-props && cp node_modules/open-props/open-props.min.css open-props/ && cp node_modules/open-props/normalize.min.css open-props/"
+  },
+  "dependencies": {
+    "open-props": "^1.7.23"
+  },
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/buildonomy/noet-core"
+  },
+  "license": "MIT OR Apache-2.0"
+}
