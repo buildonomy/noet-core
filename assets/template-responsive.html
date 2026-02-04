@@ -45,9 +45,23 @@
 
             <!-- Left Navigation -->
             <nav class="noet-nav" id="nav-panel">
+                <button
+                    class="noet-nav__collapse"
+                    id="nav-collapse"
+                    aria-label="Collapse navigation panel"
+                >
+                    ◀
+                </button>
                 <div class="noet-nav__content">
                     <div class="noet-nav-header">
                         <h2>Navigation</h2>
+                    </div>
+                    <div id="nav-error" class="noet-error" hidden>
+                        <h3 class="noet-error__title">Navigation Error</h3>
+                        <p class="noet-error__message">Failed to load navigation data.</p>
+                        <button class="noet-error__action" onclick="window.location.reload()">
+                            Reload Page
+                        </button>
                     </div>
                     <div id="nav-content" class="noet-nav-tree">
                         <!-- Populated by viewer.js -->
@@ -66,11 +80,20 @@
 
             <!-- Main Content Area -->
             <main class="noet-content">
-                <article>{{CONTENT}}</article>
+                <div class="noet-content__inner">
+                    <article>{{CONTENT}}</article>
+                </div>
             </main>
 
             <!-- Right Metadata Panel (hidden by default) -->
             <aside class="noet-metadata" id="metadata-panel" hidden>
+                <button
+                    class="noet-metadata__collapse"
+                    id="metadata-collapse"
+                    aria-label="Collapse metadata panel"
+                >
+                    ▶
+                </button>
                 <div class="noet-metadata-header">
                     <h2>Metadata</h2>
                     <button
@@ -79,6 +102,13 @@
                         aria-label="Close metadata panel"
                     >
                         ×
+                    </button>
+                </div>
+                <div id="metadata-error" class="noet-error" hidden>
+                    <h3 class="noet-error__title">Metadata Error</h3>
+                    <p class="noet-error__message">Failed to load metadata.</p>
+                    <button class="noet-error__action" onclick="window.location.reload()">
+                        Reload Page
                     </button>
                 </div>
                 <div id="metadata-content" class="noet-metadata-content">

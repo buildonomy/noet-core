@@ -1262,20 +1262,15 @@ impl DocCodec for MdCodec {
                     title,
                     id,
                 }) => {
-                    // Get list of registered codec extensions
-                    let codec_extensions = crate::codec::CODECS.extensions();
-
-                    // Rewrite if this is a BeliefBase link OR an unresolved document link
-                    let is_beliefbase_link = title.contains("bref://");
-                    let is_unresolved_doc_link = codec_extensions.iter().any(|ext| {
-                        dest_url.ends_with(&format!(".{}", ext))
-                            || dest_url.contains(&format!(".{}#", ext))
-                    });
-
-                    let should_rewrite = is_beliefbase_link || is_unresolved_doc_link;
+                    // Only rewrite links that we parsed (indicated by bref:// in title)
+                    // Don't modify unparsed links - we don't have nodes for them
+                    let should_rewrite = title.contains("bref://");
 
                     let new_url = if should_rewrite {
                         let mut url = dest_url.to_string();
+
+                        // Get list of registered codec extensions
+                        let codec_extensions = crate::codec::CODECS.extensions();
 
                         // Replace any codec extension with .html
                         for ext in codec_extensions.iter() {
@@ -2812,13 +2807,13 @@ Already HTML [html link](./page.html "bref://doc789").
         assert!(html_content.contains("href=\"./other.html\""));
         assert!(html_content.contains("href=\"docs/page.html#section-1\""));
 
-        // Verify external .md links WITHOUT bref:// are NOT rewritten
+        // Verify .md links WITHOUT bref:// are NOT rewritten (we didn't parse them)
         assert!(html_content.contains("href=\"https://example.com/doc.md\""));
 
         // Verify already-.html links with bref:// are unchanged
         assert!(html_content.contains("href=\"./page.html\""));
 
-        // Verify only BeliefBase .md links were rewritten
+        // Verify only links with bref:// were rewritten
         assert!(!html_content.contains("href=\"./other.md\""));
         assert!(!html_content.contains("href=\"docs/page.md#"));
     }

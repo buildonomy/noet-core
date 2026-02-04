@@ -16,6 +16,8 @@
 //! For RelationIn queries, both sources should mark all returned nodes as Trace since
 //! we're not guaranteeing complete relation sets for matching nodes.
 
+#![cfg(feature = "service")]
+
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 use tempfile::tempdir;

@@ -62,6 +62,41 @@ use enumset::EnumSet;
 #[cfg(feature = "wasm")]
 use std::collections::{BTreeMap, HashMap};
 
+/// Navigation tree structure for hierarchical document navigation
+///
+/// Pre-structured tree generated in Rust for better performance than client-side tree building.
+/// Uses a flat map structure with child IDs for efficient lookups and intelligent expand/collapse.
+/// See `docs/design/interactive_viewer.md` § Navigation Tree Generation for specification.
+#[cfg(feature = "wasm")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavTree {
+    /// Flat map of all nodes by BID (O(1) lookup)
+    pub nodes: BTreeMap<String, NavNode>,
+    /// Root node BIDs (networks) in display order
+    pub roots: Vec<String>,
+}
+
+/// Unified navigation node (can be network, document, or section)
+///
+/// Stores only child BIDs, not nested nodes. This enables:
+/// - O(1) lookup by path/BID for active node highlighting
+/// - Easy parent chain traversal (path -> node -> parent via path lookup)
+/// - Intelligent expand/collapse (expand parent chain, collapse siblings)
+#[cfg(feature = "wasm")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavNode {
+    /// Node BID
+    pub bid: String,
+    /// Node title (from BeliefNode state)
+    pub title: String,
+    /// Full path with extension normalized to .html (e.g., "docs/guide.html" or "docs/guide.html#intro")
+    pub path: String,
+    /// Parent node BID (None for root nodes)
+    pub parent: Option<String>,
+    /// Child node BIDs (ordered by WEIGHT_SORT_KEY)
+    pub children: Vec<String>,
+}
+
 /// WASM-compatible node context (no lifetimes, fully owned)
 ///
 /// This is a serializable version of BeliefContext that can cross the FFI boundary.
@@ -605,6 +640,168 @@ impl BeliefBaseWasm {
             console::error_1(&format!("Failed to serialize paths: {}", e).into());
             JsValue::NULL
         })
+    }
+
+    /// Get pre-structured navigation tree (hierarchical, ready to render)
+    ///
+    /// Returns a hierarchical navigation tree with networks, documents, and sections.
+    /// Uses a stack-based algorithm to build the tree structure based on order_indices depth.
+    /// This is more efficient than `get_paths()` because the tree is built in Rust
+    /// with proper title extraction from BeliefNode states.
+    ///
+    /// See `docs/design/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
+    ///
+    /// # JavaScript Example
+    /// ```javascript
+    /// const tree = beliefbase.get_nav_tree();
+    /// // tree.nodes[0].title => "Network Name"
+    /// // tree.nodes[0].children[0].title => "Document Title"
+    /// // tree.nodes[0].children[0].children[0].title => "Section Title"
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_nav_tree(&self) -> JsValue {
+        let base = self.inner.borrow();
+        let paths = base.paths();
+        let states = base.states();
+
+        // Build navigation tree from PathMapMap using stack-based algorithm
+        let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
+        let mut root_nodes: Vec<String> = Vec::new();
+
+        // System namespaces to exclude from navigation
+        let system_namespaces = [
+            Self::href_namespace(),
+            Self::asset_namespace(),
+            Self::buildonomy_namespace(),
+        ];
+
+        for (net_bid, pm_lock) in paths.map().iter() {
+            // Skip system namespaces (they use BIDs as paths)
+            if system_namespaces.contains(&net_bid.to_string()) {
+                continue;
+            }
+
+            let pm = pm_lock.read();
+
+            // Get network title from BeliefNode
+            let net_title = states
+                .get(net_bid)
+                .map(|node| node.title.clone())
+                .unwrap_or_else(|| net_bid.to_string());
+
+            // Flat map for all nodes in this network
+            let mut nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
+
+            // Create network node
+            let network_bid_str = net_bid.to_string();
+            nodes_map.insert(
+                network_bid_str.clone(),
+                NavNode {
+                    bid: network_bid_str.clone(),
+                    title: net_title,
+                    path: String::new(), // Networks don't have paths
+                    parent: None,
+                    children: Vec::new(),
+                },
+            );
+
+            // Stack of (bid, depth) for tracking parent hierarchy
+            let mut stack: Vec<(String, usize)> = Vec::new();
+            stack.push((network_bid_str.clone(), 0)); // Network is at depth 0
+
+            for (path, bid, order_indices) in pm.map().iter() {
+                let depth = order_indices.len();
+                let bid_str = bid.to_string();
+
+                // Get node title from BeliefNode
+                let node_title = states
+                    .get(bid)
+                    .map(|node| node.title.clone())
+                    .unwrap_or_else(|| path.clone());
+
+                // Normalize extension to .html
+                let html_path = Self::normalize_path_extension(path);
+
+                // Pop stack until we reach the parent level
+                while stack.len() > 1 && stack.last().unwrap().1 >= depth {
+                    stack.pop();
+                }
+
+                // Parent is the last item on stack
+                let parent_bid = stack.last().unwrap().0.clone();
+
+                // Create new node
+                let new_node = NavNode {
+                    bid: bid_str.clone(),
+                    title: node_title,
+                    path: html_path,
+                    parent: Some(parent_bid.clone()),
+                    children: Vec::new(),
+                };
+
+                // Add node to map
+                nodes_map.insert(bid_str.clone(), new_node);
+
+                // Add this node as child to its parent
+                if let Some(parent_node) = nodes_map.get_mut(&parent_bid) {
+                    parent_node.children.push(bid_str.clone());
+                }
+
+                // Push to stack for potential children
+                stack.push((bid_str, depth));
+            }
+
+            // Merge this network's nodes into global map
+            root_nodes.push(network_bid_str);
+            for (bid, node) in nodes_map {
+                // Update parent references for network nodes (should be None, not Some(network_bid))
+                let mut node = node;
+                if node.parent.as_ref() == Some(&node.bid) {
+                    node.parent = None;
+                }
+                root_nodes_map.insert(bid, node);
+            }
+        }
+
+        let tree = NavTree {
+            nodes: root_nodes_map,
+            roots: root_nodes,
+        };
+
+        serde_wasm_bindgen::to_value(&tree).unwrap_or_else(|e| {
+            console::error_1(&format!("Failed to serialize nav tree: {}", e).into());
+            JsValue::NULL
+        })
+    }
+
+    /// Helper: Normalize path extension to .html
+    fn normalize_path_extension(path: &str) -> String {
+        use crate::codec::CODECS;
+
+        // Split path and anchor fragment
+        let (path_part, anchor_part) = if let Some(hash_idx) = path.find('#') {
+            (&path[..hash_idx], Some(&path[hash_idx..]))
+        } else {
+            (path, None)
+        };
+
+        // Check all registered codec extensions
+        let mut normalized = path_part.to_string();
+        for ext in CODECS.extensions() {
+            let ext_str = format!(".{}", ext);
+            if path_part.ends_with(&ext_str) {
+                let base = &path_part[..path_part.len() - ext_str.len()];
+                normalized = format!("{}.html", base);
+                break;
+            }
+        }
+
+        // Re-attach anchor fragment if present
+        if let Some(anchor) = anchor_part {
+            normalized.push_str(anchor);
+        }
+
+        normalized
     }
 }
 

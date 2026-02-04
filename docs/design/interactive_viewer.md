@@ -489,105 +489,189 @@ function toggleMetadataPanel() {
 
 ## Navigation Tree Generation
 
-### Algorithm
+### Flat Map Data Structure
 
-**Data Source**: PathMaps from `BeliefBase::paths()` via WASM
-- PathMaps provide network structure (documents, sections, hierarchy)
-- Each PathMap represents a network's document tree
-- Current document determines which PathMap to render and which branch to expand
+**Design Decision**: Use flat map with BID references instead of nested tree structure.
 
-**WASM Bindings Required**:
+**Data Structure**:
+```rust
+pub struct NavTree {
+    pub nodes: BTreeMap<String, NavNode>,  // Flat map: BID → NavNode
+    pub roots: Vec<String>,                // Root BIDs (networks)
+}
+
+pub struct NavNode {
+    pub bid: String,
+    pub title: String,
+    pub path: String,              // Normalized to .html extension
+    pub parent: Option<String>,    // Parent BID for chain traversal
+    pub children: Vec<String>,     // Child BIDs (not nested objects)
+}
+```
+
+**Benefits of Flat Map**:
+- O(1) lookup by BID for active node highlighting
+- Trivial parent chain traversal (follow `parent` field)
+- No recursive tree walking needed in JavaScript
+- Simpler rendering logic (map children BIDs to nodes)
+- Enables intelligent expand/collapse (expand ancestors, collapse siblings)
+
+**Why Not Nested Tree?**
+```javascript
+// Nested approach (rejected): Deep traversal for active node
+tree.nodes[0].children[0].children[0]  // O(n) search
+
+// Flat map approach (implemented): Direct lookup
+const node = tree.nodes[activeBid];    // O(1) lookup
+const parent = tree.nodes[node.parent]; // O(1) parent access
+```
+
+### WASM API
+
 ```rust
 #[wasm_bindgen]
 impl BeliefBaseWasm {
-    /// Get all PathMaps (network structures)
-    pub fn get_paths() -> JsValue;
-    
-    /// Get specific PathMap for a network
-    pub fn get_path_for_network(net_bid: String) -> JsValue;
+    /// Get pre-structured navigation tree (flat map)
+    pub fn get_nav_tree() -> JsValue;
 }
 ```
+
+### Algorithm: Stack-Based Tree Construction
+
+**Data Source**: `PathMapMap` from `BeliefBase::paths()`
+- Already ordered by `WEIGHT_SORT_KEY`
+- Each path has depth information in `order_indices`
 
 **Process**:
-1. Load PathMaps from WASM on page initialization
-2. Identify current document's network BID
-3. Render PathMap for that network as nav tree
-4. Expand/collapse branches based on current document focus
-5. Highlight current document/section in tree
+1. Iterate through `PathMapMap` entries (path, bid, order_indices)
+2. For each entry:
+   - `depth = order_indices.len()`
+   - Pop stack until `stack.last().depth < depth` (find parent level)
+   - Parent is `stack.last().bid` (or None for networks)
+   - Extract title from `BeliefBase.states().get(bid)`
+   - Normalize path to `.html` extension using `CODECS.extensions()`
+   - Create `NavNode` with parent reference
+   - Add node to flat map
+   - Add node BID to parent's children list
+   - Push `(bid, depth)` to stack
+3. Result: Flat map where each node knows its parent and children (by BID)
 
-**PathMap Structure** (from `src/paths.rs`):
-- Hierarchical document structure for a network
-- Contains: Documents, sections, relationships
-- Ordered by relation weight (sort_key)
-- Already structured as tree (no need to parse headings)
+**Title Extraction**:
+- Network nodes: Use network title from state
+- Document nodes: Use document title from state (not filename)
+- Section nodes: Use heading text from state
 
-**Output**: Hierarchical nav structure from PathMap
+**Path Normalization**:
+- Convert `.md` paths to `.html` using codec extensions
+- Preserve anchor fragments for sections (`doc.html#section-id`)
+- Networks have empty path (no direct link)
+
+**Complexity**: O(n) single pass through paths
+
+### JavaScript Integration: Intelligent Expand/Collapse
+
+**On Page Load**:
 ```javascript
-// PathMap serialized to JavaScript
-{
-  network_bid: "network-bid-here",
-  documents: [
-    {
-      bid: "doc-bid",
-      title: "Document Title",
-      path: "/path/to/doc",
-      sections: [
-        {
-          bid: "section-bid",
-          title: "Section Title",
-          id: "section-id",
-          subsections: [...]
-        }
-      ]
+// Get current document/section from URL or embedded data
+const activeBid = document.body.dataset.bid;
+const tree = beliefbase.get_nav_tree();
+
+// Build parent chain (O(depth) where depth << n)
+const chain = [];
+let bid = activeBid;
+while (bid) {
+    chain.push(bid);
+    bid = tree.nodes[bid].parent;
+}
+
+// Expand ancestors, collapse everything else
+expandedSet.clear();
+chain.forEach(bid => expandedSet.add(bid));
+
+// Render tree with expand/collapse state
+renderNavTree(tree, expandedSet);
+```
+
+**Active Node Highlighting**:
+```javascript
+// O(1) lookup for active node styling
+const activeNode = tree.nodes[activeBid];
+document.querySelector(`[data-bid="${activeBid}"]`).classList.add('active');
+```
+
+**Section-to-BID Mapping**:
+- Each HTML document embeds `data-section-bids` attribute
+- Maps section IDs to BIDs: `{"intro": "bid-123", "setup": "bid-456"}`
+- On scroll or anchor navigation, lookup section BID and update active state
+
+**Rationale**: Flat map structure optimized for interactive navigation patterns. Active node lookup and parent chain traversal are O(1) and O(depth) respectively, enabling responsive UI. PathMaps provide authoritative network structure; building nav from DOM would be document-centric and miss cross-document relationships.
+
+### Collapsible Branches & Rendering
+
+**Behavior**: Intelligent expand/collapse based on active document/section
+- Active node's parent chain auto-expands
+- Siblings (not in parent chain) collapsed by default
+- User can manually toggle any branch
+- Expand/collapse state stored in `Set` (ephemeral, per-session)
+
+**Rendering Strategy**:
+```javascript
+function renderNavTree(tree, expandedSet) {
+    const ul = document.createElement('ul');
+    ul.className = 'noet-nav-tree';
+    
+    tree.roots.forEach(rootBid => {
+        renderNode(tree.nodes[rootBid], tree, expandedSet, ul);
+    });
+    
+    return ul;
+}
+
+function renderNode(node, tree, expandedSet, parentUl) {
+    const li = document.createElement('li');
+    li.dataset.bid = node.bid;
+    
+    // Toggle button if node has children
+    if (node.children.length > 0) {
+        const toggle = document.createElement('button');
+        toggle.className = 'nav-toggle';
+        toggle.textContent = expandedSet.has(node.bid) ? '▼' : '▶';
+        toggle.onclick = () => toggleNode(node.bid, expandedSet);
+        li.appendChild(toggle);
     }
-  ]
+    
+    // Link to node (if it has a path)
+    if (node.path) {
+        const link = document.createElement('a');
+        link.href = node.path;
+        link.textContent = node.title;
+        li.appendChild(link);
+    } else {
+        // Network node (no direct link)
+        const span = document.createElement('span');
+        span.textContent = node.title;
+        li.appendChild(span);
+    }
+    
+    // Render children if expanded
+    if (expandedSet.has(node.bid) && node.children.length > 0) {
+        const childUl = document.createElement('ul');
+        node.children.forEach(childBid => {
+            renderNode(tree.nodes[childBid], tree, expandedSet, childUl);
+        });
+        li.appendChild(childUl);
+    }
+    
+    parentUl.appendChild(li);
 }
 ```
 
-**Rendering**:
-- Nested `<ul>` structure from PathMap hierarchy
-- Collapse/expand buttons for document branches
-- Expand current document's branch automatically
-- Click handlers for two-click pattern (single-click in nav panel)
-- Active document/section highlighting (`.active` class)
+**Unified Node Rendering**:
+- Networks, documents, sections all use same `NavNode` structure
+- Leaf nodes (sections) just have empty `children` array
+- No artificial type distinctions in rendering logic
 
-**Rationale**: PathMaps provide authoritative network structure. Building nav from DOM headings would be document-centric (misses cross-document hierarchy) and wouldn't reflect network relationships.
-
-### Collapsible Branches
-
-**Behavior**: Nav tree branches (documents with sections) are collapsible
-- Expand/collapse buttons for document branches
-- Current document's branch auto-expands on page load
-- Other documents collapsed by default (cleaner view)
-- No state persistence needed (ephemeral per-session preference)
-
-**Implementation**:
-```html
-<ul class="noet-nav-tree">
-  <li class="nav-document">
-    <button class="nav-toggle" aria-expanded="true">▼</button>
-    <a href="document.html">Document Title</a>
-    <ul class="nav-sections">
-      <li><a href="document.html#section-1">Section 1</a></li>
-      <li><a href="document.html#section-2">Section 2</a></li>
-    </ul>
-  </li>
-  <li class="nav-document">
-    <button class="nav-toggle" aria-expanded="false">▶</button>
-    <a href="other.html">Other Document</a>
-    <ul class="nav-sections" hidden>
-      <!-- Collapsed -->
-    </ul>
-  </li>
-</ul>
-```
-
-**Focus Behavior**:
-- On page load: Expand current document's branch, collapse others
-- On navigation: Expand new document's branch, collapse previous
-- User can manually expand/collapse any branch
-
-**Rationale**: Collapsible branches improve navigation of large networks without cluttering screen. Auto-expanding current document provides context. State persistence not critical since collapse state is per-session preference, unlike theme which is cross-session preference.
+**Rationale**: Flat map enables efficient parent chain traversal for intelligent expand/collapse. Auto-expanding active branch provides context while keeping UI clean. State persistence not critical (ephemeral per-session preference, unlike theme which persists cross-session).
 
 ## Client-Side Document Fetching
 

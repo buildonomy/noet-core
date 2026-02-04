@@ -28,20 +28,19 @@
 //! - This allows the compiler's own writes to be ignored while detecting legitimate user edits
 //!   to other files immediately
 
-// Compile-time check for service feature (required for watch command)
-#[cfg(all(not(feature = "service"), not(doc)))]
-compile_error!(
-    "The 'watch' subcommand requires the 'service' feature. \
-     Please rebuild with '--features service' or use the default 'bin' feature."
-);
-
 use clap::{Parser, Subcommand};
 #[cfg(feature = "service")]
 mod dev_server;
+use noet_core::codec::compiler::DocumentCompiler;
+#[cfg(feature = "service")]
+use noet_core::event::Event;
 #[cfg(feature = "service")]
 use noet_core::watch::WatchService;
-use noet_core::{codec::compiler::DocumentCompiler, event::Event};
-use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
+use std::path::PathBuf;
+#[cfg(feature = "service")]
+use std::sync::mpsc::channel;
+#[cfg(feature = "service")]
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "noet")]
@@ -80,6 +79,7 @@ enum Commands {
     },
 
     /// Watch a directory for changes and continuously parse
+    #[cfg(feature = "service")]
     Watch {
         /// Path to the directory to watch
         path: PathBuf,
@@ -241,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
+        #[cfg(feature = "service")]
         Commands::Watch {
             path,
             verbose,

@@ -23,15 +23,23 @@ TEST_OUTPUT="$SCRIPT_DIR/test-output"
 
 echo -e "${BLUE}=== Noet WASM Browser Test Runner ===${NC}\n"
 
-# Step 1: Build WASM module
-echo -e "${BLUE}[1/4] Building WASM module...${NC}"
+# Step 1: Build noet CLI binary (build.rs will handle WASM compilation)
+echo -e "${BLUE}[1/4] Building noet CLI binary (includes WASM via build.rs)...${NC}"
 cd "$PROJECT_ROOT"
-wasm-pack build --target web -- --features wasm --no-default-features
+
+# Clean any stale locks
+if pgrep -f "cargo.*wasm" > /dev/null; then
+    echo -e "${YELLOW}⚠ Killing stale cargo processes...${NC}"
+    pkill -f "cargo.*wasm"
+    sleep 1
+fi
+
+cargo build --features bin
 
 if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓ WASM build successful${NC}\n"
+    echo -e "${GREEN}✓ Binary build successful${NC}\n"
 else
-    echo -e "${RED}✗ WASM build failed${NC}"
+    echo -e "${RED}✗ Binary build failed${NC}"
     exit 1
 fi
 

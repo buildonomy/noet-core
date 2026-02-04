@@ -368,6 +368,37 @@ See [`ROADMAP.md`](./ROADMAP.md) for future versions:
 - **v0.4.0**: Multi-Device Sync & Collaboration - Issue 16
 - **v0.5.0+**: Future enhancements
 
+### Technical Debt
+
+**Two-Phase WASM Compilation** (Low Priority, Post-v0.1.0)
+
+**Current State**: Building `noet` with full features (`bin` + `service` + WASM) requires two-phase compilation:
+1. Build WASM module: `wasm-pack build --target web --out-dir pkg -- --features wasm --no-default-features`
+2. Build CLI binary: `cargo build --features "bin service"`
+
+This is handled by `./scripts/build-full.sh` but is not ergonomic for end users.
+
+**Root Cause**: The `wasm` and `service` features are mutually exclusive (WASM can't have filesystem/SQLite/tokio runtime). When `build.rs` calls `wasm-pack`, it inherits parent build's features, causing conflicts.
+
+**Potential Solutions**:
+1. **Split into two crates** (recommended for v0.2.0+):
+   - `noet-core-wasm` - WASM-only crate with pre-built artifacts
+   - `noet-core` - Main crate, depends on `noet-core-wasm` when `bin` feature enabled
+   - Cleanest solution, no build.rs hacks
+   - Similar to how `sqlx` separates `sqlx-macros`
+
+2. **Use cargo-make or Just**:
+   - Orchestrate builds with external tool
+   - Adds tooling dependency
+
+3. **Pre-build WASM and check into git**:
+   - Include `pkg/` in repository/crates.io package
+   - Simple but increases repo size
+
+**Decision**: Defer to post-v0.1.0. Current workaround (`./scripts/build-full.sh`) is acceptable for development. For crates.io publication, pre-built WASM can be included in package.
+
+**Impact**: Low - only affects developers building from source with full features. End users installing via `cargo install noet` will get pre-built artifacts from crates.io package.
+
 ---
 
 ## References

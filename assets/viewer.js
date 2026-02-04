@@ -27,11 +27,15 @@ let navElement;
 /** @type {HTMLElement} */
 let navContent;
 /** @type {HTMLElement} */
+let navError;
+/** @type {HTMLElement} */
 let contentElement;
 /** @type {HTMLElement} */
 let metadataPanel;
 /** @type {HTMLElement} */
 let metadataContent;
+/** @type {HTMLElement} */
+let metadataError;
 /** @type {HTMLElement} */
 let graphContainer;
 /** @type {HTMLElement} */
@@ -45,11 +49,18 @@ let themeSelect;
 let metadataClose;
 /** @type {HTMLButtonElement} */
 let graphClose;
+/** @type {HTMLButtonElement} */
+let navCollapseBtn;
+/** @type {HTMLButtonElement} */
+let metadataCollapseBtn;
 
 /** @type {HTMLLinkElement} */
 let themeLightLink;
 /** @type {HTMLLinkElement} */
 let themeDarkLink;
+
+/** @type {HTMLElement} */
+let containerElement;
 
 // =============================================================================
 // State
@@ -70,8 +81,17 @@ let wasmModule = null;
 /** BeliefBaseWasm instance */
 let beliefbase = null;
 
-/** Navigation tree data (network_bid -> paths) */
-let pathsData = null;
+/** Navigation tree data (flat map structure from get_nav_tree()) */
+let navTree = null;
+
+/** Set of expanded node BIDs for navigation tree */
+let expandedNodes = new Set();
+
+/** Panel collapse state (persisted to localStorage) */
+let panelState = {
+  navCollapsed: false,
+  metadataCollapsed: false,
+};
 
 // =============================================================================
 // Initialization
@@ -95,6 +115,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Initialize theme (read from localStorage or default to light)
   initializeTheme();
 
+  // Initialize panel collapse state
+  initializePanelState();
+
   // Load WASM and BeliefBase (non-blocking - theme should work even if this fails)
   try {
     await initializeWasm();
@@ -103,6 +126,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       "[Noet] WASM initialization failed (theme and basic features still work):",
       error,
     );
+    // Show error state in navigation panel
+    showNavError();
   }
 
   console.log("[Noet] Viewer initialized successfully");
@@ -113,12 +138,15 @@ document.addEventListener("DOMContentLoaded", async () => {
  */
 function initializeDOMReferences() {
   // Container elements
+  containerElement = document.querySelector(".noet-container");
   headerElement = document.querySelector(".noet-header");
   navElement = document.querySelector(".noet-nav");
   navContent = document.getElementById("nav-content");
+  navError = document.getElementById("nav-error");
   contentElement = document.querySelector(".noet-content");
   metadataPanel = document.getElementById("metadata-panel");
   metadataContent = document.getElementById("metadata-content");
+  metadataError = document.getElementById("metadata-error");
   graphContainer = document.getElementById("graph-container");
   graphCanvas = document.getElementById("graph-canvas");
   footerElement = document.querySelector(".noet-footer");
@@ -127,13 +155,15 @@ function initializeDOMReferences() {
   themeSelect = document.getElementById("theme-select");
   metadataClose = document.getElementById("metadata-close");
   graphClose = document.getElementById("graph-close");
+  navCollapseBtn = document.getElementById("nav-collapse");
+  metadataCollapseBtn = document.getElementById("metadata-collapse");
 
   // Theme stylesheets
   themeLightLink = document.getElementById("theme-light");
   themeDarkLink = document.getElementById("theme-dark");
 
   // Verify critical elements exist
-  if (!navContent || !metadataPanel || !metadataContent) {
+  if (!navContent || !metadataPanel || !metadataContent || !containerElement) {
     console.error("[Noet] Critical DOM elements missing - viewer may not work correctly");
   }
 
@@ -185,6 +215,18 @@ function setupEventListeners() {
   if (graphClose) {
     graphClose.addEventListener("click", closeGraphView);
   }
+
+  // Panel collapse buttons (desktop only)
+  if (navCollapseBtn) {
+    navCollapseBtn.addEventListener("click", toggleNavPanel);
+  }
+
+  if (metadataCollapseBtn) {
+    metadataCollapseBtn.addEventListener("click", toggleMetadataPanel);
+  }
+
+  // Keyboard shortcuts for panel collapse (desktop only)
+  document.addEventListener("keydown", handleKeyboardShortcuts);
 
   // Navigation tree toggle/collapse (delegated event listener)
   if (navContent) {
@@ -338,12 +380,13 @@ async function initializeWasm() {
     // Initialize BeliefBaseWasm (from_json is a constructor in WASM bindings)
     beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson);
     console.log("[Noet] BeliefBaseWasm initialized");
+    console.log("[Noet] BeliefBase loaded successfully");
 
-    // Get paths data for navigation
-    pathsData = beliefbase.get_paths();
-    console.log("[Noet] Paths data loaded:", pathsData);
+    // Get navigation tree (flat map structure)
+    navTree = beliefbase.get_nav_tree();
+    console.log("[Noet] NavTree loaded:", navTree);
 
-    // Build navigation tree
+    // Build navigation UI
     buildNavigation();
   } catch (error) {
     console.error("[Noet] Failed to initialize WASM:", error);
@@ -359,175 +402,349 @@ async function initializeWasm() {
 // =============================================================================
 
 /**
- * Build navigation tree from paths data
+ * Build navigation tree from NavTree (flat map structure)
+ * Uses intelligent expand/collapse based on active document
  */
 function buildNavigation() {
-  if (!pathsData || !navContent) {
-    console.warn("[Noet] Cannot build navigation: missing data or container");
+  if (!navContent) {
+    console.warn("[Noet] Nav content container not found");
     return;
   }
 
-  console.log("[Noet] Building navigation tree...");
-
-  // Find the main network (usually the first non-system network)
-  const systemNamespaces = [
-    wasmModule.BeliefBaseWasm.href_namespace(),
-    wasmModule.BeliefBaseWasm.asset_namespace(),
-    wasmModule.BeliefBaseWasm.buildonomy_namespace(),
-  ];
-
-  let mainNetwork = null;
-  let mainNetworkBid = null;
-
-  for (const [netBid, paths] of Array.from(pathsData)) {
-    if (!systemNamespaces.includes(netBid) && paths.length > 0) {
-      mainNetwork = paths;
-      mainNetworkBid = netBid;
-      break;
-    }
-  }
-
-  if (!mainNetwork) {
-    navContent.innerHTML = '<p class="noet-placeholder">No documents found in network</p>';
+  if (!navTree || !navTree.nodes || !navTree.roots) {
+    navContent.innerHTML = '<p class="noet-placeholder">Navigation data not loaded</p>';
     return;
   }
 
-  console.log(`[Noet] Using network ${mainNetworkBid} with ${mainNetwork.length} paths`);
+  console.log(`[Noet] Building navigation from ${Object.keys(navTree.nodes).length} nodes`);
 
-  // Build hierarchical tree structure
-  const tree = buildTreeStructure(mainNetwork);
+  // Determine active BID from current document
+  const activeBid = getActiveBid();
+
+  // Build parent chain for intelligent expand/collapse
+  if (activeBid) {
+    buildParentChain(activeBid);
+    console.log(`[Noet] Active BID: ${activeBid}, expanded ${expandedNodes.size} ancestors`);
+  }
 
   // Render tree to HTML
-  const treeHtml = renderTree(tree);
+  const treeHtml = renderNavTree();
   navContent.innerHTML = treeHtml;
 
+  // Attach toggle event listeners
+  attachNavToggleListeners();
+
   console.log("[Noet] Navigation tree built successfully");
+
+  // Hide error state if navigation loaded successfully
+  if (navError) {
+    navError.hidden = true;
+  }
 }
 
 /**
- * Build hierarchical tree structure from flat paths array
- * @param {Array} paths - Array of [path, bid, order_indices] tuples
- * @returns {Array} Tree structure with nested children
+ * Get active BID from current page
+ * Tries multiple strategies: URL path, data attribute, section mapping
+ * @returns {string|null} Active BID or null if not found
  */
-function buildTreeStructure(paths) {
-  const tree = [];
-  const pathMap = new Map();
+function getActiveBid() {
+  // Strategy 1: Check body data-bid attribute
+  if (document.body.dataset.bid) {
+    return document.body.dataset.bid;
+  }
 
-  // Sort paths by order_indices (documents before sections, then by sort key)
-  const sortedPaths = [...paths].sort((a, b) => {
-    const [, , orderA] = a;
-    const [, , orderB] = b;
+  // Strategy 2: Check current path against NavTree paths
+  const currentPath = window.location.pathname;
+  const currentHash = window.location.hash;
 
-    // Compare order indices lexicographically
-    for (let i = 0; i < Math.max(orderA.length, orderB.length); i++) {
-      const valA = orderA[i] || 0;
-      const valB = orderB[i] || 0;
-      if (valA !== valB) {
-        return valA - valB;
+  // Try exact match with hash first (section)
+  if (currentHash) {
+    const fullPath = currentPath + currentHash;
+    for (const [bid, node] of Object.entries(navTree.nodes)) {
+      if (node.path && node.path.includes(currentHash.substring(1))) {
+        return bid;
       }
-    }
-    return 0;
-  });
-
-  for (const [path, bid, orderIndices] of sortedPaths) {
-    const node = {
-      path,
-      bid,
-      orderIndices,
-      children: [],
-      isSection: path.includes("#"),
-      title: extractTitle(path),
-      href: path.replace(/\.md(#|$)/, ".html$1"), // Convert .md to .html
-    };
-
-    pathMap.set(path, node);
-
-    // Determine parent based on path structure
-    if (node.isSection) {
-      // Section: parent is the document
-      const docPath = path.split("#")[0];
-      const parent = pathMap.get(docPath);
-      if (parent) {
-        parent.children.push(node);
-      } else {
-        tree.push(node);
-      }
-    } else {
-      // Document: top-level
-      tree.push(node);
     }
   }
 
-  return tree;
+  // Try document path match
+  for (const [bid, node] of Object.entries(navTree.nodes)) {
+    if (node.path && currentPath.endsWith(node.path)) {
+      return bid;
+    }
+  }
+
+  // Strategy 3: Check for section BID mapping in page
+  if (currentHash && document.body.dataset.sectionBids) {
+    try {
+      const sectionMap = JSON.parse(document.body.dataset.sectionBids);
+      const sectionId = currentHash.substring(1);
+      if (sectionMap[sectionId]) {
+        return sectionMap[sectionId];
+      }
+    } catch (e) {
+      console.warn("[Noet] Failed to parse section BID mapping:", e);
+    }
+  }
+
+  return null;
 }
 
 /**
- * Extract display title from path
- * @param {string} path - File path or path#anchor
- * @returns {string} Display title
+ * Build parent chain and populate expandedNodes set
+ * Expands all ancestors of activeBid, collapses everything else
+ * @param {string} activeBid - BID of active node
  */
-function extractTitle(path) {
-  if (path.includes("#")) {
-    // Section: use anchor as title (will be cleaned up)
-    const anchor = path.split("#")[1];
-    return anchor.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+function buildParentChain(activeBid) {
+  expandedNodes.clear();
+
+  let currentBid = activeBid;
+  while (currentBid) {
+    expandedNodes.add(currentBid);
+    const node = navTree.nodes[currentBid];
+    if (!node) break;
+    currentBid = node.parent;
+  }
+}
+
+/**
+ * Toggle expand/collapse state for a node
+ * @param {string} bid - BID of node to toggle
+ */
+function toggleNode(bid) {
+  if (expandedNodes.has(bid)) {
+    expandedNodes.delete(bid);
   } else {
-    // Document: use filename without extension
-    const filename = path.split("/").pop();
-    return filename.replace(/\.md$/, "").replace(/_/g, " ");
+    expandedNodes.add(bid);
   }
+
+  // Re-render navigation
+  buildNavigation();
 }
 
 /**
- * Render tree structure to HTML
- * @param {Array} nodes - Tree nodes to render
- * @param {number} level - Nesting level (for indentation)
+ * Render navigation tree from NavTree flat map
  * @returns {string} HTML string
  */
-function renderTree(nodes, level = 0) {
-  if (!nodes || nodes.length === 0) {
-    return "";
+function renderNavTree() {
+  if (!navTree.roots || navTree.roots.length === 0) {
+    return '<p class="noet-placeholder">No networks found</p>';
   }
 
   let html = '<ul class="noet-nav-tree">';
 
-  for (const node of nodes) {
-    const hasChildren = node.children && node.children.length > 0;
-    const itemClass = hasChildren ? "noet-nav-tree__item has-children" : "noet-nav-tree__item";
-
-    html += `<li class="${itemClass}">`;
-
-    if (hasChildren) {
-      // Collapsible parent
-      html += `
-                <button class="noet-nav-tree__toggle" aria-label="Toggle ${escapeHtml(node.title)}">
-                    ›
-                </button>
-            `;
-    }
-
-    // Link
-    html += `
-            <a href="${escapeHtml(node.href)}"
-               class="noet-nav-tree__link"
-               data-bid="${escapeHtml(node.bid)}"
-               data-path="${escapeHtml(node.path)}">
-                ${escapeHtml(node.title)}
-            </a>
-        `;
-
-    // Render children recursively
-    if (hasChildren) {
-      html += '<div class="noet-nav-tree__children">';
-      html += renderTree(node.children, level + 1);
-      html += "</div>";
-    }
-
-    html += "</li>";
+  for (const rootBid of navTree.roots) {
+    html += renderNavNode(rootBid);
   }
 
   html += "</ul>";
   return html;
+}
+
+/**
+ * Render a single navigation node
+ * @param {string} bid - BID of node to render
+ * @returns {string} HTML string
+ */
+function renderNavNode(bid) {
+  const node = navTree.nodes[bid];
+  if (!node) return "";
+
+  const hasChildren = node.children && node.children.length > 0;
+  const isExpanded = expandedNodes.has(bid);
+  const isActive = bid === getActiveBid();
+
+  let itemClass = "noet-nav-tree__item";
+  if (hasChildren) itemClass += " has-children";
+  if (isActive) itemClass += " active";
+
+  let html = `<li class="${itemClass}" data-bid="${escapeHtml(bid)}">`;
+
+  // Toggle button for nodes with children
+  if (hasChildren) {
+    const toggleIcon = isExpanded ? "▼" : "▶";
+    html += `
+      <button class="noet-nav-tree__toggle"
+              data-bid="${escapeHtml(bid)}"
+              aria-label="Toggle ${escapeHtml(node.title)}"
+              aria-expanded="${isExpanded}">
+        ${toggleIcon}
+      </button>
+    `;
+  }
+
+  // Link (or span for networks with no path)
+  if (node.path && node.path.length > 0) {
+    html += `
+      <a href="${escapeHtml(node.path)}"
+         class="noet-nav-tree__link${isActive ? " active" : ""}"
+         data-bid="${escapeHtml(bid)}">
+        ${escapeHtml(node.title)}
+      </a>
+    `;
+  } else {
+    // Network node (no direct link)
+    html += `
+      <span class="noet-nav-tree__label">
+        ${escapeHtml(node.title)}
+      </span>
+    `;
+  }
+
+  // Render children if expanded
+  if (hasChildren && isExpanded) {
+    html += '<ul class="noet-nav-tree__children">';
+    for (const childBid of node.children) {
+      html += renderNavNode(childBid);
+    }
+    html += "</ul>";
+  }
+
+  html += "</li>";
+  return html;
+}
+
+/**
+ * Attach click event listeners to toggle buttons
+ */
+function attachNavToggleListeners() {
+  const toggleButtons = navContent.querySelectorAll(".noet-nav-tree__toggle");
+
+  toggleButtons.forEach((button) => {
+    button.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const bid = button.dataset.bid;
+      if (bid) {
+        toggleNode(bid);
+      }
+    });
+  });
+}
+
+// =============================================================================
+// Panel Collapse Management
+// =============================================================================
+
+/**
+ * Initialize panel collapse state from localStorage
+ */
+function initializePanelState() {
+  const saved = localStorage.getItem("noet-panel-state");
+  if (saved) {
+    try {
+      panelState = JSON.parse(saved);
+    } catch (e) {
+      console.warn("[Noet] Failed to parse saved panel state");
+    }
+  }
+
+  // Apply saved state
+  applyPanelState();
+}
+
+/**
+ * Toggle navigation panel (desktop only)
+ */
+function toggleNavPanel() {
+  panelState.navCollapsed = !panelState.navCollapsed;
+  applyPanelState();
+  savePanelState();
+}
+
+/**
+ * Toggle metadata panel (desktop only)
+ */
+function toggleMetadataPanel() {
+  panelState.metadataCollapsed = !panelState.metadataCollapsed;
+  applyPanelState();
+  savePanelState();
+}
+
+/**
+ * Apply panel collapse state to DOM
+ */
+function applyPanelState() {
+  if (!containerElement) return;
+
+  // Apply nav collapse state
+  if (panelState.navCollapsed) {
+    containerElement.classList.add("nav-collapsed");
+    if (navCollapseBtn) navCollapseBtn.textContent = "▶";
+    if (navCollapseBtn) navCollapseBtn.setAttribute("aria-label", "Expand navigation panel");
+  } else {
+    containerElement.classList.remove("nav-collapsed");
+    if (navCollapseBtn) navCollapseBtn.textContent = "◀";
+    if (navCollapseBtn) navCollapseBtn.setAttribute("aria-label", "Collapse navigation panel");
+  }
+
+  // Apply metadata collapse state
+  if (panelState.metadataCollapsed) {
+    containerElement.classList.add("metadata-collapsed");
+    if (metadataCollapseBtn) metadataCollapseBtn.textContent = "◀";
+    if (metadataCollapseBtn)
+      metadataCollapseBtn.setAttribute("aria-label", "Expand metadata panel");
+  } else {
+    containerElement.classList.remove("metadata-collapsed");
+    if (metadataCollapseBtn) metadataCollapseBtn.textContent = "▶";
+    if (metadataCollapseBtn)
+      metadataCollapseBtn.setAttribute("aria-label", "Collapse metadata panel");
+  }
+}
+
+/**
+ * Save panel state to localStorage
+ */
+function savePanelState() {
+  localStorage.setItem("noet-panel-state", JSON.stringify(panelState));
+}
+
+// =============================================================================
+// Error State Management
+// =============================================================================
+
+/**
+ * Show navigation error message
+ */
+function showNavError() {
+  if (navError) {
+    navError.hidden = false;
+  }
+  if (navContent) {
+    navContent.innerHTML = "";
+  }
+}
+
+/**
+ * Show metadata error message
+ */
+function showMetadataError() {
+  if (metadataError) {
+    metadataError.hidden = false;
+  }
+}
+
+/**
+ * Handle keyboard shortcuts
+ * @param {KeyboardEvent} e - Keyboard event
+ */
+function handleKeyboardShortcuts(e) {
+  // Only on desktop (min-width: 1024px check via matchMedia)
+  const isDesktop = window.matchMedia("(min-width: 1024px)").matches;
+  if (!isDesktop) return;
+
+  // Ctrl+\ (Ctrl+Backslash) - Toggle navigation panel
+  if (e.ctrlKey && e.key === "\\") {
+    e.preventDefault();
+    toggleNavPanel();
+  }
+
+  // Ctrl+] (Ctrl+RightBracket) - Toggle metadata panel
+  if (e.ctrlKey && e.key === "]") {
+    e.preventDefault();
+    toggleMetadataPanel();
+  }
 }
 
 // =============================================================================

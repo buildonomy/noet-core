@@ -312,17 +312,17 @@
                 // Test 11: get_paths() - Navigation tree data
                 log('Test 11: get_paths() - Navigation tree data', 'info');
                 {
-                    const paths = beliefbase.get_paths();
+                    const paths = bb.get_paths();
                     assert(paths !== null && paths !== undefined, 'get_paths() returns data');
-                    assert(typeof paths === 'object', 'get_paths() returns object');
+                    assert(paths instanceof Map, 'get_paths() returns Map');
 
-                    const networkBids = Object.keys(paths);
+                    const networkBids = Array.from(paths.keys());
                     assert(networkBids.length > 0, 'At least one network in paths');
                     log(`Found ${networkBids.length} networks`, 'info');
 
                     // Check structure: network_bid → Vec<(path, bid, order_indices)>
                     for (const netBid of networkBids) {
-                        const pathData = paths[netBid];
+                        const pathData = paths.get(netBid);
                         assert(Array.isArray(pathData), `Network ${netBid} has array of paths`);
                         log(`  Network ${netBid}: ${pathData.length} paths`, 'info');
 
@@ -337,9 +337,130 @@
                     }
 
                     // Log statistics
-                    const totalPaths = networkBids.reduce((sum, bid) => sum + paths[bid].length, 0);
+                    const totalPaths = Array.from(paths.values()).reduce((sum, pathArr) => sum + pathArr.length, 0);
                     log(`Total paths across all networks: ${totalPaths}`, 'info');
                 }
+
+                // Test 12: get_nav_tree() - Flat map with parent/child BIDs
+                log('Test 12: get_nav_tree() - Flat map with parent/child BIDs', 'info');
+                {
+                    const tree = bb.get_nav_tree();
+                    console.log('DEBUG: tree =', tree);
+                    console.log('DEBUG: typeof tree =', typeof tree);
+                    console.log('DEBUG: tree.nodes =', tree.nodes);
+                    console.log('DEBUG: tree.roots =', tree.roots);
+                    assert(tree !== null && tree !== undefined, 'get_nav_tree() returns data');
+                    assert(typeof tree === 'object', 'get_nav_tree() returns object');
+                    assert(tree.nodes !== undefined, 'NavTree has nodes field');
+                    assert(typeof tree.nodes === 'object', 'NavTree.nodes is object (map)');
+                    assert(tree.roots !== undefined, 'NavTree has roots field');
+                    assert(Array.isArray(tree.roots), 'NavTree.roots is array');
+                    assert(tree.roots.length > 0, 'At least one root node (network) in tree');
+                    log(`Found ${tree.roots.length} networks`, 'info');
+
+                    // Validate flat map structure (handle both Map and plain object)
+                    const nodesIsMap = tree.nodes instanceof Map;
+                    const nodeBids = nodesIsMap ? Array.from(tree.nodes.keys()) : Object.keys(tree.nodes);
+                    assert(nodeBids.length > 0, 'Nodes map is not empty');
+                    log(`Total nodes in map: ${nodeBids.length}`, 'info');
+
+                    // Validate each node in the map
+                    for (const bid of nodeBids) {
+                        const node = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+                        assert(typeof node.bid === 'string', 'NavNode has bid');
+                        assert(node.bid === bid, 'NavNode bid matches map key');
+                        assert(typeof node.title === 'string', 'NavNode has title');
+                        assert(typeof node.path === 'string', 'NavNode has path');
+                        assert(Array.isArray(node.children), 'NavNode has children array (of BIDs)');
+                        assert(node.parent === null || node.parent === undefined || typeof node.parent === 'string', 'NavNode parent is null, undefined, or string');
+
+                        // Verify path normalization (non-root nodes should have .html extension if they have a real path)
+                        // Note: Some nodes may have BID as path (sections without files) or empty path (networks)
+                        if (node.path && node.path.length > 0) {
+                            // Skip validation if path looks like a BID (UUID format with hyphens)
+                            const looksLikeBid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(node.path);
+
+                            if (looksLikeBid) {
+                                console.log('DEBUG: Node has BID as path:', {
+                                    bid: node.bid,
+                                    title: node.title,
+                                    path: node.path,
+                                    parent: node.parent,
+                                    childCount: node.children.length
+                                });
+                            } else {
+                                const hasHtmlExt = node.path.endsWith('.html') || node.path.includes('.html#');
+                                if (!hasHtmlExt) {
+                                    console.error('DEBUG: Path missing .html extension:', node.path, 'for node:', node.title, 'BID:', node.bid);
+                                }
+                                assert(hasHtmlExt,
+                                    `NavNode path should use .html extension (got: ${node.path})`);
+                            }
+                        }
+
+                        // Verify titles are real (not path-based heuristics)
+                        if (node.parent) { // Has parent = not a network node
+                            assert(!node.title.includes('/'), 'Node title should not contain path separators');
+                            assert(!node.title.endsWith('.md'), 'Node title should not end with .md');
+                            assert(!node.title.endsWith('.html'), 'Node title should not end with .html');
+                        }
+
+                        // Verify parent references are valid
+                        if (node.parent) {
+                            const parentExists = nodesIsMap ? tree.nodes.has(node.parent) : tree.nodes[node.parent] !== undefined;
+                            assert(parentExists, `Parent ${node.parent} exists in map`);
+                        }
+
+                        // Verify child references are valid
+                        for (const childBid of node.children) {
+                            const childExists = nodesIsMap ? tree.nodes.has(childBid) : tree.nodes[childBid] !== undefined;
+                            assert(childExists, `Child ${childBid} exists in map`);
+                        }
+                    }
+
+                    // Test parent chain traversal for a non-root node
+                    const nonRootNodes = nodeBids.filter(bid => {
+                        const node = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+                        return node.parent !== null && node.parent !== undefined;
+                    });
+                    if (nonRootNodes.length > 0) {
+                        const testBid = nonRootNodes[0];
+                        const parentChain = [];
+                        let currentBid = testBid;
+
+                        while (currentBid) {
+                            parentChain.push(currentBid);
+                            const node = nodesIsMap ? tree.nodes.get(currentBid) : tree.nodes[currentBid];
+                            currentBid = node.parent;
+                        }
+
+                        const chainTitles = parentChain.map(bid => {
+                            const node = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+                            return node.title;
+                        }).join(' > ');
+                        log(`Parent chain example (${parentChain.length} levels): ${chainTitles}`, 'info');
+                        assert(parentChain.length >= 2, 'Parent chain has at least node + network');
+                    }
+
+                    // Test cycle detection in parent chain
+                    for (const bid of nodeBids) {
+                        const visited = new Set();
+                        let currentBid = bid;
+                        const startNode = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+
+                        while (currentBid) {
+                            assert(!visited.has(currentBid), `No cycles in parent chain starting from ${startNode.title}`);
+                            visited.add(currentBid);
+                            const node = nodesIsMap ? tree.nodes.get(currentBid) : tree.nodes[currentBid];
+                            currentBid = node.parent;
+                        }
+                    }
+
+                    log('All titles properly extracted from BeliefNode state', 'info');
+                    log('Flat map structure validated (O(1) lookup, parent chain traversal)', 'info');
+                    log('No cycles detected in parent chains', 'info');
+                }
+
 
                 // Summary
                 const summary = document.createElement('div');

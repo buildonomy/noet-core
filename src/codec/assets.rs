@@ -50,8 +50,10 @@ const WASM_BINARY: &[u8] = include_bytes!("../../pkg/noet_core_bg.wasm");
 
 /// Available HTML layout templates
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Layout {
     /// Simple layout: minimal article wrapper (backward compatible)
+    #[default]
     Simple,
     /// Responsive SPA layout: full interactive interface with nav, metadata panel, graph area
     Responsive,
@@ -75,11 +77,6 @@ impl Layout {
     }
 }
 
-impl Default for Layout {
-    fn default() -> Self {
-        Layout::Simple
-    }
-}
 
 impl FromStr for Layout {
     type Err = String;
@@ -307,7 +304,6 @@ mod tests {
 
     #[test]
     fn test_extract_assets_all() {
-        use std::fs;
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
@@ -330,7 +326,6 @@ mod tests {
 
     #[test]
     fn test_extract_assets_cdn_mode() {
-        use std::fs;
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();

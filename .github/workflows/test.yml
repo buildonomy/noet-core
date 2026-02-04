@@ -28,7 +28,7 @@ jobs:
         features:
           - "no-default"
           - "service"
-          - "all"
+          - "bin"
         exclude:
           # Reduce matrix: only test beta on Linux
           - os: macos-latest
@@ -76,9 +76,9 @@ jobs:
         if: matrix.features == 'service'
         run: cargo build --verbose --features service
 
-      - name: Build (all features)
-        if: matrix.features == 'all'
-        run: cargo build --verbose --all-features
+      - name: Build (bin feature)
+        if: matrix.features == 'bin'
+        run: cargo build --verbose --features bin
 
       - name: Test (no default features)
         if: matrix.features == 'no-default'
@@ -88,9 +88,9 @@ jobs:
         if: matrix.features == 'service'
         run: cargo test --verbose --features service
 
-      - name: Test (all features)
-        if: matrix.features == 'all'
-        run: cargo test --verbose --all-features
+      - name: Test (bin feature)
+        if: matrix.features == 'bin'
+        run: cargo test --verbose --features bin
 
       - name: Doc tests (no default features)
         if: matrix.features == 'no-default'
@@ -100,9 +100,9 @@ jobs:
         if: matrix.features == 'service'
         run: cargo test --doc --features service
 
-      - name: Doc tests (all features)
-        if: matrix.features == 'all'
-        run: cargo test --doc --all-features
+      - name: Doc tests (bin feature)
+        if: matrix.features == 'bin'
+        run: cargo test --doc --features bin
 
   # MSRV (Minimum Supported Rust Version) check
   msrv:
@@ -127,8 +127,8 @@ jobs:
 
       - name: Check MSRV
         run: |
-          cargo build --all-features
-          cargo test --all-features
+          cargo build --features bin
+          cargo test --features bin
 
   # Example verification
   examples:
@@ -150,7 +150,7 @@ jobs:
           key: examples-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build examples
-        run: cargo build --examples --all-features
+        run: cargo build --examples --features service
 
       - name: Run basic_usage example
         run: cargo run --example basic_usage --features service
@@ -179,8 +179,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Run clippy (bin)
+        run: cargo clippy --features bin --all-targets -- -D warnings
+
+      - name: Run clippy (service)
+        run: cargo clippy --features service --all-targets -- -D warnings
 
   # Documentation generation
   docs:
@@ -202,7 +205,7 @@ jobs:
           key: docs-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Generate documentation
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --features service
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -244,7 +247,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
+        run: cargo tarpaulin --verbose --features service --workspace --timeout 300 --out xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
@@ -283,7 +286,7 @@ jobs:
       - name: Run benchmarks
         run: |
           if [ -d "benches" ]; then
-            cargo bench --all-features -- --output-format bencher | tee output.txt
+            cargo bench --features service -- --output-format bencher | tee output.txt
           else
             echo "No benchmarks found, skipping"
           fi

@@ -33,7 +33,6 @@ notify-debouncer-full = { version = "0.3.1", default-features = false, optional 
 once_cell = "1.21.3"
 path-clean = "1.0.1"
 pathdiff = "0.2"
-orgize = "0.10.0-alpha"
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 petgraph = { version = "0.6.5", features = ["serde-1"] }
 pulldown-cmark = { version = "0.13.0" }
@@ -59,7 +58,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
 ], optional = true }
 thiserror = "1.0.63"
-tokio = { version = "1.40", features = ["sync", "macros"] }
+tokio = { version = "1.40", default-features = false, features = ["sync", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 toml = "0.8.12"
 tower = { version = "0.4", optional = true }
@@ -82,9 +81,24 @@ trybuild = "1.0"
 
 [features]
 default = ["bin"]
-bin = ["service", "clap", "ctrlc", "tracing-subscriber"]
+bin = ["clap", "ctrlc", "tracing-subscriber"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "uuid/js", "futures"]
+
+# WARNING: Do NOT use --all-features!
+# The 'wasm' and 'service' features are mutually exclusive:
+# - 'wasm' is for browser WASM (no filesystem, no native I/O)
+# - 'service' includes sqlx, tokio runtime, file watching (requires native platform)
+#
+# Valid build commands:
+#   cargo build --features bin          # CLI with WASM for HTML generation
+#   cargo build --features "bin service" # CLI with daemon/watching features
+#   cargo build --features service      # Library with service features
+#   cargo build --no-default-features   # Library only
+#   cargo test --features service       # Run tests
+#
+# Invalid:
+#   cargo build --all-features  # ❌ Combines incompatible features
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.40", features = ["fs", "time", "rt", "rt-multi-thread"] }
