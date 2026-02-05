@@ -144,34 +144,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Create a compiler with write flag and optional HTML output
-            let compiler = if let Some(ref html_dir) = html_output {
-                std::fs::create_dir_all(html_dir)?;
-                DocumentCompiler::with_html_output(
-                    &path,
-                    None,
-                    None,
-                    write,
-                    Some(html_dir.clone()),
-                    None, // No live reload script for parse command
-                    cdn,
-                )?
-            } else {
-                DocumentCompiler::new(&path, None, None, write)?
-            };
-
-            // Parse all documents
+            // Parse all documents with explicit event loop management
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let mut compiler = compiler;
-                // Use the accumulated BeliefBase as cache for parsing
+                use noet_core::beliefbase::BeliefBase;
+                use noet_core::event::BeliefEvent;
+                use tokio::sync::mpsc::unbounded_channel;
+
+                // Create event channel for belief events
+                let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+
+                // Start event processor in background task
+                let mut global_bb = BeliefBase::empty();
+                let processor = tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        let _ = global_bb.process_event(&event);
+                    }
+                    global_bb // Return processed BeliefBase when channel closes
+                });
+
+                // Create compiler with event transmitter
+                let mut compiler = if let Some(ref html_dir) = html_output {
+                    std::fs::create_dir_all(html_dir)?;
+                    DocumentCompiler::with_html_output(
+                        &path,
+                        Some(tx),
+                        None,
+                        write,
+                        Some(html_dir.clone()),
+                        None, // No live reload script for parse command
+                        cdn,
+                    )?
+                } else {
+                    DocumentCompiler::new(&path, Some(tx), None, write)?
+                };
+
+                // Parse all documents (events sent to processor)
                 let cache = compiler.builder().doc_bb().clone();
                 compiler.parse_all(cache, force).await?;
 
-                // Get final stats
+                // Get stats
                 let stats = compiler.stats();
+
+                // Close tx to signal event processor
+                compiler.builder_mut().close_tx();
+
+                // Wait for event processor to finish (drains all events)
+                let final_bb = processor.await.map_err(|e| {
+                    noet_core::BuildonomyError::Custom(format!("Event processor failed: {}", e))
+                })?;
+
+                // Finalize HTML generation with synchronized BeliefBase
+                // Note: finalize() was already called during parse_all (with empty global_bb)
+                // Now call finalize_html with synchronized final_bb for remaining tasks
+                if html_output.is_some() {
+                    compiler.finalize_html(&final_bb).await?;
+                }
 
                 println!("\n=== Parse Results ===");
                 println!("Primary queue: {}", stats.primary_queue_len);
@@ -186,50 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Note: Only modified files are written back");
                 }
 
-                // Complete HTML generation if output directory specified
-                if let Some(ref html_dir) = html_output {
-                    // Generate network index pages
-                    if let Err(e) = compiler.generate_network_indices().await {
-                        eprintln!("Warning: Failed to generate network indices: {}", e);
-                    }
-
-                    // Create asset hardlinks
-                    // Get asset manifest from session_bb (contains all parsed content)
-                    use noet_core::properties::asset_namespace;
-                    use noet_core::query::BeliefSource;
-                    let asset_manifest: std::collections::BTreeMap<
-                        String,
-                        noet_core::properties::Bid,
-                    > = compiler
-                        .builder()
-                        .session_bb()
-                        .get_network_paths(asset_namespace())
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|(path, _)| !path.is_empty()) // Skip network node itself
-                        .collect();
-
-                    if let Err(e) = compiler
-                        .create_asset_hardlinks(html_dir, &asset_manifest)
-                        .await
-                    {
-                        eprintln!("Warning: Failed to create asset hardlinks: {}", e);
-                    }
-
-                    // Export BeliefGraph to JSON for client-side use
-                    let beliefgraph = compiler.builder().session_bb().export_beliefgraph().await?;
-                    if let Err(e) = compiler.export_beliefbase_json(beliefgraph).await {
-                        eprintln!("Warning: Failed to export beliefbase.json: {}", e);
-                    }
-
-                    println!("\n=== HTML Export Results ===");
-                    println!("HTML output: {}", html_dir.display());
-                    println!("Asset hardlinks: {} assets", asset_manifest.len());
-                }
-
-                // TODO: Display diagnostics from accumulated cache
-                // For now, we just show that parsing completed
+                // HTML generation and export handled by finalize_html above
 
                 Ok::<(), noet_core::BuildonomyError>(())
             })?;

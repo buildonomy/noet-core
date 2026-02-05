@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::replace,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     result::Result,
     str::FromStr,
 };
@@ -20,7 +20,6 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        assets::Layout,
         belief_ir::{detect_schema_from_path, ProtoBeliefNode},
         DocCodec,
     },
@@ -1239,21 +1238,8 @@ impl DocCodec for MdCodec {
         Self::events_to_text(&self.content, events)
     }
 
-    fn generate_html(
-        &self,
-        script: Option<&str>,
-        use_cdn: bool,
-    ) -> Result<Option<String>, BuildonomyError> {
-        use serde_json::json;
-
+    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
         /// Rewrite document links to .html for HTML output
-        ///
-        /// This implements the link normalization requirement from the DocCodec trait:
-        /// All registered codec extensions (md, toml, org, etc.) must be converted to .html
-        /// for browser navigation. This handles both resolved links (with bref://) and
-        /// unresolved links (graceful degradation).
-        ///
-        /// See: DocCodec::generate_html() trait documentation for requirements
         fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
                 MdEvent::Start(MdTag::Link {
@@ -1262,30 +1248,20 @@ impl DocCodec for MdCodec {
                     title,
                     id,
                 }) => {
-                    // Only rewrite links that we parsed (indicated by bref:// in title)
-                    // Don't modify unparsed links - we don't have nodes for them
                     let should_rewrite = title.contains("bref://");
-
                     let new_url = if should_rewrite {
                         let mut url = dest_url.to_string();
-
-                        // Get list of registered codec extensions
                         let codec_extensions = crate::codec::CODECS.extensions();
-
-                        // Replace any codec extension with .html
                         for ext in codec_extensions.iter() {
-                            // Handle .ext at end of URL
                             if url.ends_with(&format!(".{}", ext)) {
                                 url = url.replace(&format!(".{}", ext), ".html");
                                 break;
                             }
-                            // Handle .ext# (with anchor)
                             if url.contains(&format!(".{}#", ext)) {
                                 url = url.replace(&format!(".{}#", ext), ".html#");
                                 break;
                             }
                         }
-
                         CowStr::from(url)
                     } else {
                         dest_url
@@ -1302,50 +1278,19 @@ impl DocCodec for MdCodec {
             }
         }
 
-        // Extract document BID from first node (document node)
-        let doc_bid = self
+        // Get source path from ProtoBeliefNode's path field to compute output path
+        let source_path = self
             .current_events
             .first()
-            .and_then(|(proto, _)| proto.document.get("bid"))
-            .and_then(|v| v.as_str())
+            .map(|(proto, _)| &proto.path)
             .ok_or_else(|| {
-                BuildonomyError::Codec("Document missing BID for HTML generation".to_string())
+                BuildonomyError::Codec("Document missing for HTML generation".to_string())
             })?;
 
-        let doc_title = self
-            .current_events
-            .first()
-            .and_then(|(proto, _)| proto.document.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Untitled");
+        // Convert source path to output path (replace extension with .html)
+        let output_path = PathBuf::from(source_path).with_extension("html");
 
-        // Always use responsive template for interactive SPA
-        // (layout field is deprecated - all documents use same interactive viewer)
-
-        // Build sections map: anchor_id -> section_bid
-        // Only include sections that have explicit BIDs (heading > 2)
-        let mut sections = serde_json::Map::new();
-        for (proto, _) in self.current_events.iter().skip(1) {
-            // Skip document node
-            if proto.heading > 2 {
-                if let (Some(id), Some(bid)) = (
-                    proto.id.as_ref(),
-                    proto.document.get("bid").and_then(|v| v.as_str()),
-                ) {
-                    sections.insert(id.clone(), json!(bid));
-                }
-            }
-        }
-
-        // Build metadata JSON
-        let metadata = json!({
-            "document": {
-                "bid": doc_bid
-            },
-            "sections": sections
-        });
-
-        // Generate HTML body from markdown events, rewriting .md links to .html
+        // Generate HTML body from markdown events
         let events = self
             .current_events
             .iter()
@@ -1355,35 +1300,7 @@ impl DocCodec for MdCodec {
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
 
-        // Always use responsive template for interactive SPA
-        let template = crate::codec::assets::get_template(Layout::Responsive);
-
-        // Get stylesheet URLs based on use_cdn parameter
-        let stylesheet_urls = crate::codec::assets::get_stylesheet_urls(use_cdn);
-
-        // Format script tag if provided
-        let script_tag = script
-            .map(|s| format!("<script>{}</script>", s))
-            .unwrap_or_default();
-
-        // Substitute template placeholders
-        let html = template
-            .replace("{{TITLE}}", doc_title)
-            .replace("{{CONTENT}}", &html_body)
-            .replace(
-                "{{METADATA}}",
-                &serde_json::to_string_pretty(&metadata).map_err(|e| {
-                    BuildonomyError::Codec(format!("JSON serialization failed: {}", e))
-                })?,
-            )
-            .replace("{{STYLESHEET_OPEN_PROPS}}", &stylesheet_urls.open_props)
-            .replace("{{STYLESHEET_NORMALIZE}}", &stylesheet_urls.normalize)
-            .replace("{{STYLESHEET_THEME_LIGHT}}", &stylesheet_urls.theme_light)
-            .replace("{{STYLESHEET_THEME_DARK}}", &stylesheet_urls.theme_dark)
-            .replace("{{STYLESHEET_LAYOUT}}", &stylesheet_urls.layout)
-            .replace("{{SCRIPT}}", &script_tag);
-
-        Ok(Some(html))
+        Ok(vec![(output_path, html_body)])
     }
 
     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
@@ -2670,40 +2587,18 @@ Install the software.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec
-            .generate_html(None, false)
-            .expect("HTML generation failed");
-        assert!(html.is_some(), "HTML should be generated");
+        let fragments = codec.generate_html().expect("HTML generation failed");
+        assert_eq!(fragments.len(), 1, "Should generate one fragment");
 
-        let html_content = html.unwrap();
+        let (_path, html_content) = &fragments[0];
 
-        // Verify HTML structure (responsive template uses lowercase doctype)
-        assert!(html_content.contains("<!doctype html>"), "Missing DOCTYPE");
-        assert!(html_content.contains("<html"), "Missing html tag");
+        // Verify HTML body content (fragments don't include DOCTYPE, html, head tags)
+        assert!(html_content.contains("<h1"), "Missing h1 heading");
         assert!(
-            html_content.contains("<title>Test Document</title>"),
-            "Missing or wrong title"
+            html_content.contains("Getting Started"),
+            "Missing heading content"
         );
-        assert!(
-            html_content.contains("noet-metadata"),
-            "Missing metadata script"
-        );
-        assert!(html_content.contains("<article>"), "Missing article tag");
-
-        // Verify metadata JSON structure
-        assert!(
-            html_content.contains("\"document\""),
-            "Missing document in metadata"
-        );
-        assert!(html_content.contains("\"bid\""), "Missing bid in metadata");
-        assert!(
-            html_content.contains("01234567-89ab-cdef-0123-456789abcdef"),
-            "Wrong document BID"
-        );
-        assert!(
-            html_content.contains("\"sections\""),
-            "Missing sections in metadata"
-        );
+        assert!(html_content.contains("<p>"), "Missing paragraph tag");
 
         // Verify markdown content was converted to HTML
         assert!(html_content.contains("<h1"), "Missing h1 heading");
@@ -2748,24 +2643,18 @@ This section has no explicit BID.
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec
-            .generate_html(None, false)
-            .expect("HTML generation failed");
-        assert!(html.is_some());
+        let fragments = codec.generate_html().expect("HTML generation failed");
+        assert_eq!(fragments.len(), 1, "Should generate one fragment");
 
-        let html_content = html.unwrap();
+        let (_path, html_content) = &fragments[0];
 
-        // Parse the metadata JSON to verify structure
-        let metadata_start = html_content
-            .find("\"document\"")
-            .expect("No metadata found");
-        assert!(metadata_start > 0);
-
-        // Verify document BID is present
-        assert!(html_content.contains("12345678-1234-5678-1234-567812345678"));
-
-        // Sections map should be present but might be empty (sections without explicit BIDs)
-        assert!(html_content.contains("\"sections\""));
+        // Verify HTML body content (fragments don't include metadata)
+        assert!(html_content.contains("<h1"), "Missing h1 heading");
+        assert!(
+            html_content.contains("Content here"),
+            "Missing body content"
+        );
+        assert!(html_content.contains("<p>"), "Missing paragraph tag");
     }
 
     #[test]
@@ -2796,12 +2685,10 @@ Already HTML [html link](./page.html "bref://doc789").
             .parse(markdown.to_string(), proto)
             .expect("Parse failed");
 
-        let html = codec
-            .generate_html(None, false)
-            .expect("HTML generation failed");
-        assert!(html.is_some());
+        let fragments = codec.generate_html().expect("HTML generation failed");
+        assert_eq!(fragments.len(), 1, "Should generate one fragment");
 
-        let html_content = html.unwrap();
+        let (_path, html_content) = &fragments[0];
 
         // Verify .md links WITH bref:// are rewritten to .html
         assert!(html_content.contains("href=\"./other.html\""));

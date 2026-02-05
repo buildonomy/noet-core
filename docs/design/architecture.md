@@ -312,32 +312,34 @@ pub trait DocCodec {
     fn nodes(&self) -> Vec<ProtoBeliefNode>;
     fn inject_context(&mut self, node: &ProtoBeliefNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
+    
+    // HTML Generation API
+    fn should_defer(&self) -> bool;  // Signal if codec needs full context
+    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError>;  // Immediate generation
+    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError>;  // Context-aware generation
 }
 ```
 
-**Built-in codecs**:
-- **MdCodec** (`.md`) - Markdown with frontmatter, extracts heading hierarchy
-- **TomlCodec** (`.toml`) - Standalone TOML files, schema-aware
-
-**Register custom codecs** via the global `CODECS` registry:
+**Factory Pattern**: Codecs are created via factory functions (`fn() -> Box<dyn DocCodec>`), not singletons. This ensures thread-safety and prevents stale state:
 
 ```rust
-use noet_core::codec::{CODECS, DocCodec};
+use noet_core::codec::{CODECS, DocCodec, CodecFactory};
 
-#[derive(Default, Clone)]
-struct OrgModeCodec;
-
-impl DocCodec for OrgModeCodec {
-    // Implement trait methods...
-}
-
-// Register for .org files
-CODECS.insert::<OrgModeCodec>("org".to_string());
+// Register factory function for .org files
+CODECS.insert("org".to_string(), || Box::new(OrgModeCodec::new()));
 ```
 
-**Key principle**: Codecs handle **syntax only** (parsing documents into `ProtoBeliefNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity).
+**Dual-Phase HTML Generation**:
+1. **Immediate** (`generate_html`): Called after parsing, uses parsed AST. Example: Markdown → HTML
+2. **Deferred** (`generate_deferred_html`): Called after all parsing, with full graph context. Example: Network indices listing child documents
 
-**Example**: MdCodec parses headings into a stack-based hierarchy, but doesn't resolve cross-document links. The builder later matches `[[Document Name]]` references to actual BIDs during multi-pass compilation.
+**Built-in codecs**:
+- **MdCodec** (`.md`) - Markdown with frontmatter, immediate HTML generation
+- **ProtoBeliefNode** (`.toml`, `.json`, `.yaml`) - Schema-aware, deferred generation for networks
+
+**Key principle**: Codecs handle **syntax only** (parsing documents into `ProtoBeliefNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity). HTML generation is **presentation** (codecs return body content, compiler wraps with templates).
+
+**Example**: MdCodec parses headings into a stack-based hierarchy, generates HTML from AST immediately. ProtoBeliefNode (network nodes) defer HTML generation until full context is available to query child documents.
 
 **For detailed specification** including the document stack algorithm and codec implementation details, see [`beliefbase_architecture.md` § 3.5-3.6](./beliefbase_architecture.md#35-doccodec-the-frontend-interface).
 

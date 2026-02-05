@@ -49,13 +49,12 @@ const WASM_JS_GLUE: &[u8] = include_bytes!("../../pkg/noet_core.js");
 const WASM_BINARY: &[u8] = include_bytes!("../../pkg/noet_core_bg.wasm");
 
 /// Available HTML layout templates
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// Simple layout: minimal article wrapper (backward compatible)
-    #[default]
+    /// Simple layout: minimal wrapper (backward compatible)
     Simple,
     /// Responsive SPA layout: full interactive interface with nav, metadata panel, graph area
+    #[default]
     Responsive,
 }
 
@@ -76,7 +75,6 @@ impl Layout {
         }
     }
 }
-
 
 impl FromStr for Layout {
     type Err = String;
@@ -272,7 +270,7 @@ pub fn get_stylesheet_urls(use_cdn: bool) -> StylesheetUrls {
 ///
 /// // Get simple template
 /// let template = assets::get_template(Layout::Simple);
-/// assert!(template.contains("<article>"));
+/// assert!(template.contains("<body>"));
 /// ```
 pub fn get_template(layout: Layout) -> &'static str {
     layout.template()
@@ -359,10 +357,10 @@ mod tests {
     #[test]
     fn test_get_template_simple() {
         let template = get_template(Layout::Simple);
-        assert!(template.contains("{{CONTENT}}"));
+        assert!(template.contains("{{BODY}}"));
+        assert!(template.contains("{{CANONICAL}}"));
+        assert!(template.contains("{{SCRIPT}}"));
         assert!(template.contains("{{TITLE}}"));
-        assert!(template.contains("{{METADATA}}"));
-        assert!(template.contains("<article>"));
     }
 
     #[test]
@@ -391,28 +389,43 @@ mod tests {
 
     #[test]
     fn test_layout_default() {
-        assert_eq!(Layout::default(), Layout::Simple);
+        assert_eq!(Layout::default(), Layout::Responsive);
     }
 
     #[test]
     fn test_template_placeholders() {
-        for layout in &[Layout::Simple, Layout::Responsive] {
-            let template = get_template(*layout);
-            assert!(
-                template.contains("{{CONTENT}}"),
-                "Missing CONTENT placeholder in {}",
-                layout
-            );
-            assert!(
-                template.contains("{{TITLE}}"),
-                "Missing TITLE placeholder in {}",
-                layout
-            );
-            assert!(
-                template.contains("{{METADATA}}"),
-                "Missing METADATA placeholder in {}",
-                layout
-            );
-        }
+        // Simple template uses different placeholders (fragments)
+        let simple = get_template(Layout::Simple);
+        assert!(
+            simple.contains("{{BODY}}"),
+            "Missing BODY placeholder in simple"
+        );
+        assert!(
+            simple.contains("{{CANONICAL}}"),
+            "Missing CANONICAL placeholder in simple"
+        );
+        assert!(
+            simple.contains("{{SCRIPT}}"),
+            "Missing SCRIPT placeholder in simple"
+        );
+        assert!(
+            simple.contains("{{TITLE}}"),
+            "Missing TITLE placeholder in simple"
+        );
+
+        // Responsive template uses full page placeholders
+        let responsive = get_template(Layout::Responsive);
+        assert!(
+            responsive.contains("{{CONTENT}}"),
+            "Missing CONTENT placeholder in responsive"
+        );
+        assert!(
+            responsive.contains("{{TITLE}}"),
+            "Missing TITLE placeholder in responsive"
+        );
+        assert!(
+            responsive.contains("{{METADATA}}"),
+            "Missing METADATA placeholder in responsive"
+        );
     }
 }

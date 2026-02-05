@@ -6,9 +6,8 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     result::Result,
-    time::Duration,
 };
-use tokio::{sync::mpsc::UnboundedSender, time::sleep};
+use tokio::sync::mpsc::UnboundedSender;
 /// Utilities for parsing various document types into BeliefBases
 use toml::value::Table as TomlTable;
 
@@ -17,7 +16,7 @@ use crate::{
     codec::{
         belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
         diagnostic::ParseDiagnostic,
-        CODECS,
+        DocCodec, CODECS,
     },
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
@@ -59,7 +58,7 @@ pub enum GetOrCreateResult {
     Unresolved(crate::codec::diagnostic::UnresolvedReference),
 }
 
-/// Result of parsing document content
+/// Result of parsing document content (without owned codec)
 #[derive(Debug, Clone)]
 pub struct ParseContentResult {
     /// Optionally rewritten content if BIDs were injected or links updated
@@ -67,6 +66,14 @@ pub struct ParseContentResult {
 
     /// Diagnostics collected during parsing (unresolved refs, warnings, etc.)
     pub diagnostics: Vec<ParseDiagnostic>,
+}
+
+/// Result of parsing document content with owned codec instance
+pub struct ParseContentWithCodec {
+    /// Parse result (rewritten content and diagnostics)
+    pub result: ParseContentResult,
+    /// Owned codec instance with parsed state
+    pub codec: Box<dyn DocCodec + Send>,
 }
 
 impl ParseContentResult {
@@ -228,6 +235,18 @@ impl GraphBuilder {
         &self.tx
     }
 
+    /// Close the event transmitter channel
+    ///
+    /// This signals the event receiver to finish processing and exit.
+    /// Used by parse command to ensure all events are drained before export.
+    pub fn close_tx(&mut self) {
+        // Create a dummy channel and swap it with the real one
+        // Dropping the old tx closes the channel
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _old_tx = std::mem::replace(&mut self.tx, dummy_tx);
+        // old_tx is dropped here, closing the channel
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
@@ -256,6 +275,11 @@ impl GraphBuilder {
     /// their titles changed, returns an ordered list of documents which reference those elements,
     /// so that the documents can be rewritten with the updated titles and IDs.
     ///
+    /// # Returns
+    ///
+    /// Returns owned codec instance along with parse result. The codec contains
+    /// parsed state and can be used for immediate HTML generation.
+    ///
     pub async fn parse_content<
         P: AsRef<std::path::Path> + std::fmt::Debug,
         B: BeliefSource + Clone,
@@ -264,7 +288,7 @@ impl GraphBuilder {
         input_path: P,
         content: String,
         global_bb: B,
-    ) -> Result<ParseContentResult, BuildonomyError> {
+    ) -> Result<ParseContentWithCodec, BuildonomyError> {
         tracing::debug!("Phase 0: initialize stack");
         let mut full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let initial = self
@@ -303,12 +327,11 @@ impl GraphBuilder {
             .ok_or(file_err)?;
 
         let mut parsed_bids;
-        if let Some(codec_lock) = CODECS.get(ext) {
-            while codec_lock.is_locked() {
-                tracing::info!("Waiting for lock access to the codec map");
-                sleep(Duration::from_millis(100)).await;
-            }
-            let mut codec = codec_lock.lock_arc();
+        let owned_codec: Box<dyn DocCodec + Send>;
+
+        if let Some(codec_factory) = CODECS.get(ext) {
+            // Create fresh codec instance from factory
+            let mut codec = codec_factory();
             codec.parse(content, initial)?;
 
             let mut inject_context = false;
@@ -528,6 +551,9 @@ impl GraphBuilder {
                 tracing::debug!("Generating source");
                 maybe_content = codec.generate_source();
             }
+
+            // Store owned codec to return
+            owned_codec = codec;
         } else {
             return Err(BuildonomyError::Codec(format!(
                 "Cannot parse {full_path:?}. No Codec for extension type {ext} found in CodecMap"
@@ -541,9 +567,12 @@ impl GraphBuilder {
         )
         .await?;
 
-        Ok(ParseContentResult {
-            rewritten_content: maybe_content,
-            diagnostics,
+        Ok(ParseContentWithCodec {
+            result: ParseContentResult {
+                rewritten_content: maybe_content,
+                diagnostics,
+            },
+            codec: owned_codec,
         })
     }
 

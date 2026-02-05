@@ -1,8 +1,8 @@
-# Issue 39: Advanced Interactive Features for HTML Viewer
+# Issue 39: Two-Click Navigation + Metadata Panel
 
 **Priority**: HIGH  
-**Estimated Effort**: 12-15 days (multi-session)  
-**Dependencies**: ISSUE_38 (✅ Complete - Foundation Phase)  
+**Estimated Effort**: 4-6 days  
+**Dependencies**: ISSUE_38 (✅ Complete), ISSUE_40 (Network Index Generation)  
 **Status**: IN PROGRESS
 
 ---
@@ -27,7 +27,7 @@
 
 ## Summary
 
-Build advanced interactive features for the Noet HTML viewer: two-click navigation pattern, metadata panel with backlinks/forward links, resizable panels, query builder UI, and force-directed graph visualization. All features are progressive enhancements - static HTML remains fully functional.
+Implement two-click navigation pattern and metadata panel display for the interactive HTML viewer. The two-click pattern provides contextual metadata access without interrupting reading flow: first click navigates/previews, second click shows full metadata (backlinks, forward links, node properties).
 
 **Foundation Complete** (ISSUE_38):
 - ✅ Responsive layout (mobile/desktop)
@@ -36,29 +36,52 @@ Build advanced interactive features for the Noet HTML viewer: two-click navigati
 - ✅ WASM integration (BeliefBase queries)
 - ✅ Progressive enhancement verified
 
+**Phase 0 Complete** (Session 7):
+- ✅ Mobile drawer height fix
+- ✅ Pre-structured navigation tree API + integration
+- ✅ Reading mode + collapsible panels
+- ✅ Visible error states
+
 ## Goals
 
-1. **Pre-Structured Navigation**: Move tree generation from JavaScript to Rust (performance)
-2. **Resizable Panels**: User-adjustable panel widths with drag handles
-3. **Mobile UX Refinement**: Better drawer heights, error states
-4. **Two-Click Navigation**: First click = metadata preview, second click = navigate
-5. **Metadata Display**: Backlinks, forward links, node context
-6. **Client-Side Routing**: SPA navigation with History API
-7. **Query Builder**: Visual Expression constructor
-8. **Graph Visualization**: Force-directed layout with WeightKind gravity
-9. **Polish & Accessibility**: Keyboard navigation, ARIA labels, browser testing
+**Phase 1 Scope** (this issue):
+1. **Metadata Panel Display**: Show node properties, backlinks, forward links, related nodes
+2. **Two-Click Navigation**: First click navigates, second click shows metadata
+3. **Client-Side Document Fetching**: SPA navigation without page reloads
+4. **URL Routing**: History API integration for browser back/forward
+5. **Testing & Polish**: Automated tests, accessibility, browser compatibility
+
+**Future Work** (separate issues):
+- ISSUE_41: Query Builder UI
+- ISSUE_42: Force-Directed Graph Visualization
+- Future: Resizable panels (optional enhancement)
 
 ## Architecture
 
-**See**: [Interactive Viewer Design](../design/interactive_viewer.md) for complete architecture documentation.
+**See**: [Interactive Viewer Design](../design/interactive_viewer.md) § Two-Click Navigation Pattern and § Metadata Panel Display for complete specifications.
 
-**Key Additions**:
-- Pre-structured tree API (`get_nav_tree()` returns hierarchical Rust structs)
-- Two-click pattern (activate → metadata, click again → navigate)
-- Client-side document fetching (AJAX, replace `<article>` content)
-- URL routing with `history.pushState()` and `popstate` handlers
-- Query builder with simple/advanced/text modes
-- Force-directed graph with D3.js or Cytoscape.js
+**Phase 1 Components**:
+
+### Two-Click Navigation Pattern
+- **Scope**: Links within `<article>` tag only (not nav/metadata/header links)
+- **State**: Single `selectedBid` variable tracks first-click target
+- **First Click**: Navigate to document/section (fetch + inject HTML)
+- **Second Click**: Show metadata panel with full `NodeContext` from WASM
+
+### Metadata Panel Content
+- **Data Source**: `wasm.get_context(bid)` returns `NodeContext`
+- **Display Sections**:
+  - Node properties (BID, title, kind, schema, payload)
+  - Location (home network, path)
+  - Backlinks (who references this node)
+  - Forward links (what this node references)
+  - Related nodes (from graph)
+- **Pass-through link**: Direct navigation from metadata panel
+
+### Client-Side Document Fetching
+- **Strategy**: Fetch full HTML documents (191-line template overhead acceptable)
+- **Extraction**: Use DOM parser to extract `<article>` content
+- **URL Routing**: `history.pushState()` for browser back/forward support
 
 ## Implementation Steps
 
@@ -338,104 +361,11 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ---
 
-### Phase 2: Query Builder UI (4-5 days)
-
-**Goal**: Visual interface for constructing Expression queries.
-
-**Tasks**:
-- [ ] Add query panel to header or collapsible section
-- [ ] **Simple Mode**: Dropdown for common queries
-  - Filter by BeliefKind (Document, Section, Keyword, etc.)
-  - Filter by title (text search)
-  - Show backlinks to current document
-  - Show forward links from current document
-  - Show orphaned nodes (no connections)
-- [ ] **Advanced Mode**: Nested Expression builder
-  - Dropdown for Expression type (StateIn, Dyad, And, Or, Not, etc.)
-  - Dynamic form inputs based on selection
-  - Validation for regex patterns, BID format
-  - Add/remove nested expressions (recursive)
-- [ ] **Text Mode**: JSON input for power users
-  - Textarea with JSON syntax highlighting
-  - Validation on parse (show errors)
-  - Convert to/from visual mode
-- [ ] Execute query via `beliefbase.query(expr)`
-- [ ] Display results in list view (node cards with title, kind, BID)
-- [ ] Option to visualize results in graph mode (filter graph by query)
-- [ ] Save queries to LocalStorage (query history)
-- [ ] Load saved queries from dropdown
-
-**Deliverables**:
-- Query builder UI in collapsible panel
-- Results display with node cards
-- Integration with graph view (Phase 3)
-
-**Reference**: Design doc § Query Builder UI (Step 3)
-
-**Files Modified**:
-- `assets/template-responsive.html` - Query panel structure
-- `assets/viewer.js` - Query builder logic (~150 lines)
-- `assets/noet-layout.css` - Query panel styling (~40 lines)
-
----
-
-### Phase 3: Force-Directed Graph Visualization (3-4 days)
-
-**Goal**: Full-page graph view with WeightKind-based layout.
-
-**Tasks**:
-- [ ] **Library Selection**: Choose between D3.js or Cytoscape.js
-  - D3.js: More flexible, lower-level, custom layouts
-  - Cytoscape.js: Higher-level, better performance, built-in layouts
-  - Recommendation: **Cytoscape.js** for simplicity and performance
-- [ ] Add graph view toggle button in header
-- [ ] Render nodes:
-  - Color by BeliefKind (Document=blue, Section=green, Keyword=yellow, etc.)
-  - Size by connection count (more connections = larger node)
-  - Label with title (truncate long titles)
-- [ ] Render edges:
-  - Weight by selected WeightKind (dropdown to switch kinds)
-  - Arrow direction (source → sink)
-  - Color by WeightKind (different colors for Section/Reference/Keyword)
-- [ ] Force simulation with gravity:
-  - Sources flow toward sinks (bottom to top)
-  - External sources at bottom edge
-  - External sinks at top edge
-  - Repulsion between nodes (prevent overlap)
-- [ ] Interactions:
-  - Two-click pattern (first click = highlight + metadata, second click = navigate)
-  - Hover shows tooltip (full title, BID, kind)
-  - Drag to reposition nodes
-  - Zoom and pan (mouse wheel, trackpad gestures)
-  - Double-click to center and zoom on node
-- [ ] Filter graph by query results (Phase 2 integration)
-- [ ] Toggle between full graph and filtered graph
-- [ ] Reset zoom/position button
-
-**Deliverables**:
-- Graph view toggle working
-- Force-directed layout renders full network
-- Node styling by kind/schema
-- Two-click pattern integrated with graph
-- Query filter integration
-
-**Reference**: Design doc § Graph Visualization (Step 4)
-
-**Files Modified**:
-- `assets/template-responsive.html` - Graph container
-- `assets/viewer.js` - Graph rendering (~200 lines)
-- `assets/noet-layout.css` - Graph view styling (~30 lines)
-- `assets/noet-graph.css` (new file) - Graph-specific styles (~50 lines)
-
-**External Dependency**: Cytoscape.js CDN or embedded (~150KB minified)
-
----
-
-### Phase 4: Polish + Testing (2-3 days)
+### Phase 2: Polish + Testing (2-3 days)
 
 **Goal**: Refinements, accessibility, performance, cross-browser testing.
 
-#### Phase 4.1: Accessibility (1-2 days)
+#### Phase 2.1: Accessibility (1-2 days)
 
 **Tasks**:
 - [ ] Keyboard navigation (Tab, Enter, Escape, Arrow keys)
@@ -473,7 +403,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ---
 
-#### Phase 4.2: Browser Compatibility (1 day)
+#### Phase 2.2: Browser Compatibility (1 day)
 
 **Tasks**:
 - [ ] Test on Chrome/Edge 90+ (desktop + mobile)
@@ -506,7 +436,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ---
 
-#### Phase 4.3: Performance Optimization (half day)
+#### Phase 2.3: Performance Optimization (half day)
 
 **Tasks**:
 - [ ] Lazy WASM loading (only load when interactive features requested)
@@ -534,7 +464,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ---
 
-#### Phase 4.4: Documentation (half day)
+#### Phase 2.4: Documentation (half day)
 
 **Tasks**:
 - [ ] Update design doc with implementation notes
@@ -702,16 +632,20 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 **Rationale**: Mobile screen space too constrained. Fixed drawer heights provide consistent UX.
 
 ### Two-Click Pattern Scope
-**Decision**: Main content links only, bypass for nav/metadata panels  
+**Decision**: Main content links only (within `<article>`), bypass for nav/metadata panels  
 **Rationale**: Navigation and metadata links are already contextual (user knows destination). Two-click pattern most valuable for inline content links where context preview is helpful.
 
-### Query Builder Modes
-**Decision**: Three modes (simple/advanced/text) with mode switching  
-**Rationale**: Progressive disclosure. Simple mode for common tasks, advanced for power users, text for debugging/sharing queries.
+### Metadata Data Source
+**Decision**: Use `wasm.get_context(bid)` which returns full `NodeContext`  
+**Rationale**: Single API call gets all needed data (node, backlinks, forward links, related nodes, graph). Avoids multiple round-trips to WASM.
 
-### Graph Library
-**Decision**: Cytoscape.js over D3.js  
-**Rationale**: Higher-level API, better performance, built-in layouts. D3.js more flexible but requires more custom code.
+### Document Fetching Strategy
+**Decision**: Fetch full HTML documents (not fragments)  
+**Rationale**: Template overhead (~191 lines) is minimal, DOM extraction is efficient, avoids creating separate fragment endpoint.
+
+### Two-Click State Management
+**Decision**: Single `selectedBid` variable (not CSS classes or Set)  
+**Rationale**: Simple state model, easy to debug, clear reset conditions.
 
 ### Mobile Drawer Height
 **Decision**: 40vh for metadata (down from 60vh)  
@@ -721,8 +655,11 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ## References
 
-- **[Interactive Viewer Design](../design/interactive_viewer.md)** - Complete architecture (859 lines)
-- **[ISSUE_38: Interactive SPA Foundation](ISSUE_38_INTERACTIVE_SPA.md)** - Completed foundation work
+- **[Interactive Viewer Design](../design/interactive_viewer.md)** - Complete architecture, § Two-Click Navigation Pattern, § Metadata Panel Display
+- **[ISSUE_38: Interactive SPA Foundation](completed/ISSUE_38_INTERACTIVE_SPA.md)** - Completed foundation work
+- **[ISSUE_40: Network Index Generation](ISSUE_40_NETWORK_INDEX_DOCCODEC.md)** - Blocking dependency (must complete before Phase 1 testing)
+- **[ISSUE_41: Query Builder UI](ISSUE_41_QUERY_BUILDER.md)** - Future work (extracted from original Phase 2)
+- **[ISSUE_42: Graph Visualization](ISSUE_42_GRAPH_VISUALIZATION.md)** - Future work (extracted from original Phase 3)
 - [BeliefBase Architecture](../design/beliefbase_architecture.md) - Data model
 - [Link Format Design](../design/link_format.md) - BID attribution
 - [Architecture Overview](../design/architecture.md) - System namespaces
@@ -734,17 +671,21 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ## Notes
 
-**Multi-Session Scope**: This issue spans 12-15 days across 4-6 sessions. Each phase is a natural stopping point.
+**Scope Reduction**: Original issue included Query Builder and Graph Visualization. These are now separate issues (ISSUE_41, ISSUE_42) to keep work focused and manageable.
 
-**Progressive Enhancement**: All features are enhancements. Static HTML works without JS. WASM failure doesn't break the page.
+**Blocking Dependency**: ISSUE_40 (Network Index Generation) must be completed before Phase 1 manual testing can proceed. Network indices currently use hardcoded HTML without WASM support.
 
-**Performance Focus**: Pre-structured tree, virtual scrolling, lazy loading all aimed at maintaining < 500ms interactive time even for large networks.
+**Session-Based Approach**: Phase 1 spans multiple sessions. Each sub-phase has clear checkpoints with automated tests verifying functionality.
+
+**Two-Click Pattern**: Experimental UX pattern. Build → test → gather feedback → iterate. May need refinement based on user testing.
+
+**WASM Performance**: Initial load may be slow on low-end devices. Consider loading spinner and defer WASM initialization until user interacts (progressive enhancement).
+
+**Performance Target**: Maintain < 500ms interactive time even for large networks. Phase 0 pre-structured tree helps achieve this.
 
 **Accessibility First**: Keyboard navigation and ARIA labels built in from the start, not bolted on later.
 
-**Iterative UX Validation**: Two-click pattern is experimental. Build it, experience it, gather feedback, iterate. User testing essential for validating design decisions.
-
-**Foundation Quality**: ISSUE_38 delivered solid foundation (responsive layout, navigation tree, theme system, WASM integration). This issue builds advanced features on proven infrastructure.
+**Foundation Quality**: ISSUE_38 delivered solid foundation (responsive layout, navigation tree, theme system, WASM integration). Phase 1 builds advanced features on proven infrastructure.
 
 ---
 

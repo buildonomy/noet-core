@@ -1176,45 +1176,82 @@ impl DocCodec for ProtoBeliefNode {
         Some(self.document.to_string())
     }
 
-    fn generate_html(
+    fn should_defer(&self) -> bool {
+        // Networks need full context to list child documents
+        self.kind.contains(BeliefKind::Network)
+    }
+
+    fn generate_deferred_html(
         &self,
-        _script: Option<&str>,
-        _use_cdn: bool,
-    ) -> Result<Option<String>, BuildonomyError> {
+        ctx: &crate::beliefbase::BeliefContext<'_>,
+    ) -> Result<Vec<(std::path::PathBuf, String)>, BuildonomyError> {
+        use crate::properties::{WeightKind, WEIGHT_SORT_KEY};
+
         // Only generate index.html for Network nodes
         if !self.kind.contains(BeliefKind::Network) {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
-        // Get network title from document
-        let network_title = self
+        // Query child documents via Section (subsection) edges
+        let sources = ctx.sources();
+        let mut children: Vec<_> = sources
+            .iter()
+            .filter_map(|edge| {
+                // Check if this edge has a Section weight (subsection relationship)
+                edge.weight.get(&WeightKind::Section).map(|section_weight| {
+                    let sort_key: u16 = section_weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                    (edge, sort_key)
+                })
+            })
+            .collect();
+
+        // Sort by WEIGHT_SORT_KEY
+        children.sort_by_key(|(_, sort_key)| *sort_key);
+
+        // Generate HTML list of child documents
+        let title = self
             .document
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Network Index");
 
-        // For now, generate a placeholder index.html
-        // The actual document listing will be populated by the compiler
-        // after all documents are parsed, using PathMap to get relative paths
-        let html = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{}</title>
-  <link rel="stylesheet" href="assets/default-theme.css">
-</head>
-<body>
-  <article>
-    <h1>{}</h1>
-    <p>Network index will be generated after parsing completes.</p>
-  </article>
-</body>
-</html>"#,
-            network_title, network_title
-        );
+        let mut html = String::new();
+        html.push_str(&format!("<h1>{}</h1>\n", title));
 
-        Ok(Some(html))
+        if let Some(description) = self.document.get("description").and_then(|v| v.as_str()) {
+            html.push_str(&format!("<p>{}</p>\n", description));
+        }
+
+        if children.is_empty() {
+            html.push_str("<p><em>No documents in this network yet.</em></p>\n");
+        } else {
+            html.push_str("<ul>\n");
+            for (edge, _sort_key) in children {
+                // Convert home_path to HTML link (replace extension with .html)
+                let mut link_path = edge.home_path.clone();
+
+                // Normalize document links to .html extension
+                let codec_extensions = crate::codec::CODECS.extensions();
+                for ext in codec_extensions.iter() {
+                    if link_path.ends_with(&format!(".{}", ext)) {
+                        link_path = link_path.replace(&format!(".{}", ext), ".html");
+                        break;
+                    }
+                }
+
+                let title = edge.other.display_title();
+                html.push_str(&format!(
+                    "  <li><a href=\"/{}\">{}</a></li>\n",
+                    link_path, title
+                ));
+            }
+            html.push_str("</ul>\n");
+        }
+
+        // Output path is index.html in the network directory
+        let output_path = std::path::PathBuf::from(&self.path).with_extension("html");
+
+        Ok(vec![(output_path, html)])
     }
 
     fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError> {

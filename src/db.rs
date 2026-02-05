@@ -2,6 +2,7 @@ use crate::{
     beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     error::BuildonomyError,
     event::BeliefEvent,
+    paths::path_join,
     properties::{BeliefKind, BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
     query::{push_string_expr, AsSql, BeliefSource, Expression, StatePred},
 };
@@ -16,8 +17,11 @@ use sqlx::{
 use sqlx::{migrate::MigrationType, Pool, QueryBuilder};
 use std::{collections::BTreeMap, fmt::Debug, result::Result};
 use std::{
+    collections::BTreeSet,
     fs,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr,
     time::SystemTime,
 };
@@ -266,6 +270,11 @@ impl<'a> Transaction<'a> {
     }
 }
 
+// No 'futures' crate needed!
+// This is exactly what BoxFuture<'static, u32> expands to.
+type NestedNetFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send + 'static>>;
+
 #[derive(Debug, Clone)]
 pub struct DbConnection(pub Pool<Sqlite>);
 
@@ -362,22 +371,101 @@ impl DbConnection {
             .map(|(path, mtime)| (PathBuf::from(path), mtime))
             .collect())
     }
+}
 
-    pub async fn get_network_paths(
-        &self,
-        network_bid: Bid,
-    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+fn get_network_paths(
+    pool: Pool<Sqlite>,
+    network_bid: Bid,
+    processed_nets: BTreeSet<Bid>,
+) -> NestedNetFuture {
+    Box::pin(async move {
+        if processed_nets.contains(&network_bid) {
+            tracing::debug!(
+                "[get_network_paths] Skipping already processed network: {}",
+                network_bid
+            );
+            return Ok(vec![]);
+        }
+
+        tracing::debug!(
+            "[get_network_paths] Querying paths for network: {}",
+            network_bid
+        );
+
         let rows =
             sqlx::query_as::<_, (String, String)>("SELECT path, target FROM paths WHERE net = ?")
                 .bind(network_bid.to_string())
-                .fetch_all(&self.0)
+                .fetch_all(&pool)
                 .await?;
-
-        Ok(rows
+        let mut row_results = rows
             .into_iter()
             .filter_map(|(path, target)| Bid::try_from(target.as_str()).ok().map(|bid| (path, bid)))
-            .collect())
-    }
+            .collect::<Vec<_>>();
+
+        let mut row_nets = row_results
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, elem)| {
+                // Designates a network directory (no file extension)
+                if PathBuf::from(&elem.0).extension().is_none() && !processed_nets.contains(&elem.1)
+                {
+                    Some((idx, elem.1))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        tracing::debug!(
+            "[get_network_paths] Found {} subnets in network {}",
+            row_nets.len(),
+            network_bid
+        );
+        row_nets.sort_by(|a, b| a.0.cmp(&b.0));
+        let new_nets = BTreeSet::from_iter(row_nets.iter().map(|elem| elem.1));
+        let mut newly_processed = processed_nets.clone();
+        newly_processed.insert(network_bid);
+        newly_processed.append(&mut new_nets.clone());
+        for new_net in new_nets.iter() {
+            // remove new_net from processed just for this call
+            let mut newly_processed_for_call = newly_processed.clone();
+            newly_processed_for_call.remove(new_net);
+            let mut sub_results =
+                get_network_paths(pool.clone(), *new_net, newly_processed_for_call).await?;
+
+            tracing::debug!(
+                "[get_network_paths] Subnet {} returned {} documents",
+                new_net,
+                sub_results.len()
+            );
+
+            if !sub_results.is_empty() {
+                let Some(row_nets_index) = row_nets.iter().position(|elem| elem.1 == *new_net)
+                else {
+                    tracing::warn!(
+                        "[get_network_paths] Subnet {} expected in row_nets but not found (len={})",
+                        new_net,
+                        row_nets.len()
+                    );
+                    continue;
+                };
+                let (start_idx, _net) = row_nets[row_nets_index];
+                {
+                    let base_path = &row_results[start_idx].0;
+                    for (sub_path, _bid) in sub_results.iter_mut() {
+                        *sub_path = path_join(base_path, sub_path, false);
+                    }
+                }
+                let incr = sub_results.len() - 1; // since not empty, this is always >= 0
+                row_results.splice(start_idx..start_idx + 1, sub_results.into_iter());
+                // Increment indices to account for our splice
+                for next_idx in (row_nets_index + 1)..row_nets.len() {
+                    row_nets[next_idx].0 += incr;
+                }
+            }
+        }
+        Ok(row_results)
+    })
 }
 
 impl BeliefSource for DbConnection {
@@ -549,7 +637,7 @@ impl BeliefSource for DbConnection {
         &self,
         network_bid: Bid,
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
-        self.get_network_paths(network_bid).await
+        get_network_paths(self.0.clone(), network_bid, BTreeSet::default()).await
     }
 
     async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {

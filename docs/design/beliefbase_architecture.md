@@ -1151,24 +1151,112 @@ pub trait DocCodec {
     fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError>;
     fn nodes(&self) -> Vec<ProtoBeliefNode>;
     fn inject_context(&mut self, node: &ProtoBeliefNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
-    fn is_changed(&self) -> bool;
     fn generate_source(&self) -> Option<String>;
+    
+    // HTML Generation API (dual-phase)
+    fn should_defer(&self) -> bool { false }
+    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> { Ok(vec![]) }
+    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> { Ok(vec![]) }
+}
+```
+
+#### Factory Pattern Architecture
+
+Codecs are created via **factory functions** (`type CodecFactory = fn() -> Box<dyn DocCodec>`), not singletons:
+
+```rust
+pub struct CodecMap(Arc<RwLock<Vec<(String, CodecFactory)>>>);
+
+impl CodecMap {
+    pub fn create() -> Self {
+        let map = CodecMap(Arc::new(RwLock::new(vec![
+            ("md".to_string(), || Box::new(md::MdCodec::new())),
+            ("toml".to_string(), || Box::new(ProtoBeliefNode::default())),
+            // ... other codecs
+        ])));
+        map
+    }
+    
+    pub fn get(&self, ext: &str) -> Option<CodecFactory> {
+        // Returns factory function, not codec instance
+    }
+}
+```
+
+**Benefits**:
+- **Thread-safe**: Each parse operation gets fresh codec instance
+- **No state leakage**: Parsing one file doesn't affect another
+- **Concurrent parsing**: Multiple threads can parse simultaneously
+- **Testability**: Each test gets isolated codec state
+
+#### Dual-Phase HTML Generation
+
+HTML generation happens in two phases to handle different codec needs:
+
+**Phase 1: Immediate Generation** (`generate_html`)
+- Called immediately after parsing, before context injection
+- Codec has parsed AST but no graph context
+- Use for: Static content (Markdown → HTML, syntax highlighting)
+- Returns: `Vec<(PathBuf, String)>` of (repo-relative-path, html-body)
+
+**Phase 2: Deferred Generation** (`generate_deferred_html`)
+- Called after all documents parsed and context injected
+- Codec has full `BeliefContext` with graph relationships
+- Use for: Dynamic content (network indices, backlinks, cross-references)
+- Returns: Same format as immediate generation
+
+**Deferral Signal**: `should_defer()` tells compiler which phase to use:
+- `false` (default): Only immediate generation
+- `true`: Skip immediate, use deferred with context
+
+**Example: Network Index Generation**
+```rust
+impl DocCodec for ProtoBeliefNode {
+    fn should_defer(&self) -> bool {
+        self.kind.contains(BeliefKind::Network)
+    }
+    
+    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+        // Query child documents via Section (subsection) edges
+        let mut children: Vec<_> = ctx.sources()
+            .iter()
+            .filter_map(|edge| {
+                edge.weight.get(&WeightKind::Section).map(|section_weight| {
+                    let sort_key: u16 = section_weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                    (edge, sort_key)
+                })
+            })
+            .collect();
+        
+        // Sort by sort_key, generate HTML list
+        children.sort_by_key(|(_, sort_key)| *sort_key);
+        let html = format!("<ul>{}</ul>", 
+            children.iter()
+                .map(|(edge, _)| format!("<li><a href='/{}'>{}</a></li>", 
+                    edge.home_path.replace(".md", ".html"), 
+                    edge.other.display_title()))
+                .collect::<String>());
+        
+        Ok(vec![(self.path.with_extension("html"), html)])
+    }
 }
 ```
 
 **Current Implementations:**
 
-- **TomlCodec** (belief_ir.rs): Parses standalone TOML files and TOML frontmatter
-  - Schema-aware: Can detect schema type from file path or frontmatter
-  - Preserves formatting via `toml_edit::DocumentMut`
-  - Extensible for custom relationship field handling
+- **MdCodec** (md.rs): Immediate generation only
+  - Parses Markdown with TOML frontmatter
+  - Generates HTML from pulldown-cmark AST
+  - Rewrites internal links to `.html` extension
+  - Extracts headings for structural hierarchy
 
-- **MdCodec** (md.rs): Parses Markdown with TOML frontmatter
-  - Extracts frontmatter as ProtoBeliefNode payload
-  - Parses headings to create structural hierarchy
-  - Extracts code blocks and other structural elements
+- **ProtoBeliefNode** (belief_ir.rs): Deferred generation for networks
+  - Parses TOML/JSON/YAML files
+  - Schema-aware: detects schema from path or frontmatter
+  - Networks defer to query child documents from context
+  - Generates index pages listing subsections
 
-**Key Responsibility**: Codecs are **syntax-only**. They produce ProtoBeliefNodes with unresolved references (NodeKey instances). The builder handles semantic analysis and linking.
+**Key Responsibility**: Codecs are **syntax-only** for parsing. They produce ProtoBeliefNodes with unresolved references (NodeKey instances). The builder handles semantic analysis and linking. For HTML generation, codecs are **presentation-only** — they return body content, compiler wraps with templates.
 
 ### 3.6. The Document Stack: Nested Structure Parsing
 
@@ -1301,6 +1389,71 @@ After "Advanced Topics": [(guide_bid, "User Guide", 1), (adv_bid, "Advanced Topi
 - User Guide → Getting Started (Subsection)
 - Getting Started → Installation (Subsection)
 - User Guide → Advanced Topics (Subsection)
+
+### 3.7. Event Synchronization and BeliefBase Export
+
+When the compiler finishes parsing, it must ensure all `BeliefEvent`s have been processed before exporting the beliefbase. This is critical for the `parse` command which uses an in-memory `BeliefBase` with asynchronous event processing.
+
+#### The Problem
+
+```
+Compiler (tx) → [events in channel] → rx → BeliefBase (processes events)
+                                             ↓
+                                        export_beliefgraph() ← Called too early!
+```
+
+If `export_beliefgraph()` is called before all events are processed, the export will be incomplete.
+
+#### Solution: Event Loop Synchronization (Option G Pattern)
+
+The `parse` command manages the event loop explicitly:
+
+```rust
+// In main.rs parse command
+runtime.block_on(async {
+    // 1. Create event channel
+    let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+    
+    // 2. Spawn background task to process events
+    let mut global_bb = BeliefBase::empty();
+    let processor = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let _ = global_bb.process_event(&event);
+        }
+        global_bb  // Return synchronized BeliefBase when channel closes
+    });
+    
+    // 3. Create compiler with event transmitter
+    let mut compiler = DocumentCompiler::with_html_output(
+        &path, Some(tx), None, write, Some(html_dir), None, cdn
+    )?;
+    
+    // 4. Parse all documents (sends events to processor)
+    compiler.parse_all(cache, force).await?;
+    
+    // 5. Drop compiler to close tx channel
+    drop(compiler);
+    
+    // 6. Wait for event processor to finish (drains all events)
+    let final_bb = processor.await?;
+    
+    // 7. Now safe to export from synchronized BeliefBase
+    let graph = final_bb.clone().consume();
+    export_beliefbase_json(graph, html_dir).await?;
+});
+```
+
+**Key Points**:
+- Background task processes events asynchronously
+- Dropping compiler closes `tx`, signaling processor to finish
+- `processor.await` blocks until all events processed
+- Export happens from synchronized `final_bb`
+
+**Watch Service vs Parse Command**:
+- **Watch service**: Uses `DbConnection` which processes events in its own loop → `finalize()` exports from database
+- **Parse command**: Uses in-memory `BeliefBase` with explicit event loop → exports after synchronization
+
+This pattern ensures `beliefbase.json` always contains complete graph data for the interactive viewer.
 
 ## 6. Architectural Concerns and Future Enhancements
 

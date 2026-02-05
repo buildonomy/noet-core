@@ -73,7 +73,7 @@
 //!         todo!();
 //!     }
 //! }
-//! CODECS.insert::<MyCustomCodec>("myext".to_string());
+//! CODECS.insert("myext".to_string(), || Box::new(MyCustomCodec));
 //! ```
 //!
 //! ## Schema Registration
@@ -114,9 +114,9 @@ use once_cell::sync::Lazy;
 pub use assets::Layout;
 
 #[cfg(not(target_arch = "wasm32"))]
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use std::{result::Result, sync::Arc, time::Duration};
+use std::{path::PathBuf, result::Result, sync::Arc, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
@@ -148,8 +148,16 @@ pub use diagnostic::{ParseDiagnostic, UnresolvedReference};
 #[cfg(not(target_arch = "wasm32"))]
 pub use schema_registry::SCHEMAS;
 
-/// Global singleton codec map with builtin codecs (md, toml)
+/// Factory function type for creating fresh codec instances
+#[cfg(not(target_arch = "wasm32"))]
+pub type CodecFactory = fn() -> Box<dyn DocCodec + Send>;
+
+/// Global codec map - creates fresh instances on demand via factory pattern
+#[cfg(not(target_arch = "wasm32"))]
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
+
+/// List of built-in codec extensions (synchronized between WASM and non-WASM builds)
+const BUILTIN_EXTENSIONS: &[&str] = &["md", "toml", "tml", "json", "jsn", "yaml", "yml"];
 
 /// [ ] Need to iterate out protobeliefstate
 /// [ ] Need to replace protobeliefstates
@@ -188,54 +196,105 @@ pub trait DocCodec: Sync {
 
     fn generate_source(&self) -> Option<String>;
 
-    /// Generate HTML representation of the document with embedded metadata.
+    /// Signal whether this codec needs deferred generation.
     ///
-    /// Returns an HTML string with:
-    /// - Document structure (head, body, article)
-    /// - Embedded JSON metadata mapping document/section IDs to BIDs
-    /// - Clean semantic HTML from markdown (pulldown-cmark output)
+    /// If true, compiler will call `generate_html()` again after all parsing completes
+    /// with full BeliefContext available.
     ///
-    /// The metadata enables WASM SPA to map HTML elements to BeliefBase nodes:
-    /// - `metadata.document.bid` - Document node BID
-    /// - `metadata.sections[anchor_id]` - Section node BIDs (only for explicit section nodes)
+    /// # Returns
+    /// - `true`: Needs full context, call generate_html() again after all files parsed
+    /// - `false`: Only immediate generation needed (default)
+    ///
+    /// # Examples
+    /// - Markdown files: `false` (can generate from parsed AST immediately)
+    /// - Network indices: `true` (need to query child documents from context)
+    fn should_defer(&self) -> bool {
+        false // Default: no deferral needed
+    }
+
+    /// Generate HTML fragments from parsed content (immediate phase).
+    ///
+    /// Called immediately after parsing completes, before BeliefContext is available.
+    /// Use for codecs that can generate HTML from parsed AST alone (e.g., Markdown).
+    ///
+    /// # Returns
+    /// - `Ok(vec![(path, body), ...])`: Repo-relative output paths and HTML body content
+    /// - `Ok(vec![])`: No immediate generation (may use deferred instead if should_defer == true)
+    /// - `Err(_)`: Generation failed
+    ///
+    /// # Path Format
+    /// Return repo-relative paths where `path.is_file() == true`:
+    /// - `PathBuf::from("docs/guide.html")` → written to `html_output/pages/docs/guide.html`
+    /// - Public URL will be `/docs/guide.html`
+    ///
+    /// # Body Content
+    /// Return HTML body content only (no `<html>`, `<head>`, etc.):
+    /// - Compiler wraps with Layout::Simple template
+    /// - Template adds canonical URL and optional script injection
     ///
     /// # Link Normalization
-    ///
     /// **Implementations MUST normalize document links to `.html` extension:**
     /// - Convert all registered codec extensions (`.md`, `.toml`, `.org`, etc.) to `.html`
-    /// - Handle both resolved links (with `bref://`) and unresolved links (graceful degradation)
     /// - Preserve anchors: `.md#section` → `.html#section`
     /// - Use `CODECS.extensions()` to get the list of registered extensions
     ///
-    /// Example:
+    /// Default implementation returns empty vec (no HTML generation).
+    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+        Ok(vec![])
+    }
+
+    /// Generate HTML fragments with full BeliefContext (deferred phase).
+    ///
+    /// Called after all parsing completes, with full context available.
+    /// Use for codecs that need to query relationships (e.g., network indices listing children).
+    ///
+    /// Only called if `should_defer()` returns `true`.
+    ///
+    /// # Parameters
+    /// - `ctx`: BeliefContext with full graph relationships and metadata
+    ///
+    /// # Returns
+    /// Same format as `generate_html()` - repo-relative paths and HTML body content.
+    ///
+    /// # Example: Network Index
     /// ```ignore
-    /// let codec_extensions = crate::codec::CODECS.extensions();
-    /// for ext in codec_extensions.iter() {
-    ///     url = url.replace(&format!(".{}", ext), ".html");
-    ///     url = url.replace(&format!(".{}#", ext), ".html#");
+    /// fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+    ///     // Query child documents via Subsection edges
+    ///     let mut children: Vec<_> = ctx.sources.iter()
+    ///         .filter(|edge| edge.weight.get(WeightKind::Subsection).is_some())
+    ///         .collect();
+    ///
+    ///     // Sort by WEIGHT_SORT_KEY
+    ///     children.sort_by_key(|edge| {
+    ///         edge.weight.get(WeightKind::Subsection)
+    ///             .and_then(|w| w.get("sort"))
+    ///             .and_then(|v| v.as_integer())
+    ///     });
+    ///
+    ///     // Generate HTML list
+    ///     let html = format!("<ul>{}</ul>",
+    ///         children.iter()
+    ///             .map(|edge| format!("<li><a href='{}'>{}</a></li>",
+    ///                 edge.other_path, edge.other.display_title()))
+    ///             .collect::<String>()
+    ///     );
+    ///
+    ///     Ok(vec![(self.path.with_extension("html"), html)])
     /// }
     /// ```
     ///
-    /// # Parameters
-    /// - `script`: Optional JavaScript to inject into the HTML (e.g., live reload for dev mode)
-    /// - `use_cdn`: Whether to use CDN for Open Props (requires internet, smaller output)
-    ///
-    /// Always uses responsive template for interactive SPA viewer.
-    /// Default implementation returns None (codec doesn't support HTML generation).
-    fn generate_html(
+    /// Default implementation returns empty vec (no deferred generation).
+    fn generate_deferred_html(
         &self,
-        _script: Option<&str>,
-        _use_cdn: bool,
-    ) -> Result<Option<String>, BuildonomyError> {
-        Ok(None)
+        _ctx: &BeliefContext<'_>,
+    ) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+        Ok(vec![])
     }
 }
 
-// It is better to express the complexity of the singleton than hide it. Also the CodecMap methods
-// are used to properly unwrap this structure.
+/// Factory-based codec map that creates fresh instances on demand
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::type_complexity)]
-pub struct CodecMap(Arc<RwLock<Vec<(String, Arc<Mutex<dyn DocCodec + Send>>)>>>);
+pub struct CodecMap(Arc<RwLock<Vec<(String, CodecFactory)>>>);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Clone for CodecMap {
@@ -247,78 +306,217 @@ impl Clone for CodecMap {
 #[cfg(not(target_arch = "wasm32"))]
 impl CodecMap {
     pub fn create() -> Self {
-        CodecMap(Arc::new(RwLock::new(vec![
-            ("md".to_string(), Arc::new(Mutex::new(md::MdCodec::new()))),
-            (
-                "toml".to_string(),
-                Arc::new(Mutex::new(ProtoBeliefNode::default())),
-            ),
-        ])))
+        let map = CodecMap(Arc::new(RwLock::new(vec![
+            ("md".to_string(), || Box::new(md::MdCodec::new())),
+            ("toml".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("tml".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("json".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("jsn".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("yaml".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("yml".to_string(), || Box::new(ProtoBeliefNode::default())),
+        ])));
+        debug_assert!({ BUILTIN_EXTENSIONS.iter().all(|ext| map.get(ext).is_some()) });
+        map
     }
 
-    pub fn insert<T: DocCodec + Clone + Default + Send + Sync + 'static>(&self, extension: String) {
+    pub fn insert(&self, extension: String, factory: CodecFactory) {
         while self.0.is_locked() {
-            tracing::debug!("[CodecMap::insert] Waiting for write access to the codec map");
+            tracing::debug!("[CodecMap::insert] Waiting for write access");
             std::thread::sleep(Duration::from_millis(100));
         }
         let mut writer = self.0.write_arc();
         if let Some(entry) = writer.iter_mut().find(|(ext, _)| ext == &extension) {
-            entry.1 = Arc::new(Mutex::new(T::default()));
+            entry.1 = factory;
         } else {
-            writer.push((extension, Arc::new(Mutex::new(T::default()))));
+            writer.push((extension, factory));
         }
     }
 
-    pub fn get(&self, ext: &str) -> Option<Arc<Mutex<dyn DocCodec + Send>>> {
+    pub fn get(&self, ext: &str) -> Option<CodecFactory> {
         while self.0.is_locked_exclusive() {
-            tracing::debug!("[CodecMap::insert] Waiting for read access to the codec map");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let reader = self.0.read_arc();
-        let res = reader
-            .iter()
-            .find(|(codec_ext, _value)| ext == codec_ext)
-            .map(|(_codec_ext, value)| value.clone());
-        res
-    }
-
-    pub fn extensions(&self) -> Vec<String> {
-        while self.0.is_locked_exclusive() {
-            tracing::debug!("[CodecMap::insert] Waiting for read access to the codec map");
+            tracing::debug!("[CodecMap::get] Waiting for read access");
             std::thread::sleep(Duration::from_millis(100));
         }
         let reader = self.0.read_arc();
         reader
             .iter()
-            .map(|(codec_ext, _value)| codec_ext.clone())
-            .collect::<Vec<String>>()
+            .find(|(codec_ext, _)| ext == codec_ext)
+            .map(|(_, factory)| *factory)
+    }
+
+    pub fn extensions(&self) -> Vec<String> {
+        while self.0.is_locked_exclusive() {
+            tracing::debug!("[CodecMap::extensions] Waiting for read access");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let reader = self.0.read_arc();
+        reader
+            .iter()
+            .map(|(codec_ext, _)| codec_ext.clone())
+            .collect()
     }
 }
 
-// WASM-compatible version: lightweight extension registry only
+// WASM-compatible version: lightweight extension registry only (no actual codec instances)
 #[cfg(target_arch = "wasm32")]
-pub struct CodecMap {
-    extensions: &'static [&'static str],
-}
+pub struct CodecMap;
 
 #[cfg(target_arch = "wasm32")]
 impl Clone for CodecMap {
     fn clone(&self) -> Self {
-        CodecMap {
-            extensions: self.extensions,
-        }
+        CodecMap
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl CodecMap {
     pub fn create() -> Self {
-        CodecMap {
-            extensions: &["md", "toml", "org"],
-        }
+        CodecMap
     }
 
     pub fn extensions(&self) -> Vec<String> {
-        self.extensions.iter().map(|s| s.to_string()).collect()
+        BUILTIN_EXTENSIONS.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_codec_factory_creates_fresh_instances() {
+        // Get codec factory for markdown
+        let factory = CODECS.get("md").expect("md codec should exist");
+
+        // Create two instances
+        let codec1 = factory();
+        let codec2 = factory();
+
+        // Verify they are separate instances (different addresses)
+        let ptr1 = &*codec1 as *const dyn DocCodec;
+        let ptr2 = &*codec2 as *const dyn DocCodec;
+
+        assert_ne!(ptr1, ptr2, "Factory should create separate instances");
+    }
+
+    #[test]
+    fn test_codec_factory_extensions() {
+        let extensions = CODECS.extensions();
+
+        // Verify built-in codecs are registered
+        assert!(extensions.contains(&"md".to_string()));
+        assert!(extensions.contains(&"toml".to_string()));
+        assert!(extensions.contains(&"json".to_string()));
+        assert!(extensions.contains(&"yaml".to_string()));
+    }
+
+    #[test]
+    fn test_codec_factory_get_nonexistent() {
+        let result = CODECS.get("nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_wasm_extensions_match_builtin() {
+        // Verify WASM build would have same extensions as non-WASM
+        let extensions = CODECS.extensions();
+        for builtin in BUILTIN_EXTENSIONS {
+            assert!(
+                extensions.contains(&builtin.to_string()),
+                "Extension {} should be in CODECS",
+                builtin
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_content_returns_owned_codec() {
+        use crate::codec::builder::GraphBuilder;
+        use tempfile::TempDir;
+
+        // Create temporary directory with a test markdown file
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.md");
+        let content = "# Test Document\n\nThis is a test.";
+        std::fs::write(&test_file, content).unwrap();
+
+        // Create builder with directory as root
+        let mut builder = GraphBuilder::new(temp_dir.path(), None).unwrap();
+
+        // Parse with factory method - should return owned codec
+        let session_bb = builder.session_bb().clone();
+        let result = builder
+            .parse_content(&test_file, content.to_string(), session_bb)
+            .await;
+
+        assert!(result.is_ok(), "parse_content should succeed");
+        let with_codec = result.unwrap();
+        let parse_result = with_codec.result;
+        let codec = with_codec.codec;
+
+        // Verify parse result
+        assert!(
+            parse_result.diagnostics.is_empty()
+                || !parse_result
+                    .diagnostics
+                    .iter()
+                    .any(|d| matches!(d, crate::codec::ParseDiagnostic::ParseError { .. }))
+        );
+
+        // Verify codec has parsed content
+        assert!(!codec.nodes().is_empty(), "Codec should have parsed nodes");
+    }
+
+    #[tokio::test]
+    async fn test_dual_phase_html_generation() {
+        use crate::codec::builder::GraphBuilder;
+        use tempfile::TempDir;
+
+        // Create temporary directory with a test markdown file
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.md");
+        let content = "# Test Document\n\nThis is a test with a [link](other.md).";
+        std::fs::write(&test_file, content).unwrap();
+
+        // Create builder with directory as root
+        let mut builder = GraphBuilder::new(temp_dir.path(), None).unwrap();
+
+        // Parse with factory method - should return owned codec
+        let session_bb = builder.session_bb().clone();
+        let result = builder
+            .parse_content(&test_file, content.to_string(), session_bb)
+            .await;
+
+        assert!(result.is_ok(), "parse_content should succeed");
+        let with_codec = result.unwrap();
+        let codec = with_codec.codec;
+
+        // Test Phase 1: Immediate generation
+        let immediate_result = codec.generate_html();
+        assert!(
+            immediate_result.is_ok(),
+            "generate_html should succeed: {:?}",
+            immediate_result.as_ref().err()
+        );
+
+        let fragments = immediate_result.unwrap();
+        assert_eq!(fragments.len(), 1, "Should generate one fragment");
+
+        let (output_path, html_body) = &fragments[0];
+        assert_eq!(
+            output_path.extension().and_then(|s| s.to_str()),
+            Some("html")
+        );
+        assert!(
+            html_body.contains("Test Document"),
+            "Should contain document title"
+        );
+        assert!(
+            html_body.contains("other.md"),
+            "Unresolved links remain as-is (link rewriting only for resolved references)"
+        );
+
+        // Test deferral signal (markdown doesn't need deferral)
+        assert!(!codec.should_defer(), "Markdown should not need deferral");
     }
 }

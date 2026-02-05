@@ -1,21 +1,14 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{TITLE}}</title>
-  <link rel="stylesheet" href="{{STYLESHEET_OPEN_PROPS}}">
-  <link rel="stylesheet" href="{{STYLESHEET_NORMALIZE}}">
-  <link rel="stylesheet" href="{{STYLESHEET_THEME_LIGHT}}" id="theme-light">
-  <link rel="stylesheet" href="{{STYLESHEET_THEME_DARK}}" id="theme-dark" disabled>
-  <script type="application/json" id="noet-metadata">
-{{METADATA}}
-  </script>{{SCRIPT}}
-</head>
-<body>
-  <article>
-    <h1 class="document-title">{{TITLE}}</h1>
-{{CONTENT}}
-  </article>
-</body>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{TITLE}}</title>
+        <link rel="canonical" href="{{CANONICAL}}" />
+        {{SCRIPT}}
+    </head>
+    <body>
+        <h1 class="document-title">{{TITLE}}</h1>
+        {{BODY}}
+    </body>
 </html>

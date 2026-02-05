@@ -846,52 +846,6 @@ impl FileUpdateSyncer {
                                 stats.reparse_queue_len,
                                 stats.total_parses
                             );
-
-                            // After queue empties, run post-parse cleanup
-                            {
-                                while compiler_ref.is_locked() {
-                                    tracing::debug!(
-                                        "[DocumentCompiler] Waiting for write access for post-parse cleanup"
-                                    );
-                                    sleep(Duration::from_millis(100)).await;
-                                }
-                                let compiler_read = compiler_ref.read_arc();
-
-                                // Generate network index pages
-                                if let Err(e) = compiler_read.generate_network_indices().await {
-                                    tracing::warn!("[WatchService] Failed to generate network indices: {}", e);
-                                }
-
-                                // Create asset hardlinks if HTML output is configured
-                                if let Some(html_dir) = compiler_read.html_output_dir() {
-                                    // Query cache for asset manifest
-                                    let asset_manifest: std::collections::BTreeMap<String, crate::properties::Bid> =
-                                        compiler_global_bb
-                                            .get_network_paths(crate::properties::asset_namespace())
-                                            .await
-                                            .unwrap_or_default()
-                                            .into_iter()
-                                            .collect();
-
-                                    if let Err(e) = compiler_read.create_asset_hardlinks(html_dir, &asset_manifest).await {
-                                        tracing::warn!("[WatchService] Failed to create asset hardlinks: {}", e);
-                                    }
-
-                                    // Export BeliefGraph to JSON for client-side use
-                                    use crate::query::BeliefSource;
-                                    match compiler_global_bb.export_beliefgraph().await {
-                                        Ok(graph) => {
-                                            if let Err(e) = compiler_read.export_beliefbase_json(graph).await {
-                                                tracing::warn!("[WatchService] Failed to export beliefbase.json: {}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("[WatchService] Failed to export BeliefGraph: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-
                             // Break inner loop to wait for next notification
                             break;
                         }

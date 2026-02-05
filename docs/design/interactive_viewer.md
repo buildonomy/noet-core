@@ -34,7 +34,7 @@ The Interactive HTML Viewer is a progressive-enhancement Single-Page Application
 **Static Foundation**:
 - HTML5 semantic markup
 - CSS Grid layout (responsive, no framework)
-- Open Props design tokens
+- Open Props design tokens (CDN or vendored)
 - Standard browser APIs (no dependencies)
 
 **Interactive Layer**:
@@ -43,6 +43,39 @@ The Interactive HTML Viewer is a progressive-enhancement Single-Page Application
 - BeliefGraph JSON (`beliefbase.json`) for full network data
 
 **Key Design Decision**: No JavaScript frameworks (React/Vue/etc). Pure DOM manipulation keeps bundle size minimal and avoids framework lock-in.
+
+### Output Structure
+
+HTML generation produces a complete SPA architecture:
+
+```
+html_output/
+  index.html              ← SPA shell (Layout::Responsive, repo metadata)
+  sitemap.xml             ← SEO sitemap with all document URLs
+  beliefbase.json         ← Full graph data (synchronized export)
+  assets/
+    noet-layout.css       ← Custom layout styles
+    noet-theme-light.css  ← Light theme
+    noet-theme-dark.css   ← Dark theme
+    viewer.js             ← Interactive viewer (future)
+    open-props/           ← Design tokens (if not using CDN)
+      open-props.min.css
+      normalize.min.css
+  pages/
+    docs/
+      guide.html          ← Document fragment (Layout::Simple)
+      tutorials/
+        intro.html        ← Nested document
+      index.html          ← Network index (deferred generation)
+```
+
+**Two Template Modes**:
+- **Layout::Simple**: Minimal wrapper for document fragments (in `pages/`)
+- **Layout::Responsive**: Full SPA interface for root `index.html`
+
+**Asset Management**:
+- `--cdn` flag: Use unpkg.com for Open Props (smaller output)
+- Default: Vendor all assets locally (offline-first)
 
 ### Data Flow
 
@@ -104,7 +137,7 @@ The Interactive HTML Viewer is a progressive-enhancement Single-Page Application
 }
 ```
 
-**Note**: See `tests/browser/test-output/beliefbase.json` for complete real-world example.
+**Export Synchronization**: The `beliefbase.json` file is guaranteed to contain complete graph data through event loop synchronization (see § Data Export Timing below).
 
 ## Standard Paths
 
@@ -120,6 +153,71 @@ All paths are relative to HTML output directory root:
 **WASM Integration**: WASM artifacts are embedded in the binary (like CSS/JS) and extracted to `assets/` during HTML generation. Build process must run `wasm-pack build` before embedding.
 
 **Rationale**: Fixed paths simplify deployment and eliminate configuration. Embedding WASM maintains offline-first architecture and consistent UX (no manual copy steps).
+
+## Data Export Timing
+
+The `beliefbase.json` file must contain complete graph data with all nodes and relations from the parsing session. This requires **event synchronization** to ensure all `BeliefEvent`s have been processed before export.
+
+### The Challenge
+
+Parsing emits events asynchronously:
+
+```
+Compiler → [events in channel] → BeliefBase.process_event()
+           ↓ (parse completes)
+      Export too early! ← Missing in-flight events
+```
+
+If export happens before event processing completes, the JSON will be incomplete.
+
+### Solution: Event Loop Synchronization
+
+The `parse` command uses explicit event loop management (Option G pattern):
+
+```rust
+// 1. Create event channel
+let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+
+// 2. Spawn background task to process events
+let mut global_bb = BeliefBase::empty();
+let processor = tokio::spawn(async move {
+    while let Some(event) = rx.recv().await {
+        let _ = global_bb.process_event(&event);
+    }
+    global_bb  // Return synchronized BeliefBase
+});
+
+// 3. Parse all documents (sends events via tx)
+let mut compiler = DocumentCompiler::with_html_output(path, Some(tx), ...)?;
+compiler.parse_all(cache, force).await?;
+
+// 4. Close channel to signal completion
+drop(compiler);  // Drops tx, closing channel
+
+// 5. Wait for all events to drain
+let final_bb = processor.await?;
+
+// 6. Export from synchronized state
+let graph = final_bb.clone().consume();
+export_beliefbase_json(graph, html_dir).await?;
+```
+
+**Key Points**:
+- Background task processes events asynchronously
+- Dropping compiler closes transmitter, signaling no more events
+- `processor.await` blocks until event queue is empty
+- Export happens from fully-synchronized `final_bb`
+
+### Watch Service vs Parse Command
+
+| Mode | BeliefSource | Event Processing | Export Location |
+|------|-------------|------------------|----------------|
+| **Watch Service** | `DbConnection` (SQLite) | Database transaction loop | `finalize()` exports from DB |
+| **Parse Command** | `BeliefBase` (in-memory) | Explicit background task | After synchronization in main |
+
+Watch service has persistent database that processes events in its own loop, so `finalize()` can safely export. Parse command requires explicit synchronization pattern.
+
+**Result**: `beliefbase.json` always contains complete graph (typically 30-50KB for medium networks, 57+ nodes in test fixtures).
 
 ## Link Detection and Navigation
 
@@ -177,36 +275,125 @@ During HTML generation, **all links** (internal and external) are marked with BI
 
 ### Two-Click Navigation Pattern
 
-**First Click** (any link):
-- **Internal doc**: Fetch HTML, inject `<article>` into current page
-- **Anchor**: Scroll to section, highlight
-- **External link**: Show metadata panel (analyze link frequency/context)
-- Track `selectedNodeBid = link.bid`
+The two-click pattern provides contextual metadata access without interrupting reading flow. Links within the main content area require two clicks: first to navigate/preview, second to show metadata.
 
-**Second Click** (same link):
-- **Internal doc/Anchor**: Show metadata panel with full `NodeContext` from WASM
-- **External link**: Open in new tab (after reviewing metadata)
-- **Asset link** (`<a href="image.png">`): Download or open asset
-- Metadata panel includes pass-through link to clicked element (single-click navigation)
+#### Scope
 
-**Not Intercepted**:
-- `<img src>` - Images load normally on page load
-- `<script src>` - Scripts load normally
-- `<link href>` - Stylesheets load normally
-- Only `<a>` element clicks are intercepted for two-click pattern
+**Pattern Applies To**:
+- All `<a>` elements within `<article>` tag (main content area only)
+- Both internal links (documents, sections) and external links
 
-**Different Link Click**:
-- Navigate/scroll to new target
-- If metadata panel open: Update content (sticky behavior)
+**Pattern Does NOT Apply To**:
+- Navigation panel links (single-click navigation)
+- Metadata panel links (single-click navigation)
+- Header/footer links (single-click navigation)
+- Non-link elements: `<img src>`, `<script src>`, `<link href>` load normally
+
+#### State Management
+
+```javascript
+// Global state variable
+let selectedBid = null;
+
+// Click handler on <article> links
+article.addEventListener('click', (e) => {
+    if (e.target.tagName !== 'A') return;
+    
+    const linkBid = getLinkBid(e.target); // from data-bid or href resolution
+    
+    if (selectedBid === linkBid) {
+        // Second click: show metadata
+        showMetadataPanel(linkBid);
+        selectedBid = null; // Reset for next interaction
+    } else {
+        // First click: navigate/scroll
+        navigateToTarget(e.target);
+        selectedBid = linkBid; // Track for potential second click
+    }
+    
+    e.preventDefault();
+});
+```
+
+#### First Click Behavior
+
+**Internal Document Link**:
+1. Fetch full HTML document from server
+2. Extract `<article>` content via DOM parsing
+3. Replace current `<article>` with fetched content
+4. Update URL via `history.pushState()` (no page reload)
+5. Store `selectedBid = linkBid`
+
+**Section/Anchor Link**:
+1. Scroll to target section smoothly
+2. Highlight section temporarily (CSS animation)
+3. Update URL hash (`#section-id`)
+4. Store `selectedBid = linkBid`
+
+**External Link**:
+1. Do nothing on first click (or show preview tooltip)
+2. Store `selectedBid = linkBid`
+3. Indicate "click again to open" visually
+
+#### Second Click Behavior
+
+**Any Link Type** (internal, anchor, external):
+1. Call `wasm.get_context(selectedBid)` to fetch full `NodeContext`
+2. Populate metadata panel with:
+   - Node properties (kind, schema, title, payload)
+   - Backlinks (who references this node)
+   - Forward links (what this node references)
+   - Related nodes from graph
+3. Show metadata panel (slide in from right on desktop, drawer on mobile)
+4. Include pass-through navigation link in panel ("Go to X →")
+5. Reset `selectedBid = null`
+
+#### Click Reset Scenarios
+
+**Different Link Clicked**:
+- If `selectedBid !== linkBid`: Perform first-click behavior for new link
+- If metadata panel open: Update content (sticky panel behavior)
 - If metadata panel closed: Stay closed
 
-**Rationale**: Two-click pattern reduces modal spam while keeping metadata accessible. Sticky panel shows user intent to explore metadata.
+**Panel Closed Manually**:
+- Reset `selectedBid = null`
+- Next click is always "first click"
 
-**Link Interception Scope**:
-- **Main content area** (`<main class="noet-content">`): Two-click pattern applies
-- **Nav panel links**: Single-click navigation (bypass two-click)
-- **Metadata panel links**: Single-click navigation (bypass two-click)
-- **Header/footer links**: Single-click navigation (bypass two-click)
+**Navigation Event** (browser back/forward):
+- Reset `selectedBid = null`
+- Close metadata panel
+
+#### Document Fetching Strategy
+
+**Full HTML Fetch** (not fragments):
+- Fetch complete HTML document (191-line template overhead is acceptable)
+- Use DOM parser: `new DOMParser().parseFromString(html, 'text/html')`
+- Extract via `fetchedDoc.querySelector('article').innerHTML`
+- Replace current article: `document.querySelector('article').innerHTML = extractedContent`
+
+**Why Full HTML**:
+- Template overhead (~191 lines) is minimal
+- DOM extraction is efficient
+- Avoids creating separate fragment endpoint
+- Consistent with static site serving
+
+#### Visual Feedback
+
+**First Click**:
+- Link gets `.clicked-once` class (subtle visual indicator)
+- Optional tooltip: "Click again for metadata"
+
+**Second Click**:
+- Remove `.clicked-once` class
+- Metadata panel animates in
+- Link highlighted in metadata panel header
+
+#### Rationale
+
+Two-click pattern reduces metadata panel spam while keeping information accessible:
+- First click: Fast navigation (reading flow preserved)
+- Second click: Deep dive into node relationships (exploration mode)
+- Sticky panel: User intent to explore metadata maintained across links
 
 ## WASM Integration
 
@@ -446,39 +633,87 @@ function toggleMetadataPanel() {
 
 ### Content Structure
 
-**Metadata Sections**:
-1. **Node Info**: BID, title, schema, kind
-   - **Pass-through link**: Direct link to node (single click navigation from metadata drawer)
-2. **Network**: Home network, path
-3. **Relations**: 
-   - Sources (backlinks): Nodes linking here
-   - Sinks (forward links): Nodes this links to
-   - Grouped by WeightKind (Section, Epistemic, etc.)
-4. **Payload**: Key-value display of custom fields
+**Data Source**: `wasm.get_context(bid)` returns `NodeContext`:
+```rust
+pub struct NodeContext {
+    pub node: BeliefNode,           // The node itself
+    pub home_path: Option<String>,  // Path in home network
+    pub home_net: Option<Bid>,      // Home network BID
+    pub related_nodes: Vec<BeliefNode>, // Related nodes from graph
+    pub graph: BeliefGraph,         // Full graph with states and relations
+}
+```
+
+**Metadata Sections** (Phase 1.1 Initial Scope):
+
+1. **Node Properties** (from `context.node`):
+   - BID (truncated with copy button: `1f100f54...`)
+   - Title
+   - Kind (Belief, Network, etc.)
+   - Schema (if present)
+   - Payload (key-value pairs from `node.document`)
+
+2. **Location** (from `context.home_path`, `context.home_net`):
+   - Home network name (resolve from `home_net` BID)
+   - Path within network
+
+3. **Backlinks** (from `context.graph.relations`):
+   - Filter relations where current node is **sink** (target)
+   - Group by WeightKind (Section, Epistemic, etc.)
+   - Show source node title + link
+
+4. **Forward Links** (from `context.graph.relations`):
+   - Filter relations where current node is **source**
+   - Group by WeightKind
+   - Show sink node title + link
+
+5. **Related Nodes** (from `context.related_nodes`):
+   - Display nodes with strong relational connections
+   - Useful for discovery ("nodes you might be interested in")
+
+**Pass-Through Navigation Link**:
+- Prominent button at top: "→ Navigate to [Title]"
+- Single-click navigation from metadata panel (bypasses two-click pattern)
+- Closes metadata panel after navigation
 
 **Example Layout**:
 ```
-┌─────────────────────────┐
-│ Metadata            [×] │
-├─────────────────────────┤
-│ ■ Node                  │
-│   BID: 1f100f54-...     │
-│   Title: Section Title  │
-│   [→ Navigate to Node]  │ ← Pass-through link
-│   Schema: Section       │
-│   Kind: Belief          │
-│                         │
-│ ■ Network               │
-│   Home: my-network      │
-│   Path: /docs/guide     │
-│                         │
-│ ■ Relations (3)         │
-│   ▸ Section (2)         │
-│     → Parent Document   │
-│     → Sibling Section   │
-│   ▸ Epistemic (1)       │
-│     → Referenced By     │
-│                         │
+┌──────────────────────────────┐
+│ Metadata                 [×] │
+├──────────────────────────────┤
+│ [→ Navigate to Section Title]│ ← Pass-through link
+│                              │
+│ ■ Node Properties            │
+│   BID: 1f100f54... [copy]    │
+│   Title: Section Title       │
+│   Kind: Belief               │
+│   Schema: Section            │
+│                              │
+│ ■ Location                   │
+│   Network: my-network        │
+│   Path: /docs/guide.md       │
+│                              │
+│ ■ Backlinks (3)              │
+│   Section (2)                │
+│     • Parent Document        │
+│     • Sibling Section        │
+│   Epistemic (1)              │
+│     • Referenced By          │
+│                              │
+│ ■ Forward Links (2)          │
+│   Section (1)                │
+│     • Child Section          │
+│   Asset (1)                  │
+│     • diagram.png            │
+│                              │
+│ ■ Related Nodes (5)          │
+│   • Similar Topic A          │
+│   • Similar Topic B          │
+│   • ...                      │
+│                              │
+│ ■ Payload                    │
+│   custom_field: "value"      │
+│   tags: ["tag1", "tag2"]     │
 │ ■ Payload               │
 │   complexity: 3         │
 │   priority: HIGH        │
@@ -920,6 +1155,27 @@ Brief overview:
 - [WASM Bindgen](https://rustwasm.github.io/docs/wasm-bindgen/) - Rust ↔ JS bridge
 
 ## Change Log
+
+### Version 0.2 (2025-02-04)
+- Expanded Two-Click Navigation Pattern section with full implementation details
+  - Scope: Links within `<article>` only (not nav/metadata/header)
+  - State management: Single `selectedBid` variable
+  - First click: Navigate/scroll behavior for internal/anchor/external links
+  - Second click: Show metadata panel with full `NodeContext`
+  - Click reset scenarios documented
+  - Visual feedback patterns specified
+- Expanded Metadata Panel Display section with NodeContext integration
+  - Data source: `wasm.get_context(bid)` returns complete `NodeContext`
+  - Five display sections: Node Properties, Location, Backlinks, Forward Links, Related Nodes
+  - Pass-through navigation link for single-click access from metadata panel
+  - Example layout with all sections detailed
+- Document Fetching Strategy clarified
+  - Fetch full HTML documents (191-line template overhead acceptable)
+  - DOM parser extraction of `<article>` content
+  - Rationale: Simplicity over fragment endpoint complexity
+- Scoped to Phase 1 features only
+  - Query Builder extracted to ISSUE_41
+  - Graph Visualization extracted to ISSUE_42
 
 ### Version 0.1 (2025-02-03)
 - Initial design document
