@@ -107,7 +107,7 @@ pub struct NodeContext {
     /// The node itself
     pub node: BeliefNode,
     /// Relative path within home network (e.g., "docs/guide.md#section")
-    pub home_path: String,
+    pub relative_path: String,
     /// Home network BID (which Network node owns this document)
     pub home_net: Bid,
     /// All nodes related to this one (other end of all edges, both sources and sinks)
@@ -127,21 +127,24 @@ pub struct NodeContext {
 #[wasm_bindgen]
 pub struct BeliefBaseWasm {
     inner: std::cell::RefCell<BeliefBase>,
+    entry_point_bid: Bid,
 }
 
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BeliefBaseWasm {
-    /// Create a BeliefBase from JSON string (exported beliefbase.json)
+    /// Create a BeliefBase from JSON string (exported beliefbase.json) and metadata
     ///
     /// # JavaScript Example
     /// ```javascript
     /// const response = await fetch('beliefbase.json');
     /// const json = await response.text();
-    /// const bb = BeliefBaseWasm.from_json(json);
+    /// const metadataScript = document.getElementById('noet-metadata');
+    /// const metadata = metadataScript.textContent;
+    /// const bb = new BeliefBaseWasm(json, metadata);
     /// ```
     #[wasm_bindgen(constructor)]
-    pub fn from_json(data: String) -> Result<BeliefBaseWasm, JsValue> {
+    pub fn from_json(data: String, metadata: String) -> Result<BeliefBaseWasm, JsValue> {
         // Parse JSON into BeliefGraph
         let graph: BeliefGraph = serde_json::from_str(&data).map_err(|e| {
             let msg = format!("❌ Failed to parse BeliefGraph JSON: {}", e);
@@ -160,11 +163,31 @@ impl BeliefBaseWasm {
             .into(),
         );
 
+        // Parse metadata to extract entry point Bid
+        let metadata_value: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
+            let msg = format!("❌ Failed to parse metadata JSON: {}", e);
+            console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
+
+        let entry_point_bid = metadata_value
+            .get("bid")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Bid::try_from(s).ok())
+            .ok_or_else(|| {
+                let msg = "❌ Failed to extract entry point Bid from metadata";
+                console::error_1(&msg.into());
+                JsValue::from_str(msg)
+            })?;
+
+        console::log_1(&format!("✅ Entry point Bid: {}", entry_point_bid).into());
+
         // Convert BeliefGraph to BeliefBase
         let inner = BeliefBase::from(graph);
 
         Ok(BeliefBaseWasm {
             inner: std::cell::RefCell::new(inner),
+            entry_point_bid,
         })
     }
 
@@ -310,7 +333,7 @@ impl BeliefBaseWasm {
 
         // Get context which includes sources (nodes that link to this one)
         let mut inner = self.inner.borrow_mut();
-        let ctx = match inner.get_context(&bid) {
+        let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
             Some(ctx) => ctx,
             None => {
                 console::warn_1(&format!("⚠️ Node not found for backlinks: {}", bid).into());
@@ -351,7 +374,7 @@ impl BeliefBaseWasm {
 
         // Get context which includes sinks (nodes this one links to)
         let mut inner = self.inner.borrow_mut();
-        let ctx = match inner.get_context(&bid) {
+        let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
             Some(ctx) => ctx,
             None => {
                 console::warn_1(&format!("⚠️ Node not found for forward links: {}", bid).into());
@@ -454,8 +477,7 @@ impl BeliefBaseWasm {
     /// ```javascript
     /// const ctx = bb.get_context("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`Node: ${ctx.node.title}`);
-    /// console.log(`Path: ${ctx.home_path}`);
-    /// console.log(`Related nodes: ${ctx.related_nodes.length}`);
+    /// console.log(`Path: ${ctx.relative_path}`);
     /// ```
     #[wasm_bindgen]
     pub fn get_context(&self, bid: String) -> JsValue {
@@ -468,9 +490,9 @@ impl BeliefBaseWasm {
         };
 
         // Collect all data while holding the borrow
-        let (node, home_path, home_net, related_nodes, graph) = {
+        let (node, relative_path, home_net, related_nodes, graph) = {
             let mut inner = self.inner.borrow_mut();
-            let ctx = match inner.get_context(&bid) {
+            let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
                 Some(c) => c,
                 None => {
                     console::warn_1(&format!("⚠️ Node not found: {}", bid).into());
@@ -532,7 +554,7 @@ impl BeliefBaseWasm {
 
             (
                 ctx.node.clone(),
-                ctx.home_path.clone(),
+                ctx.relative_path.clone(),
                 ctx.home_net,
                 related_nodes,
                 sorted_graph,
@@ -541,7 +563,7 @@ impl BeliefBaseWasm {
 
         let node_context = NodeContext {
             node,
-            home_path,
+            relative_path,
             home_net,
             related_nodes,
             graph,

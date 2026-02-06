@@ -2505,7 +2505,6 @@ impl BeliefBase {
                     self.relations()
                         .filter(&RelationPred::NodeIn(state_set), false),
                 );
-                tracing::debug!("States: {states:?}\nRelations: {relations:?}");
                 // Add sink nodes to maintain referential integrity
                 // Mark them as Trace since we haven't loaded their full relation set
                 for edge in relations.as_graph().raw_edges() {

@@ -21,8 +21,6 @@
 // =============================================================================
 
 /** @type {HTMLElement} */
-let headerElement;
-/** @type {HTMLElement} */
 let navElement;
 /** @type {HTMLElement} */
 let navContent;
@@ -142,7 +140,6 @@ document.addEventListener("DOMContentLoaded", async () => {
 function initializeDOMReferences() {
   // Container elements
   containerElement = document.querySelector(".noet-container");
-  headerElement = document.querySelector(".noet-header");
   navElement = document.querySelector(".noet-nav");
   navContent = document.getElementById("nav-content");
   navError = document.getElementById("nav-error");
@@ -380,8 +377,16 @@ async function initializeWasm() {
     const beliefbaseJson = await response.text();
     console.log("[Noet] BeliefBase JSON loaded successfully");
 
+    // Get metadata JSON from script tag
+    const metadataScript = document.getElementById("noet-metadata");
+    if (!metadataScript) {
+      throw new Error("Missing #noet-metadata script tag");
+    }
+    const metadataJson = metadataScript.textContent;
+
     // Initialize BeliefBaseWasm (from_json is a constructor in WASM bindings)
-    beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson);
+    // Pass both beliefbase JSON and metadata JSON (for entry point Bid)
+    beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson, metadataJson);
     console.log("[Noet] BeliefBaseWasm initialized");
     console.log("[Noet] BeliefBase loaded successfully");
 

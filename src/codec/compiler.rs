@@ -1758,7 +1758,6 @@ impl DocumentCompiler {
                 )
                 .await?,
         );
-        tracing::debug!("{}\n{}", bb.clone().consume(), bb.paths());
         let Some(node) = bb.get(&nodekey) else {
             tracing::warn!(
                 "[generate_html_for_path] No match found for path: '{}'\nbb.paths:\n{}",

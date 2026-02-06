@@ -697,11 +697,6 @@ pub trait BeliefSource: Sync {
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
         async move {
             let mut bg = self.eval_unbalanced(&query.seed).await?;
-            tracing::debug!(
-                "initial bg: {} states, {} relations",
-                bg.states.len(),
-                bg.relations.as_graph().edge_count()
-            );
 
             // If all_or_none is true and the seed query returned nothing, return empty immediately
             if all_or_none && bg.states.is_empty() {
@@ -785,11 +780,6 @@ pub trait BeliefSource: Sync {
                     }
                 }
             }
-            tracing::debug!(
-                "bg after walk: {} states, {} relations",
-                bg.states.len(),
-                bg.relations.as_graph().edge_count()
-            );
 
             if !bg.states.is_empty() {
                 self.balance(&mut bg).await?;
@@ -806,11 +796,6 @@ pub trait BeliefSource: Sync {
                 //     }
                 // }));
             }
-            tracing::debug!(
-                "bg after balance: {} states, {} relations",
-                bg.states.len(),
-                bg.relations.as_graph().edge_count()
-            );
             Ok(bg)
         }
     }

@@ -5,10 +5,10 @@
  * Mobile-first approach with progressive enhancement for tablet/desktop.
  *
  * Layout Structure:
- * - Header: Fixed top bar with branding and theme switcher
  * - Nav: Left sidebar (desktop) / Hamburger menu (mobile/tablet)
  * - Content: Main document area (scrollable)
  * - Metadata: Right sidebar (desktop) / Bottom drawer (mobile/tablet)
+ * - Footer: Theme switcher and status info
  * - Graph: Graph visualization area
  *
  * Responsive Breakpoints (Open Props defaults):
@@ -28,9 +28,20 @@
 }
 
 html {
-    font-family: var(--font-sans);
+    font-family: var(--noet-font-family, var(--font-sans));
     font-size: var(--font-size-fluid-0);
     line-height: var(--font-lineheight-3);
+}
+
+/* Scale UI chrome (everything except content) to 80% */
+body {
+    font-size: 0.8em;
+    font-weight: var(--noet-font-weight-ui, 350);
+}
+
+.noet-content {
+    font-size: 1.25em; /* Reset to 100% (0.8 * 1.25 = 1.0) */
+    font-weight: var(--noet-font-weight-body, 400);
 }
 
 body {
@@ -48,156 +59,79 @@ body {
     height: 100vh;
     width: 100vw;
 
-    /* Mobile layout: single column with header and footer */
+    /* Mobile layout: single column with footer */
     grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr auto;
+    grid-template-rows: 1fr auto;
     grid-template-areas:
-        "header"
         "content"
         "footer";
 }
 
-/* Tablet: Still single column with footer */
-@media (min-width: 640px) {
-    .noet-container {
-        grid-template-areas:
-            "header"
-            "content"
-            "footer";
-    }
-}
-
-/* Desktop: Three-column layout with footer */
+/* Desktop: Content centered in viewport, panels positioned absolutely */
 @media (min-width: 1024px) {
     .noet-container {
-        grid-template-columns: 280px 1fr 320px;
-        grid-template-rows: auto 1fr auto;
-        grid-template-areas:
-            "header header header"
-            "nav content metadata"
-            "footer footer footer";
-    }
-
-    /* Collapsed nav panel */
-    .noet-container.nav-collapsed {
-        grid-template-columns: 0 1fr 320px;
-    }
-
-    /* Collapsed metadata panel */
-    .noet-container.metadata-collapsed {
-        grid-template-columns: 280px 1fr 0;
-    }
-
-    /* Both panels collapsed (reading mode) */
-    .noet-container.nav-collapsed.metadata-collapsed {
-        grid-template-columns: 0 1fr 0;
+        position: relative;
     }
 }
 
 /* =========================================================================
-   Header
+   Hamburger Menu Button (Mobile/Tablet only)
    ========================================================================= */
 
-.noet-header {
-    grid-area: header;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--size-3);
-    background-color: var(--noet-bg-secondary);
-    border-bottom: 1px solid var(--noet-border-primary);
-    z-index: 100;
-}
-
-.noet-header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--size-3);
-}
-
-.noet-header-right {
-    display: flex;
-    align-items: center;
-    gap: var(--size-2);
-}
-
-.noet-site-title {
-    font-size: var(--font-size-3);
-    font-weight: var(--font-weight-6);
-    color: var(--noet-text-primary);
-    margin: 0;
-}
-
-@media (min-width: 640px) {
-    .noet-site-title {
-        font-size: var(--font-size-4);
-        font-weight: var(--font-weight-7);
-    }
-}
-
-.noet-header__brand {
-    font-size: var(--font-size-4);
-    font-weight: var(--font-weight-7);
-    color: var(--noet-text-primary);
-    text-decoration: none;
-}
-
-.noet-header__actions {
-    display: flex;
-    gap: var(--size-2);
-    align-items: center;
-}
-
-/* Hamburger menu button (mobile/tablet only) */
+/* Hamburger menu button - fixed position in top-left corner */
 .noet-hamburger {
-    display: block;
-    background: none;
-    border: none;
-    font-size: var(--font-size-5);
-    cursor: pointer;
-    padding: var(--size-2);
-    color: var(--noet-text-primary);
-}
-
-@media (min-width: 1024px) {
-    .noet-hamburger {
-        display: none;
-    }
-}
-
-/* Metadata toggle button (mobile/tablet only) */
-.noet-metadata-toggle {
-    display: block;
-    background: var(--noet-button-bg);
+    display: none; /* Hidden by default, shown on mobile/tablet */
+    position: fixed;
+    top: var(--size-2);
+    left: var(--size-2);
+    z-index: 150;
+    background: var(--noet-bg-primary);
     border: 1px solid var(--noet-border-primary);
     border-radius: var(--radius-2);
-    padding: var(--size-2) var(--size-3);
-    font-size: var(--font-size-1);
+    font-size: var(--font-size-3);
     cursor: pointer;
-    color: var(--noet-button-text);
+    padding: var(--size-1);
+    color: var(--noet-text-primary);
+    box-shadow: var(--noet-shadow-small);
 }
 
-.noet-metadata-toggle:hover {
-    background: var(--noet-button-bg-hover);
+.noet-hamburger:hover {
+    background: var(--noet-bg-secondary);
 }
 
-@media (min-width: 1024px) {
-    .noet-metadata-toggle {
-        display: none;
+@media (max-width: 1023px) {
+    .noet-hamburger {
+        display: block;
     }
 }
 
 /* =========================================================================
-   Navigation Sidebar / Menu
+   Left Navigation Panel
    ========================================================================= */
 
 .noet-nav {
-    grid-area: nav;
-    background-color: var(--noet-bg-secondary);
+    background-color: var(--noet-bg-primary);
     border-right: 1px solid var(--noet-border-primary);
-    overflow-y: auto;
     display: flex;
     flex-direction: column;
+}
+
+/* Desktop: Position nav absolutely on left side */
+@media (min-width: 1024px) {
+    .noet-nav {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 280px;
+        z-index: 40;
+        overflow: hidden;
+        transition: transform 0.3s var(--ease-2);
+    }
+
+    .nav-collapsed .noet-nav {
+        transform: translateX(-100%);
+    }
 }
 
 /* Mobile/Tablet: Off-canvas slide-in menu */
@@ -219,32 +153,15 @@ body {
 }
 
 /* Desktop: Always visible */
-@media (min-width: 1024px) {
-    .noet-nav {
-        position: relative;
-        transition: opacity 0.2s var(--ease-2);
-    }
-
-    .nav-collapsed .noet-nav {
-        opacity: 0;
-        pointer-events: none;
-        overflow: hidden;
-    }
-}
 
 .noet-nav__content {
     flex: 1;
     padding: var(--size-4);
     overflow-y: auto;
+    font-weight: var(--noet-font-weight-ui, 350);
 }
 
-.noet-nav__footer {
-    padding: var(--size-3);
-    border-top: 1px solid var(--noet-border-primary);
-    background-color: var(--noet-bg-tertiary);
-}
-
-/* Collapse button for nav panel (desktop only) */
+/* Collapse button for nav panel (desktop only) - manila folder tab style */
 .noet-nav__collapse {
     display: none;
 }
@@ -252,29 +169,37 @@ body {
 @media (min-width: 1024px) {
     .noet-nav__collapse {
         display: block;
-        position: absolute;
+        position: fixed;
         top: 50%;
-        right: -12px;
+        left: 279px; /* Overlap panel border by 1px for seamless appearance */
         transform: translateY(-50%);
-        background: var(--noet-bg-secondary);
+        background: var(--noet-collapse-bg);
         border: 1px solid var(--noet-border-primary);
-        border-radius: var(--radius-2);
-        padding: var(--size-2);
+        border-left: none;
+        border-radius: 0 var(--radius-2) var(--radius-2) 0;
+        padding: var(--size-2) var(--size-3);
         cursor: pointer;
-        font-size: var(--font-size-1);
+        font-size: var(--font-size-2);
         color: var(--noet-text-secondary);
-        z-index: 10;
-        transition: background 0.2s var(--ease-2);
+        z-index: 100;
+        transition:
+            left 0.3s var(--ease-2),
+            background 0.2s var(--ease-2),
+            box-shadow 0.2s var(--ease-2);
+        box-shadow: var(--noet-collapse-shadow-nav);
     }
 
     .noet-nav__collapse:hover {
-        background: var(--noet-bg-tertiary);
+        background: var(--noet-collapse-bg-hover);
         color: var(--noet-text-primary);
+        box-shadow: var(--noet-collapse-shadow-nav-hover);
+    }
+
+    /* When nav is collapsed, move button to left edge */
+    .nav-collapsed .noet-nav__collapse {
+        left: 0;
     }
 }
-</text>
-
-<old_text line=248>
 /* =========================================================================
    Main Content Area
    ========================================================================= */
@@ -282,35 +207,48 @@ body {
 .noet-content {
     grid-area: content;
     overflow-y: auto;
-    padding: var(--size-4);
+    padding: 0;
+    background-color: var(--noet-bg-secondary);
+    max-height: 100vh;
+}
+
+.noet-content__inner {
+    padding: 0 var(--size-4);
     background-color: var(--noet-bg-primary);
+    min-height: 100%;
 }
 
-/* Theme selector in nav footer */
-.noet-nav__footer {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--size-2);
+/* Mobile: Add top/bottom padding to avoid hamburger button */
+@media (max-width: 1023px) {
+    .noet-content__inner {
+        padding: var(--size-8) var(--size-4);
+    }
 }
 
-.noet-nav__footer label {
-    font-size: var(--font-size-0);
-    font-weight: var(--font-weight-6);
+/* Desktop: Add max-width and shadow for paper effect */
+@media (min-width: 1024px) {
+    .noet-content__inner {
+        max-width: 45rem; /* ~720px at 16px base, optimal reading width */
+        margin: 0 auto;
+        box-shadow: var(--noet-shadow-medium);
+    }
+}
+
+/* Theme selector styling */
+.noet-footer__theme label {
+    font-size: var(--font-size-1);
+    font-weight: var(--font-weight-5);
     color: var(--noet-text-secondary);
 }
 
 .noet-theme-select {
-    width: 100%;
-    padding: var(--size-2) var(--size-3);
+    padding: var(--size-1) var(--size-2);
     background-color: var(--noet-bg-primary);
     border: 1px solid var(--noet-border-primary);
     border-radius: var(--radius-2);
     color: var(--noet-text-primary);
-    font-family: var(--font-sans);
     font-size: var(--font-size-1);
     cursor: pointer;
-    transition: border-color 0.2s var(--ease-2);
 }
 
 .noet-theme-select:hover {
@@ -324,23 +262,6 @@ body {
 }
 
 /* =========================================================================
-   Content Area
-   ========================================================================= */
-
-.noet-content {
-    grid-area: content;
-    overflow-y: auto;
-    padding: var(--size-5);
-    background-color: var(--noet-bg-primary);
-}
-
-/* Constrain content width for readability */
-.noet-content__inner {
-    max-width: 800px;
-    margin: 0 auto;
-}
-
-/* =========================================================================
    Metadata Panel / Drawer
    ========================================================================= */
 
@@ -350,6 +271,7 @@ body {
     border-left: 1px solid var(--noet-border-primary);
     overflow-y: auto;
     padding: var(--size-4);
+    font-weight: var(--noet-font-weight-ui, 350);
 }
 
 /* Mobile/Tablet: Bottom drawer */
@@ -385,21 +307,25 @@ body {
     }
 }
 
-/* Desktop: Always visible */
+/* Desktop: Position metadata absolutely on right side */
 @media (min-width: 1024px) {
     .noet-metadata {
-        position: relative;
-        transition: opacity 0.2s var(--ease-2);
+        position: fixed;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        width: 320px;
+        z-index: 40;
+        overflow: hidden;
+        transition: transform 0.3s var(--ease-2);
     }
 
     .metadata-collapsed .noet-metadata {
-        opacity: 0;
-        pointer-events: none;
-        overflow: hidden;
+        transform: translateX(100%);
     }
 }
 
-/* Collapse button for metadata panel (desktop only) */
+/* Collapse button for metadata panel (desktop only) - manila folder tab style */
 .noet-metadata__collapse {
     display: none;
 }
@@ -407,24 +333,35 @@ body {
 @media (min-width: 1024px) {
     .noet-metadata__collapse {
         display: block;
-        position: absolute;
+        position: fixed;
         top: 50%;
-        left: -12px;
+        right: 319px; /* Overlap panel border by 1px for seamless appearance */
         transform: translateY(-50%);
-        background: var(--noet-bg-secondary);
+        background: var(--noet-collapse-bg);
         border: 1px solid var(--noet-border-primary);
-        border-radius: var(--radius-2);
-        padding: var(--size-2);
+        border-right: none;
+        border-radius: var(--radius-2) 0 0 var(--radius-2);
+        padding: var(--size-2) var(--size-3);
         cursor: pointer;
-        font-size: var(--font-size-1);
+        font-size: var(--font-size-2);
         color: var(--noet-text-secondary);
-        z-index: 10;
-        transition: background 0.2s var(--ease-2);
+        z-index: 100;
+        transition:
+            right 0.3s var(--ease-2),
+            background 0.2s var(--ease-2),
+            box-shadow 0.2s var(--ease-2);
+        box-shadow: var(--noet-collapse-shadow-metadata);
     }
 
     .noet-metadata__collapse:hover {
-        background: var(--noet-bg-tertiary);
+        background: var(--noet-collapse-bg-hover);
         color: var(--noet-text-primary);
+        box-shadow: var(--noet-collapse-shadow-metadata-hover);
+    }
+
+    /* When metadata is collapsed, move button to right edge */
+    .metadata-collapsed .noet-metadata__collapse {
+        right: 0;
     }
 }
 
@@ -487,12 +424,26 @@ body {
 
 .noet-footer {
     grid-area: footer;
-    padding: var(--size-3);
-    background-color: var(--noet-bg-tertiary);
+    padding: var(--size-3) var(--size-4);
+    background-color: var(--noet-bg-secondary);
     border-top: 1px solid var(--noet-border-primary);
-    text-align: center;
-    font-size: var(--font-size-0);
-    color: var(--noet-text-secondary);
+    font-size: var(--font-size-1);
+    color: var(--noet-text-tertiary);
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: var(--noet-font-weight-ui, 350);
+}
+
+.noet-footer__theme {
+    display: flex;
+    align-items: center;
+    gap: var(--size-2);
+}
+
+.noet-footer__credit {
+    margin: 0;
 }
 
 .noet-footer a {
@@ -502,6 +453,14 @@ body {
 
 .noet-footer a:hover {
     text-decoration: underline;
+}
+
+/* Mobile: Stack footer elements */
+@media (max-width: 640px) {
+    .noet-footer {
+        flex-direction: column;
+        text-align: center;
+    }
 }
 
 /* =========================================================================
@@ -538,15 +497,32 @@ body {
     margin-bottom: var(--size-1);
 }
 
+/* Items with toggle buttons - use grid to position button, label, and children */
 .noet-nav-tree__item.has-children {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    gap: 0 var(--size-1);
+    align-items: center;
 }
 
-.noet-nav-tree__item.has-children > :first-child {
-    display: flex;
-    align-items: center;
-    gap: var(--size-1);
+/* Toggle button in first column */
+.noet-nav-tree__item.has-children > .noet-nav-tree__toggle {
+    grid-column: 1;
+    grid-row: 1;
+}
+
+/* Link/label in second column, same row as toggle */
+.noet-nav-tree__item.has-children > .noet-nav-tree__link,
+.noet-nav-tree__item.has-children > .noet-nav-tree__label {
+    grid-column: 2;
+    grid-row: 1;
+}
+
+/* Children list spans both columns on second row */
+.noet-nav-tree__item.has-children > .noet-nav-tree__children {
+    grid-column: 1 / -1;
+    grid-row: 2;
 }
 
 /* Toggle button for collapsible sections */
@@ -556,9 +532,8 @@ body {
     padding: var(--size-1);
     cursor: pointer;
     color: var(--noet-text-secondary);
-    font-size: var(--font-size-2);
+    font-size: var(--font-size-1);
     line-height: 1;
-    transition: transform 0.2s var(--ease-2);
     flex-shrink: 0;
 }
 
@@ -566,18 +541,19 @@ body {
     color: var(--noet-text-primary);
 }
 
-.noet-nav-tree__item.is-expanded > :first-child > .noet-nav-tree__toggle {
-    transform: rotate(90deg);
-}
-
 .noet-nav-tree__link {
     display: block;
-    padding: var(--size-2) var(--size-3);
+    padding: var(--size-1) var(--size-3);
+    font-size: var(--font-size-1);
     color: var(--noet-text-primary);
     text-decoration: none;
     border-radius: var(--radius-2);
     transition: background-color 0.2s var(--ease-2);
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .noet-nav-tree__link:hover {
@@ -597,6 +573,10 @@ body {
     color: var(--noet-text-primary);
     font-weight: var(--font-weight-6);
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Nested navigation children */
@@ -666,7 +646,7 @@ body {
 .noet-content h6 {
     margin-top: var(--size-5);
     margin-bottom: var(--size-3);
-    font-weight: var(--font-weight-7);
+    font-weight: var(--noet-font-weight-heading, 600);
     line-height: var(--font-lineheight-1);
 }
 
@@ -787,7 +767,6 @@ body {
    ========================================================================= */
 
 @media print {
-    .noet-header,
     .noet-nav,
     .noet-metadata,
     .noet-backdrop {
