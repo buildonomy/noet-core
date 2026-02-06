@@ -156,6 +156,10 @@ pub type CodecFactory = fn() -> Box<dyn DocCodec + Send>;
 #[cfg(not(target_arch = "wasm32"))]
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 
+/// Global codec map for WASM - lightweight extension registry only
+#[cfg(target_arch = "wasm32")]
+pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
+
 /// List of built-in codec extensions (synchronized between WASM and non-WASM builds)
 const BUILTIN_EXTENSIONS: &[&str] = &["md", "toml", "tml", "json", "jsn", "yaml", "yml"];
 

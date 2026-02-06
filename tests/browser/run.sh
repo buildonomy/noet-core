@@ -107,6 +107,117 @@ if command -v python3 &> /dev/null; then
         explorer.exe "http://localhost:8000/tests/browser/test_runner.html" 2>/dev/null &
     fi
 
+    # Add nav tree rendering test
+    echo -e "\n${BLUE}[5/5] Running nav tree rendering test...${NC}"
+
+    # Create a simple test HTML to verify nav tree rendering
+    cat > "$TEST_OUTPUT/nav_test.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Nav Tree Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        .pass { color: green; }
+        .fail { color: red; }
+        .info { color: blue; }
+        pre { background: #f5f5f5; padding: 10px; border: 1px solid #ddd; }
+    </style>
+</head>
+<body>
+    <h1>Navigation Tree Rendering Test</h1>
+    <div id="test-results"></div>
+    <h2>Generated HTML:</h2>
+    <pre id="html-output"></pre>
+
+    <script type="module">
+        const results = document.getElementById('test-results');
+        const htmlOutput = document.getElementById('html-output');
+
+        function log(msg, type = 'info') {
+            const p = document.createElement('p');
+            p.className = type;
+            p.textContent = msg;
+            results.appendChild(p);
+        }
+
+        try {
+            // Load WASM module
+            const wasmModule = await import('./assets/noet_core.js');
+            await wasmModule.default();
+            log('✓ WASM module loaded', 'pass');
+
+            // Load beliefbase
+            const response = await fetch('./beliefbase.json');
+            const json = await response.text();
+            const bb = new wasmModule.BeliefBaseWasm(json);
+            log('✓ BeliefBase loaded', 'pass');
+
+            // Get nav tree
+            const navTree = bb.get_nav_tree();
+            log(`✓ Nav tree loaded: ${Object.keys(navTree.nodes).length} nodes, ${navTree.roots.length} roots`, 'pass');
+
+            // Test rendering logic
+            function renderNavNode(bid, nodes) {
+                const node = nodes[bid];
+                if (!node) return '';
+
+                const hasChildren = node.children && node.children.length > 0;
+                let html = `<li data-bid="${bid}">`;
+
+                if (hasChildren) {
+                    html += `<button>▶</button>`;
+                }
+
+                if (node.path) {
+                    html += `<a href="${node.path}">${node.title}</a>`;
+                } else {
+                    html += `<span>${node.title}</span>`;
+                }
+
+                if (hasChildren) {
+                    html += '<ul>';
+                    for (const childBid of node.children) {
+                        html += renderNavNode(childBid, nodes);
+                    }
+                    html += '</ul>';
+                }
+
+                html += '</li>';
+                return html;
+            }
+
+            let html = '<ul class="noet-nav-tree">';
+            for (const rootBid of navTree.roots) {
+                html += renderNavNode(rootBid, navTree.nodes);
+            }
+            html += '</ul>';
+
+            htmlOutput.textContent = html;
+
+            if (html.length > 100) {
+                log(`✓ HTML generated (${html.length} characters)`, 'pass');
+            } else {
+                log(`✗ HTML too short (${html.length} characters)`, 'fail');
+            }
+
+            // Count rendered nodes
+            const nodeCount = (html.match(/<li /g) || []).length;
+            log(`✓ Rendered ${nodeCount} nodes`, 'pass');
+
+        } catch (error) {
+            log(`✗ Error: ${error.message}`, 'fail');
+            console.error(error);
+        }
+    </script>
+</body>
+</html>
+EOF
+
+    echo -e "${GREEN}✓ Nav tree test created at test-output/nav_test.html${NC}"
+    echo -e "${YELLOW}Visit http://localhost:8000/tests/browser/test-output/nav_test.html to run test${NC}\n"
+
     python3 -m http.server 8000
 else
     echo -e "${RED}✗ python3 not found. Please install Python 3 or use another HTTP server.${NC}"

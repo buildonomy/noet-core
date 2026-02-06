@@ -590,6 +590,15 @@ body {
     font-weight: var(--font-weight-6);
 }
 
+/* Label for network nodes (no href) */
+.noet-nav-tree__label {
+    display: block;
+    padding: var(--size-2) var(--size-3);
+    color: var(--noet-text-primary);
+    font-weight: var(--font-weight-6);
+    flex: 1;
+}
+
 /* Nested navigation children */
 .noet-nav-tree__children {
     display: none;

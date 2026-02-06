@@ -2,7 +2,7 @@
 
 **Priority**: HIGH  
 **Estimated Effort**: 4-6 days  
-**Dependencies**: ISSUE_38 (✅ Complete), ISSUE_40 (Network Index Generation)  
+**Dependencies**: ISSUE_38 (✅ Complete), ISSUE_40 (✅ Complete - Network Index Generation)
 **Status**: IN PROGRESS
 
 ---
@@ -657,7 +657,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 - **[Interactive Viewer Design](../design/interactive_viewer.md)** - Complete architecture, § Two-Click Navigation Pattern, § Metadata Panel Display
 - **[ISSUE_38: Interactive SPA Foundation](completed/ISSUE_38_INTERACTIVE_SPA.md)** - Completed foundation work
-- **[ISSUE_40: Network Index Generation](ISSUE_40_NETWORK_INDEX_DOCCODEC.md)** - Blocking dependency (must complete before Phase 1 testing)
+- **[ISSUE_40: Network Index Generation](completed/ISSUE_40_NETWORK_INDEX_DOCCODEC.md)** - ✅ Complete (implemented via ISSUE_43 SPA shell)
 - **[ISSUE_41: Query Builder UI](ISSUE_41_QUERY_BUILDER.md)** - Future work (extracted from original Phase 2)
 - **[ISSUE_42: Graph Visualization](ISSUE_42_GRAPH_VISUALIZATION.md)** - Future work (extracted from original Phase 3)
 - [BeliefBase Architecture](../design/beliefbase_architecture.md) - Data model
@@ -673,7 +673,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 **Scope Reduction**: Original issue included Query Builder and Graph Visualization. These are now separate issues (ISSUE_41, ISSUE_42) to keep work focused and manageable.
 
-**Blocking Dependency**: ISSUE_40 (Network Index Generation) must be completed before Phase 1 manual testing can proceed. Network indices currently use hardcoded HTML without WASM support.
+**Dependency Resolved**: ISSUE_40 (Network Index Generation) completed via ISSUE_43. Network indices now use SPA shell with full WASM support, navigation panel, and theme switching. Phase 1 manual testing can proceed.
 
 **Session-Based Approach**: Phase 1 spans multiple sessions. Each sub-phase has clear checkpoints with automated tests verifying functionality.
 

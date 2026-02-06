@@ -668,16 +668,9 @@ impl BeliefBaseWasm {
         let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
         let mut root_nodes: Vec<String> = Vec::new();
 
-        // System namespaces to exclude from navigation
-        let system_namespaces = [
-            Self::href_namespace(),
-            Self::asset_namespace(),
-            Self::buildonomy_namespace(),
-        ];
-
         for (net_bid, pm_lock) in paths.map().iter() {
-            // Skip system namespaces (they use BIDs as paths)
-            if system_namespaces.contains(&net_bid.to_string()) {
+            // Skip reserved BIDs (system namespaces and API nodes)
+            if net_bid.is_reserved() {
                 continue;
             }
 
@@ -712,6 +705,11 @@ impl BeliefBaseWasm {
             for (path, bid, order_indices) in pm.map().iter() {
                 let depth = order_indices.len();
                 let bid_str = bid.to_string();
+
+                // Skip the network node itself (prevents self-reference)
+                if bid_str == network_bid_str {
+                    continue;
+                }
 
                 // Get node title from BeliefNode
                 let node_title = states
@@ -752,10 +750,15 @@ impl BeliefBaseWasm {
             }
 
             // Merge this network's nodes into global map
-            root_nodes.push(network_bid_str);
-            for (bid, node) in nodes_map {
-                // Update parent references for network nodes (should be None, not Some(network_bid))
-                let mut node = node;
+            root_nodes.push(network_bid_str.clone());
+            for (bid, mut node) in nodes_map {
+                // Remove network from its own children list (prevents self-reference)
+                if bid == network_bid_str {
+                    node.children
+                        .retain(|child_bid| child_bid != &network_bid_str);
+                }
+
+                // Update parent references for network nodes (should be None, not parent = self)
                 if node.parent.as_ref() == Some(&node.bid) {
                     node.parent = None;
                 }

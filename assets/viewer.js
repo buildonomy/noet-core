@@ -87,6 +87,9 @@ let navTree = null;
 /** Set of expanded node BIDs for navigation tree */
 let expandedNodes = new Set();
 
+/** Track first navigation render to auto-expand roots only once */
+let isFirstNavRender = true;
+
 /** Panel collapse state (persisted to localStorage) */
 let panelState = {
   navCollapsed: false,
@@ -411,12 +414,35 @@ function buildNavigation() {
     return;
   }
 
+  console.log("[Noet] DEBUG: navTree =", navTree);
+  console.log("[Noet] DEBUG: navTree.nodes =", navTree?.nodes);
+  console.log("[Noet] DEBUG: navTree.roots =", navTree?.roots);
+
   if (!navTree || !navTree.nodes || !navTree.roots) {
+    console.error("[Noet] Navigation data incomplete:", {
+      hasNavTree: !!navTree,
+      hasNodes: !!navTree?.nodes,
+      hasRoots: !!navTree?.roots,
+    });
     navContent.innerHTML = '<p class="noet-placeholder">Navigation data not loaded</p>';
     return;
   }
 
-  console.log(`[Noet] Building navigation from ${Object.keys(navTree.nodes).length} nodes`);
+  const nodeCount = navTree.nodes.size;
+  const rootCount = navTree.roots.length;
+  console.log(`[Noet] Building navigation: ${nodeCount} nodes, ${rootCount} roots`);
+
+  // Log first few nodes for debugging
+  const firstFewNodes = Array.from(navTree.nodes.entries()).slice(0, 3);
+  console.log("[Noet] Sample nodes:", firstFewNodes);
+
+  // Auto-expand root nodes (networks) by default - only on first render
+  if (isFirstNavRender && navTree.roots && navTree.roots.length > 0) {
+    for (const rootBid of navTree.roots) {
+      expandedNodes.add(rootBid);
+    }
+    isFirstNavRender = false;
+  }
 
   // Determine active BID from current document
   const activeBid = getActiveBid();
@@ -429,6 +455,9 @@ function buildNavigation() {
 
   // Render tree to HTML
   const treeHtml = renderNavTree();
+  console.log("[Noet] Generated HTML length:", treeHtml.length);
+  console.log("[Noet] First 500 chars of HTML:", treeHtml.substring(0, 500));
+
   navContent.innerHTML = treeHtml;
 
   // Attach toggle event listeners
@@ -501,7 +530,7 @@ function buildParentChain(activeBid) {
   let currentBid = activeBid;
   while (currentBid) {
     expandedNodes.add(currentBid);
-    const node = navTree.nodes[currentBid];
+    const node = navTree.nodes.get(currentBid);
     if (!node) break;
     currentBid = node.parent;
   }
@@ -512,6 +541,7 @@ function buildParentChain(activeBid) {
  * @param {string} bid - BID of node to toggle
  */
 function toggleNode(bid) {
+  console.log(`[Noet] Toggling node: ${bid}, currently expanded: ${expandedNodes.has(bid)}`);
   if (expandedNodes.has(bid)) {
     expandedNodes.delete(bid);
   } else {
@@ -528,16 +558,23 @@ function toggleNode(bid) {
  */
 function renderNavTree() {
   if (!navTree.roots || navTree.roots.length === 0) {
+    console.error("[Noet] No roots to render");
     return '<p class="noet-placeholder">No networks found</p>';
   }
+
+  console.log(`[Noet] Rendering ${navTree.roots.length} root nodes:`, navTree.roots);
 
   let html = '<ul class="noet-nav-tree">';
 
   for (const rootBid of navTree.roots) {
-    html += renderNavNode(rootBid);
+    console.log(`[Noet] Rendering root node: ${rootBid}`);
+    const nodeHtml = renderNavNode(rootBid);
+    console.log(`[Noet] Root node HTML length: ${nodeHtml.length}`);
+    html += nodeHtml;
   }
 
   html += "</ul>";
+  console.log(`[Noet] Total tree HTML length: ${html.length}`);
   return html;
 }
 
@@ -546,9 +583,26 @@ function renderNavTree() {
  * @param {string} bid - BID of node to render
  * @returns {string} HTML string
  */
-function renderNavNode(bid) {
-  const node = navTree.nodes[bid];
-  if (!node) return "";
+function renderNavNode(bid, depth = 0, visited = new Set()) {
+  // Cycle detection: prevent infinite recursion
+  if (visited.has(bid)) {
+    console.error(`[Noet] Cycle detected: node ${bid} already visited in this chain`);
+    return `<li class="noet-nav-tree__item noet-error">⚠ Cycle detected: ${escapeHtml(bid)}</li>`;
+  }
+
+  // Depth limit: prevent stack overflow
+  if (depth > 50) {
+    console.error(`[Noet] Max depth exceeded at node ${bid}`);
+    return `<li class="noet-nav-tree__item noet-error">⚠ Max depth exceeded</li>`;
+  }
+
+  const node = navTree.nodes.get(bid);
+  if (!node) {
+    console.warn(`[Noet] Node not found for BID: ${bid}`);
+    return "";
+  }
+
+  console.log(`[Noet] Rendering node: ${node.title} (${bid}) at depth ${depth}`);
 
   const hasChildren = node.children && node.children.length > 0;
   const isExpanded = expandedNodes.has(bid);
@@ -556,6 +610,7 @@ function renderNavNode(bid) {
 
   let itemClass = "noet-nav-tree__item";
   if (hasChildren) itemClass += " has-children";
+  if (isExpanded) itemClass += " is-expanded";
   if (isActive) itemClass += " active";
 
   let html = `<li class="${itemClass}" data-bid="${escapeHtml(bid)}">`;
@@ -593,9 +648,19 @@ function renderNavNode(bid) {
 
   // Render children if expanded
   if (hasChildren && isExpanded) {
+    // Add current node to visited set for cycle detection
+    const newVisited = new Set(visited);
+    newVisited.add(bid);
+
     html += '<ul class="noet-nav-tree__children">';
     for (const childBid of node.children) {
-      html += renderNavNode(childBid);
+      // Skip if child is same as parent (self-reference)
+      if (childBid === bid) {
+        console.error(`[Noet] Self-reference detected: node ${bid} references itself as child`);
+        html += `<li class="noet-nav-tree__item noet-error">⚠ Self-reference detected</li>`;
+        continue;
+      }
+      html += renderNavNode(childBid, depth + 1, newVisited);
     }
     html += "</ul>";
   }
@@ -609,6 +674,7 @@ function renderNavNode(bid) {
  */
 function attachNavToggleListeners() {
   const toggleButtons = navContent.querySelectorAll(".noet-nav-tree__toggle");
+  console.log(`[Noet] Attaching listeners to ${toggleButtons.length} toggle buttons`);
 
   toggleButtons.forEach((button) => {
     button.addEventListener("click", (e) => {
@@ -616,6 +682,7 @@ function attachNavToggleListeners() {
       e.stopPropagation();
 
       const bid = button.dataset.bid;
+      console.log(`[Noet] Toggle button clicked: ${bid}`);
       if (bid) {
         toggleNode(bid);
       }

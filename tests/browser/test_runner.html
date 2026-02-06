@@ -352,21 +352,26 @@
                     assert(tree !== null && tree !== undefined, 'get_nav_tree() returns data');
                     assert(typeof tree === 'object', 'get_nav_tree() returns object');
                     assert(tree.nodes !== undefined, 'NavTree has nodes field');
-                    assert(typeof tree.nodes === 'object', 'NavTree.nodes is object (map)');
+
+                    // IMPORTANT: tree.nodes is a JavaScript Map, not a plain object
+                    const nodesIsMap = tree.nodes instanceof Map;
+                    assert(nodesIsMap, 'NavTree.nodes is a Map (not plain object)');
+                    log('✓ NavTree.nodes is a Map', 'pass');
+
                     assert(tree.roots !== undefined, 'NavTree has roots field');
                     assert(Array.isArray(tree.roots), 'NavTree.roots is array');
                     assert(tree.roots.length > 0, 'At least one root node (network) in tree');
                     log(`Found ${tree.roots.length} networks`, 'info');
 
-                    // Validate flat map structure (handle both Map and plain object)
-                    const nodesIsMap = tree.nodes instanceof Map;
-                    const nodeBids = nodesIsMap ? Array.from(tree.nodes.keys()) : Object.keys(tree.nodes);
+                    // Validate flat map structure - use Map methods
+                    const nodeBids = Array.from(tree.nodes.keys());
                     assert(nodeBids.length > 0, 'Nodes map is not empty');
-                    log(`Total nodes in map: ${nodeBids.length}`, 'info');
+                    assert(tree.nodes.size > 0, 'Map.size is greater than 0');
+                    log(`Total nodes in map: ${nodeBids.length} (Map.size = ${tree.nodes.size})`, 'info');
 
-                    // Validate each node in the map
+                    // Validate each node in the map - use Map.get()
                     for (const bid of nodeBids) {
-                        const node = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+                        const node = tree.nodes.get(bid);
                         assert(typeof node.bid === 'string', 'NavNode has bid');
                         assert(node.bid === bid, 'NavNode bid matches map key');
                         assert(typeof node.title === 'string', 'NavNode has title');
@@ -380,19 +385,8 @@
                             // Skip validation if path looks like a BID (UUID format with hyphens)
                             const looksLikeBid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(node.path);
 
-                            if (looksLikeBid) {
-                                console.log('DEBUG: Node has BID as path:', {
-                                    bid: node.bid,
-                                    title: node.title,
-                                    path: node.path,
-                                    parent: node.parent,
-                                    childCount: node.children.length
-                                });
-                            } else {
+                            if (!looksLikeBid) {
                                 const hasHtmlExt = node.path.endsWith('.html') || node.path.includes('.html#');
-                                if (!hasHtmlExt) {
-                                    console.error('DEBUG: Path missing .html extension:', node.path, 'for node:', node.title, 'BID:', node.bid);
-                                }
                                 assert(hasHtmlExt,
                                     `NavNode path should use .html extension (got: ${node.path})`);
                             }
@@ -407,20 +401,62 @@
 
                         // Verify parent references are valid
                         if (node.parent) {
-                            const parentExists = nodesIsMap ? tree.nodes.has(node.parent) : tree.nodes[node.parent] !== undefined;
+                            const parentExists = tree.nodes.has(node.parent);
                             assert(parentExists, `Parent ${node.parent} exists in map`);
                         }
 
                         // Verify child references are valid
                         for (const childBid of node.children) {
-                            const childExists = nodesIsMap ? tree.nodes.has(childBid) : tree.nodes[childBid] !== undefined;
+                            const childExists = tree.nodes.has(childBid);
                             assert(childExists, `Child ${childBid} exists in map`);
+                        }
+                    }
+
+                    // Test rendering the navigation tree HTML (using Map.get())
+                    log('Testing HTML rendering with Map...', 'info');
+                    {
+                        if (tree.roots && tree.roots.length > 0) {
+                            let testHtml = '<ul class="noet-nav-tree">';
+                            let nodeCount = 0;
+
+                            for (const rootBid of tree.roots) {
+                                const rootNode = tree.nodes.get(rootBid);
+                                if (rootNode) {
+                                    nodeCount++;
+                                    testHtml += `<li>${rootNode.title} (${rootNode.children.length} children)</li>`;
+                                } else {
+                                    log(`WARNING: Root node ${rootBid} not found in Map!`, 'fail');
+                                }
+                            }
+                            testHtml += '</ul>';
+
+                            log(`Rendered ${nodeCount} root nodes`, nodeCount > 0 ? 'pass' : 'fail');
+                            if (testHtml.length > 50) {
+                                log(`Sample HTML: ${testHtml.substring(0, 200)}...`, 'info');
+                            }
+
+                            // Check if any nodes have empty titles
+                            let emptyTitleCount = 0;
+                            for (const bid of nodeBids) {
+                                const node = tree.nodes.get(bid);
+                                if (!node.title || node.title.trim() === '') {
+                                    emptyTitleCount++;
+                                    console.warn('Node with empty title:', bid, node);
+                                }
+                            }
+                            if (emptyTitleCount > 0) {
+                                log(`WARNING: ${emptyTitleCount} nodes have empty titles`, 'fail');
+                            } else {
+                                log('✓ All nodes have non-empty titles', 'pass');
+                            }
+                        } else {
+                            log('ERROR: No roots to render', 'fail');
                         }
                     }
 
                     // Test parent chain traversal for a non-root node
                     const nonRootNodes = nodeBids.filter(bid => {
-                        const node = nodesIsMap ? tree.nodes.get(bid) : tree.nodes[bid];
+                        const node = tree.nodes.get(bid);
                         return node.parent !== null && node.parent !== undefined;
                     });
                     if (nonRootNodes.length > 0) {
