@@ -2666,6 +2666,22 @@ impl BeliefSource for BeliefBase {
             .unwrap_or_default())
     }
 
+    async fn get_all_document_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        Ok(self
+            .paths()
+            .get_map(&network_bid)
+            .map(|pm| {
+                pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
+                    .into_iter()
+                    .filter(|(path, _bid)| !path.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn eval_trace(
         &self,
         expr: &Expression,
@@ -2693,6 +2709,22 @@ impl BeliefSource for &BeliefBase {
             .paths()
             .get_map(&network_bid)
             .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
+            .unwrap_or_default())
+    }
+
+    async fn get_all_document_paths(
+        &self,
+        network_bid: Bid,
+    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
+        Ok(self
+            .paths()
+            .get_map(&network_bid)
+            .map(|pm| {
+                pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
+                    .into_iter()
+                    .filter(|(path, _bid)| !path.is_empty())
+                    .collect()
+            })
             .unwrap_or_default())
     }
 

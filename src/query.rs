@@ -557,6 +557,17 @@ pub trait BeliefSource: Sync {
         _network_bid: Bid,
     ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send;
 
+    /// Get all document paths (including documents in subnets) for a network as (path, bid) pairs.
+    /// Unlike get_network_paths which returns only network nodes, this returns all documents.
+    /// Useful for sitemap generation and comprehensive document enumeration.
+    /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
+    fn get_all_document_paths(
+        &self,
+        _network_bid: Bid,
+    ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
     /// Evaluate an expression as a trace, marking nodes as Trace and only returning
     /// relations matching the provided weight filter. This prevents pulling in the
     /// entire graph during balance operations.

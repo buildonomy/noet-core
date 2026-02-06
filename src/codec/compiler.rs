@@ -932,11 +932,9 @@ impl DocumentCompiler {
         // Generate sitemap from document paths
         self.generate_sitemap(global_bb.clone()).await?;
 
-        // Query cache for asset manifest
-        let asset_manifest: BTreeMap<String, Bid> = self
-            .builder
-            .session_bb()
-            .get_network_paths(asset_namespace())
+        // Query synchronized global_bb for asset manifest
+        let asset_manifest: BTreeMap<String, Bid> = global_bb
+            .get_all_document_paths(asset_namespace())
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1584,10 +1582,10 @@ impl DocumentCompiler {
             None => return Ok(()), // No HTML output configured
         };
 
-        // Get all document paths from the repository network
+        // Get all document paths from the repository network (including subnets)
         let repo_bid = self.builder.repo();
         let document_paths: Vec<(String, Bid)> = global_bb
-            .get_network_paths(repo_bid)
+            .get_all_document_paths(repo_bid)
             .await
             .unwrap_or_default();
 
@@ -1612,18 +1610,25 @@ impl DocumentCompiler {
                 continue;
             }
 
+            // Skip anchor paths (sections within documents) - sitemap should only include document-level URLs
+            if repo_relative_path.contains('#') {
+                continue;
+            }
+
             // Convert to HTML path (replace codec extension with .html)
-            let mut html_path = if repo_relative_path.is_empty() {
-                // Empty path represents the network node itself, which should generate its own
-                // index.html (per belief_ir.rs ProtoBeliefNode DocCodec implementation).
-                "index.html".to_string()
+            let mut html_path = repo_relative_path.clone();
+
+            // Check if this is a directory path (network node) without an extension
+            if Path::new(&html_path).extension().is_none() {
+                // Directory paths should point to index.html
+                html_path = format!("{}/index.html", html_path.trim_end_matches('/'));
             } else {
-                repo_relative_path.clone()
-            };
-            for ext in codec_extensions.iter() {
-                if html_path.ends_with(&format!(".{}", ext)) {
-                    html_path = html_path.replace(&format!(".{}", ext), ".html");
-                    break;
+                // Regular files: replace codec extension with .html
+                for ext in codec_extensions.iter() {
+                    if html_path.ends_with(&format!(".{}", ext)) {
+                        html_path = html_path.replace(&format!(".{}", ext), ".html");
+                        break;
+                    }
                 }
             }
 
@@ -1919,8 +1924,8 @@ impl DocumentCompiler {
                 );
             }
 
-            // Create hardlink at semantic path
-            let html_full_path = html_output_dir.join(asset_path);
+            // Create hardlink at semantic path in pages/ subdirectory (where HTML documents are)
+            let html_full_path = html_output_dir.join("pages").join(asset_path);
 
             // Create parent directories for semantic path
             if let Some(parent) = html_full_path.parent() {
