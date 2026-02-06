@@ -13,7 +13,7 @@ use crate::{
         asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Weight, WeightKind,
         WEIGHT_DOC_PATHS,
     },
-    query::BeliefSource,
+    query::{BeliefSource, Expression, NeighborsExpression, Query},
 };
 
 use sha2::{Digest, Sha256};
@@ -286,7 +286,7 @@ impl DocumentCompiler {
         } else if let Some(p) = self.peek_next_reparse_candidate() {
             p.clone()
         } else {
-            self.finalize(global_bb.clone()).await?;
+            self.finalize().await?;
             let Some(path) = self.primary_queue.front().cloned() else {
                 tracing::info!("[Compiler] No cached assets to verify, parsing complete");
                 return Ok(None);
@@ -448,7 +448,18 @@ impl DocumentCompiler {
 
             match codec.generate_html() {
                 Ok(fragments) => {
-                    for (rel_path, html_body) in fragments {
+                    // Convert absolute path to repo-relative path
+                    let repo_relative_path = file_path
+                        .strip_prefix(self.builder.repo_root())
+                        .unwrap_or(file_path.as_path());
+
+                    // Get base directory for output (always use parent directory, never the file itself)
+                    let base_dir = repo_relative_path.parent().unwrap_or(Path::new(""));
+
+                    for (filename, html_body) in fragments {
+                        // Join base directory with filename to get relative path
+                        let rel_path = base_dir.join(&filename);
+
                         if let Err(e) = self
                             .write_fragment(html_dir, &rel_path, html_body, &title)
                             .await
@@ -473,6 +484,10 @@ impl DocumentCompiler {
 
             // 7b. Queue for deferred generation if codec requests it
             if codec.should_defer() {
+                tracing::debug!(
+                    "[Compiler] Queueing for deferred HTML generation: {:?}",
+                    file_path
+                );
                 self.deferred_html.insert(path.clone());
             }
         }
@@ -840,10 +855,7 @@ impl DocumentCompiler {
         self.reparse_queue.retain(|p| p != path);
     }
 
-    async fn finalize<B: BeliefSource + Clone>(
-        &mut self,
-        global_bb: B,
-    ) -> Result<(), BuildonomyError> {
+    async fn finalize(&mut self) -> Result<(), BuildonomyError> {
         // Both queues empty - check if there are cached assets to verify
         tracing::info!("[Compiler] Both queues empty, checking for cached assets");
 
@@ -888,9 +900,6 @@ impl DocumentCompiler {
             // Generate HTML outputs now that all documents are parsed
             if self.html_output_dir().is_some() {
                 self.generate_spa_shell().await?;
-                // Watch service path: has DbConnection with synchronized state
-                self.generate_deferred_html().await?;
-                self.finalize_html(global_bb).await?;
             }
         }
         Ok(())
@@ -899,6 +908,7 @@ impl DocumentCompiler {
     /// Finalize HTML generation tasks that require synchronized BeliefBase
     ///
     /// This method handles HTML finalization tasks that need complete event processing:
+    /// - Deferred HTML generation (network indices need complete child relationships)
     /// - Sitemap generation (needs all document paths from global_bb)
     /// - Asset hardlinking (needs asset manifest)
     /// - BeliefGraph export to JSON (needs complete graph)
@@ -909,12 +919,15 @@ impl DocumentCompiler {
     /// # Parameters
     /// - `global_bb`: Synchronized BeliefBase with all events processed
     pub async fn finalize_html<B: BeliefSource + Clone>(
-        &mut self,
+        &self,
         global_bb: B,
     ) -> Result<(), BuildonomyError> {
         if self.html_output_dir().is_none() {
             return Ok(()); // No HTML output configured
         }
+
+        // Generate deferred HTML with synchronized context
+        self.generate_deferred_html(global_bb.clone()).await?;
 
         // Generate sitemap from document paths
         self.generate_sitemap(global_bb.clone()).await?;
@@ -1454,7 +1467,13 @@ impl DocumentCompiler {
     /// after all documents have been parsed and added to the belief base.
     ///
     /// Called automatically by parse_all() when both queues are empty.
-    pub async fn generate_deferred_html(&mut self) -> Result<(), BuildonomyError> {
+    ///
+    /// # Parameters
+    /// - `global_bb`: Synchronized BeliefBase with complete graph relationships
+    pub async fn generate_deferred_html<B: BeliefSource + Clone>(
+        &self,
+        global_bb: B,
+    ) -> Result<(), BuildonomyError> {
         let html_output_dir = match &self.html_output_dir {
             Some(dir) => dir.clone(),
             None => return Ok(()), // No HTML output configured
@@ -1469,21 +1488,18 @@ impl DocumentCompiler {
             self.deferred_html.len()
         );
 
-        // Drain the deferred set and generate HTML for each
-        let network_files: Vec<PathBuf> = self.deferred_html.drain().collect();
-
-        for file_path in network_files {
+        for file_path in self.deferred_html.iter() {
             tracing::info!(
-                "[generate_deferred_html] Generating HTML for network at path={:?}",
+                "[generate_deferred_html] Generating HTML for file at path={:?}",
                 file_path
             );
 
             if let Err(e) = self
-                .generate_html_for_path(&file_path, &html_output_dir)
+                .generate_html_for_path(file_path, &html_output_dir, global_bb.clone())
                 .await
             {
                 tracing::warn!(
-                    "[generate_deferred_htm]l Failed to generate HTML for {:?}: {}",
+                    "[generate_deferred_html] Failed to generate HTML for {:?}: {}",
                     file_path,
                     e
                 );
@@ -1673,112 +1689,119 @@ impl DocumentCompiler {
         Ok(())
     }
 
-    async fn generate_html_for_path(
-        &mut self,
+    async fn generate_html_for_path<B: BeliefSource + Clone>(
+        &self,
         source_path: &Path,
         html_output_dir: &Path,
+        global_bb: B,
     ) -> Result<(), BuildonomyError> {
         // Get file extension
-        let ext = source_path
+        let mut full_path = self.builder.repo_root().join(source_path);
+        if source_path.extension().is_none() {
+            let Some((path, _format)) = detect_network_file(&full_path) else {
+                return Err(BuildonomyError::Codec(format!(
+                    "Could not determine extension for {:?}",
+                    full_path
+                )));
+            };
+            full_path = path;
+        }
+        let ext = full_path
             .extension()
             .and_then(|s| s.to_str())
             .ok_or_else(|| {
-                BuildonomyError::Codec(format!(
-                    "Source file has no extension: {}",
-                    source_path.display()
-                ))
+                let msg = format!("Could not determine extension for {:?}", full_path);
+                tracing::warn!("{}", msg);
+                BuildonomyError::Codec(msg)
             })?;
 
-        // Get codec factory for this file type
         let codec_factory = CODECS.get(ext).ok_or_else(|| {
-            BuildonomyError::Codec(format!("No codec available for .{} files", ext))
+            let msg = format!("No codec available for .{} files", ext);
+            tracing::warn!("{}", msg);
+            BuildonomyError::Codec(msg)
         })?;
+        // Get codec factory for this file type
 
-        // Get BeliefContext for this file if it exists in the belief base
-        // Convert file path to repo-relative path for lookup
-        tracing::debug!(
-            "[generate_html_for_path] repo_root: {:?}, source_path: {:?}",
-            self.builder.repo_root(),
-            source_path
-        );
-
-        let relative_path = source_path
+        // the paths we're provided come from the builder. they are already relative to repo_root
+        let path_str = source_path
             .strip_prefix(self.builder.repo_root())
-            .unwrap_or(source_path);
+            .unwrap_or(source_path)
+            .to_string_lossy()
+            .to_string();
 
-        // Network files (BeliefNetwork.toml, etc.) at the repo root represent the network root
-        // which is stored in PathMap with an empty path "". Subnets keep their directory path.
-        let path_str = if relative_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .map(|f| f.starts_with("BeliefNetwork."))
-            .unwrap_or(false)
-        {
-            // Check if this is the root network (no parent directory in relative_path)
-            if relative_path
-                .parent()
-                .map(|p| p.as_os_str().is_empty())
-                .unwrap_or(true)
-            {
-                String::new() // Empty path for root network
-            } else {
-                // Subnet network - use directory path (strip filename)
-                relative_path
-                    .parent()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            }
-        } else {
-            relative_path.to_string_lossy().to_string()
-        };
-
+        tracing::debug!(
+            "[generate_html_for_path] repo_root '{:?}'",
+            self.builder.repo_root()
+        );
         tracing::debug!(
             "[generate_html_for_path] Looking up path in PathMap: '{}'",
             path_str
         );
 
-        let ctx_opt = {
-            let bb = self.builder.session_bb();
-            let paths = bb.paths();
-
-            // Look up BID from path
-            if let Some((_net_bid, node_bid)) = paths.get(&path_str) {
-                tracing::info!(
-                    "[generate_html_for_path] Found BID for path '{}': {:?}",
-                    path_str,
-                    node_bid
-                );
-                // Get mutable access to belief base for get_context
-                drop(paths); // Release read lock
-                let bb_mut = self.builder.session_bb_mut();
-                bb_mut.get_context(&node_bid)
-            } else {
-                tracing::warn!(
-                    "[generate_html_for_path] No BID found for path: '{}'",
-                    path_str
-                );
-                None
-            }
+        // Query for the node using path from synchronized global_bb
+        let nodekey = NodeKey::Path {
+            net: self.builder.repo(),
+            path: path_str.clone(),
+        };
+        let mut bb = BeliefBase::from(
+            global_bb
+                .eval_query(
+                    &Query {
+                        seed: Expression::from(&nodekey),
+                        traverse: Some(NeighborsExpression {
+                            filter: None,
+                            upstream: 1,
+                            downstream: 0,
+                        }),
+                    },
+                    true,
+                )
+                .await?,
+        );
+        tracing::debug!("{}\n{}", bb.clone().consume(), bb.paths());
+        let Some(node) = bb.get(&nodekey) else {
+            tracing::warn!(
+                "[generate_html_for_path] No match found for path: '{}'\nbb.paths:\n{}",
+                nodekey,
+                bb.paths()
+            );
+            return Ok(());
+        };
+        let Some(ctx) = bb.get_context(&self.builder.repo(), &node.bid) else {
+            tracing::warn!(
+                "[generate_html_for_path] No match found for path: '{}'",
+                nodekey
+            );
+            return Ok(());
         };
 
         // Generate HTML using fresh codec instance (deferred generation)
         let codec = codec_factory();
 
         // Get title and generate fragments based on context availability
-        let (title, fragments) = if let Some(ctx) = &ctx_opt {
-            let title = ctx.node.display_title().to_string();
-            let fragments = codec.generate_deferred_html(ctx)?;
-            (title, fragments)
+        let title = ctx.node.display_title().to_string();
+        let fragments = codec.generate_deferred_html(&ctx)?;
+
+        // Convert absolute path to repo-relative path
+        let repo_relative_path = source_path
+            .strip_prefix(self.builder.repo_root())
+            .unwrap_or(source_path);
+
+        // Get base directory for output (ctx.path for directories, parent for files)
+        // ctx.path is home-network relative, so for network nodes it's just the network name
+        // For document files, use the parent directory
+        let base_dir = if ctx.node.kind.is_network() {
+            // Network nodes: ctx.path is the network directory (may be subnet path)
+            repo_relative_path
         } else {
-            tracing::warn!(
-                "[generate_html_for_path] No context found for deferred path: {:?}",
-                source_path
-            );
-            ("Untitled".to_string(), vec![])
+            // Document nodes: use parent directory of the source file
+            repo_relative_path.parent().unwrap_or(Path::new(""))
         };
 
-        for (rel_path, html_body) in fragments {
+        for (filename, html_body) in fragments.into_iter() {
+            // Join base directory with filename to get relative path
+            let rel_path = base_dir.join(&filename);
+
             // Write fragment using helper with title
             self.write_fragment(html_output_dir, &rel_path, html_body, &title)
                 .await?;
@@ -1960,7 +1983,7 @@ impl DocumentCompiler {
 }
 
 /// Statistics about the compiler's current state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompilerStats {
     pub primary_queue_len: usize,
     pub reparse_queue_len: usize,

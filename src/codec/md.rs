@@ -540,28 +540,29 @@ fn check_for_link_and_push(
                     "Found relation for link: title={}, id={:?}, home_path={}",
                     relation.other.title,
                     relation.other.id,
-                    relation.home_path
+                    relation.relative_path
                 );
 
                 // 1. Calculate relative path from source to target
                 // Strip any existing anchor from home_path to avoid double anchors
-                let home_path_without_anchor = get_doc_path(&relation.home_path);
-                let ctx_home_doc_path = get_doc_path(&ctx.home_path);
-                let relative_path = make_relative_path(&ctx.home_path, home_path_without_anchor);
+                let relative_path_without_anchor = get_doc_path(&relation.relative_path);
+                let ctx_home_doc_path = get_doc_path(&ctx.relative_path);
+                let relative_path =
+                    make_relative_path(&ctx.relative_path, relative_path_without_anchor);
 
                 // 2. Add anchor if target is a heading node
                 // Extract anchor from relation.other.id or from home_path
                 let maybe_anchor = relation.other.id.as_deref().or_else(|| {
                     // If id is not set, extract anchor from home_path
                     relation
-                        .home_path
+                        .relative_path
                         .rfind('#')
-                        .map(|idx| &relation.home_path[idx + 1..])
+                        .map(|idx| &relation.relative_path[idx + 1..])
                 });
 
                 // If source and target are in the same document, use fragment-only format
                 let dest_with_anchor = if let Some(anchor) = maybe_anchor {
-                    if home_path_without_anchor == ctx_home_doc_path {
+                    if relative_path_without_anchor == ctx_home_doc_path {
                         // Same document - use fragment-only format
                         format!("#{anchor}")
                     } else {
@@ -1238,7 +1239,7 @@ impl DocCodec for MdCodec {
         Self::events_to_text(&self.content, events)
     }
 
-    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+    fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
         /// Rewrite document links to .html for HTML output
         fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
@@ -1278,7 +1279,7 @@ impl DocCodec for MdCodec {
             }
         }
 
-        // Get source path from ProtoBeliefNode's path field to compute output path
+        // Get source path from ProtoBeliefNode's path field to compute output filename
         let source_path = self
             .current_events
             .first()
@@ -1287,8 +1288,26 @@ impl DocCodec for MdCodec {
                 BuildonomyError::Codec("Document missing for HTML generation".to_string())
             })?;
 
-        // Convert source path to output path (replace extension with .html)
-        let output_path = PathBuf::from(source_path).with_extension("html");
+        // Extract filename and convert extension to .html
+        // Extract filename and convert extension to .html
+        // Handle empty path (tests) by defaulting to "document.html"
+        let output_filename = if source_path.is_empty() {
+            "document.html".to_string()
+        } else {
+            let filename = PathBuf::from(source_path)
+                .file_name()
+                .ok_or_else(|| {
+                    BuildonomyError::Codec("Cannot extract filename from path".to_string())
+                })?
+                .to_string_lossy()
+                .to_string();
+
+            if let Some(stem) = filename.strip_suffix(".md") {
+                format!("{}.html", stem)
+            } else {
+                filename
+            }
+        };
 
         // Generate HTML body from markdown events
         let events = self
@@ -1300,7 +1319,7 @@ impl DocCodec for MdCodec {
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
 
-        Ok(vec![(output_path, html_body)])
+        Ok(vec![(output_filename, html_body)])
     }
 
     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {

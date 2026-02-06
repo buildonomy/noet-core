@@ -281,13 +281,14 @@ impl<'a> DerefMut for BidRefGraph<'a> {
 pub struct ExtendedRelation<'a> {
     pub other: &'a BeliefNode,
     pub home_net: Bid,
-    pub home_path: String,
+    pub relative_path: String,
     pub weight: &'a WeightSet,
 }
 
 impl<'a> ExtendedRelation<'a> {
     pub fn new(
         other_bid: Bid,
+        relative_net: Bid,
         weight: &'a WeightSet,
         set: &'a BeliefBase,
     ) -> Option<ExtendedRelation<'a>> {
@@ -297,15 +298,18 @@ impl<'a> ExtendedRelation<'a> {
         };
 
         let paths_guard = set.paths();
-        let Some((home_net, home_path)) = paths_guard.api_map().home_path(&other_bid, &paths_guard)
+        let Some((home_net, relative_path)) = paths_guard
+            .get_map(&relative_net)
+            .and_then(|pm| pm.path(&other_bid, &paths_guard))
+            .and_then(|(bid, path, _order)| Some((bid, path)))
         else {
             tracing::warn!("Could not find api_path to other node: {}", other);
             return None;
         };
 
         Some(ExtendedRelation {
-            home_path,
             home_net,
+            relative_path,
             other,
             weight,
         })
@@ -328,7 +332,8 @@ impl<'a> ExtendedRelation<'a> {
 #[derive(Debug)]
 pub struct BeliefContext<'a> {
     pub node: &'a BeliefNode,
-    pub home_path: String,
+    pub relative_path: String,
+    pub relative_net: Bid,
     pub home_net: Bid,
     set: &'a BeliefBase,
     relations_guard: ArcRwLockReadGuard<RawRwLock, BidGraph>,
@@ -337,7 +342,7 @@ pub struct BeliefContext<'a> {
 impl<'a> BeliefContext<'a> {
     pub fn href(&self, origin: String) -> Result<String, BuildonomyError> {
         let origin = Url::parse(&origin)?;
-        Ok(origin.join(&self.home_path)?.as_str().to_string())
+        Ok(origin.join(&self.relative_path)?.as_str().to_string())
     }
 
     /// Get a reference to the underlying BeliefBase
@@ -356,7 +361,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if sink_bid == self.node.bid {
-                    ExtendedRelation::new(source_bid, &edge.weight, self.set)
+                    ExtendedRelation::new(source_bid, self.relative_net, &edge.weight, self.set)
                 } else {
                     None
                 }
@@ -375,7 +380,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if source_bid == self.node.bid {
-                    ExtendedRelation::new(sink_bid, &edge.weight, self.set)
+                    ExtendedRelation::new(sink_bid, self.relative_net, &edge.weight, self.set)
                 } else {
                     None
                 }
@@ -611,6 +616,22 @@ impl BeliefGraph {
     pub fn union_mut(&mut self, rhs: &BeliefGraph) {
         // First, union the states with the non-trace elements of rhs.
         for node in rhs.states.values().filter(|node| node.kind.is_complete()) {
+            let self_node_entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
+            if self_node_entry.kind.contains(BeliefKind::Trace)
+                && !node.kind.contains(BeliefKind::Trace)
+            {
+                // rhs asserts it contains all relations for this node, so remove the Trace kind.
+                self_node_entry.kind.remove(BeliefKind::Trace);
+            }
+        }
+        self.add_relations(rhs);
+    }
+
+    /// Union with trace nodes included. Used during traversal where we want to accumulate
+    /// nodes even if they're marked as Trace (incomplete relations).
+    pub fn union_mut_with_trace(&mut self, rhs: &BeliefGraph) {
+        // Accept all nodes from rhs, including Trace nodes
+        for node in rhs.states.values() {
             let self_node_entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
             if self_node_entry.kind.contains(BeliefKind::Trace)
                 && !node.kind.contains(BeliefKind::Trace)
@@ -967,7 +988,6 @@ impl Clone for BeliefBase {
 ///
 /// 2. PathMaps identify how to acquire the source starting from known network locations.
 impl BeliefBase {
-    #[tracing::instrument]
     pub fn empty() -> BeliefBase {
         BeliefBase {
             states: BTreeMap::default(),
@@ -981,7 +1001,6 @@ impl BeliefBase {
         }
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn new_unbalanced(
         states: BTreeMap<Bid, BeliefNode>,
         relations: BidGraph,
@@ -1003,7 +1022,6 @@ impl BeliefBase {
         bs
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn new(
         states: BTreeMap<Bid, BeliefNode>,
         relations: BidGraph,
@@ -1143,28 +1161,33 @@ impl BeliefBase {
     }
 
     // FIXME: This could introduce index issues, as BeliefContext has mutable access to self.
-    pub fn get_context(&mut self, bid: &Bid) -> Option<BeliefContext<'_>> {
+    pub fn get_context(&mut self, relative_to_net: &Bid, bid: &Bid) -> Option<BeliefContext<'_>> {
         self.index_sync(false);
         assert!(
             self.is_balanced().is_ok(),
             "get_context called on an unbalanced BeliefBase. errors: {:?}",
             self.errors.read().clone()
         );
-        self.states().get(bid).map(|node| {
-            let paths_guard = self.paths();
-            let (home_net, home_path) = paths_guard
-                .api_map()
-                .home_path(bid, &paths_guard)
-                .expect("all nodes in self.states() to have api paths");
-
-            BeliefContext {
-                node,
-                home_net,
-                home_path,
-                set: self,
-                relations_guard: self.relations(),
-            }
-        })
+        let Some(node) = self.states.get(bid) else {
+            tracing::debug!("[get_context] node {bid} is not loaded");
+            return None;
+        };
+        let Some(relative_to_pm) = self.paths().get_map(relative_to_net) else {
+            tracing::debug!("[get_context] network {relative_to_net} is not loaded");
+            return None;
+        };
+        relative_to_pm
+            .path(bid, &self.paths())
+            .and_then(|(home_net, relative_path, _order)| {
+                Some(BeliefContext {
+                    node,
+                    home_net,
+                    relative_path,
+                    relative_net: *relative_to_net,
+                    set: self,
+                    relations_guard: self.relations(),
+                })
+            })
     }
 
     pub fn consume(&mut self) -> BeliefGraph {
@@ -2311,7 +2334,6 @@ impl BeliefBase {
 
     // TODO this can be more efficient for some StatePreds (Bid and Bref) by using map.get instead
     // of filter operations.
-    #[tracing::instrument(skip(self))]
     pub fn filter_states(
         &self,
         pred: &StatePred,
@@ -2483,6 +2505,7 @@ impl BeliefBase {
                     self.relations()
                         .filter(&RelationPred::NodeIn(state_set), false),
                 );
+                tracing::debug!("States: {states:?}\nRelations: {relations:?}");
                 // Add sink nodes to maintain referential integrity
                 // Mark them as Trace since we haven't loaded their full relation set
                 for edge in relations.as_graph().raw_edges() {
@@ -2626,7 +2649,6 @@ impl BeliefBase {
 }
 
 impl BeliefSource for BeliefBase {
-    #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
     }
@@ -2645,7 +2667,6 @@ impl BeliefSource for BeliefBase {
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(skip(self))]
     async fn eval_trace(
         &self,
         expr: &Expression,
@@ -2661,7 +2682,6 @@ impl BeliefSource for BeliefBase {
 }
 
 impl BeliefSource for &BeliefBase {
-    #[tracing::instrument(skip(self))]
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
     }
@@ -2677,7 +2697,6 @@ impl BeliefSource for &BeliefBase {
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(skip(self))]
     async fn eval_trace(
         &self,
         expr: &Expression,
@@ -3045,6 +3064,139 @@ mod tests {
         assert!(
             bs.get(&NodeKey::Bid { bid: orphan_bid }).is_none(),
             "Should NOT find orphan BID - it's not in states"
+        );
+    }
+
+    /// Test for traversal with Trace nodes
+    ///
+    /// This verifies that union_mut_with_trace correctly accumulates Trace nodes
+    /// during traversal operations, fixing the bug where eval_trace marked nodes
+    /// as Trace and union_mut filtered them out, causing traversal to fail.
+    #[test]
+    fn test_union_with_trace_nodes() {
+        let net_bid = Bid::new(Bid::nil());
+        let doc_a_bid = Bid::new(net_bid);
+        let doc_b_bid = Bid::new(net_bid);
+
+        // Create nodes
+        let net_node = BeliefNode {
+            bid: net_bid,
+            title: "Network".to_string(),
+            kind: BeliefKindSet(BeliefKind::Network.into()),
+            ..Default::default()
+        };
+
+        let mut doc_a = BeliefNode {
+            bid: doc_a_bid,
+            title: "Doc A".to_string(),
+            kind: BeliefKindSet(BeliefKind::Document.into()),
+            ..Default::default()
+        };
+
+        let mut doc_b = BeliefNode {
+            bid: doc_b_bid,
+            title: "Doc B".to_string(),
+            kind: BeliefKindSet(BeliefKind::Document.into()),
+            ..Default::default()
+        };
+
+        // Mark doc_b as Trace (simulating eval_trace result)
+        doc_b.kind.insert(BeliefKind::Trace);
+
+        // Create initial BeliefGraph with net and doc_a
+        let mut states = BTreeMap::new();
+        states.insert(net_bid, net_node.clone());
+        states.insert(doc_a_bid, doc_a.clone());
+
+        let initial_bg = BeliefGraph {
+            states,
+            relations: BidGraph::default(),
+        };
+
+        // Create a second BeliefGraph with trace node (simulating eval_trace result)
+        let mut trace_states = BTreeMap::new();
+        trace_states.insert(doc_b_bid, doc_b.clone());
+
+        let trace_bg = BeliefGraph {
+            states: trace_states,
+            relations: BidGraph::default(),
+        };
+
+        // Test union_mut (should filter out Trace nodes)
+        let mut test_union_mut = initial_bg.clone();
+        test_union_mut.union_mut(&trace_bg);
+        assert_eq!(
+            test_union_mut.states.len(),
+            2,
+            "union_mut should NOT add Trace nodes"
+        );
+        assert!(
+            !test_union_mut.states.contains_key(&doc_b_bid),
+            "union_mut should filter out Trace node"
+        );
+
+        // Test union_mut_with_trace (should include Trace nodes)
+        let mut test_union_with_trace = initial_bg.clone();
+        test_union_with_trace.union_mut_with_trace(&trace_bg);
+        assert_eq!(
+            test_union_with_trace.states.len(),
+            3,
+            "union_mut_with_trace should add Trace nodes"
+        );
+        assert!(
+            test_union_with_trace.states.contains_key(&doc_b_bid),
+            "union_mut_with_trace should include Trace node"
+        );
+
+        // Verify the Trace node maintains its Trace flag
+        let added_node = test_union_with_trace.states.get(&doc_b_bid).unwrap();
+        assert!(
+            added_node.kind.contains(BeliefKind::Trace),
+            "Trace flag should be preserved"
+        );
+
+        // Test that complete nodes overwrite Trace nodes
+        doc_a.kind.insert(BeliefKind::Trace);
+        let mut trace_doc_a = BTreeMap::new();
+        trace_doc_a.insert(doc_a_bid, doc_a.clone());
+        let trace_bg_a = BeliefGraph {
+            states: trace_doc_a,
+            relations: BidGraph::default(),
+        };
+
+        // Initial has complete doc_a, trace_bg_a has Trace doc_a
+        let mut test_overwrite = initial_bg.clone();
+        test_overwrite.union_mut_with_trace(&trace_bg_a);
+
+        // Complete node should remain complete (Trace not added)
+        let result_node = test_overwrite.states.get(&doc_a_bid).unwrap();
+        assert!(
+            !result_node.kind.contains(BeliefKind::Trace),
+            "Complete node should remain complete when merged with Trace version"
+        );
+
+        // Test reverse: Trace node upgraded to complete
+        let mut trace_initial = initial_bg.clone();
+        trace_initial
+            .states
+            .get_mut(&doc_a_bid)
+            .unwrap()
+            .kind
+            .insert(BeliefKind::Trace);
+
+        let mut complete_doc_a = BTreeMap::new();
+        doc_a.kind.remove(BeliefKind::Trace);
+        complete_doc_a.insert(doc_a_bid, doc_a.clone());
+        let complete_bg = BeliefGraph {
+            states: complete_doc_a,
+            relations: BidGraph::default(),
+        };
+
+        trace_initial.union_mut_with_trace(&complete_bg);
+        let upgraded_node = trace_initial.states.get(&doc_a_bid).unwrap();
+        assert!(
+            !upgraded_node.kind.contains(BeliefKind::Trace),
+            "Trace node should be upgraded to complete when merged with complete version"
         );
     }
 }

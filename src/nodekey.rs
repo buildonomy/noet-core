@@ -104,8 +104,20 @@ impl NodeKey {
                     let regularized_path = PathBuf::from(&home_doc_path);
                     format!("{}{}", regularized_path.to_string_lossy(), link_path)
                 } else {
-                    // Already absolute or network-relative
-                    link_path.to_string()
+                    // Network-relative path - prepend network directory
+                    // For subnets, this ensures "subnet1_file1.md" becomes "subnet1/subnet1_file1.md"
+                    let home_path_buf = PathBuf::from(&home_doc_path);
+                    if home_path_buf.extension().is_none() {
+                        // home_path is a directory (network), prepend it
+                        let network_relative = PathBuf::from(&home_doc_path).join(link_path);
+                        clean_path(network_relative).to_string_lossy().to_string()
+                    } else {
+                        // home_path is a file (document), prepend its parent directory (network dir)
+                        let mut network_relative = home_path_buf.clone();
+                        network_relative.pop(); // Remove document filename
+                        network_relative.push(link_path);
+                        clean_path(network_relative).to_string_lossy().to_string()
+                    }
                 };
 
                 // Now handle network-specific logic

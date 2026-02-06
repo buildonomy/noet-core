@@ -616,12 +616,11 @@ pub trait BeliefSource: Sync {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn get_async(
         &self,
         key: &NodeKey,
     ) -> impl std::future::Future<Output = Result<Option<BeliefNode>, BuildonomyError>> + Send {
-        async {
+        async move {
             let result_set = BeliefBase::from(self.eval_unbalanced(&Expression::from(key)).await?);
             Ok(result_set.get(key))
         }
@@ -681,23 +680,39 @@ pub trait BeliefSource: Sync {
         }
     }
 
-    /// Parse the NeighborsExpression such that traverse: 1 means go (up/down)stream once.
+    /// Parse the NeighborsExpression such that traverse: 1 means follow edges (up/down)stream once
+    /// from the seed query results.
     ///
-    /// all_or_none: Return an empty set if the cache exhausted before the traversal is complete.
-    #[tracing::instrument(skip(self))]
+    /// The seed query (via eval_unbalanced) returns nodes with their immediate relations, where
+    /// edge nodes are marked as Trace. Traversal then walks upstream/downstream from those edges:
+    /// - upstream: 0 = no upstream traversal, 1 = traverse 1 hop upstream from seed's sources
+    /// - downstream: 0 = no downstream traversal, 1 = traverse 1 hop downstream from seed's sinks
+    ///
+    /// all_or_none: Return an empty set if the seed query returned nothing. Partial traversal
+    /// results are kept even if cache is exhausted before reaching the requested depth.
     fn eval_query(
         &self,
         query: &Query,
         all_or_none: bool,
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
         async move {
-            let mut bs = self.eval_unbalanced(&query.seed).await?;
+            let mut bg = self.eval_unbalanced(&query.seed).await?;
+            tracing::debug!(
+                "initial bg: {} states, {} relations",
+                bg.states.len(),
+                bg.relations.as_graph().edge_count()
+            );
+
+            // If all_or_none is true and the seed query returned nothing, return empty immediately
+            if all_or_none && bg.states.is_empty() {
+                return Ok(BeliefGraph::default());
+            }
 
             if let Some(ref neighbor_walk) = query.traverse {
                 // walk upstream, accrueing relation sources
                 let mut upstream_set = None;
                 let mut upstream_loop = 0;
-                let mut upstream_expr = bs.build_upstream_expr(neighbor_walk.filter.clone());
+                let mut upstream_expr = bg.build_upstream_expr(neighbor_walk.filter.clone());
                 let upstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.upstream);
                 while let Some(up_expr) = upstream_expr {
                     // Traverse 1 should mean loop once, not twice
@@ -707,21 +722,17 @@ pub trait BeliefSource: Sync {
                     // tracing::debug!("upstream loop {}", upstream_loop);
                     upstream_loop += 1;
                     let up_set = upstream_set.get_or_insert(BeliefGraph {
-                        states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
-                        relations: bs.relations.clone(),
+                        states: BTreeMap::from_iter(bg.states.iter().map(|(k, v)| (*k, v.clone()))),
+                        relations: bg.relations.clone(),
                     });
                     let upwalk_eval_set = self.eval_unbalanced(&up_expr).await?;
-                    up_set.union_mut(&upwalk_eval_set);
+                    up_set.union_mut_with_trace(&upwalk_eval_set);
                     upstream_expr = up_set.build_upstream_expr(neighbor_walk.filter.clone());
                     if let Some(ref new_up_expr) = upstream_expr {
                         if *new_up_expr == up_expr {
-                            if all_or_none {
-                                // tracing::debug!("Returning empty set");
-                                return Ok(BeliefGraph::default());
-                            } else {
-                                // tracing::debug!("breaking traversal");
-                                break;
-                            }
+                            // Cache exhausted - traversal incomplete, but keep what we have
+                            // tracing::debug!("breaking upstream traversal - cache exhausted");
+                            break;
                         }
                     }
                 }
@@ -729,7 +740,7 @@ pub trait BeliefSource: Sync {
                 // walk downstream, accrueing relation sinks
                 let mut downstream_set = None;
                 let mut downstream_loop = 0;
-                let mut downstream_expr = bs.build_downstream_expr(neighbor_walk.filter.clone());
+                let mut downstream_expr = bg.build_downstream_expr(neighbor_walk.filter.clone());
                 let downstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.downstream);
                 while let Some(down_expr) = downstream_expr {
                     // Traverse 1 should mean loop once, not twice
@@ -739,26 +750,22 @@ pub trait BeliefSource: Sync {
                     // tracing::debug!("downstream loop {}", downstream_loop);
                     downstream_loop += 1;
                     let down_set = downstream_set.get_or_insert(BeliefGraph {
-                        states: BTreeMap::from_iter(bs.states.iter().map(|(k, v)| (*k, v.clone()))),
-                        relations: bs.relations.clone(),
+                        states: BTreeMap::from_iter(bg.states.iter().map(|(k, v)| (*k, v.clone()))),
+                        relations: bg.relations.clone(),
                     });
                     let downwalk_eval_set = self.eval_unbalanced(&down_expr).await?;
-                    down_set.union_mut(&downwalk_eval_set);
+                    down_set.union_mut_with_trace(&downwalk_eval_set);
                     downstream_expr = down_set.build_downstream_expr(neighbor_walk.filter.clone());
                     if let Some(ref new_down_expr) = downstream_expr {
                         if *new_down_expr == down_expr {
-                            if all_or_none {
-                                // tracing::debug!("Returning empty set");
-                                return Ok(BeliefGraph::default());
-                            } else {
-                                // tracing::debug!("breaking traversal");
-                                break;
-                            }
+                            // Cache exhausted - traversal incomplete, but keep what we have
+                            // tracing::debug!("breaking downstream traversal - cache exhausted");
+                            break;
                         }
                     }
                 }
 
-                bs = match (upstream_set, downstream_set) {
+                bg = match (upstream_set, downstream_set) {
                     (Some(mut up_set), Some(down_set)) => {
                         // tracing::debug!("joining upstream and downstream sets");
                         up_set.union_mut(&down_set);
@@ -774,13 +781,19 @@ pub trait BeliefSource: Sync {
                     }
                     (None, None) => {
                         // tracing::debug!("returning original eval set");
-                        bs
+                        bg
                     }
                 }
             }
-            if !bs.states.is_empty() {
-                self.balance(&mut bs).await?;
-                // debug_assert!(BeliefBase::from(bs.clone()).check(true).is_err_and(|e| {
+            tracing::debug!(
+                "bg after walk: {} states, {} relations",
+                bg.states.len(),
+                bg.relations.as_graph().edge_count()
+            );
+
+            if !bg.states.is_empty() {
+                self.balance(&mut bg).await?;
+                // debug_assert!(BeliefBase::from(bg.clone()).check(true).is_err_and(|e| {
                 //     if let BuildonomyError::Custom(msg) = e {
                 //         tracing::warn!(
                 //             "Query results for {:?} aren't balanced! errors are:\n\t{}",
@@ -793,7 +806,12 @@ pub trait BeliefSource: Sync {
                 //     }
                 // }));
             }
-            Ok(bs)
+            tracing::debug!(
+                "bg after balance: {} states, {} relations",
+                bg.states.len(),
+                bg.relations.as_graph().edge_count()
+            );
+            Ok(bg)
         }
     }
 }
@@ -809,18 +827,32 @@ pub struct ResultsPage<B> {
     pub results: B,
 }
 
-/// Target for a query expression, can either be the full belief cache, or a depth-limited graph traversal
+/// Depth-limited graph traversal configuration for Query.
+///
+/// Traversal walks from the edges of seed query results:
+/// - upstream/downstream: 0 = no traversal, 1 = one hop from seed's edges, etc.
+/// - filter: Optional WeightSet to restrict which relation types to traverse
+///
+/// Example: If seed returns a document node, upstream: 1 will fetch its parent section.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NeighborsExpression {
+    /// Optional relation type filter (e.g., only Section relations)
     pub filter: Option<WeightSet>,
+    /// Number of hops to traverse upstream (toward sources) from seed's relation sources
     pub upstream: u8,
+    /// Number of hops to traverse downstream (toward sinks) from seed's relation sinks
     pub downstream: u8,
 }
 
-/// A page of results from the sqlx cache of BeliefState or BeliefRelation objects.
+/// Query for BeliefGraph with optional graph traversal.
+///
+/// The seed expression is evaluated first, then optional traversal walks upstream/downstream
+/// from the seed results' edges. See NeighborsExpression for traversal semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct Query {
+    /// Initial query expression to evaluate
     pub seed: Expression,
+    /// Optional depth-limited traversal from seed results
     pub traverse: Option<NeighborsExpression>,
 }
 

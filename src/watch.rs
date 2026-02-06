@@ -245,7 +245,7 @@ use crate::{
     beliefbase::BeliefGraph,
     codec::{
         belief_ir::{detect_network_file, ProtoBeliefNode},
-        compiler::DocumentCompiler,
+        compiler::{CompilerStats, DocumentCompiler},
         CodecMap,
     },
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
@@ -838,7 +838,19 @@ impl FileUpdateSyncer {
                         Ok(None) => {
                             let stats = {
                                 let compiler_read = compiler_ref.read_arc();
-                                compiler_read.stats()
+                                match compiler_read
+                                    .finalize_html(compiler_global_bb.clone())
+                                    .await {
+                                        Ok(_) => compiler_read.stats(),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                "[DocumentCompiler] Finalize html failed with \
+                                                 error: {:?}",
+                                                err
+                                            );
+                                            CompilerStats::default()
+                                        }
+                                    }
                             };
                             tracing::info!(
                                 "[DocumentCompiler] parse_next returned None - Queue is empty. Final stats: primary={}, reparse={}, total_parses={}",

@@ -1184,11 +1184,11 @@ impl DocCodec for ProtoBeliefNode {
     fn generate_deferred_html(
         &self,
         ctx: &crate::beliefbase::BeliefContext<'_>,
-    ) -> Result<Vec<(std::path::PathBuf, String)>, BuildonomyError> {
+    ) -> Result<Vec<(String, String)>, BuildonomyError> {
         use crate::properties::{WeightKind, WEIGHT_SORT_KEY};
 
         // Only generate index.html for Network nodes
-        if !self.kind.contains(BeliefKind::Network) {
+        if !ctx.node.kind.is_network() {
             return Ok(vec![]);
         }
 
@@ -1228,7 +1228,7 @@ impl DocCodec for ProtoBeliefNode {
             html.push_str("<ul>\n");
             for (edge, _sort_key) in children {
                 // Convert home_path to HTML link (replace extension with .html)
-                let mut link_path = edge.home_path.clone();
+                let mut link_path = edge.relative_path.clone();
 
                 // Normalize document links to .html extension
                 let codec_extensions = crate::codec::CODECS.extensions();
@@ -1248,10 +1248,8 @@ impl DocCodec for ProtoBeliefNode {
             html.push_str("</ul>\n");
         }
 
-        // Output path is index.html in the network directory
-        let output_path = std::path::PathBuf::from(&self.path).with_extension("html");
-
-        Ok(vec![(output_path, html)])
+        // Output filename is index.html (caller handles directory path)
+        Ok(vec![("index.html".to_string(), html)])
     }
 
     fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError> {

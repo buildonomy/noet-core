@@ -116,7 +116,7 @@ pub use assets::Layout;
 #[cfg(not(target_arch = "wasm32"))]
 use parking_lot::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use std::{path::PathBuf, result::Result, sync::Arc, time::Duration};
+use std::{result::Result, sync::Arc, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
@@ -222,14 +222,18 @@ pub trait DocCodec: Sync {
     /// Use for codecs that can generate HTML from parsed AST alone (e.g., Markdown).
     ///
     /// # Returns
-    /// - `Ok(vec![(path, body), ...])`: Repo-relative output paths and HTML body content
+    /// - `Ok(vec![(filename, body), ...])`: Output filenames and HTML body content
     /// - `Ok(vec![])`: No immediate generation (may use deferred instead if should_defer == true)
     /// - `Err(_)`: Generation failed
     ///
-    /// # Path Format
-    /// Return repo-relative paths where `path.is_file() == true`:
-    /// - `PathBuf::from("docs/guide.html")` → written to `html_output/pages/docs/guide.html`
-    /// - Public URL will be `/docs/guide.html`
+    /// # Filename Format
+    /// Return output filename only (not full path):
+    /// - `"guide.html"` → written to source file's directory
+    /// - `"subdir/index.html"` → creates subdir/ relative to source file's directory
+    /// - Compiler handles directory resolution based on source file location
+    ///
+    /// For source file `/repo/docs/page.md`, returning `"page.html"` writes to
+    /// `html_output/pages/docs/page.html` with public URL `/docs/page.html`.
     ///
     /// # Body Content
     /// Return HTML body content only (no `<html>`, `<head>`, etc.):
@@ -243,7 +247,7 @@ pub trait DocCodec: Sync {
     /// - Use `CODECS.extensions()` to get the list of registered extensions
     ///
     /// Default implementation returns empty vec (no HTML generation).
-    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+    fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
         Ok(vec![])
     }
 
@@ -258,11 +262,12 @@ pub trait DocCodec: Sync {
     /// - `ctx`: BeliefContext with full graph relationships and metadata
     ///
     /// # Returns
-    /// Same format as `generate_html()` - repo-relative paths and HTML body content.
+    /// Same format as `generate_html()` - output filenames and HTML body content.
+    /// Filenames are resolved relative to the source file's directory (from ctx.path).
     ///
     /// # Example: Network Index
     /// ```ignore
-    /// fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+    /// fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(String, String)>, BuildonomyError> {
     ///     // Query child documents via Subsection edges
     ///     let mut children: Vec<_> = ctx.sources.iter()
     ///         .filter(|edge| edge.weight.get(WeightKind::Subsection).is_some())
@@ -283,7 +288,7 @@ pub trait DocCodec: Sync {
     ///             .collect::<String>()
     ///     );
     ///
-    ///     Ok(vec![(self.path.with_extension("html"), html)])
+    ///     Ok(vec![("index.html".to_string(), html)])
     /// }
     /// ```
     ///
@@ -291,7 +296,7 @@ pub trait DocCodec: Sync {
     fn generate_deferred_html(
         &self,
         _ctx: &BeliefContext<'_>,
-    ) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
+    ) -> Result<Vec<(String, String)>, BuildonomyError> {
         Ok(vec![])
     }
 }
@@ -506,10 +511,10 @@ mod tests {
         let fragments = immediate_result.unwrap();
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
 
-        let (output_path, html_body) = &fragments[0];
-        assert_eq!(
-            output_path.extension().and_then(|s| s.to_str()),
-            Some("html")
+        let (output_filename, html_body) = &fragments[0];
+        assert!(
+            output_filename.ends_with(".html"),
+            "Output filename should end with .html"
         );
         assert!(
             html_body.contains("Test Document"),

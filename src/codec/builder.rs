@@ -514,7 +514,7 @@ impl GraphBuilder {
                 for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                     let ctx = self
                         .doc_bb
-                        .get_context(bid)
+                        .get_context(&self.repo(), bid)
                         .expect("Set should be balanced here");
                     // Inject proto text into our self set here, because inject context is where the
                     // markdown parser generates section-specific text fields regardless of whether
