@@ -24,7 +24,7 @@ use crate::{
     },
     error::BuildonomyError,
     nodekey::{get_doc_path, href_to_nodekey, to_anchor, NodeKey},
-    paths::{path_join, path_normalize, path_parent},
+    paths::{path_extension, path_join, path_normalize, path_parent},
     properties::{asset_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
@@ -424,19 +424,21 @@ fn check_for_link_and_push(
                     user_words: None,
                 });
 
-            // Normalize dest_url if it contains ../ by resolving against ctx.relative_path
-            let normalized_dest_url = if link_data.dest_url.contains("../")
-                || link_data.dest_url.contains("./")
-            {
+            let normalized_dest_url = if link_data.dest_url.starts_with("/") {
+                tracing::warn!(
+                    "[check_for_link_and_push] noet-core cannot determine what an absolute link \
+                    is in relation to, treating link as absolute relative to our parsing context. \
+                    If this document is in a subnet, this may have surprising effects."
+                );
+                CowStr::from(path_normalize(link_data.dest_url.as_ref()))
+            } else {
                 // Get the directory containing the current document
-                let current_dir = path_parent(&ctx.relative_path);
-
-                // Resolve the relative reference against current directory using URL-safe path_join
-                let resolved = if current_dir.is_empty() {
-                    link_data.dest_url.to_string()
+                let current_dir = if path_extension(&ctx.relative_path).is_none() {
+                    ctx.relative_path.as_ref()
                 } else {
-                    path_join(current_dir, link_data.dest_url.as_ref(), false)
+                    path_parent(&ctx.relative_path)
                 };
+                let resolved = path_join(current_dir, link_data.dest_url.as_ref(), false);
 
                 // Normalize the path (resolve .. and .) using URL-safe path_normalize
                 let normalized = path_normalize(&resolved);
@@ -448,15 +450,9 @@ fn check_for_link_and_push(
                         link_data.dest_url,
                         ctx.relative_path
                     );
-                    // Return the original dest_url - it will be caught and broken during HTML generation
-                    link_data.dest_url.clone()
-                } else {
-                    CowStr::from(normalized)
                 }
-            } else {
-                link_data.dest_url.clone()
+                CowStr::from(normalized)
             };
-
             // Determine the key to use for matching
             // If title attribute contains a Bref, prioritize it
             let key = if let Some(bref) = &title_parts.bref {
@@ -615,19 +611,8 @@ fn check_for_link_and_push(
                 let relative_path_without_anchor = get_doc_path(&relation.relative_path);
                 let ctx_home_doc_path = get_doc_path(&ctx.relative_path);
 
-                // For assets, normalize path to be relative from pages root (for SPA base tag)
-                // For documents, use document-relative paths
-                let relative_path = if is_asset {
-                    // Asset path should be just the path without leading "./"
-                    // e.g., "assets/test_image.png" works with <base href="/pages/">
-                    relative_path_without_anchor
-                        .trim_start_matches("./")
-                        .trim_start_matches("../")
-                        .trim_start_matches("network_1/") // Strip network dir if present
-                        .to_string()
-                } else {
-                    make_relative_path(&ctx.relative_path, relative_path_without_anchor)
-                };
+                let relative_path =
+                    make_relative_path(&ctx.relative_path, relative_path_without_anchor);
 
                 // 2. Add anchor if target is a heading node
                 // Extract anchor from relation.other.id or from home_path
@@ -1319,8 +1304,19 @@ impl DocCodec for MdCodec {
     }
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
-        /// Rewrite document links to .html for HTML output and break invalid backtracking links
-        fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
+        // Rewrite document links to .html for HTML output and break invalid backtracking links
+        let mut relative_path = self
+            .current_events
+            .first()
+            .map(|(proto, _)| proto.path.clone())
+            .unwrap_or_default();
+        if path_extension(&relative_path).is_some() {
+            relative_path = path_parent(&relative_path).to_string();
+        }
+        fn rewrite_md_links_to_html(
+            relative_path: &str,
+            event: MdEvent<'static>,
+        ) -> MdEvent<'static> {
             match event {
                 MdEvent::Start(MdTag::Link {
                     link_type,
@@ -1329,7 +1325,12 @@ impl DocCodec for MdCodec {
                     id,
                 }) => {
                     // Check for invalid backtracking links (detected during context injection)
-                    let url_str = dest_url.to_string();
+                    // Even if dest_url is an anchor path,
+                    let url_str = path_normalize(&path_join(
+                        relative_path,
+                        &dest_url,
+                        dest_url.starts_with('#'),
+                    ));
                     if url_str.starts_with("../") {
                         // Break invalid backtracking link
                         return MdEvent::Start(MdTag::Link {
@@ -1342,19 +1343,27 @@ impl DocCodec for MdCodec {
 
                     let should_rewrite = title.contains("bref://");
                     let new_url = if should_rewrite {
-                        let mut url = url_str;
-                        let codec_extensions = CODECS.extensions();
-                        for ext in codec_extensions.iter() {
-                            if url.ends_with(&format!(".{}", ext)) {
-                                url = url.replace(&format!(".{}", ext), ".html");
-                                break;
+                        // Use anchor-aware extension checking
+                        if let Some(ext) = path_extension(&url_str) {
+                            let codec_extensions = CODECS.extensions();
+                            if codec_extensions.iter().any(|ce| ce == ext) {
+                                // Check if there's an anchor
+                                if let Some(anchor_idx) = url_str.find('#') {
+                                    // Replace extension before anchor: file.md#anchor -> file.html#anchor
+                                    let path_part = &url_str[..anchor_idx];
+                                    let anchor_part = &url_str[anchor_idx..];
+                                    let new_path = path_part.replace(&format!(".{}", ext), ".html");
+                                    CowStr::from(format!("{}{}", new_path, anchor_part))
+                                } else {
+                                    // No anchor: file.md -> file.html
+                                    CowStr::from(url_str.replace(&format!(".{}", ext), ".html"))
+                                }
+                            } else {
+                                dest_url
                             }
-                            if url.contains(&format!(".{}#", ext)) {
-                                url = url.replace(&format!(".{}#", ext), ".html#");
-                                break;
-                            }
+                        } else {
+                            dest_url
                         }
-                        CowStr::from(url)
                     } else {
                         dest_url
                     };
@@ -1429,7 +1438,7 @@ impl DocCodec for MdCodec {
             .current_events
             .iter()
             .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
-            .map(rewrite_md_links_to_html);
+            .map(|e| rewrite_md_links_to_html(&relative_path, e));
 
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);

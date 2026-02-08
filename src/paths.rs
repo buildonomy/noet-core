@@ -288,6 +288,7 @@ pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, Buildonom
 ///
 /// # Examples
 /// ```
+/// use noet_core::paths::path_parent;
 /// assert_eq!(path_parent("dir/file.md"), "dir");
 /// assert_eq!(path_parent("dir/file.md#anchor"), "dir/file.md");
 /// assert_eq!(path_parent("file.md"), "");
@@ -314,6 +315,7 @@ pub fn path_parent(path: &str) -> &str {
 ///
 /// # Examples
 /// ```
+/// use noet_core::paths::path_normalize;
 /// assert_eq!(path_normalize("dir/./file.md"), "dir/file.md");
 /// assert_eq!(path_normalize("dir/sub/../file.md"), "dir/file.md");
 /// assert_eq!(path_normalize("../file.md"), "../file.md"); // Preserved
@@ -349,6 +351,38 @@ pub fn path_normalize(path: &str) -> String {
     }
 
     components.join("/")
+}
+
+/// Get the file extension from a URL path (anchor-aware)
+///
+/// Strips any anchor fragment before extracting the extension.
+///
+/// # Examples
+/// ```
+/// use noet_core::paths::path_extension;
+/// assert_eq!(path_extension("file.md"), Some("md"));
+/// assert_eq!(path_extension("file.md#anchor"), Some("md"));
+/// assert_eq!(path_extension("dir/file.html"), Some("html"));
+/// assert_eq!(path_extension("dir/file.html#section"), Some("html"));
+/// assert_eq!(path_extension("noextension"), None);
+/// assert_eq!(path_extension("noextension#anchor"), None);
+/// ```
+pub fn path_extension(path: &str) -> Option<&str> {
+    // Strip anchor first
+    let path_without_anchor = get_doc_path(path);
+
+    // Find the last dot after the last slash (to avoid ".." in parent dirs)
+    let last_slash = path_without_anchor.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let remaining = &path_without_anchor[last_slash..];
+
+    remaining.rfind('.').and_then(|dot_idx| {
+        let ext = &remaining[dot_idx + 1..];
+        if ext.is_empty() {
+            None
+        } else {
+            Some(ext)
+        }
+    })
 }
 
 impl PathMapMap {

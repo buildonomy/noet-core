@@ -6,6 +6,7 @@ use crate::{
     },
     error::BuildonomyError,
     nodekey::{trim_path_sep, NodeKey},
+    paths::{path_extension, path_parent},
     properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind},
 };
 
@@ -629,17 +630,14 @@ pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
 ///
 /// # Examples
 /// ```
+/// use noet_core::codec::belief_ir::build_title_attribute;
 /// let attr = build_title_attribute("bref://abc123", false, None);
 /// assert_eq!(attr, "bref://abc123");
 ///
 /// let attr = build_title_attribute("bref://abc123", true, Some("My Note"));
 /// assert_eq!(attr, "bref://abc123 {\"auto_title\":true} My Note");
 /// ```
-pub(crate) fn build_title_attribute(
-    bref: &str,
-    auto_title: bool,
-    user_words: Option<&str>,
-) -> String {
+pub fn build_title_attribute(bref: &str, auto_title: bool, user_words: Option<&str>) -> String {
     let mut parts = vec![bref.to_string()];
 
     if auto_title {
@@ -947,6 +945,8 @@ impl ProtoBeliefNode {
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
         let mut changed = self.merge(&mut ProtoBeliefNode::try_from(ctx.node)?);
+        // I don't think this needs to be tracked as a change
+        self.path = ctx.relative_path.clone();
         // We need to fold in and updates to the references stored in our schema so that we can write them out to file here.
         if self.update_schema(ctx)? {
             changed = true;
@@ -1258,7 +1258,7 @@ impl DocCodec for ProtoBeliefNode {
             html.push_str("<p><em>No documents in this network yet.</em></p>\n");
         } else {
             html.push_str("<ul>\n");
-            let mut subdir_stack: Vec<String> = Vec::default();
+            let mut last_subdir: Option<String> = None;
             for (edge, _sort_key) in children {
                 // Convert home_path to HTML link (replace extension with .html)
                 let mut link_path = edge.relative_path.clone();
@@ -1266,13 +1266,30 @@ impl DocCodec for ProtoBeliefNode {
                 // Normalize document links to .html extension
                 let codec_extensions = crate::codec::CODECS.extensions();
                 for ext in codec_extensions.iter() {
-                    if link_path.ends_with(&format!(".{}", ext)) {
+                    if path_extension(&link_path)
+                        .filter(|link_ext| link_ext == ext)
+                        .is_some()
+                    {
                         link_path = link_path.replace(&format!(".{}", ext), ".html");
                         break;
                     }
                 }
 
                 let title = edge.other.display_title();
+                let parent_dir = path_parent(link_path.as_ref()).to_string();
+                if parent_dir.is_empty() {
+                    if last_subdir.is_some() {
+                        last_subdir = None;
+                        html.push_str("</ul>");
+                    }
+                } else {
+                    if let Some(ref last_dir) = last_subdir {
+                        if &parent_dir != last_dir {
+                            html.push_str("</ul><ul>");
+                            last_subdir = Some(parent_dir);
+                        }
+                    }
+                }
 
                 // Get bref for the child node to add to title attribute
                 let bref_attr = ctx
@@ -1295,6 +1312,9 @@ impl DocCodec for ProtoBeliefNode {
                     "  <li><a href=\"/{}\"{}>{}</a></li>\n",
                     link_path, bref_attr, title
                 ));
+            }
+            if last_subdir.is_some() {
+                html.push_str("</ul>\n");
             }
             html.push_str("</ul>\n");
         }
