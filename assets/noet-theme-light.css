@@ -46,6 +46,11 @@
     --noet-link-hover: var(--blue-7);
     --noet-link-visited: var(--purple-6);
 
+    /* Two-click navigation highlight */
+    --noet-highlight-bg: rgba(255, 200, 0, 0.25);
+    --noet-highlight-bg-hover: rgba(255, 200, 0, 0.35);
+    --noet-highlight-border: rgba(255, 180, 0, 0.6);
+
     /* UI element colors */
     --noet-button-bg: var(--gray-2);
     --noet-button-bg-hover: var(--gray-3);

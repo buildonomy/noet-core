@@ -506,7 +506,11 @@ impl FromStr for NodeKey {
                 if let Some(ext) = Path::new(path).extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
                     // If extension is NOT registered in CODECS, it's a static asset
-                    if !CODECS.extensions().contains(&ext_str) {
+                    if !CODECS
+                        .extensions()
+                        .iter()
+                        .any(|ext| ext.as_str() == get_doc_path(&ext_str))
+                    {
                         return asset_namespace();
                     }
                 }

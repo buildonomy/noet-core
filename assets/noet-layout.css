@@ -213,7 +213,7 @@ body {
 }
 
 .noet-content__inner {
-    padding: 0 var(--size-4);
+    padding: var(--size-4);
     background-color: var(--noet-bg-primary);
     min-height: 100%;
 }
@@ -632,6 +632,124 @@ body {
 
 .noet-metadata__field-value {
     color: var(--noet-text-primary);
+}
+
+/* Metadata content sections */
+.noet-metadata-section {
+    margin-bottom: var(--size-5);
+}
+
+.noet-metadata-section h3 {
+    font-size: var(--font-size-2);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-primary);
+    margin-top: 0;
+    margin-bottom: var(--size-3);
+    border-bottom: 1px solid var(--noet-border-secondary);
+    padding-bottom: var(--size-2);
+}
+
+.noet-metadata-section h4 {
+    font-size: var(--font-size-1);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    margin-top: var(--size-3);
+    margin-bottom: var(--size-2);
+}
+
+/* Definition list for metadata fields */
+.noet-metadata-list {
+    margin: 0;
+}
+
+.noet-metadata-list dt {
+    font-size: var(--font-size-0);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    margin-top: var(--size-3);
+    margin-bottom: var(--size-1);
+}
+
+.noet-metadata-list dt:first-child {
+    margin-top: 0;
+}
+
+.noet-metadata-list dd {
+    margin: 0 0 var(--size-2) 0;
+    color: var(--noet-text-primary);
+    word-break: break-word;
+}
+
+.noet-metadata-list dd code {
+    font-size: var(--font-size-0);
+    background: var(--noet-bg-tertiary);
+    padding: var(--size-1) var(--size-2);
+    border-radius: var(--radius-2);
+    font-family: var(--font-mono);
+}
+
+/* Related nodes and links */
+.noet-metadata-count {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    margin: var(--size-2) 0;
+}
+
+.noet-metadata-label {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    margin: var(--size-1) 0;
+}
+
+.noet-metadata-links {
+    list-style: none;
+    padding: 0;
+    margin: var(--size-2) 0;
+}
+
+.noet-metadata-links li {
+    margin-bottom: var(--size-2);
+    padding: var(--size-2);
+    background: var(--noet-bg-tertiary);
+    border-radius: var(--radius-2);
+    display: flex;
+    align-items: center;
+    gap: var(--size-2);
+}
+
+.noet-node-link {
+    color: var(--noet-link-primary);
+    text-decoration: none;
+    font-weight: var(--font-weight-5);
+    flex: 1;
+    min-width: 0;
+}
+
+.noet-node-link:hover {
+    color: var(--noet-link-hover);
+    text-decoration: underline;
+}
+
+.noet-bid-small {
+    font-size: var(--font-size-00);
+    color: var(--noet-text-tertiary);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+}
+
+/* Two-click navigation: Selected link highlight */
+.noet-link-selected {
+    background-color: var(--noet-highlight-bg, rgba(255, 200, 0, 0.3));
+    outline: 2px solid var(--noet-highlight-border, rgba(255, 200, 0, 0.6));
+    outline-offset: 2px;
+    border-radius: var(--radius-2);
+    transition:
+        background-color 0.2s var(--ease-2),
+        outline 0.2s var(--ease-2);
+}
+
+.noet-link-selected:hover {
+    background-color: var(--noet-highlight-bg-hover, rgba(255, 200, 0, 0.4));
 }
 
 /* =========================================================================

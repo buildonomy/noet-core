@@ -617,6 +617,42 @@ pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
 //     Ok(relations)
 // }
 
+/// Builds a title attribute for HTML links containing bref and optional metadata.
+///
+/// The title attribute format is: "bref://[bref] [metadata] [user_words]"
+/// where metadata and user_words are optional.
+///
+/// # Arguments
+/// * `bref` - The bref string (should already include "bref://" prefix)
+/// * `auto_title` - If true, adds {"auto_title":true} metadata
+/// * `user_words` - Optional user-provided text to append
+///
+/// # Examples
+/// ```
+/// let attr = build_title_attribute("bref://abc123", false, None);
+/// assert_eq!(attr, "bref://abc123");
+///
+/// let attr = build_title_attribute("bref://abc123", true, Some("My Note"));
+/// assert_eq!(attr, "bref://abc123 {\"auto_title\":true} My Note");
+/// ```
+pub(crate) fn build_title_attribute(
+    bref: &str,
+    auto_title: bool,
+    user_words: Option<&str>,
+) -> String {
+    let mut parts = vec![bref.to_string()];
+
+    if auto_title {
+        parts.push("{\"auto_title\":true}".to_string());
+    }
+
+    if let Some(words) = user_words {
+        parts.push(words.to_string());
+    }
+
+    parts.join(" ")
+}
+
 /// Detects the schema type based on the file path.
 /// Returns the schema name that can be looked up in the schema registry.
 ///
@@ -1209,16 +1245,12 @@ impl DocCodec for ProtoBeliefNode {
         children.sort_by_key(|(_, sort_key)| *sort_key);
 
         // Generate HTML list of child documents
-        let title = self
-            .document
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Network Index");
+        let title = ctx.node.display_title();
 
         let mut html = String::new();
-        html.push_str(&format!("<h1>{}</h1>\n", title));
+        html.push_str(&format!("<h1>{} Index</h1>\n", title));
 
-        if let Some(description) = self.document.get("description").and_then(|v| v.as_str()) {
+        if let Some(description) = ctx.node.payload.get("description").and_then(|v| v.as_str()) {
             html.push_str(&format!("<p>{}</p>\n", description));
         }
 
@@ -1226,6 +1258,7 @@ impl DocCodec for ProtoBeliefNode {
             html.push_str("<p><em>No documents in this network yet.</em></p>\n");
         } else {
             html.push_str("<ul>\n");
+            let mut subdir_stack: Vec<String> = Vec::default();
             for (edge, _sort_key) in children {
                 // Convert home_path to HTML link (replace extension with .html)
                 let mut link_path = edge.relative_path.clone();
@@ -1240,9 +1273,27 @@ impl DocCodec for ProtoBeliefNode {
                 }
 
                 let title = edge.other.display_title();
+
+                // Get bref for the child node to add to title attribute
+                let bref_attr = ctx
+                    .belief_set()
+                    .brefs()
+                    .iter()
+                    .find_map(|(bref, bid)| {
+                        if bid == &edge.other.bid {
+                            Some(format!(
+                                " title=\"{}\"",
+                                build_title_attribute(&format!("bref://{}", bref), false, None)
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
                 html.push_str(&format!(
-                    "  <li><a href=\"/{}\">{}</a></li>\n",
-                    link_path, title
+                    "  <li><a href=\"/{}\"{}>{}</a></li>\n",
+                    link_path, bref_attr, title
                 ));
             }
             html.push_str("</ul>\n");

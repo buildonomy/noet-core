@@ -44,7 +44,7 @@ use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
     nodekey::NodeKey,
     properties::{
-        asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefNode, Bid,
+        asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefNode, Bid, Bref,
         WeightKind, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, StatePred},
@@ -403,6 +403,41 @@ impl BeliefBaseWasm {
     #[wasm_bindgen]
     pub fn node_count(&self) -> usize {
         self.inner.borrow().states().len()
+    }
+
+    /// Get BID from a bref string
+    ///
+    /// Returns the BID corresponding to the given bref, or null if not found.
+    ///
+    /// # JavaScript Example
+    /// ```javascript
+    /// const bid = bb.get_bid_from_bref("abc123456789");
+    /// if (bid) {
+    ///     const node = bb.get_by_bid(bid);
+    ///     console.log(node.title);
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_bid_from_bref(&self, bref: String) -> JsValue {
+        let bref = match Bref::try_from(bref.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                console::warn_1(&format!("⚠️ Invalid bref format: {}", bref).into());
+                return JsValue::NULL;
+            }
+        };
+
+        let inner = self.inner.borrow();
+        match inner.brefs().get(&bref) {
+            Some(bid) => {
+                console::log_1(&format!("✅ Resolved bref to BID: {}", bid).into());
+                JsValue::from_str(&bid.to_string())
+            }
+            None => {
+                console::warn_1(&format!("⚠️ Bref not found: {}", bref).into());
+                JsValue::NULL
+            }
+        }
     }
 
     /// Get all network nodes (convenience wrapper around query)

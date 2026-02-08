@@ -172,6 +172,21 @@
                 log('✅ WASM initialized successfully', 'pass');
 
                 // Load beliefbase.json
+                log('Fetching index.html to extract entry point metadata...', 'info');
+                const indexResponse = await fetch('./test-output/index.html');
+                assert(indexResponse.ok, 'index.html exists and is accessible');
+
+                const indexHtml = await indexResponse.text();
+                const parser = new DOMParser();
+                const indexDoc = parser.parseFromString(indexHtml, 'text/html');
+                const metadataScript = indexDoc.getElementById('noet-metadata');
+                assert(metadataScript, 'Metadata script tag found in index.html');
+
+                const metadataJson = metadataScript.textContent;
+                const documentMetadata = JSON.parse(metadataJson);
+                assert(documentMetadata.bid, 'Entry point BID found in metadata');
+                log(`Entry point BID: ${documentMetadata.bid}`, 'info');
+
                 log('Fetching beliefbase.json...', 'info');
                 const response = await fetch('./test-output/beliefbase.json');
                 assert(response.ok, 'beliefbase.json exists and is accessible');
@@ -181,7 +196,7 @@
 
                 // Create BeliefBase from JSON
                 log('Creating BeliefBaseWasm from JSON...', 'info');
-                const bb = new BeliefBaseWasm(json);
+                const bb = new BeliefBaseWasm(json, metadataJson);
                 log('✅ BeliefBaseWasm created successfully', 'pass');
 
                 // Test 1: Node count
@@ -277,8 +292,8 @@
                     assert(ctx.node !== undefined, 'NodeContext has node field');
                     assertEqual(ctx.node.bid, doc.bid, 'NodeContext.node has correct BID');
 
-                    assert(typeof ctx.home_path === 'string', 'NodeContext has home_path string');
-                    log(`Home path: ${ctx.home_path}`, 'info');
+                    assert(typeof ctx.relative_path === 'string', 'NodeContext has relative_path string');
+                    log(`Relative path: ${ctx.relative_path}`, 'info');
 
                     assert(typeof ctx.home_net === 'string', 'NodeContext has home_net string');
                     log(`Home network: ${ctx.home_net}`, 'info');

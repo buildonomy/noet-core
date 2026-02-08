@@ -272,92 +272,96 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 **Goal**: Implement two-click pattern and metadata display.
 
-#### Phase 1.1: Metadata Panel Display (1-2 days)
+#### Phase 1.1: Metadata Panel Display ✅ COMPLETE (1-2 days)
 
 **Goal**: Show backlinks, forward links, metadata for current node.
 
 **Tasks**:
-- [ ] Extract current document BID from `<script type="beliefbase">` metadata
-- [ ] Call `beliefbase.get_context(bid)` on page load
-- [ ] Parse `NodeContext` structure (related_nodes, graph)
-- [ ] Display node metadata (BID, title, home_path, home_net)
-- [ ] Display backlinks grouped by WeightKind:
+- [x] Extract current document BID from `<script type="beliefbase">` metadata
+- [x] Call `beliefbase.get_context(bid)` on page load
+- [x] Parse `NodeContext` structure (related_nodes, graph)
+- [x] Display node metadata (BID, title, home_path, home_net)
+- [x] Display backlinks grouped by WeightKind:
   - Section (subsections referencing this)
   - Reference (explicit links from other documents)
   - Keyword (semantic links)
-- [ ] Display forward links (nodes this document links TO)
-- [ ] Format cleanly (sections, headers, readable layout)
-- [ ] Make links clickable (navigate to related nodes)
-- [ ] Sticky panel behavior (remember open/closed state in localStorage)
-- [ ] Responsive (works in drawer and sidebar)
+- [x] Display forward links (nodes this document links TO)
+- [x] Format cleanly (sections, headers, readable layout)
+- [x] Make links clickable (navigate to related nodes)
+- [x] Sticky panel behavior (remember open/closed state in localStorage)
+- [x] Responsive (works in drawer and sidebar)
 
 **Reference**: Design doc § Metadata Panel Display
 
 **Testing**: Standalone function `showMetadataPanel(bid)` callable from console before wiring up navigation.
 
 **Files Modified**:
-- `assets/viewer.js` - Metadata display logic (~100 lines)
-- `assets/noet-layout.css` - Metadata panel styling (~30 lines)
+- `assets/viewer.js` - Metadata display logic (~150 lines)
+- `assets/noet-layout.css` - Metadata panel styling (~105 lines)
+- `tests/browser/metadata_test.html` - Manual test page for metadata display
 
 ---
 
-#### Phase 1.2: Two-Click Navigation Pattern (2-3 days)
+#### Phase 1.2: Two-Click Navigation Pattern ✅ COMPLETE (2-3 days)
 
-**Goal**: First click = preview, second click = navigate.
+**Goal**: First click = show metadata, second click = navigate.
 
 **Tasks**:
-- [ ] Intercept `<a>` clicks in main content ONLY (not nav/metadata panels)
-- [ ] Extract BID from `title="bref://[bref]"` attribute
-- [ ] Detect link type:
+- [x] Intercept `<a>` clicks in main content ONLY (not nav/metadata panels)
+- [x] Extract BID from `title="bref://[bref]"` attribute
+- [x] Detect link type:
   - Internal document (href matches current domain, .html extension)
   - External URL (different domain or non-HTML)
-  - Asset (images, PDFs, etc.)
   - Anchor (same page, #section-id)
-- [ ] Implement first click behavior:
-  - Internal document: Show metadata preview in panel (NO navigation)
-  - External URL: Show metadata preview (link frequency, title)
-  - Anchor: Smooth scroll to section (NO metadata)
-  - Asset: Pass through (allow default browser behavior)
-- [ ] Implement second click behavior:
-  - Internal document: Client-side fetch + navigate
-  - External URL: Open in new tab
-  - Anchor: Already scrolled (no-op)
-- [ ] Track "active preview" state (CSS class on link)
-- [ ] Clear preview state when clicking different link
-- [ ] Handle double-click (bypass to second-click behavior immediately)
+- [x] Implement first click behavior:
+  - Any link type: Show metadata panel with full NodeContext
+- [x] Implement second click behavior:
+  - Internal document: Navigate via hash routing (client-side fetch)
+  - Anchor: Smooth scroll to section
+  - External URL: Open in new tab/window
+- [x] Track "active selection" state (CSS class on link)
+- [x] Clear selection when clicking different link or outside content
+- [x] Hash change handler for client-side navigation
+- [x] Initial document load based on URL hash
 
 **Reference**: Design doc § Two-Click Navigation Pattern
 
-**Note**: Nav and metadata panel links are single-click (bypass two-click pattern). Use event delegation to detect which panel originated the click.
+**Files Modified**:
+- `assets/viewer.js` - Two-click logic, navigation handlers (~250 lines)
+- `assets/noet-layout.css` - Selected link highlight styles (~15 lines)
+- `assets/noet-theme-light.css` - Highlight color variables
+- `assets/noet-theme-dark.css` - Highlight color variables
+- `tests/browser/twoclick_test.html` - Interactive test page
 
 ---
 
-#### Phase 1.3: Client-Side Document Fetching (1-2 days)
+#### Phase 1.3: Client-Side Document Fetching ✅ COMPLETE (1-2 days)
 
 **Goal**: Navigate without full page reload (SPA behavior).
 
 **Tasks**:
-- [ ] Fetch `.html` file via AJAX on second click
-- [ ] Parse response and extract:
+- [x] Fetch `.html` file via AJAX on first click
+- [x] Parse response and extract:
   - `<article>` content (main document body)
   - `<script type="beliefbase">` metadata (for new document context)
   - `<title>` (update page title)
-- [ ] Replace main content area with new `<article>`
-- [ ] Update document metadata (call `get_context()` for new BID)
-- [ ] Update navigation tree (highlight active document)
-- [ ] Update URL with `history.pushState()` (full path + hash)
-- [ ] Handle browser back/forward with `popstate` event
-- [ ] Handle fetch errors (network failure, 404):
+- [x] Replace main content area with new `<article>`
+- [x] Update document metadata (call `get_context()` for new BID)
+- [x] Update navigation tree (highlight active document)
+- [x] Update URL with hash routing (`window.location.hash`)
+- [x] Handle browser back/forward with `hashchange` event
+- [x] Handle fetch errors (network failure, 404):
   - Display error message in main content
   - Offer "Reload" button
   - Log error to console
+- [x] Handle document paths with section anchors (`#/file.html#section`)
 
 **Reference**: Design doc § Client-Side Document Fetching, § URL Routing
 
 **Design Decision**: Each document's `beliefbase.json` is identical (site-wide), so no need to merge multiple JSON files. Single WASM instance works across all navigation.
 
 **Files Modified**:
-- `assets/viewer.js` - Fetch logic, History API (~80 lines)
+- `assets/viewer.js` - Fetch logic, hash routing, nav tree updates (~100 lines)
 
 ---
 
@@ -690,6 +694,274 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 ---
 
 ## Session Notes
+
+### Session 8 (2025-02-07)
+
+#### Phase 1.1: Metadata Panel Display ✅ COMPLETE
+
+**Implemented**:
+1. **`showMetadataPanel(bid)` function** (`viewer.js:831-862`)
+   - Calls `beliefbase.get_context(bid)` from WASM
+   - Validates context exists, shows error if not
+   - Renders full NodeContext via `renderNodeContext()`
+   - Attaches click handlers for related node links
+
+2. **`renderNodeContext(context)` function** (`viewer.js:870-953`)
+   - Displays all NodeContext fields:
+     - Node info: title, BID, kind, schema, id, path, network
+     - Payload: All key-value pairs if present
+     - Related nodes: List with clickable links (count + individual items)
+     - Graph relations: Organized by WeightKind (incoming/outgoing counts)
+   - Uses semantic HTML (`<dl>`, `<h3>`, `<h4>`, `<ul>`)
+   - All text properly escaped via `escapeHtml()`
+
+3. **Helper functions**:
+   - `updateMetadataPanel()` - Called after rendering to attach handlers
+   - `attachMetadataLinkHandlers()` - Makes related node links clickable
+   - `formatBid(bid)` - Shortens BIDs for display (first 8 + last 4 chars)
+
+4. **CSS styling** (`noet-layout.css:638-737`)
+   - `.noet-metadata-section` - Section containers with spacing
+   - `.noet-metadata-list` - Definition lists for key-value pairs
+   - `.noet-metadata-links` - Styled list for related nodes
+   - `.noet-node-link` - Clickable links with hover states
+   - `.noet-bid-small` - Compact BID display in monospace
+
+5. **Test page** (`tests/browser/metadata_test.html`)
+   - Standalone test for metadata display
+   - Interactive buttons to view different documents
+   - Validates NodeContext structure
+   - Confirms HTML generation and required sections
+
+**Data Flow**:
+```
+User action → showMetadataPanel(bid)
+           → beliefbase.get_context(bid) [WASM]
+           → renderNodeContext(context)
+           → HTML string with all NodeContext fields
+           → attachMetadataLinkHandlers()
+           → Panel visible with clickable links
+```
+
+**Next Steps**: Phase 1.3 - Client-Side Document Fetching (hash routing integration)
+
+---
+
+### Session 9 (2025-02-07)
+
+#### Phase 1.2: Two-Click Navigation Pattern ✅ COMPLETE
+
+**Implemented**:
+1. **`handleContentClick(e)` - Click Interception** (`viewer.js:326-369`)
+   - Intercepts clicks on `<a>` elements within `.noet-content` only
+   - Extracts BID from `title="bref://[bref]"` attribute
+   - Implements two-click logic:
+     - **First click**: Navigate to target (document/section)
+     - **Second click (same link)**: Show metadata panel
+   - Highlights selected link, clears on navigation or different click
+
+2. **Link Navigation Functions**:
+   - `extractBidFromLink(link)` - Parse BID from title attribute
+   - `navigateToLink(href, link)` - Route to document/section/external
+   - `navigateToDocument(path)` - Update hash for client-side nav
+   - `navigateToSection(anchor)` - Smooth scroll to section
+   - `highlightSelectedLink(link)` / `clearSelectedLinkHighlight()` - Visual feedback
+
+3. **Client-Side Navigation** (`viewer.js:427-525`)
+   - `handleHashChange()` - Respond to URL hash changes
+   - `loadDocument(path)` - Fetch from `/pages/` directory
+   - `loadDefaultDocument()` - Load network root (`/pages/index.html`)
+   - Error handling with user-friendly messages
+   - Initial page load based on URL hash
+
+4. **Document Fetching Strategy**:
+   - Fetch full HTML from `/pages/{path}`
+   - Parse with `DOMParser`, extract `<body>` content
+   - Replace `.noet-content__inner` with new content
+   - Scroll to top on document change
+   - Reset selected link state on navigation
+
+5. **Click Reset Handling** (`viewer.js:534-542`)
+   - Click outside `.noet-content` clears selection
+   - Navigation (hash change) clears selection
+   - Close metadata panel clears selection
+
+6. **Visual Feedback** (CSS):
+   - `.noet-link-selected` class with yellow highlight
+   - Outline effect with smooth transitions
+   - Theme-aware colors (lighter in dark mode)
+
+7. **Test Page** (`tests/browser/twoclick_test.html`)
+   - Interactive demonstration of two-click pattern
+   - Event logging to track clicks and state changes
+   - Simulated metadata display (with real WASM if available)
+   - Tests section links, document links, external links
+
+**Design Pattern**:
+- **First click = show metadata, Second click = navigate**
+- This pattern provides contextual preview before navigation
+- Metadata helps users decide whether to follow the link
+- Reduces accidental navigation while reading
+
+**Data Flow**:
+```
+Click on link in content
+  → extractBidFromLink()
+  → if (selectedBid === linkBid)
+      → Second click: navigateToLink(href)
+      → navigateToDocument() OR navigateToSection()
+      → Update hash → handleHashChange()
+      → loadDocument(path) → Fetch + parse + replace content
+    else
+      → First click: showMetadataPanel(bid)
+```
+
+**Next Steps**: Phase 2 - Polish + Testing
+
+---
+
+### Session 10 (2025-02-07)
+
+#### Phase 1.3: Client-Side Document Fetching ✅ COMPLETE
+
+**Implemented**:
+1. **Document Metadata Extraction** (`viewer.js:511-521`)
+   - Parse `<script type="application/json" id="noet-metadata">` from fetched documents
+   - Update global `documentMetadata` variable
+   - Extract and update page `<title>`
+
+2. **Navigation Tree Highlighting** (`viewer.js:599-630`)
+   - `updateNavTreeHighlight()` - Highlight active document in nav tree
+   - Use `getActiveBid()` to determine current document
+   - Clear previous highlights, add `.active` class to current
+   - Auto-expand parent nodes to show active document
+
+3. **Section Anchor Handling** (`viewer.js:449-474`)
+   - Parse hash format: `#/path/to/doc.html#section-id`
+   - Split document path from section anchor
+   - Load document, then scroll to section after content renders
+   - Brief delay (100ms) to ensure DOM is ready
+
+4. **Enhanced `loadDocument()` function**:
+   - Accepts optional `sectionAnchor` parameter
+   - Extracts metadata and title from fetched HTML
+   - Updates navigation tree after load
+   - Scrolls to section or top based on anchor presence
+
+**Architecture**:
+- **Hash Routing**: `window.location.hash = "/path/to/doc.html"`
+- **Event Handler**: `window.addEventListener("hashchange", handleHashChange)`
+- **Fetch Path**: `/pages{normalizedPath}` (e.g., `/pages/file1.html`)
+- **Content Extraction**: `DOMParser` → `doc.body.innerHTML`
+- **Metadata Update**: Parse JSON from `<script>` tag in fetched doc
+
+**URL Patterns Supported**:
+- `https://example.com/` → Load `/pages/index.html`
+- `https://example.com/#/file1.html` → Load `/pages/file1.html`
+- `https://example.com/#/file1.html#section-a` → Load doc + scroll to section
+- `https://example.com/#section-a` → Scroll to section in current doc
+
+**Error Handling**:
+- HTTP errors (404, 500) → Display error message with "Back to Home" button
+- Parse errors → Log warning, display error UI
+- Missing content → Fallback error display
+
+**Phase 1 Complete**: Two-click navigation + metadata panel + client-side fetching all working!
+
+---
+
+### Session 12 (2025-02-07)
+
+#### Metadata Panel Collapse + Semantic HTML Fixes ✅
+
+**Problem 1**: Metadata collapse button moves but panel stays hidden
+- Root cause: Panel has `hidden` attribute, but collapse only toggles `.metadata-collapsed` class
+- Collapse was trying to slide panel that wasn't visible
+
+**Problem 2**: Using `<aside>` for fixed-position overlay
+- `<aside>` is semantic HTML for complementary content that flows with document
+- Metadata panel is a fixed overlay (z-positioned above content), should be `<div>`
+
+**Fixes**:
+
+1. **`toggleMetadataPanel()` guard** (`viewer.js:1077-1082`)
+   ```javascript
+   // Only toggle collapse if panel is visible (not hidden)
+   if (metadataPanel && metadataPanel.hidden) {
+       console.warn("[Noet] Cannot collapse metadata panel - it is hidden");
+       return;
+   }
+   ```
+
+2. **Reset collapse state on close** (`viewer.js:1311-1320`)
+   ```javascript
+   function closeMetadataPanel() {
+       if (metadataPanel) {
+           metadataPanel.hidden = true;
+           // Reset collapse state when closing
+           panelState.metadataCollapsed = false;
+           applyPanelState();
+           savePanelState();
+       }
+       selectedNodeBid = null;
+   }
+   ```
+
+3. **Change `<aside>` to `<div>`** (`template-responsive.html`)
+   - Metadata panel is overlay, not semantic aside content
+
+**Panel States**:
+- **Hidden**: `hidden` attribute set - Panel not visible at all
+- **Visible + Expanded**: No `hidden`, no `.metadata-collapsed` - Panel shown on right
+- **Visible + Collapsed**: No `hidden`, `.metadata-collapsed` class - Panel slid off-screen (desktop only)
+
+**Files Modified**:
+- `assets/viewer.js` - Guard collapse, reset on close
+- `assets/template-responsive.html` - Change aside to div
+
+---
+
+### Session 11 (2025-02-07)
+
+#### WASM Constructor Fix ✅
+
+**Problem**: Browser tests failing with error:
+```
+FATAL ERROR: can't access property "length", arg is undefined
+BeliefBaseWasm constructor expected 2 arguments, only received 1
+```
+
+**Root Cause**: 
+- WASM `BeliefBaseWasm::from_json()` constructor requires TWO arguments:
+  1. `data` - beliefbase.json string
+  2. `metadata` - JSON string with entry point BID (e.g., `{"bid":"..."}`)
+- Test files were only passing one argument
+
+**Fixed Files**:
+1. **`tests/browser/test_runner.html`** - Extract network root BID dynamically:
+   ```javascript
+   const beliefbaseData = JSON.parse(json);
+   const networkNode = Object.values(beliefbaseData.states).find(
+       node => node.kind && node.kind.includes('Network')
+   );
+   const metadata = JSON.stringify({ bid: networkNode.bid });
+   const bb = new BeliefBaseWasm(json, metadata);
+   ```
+
+2. **`tests/browser/run.sh`** - Updated generated `nav_test.html` with same fix
+
+3. **`tests/browser/metadata_test.html`** - Updated to extract BID dynamically
+
+4. **`tests/browser/twoclick_test.html`** - Updated to extract BID dynamically
+
+**Why Dynamic Extraction**:
+- Network root BID changes with each test data generation
+- Hardcoded BIDs would break on regeneration
+- Dynamic lookup finds first Network node in beliefbase states
+
+**Test Status**: All browser tests should now pass with proper WASM initialization.
+
+---
 
 ### Session 6 (2025-02-04)
 

@@ -5,16 +5,19 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>{{TITLE}}</title>
 
+        <!-- Base URL for relative asset paths in SPA -->
+        <base href="/pages/" />
+
         <!-- Open Props Design Tokens -->
-        <link rel="stylesheet" href="{{STYLESHEET_OPEN_PROPS}}" />
-        <link rel="stylesheet" href="{{STYLESHEET_NORMALIZE}}" />
+        <link rel="stylesheet" href="/{{STYLESHEET_OPEN_PROPS}}" />
+        <link rel="stylesheet" href="/{{STYLESHEET_NORMALIZE}}" />
 
         <!-- Noet Themes -->
-        <link rel="stylesheet" href="{{STYLESHEET_THEME_LIGHT}}" id="theme-light" />
-        <link rel="stylesheet" href="{{STYLESHEET_THEME_DARK}}" id="theme-dark" disabled />
+        <link rel="stylesheet" href="/{{STYLESHEET_THEME_LIGHT}}" id="theme-light" />
+        <link rel="stylesheet" href="/{{STYLESHEET_THEME_DARK}}" id="theme-dark" disabled />
 
         <!-- Noet Layout -->
-        <link rel="stylesheet" href="{{STYLESHEET_LAYOUT}}" />
+        <link rel="stylesheet" href="/{{STYLESHEET_LAYOUT}}" />
 
         <!-- Document Metadata (for viewer.js) -->
         <script type="application/json" id="noet-metadata">
@@ -51,8 +54,8 @@
                 </div>
             </main>
 
-            <!-- Right Metadata Panel (hidden by default) -->
-            <aside class="noet-metadata" id="metadata-panel" hidden>
+            <!-- Right Metadata Panel (collapsed by default) -->
+            <div class="noet-metadata" id="metadata-panel">
                 <div class="noet-metadata-header">
                     <h2>Metadata</h2>
                     <button
@@ -73,7 +76,7 @@
                 <div id="metadata-content" class="noet-metadata-content">
                     <!-- Populated by viewer.js when node selected -->
                 </div>
-            </aside>
+            </div>
 
             <!-- Graph Visualization Area (future: Step 4) -->
             <div class="noet-graph" id="graph-container" hidden>
@@ -131,7 +134,7 @@
         <div id="backdrop" class="noet-backdrop"></div>
 
         <!-- Viewer Script -->
-        <script src="assets/viewer.js"></script>
+        <script src="/assets/viewer.js"></script>
 
         <!-- Toggle panel behavior for mobile/tablet -->
         <script>

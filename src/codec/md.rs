@@ -10,7 +10,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem::replace,
     ops::Range,
-    path::{Path, PathBuf},
     result::Result,
     str::FromStr,
 };
@@ -20,12 +19,13 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        belief_ir::{detect_schema_from_path, ProtoBeliefNode},
-        DocCodec,
+        belief_ir::{build_title_attribute, detect_schema_from_path, ProtoBeliefNode},
+        DocCodec, CODECS,
     },
     error::BuildonomyError,
     nodekey::{get_doc_path, href_to_nodekey, to_anchor, NodeKey},
-    properties::{BeliefNode, Bid, Bref, Weight, WeightKind},
+    paths::{path_join, path_normalize, path_parent},
+    properties::{asset_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
 pub use pulldown_cmark;
@@ -306,23 +306,6 @@ fn parse_title_attribute(title: &str) -> TitleAttributeParts {
 /// ```
 ///
 /// Note: This function is tested via unit tests in the `tests` module.
-pub(crate) fn build_title_attribute(
-    bref: &str,
-    auto_title: bool,
-    user_words: Option<&str>,
-) -> String {
-    let mut parts = vec![bref.to_string()];
-
-    if auto_title {
-        parts.push("{\"auto_title\":true}".to_string());
-    }
-
-    if let Some(words) = user_words {
-        parts.push(words.to_string());
-    }
-
-    parts.join(" ")
-}
 
 /// Calculate relative path from source document to target document.
 ///
@@ -349,21 +332,47 @@ pub(crate) fn build_title_attribute(
 ///
 /// Note: This function is tested via unit tests in the `tests` module.
 pub(crate) fn make_relative_path(from_path: &str, to_path: &str) -> String {
+    // URL-safe path manipulation (no PathBuf to avoid Windows path separator issues)
+
     // Get the directory containing the source document
-    let from_dir = Path::new(from_path)
-        .parent()
-        .unwrap_or_else(|| Path::new(""));
+    let from_dir = path_parent(from_path);
 
-    let to = Path::new(to_path);
+    // Split paths into components
+    let from_parts: Vec<&str> = if from_dir.is_empty() {
+        vec![]
+    } else {
+        from_dir.split('/').collect()
+    };
+    let to_parts: Vec<&str> = to_path.split('/').collect();
 
-    // Calculate relative path from source directory to target
-    let relative = pathdiff::diff_paths(to, from_dir)
-        .unwrap_or_else(|| to.to_path_buf())
-        .to_string_lossy()
-        .to_string();
+    // Find common prefix length
+    let mut common_len = 0;
+    for (i, (from_part, to_part)) in from_parts.iter().zip(to_parts.iter()).enumerate() {
+        if from_part == to_part {
+            common_len = i + 1;
+        } else {
+            break;
+        }
+    }
 
-    // Normalize to forward slashes for Markdown/URL compatibility across platforms
-    relative.replace('\\', "/")
+    // Build relative path
+    let mut result = Vec::new();
+
+    // Add ../ for each remaining directory in from_path
+    for _ in common_len..from_parts.len() {
+        result.push("..");
+    }
+
+    // Add remaining parts of to_path
+    for part in &to_parts[common_len..] {
+        result.push(*part);
+    }
+
+    if result.is_empty() {
+        to_path.to_string()
+    } else {
+        result.join("/")
+    }
 }
 
 #[tracing::instrument(skip_all)]
@@ -415,16 +424,49 @@ fn check_for_link_and_push(
                     user_words: None,
                 });
 
+            // Normalize dest_url if it contains ../ by resolving against ctx.relative_path
+            let normalized_dest_url = if link_data.dest_url.contains("../")
+                || link_data.dest_url.contains("./")
+            {
+                // Get the directory containing the current document
+                let current_dir = path_parent(&ctx.relative_path);
+
+                // Resolve the relative reference against current directory using URL-safe path_join
+                let resolved = if current_dir.is_empty() {
+                    link_data.dest_url.to_string()
+                } else {
+                    path_join(current_dir, link_data.dest_url.as_ref(), false)
+                };
+
+                // Normalize the path (resolve .. and .) using URL-safe path_normalize
+                let normalized = path_normalize(&resolved);
+
+                // Check if normalized path backtracks above root (starts with ../)
+                if normalized.starts_with("../") || normalized == ".." {
+                    tracing::warn!(
+                        "[check_for_link_and_push] SECURITY: Link '{}' backtracks beyond repository root from '{}' - will be broken in HTML output",
+                        link_data.dest_url,
+                        ctx.relative_path
+                    );
+                    // Return the original dest_url - it will be caught and broken during HTML generation
+                    link_data.dest_url.clone()
+                } else {
+                    CowStr::from(normalized)
+                }
+            } else {
+                link_data.dest_url.clone()
+            };
+
             // Determine the key to use for matching
             // If title attribute contains a Bref, prioritize it
             let key = if let Some(bref) = &title_parts.bref {
                 NodeKey::Bref { bref: bref.clone() }
             } else {
-                // Otherwise parse from dest_url as before
+                // Otherwise parse from normalized dest_url
                 let title = CowStr::from(link_text.clone());
                 if let Some((parsed_key, _)) = link_to_relation(
                     &link_data.link_type,
-                    &link_data.dest_url,
+                    &normalized_dest_url,
                     &title,
                     &link_data.id,
                 ) {
@@ -486,7 +528,6 @@ fn check_for_link_and_push(
             let keys = vec![regularized];
 
             // DEBUG: Asset link tracing
-            use crate::properties::asset_namespace;
             let is_asset = if let NodeKey::Path { net, path } = &key {
                 if *net == asset_namespace() {
                     tracing::info!(
@@ -511,25 +552,51 @@ fn check_for_link_and_push(
                 }
             }
 
+            // Check both sources (upstream) and sinks (downstream) for the link target
+            // Assets are typically sink-owned (downstream), while document links are sources (upstream)
             let sources = ctx.sources();
+            let sinks = ctx.sinks();
+
             let maybe_keyed_relation = keys.iter().find_map(|link_key| {
-                sources.iter().find(|rel| {
-                    rel.other
-                        .keys(Some(ctx.home_net), None, ctx.belief_set())
-                        .iter()
-                        .any(|ctx_source_key| ctx_source_key == link_key)
-                })
+                // First check sources (upstream relations - documents linking TO this node)
+                sources
+                    .iter()
+                    .find(|rel| {
+                        rel.other
+                            .keys(Some(ctx.home_net), None, ctx.belief_set())
+                            .iter()
+                            .any(|ctx_source_key| ctx_source_key == link_key)
+                    })
+                    .or_else(|| {
+                        // Then check sinks (downstream relations - things this document links TO, like assets)
+                        sinks.iter().find(|rel| {
+                            rel.other
+                                .keys(Some(ctx.home_net), None, ctx.belief_set())
+                                .iter()
+                                .any(|ctx_sink_key| ctx_sink_key == link_key)
+                        })
+                    })
             });
 
             if is_asset {
                 if maybe_keyed_relation.is_some() {
-                    tracing::info!("[check_for_link_and_push] Asset link FOUND in sources");
+                    tracing::info!("[check_for_link_and_push] Asset link FOUND");
                 } else {
-                    tracing::info!("[check_for_link_and_push] Asset link NOT FOUND in sources");
+                    tracing::info!("[check_for_link_and_push] Asset link NOT FOUND");
                     tracing::info!(
-                        "[check_for_link_and_push] Available sources: {}",
-                        sources.len()
+                        "[check_for_link_and_push] Available sources: {}, sinks: {}",
+                        sources.len(),
+                        sinks.len()
                     );
+                    tracing::info!("[check_for_link_and_push] Looking for keys: {:?}", keys);
+                    if !sinks.is_empty() {
+                        tracing::info!(
+                            "[check_for_link_and_push] Sink keys: {:?}",
+                            sinks[0]
+                                .other
+                                .keys(Some(ctx.home_net), None, ctx.belief_set())
+                        );
+                    }
                 }
             }
 
@@ -547,8 +614,20 @@ fn check_for_link_and_push(
                 // Strip any existing anchor from home_path to avoid double anchors
                 let relative_path_without_anchor = get_doc_path(&relation.relative_path);
                 let ctx_home_doc_path = get_doc_path(&ctx.relative_path);
-                let relative_path =
-                    make_relative_path(&ctx.relative_path, relative_path_without_anchor);
+
+                // For assets, normalize path to be relative from pages root (for SPA base tag)
+                // For documents, use document-relative paths
+                let relative_path = if is_asset {
+                    // Asset path should be just the path without leading "./"
+                    // e.g., "assets/test_image.png" works with <base href="/pages/">
+                    relative_path_without_anchor
+                        .trim_start_matches("./")
+                        .trim_start_matches("../")
+                        .trim_start_matches("network_1/") // Strip network dir if present
+                        .to_string()
+                } else {
+                    make_relative_path(&ctx.relative_path, relative_path_without_anchor)
+                };
 
                 // 2. Add anchor if target is a heading node
                 // Extract anchor from relation.other.id or from home_path
@@ -1240,7 +1319,7 @@ impl DocCodec for MdCodec {
     }
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
-        /// Rewrite document links to .html for HTML output
+        /// Rewrite document links to .html for HTML output and break invalid backtracking links
         fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
                 MdEvent::Start(MdTag::Link {
@@ -1249,10 +1328,22 @@ impl DocCodec for MdCodec {
                     title,
                     id,
                 }) => {
+                    // Check for invalid backtracking links (detected during context injection)
+                    let url_str = dest_url.to_string();
+                    if url_str.starts_with("../") {
+                        // Break invalid backtracking link
+                        return MdEvent::Start(MdTag::Link {
+                            link_type,
+                            dest_url: CowStr::from("#"),
+                            title: CowStr::from("⚠️ Invalid link - backtracks beyond repository"),
+                            id,
+                        });
+                    }
+
                     let should_rewrite = title.contains("bref://");
                     let new_url = if should_rewrite {
-                        let mut url = dest_url.to_string();
-                        let codec_extensions = crate::codec::CODECS.extensions();
+                        let mut url = url_str;
+                        let codec_extensions = CODECS.extensions();
                         for ext in codec_extensions.iter() {
                             if url.ends_with(&format!(".{}", ext)) {
                                 url = url.replace(&format!(".{}", ext), ".html");
@@ -1271,6 +1362,33 @@ impl DocCodec for MdCodec {
                     MdEvent::Start(MdTag::Link {
                         link_type,
                         dest_url: new_url,
+                        title,
+                        id,
+                    })
+                }
+                MdEvent::Start(MdTag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => {
+                    // Check for invalid backtracking images (detected during context injection)
+                    let url_str = dest_url.to_string();
+                    if url_str.starts_with("../") {
+                        // Break invalid backtracking image with red X data URI
+                        let data_uri = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M2 2 L14 14 M14 2 L2 14' stroke='%23ff0000' stroke-width='2'/%3E%3C/svg%3E";
+                        return MdEvent::Start(MdTag::Image {
+                            link_type,
+                            dest_url: CowStr::from(data_uri),
+                            title: CowStr::from("⚠️ Invalid image - backtracks beyond repository"),
+                            id,
+                        });
+                    }
+
+                    // Images don't need link rewriting, pass through unchanged
+                    MdEvent::Start(MdTag::Image {
+                        link_type,
+                        dest_url,
                         title,
                         id,
                     })
@@ -1294,18 +1412,15 @@ impl DocCodec for MdCodec {
         let output_filename = if source_path.is_empty() {
             "document.html".to_string()
         } else {
-            let filename = PathBuf::from(source_path)
-                .file_name()
-                .ok_or_else(|| {
-                    BuildonomyError::Codec("Cannot extract filename from path".to_string())
-                })?
-                .to_string_lossy()
-                .to_string();
+            // Extract filename using URL-safe string manipulation (no PathBuf)
+            let filename = source_path.rsplit('/').next().ok_or_else(|| {
+                BuildonomyError::Codec("Cannot extract filename from path".to_string())
+            })?;
 
             if let Some(stem) = filename.strip_suffix(".md") {
                 format!("{}.html", stem)
             } else {
-                filename
+                filename.to_string()
             }
         };
 

@@ -297,7 +297,21 @@ impl<'a> ExtendedRelation<'a> {
             return None;
         };
 
+        // Treat const namespaces differently, just return their path
         let paths_guard = set.paths();
+        for const_net in [asset_namespace(), href_namespace()] {
+            if let Some(pm) = paths_guard.get_map(&const_net) {
+                if let Some((_bid, elem_path, _order)) = pm.path(&other_bid, &paths_guard) {
+                    return Some(ExtendedRelation {
+                        other,
+                        home_net: const_net,
+                        relative_path: elem_path.clone(),
+                        weight,
+                    });
+                }
+            }
+        }
+
         let Some((home_net, relative_path)) = paths_guard
             .get_map(&relative_net)
             .and_then(|pm| pm.path(&other_bid, &paths_guard))

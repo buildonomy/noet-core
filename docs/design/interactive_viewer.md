@@ -275,7 +275,7 @@ During HTML generation, **all links** (internal and external) are marked with BI
 
 ### Two-Click Navigation Pattern
 
-The two-click pattern provides contextual metadata access without interrupting reading flow. Links within the main content area require two clicks: first to navigate/preview, second to show metadata.
+The two-click pattern provides contextual metadata access without interrupting reading flow. Links within the main content area require two clicks: first to show metadata, second to navigate.
 
 #### Scope
 
@@ -302,12 +302,12 @@ article.addEventListener('click', (e) => {
     const linkBid = getLinkBid(e.target); // from data-bid or href resolution
     
     if (selectedBid === linkBid) {
-        // Second click: show metadata
-        showMetadataPanel(linkBid);
+        // Second click: navigate
+        navigateToTarget(e.target);
         selectedBid = null; // Reset for next interaction
     } else {
-        // First click: navigate/scroll
-        navigateToTarget(e.target);
+        // First click: show metadata
+        showMetadataPanel(linkBid);
         selectedBid = linkBid; // Track for potential second click
     }
     
@@ -317,26 +317,6 @@ article.addEventListener('click', (e) => {
 
 #### First Click Behavior
 
-**Internal Document Link**:
-1. Fetch full HTML document from server
-2. Extract `<article>` content via DOM parsing
-3. Replace current `<article>` with fetched content
-4. Update URL via `history.pushState()` (no page reload)
-5. Store `selectedBid = linkBid`
-
-**Section/Anchor Link**:
-1. Scroll to target section smoothly
-2. Highlight section temporarily (CSS animation)
-3. Update URL hash (`#section-id`)
-4. Store `selectedBid = linkBid`
-
-**External Link**:
-1. Do nothing on first click (or show preview tooltip)
-2. Store `selectedBid = linkBid`
-3. Indicate "click again to open" visually
-
-#### Second Click Behavior
-
 **Any Link Type** (internal, anchor, external):
 1. Call `wasm.get_context(selectedBid)` to fetch full `NodeContext`
 2. Populate metadata panel with:
@@ -345,8 +325,27 @@ article.addEventListener('click', (e) => {
    - Forward links (what this node references)
    - Related nodes from graph
 3. Show metadata panel (slide in from right on desktop, drawer on mobile)
-4. Include pass-through navigation link in panel ("Go to X →")
+4. Highlight link to indicate "click again to navigate"
+5. Store `selectedBid = linkBid`
+
+#### Second Click Behavior
+
+**Internal Document Link**:
+1. Fetch full HTML document from server
+2. Extract `<article>` content via DOM parsing
+3. Replace current `<article>` with fetched content
+4. Update URL via hash routing (`window.location.hash`)
 5. Reset `selectedBid = null`
+
+**Section/Anchor Link**:
+1. Scroll to target section smoothly
+2. Highlight section temporarily (CSS animation)
+3. Update URL hash (`#section-id`)
+4. Reset `selectedBid = null`
+
+**External Link**:
+1. Open link in new tab/window
+2. Reset `selectedBid = null`
 
 #### Click Reset Scenarios
 

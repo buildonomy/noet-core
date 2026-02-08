@@ -281,6 +281,76 @@ pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, Buildonom
     }
 }
 
+/// Get the parent of a URL path (anchor-aware)
+///
+/// If the path has an anchor (#), returns the document path (strips anchor).
+/// If no anchor, returns the parent directory (strips filename).
+///
+/// # Examples
+/// ```
+/// assert_eq!(path_parent("dir/file.md"), "dir");
+/// assert_eq!(path_parent("dir/file.md#anchor"), "dir/file.md");
+/// assert_eq!(path_parent("file.md"), "");
+/// assert_eq!(path_parent("file.md#anchor"), "file.md");
+/// assert_eq!(path_parent(""), "");
+/// ```
+pub fn path_parent(path: &str) -> &str {
+    // If path has an anchor, return document path (strip anchor)
+    if let Some(anchor_idx) = path.find('#') {
+        return &path[..anchor_idx];
+    }
+
+    // No anchor - return parent directory (strip filename)
+    match path.rfind('/') {
+        Some(idx) => &path[..idx],
+        None => "",
+    }
+}
+
+/// Normalize a URL path by resolving `.` and `..` components
+///
+/// Preserves leading `..` components (standard path normalization behavior).
+/// Callers should check the result if they need to validate against backtracking.
+///
+/// # Examples
+/// ```
+/// assert_eq!(path_normalize("dir/./file.md"), "dir/file.md");
+/// assert_eq!(path_normalize("dir/sub/../file.md"), "dir/file.md");
+/// assert_eq!(path_normalize("../file.md"), "../file.md"); // Preserved
+/// assert_eq!(path_normalize("../../dir/file.md"), "../../dir/file.md");
+/// ```
+pub fn path_normalize(path: &str) -> String {
+    let mut components = Vec::new();
+
+    for part in path.split('/') {
+        match part {
+            "" | "." => {
+                // Skip empty and current dir references
+            }
+            ".." => {
+                // Try to go up one level
+                if let Some(last) = components.last() {
+                    // If last component is "..", we're already backtracking - add another
+                    if *last == ".." {
+                        components.push("..");
+                    } else {
+                        // Normal component - go up by removing it
+                        components.pop();
+                    }
+                } else {
+                    // Empty stack - preserve leading ..
+                    components.push("..");
+                }
+            }
+            _ => {
+                components.push(part);
+            }
+        }
+    }
+
+    components.join("/")
+}
+
 impl PathMapMap {
     #[tracing::instrument(skip(states, relations))]
     pub fn new(states: &BTreeMap<Bid, BeliefNode>, relations: Arc<RwLock<BidGraph>>) -> PathMapMap {

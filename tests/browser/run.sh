@@ -151,7 +151,18 @@ if command -v python3 &> /dev/null; then
             // Load beliefbase
             const response = await fetch('./beliefbase.json');
             const json = await response.text();
-            const bb = new wasmModule.BeliefBaseWasm(json);
+
+            // Extract network root BID from beliefbase JSON
+            const beliefbaseData = JSON.parse(json);
+            const networkNode = Object.values(beliefbaseData.states).find(node =>
+                node.kind && node.kind.includes('Network')
+            );
+            if (!networkNode) {
+                throw new Error('Network root node not found in beliefbase');
+            }
+            const metadata = JSON.stringify({ bid: networkNode.bid });
+
+            const bb = new wasmModule.BeliefBaseWasm(json, metadata);
             log('✓ BeliefBase loaded', 'pass');
 
             // Get nav tree
