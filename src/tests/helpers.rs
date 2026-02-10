@@ -2,6 +2,7 @@
 
 use crate::{
     beliefbase::{BeliefBase, BidGraph},
+    paths::to_anchor,
     properties::{
         BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
     },
@@ -22,6 +23,7 @@ pub fn create_test_node(title: &str, kind: BeliefKind) -> BeliefNode {
     BeliefNode {
         title: title.to_string(),
         kind: BeliefKindSet(kind.into()),
+        id: Some(to_anchor(title)),
         bid: Bid::new(Bid::nil()),
         ..Default::default()
     }

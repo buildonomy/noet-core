@@ -106,8 +106,8 @@ pub struct NavNode {
 pub struct NodeContext {
     /// The node itself
     pub node: BeliefNode,
-    /// Relative path within home network (e.g., "docs/guide.md#section")
-    pub relative_path: String,
+    /// path relative to the home network root (e.g., "/docs/guide.md#section")
+    pub root_path: String,
     /// Home network BID (which Network node owns this document)
     pub home_net: Bid,
     /// All nodes related to this one (other end of all edges, both sources and sinks)
@@ -118,6 +118,35 @@ pub struct NodeContext {
     /// Sinks: BIDs of nodes this one links TO
     /// Both vectors are sorted by WEIGHT_SORT_KEY edge payload value
     pub graph: HashMap<WeightKind, (Vec<Bid>, Vec<Bid>)>,
+}
+
+/// WASM-compatible path context
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathParts {
+    path: String,
+    filename: String,
+    anchor: String,
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl PathParts {
+    #[wasm_bindgen(getter)]
+    pub fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn filename(&self) -> String {
+        self.filename.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn anchor(&self) -> String {
+        self.anchor.clone()
+    }
 }
 
 /// WASM wrapper around BeliefBase for browser use
@@ -133,6 +162,104 @@ pub struct BeliefBaseWasm {
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BeliefBaseWasm {
+    /// Normalize a URL path by resolving `..` and `.` segments.
+    ///
+    /// This uses the `path_normalize` function from `paths.rs` which is designed
+    /// for URL paths (always uses `/` separator, cross-platform safe).
+    ///
+    /// # Arguments
+    /// * `path` - The path to normalize (e.g., "dir/../file.html" -> "file.html")
+    ///
+    /// # Returns
+    /// The normalized path as a string
+    #[wasm_bindgen(js_name = normalizePath)]
+    pub fn normalize_path(path: &str) -> String {
+        crate::paths::AnchorPath::new(path).normalize()
+    }
+
+    /// Parse a path into its components: directory, filename, and anchor.
+    ///
+    /// Returns a PathParts object with `path` (directory), `filename`, and `anchor` properties.
+    ///
+    /// # Arguments
+    /// * `path` - The path to parse (e.g., "dir/file.html#section")
+    ///
+    /// # Returns
+    /// PathParts object with path, filename, and anchor components
+    #[wasm_bindgen(js_name = pathParts)]
+    pub fn path_parts(path: &str) -> PathParts {
+        let anchor_path = crate::paths::AnchorPath::new(path);
+        PathParts {
+            path: anchor_path.dir().to_string(),
+            filename: anchor_path.filename().to_string(),
+            anchor: anchor_path.anchor().to_string(),
+        }
+    }
+
+    /// Join two URL paths safely.
+    ///
+    /// # Arguments
+    /// * `base` - The base path (e.g., "/dir/doc.html" or "/dir/")
+    /// * `end` - The path to append (e.g., "other.html" or "../file.html")
+    /// * `end_is_anchor` - Whether `end` is an anchor/section (uses # separator)
+    ///
+    /// # Returns
+    /// The joined path as a string
+    #[wasm_bindgen(js_name = pathJoin)]
+    pub fn path_join(base: &str, end: &str, end_is_anchor: bool) -> String {
+        let base_path = crate::paths::AnchorPath::new(base);
+        if end_is_anchor {
+            let end_with_hash = if end.starts_with('#') {
+                end.to_string()
+            } else {
+                format!("#{}", end)
+            };
+            base_path.join(end_with_hash)
+        } else {
+            base_path.join(end)
+        }
+    }
+
+    /// Get the file extension from a path, ignoring any anchor.
+    ///
+    /// # Arguments
+    /// * `path` - The path to extract extension from (e.g., "file.html#section")
+    ///
+    /// # Returns
+    /// The extension (e.g., "html") or empty string if none
+    #[wasm_bindgen(js_name = pathExtension)]
+    pub fn path_extension(path: &str) -> String {
+        crate::paths::AnchorPath::new(path).ext().to_string()
+    }
+
+    /// Get the parent path (directory or document path without anchor).
+    ///
+    /// - For paths with anchors: returns path without anchor (e.g., "dir/file.html#section" → "dir/file.html")
+    /// - For file paths: returns directory (e.g., "dir/file.html" → "dir")
+    /// - For directory paths: returns parent directory (e.g., "dir/subdir" → "dir")
+    ///
+    /// # Arguments
+    /// * `path` - The path to get parent of
+    ///
+    /// # Returns
+    /// The parent path as a string
+    #[wasm_bindgen(js_name = pathParent)]
+    pub fn path_parent(path: &str) -> String {
+        crate::paths::AnchorPath::new(path).parent().to_string()
+    }
+
+    /// Get the filename without extension (stem).
+    ///
+    /// # Arguments
+    /// * `path` - The path to extract stem from (e.g., "dir/file.html#section")
+    ///
+    /// # Returns
+    /// The filename without extension (e.g., "file")
+    #[wasm_bindgen(js_name = pathFilestem)]
+    pub fn path_filestem(path: &str) -> String {
+        crate::paths::AnchorPath::new(path).filestem().to_string()
+    }
+
     /// Create a BeliefBase from JSON string (exported beliefbase.json) and metadata
     ///
     /// # JavaScript Example
@@ -512,7 +639,7 @@ impl BeliefBaseWasm {
     /// ```javascript
     /// const ctx = bb.get_context("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`Node: ${ctx.node.title}`);
-    /// console.log(`Path: ${ctx.relative_path}`);
+    /// console.log(`Path: ${ctx.root_path}`);
     /// ```
     #[wasm_bindgen]
     pub fn get_context(&self, bid: String) -> JsValue {
@@ -525,7 +652,7 @@ impl BeliefBaseWasm {
         };
 
         // Collect all data while holding the borrow
-        let (node, relative_path, home_net, related_nodes, graph) = {
+        let (node, root_path, home_net, related_nodes, graph) = {
             let mut inner = self.inner.borrow_mut();
             let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
                 Some(c) => c,
@@ -589,7 +716,7 @@ impl BeliefBaseWasm {
 
             (
                 ctx.node.clone(),
-                ctx.relative_path.clone(),
+                ctx.root_path.clone(),
                 ctx.home_net,
                 related_nodes,
                 sorted_graph,
@@ -598,7 +725,7 @@ impl BeliefBaseWasm {
 
         let node_context = NodeContext {
             node,
-            relative_path,
+            root_path,
             home_net,
             related_nodes,
             graph,
@@ -720,12 +847,19 @@ impl BeliefBaseWasm {
         let base = self.inner.borrow();
         let paths = base.paths();
         let states = base.states();
+        let brefs = base.brefs();
 
         // Build navigation tree from PathMapMap using stack-based algorithm
         let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
         let mut root_nodes: Vec<String> = Vec::new();
 
-        for (net_bid, pm_lock) in paths.map().iter() {
+        for (net_bref, pm_lock) in paths.map().iter() {
+            // Resolve Bref to Bid
+            let net_bid = match brefs.get(net_bref) {
+                Some(bid) => bid,
+                None => continue, // Skip if we can't resolve the Bref
+            };
+
             // Skip reserved BIDs (system namespaces and API nodes)
             if net_bid.is_reserved() {
                 continue;
@@ -837,28 +971,34 @@ impl BeliefBaseWasm {
     /// Helper: Normalize path extension to .html
     fn normalize_path_extension(path: &str) -> String {
         use crate::codec::CODECS;
+        use crate::paths::AnchorPath;
 
-        // Split path and anchor fragment
-        let (path_part, anchor_part) = if let Some(hash_idx) = path.find('#') {
-            (&path[..hash_idx], Some(&path[hash_idx..]))
-        } else {
-            (path, None)
-        };
+        let anchor_path = AnchorPath::new(path);
+        let filepath = anchor_path.filepath();
 
         // Check all registered codec extensions
-        let mut normalized = path_part.to_string();
+        let mut normalized = filepath.to_string();
+        let mut found_extension = false;
         for ext in CODECS.extensions() {
             let ext_str = format!(".{}", ext);
-            if path_part.ends_with(&ext_str) {
-                let base = &path_part[..path_part.len() - ext_str.len()];
+            if filepath.ends_with(&ext_str) {
+                let base = &filepath[..filepath.len() - ext_str.len()];
                 normalized = format!("{}.html", base);
+                found_extension = true;
                 break;
             }
         }
 
+        // If no codec extension found and no .html extension, treat as directory
+        if !found_extension && !filepath.ends_with(".html") {
+            // Directory path - append /index.html
+            normalized = format!("{}/index.html", filepath);
+        }
+
         // Re-attach anchor fragment if present
-        if let Some(anchor) = anchor_part {
-            normalized.push_str(anchor);
+        if !anchor_path.anchor().is_empty() {
+            normalized.push_str("#");
+            normalized.push_str(anchor_path.anchor());
         }
 
         normalized

@@ -76,6 +76,11 @@ enum Commands {
         /// Use CDN for Open Props (smaller output, requires internet)
         #[arg(long)]
         cdn: bool,
+
+        /// Base URL for sitemap and canonical URLs (e.g., https://username.github.io/repo)
+        /// Can also be set via NOET_BASE_URL environment variable
+        #[arg(long)]
+        base_url: Option<String>,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -104,6 +109,11 @@ enum Commands {
         /// Use CDN for Open Props (smaller output, requires internet)
         #[arg(long)]
         cdn: bool,
+
+        /// Base URL for sitemap and canonical URLs (e.g., https://username.github.io/repo)
+        /// Can also be set via NOET_BASE_URL environment variable
+        #[arg(long)]
+        base_url: Option<String>,
 
         /// Start HTTP server for viewing HTML output (requires --html-output)
         #[arg(long)]
@@ -134,7 +144,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
             html_output,
             cdn,
+            base_url,
         } => {
+            // Read base_url from environment if not provided via CLI
+            let base_url = base_url.or_else(|| std::env::var("NOET_BASE_URL").ok());
+
             if verbose {
                 println!("Parsing: {path:?}");
                 if write {
@@ -176,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(html_dir.clone()),
                         None, // No live reload script for parse command
                         cdn,
+                        base_url,
                     )?
                 } else {
                     DocumentCompiler::new(&path, Some(tx), None, write)?
@@ -236,9 +251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write,
             html_output,
             cdn,
+            base_url,
             serve,
             port,
         } => {
+            // Read base_url from environment if not provided via CLI
+            let base_url = base_url.or_else(|| std::env::var("NOET_BASE_URL").ok());
             #[cfg(not(feature = "service"))]
             {
                 eprintln!("Error: The 'watch' subcommand requires the 'service' feature.");
@@ -353,6 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(html_dir.clone()),
                         live_reload_script,
                         cdn,
+                        base_url,
                     )?
                 } else {
                     WatchService::new(root_dir.clone(), tx, write)?

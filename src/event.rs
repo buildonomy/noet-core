@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::{
     nodekey::NodeKey,
-    properties::{Bid, Weight, WeightKind, WeightSet},
+    properties::{Bid, Bref, Weight, WeightKind, WeightSet},
 };
 
 /// Indicates the origin of a BeliefEvent for proper handling by different cache implementations.
@@ -29,9 +29,9 @@ pub enum BeliefEvent {
     /// From ID, To ID
     NodeRenamed(Bid, Bid, EventOrigin),
     /// Network updated, list of new (path, node, order) tuples
-    PathAdded(Bid, String, Bid, Vec<u16>, EventOrigin),
-    PathUpdate(Bid, String, Bid, Vec<u16>, EventOrigin),
-    PathsRemoved(Bid, Vec<String>, EventOrigin),
+    PathAdded(Bref, String, Bid, Vec<u16>, EventOrigin),
+    PathUpdate(Bref, String, Bid, Vec<u16>, EventOrigin),
+    PathsRemoved(Bref, Vec<String>, EventOrigin),
     /// Source, Sink, WeightSet, EventOrigin)
     RelationUpdate(Bid, Bid, WeightSet, EventOrigin),
     /// Source, Sink, WeightKind, weight_payload, event origin

@@ -4,8 +4,9 @@
 //! references that need to be resolved in subsequent parse passes.
 
 use crate::{
-    nodekey::{get_doc_path, NodeKey},
-    properties::{Bid, WeightKind},
+    nodekey::NodeKey,
+    paths::AnchorPath,
+    properties::{Bid, Bref, WeightKind},
 };
 use petgraph::Direction;
 use toml_edit::Table as TomlTable;
@@ -19,9 +20,10 @@ use toml_edit::Table as TomlTable;
 /// # Examples
 ///
 /// ```
-/// # use noet_core::{nodekey::NodeKey, properties::{Bid, WeightKind}, codec::UnresolvedReference};
+/// # use noet_core::{nodekey::NodeKey, properties::{Bid, Bref, WeightKind}, codec::UnresolvedReference};
 /// # use petgraph::Direction;
 /// # let network_bid = Bid::default();
+/// # let network_bref = network_bid.bref();
 /// # let bid_of_document_a = Bid::new(network_bid);
 /// // Document A references Document B before B is parsed:
 /// let unresolved = UnresolvedReference {
@@ -29,7 +31,7 @@ use toml_edit::Table as TomlTable;
 ///     self_bid: bid_of_document_a,
 ///     self_net: network_bid,
 ///     self_path: "docs/a.md".to_string(),
-///     other_keys: vec![NodeKey::Path { net: network_bid, path: "docs/b.md".to_string() }],
+///     other_keys: vec![NodeKey::Path { net: network_bref, path: "docs/b.md".to_string() }],
 ///     weight_kind: WeightKind::Epistemic,
 ///     weight_data: None,
 ///     reference_location: Some((42, 10)), // Line 42, column 10
@@ -133,14 +135,14 @@ impl UnresolvedReference {
     }
 
     /// Get the sink path if this is a sink dependency
-    pub fn as_sink_dependency(&self) -> Option<(String, Bid)> {
+    pub fn as_sink_dependency(&self) -> Option<(String, Bref)> {
         if self.direction == Direction::Incoming {
             if let Some(NodeKey::Path { net, path }) = self
                 .other_keys
                 .iter()
                 .find(|k| matches!(k, NodeKey::Path { .. }))
             {
-                Some((get_doc_path(path).to_string(), *net))
+                Some((AnchorPath::from(&path).filepath().to_string(), *net))
             } else {
                 None
             }
@@ -270,7 +272,7 @@ mod tests {
             Bid::nil(),
             "test.md".to_string(),
             vec![NodeKey::Path {
-                net: Bid::nil(),
+                net: Bref::default(),
                 path: "other.md".to_string(),
             }],
             WeightKind::Epistemic,
@@ -289,7 +291,7 @@ mod tests {
             Bid::nil(),
             "test.md".to_string(),
             vec![NodeKey::Path {
-                net: Bid::nil(),
+                net: Bref::default(),
                 path: "other.md".to_string(),
             }],
             WeightKind::Epistemic,
@@ -319,7 +321,7 @@ mod tests {
             Bid::nil(),
             "test.md".to_string(),
             vec![NodeKey::Path {
-                net: Bid::nil(),
+                net: Bref::default(),
                 path: "other.md".to_string(),
             }],
             WeightKind::Epistemic,

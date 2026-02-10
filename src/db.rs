@@ -2,8 +2,8 @@ use crate::{
     beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     error::BuildonomyError,
     event::BeliefEvent,
-    paths::path_join,
-    properties::{BeliefKind, BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
+    paths::AnchorPath,
+    properties::{BeliefKind, BeliefNode, BeliefRelation, Bid, Bref, WeightKind, WeightSet},
     query::{push_string_expr, AsSql, BeliefSource, Expression, StatePred},
 };
 use futures_core::future::BoxFuture;
@@ -148,7 +148,7 @@ impl<'a> Transaction<'a> {
             .push("INSERT OR REPLACE INTO beliefs(bid, bref, kind, title, schema, payload, id) ");
         self.qb.push_values(vec![belief], |mut b, belief| {
             b.push_bind::<String>(belief.bid.into())
-                .push_bind::<String>(belief.bid.namespace().into())
+                .push_bind::<String>(belief.bid.bref().to_string())
                 .push_bind(belief.kind.as_u32())
                 .push_bind::<String>(belief.title.clone())
                 .push_bind::<Option<String>>(belief.schema.clone())
@@ -198,7 +198,7 @@ impl<'a> Transaction<'a> {
         self.staged += 1;
     }
 
-    fn add_paths(&mut self, net: &Bid, paths: Vec<(&String, Bid, &Vec<u16>)>) {
+    fn add_paths(&mut self, net: &Bref, paths: Vec<(&String, Bid, &Vec<u16>)>) {
         if paths.is_empty() {
             return;
         }
@@ -211,7 +211,7 @@ impl<'a> Transaction<'a> {
                     .map(|idx| idx.to_string())
                     .collect::<Vec<String>>()
                     .join(".");
-                b.push_bind::<String>(net.into())
+                b.push_bind::<String>(net.to_string())
                     .push_bind::<String>(path.clone())
                     .push_bind::<String>(target.into())
                     .push_bind::<String>(order_str);
@@ -220,12 +220,12 @@ impl<'a> Transaction<'a> {
         self.staged += 1;
     }
 
-    fn remove_paths(&mut self, net: &Bid, paths: &[String]) {
+    fn remove_paths(&mut self, net: &Bref, paths: &[String]) {
         if paths.is_empty() {
             return;
         }
         self.qb.push("DELETE from paths WHERE net = ");
-        self.qb.push_bind::<String>(net.into());
+        self.qb.push_bind::<String>(net.to_string());
         self.qb.push(" AND ");
         push_string_expr(&mut self.qb, paths, "path", true, true);
         self.qb.push("; ");
@@ -459,9 +459,9 @@ fn get_all_document_paths(
                 };
                 let (start_idx, _net) = row_nets[row_nets_index];
                 {
-                    let base_path = &row_results[start_idx].0;
+                    let base_ap = AnchorPath::from(&row_results[start_idx].0);
                     for (sub_path, _bid) in sub_results.iter_mut() {
-                        *sub_path = path_join(base_path, sub_path, false);
+                        *sub_path = base_ap.join(&sub_path);
                     }
                 }
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0
@@ -554,9 +554,9 @@ fn get_network_paths(
                 };
                 let (start_idx, _net) = row_nets[row_nets_index];
                 {
-                    let base_path = &row_results[start_idx].0;
+                    let base_ap = AnchorPath::from(&row_results[start_idx].0);
                     for (sub_path, _bid) in sub_results.iter_mut() {
-                        *sub_path = path_join(base_path, sub_path, false);
+                        *sub_path = base_ap.join(&sub_path);
                     }
                 }
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0

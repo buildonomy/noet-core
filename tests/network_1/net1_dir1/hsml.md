@@ -10,4 +10,4 @@ As defined by the [[The Spatial Web Standards]]:
 > implementation standard, it provides testable requirements that enable independent
 > implementations to interoperate.
 
-See also [[title://HSTP]].
+See also [[HSTP]].

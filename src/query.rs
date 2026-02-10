@@ -110,7 +110,7 @@ fn push_namespace_expr(
             column,
             if match_pred { "" } else { "NOT " }
         ));
-        qb.push_bind::<String>(bref.into());
+        qb.push_bind::<String>(bref.to_string());
         qb.push(") ");
         if idx < last_sep {
             if match_pred {
@@ -187,21 +187,15 @@ impl AsSql for &Expression {
     }
 }
 
-// TODO/FIXME See Statepred todo/fixme for changing Path and Title predicates
 impl From<&NodeKey> for Expression {
     fn from(key: &NodeKey) -> Expression {
         match key {
             NodeKey::Bid { bid } => Expression::StateIn(StatePred::Bid(vec![*bid])),
-            NodeKey::Bref { bref } => Expression::StateIn(StatePred::Bref(vec![bref.clone()])),
+            NodeKey::Bref { bref } => Expression::StateIn(StatePred::Bref(vec![*bref])),
             NodeKey::Path { net, path } => {
                 Expression::StateIn(StatePred::NetPath(*net, path.to_string()))
             }
-            NodeKey::Title { net, title } => {
-                // TODO/fixme: path can't specify Make title search use the paths table. Doc titles
-                // are simply special paths tied to the network
-                Expression::StateIn(StatePred::Title(*net, WrappedRegex::from(title.as_str())))
-            }
-            NodeKey::Id { net: _, id } => Expression::StateIn(StatePred::Id(vec![id.clone()])),
+            NodeKey::Id { net, id } => Expression::StateIn(StatePred::NetId(*net, id.clone())),
         }
     }
 }
@@ -292,8 +286,6 @@ impl Eq for WrappedRegex {}
 
 /// Filter based on BeliefState properties
 ///
-/// TODO/FIXME Path and Title predicates should mirror nodekey and take a preceeding home_net and
-/// home_path argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StatePred {
     // Return all nodes
@@ -304,20 +296,18 @@ pub enum StatePred {
     Bid(Vec<Bid>),
     // Return nodes who's bref is contained in the predicate values
     Bref(Vec<Bref>),
-    // Return nodes who's Id is contained in the predicate values
-    Id(Vec<String>),
+    // Return node who's within arg1 network bref with id equal to arg2
+    NetId(Bref, String),
     // Return nodes who's schema matches
     Schema(String),
     // Return nodes who's node kind is a superset of the predicate value
     Kind(EnumSet<BeliefKind>),
     // Return node of the specified network path
-    NetPath(Bid, String),
+    NetPath(Bref, String),
     // Return all paths within a network
     NetPathIn(Bid),
     // Return nodes containing a path that equals one of the predicate values
     Path(Vec<String>),
-    // Return nodes who's payload or title matches the regex. Bid is the containing network.
-    Title(Bid, WrappedRegex),
     // Return nodes who's payload matches the key and regex value
     Payload(String, WrappedRegex),
 }
@@ -326,15 +316,13 @@ impl StatePred {
     pub fn match_state(&self, node: &BeliefNode) -> bool {
         match self {
             StatePred::Any => true,
-            StatePred::InNamespace(ns_vec) => ns_vec.contains(&node.bid.parent_namespace()),
-            StatePred::Bid(bid_vec) => bid_vec.contains(&node.bid),
-            StatePred::Bref(bref_vec) => bref_vec.contains(&node.bid.namespace()),
+            StatePred::InNamespace(ns_vec) => ns_vec.contains(&node.bid.parent_bref()),
+            // More efficient to do this in filter_states
+            StatePred::Bid(..) => false,
+            StatePred::Bref(bref_vec) => bref_vec.contains(&node.bid.bref()),
             StatePred::Schema(schema) => node.schema.as_ref().filter(|s| *s == schema).is_some(),
-            StatePred::Id(id_vec) => node
-                .id
-                .as_ref()
-                .filter(|id_str| id_vec.contains(id_str))
-                .is_some(),
+            // Network splitting needs to be handled separately
+            StatePred::NetId(..) => false,
             StatePred::Kind(kind_set) => kind_set.is_superset(node.kind.0),
             // Path search needs to be handled separately
             StatePred::Path(..) => false,
@@ -342,8 +330,6 @@ impl StatePred {
             StatePred::NetPath(..) => false,
             // Path search needs to be handled separately
             StatePred::NetPathIn(..) => false,
-            // Title search needs to be handled separately
-            StatePred::Title(..) => false,
             StatePred::Payload(key, re) => {
                 if let Some(value) = node.payload.get(key) {
                     re.0.is_match(&value.to_string())
@@ -390,8 +376,10 @@ impl AsSql for StatePred {
             StatePred::Bref(bref_vec) => {
                 push_id_expr(qb, bref_vec, "bref", match_pred);
             }
-            StatePred::Id(id_vec) => {
-                push_id_expr(qb, id_vec, "id", match_pred);
+            StatePred::NetId(_net, id) => {
+                // FIXME: we should do this, then do a join on the bid results on our paths table
+                qb.push("id = ");
+                qb.push_bind(id.clone());
             }
             StatePred::Schema(schema) => {
                 push_id_expr(qb, &[schema], "schema", match_pred);
@@ -419,18 +407,6 @@ impl AsSql for StatePred {
             }
             StatePred::Path(path_vec) => {
                 push_string_expr(qb, path_vec, "path", match_pred, false);
-            }
-            // TODO/FIXME this doesn't do any filtering based on containing network
-            StatePred::Title(_net, re) => {
-                // TODO: Switch back to REGEXP once regexp function registration is fixed
-                // For now, using LIKE with wildcards as a workaround
-                let pattern = format!("%{}%", re.0.as_str());
-                if match_pred {
-                    qb.push("title LIKE ");
-                } else {
-                    qb.push("title NOT LIKE ");
-                }
-                qb.push_bind(pattern);
             }
             StatePred::Payload(_key, _re_val) => {
                 tracing::warn!(

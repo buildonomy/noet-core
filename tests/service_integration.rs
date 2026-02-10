@@ -264,7 +264,7 @@ fn test_get_set_networks() {
 
     // Set a network (set_networks returns the updated list)
     let node = BeliefNode {
-        bid: Bid::nil(),
+        bid: Bid::new(Bid::nil()),
         kind: Default::default(),
         title: "Test Network".to_string(),
         schema: None,

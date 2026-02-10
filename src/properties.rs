@@ -3,18 +3,17 @@ pub use enumset::EnumSet;
 /// [crate::beliefbase::BeliefBase]s and associated structures.
 use enumset::*;
 use petgraph::IntoWeightedEdge;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
-    fmt::{Display, Formatter},
+    fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
     mem::replace,
     ops::{Deref, DerefMut},
 };
 use toml::{from_str, to_string, value::Table, Value};
 
-use uuid::fmt::Simple;
 pub use uuid::Uuid;
 // Use `Uuid` as a custom type, with `String` as the Builtin
 uniffi::custom_type!(Uuid, String, {
@@ -42,8 +41,8 @@ use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use crate::{
     beliefbase::BeliefBase,
     error::BuildonomyError,
-    nodekey::{to_anchor, NodeKey},
-    paths::path_join,
+    nodekey::NodeKey,
+    paths::{as_anchor, to_anchor, AnchorPath},
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -146,7 +145,7 @@ pub fn buildonomy_api_bid(version: &str) -> Bid {
     // Replace octets 10-15 with Buildonomy namespace bytes
     // This makes the BID detectable as reserved while keeping it deterministic
     let mut bytes = *uuid.as_bytes();
-    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes());
+    bytes[10..16].copy_from_slice(buildonomy_namespace().bref().bytes());
 
     Bid(Uuid::from_bytes(bytes))
 }
@@ -158,7 +157,7 @@ pub fn buildonomy_asset_bid(hash_str: &str) -> Bid {
     // Replace octets 10-15 with Buildonomy namespace bytes
     // This makes the BID detectable as reserved while keeping it deterministic
     let mut bytes = *uuid.as_bytes();
-    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_ASSET).parent_namespace_bytes());
+    bytes[10..16].copy_from_slice(asset_namespace().bref().bytes());
 
     Bid(Uuid::from_bytes(bytes))
 }
@@ -170,7 +169,7 @@ pub fn buildonomy_href_bid(hash_str: &str) -> Bid {
     // Replace octets 10-15 with Buildonomy namespace bytes
     // This makes the BID detectable as reserved while keeping it deterministic
     let mut bytes = *uuid.as_bytes();
-    bytes[10..16].copy_from_slice(&Bid::from(UUID_NAMESPACE_HREF).parent_namespace_bytes());
+    bytes[10..16].copy_from_slice(href_namespace().bref().bytes());
 
     Bid(Uuid::from_bytes(bytes))
 }
@@ -203,7 +202,7 @@ uniffi::custom_newtype!(Bid, Uuid);
 
 impl Bid {
     pub fn new<U: AsRef<Bid>>(parent: U) -> Self {
-        Bid(Uuid::now_v6(&parent.as_ref().namespace_bytes()))
+        Bid(Uuid::now_v6(parent.as_ref().bref().bytes()))
     }
 
     /// Use a [Bid::nil] when generating temporary ids in order to identify that the item has no
@@ -212,8 +211,12 @@ impl Bid {
         Bid(Uuid::nil())
     }
 
+    pub fn is_nil(&self) -> bool {
+        *self == Bid::nil()
+    }
+
     pub fn initialized(&self) -> bool {
-        self.parent_namespace_bytes() != BID_NAMESPACE_NIL
+        *self.parent_bref().bytes() != BID_NAMESPACE_NIL
     }
 
     /// Mutates the BID's namespace to match the parent namespace ID. This is useful for
@@ -221,76 +224,74 @@ impl Bid {
     /// initialized BIDs.
     pub fn adopt_into(&mut self, parent: &Bid) -> Bid {
         let mut self_bytes = *self.0.as_bytes();
-        self_bytes[10..16].copy_from_slice(&parent.namespace_bytes());
+        self_bytes[10..16].copy_from_slice(parent.bref().bytes());
         let _ = replace(&mut self.0, Uuid::from_bytes(self_bytes));
         *self
     }
 
     /// Check if this BID falls within the reserved Buildonomy API namespace
     ///
-    /// Returns true if the BID's parent namespace bytes match UUID_NAMESPACE_BUILDONOMY's namespace bytes.
-    /// User files must not use BIDs in this namespace - they are reserved for system use.
+    /// Returns true if the BID's parent namespace bytes match one of the UUID_NAMESPACE_* contant's
+    /// namespace bytes. User files must not use BIDs in this namespace - they are reserved for
+    /// system use.
     ///
     /// This works because:
-    /// - All system BIDs (API versions, href tracking, etc.) are derived from UUID_NAMESPACE_BUILDONOMY
+    ///
+    /// - All system BIDs (API versions, href tracking, etc.) are derived from
+    ///   one of the UUID_NAMESPACE_* contstants
+    ///
     /// - When creating BIDs via `Bid::new()` or similar, the parent's namespace becomes the child's
     ///   parent_namespace_bytes (octets 10-15)
-    /// - We check if those bytes match the Buildonomy namespace (octets 10-15 of UUID_NAMESPACE_BUILDONOMY)
+    ///
+    /// - We check if those bytes match the Buildonomy namespace (octets 10-15 of
+    ///   UUID_NAMESPACE_BUILDONOMY)
+    ///
     /// - User-generated BIDs will have different parent namespace bytes
     pub fn is_reserved(&self) -> bool {
-        self.parent_namespace_bytes()
-            == Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
-    }
-
-    /// Similar to [Self::parent_namespace_bytes], return the least significant 6 bytes of the Bid
-    /// as a [Bref], suitable for display and serialization.
-    pub fn parent_namespace(&self) -> Bref {
-        self.0.as_simple().encode_lower(&mut Uuid::encode_buffer())[20..Simple::LENGTH]
-            .to_string()
-            .try_into()
-            .expect("Size and encoding explicitly specified.")
+        let namespace = self.parent_bref();
+        [
+            buildonomy_namespace().bref(),
+            asset_namespace().bref(),
+            href_namespace().bref(),
+            buildonomy_namespace().parent_bref(),
+            asset_namespace().parent_bref(),
+            href_namespace().parent_bref(),
+        ]
+        .contains(&namespace)
+            || self.is_nil()
     }
 
     /// Display the most significant 20 bytes as a UUID-encoded string, removing the bytes encoding
     /// the parent namespace.
     pub fn display_no_namespace(&self) -> String {
-        self.0.as_simple().encode_lower(&mut Uuid::encode_buffer())[..20].to_string()
-    }
-
-    /// Same as [Self::namespace_bytes], except suitable for serialization and display.
-    pub fn namespace(&self) -> Bref {
-        generate_namespace(self)
-            .0
-            .as_simple()
-            .encode_lower(&mut Uuid::encode_buffer())[20..Simple::LENGTH]
-            .to_string()
-            .try_into()
-            .expect("Size and encoding explicitly specified.")
+        self.0.as_simple().encode_lower(&mut Uuid::encode_buffer())[..BREF_IDX_START].to_string()
     }
 
     /// Return the least significant 6 bytes of the Bid's UUID buffer. Per UUIDv7 format and BID
     /// construction, these bits work as a key to the identity of the BID for the generating source
     /// (parent) of this id.
-    pub fn parent_namespace_bytes(&self) -> [u8; 6] {
+    pub fn parent_bref(&self) -> Bref {
         // We can unwrap because we know that UUIDs will have 16 bytes
-        self.0.as_bytes()[10..16].try_into().unwrap()
+        let mut arr = [0u8; 6];
+        arr.copy_from_slice(&self.0.as_bytes()[10..16]);
+        Bref(arr)
     }
 
     /// Generate a parent namespace from this ID, for use as the source context when generating
     /// another BID, or for determining whether this BID is the source context for a pre-existing
     /// BID.
-    pub fn namespace_bytes(&self) -> [u8; 6] {
-        generate_namespace(self).parent_namespace_bytes()
+    pub fn bref(&self) -> Bref {
+        generate_namespace(self).parent_bref()
     }
 
-    /// Generate a filter function to determine whether the input's [Bid::parent_namespace_bytes] matche
-    /// this object's [Bid::namespace_bytes].
+    /// Generate a filter function to determine whether the input's [Bid::parent_bref] matche
+    /// this object's [Bid::bref].
     pub fn is_parent_filter<U>(&self) -> impl Fn(&U) -> bool
     where
         U: AsRef<Bid>,
     {
-        let namespace = self.namespace_bytes();
-        move |id: &U| id.as_ref().parent_namespace_bytes() == namespace
+        let namespace = self.bref();
+        move |id: &U| id.as_ref().parent_bref() == namespace
     }
 }
 
@@ -356,59 +357,86 @@ impl From<Bid> for String {
     }
 }
 
+const BREF_IDX_START: usize = 20;
 /// Belief reference
 ///
-/// The least significant 6 bytes taken from generate_namespace(reference Bid), encoded as lowercase
-/// ASCII in utf8 space. 12 chars long.
-#[derive(Clone, Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bref(String);
+/// The least significant 6 bytes taken from generate_namespace(reference Bid)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bref([u8; 6]);
 
-uniffi::custom_newtype!(Bref, String);
+impl Bref {
+    pub fn is_default(&self) -> bool {
+        *self == Bid::nil().bref()
+    }
 
-impl TryFrom<String> for Bref {
-    type Error = BuildonomyError;
-
-    fn try_from(mut namespace: String) -> Result<Self, Self::Error> {
-        if namespace.len() != 12 || namespace.find(|c: char| !c.is_ascii_hexdigit()).is_some() {
-            Err(BuildonomyError::Serialization(
-                "Invalid Bid namespace string".to_string(),
-            ))
-        } else {
-            namespace.make_ascii_lowercase();
-            Ok(Bref(namespace))
-        }
+    pub fn bytes(&self) -> &[u8; 6] {
+        &self.0
     }
 }
 
-impl TryFrom<&str> for Bref {
-    type Error = BuildonomyError;
-
-    fn try_from(namespace: &str) -> Result<Self, Self::Error> {
-        if namespace.len() != 12 || namespace.find(|c: char| !c.is_ascii_hexdigit()).is_some() {
-            Err(BuildonomyError::Serialization(
-                "Invalid Bid namespace string".to_string(),
-            ))
-        } else {
-            Ok(Bref(namespace.to_lowercase()))
-        }
+impl fmt::Debug for Bref {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Bref({})", self)
     }
 }
 
 impl Display for Bref {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
     }
 }
 
-impl From<&Bref> for String {
-    fn from(val: &Bref) -> Self {
-        val.0.clone()
+impl Default for Bref {
+    fn default() -> Self {
+        Bid::nil().bref()
     }
 }
 
-impl From<Bref> for String {
-    fn from(val: Bref) -> Self {
-        val.0.clone()
+impl Hash for Bref {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Serialize for Bref {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Bref {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 6 {
+            return Err(serde::de::Error::custom("expected 6 bytes"));
+        }
+        Ok(Bref(bytes.try_into().unwrap()))
+    }
+}
+
+uniffi::custom_type!(Bref, String, {
+    try_lift: |val| Ok(Bref::try_from(val.as_ref())?),
+    lower: |obj| obj.to_string()
+});
+
+impl TryFrom<&str> for Bref {
+    type Error = BuildonomyError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let bytes = hex::decode(s).map_err(|e| {
+            BuildonomyError::Serialization(format!("bref deserialization failed: {}", e))
+        })?;
+        if bytes.len() != 6 {
+            return Err(BuildonomyError::Serialization(format!(
+                "bref invalid length. expected 6 got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Bref(bytes.try_into().unwrap()))
     }
 }
 
@@ -1017,45 +1045,57 @@ impl BeliefNode {
 
     pub fn display_title(&self) -> String {
         match self.title.is_empty() {
-            true => format!("{}", self.bid),
+            true => self.bid.bref().to_string(),
             false => self.title.to_string(),
         }
     }
 
-    // Generate all valid hrefs per NodeKey::from_str parsing definition with optional namespace
+    pub fn id(&self) -> String {
+        self.id
+            .clone()
+            .or_else(|| {
+                if !self.title.is_empty() {
+                    Some(to_anchor(&self.title))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                if !self.bid.is_nil() {
+                    self.bid.bref().to_string()
+                } else {
+                    String::default()
+                }
+            })
+    }
+
+    /// Generate all valid hrefs per NodeKey::from_str parsing definition with optional namespace
     pub fn keys(
         &self,
         maybe_ns: Option<Bid>,
         maybe_parent: Option<Bid>,
         bs: &BeliefBase,
     ) -> Vec<NodeKey> {
-        let ns = maybe_ns.unwrap_or_default();
+        let ns = maybe_ns.unwrap_or(Bid::nil());
+        let net = ns.bref();
         let mut ids = Vec::default();
         if self.bid != Bid::nil() {
             ids.push(NodeKey::Bid { bid: self.bid });
             ids.push(NodeKey::Bref {
-                bref: self.bid.namespace(),
+                bref: self.bid.bref(),
             });
         }
-        if let Some(ref id) = self.id {
-            ids.push(NodeKey::Id {
-                net: ns,
-                id: id.to_string(),
-            });
+        let id = self.id();
+        if !id.is_empty() {
+            ids.push(NodeKey::Id { net, id });
         }
-        if !self.title.is_empty() && self.kind.is_document() {
-            ids.push(NodeKey::Title {
-                net: ns,
-                title: to_anchor(&self.title),
-            });
-        }
-        if let Some(net_pm) = bs.paths().get_map(&ns) {
+        if let Some(net_pm) = bs.paths().get_map(&ns.bref()) {
             if self.bid != Bid::nil() {
                 if let Some((_bid_home_net, ns_relative_path, _order)) =
                     net_pm.path(&self.bid, &bs.paths())
                 {
                     ids.push(NodeKey::Path {
-                        net: ns,
+                        net,
                         path: ns_relative_path,
                     })
                 }
@@ -1066,10 +1106,11 @@ impl BeliefNode {
                 if let Some((_parent_home_net, ns_relative_parent_path, _order)) =
                     net_pm.path(&parent, &bs.paths())
                 {
-                    ids.push(NodeKey::Path {
-                        net: ns,
-                        path: path_join(&ns_relative_parent_path, &to_anchor(&self.title), true),
-                    })
+                    let ns_path_ap = AnchorPath::from(&ns_relative_parent_path);
+                    let path = ns_path_ap.join(as_anchor(&self.title));
+                    if path != ns_relative_parent_path {
+                        ids.push(NodeKey::Path { net, path })
+                    }
                 }
             }
         }
@@ -1156,7 +1197,7 @@ impl FromRow<'_, SqliteRow> for BeliefNode {
         let bid_str: &str = row.try_get("bid")?;
         let bid = Bid::try_from(bid_str)?;
 
-        debug_assert!(Bref::try_from(row.try_get::<&str, _>("bref")?)? == bid.namespace());
+        debug_assert!(Bref::try_from(row.try_get::<&str, _>("bref")?)? == bid.bref());
 
         let title_str: &str = row.try_get("title")?;
         let schema_str: Option<&str> = row.try_get("schema")?;
@@ -1453,14 +1494,8 @@ mod tests {
         // Test that API BIDs generated via buildonomy_api_bid are reserved
         let api_v0 = buildonomy_api_bid("0.0.0");
         println!("API v0.0.0 BID: {}", api_v0);
-        println!(
-            "API v0.0.0 parent_namespace_bytes: {:?}",
-            api_v0.parent_namespace_bytes()
-        );
-        println!(
-            "Expected namespace bytes: {:?}",
-            Bid::from(UUID_NAMESPACE_BUILDONOMY).parent_namespace_bytes()
-        );
+        println!("API v0.0.0 namespace: {:?}", api_v0.parent_bref());
+        println!("Expected namespace: {}", buildonomy_namespace().bref());
         assert!(api_v0.is_reserved(), "API v0.0.0 BID should be reserved");
 
         let api_v1 = buildonomy_api_bid("1.0.0");
@@ -1474,7 +1509,7 @@ mod tests {
         );
 
         // Test that a random BID is NOT reserved
-        let random_bid = Bid::nil();
+        let random_bid = Bid::new(Bid::nil());
         assert!(
             !random_bid.is_reserved(),
             "Random BID should not be reserved"
@@ -1493,17 +1528,11 @@ mod tests {
         let parent_bid = Bid::new(Bid::nil());
         let mut child_bid = Bid::default();
 
-        assert_ne!(
-            child_bid.parent_namespace_bytes(),
-            parent_bid.namespace_bytes()
-        );
+        assert_ne!(child_bid.parent_bref(), parent_bid.bref());
 
         child_bid.adopt_into(&parent_bid);
 
-        assert_eq!(
-            child_bid.parent_namespace_bytes(),
-            parent_bid.namespace_bytes()
-        );
+        assert_eq!(child_bid.parent_bref(), parent_bid.bref());
         assert!(parent_bid.is_parent_filter()(&child_bid));
     }
 

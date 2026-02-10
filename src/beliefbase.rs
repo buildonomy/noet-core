@@ -1,7 +1,7 @@
 use crate::{
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{PathMap, PathMapMap},
+    paths::{pathmap::pathmap_order, PathMap, PathMapMap},
     properties::{
         asset_namespace, href_namespace, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation,
         Bid, Bref, WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
@@ -26,7 +26,6 @@ use std::{
         Arc,
     },
 };
-use url::Url;
 
 pub type BidSubGraph = GraphMap<Bid, (u16, Vec<String>), Directed>;
 
@@ -281,49 +280,49 @@ impl<'a> DerefMut for BidRefGraph<'a> {
 pub struct ExtendedRelation<'a> {
     pub other: &'a BeliefNode,
     pub home_net: Bid,
-    pub relative_path: String,
+    pub root_path: String,
     pub weight: &'a WeightSet,
 }
 
 impl<'a> ExtendedRelation<'a> {
     pub fn new(
         other_bid: Bid,
-        relative_net: Bid,
+        root_net: Bid,
         weight: &'a WeightSet,
         set: &'a BeliefBase,
     ) -> Option<ExtendedRelation<'a>> {
         let Some(other) = set.states().get(&other_bid) else {
-            tracing::info!("Could not find 'other' node: {:?}", other_bid);
+            tracing::info!("Could not find 'other' node: {other_bid}");
             return None;
         };
 
         // Treat const namespaces differently, just return their path
         let paths_guard = set.paths();
         for const_net in [asset_namespace(), href_namespace()] {
-            if let Some(pm) = paths_guard.get_map(&const_net) {
+            if let Some(pm) = paths_guard.get_map(&const_net.bref()) {
                 if let Some((_bid, elem_path, _order)) = pm.path(&other_bid, &paths_guard) {
                     return Some(ExtendedRelation {
                         other,
                         home_net: const_net,
-                        relative_path: elem_path.clone(),
+                        root_path: elem_path,
                         weight,
                     });
                 }
             }
         }
 
-        let Some((home_net, relative_path)) = paths_guard
-            .get_map(&relative_net)
+        let Some((home_net, root_path)) = paths_guard
+            .get_map(&root_net.bref())
             .and_then(|pm| pm.path(&other_bid, &paths_guard))
-            .and_then(|(bid, path, _order)| Some((bid, path)))
+            .map(|(bid, path, _order)| (bid, path))
         else {
-            tracing::warn!("Could not find api_path to other node: {}", other);
+            tracing::warn!("Could not find network {root_net} path to other node: {other}");
             return None;
         };
 
         Some(ExtendedRelation {
             home_net,
-            relative_path,
+            root_path,
             other,
             weight,
         })
@@ -332,7 +331,7 @@ impl<'a> ExtendedRelation<'a> {
     pub fn as_link_ref(&self) -> String {
         format!(
             "{}{}{}",
-            self.other.bid.namespace(),
+            self.other.bid.bref(),
             if !self.other.title.is_empty() {
                 ":"
             } else {
@@ -346,19 +345,14 @@ impl<'a> ExtendedRelation<'a> {
 #[derive(Debug)]
 pub struct BeliefContext<'a> {
     pub node: &'a BeliefNode,
-    pub relative_path: String,
-    pub relative_net: Bid,
+    pub root_path: String,
+    pub root_net: Bid,
     pub home_net: Bid,
     set: &'a BeliefBase,
     relations_guard: ArcRwLockReadGuard<RawRwLock, BidGraph>,
 }
 
 impl<'a> BeliefContext<'a> {
-    pub fn href(&self, origin: String) -> Result<String, BuildonomyError> {
-        let origin = Url::parse(&origin)?;
-        Ok(origin.join(&self.relative_path)?.as_str().to_string())
-    }
-
     /// Get a reference to the underlying BeliefBase
     pub fn belief_set(&self) -> &'a BeliefBase {
         self.set
@@ -375,7 +369,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if sink_bid == self.node.bid {
-                    ExtendedRelation::new(source_bid, self.relative_net, &edge.weight, self.set)
+                    ExtendedRelation::new(source_bid, self.root_net, &edge.weight, self.set)
                 } else {
                     None
                 }
@@ -394,7 +388,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if source_bid == self.node.bid {
-                    ExtendedRelation::new(sink_bid, self.relative_net, &edge.weight, self.set)
+                    ExtendedRelation::new(sink_bid, self.root_net, &edge.weight, self.set)
                 } else {
                     None
                 }
@@ -433,21 +427,21 @@ impl BeliefGraph {
                         if !n.title.is_empty() {
                             id_vec.push(n.title.clone());
                         }
-                        id_vec.push(n.bid.namespace().to_string());
+                        id_vec.push(n.bid.bref().to_string());
                         id_vec.join(": ")
                     })
-                    .unwrap_or(source_b.namespace().to_string());
+                    .unwrap_or(source_b.bref().to_string());
                 let sink = self
                     .states
                     .get(&sink_b)
                     .map(|n| {
-                        let mut id_vec = vec![n.bid.namespace().to_string()];
+                        let mut id_vec = vec![n.bid.bref().to_string()];
                         if !n.title.is_empty() {
                             id_vec.push(n.title.clone());
                         }
                         id_vec.join(": ")
                     })
-                    .unwrap_or(sink_b.namespace().to_string());
+                    .unwrap_or(sink_b.bref().to_string());
                 let weights = e
                     .weight
                     .weights
@@ -1026,7 +1020,7 @@ impl BeliefBase {
             *bs.relations.write_arc() = relations;
         }
         bs.states = states;
-        bs.brefs = BTreeMap::from_iter(bs.states.keys().map(|bid| (bid.namespace(), *bid)));
+        bs.brefs = BTreeMap::from_iter(bs.states.keys().map(|bid| (bid.bref(), *bid)));
         if inject_api {
             bs.insert_state(bs.api.clone(), &[]);
         }
@@ -1167,15 +1161,11 @@ impl BeliefBase {
                 .paths()
                 .net_get_from_path(net, path)
                 .and_then(|(_, bid)| self.states.get(&bid).cloned()),
-            NodeKey::Title { net, title } => self
-                .paths()
-                .net_get_from_title(net, title)
-                .and_then(|(_, bid)| self.states.get(&bid).cloned()),
         }
     }
 
     // FIXME: This could introduce index issues, as BeliefContext has mutable access to self.
-    pub fn get_context(&mut self, relative_to_net: &Bid, bid: &Bid) -> Option<BeliefContext<'_>> {
+    pub fn get_context(&mut self, root_net: &Bid, bid: &Bid) -> Option<BeliefContext<'_>> {
         self.index_sync(false);
         assert!(
             self.is_balanced().is_ok(),
@@ -1186,21 +1176,19 @@ impl BeliefBase {
             tracing::debug!("[get_context] node {bid} is not loaded");
             return None;
         };
-        let Some(relative_to_pm) = self.paths().get_map(relative_to_net) else {
-            tracing::debug!("[get_context] network {relative_to_net} is not loaded");
+        let Some(root_pm) = self.paths().get_map(&root_net.bref()) else {
+            tracing::debug!("[get_context] network {root_net} is not loaded");
             return None;
         };
-        relative_to_pm
+        root_pm
             .path(bid, &self.paths())
-            .and_then(|(home_net, relative_path, _order)| {
-                Some(BeliefContext {
-                    node,
-                    home_net,
-                    relative_path,
-                    relative_net: *relative_to_net,
-                    set: self,
-                    relations_guard: self.relations(),
-                })
+            .map(|(home_net, root_path, _order)| BeliefContext {
+                node,
+                home_net,
+                root_path,
+                root_net: *root_net,
+                set: self,
+                relations_guard: self.relations(),
             })
     }
 
@@ -1419,16 +1407,27 @@ impl BeliefBase {
         }
 
         // Phase 4: New edges
+        let mut new_edges = Vec::new();
         for ((source, sink), weight) in parsed_edges
             .iter()
             .filter(|(k, _v)| !old_parsed_edges.contains_key(k))
         {
-            events.push(BeliefEvent::RelationUpdate(
-                *source,
-                *sink,
-                weight.clone(),
-                EventOrigin::Remote,
+            let sink_order = new_set
+                .paths()
+                .indexed_path(sink)
+                .map(|(_a, _b, order)| order)
+                .unwrap_or_else(|| {
+                    tracing::warn!("No entry in pathmap for sink {sink}");
+                    Vec::default()
+                });
+            new_edges.push((
+                BeliefEvent::RelationUpdate(*source, *sink, weight.clone(), EventOrigin::Remote),
+                sink_order,
             ));
+        }
+        new_edges.sort_by(|a, b| pathmap_order(&a.1, &b.1));
+        for (event, _order) in new_edges.into_iter() {
+            events.push(event);
         }
 
         // Phase 5: Check for updated edges
@@ -1552,7 +1551,7 @@ impl BeliefBase {
             .collect();
         let api_net_guards = api_nodes
             .iter()
-            .filter_map(|b| self.paths().get_map(b))
+            .filter_map(|b| self.paths().get_map(&b.bref()))
             .collect::<Vec<ArcRwLockReadGuard<_, PathMap>>>();
 
         let mut pathless_nodes = BTreeSet::default();
@@ -1822,7 +1821,7 @@ impl BeliefBase {
         let bid = node.bid;
         if updated {
             self.states.insert(bid, node);
-            self.brefs.insert(bid.namespace(), bid);
+            self.brefs.insert(bid.bref(), bid);
         }
 
         for replaced in to_replace.iter() {
@@ -1833,7 +1832,7 @@ impl BeliefBase {
 
             // Now remove from states (replace_bid already removed from graph)
             self.states.remove(replaced);
-            self.brefs.remove(&replaced.namespace());
+            self.brefs.remove(&replaced.bref());
         }
         // Our bid_to_indexes must be regenerated
         if updated || !to_replace.is_empty() {
@@ -1880,7 +1879,7 @@ impl BeliefBase {
         // Remove nodes from states
         for bid in bids {
             if self.states.remove(bid).is_some() {
-                self.brefs.remove(&bid.namespace());
+                self.brefs.remove(&bid.bref());
             }
         }
 
@@ -2382,7 +2381,7 @@ impl BeliefBase {
             StatePred::NetPathIn(net) => {
                 let paths_guard = self.paths();
                 let path_bid_pairs = paths_guard
-                    .get_map(net)
+                    .get_map(&net.bref())
                     .map(|pm| {
                         pm.all_net_paths(&paths_guard, &mut std::collections::BTreeSet::new())
                     })
@@ -2394,31 +2393,35 @@ impl BeliefBase {
                         .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
                 )
             }
-            StatePred::Title(net, title) => {
+            StatePred::NetId(net, id) => {
                 let paths_guard = self.paths();
-                let maybe_bid = paths_guard.get_map(net).and_then(|pm| {
-                    pm.get_from_title_regex(title, &paths_guard)
-                        .map(|(_net, bid)| bid)
+                let maybe_match = paths_guard.net_get_from_id(net, id).and_then(|(_, bid)| {
+                    self.states.get(&bid).map(|node| (node.bid, node.clone()))
                 });
-                BTreeMap::from_iter(
-                    maybe_bid
-                        .iter()
-                        .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
-                )
+                BTreeMap::from_iter(maybe_match)
             }
-            _ => BTreeMap::from_iter(
-                self.states
+            StatePred::Bid(bid_vec) => BTreeMap::from_iter(
+                bid_vec
                     .iter()
-                    .chain(rhs.unwrap_or(&BTreeMap::default()).iter())
-                    .filter_map(|(bid, state)| {
-                        let is_match = pred.match_state(state);
-                        if (is_match && !invert) || (!is_match && invert) {
-                            Some((*bid, state.clone()))
-                        } else {
-                            None
-                        }
-                    }),
+                    .filter_map(|bid| self.states.get(bid).map(|node| (node.bid, node.clone()))),
             ),
+            _ => {
+                let res = BTreeMap::from_iter(
+                    self.states
+                        .iter()
+                        .chain(rhs.unwrap_or(&BTreeMap::default()).iter())
+                        .filter_map(|(bid, state)| {
+                            let is_match = pred.match_state(state);
+                            if (is_match && !invert) || (!is_match && invert) {
+                                Some((*bid, state.clone()))
+                            } else {
+                                None
+                            }
+                        }),
+                );
+                tracing::debug!("Found {res:?} matches");
+                res
+            }
         }
     }
 
@@ -2675,7 +2678,7 @@ impl BeliefSource for BeliefBase {
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
-            .get_map(&network_bid)
+            .get_map(&network_bid.bref())
             .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
             .unwrap_or_default())
     }
@@ -2686,7 +2689,7 @@ impl BeliefSource for BeliefBase {
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
-            .get_map(&network_bid)
+            .get_map(&network_bid.bref())
             .map(|pm| {
                 pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
                     .into_iter()
@@ -2721,7 +2724,7 @@ impl BeliefSource for &BeliefBase {
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
-            .get_map(&network_bid)
+            .get_map(&network_bid.bref())
             .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
             .unwrap_or_default())
     }
@@ -2732,7 +2735,7 @@ impl BeliefSource for &BeliefBase {
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
-            .get_map(&network_bid)
+            .get_map(&network_bid.bref())
             .map(|pm| {
                 pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
                     .into_iter()
@@ -2857,7 +2860,7 @@ mod tests {
         // Path/Title/Id lookups may fail (this is the Issue 34 symptom)
         // but BeliefBase shouldn't panic
         let by_id = bs.get(&NodeKey::Id {
-            net: net_bid,
+            net: net_bid.bref(),
             id: "doc-a".to_string(),
         });
         // This documents current behavior - may fail due to incomplete PathMap
@@ -2956,7 +2959,7 @@ mod tests {
         // Path/Title/Id lookups may fail (this is the Issue 34 symptom)
         // but BeliefBase shouldn't panic
         let by_id = bs.get(&NodeKey::Id {
-            net: net_bid,
+            net: net_bid.bref(),
             id: "test-doc".to_string(),
         });
         // This documents current behavior - may fail due to incomplete PathMap

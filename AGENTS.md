@@ -615,6 +615,91 @@ Exploration is valuable, but unconstrained exploration wastes tokens. Establish 
 - Do implement if it requires contextual understanding
 - But if it's mechanical repetition, delegate to human/tools
 
+## Debugging Multi-System Issues
+
+**When to use this approach**: Symptoms appear in one subsystem (e.g., PathMap) but root cause may be elsewhere (e.g., cache lookups, identity resolution).
+
+### Investigation Pattern
+
+1. **Start with Observable Symptoms**
+   - Collect specific examples from logs/output
+   - Note what SHOULD happen vs. what IS happening
+   - Identify the subsystem where symptoms appear
+
+2. **Check Architecture Docs First**
+   - Before diving into code, read relevant design docs
+   - Understand the *intended* behavior and invariants
+   - Key docs for this project:
+     - `docs/design/beliefbase_architecture.md` - Identity resolution, cache system
+     - `docs/design/*.md` - Feature-specific designs
+
+3. **Trace Data Flow Backwards**
+   - Start from symptom location
+   - Work backwards through the call chain
+   - Ask: "What inputs would cause this output?"
+   - Example: Bref paths in PathMap → collision detection → cache misses → missing keys
+
+4. **Identify the "Owner" System**
+   - Multi-system architectures have ownership boundaries
+   - PathMap doesn't own identity - it displays what BeliefBase provides
+   - Cache system doesn't generate nodes - Builder does that
+   - When symptoms appear in System A, root cause may be in System B
+
+5. **Look for Lifecycle Mismatches**
+   - This project has multi-pass compilation (attempt 1/2/3)
+   - State accumulates across passes in some caches but not others
+   - Ask: "Is this data being created fresh each time when it should be reused?"
+   - Check: What's the lifecycle of BIDs, keys, paths, caches?
+
+6. **Use Determinism as a Debugging Tool**
+   - Non-deterministic behavior (different BIDs per parse) often indicates missing state reuse
+   - If "the same input" produces "different outputs" across runs, investigate caching/lookup
+
+### Common Pitfalls in This Codebase
+
+**Symptom**: Duplicate nodes with slightly different data
+- **Check**: Are keys sufficient for cache_fetch to find existing nodes?
+- **Pattern**: `cache_fetch` uses NodeKey triangulation - missing keys = cache miss = new node
+
+**Symptom**: Bref fallback paths appearing
+- **Check**: Collision detection in path generation
+- **Pattern**: Collisions between nodes that should be the same node = identity problem
+
+**Symptom**: "Should work" lookup failing
+- **Check**: Key generation for both lookup and storage
+- **Pattern**: Keys generated differently in different phases = lookup mismatch
+
+**Symptom**: Works on first parse, fails on reparse
+- **Check**: State accumulation in session_bb vs. doc_bb
+- **Pattern**: Previous parse artifacts colliding with current parse
+
+### Debugging Checklist for Cache/Identity Issues
+
+```markdown
+- [ ] What keys are being generated for lookup?
+- [ ] What keys were used when node was stored?
+- [ ] Are keys stable across reparses/phases?
+- [ ] Is BID deterministic or time-based?
+- [ ] Which cache is being queried (doc_bb vs session_bb vs global)?
+- [ ] What's the node lifecycle (when created, when merged, when removed)?
+- [ ] Is this a genuine collision or false positive?
+```
+
+### Example: PathMap Bref Path Investigation
+
+**Symptom**: `[net]/60f386b955be#definition` instead of `[net]/hsml.md#definition`
+
+**Wrong path**: "PathMap collision detection is broken" → spent time in generate_path_name_with_collision_check
+
+**Right path**: 
+1. Architecture doc says NodeKey triangulation enables merging
+2. Duplicate nodes exist → identity problem, not path problem
+3. Why duplicates? → cache_fetch not finding existing nodes
+4. Why cache miss? → missing Path keys for documents without BIDs
+5. Fix: Add Path key using `proto.path` for documents
+
+**Key insight**: PathMap was doing its job (generating paths for nodes that existed). The problem was upstream (too many nodes existing).
+
 ## When Things Go Wrong
 
 ### Agent Made a Mistake

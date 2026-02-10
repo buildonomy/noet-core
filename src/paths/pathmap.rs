@@ -7,43 +7,19 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::Path,
     sync::Arc,
 };
-use url::Url;
 
 use crate::{
     beliefbase::BidGraph,
-    error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
-    nodekey::{get_doc_path, to_anchor, trim_doc_path, trim_joiners, trim_path_sep, TRIM},
+    paths::path::{as_anchor, to_anchor, AnchorPath},
     properties::{
-        asset_namespace, href_namespace, BeliefKind, BeliefNode, Bid, WeightKind, WeightSet,
+        asset_namespace, href_namespace, BeliefKind, BeliefNode, Bid, Bref, WeightKind, WeightSet,
         WEIGHT_SORT_KEY,
     },
     query::WrappedRegex,
 };
-
-/// `core::paths::PathMap::subtree` returns a `Vec<BeliefRow>`. `BeliefRow` contains the information
-/// necessary to render a belief node within the graph structure of a particular
-/// `BeliefBase::relations`` a hierarchical structure.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BeliefRow {
-    pub sink: Bid,
-    pub net: Bid,
-    pub path: String,
-    pub bid: Bid,
-    pub order: Vec<u16>,
-    pub has_branches: bool,
-}
-
-impl BeliefRow {
-    /// Create an absolute url to the BeliefRow::bid entity.
-    pub fn href(&self, origin: String) -> Result<String, BuildonomyError> {
-        let origin = Url::parse(&origin)?;
-        Ok(origin.join(&self.path)?.as_str().to_string())
-    }
-}
 
 /// [IdMap] tracks the mapping between semantic IDs (from TOML schema) and BIDs.
 /// IDs provide globally unique references like "asp_sarah_embodiment_rest".
@@ -101,6 +77,81 @@ impl IdMap {
     }
 }
 
+/// Generate a terminal path segment for a relation.
+/// This is the core logic for determining what string to use for a path segment:
+/// 0. If sink is an API and source is a network, terminal path should be the source ID, else:
+/// 1. Explicit path from weight metadata (if provided)
+/// 2. Title anchor of the source node (if available and non-empty)
+/// 3. Index as fallback
+///
+/// FIXME: explicit path should be escaped or to_anchorized so that we ensure valid urls
+fn generate_terminal_path(
+    source: &Bid,
+    sink: &Bid,
+    explicit_path: Option<&str>,
+    index: u16,
+    nets: &PathMapMap,
+) -> String {
+    if nets.apis.contains(sink) && nets.nets.contains(source) {
+        source.to_string()
+    } else {
+        explicit_path
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .or_else(|| nets.ids.get(source).cloned())
+            .unwrap_or_else(|| index.to_string())
+    }
+}
+
+/// Generate a unique path name for a relation with collision detection.
+/// If the generated path collides with an existing path (for a different bid),
+/// use the Bref (BID namespace) to make it unique.
+fn generate_path_name_with_collision_check(
+    source: &Bid,
+    sink: &Bid,
+    sink_path: &str,
+    explicit_path: Option<&str>,
+    index: u16,
+    nets: &PathMapMap,
+    existing_map: &[(String, Bid, Vec<u16>)],
+) -> String {
+    let mut terminal_path = generate_terminal_path(source, sink, explicit_path, index, nets);
+    let sink_ap = AnchorPath::from(sink_path);
+    let mut full_path = sink_ap.join(nets.anchorize(source, &terminal_path));
+
+    // Check for collision with a different bid
+    let has_collision = existing_map
+        .iter()
+        .any(|(path, bid, _)| path == &full_path && *bid != *source);
+
+    if has_collision {
+        // Use Bref (BID namespace) as fallback for collision
+        terminal_path = source.bref().to_string();
+    }
+    full_path = sink_ap.join(nets.anchorize(source, &terminal_path));
+    // Since the Bref is unique per BID, this should guarantee we don't have any collisions
+    debug_assert!(!existing_map
+        .iter()
+        .any(|(path, bid, _)| path == &full_path && *bid != *source));
+    full_path
+}
+
+/// We want to ensure a consistent ordering of pathmaps: first order by the order element, and
+/// equality order by the path string lexical order.
+pub(crate) fn pathmap_order(a: &[u16], b: &[u16]) -> Ordering {
+    if let Some(order) = a.iter().zip(b.iter()).find_map(|(sub_a, sub_b)| {
+        let cmp = sub_a.cmp(sub_b);
+        match cmp {
+            Ordering::Equal => None,
+            _ => Some(cmp),
+        }
+    }) {
+        order
+    } else {
+        a.len().cmp(&b.len())
+    }
+}
+
 /// [PathMapMap] serves as a central manager for all [PathMap] instances for a specific
 /// [crate::properties::WeightKind] within a [crate::beliefbase::BeliefBase].
 ///
@@ -144,12 +195,12 @@ impl IdMap {
 /// navigable structure of a [crate::beliefbase::BeliefBase].
 #[derive(Debug, Clone)]
 pub struct PathMapMap {
-    map: BTreeMap<Bid, Arc<RwLock<PathMap>>>,
+    map: BTreeMap<Bref, Arc<RwLock<PathMap>>>,
     root: Bid,
     nets: BTreeSet<Bid>,
     docs: BTreeSet<Bid>,
     apis: BTreeSet<Bid>,
-    anchors: BTreeMap<Bid, String>,
+    titles: BTreeMap<Bid, String>,
     ids: BTreeMap<Bid, String>,
     relations: Arc<RwLock<BidGraph>>,
 }
@@ -168,221 +219,42 @@ impl Default for PathMapMap {
             root,
             docs: BTreeSet::default(),
             apis: BTreeSet::default(),
-            anchors: BTreeMap::default(),
+            titles: BTreeMap::default(),
             ids: BTreeMap::default(),
             relations: relations.clone(),
         };
         let api_pm = PathMap::new(WeightKind::Section, root, &pmm, relations);
-        pmm.map.insert(root, Arc::new(RwLock::new(api_pm)));
+        pmm.map.insert(root.bref(), Arc::new(RwLock::new(api_pm)));
         pmm
     }
 }
 
 impl fmt::Display for PathMapMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "nets:\n\
-            {}\n\
-            api_net anchored paths:\n - {}",
-            self.map
-                .values()
-                .map(|pm_arc| {
-                    let pm = pm_arc.read();
-                    format!(
-                        "{}: subs: {}",
-                        pm.net,
-                        pm.subnets()
-                            .iter()
-                            .map(|b| b.to_string())
-                            .collect::<Vec<String>>()
-                            .join(", ")
-                    )
-                })
-                .collect::<Vec<String>>()
-                .join("\n"),
-            self.api_map()
-                .all_paths(self, &mut BTreeSet::default())
-                .join("\n - "),
-        )
-    }
-}
-
-// 'doc' in this case means path or doc, namely anything with a real file path.
-#[tracing::instrument()]
-pub fn path_join(base: &str, end: &str, end_is_anchor: bool) -> String {
-    // Handle empty end string - just return base
-    if end.is_empty() || trim_joiners(end).is_empty() {
-        return trim_joiners(base).to_string();
-    }
-
-    if end_is_anchor {
-        let doc_path = get_doc_path(base);
-        // For anchors, also strip any nested anchors from end to get just the terminal anchor
-        // This ensures flat paths like "doc.md#anchor" instead of "doc.md#parent#child"
-        // Hierarchy is tracked via the order vector, not by nesting anchors in paths
-        let terminal_anchor = end.rfind('#').map(|idx| &end[idx + 1..]).unwrap_or(end);
-        format!("{doc_path}#{terminal_anchor}")
-    } else {
-        let path_base = trim_doc_path(base);
-        if path_base.is_empty() {
-            trim_joiners(end).to_string()
-        } else {
-            format!("{}/{}", trim_joiners(path_base), trim_joiners(end))
-        }
-    }
-}
-
-/// Calculates the path relative to `base`.
-///
-/// If `base_is_doc` is true, it treats `base` as a document path and expects `full` to start
-/// with `base` followed by `#`, returning the part after the `#`.
-///
-/// If `base_is_doc` is false, it expects `full` to start with `base` and returns the
-/// remaining suffix.
-///
-/// Returns an empty string if `full` and `base` are identical.
-///
-/// # Arguments
-///
-/// *   `full`: The full path.
-/// *   `base`: The base path to calculate the relative path from.
-/// *   `base_is_doc`: A boolean indicating whether `base` represents a document node,
-///     which uses `#` for fragments.
-///
-/// # Returns
-///
-/// A `Result` containing the relative `path` on success, or a `BuildonomyError`
-/// if `full` is not relative to `base` according to the rules specified.
-pub fn relative_path(full_ref: &str, base_ref: &str) -> Result<String, BuildonomyError> {
-    let err = BuildonomyError::Serialization(format!(
-        "Path {full_ref:?} is not relative to {base_ref:?}"
-    ));
-    let mut full = full_ref;
-    while full.starts_with('/') {
-        full = &full[1..];
-    }
-    let mut base = base_ref;
-    while base.starts_with('/') {
-        base = &base[1..];
-    }
-    if full.starts_with(base) || base.is_empty() {
-        if base.ends_with(TRIM) || base.is_empty() {
-            Ok(full[base.len()..].to_string())
-        } else if full[base.len()..].starts_with(TRIM) {
-            Ok(full[base.len() + 1..].to_string())
-        } else if full[base.len()..].is_empty() {
-            Ok("".to_string())
-        } else {
-            Err(err)
-        }
-    } else {
-        Err(err)
-    }
-}
-
-/// Get the parent of a URL path (anchor-aware)
-///
-/// If the path has an anchor (#), returns the document path (strips anchor).
-/// If no anchor, returns the parent directory (strips filename).
-///
-/// # Examples
-/// ```
-/// use noet_core::paths::path_parent;
-/// assert_eq!(path_parent("dir/file.md"), "dir");
-/// assert_eq!(path_parent("dir/file.md#anchor"), "dir/file.md");
-/// assert_eq!(path_parent("file.md"), "");
-/// assert_eq!(path_parent("file.md#anchor"), "file.md");
-/// assert_eq!(path_parent(""), "");
-/// ```
-pub fn path_parent(path: &str) -> &str {
-    // If path has an anchor, return document path (strip anchor)
-    if let Some(anchor_idx) = path.find('#') {
-        return &path[..anchor_idx];
-    }
-
-    // No anchor - return parent directory (strip filename)
-    match path.rfind('/') {
-        Some(idx) => &path[..idx],
-        None => "",
-    }
-}
-
-/// Normalize a URL path by resolving `.` and `..` components
-///
-/// Preserves leading `..` components (standard path normalization behavior).
-/// Callers should check the result if they need to validate against backtracking.
-///
-/// # Examples
-/// ```
-/// use noet_core::paths::path_normalize;
-/// assert_eq!(path_normalize("dir/./file.md"), "dir/file.md");
-/// assert_eq!(path_normalize("dir/sub/../file.md"), "dir/file.md");
-/// assert_eq!(path_normalize("../file.md"), "../file.md"); // Preserved
-/// assert_eq!(path_normalize("../../dir/file.md"), "../../dir/file.md");
-/// ```
-pub fn path_normalize(path: &str) -> String {
-    let mut components = Vec::new();
-
-    for part in path.split('/') {
-        match part {
-            "" | "." => {
-                // Skip empty and current dir references
-            }
-            ".." => {
-                // Try to go up one level
-                if let Some(last) = components.last() {
-                    // If last component is "..", we're already backtracking - add another
-                    if *last == ".." {
-                        components.push("..");
-                    } else {
-                        // Normal component - go up by removing it
-                        components.pop();
-                    }
+        for (net_bref, pm_arc) in self.map.iter() {
+            let net_pm = pm_arc.read();
+            let net_anchor = self.nets().iter().find_map(|net_bid| {
+                if net_bid.bref() == *net_bref {
+                    self.titles.get(net_bid).cloned()
                 } else {
-                    // Empty stack - preserve leading ..
-                    components.push("..");
+                    None
                 }
-            }
-            _ => {
-                components.push(part);
-            }
+            });
+            write!(
+                f,
+                "\n{}: {} anchored paths:\n\t{}\n\n",
+                net_bref,
+                net_anchor.unwrap_or_default(),
+                net_pm
+                    .map()
+                    .iter()
+                    .map(|(path, bid, _order)| format!("{} <- \"{}\"", bid.bref(), path))
+                    .collect::<Vec<_>>()
+                    .join("\n\t")
+            )?;
         }
+        Ok(())
     }
-
-    components.join("/")
-}
-
-/// Get the file extension from a URL path (anchor-aware)
-///
-/// Strips any anchor fragment before extracting the extension.
-///
-/// # Examples
-/// ```
-/// use noet_core::paths::path_extension;
-/// assert_eq!(path_extension("file.md"), Some("md"));
-/// assert_eq!(path_extension("file.md#anchor"), Some("md"));
-/// assert_eq!(path_extension("dir/file.html"), Some("html"));
-/// assert_eq!(path_extension("dir/file.html#section"), Some("html"));
-/// assert_eq!(path_extension("noextension"), None);
-/// assert_eq!(path_extension("noextension#anchor"), None);
-/// ```
-pub fn path_extension(path: &str) -> Option<&str> {
-    // Strip anchor first
-    let path_without_anchor = get_doc_path(path);
-
-    // Find the last dot after the last slash (to avoid ".." in parent dirs)
-    let last_slash = path_without_anchor.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let remaining = &path_without_anchor[last_slash..];
-
-    remaining.rfind('.').and_then(|dot_idx| {
-        let ext = &remaining[dot_idx + 1..];
-        if ext.is_empty() {
-            None
-        } else {
-            Some(ext)
-        }
-    })
 }
 
 impl PathMapMap {
@@ -398,7 +270,7 @@ impl PathMapMap {
             ..Default::default()
         };
         for node in states.values() {
-            pmm.anchors.insert(node.bid, to_anchor(&node.title));
+            pmm.titles.insert(node.bid, node.title.clone());
             if let Some(id) = node.id.as_ref() {
                 pmm.ids.insert(node.bid, id.clone());
             }
@@ -416,8 +288,12 @@ impl PathMapMap {
         }
         // Ensure the api net is always present
         pmm.nets.insert(pmm.api());
-        pmm.nets.insert(asset_namespace());
-        pmm.nets.insert(href_namespace());
+        let asset_node = BeliefNode::asset_network();
+        pmm.nets.insert(asset_node.bid);
+        pmm.titles.insert(asset_node.bid, asset_node.title.clone());
+        let href_node = BeliefNode::href_network();
+        pmm.nets.insert(href_node.bid);
+        pmm.titles.insert(href_node.bid, href_node.title.clone());
 
         // Check for states vs relations mismatch
         let states_bids: std::collections::BTreeSet<_> = states.keys().copied().collect();
@@ -451,14 +327,14 @@ impl PathMapMap {
 
         pmm.map.clear();
         for net in pmm.nets.iter() {
-            if !pmm.map.contains_key(net) {
+            if !pmm.map.contains_key(&net.bref()) {
                 let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
                 // tracing::debug!(
                 //     "[PathMapMap::new] Created PathMap for network {}: {} entries",
                 //     net,
                 //     pm.map().len()
                 // );
-                pmm.map.insert(*net, Arc::new(RwLock::new(pm)));
+                pmm.map.insert(net.bref(), Arc::new(RwLock::new(pm)));
             }
         }
 
@@ -469,7 +345,7 @@ impl PathMapMap {
         pmm
     }
 
-    pub fn map(&self) -> &BTreeMap<Bid, Arc<RwLock<PathMap>>> {
+    pub fn map(&self) -> &BTreeMap<Bref, Arc<RwLock<PathMap>>> {
         &self.map
     }
 
@@ -485,15 +361,23 @@ impl PathMapMap {
         &self.docs
     }
 
-    pub fn anchors(&self) -> &BTreeMap<Bid, String> {
-        &self.anchors
+    pub fn titles(&self) -> &BTreeMap<Bid, String> {
+        &self.titles
     }
 
     pub fn is_anchor(&self, bid: &Bid) -> bool {
         !self.docs.contains(bid)
     }
 
-    pub fn net_get_doc(&self, net: &Bid, node: &Bid) -> Option<(String, Bid, Vec<u16>)> {
+    pub fn anchorize(&self, bid: &Bid, subpath: &str) -> String {
+        if !self.is_anchor(bid) {
+            subpath.to_string()
+        } else {
+            as_anchor(subpath)
+        }
+    }
+
+    pub fn net_get_doc(&self, net: &Bref, node: &Bid) -> Option<(String, Bid, Vec<u16>)> {
         self.get_map(net)
             .and_then(|pm| pm.get_doc_from_id(node, self))
     }
@@ -504,20 +388,32 @@ impl PathMapMap {
             .find_map(|pm_lock| pm_lock.read_arc().get_doc_from_id(node, self))
     }
 
-    pub fn net_get_from_path(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
-        let normalized_net = if *net == Bid::nil() { &self.root } else { net };
+    pub fn net_get_from_path(&self, net: &Bref, path: &str) -> Option<(Bid, Bid)> {
+        let normalized_net = if *net == Bref::default() {
+            &self.root.bref()
+        } else {
+            net
+        };
         self.get_map(normalized_net)
             .and_then(|pm| pm.get(path.as_ref(), self))
     }
 
-    pub fn net_get_from_title(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
-        let normalized_net = if *net == Bid::nil() { &self.root } else { net };
+    pub fn net_get_from_title(&self, net: &Bref, path: &str) -> Option<(Bid, Bid)> {
+        let normalized_net = if *net == Bref::default() {
+            &self.root.bref()
+        } else {
+            net
+        };
         self.get_map(normalized_net)
             .and_then(|pm| pm.get_from_title(path.as_ref(), self))
     }
 
-    pub fn net_get_from_id(&self, net: &Bid, path: &str) -> Option<(Bid, Bid)> {
-        let normalized_net = if *net == Bid::nil() { &self.root } else { net };
+    pub fn net_get_from_id(&self, net: &Bref, path: &str) -> Option<(Bid, Bid)> {
+        let normalized_net = if *net == Bref::default() {
+            &self.root.bref()
+        } else {
+            net
+        };
         self.get_map(normalized_net)
             .and_then(|pm| pm.get_from_id(path.as_ref(), self))
     }
@@ -528,13 +424,17 @@ impl PathMapMap {
             .find_map(|pm_lock| pm_lock.read_arc().get(path, self))
     }
 
-    pub fn net_path(&self, net: &Bid, bid: &Bid) -> Option<(Bid, String)> {
+    pub fn net_path(&self, net: &Bref, bid: &Bid) -> Option<(Bid, String)> {
         self.net_indexed_path(net, bid)
             .map(|(net, path, _)| (net, path))
     }
 
-    pub fn net_indexed_path(&self, net: &Bid, bid: &Bid) -> Option<(Bid, String, Vec<u16>)> {
-        let normalized_net = if *net == Bid::nil() { &self.root } else { net };
+    pub fn net_indexed_path(&self, net: &Bref, bid: &Bid) -> Option<(Bid, String, Vec<u16>)> {
+        let normalized_net = if *net == Bref::default() {
+            &self.root.bref()
+        } else {
+            net
+        };
         self.get_map(normalized_net)
             .and_then(|pm| pm.path(bid, self))
     }
@@ -557,14 +457,18 @@ impl PathMapMap {
             .collect::<Vec<(Bid, Vec<String>)>>()
     }
 
-    pub fn get_map(&self, net: &Bid) -> Option<ArcRwLockReadGuard<RawRwLock, PathMap>> {
-        let normalized_net = if *net == Bid::nil() { &self.root } else { net };
+    pub fn get_map(&self, net: &Bref) -> Option<ArcRwLockReadGuard<RawRwLock, PathMap>> {
+        let normalized_net = if *net == Bref::default() {
+            &self.root.bref()
+        } else {
+            net
+        };
         self.map
             .get(normalized_net)
             .map(|pm_lock| pm_lock.read_arc())
     }
 
-    pub fn all_paths(&self) -> BTreeMap<Bid, Vec<(String, Bid, Vec<u16>)>> {
+    pub fn all_paths(&self) -> BTreeMap<Bref, Vec<(String, Bid, Vec<u16>)>> {
         self.map
             .iter()
             .map(|(net, pm)| (*net, pm.read_arc().map().clone()))
@@ -578,7 +482,7 @@ impl PathMapMap {
     #[tracing::instrument(skip(self))]
     pub fn api_map(&self) -> ArcRwLockReadGuard<RawRwLock, PathMap> {
         self.map
-            .get(&self.root)
+            .get(&self.root.bref())
             .map(|pm_lock| pm_lock.read_arc())
             .unwrap_or_else(|| {
                 tracing::warn!("API map called on empty pathmap!");
@@ -592,7 +496,7 @@ impl PathMapMap {
     #[tracing::instrument(skip(self))]
     pub fn asset_map(&self) -> ArcRwLockReadGuard<RawRwLock, PathMap> {
         self.map
-            .get(&asset_namespace())
+            .get(&asset_namespace().bref())
             .map(|pm_lock| pm_lock.read_arc())
             .unwrap_or_else(|| {
                 tracing::warn!("asset map called on empty pathmap!");
@@ -610,7 +514,7 @@ impl PathMapMap {
     #[tracing::instrument(skip(self))]
     pub fn href_map(&self) -> ArcRwLockReadGuard<RawRwLock, PathMap> {
         self.map
-            .get(&href_namespace())
+            .get(&href_namespace().bref())
             .map(|pm_lock| pm_lock.read_arc())
             .unwrap_or_else(|| {
                 tracing::warn!("asset map called on empty pathmap!");
@@ -670,12 +574,10 @@ impl PathMapMap {
         path_events
     }
 
-    /// Process a NodeUpdate event to synchronize nets, docs, and anchors
+    /// Process a NodeUpdate event to synchronize nets, docs, and titles
     pub fn process_node_update(&mut self, node: &BeliefNode, relations: &Arc<RwLock<BidGraph>>) {
-        self.anchors.insert(node.bid, to_anchor(&node.title));
-        if let Some(id) = node.id.as_ref() {
-            self.ids.insert(node.bid, id.clone());
-        }
+        self.titles.insert(node.bid, node.title.clone());
+        self.ids.insert(node.bid, node.id());
 
         if node.kind.contains(BeliefKind::API) {
             self.apis.insert(node.bid);
@@ -684,24 +586,24 @@ impl PathMapMap {
         if node.kind.is_network() {
             self.nets.insert(node.bid);
             let pm = PathMap::new(WeightKind::Section, node.bid, self, relations.clone());
-            self.map.insert(node.bid, Arc::new(RwLock::new(pm)));
+            self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
         }
         if node.kind.is_document() || node.kind.is_external() {
             self.docs.insert(node.bid);
         }
     }
 
-    /// Process a NodesRemoved event to clean up nets, docs, and anchors
+    /// Process a NodesRemoved event to clean up nets, docs, and titles
     pub fn process_nodes_removed(&mut self, bids: &[Bid]) {
         for bid in bids {
             self.nets.remove(bid);
             self.ids.remove(bid);
             self.docs.remove(bid);
-            self.anchors.remove(bid);
-            self.map.remove(bid);
+            self.titles.remove(bid);
+            self.map.remove(&bid.bref());
         }
     }
-    /// Process a NodesRemoved event to clean up nets, docs, and anchors
+    /// Process a NodesRemoved event to clean up nets, docs, and titles
     pub fn process_node_renamed(&mut self, from: &Bid, to: &Bid) {
         if self.nets.remove(from) {
             self.nets.insert(*to);
@@ -712,92 +614,11 @@ impl PathMapMap {
         if self.docs.remove(from) {
             self.docs.insert(*to);
         }
-        if let Some(anchor) = self.anchors.remove(from) {
-            self.anchors.insert(*to, anchor);
+        if let Some(title) = self.titles.remove(from) {
+            self.titles.insert(*to, title);
         };
-        if let Some(pm) = self.map.remove(from) {
-            self.map.insert(*to, pm);
-        }
-    }
-}
-
-/// Generate a terminal path segment for a relation.
-/// This is the core logic for determining what string to use for a path segment:
-/// 0. If sink is an API and source is a network, terminal path should be the source ID, else:
-/// 1. Explicit path from weight metadata (if provided)
-/// 2. Title anchor of the source node (if available and non-empty)
-/// 3. Index as fallback
-fn generate_terminal_path(
-    source: &Bid,
-    sink: &Bid,
-    explicit_path: Option<&str>,
-    index: u16,
-    nets: &PathMapMap,
-) -> String {
-    if nets.apis.contains(sink) && nets.nets.contains(source) {
-        source.to_string()
-    } else {
-        explicit_path
-            .filter(|p| !p.is_empty())
-            .map(|p| p.to_string())
-            .or_else(|| {
-                nets.anchors
-                    .get(source)
-                    .filter(|anchor| !anchor.is_empty())
-                    .cloned()
-            })
-            .unwrap_or_else(|| index.to_string())
-    }
-}
-
-/// Generate a unique path name for a relation with collision detection.
-/// If the generated path collides with an existing path (for a different bid),
-/// use the Bref (BID namespace) to make it unique.
-fn generate_path_name_with_collision_check(
-    source: &Bid,
-    sink: &Bid,
-    sink_path: &str,
-    explicit_path: Option<&str>,
-    index: u16,
-    nets: &PathMapMap,
-    existing_map: &[(String, Bid, Vec<u16>)],
-) -> String {
-    let mut terminal_path = generate_terminal_path(source, sink, explicit_path, index, nets);
-    let mut full_path = path_join(sink_path, &terminal_path, nets.is_anchor(source));
-
-    // Check for collision with a different bid
-    let has_collision = existing_map
-        .iter()
-        .any(|(path, bid, _)| path == &full_path && *bid != *source);
-
-    if has_collision {
-        // Use Bref (BID namespace) as fallback for collision
-        terminal_path = source.namespace().to_string();
-    }
-    full_path = path_join(sink_path, &terminal_path, nets.is_anchor(source));
-    // Since the Bref is unique per BID, this should guarantee we don't have any collisions
-    debug_assert!(!existing_map
-        .iter()
-        .any(|(path, bid, _)| path == &full_path && *bid != *source));
-    full_path
-}
-
-/// We want to ensure a consistent ordering of pathmaps: first order by the order element, and
-/// equality order by the path string lexical order.
-fn pathmap_order(a: &(String, Bid, Vec<u16>), b: &(String, Bid, Vec<u16>)) -> Ordering {
-    if let Some(order) = a.2.iter().zip(b.2.iter()).find_map(|(sub_a, sub_b)| {
-        let cmp = sub_a.cmp(sub_b);
-        match cmp {
-            Ordering::Equal => None,
-            _ => Some(cmp),
-        }
-    }) {
-        order
-    } else {
-        let len_order = a.2.len().cmp(&b.2.len());
-        match &len_order {
-            Ordering::Equal => a.0.cmp(&b.0),
-            _ => len_order,
+        if let Some(pm) = self.map.remove(&from.bref()) {
+            self.map.insert(to.bref(), pm);
         }
     }
 }
@@ -831,8 +652,8 @@ fn pathmap_order(a: &(String, Bid, Vec<u16>), b: &(String, Bid, Vec<u16>)) -> Or
 /// recursion during path generation.
 ///
 /// `PathMap` is primarily used by [PathMapMap] to manage and query the overall path structure of
-/// all known belief networks. It plays a crucial role in generating `BeliefRow`s for UI rendering
-/// and in propagating structural changes through `BeliefEvent`s.
+/// all known belief networks. It plays a crucial role in generating table of content type
+/// structures and navigating relative paths within a BeliefBase structure.
 #[derive(Debug, Clone)]
 pub struct PathMap {
     // usize is the order for path, such that when map.keys() is order by usize the map is
@@ -856,10 +677,10 @@ impl PathMap {
         relations: Arc<RwLock<BidGraph>>,
     ) -> PathMap {
         // Note this is reversed, because child edges are sorted based on the sink's weights for the
-        // relations. A source without any sources is a bottom node (no dependencies), whereas a
-        // sink without any sinks is a 'root', or 'main', or highest abstraction node. We want to
-        // start our stack from the highest abstraction nodes so that we can sort their child stacks
-        // before inserting those stacks into the tree.
+        // relations. A source without any sources floats (no dependencies), whereas a sink without
+        // any sinks is a 'root', or 'main', or deepest abstraction node (depends on the deepest
+        // relationships). We want to start our stack from the deepest abstraction nodes so that we
+        // can sort their child stacks before inserting those stacks into the tree.
         let tree_graph = {
             let relations = relations.read_arc();
             relations.as_subgraph(kind, true)
@@ -895,7 +716,11 @@ impl PathMap {
                     let all_paths = if !paths.is_empty() {
                         paths.clone()
                     } else {
-                        vec![generate_terminal_path(&source, &sink, None, *weight, nets)]
+                        let terminal_path =
+                            generate_terminal_path(&source, &sink, None, *weight, nets);
+                        // Anchorize the path if source is an anchor (adds # prefix)
+                        let anchorized_path = nets.anchorize(&source, &terminal_path);
+                        vec![anchorized_path]
                     };
 
                     let sub_path_info = (vec![*weight], all_paths);
@@ -904,15 +729,10 @@ impl PathMap {
                         path_info.1.insert(source, sub_path_info);
                     }).expect("Never to encounter a sink edge prior to adding it to the stack during a DFS search");
 
-                    if stack
-                        .get_mut(&source)
-                        .map(|path_info| {
-                            path_info.0.insert(sink);
-                        })
-                        .is_none()
-                    {
-                        stack.insert(source, (BTreeSet::from_iter(vec![sink]), BTreeMap::new()));
-                    }
+                    let source_entry = stack
+                        .entry(source)
+                        .or_insert((BTreeSet::new(), BTreeMap::new()));
+                    source_entry.0.insert(sink);
 
                     if nets.nets().contains(&source) && source != net {
                         // Prune network subnets - they have their own separate PathMaps.
@@ -969,12 +789,9 @@ impl PathMap {
                                 // For each base path, join with each sub path
                                 let mut joined_paths = Vec::new();
                                 for base_path in source_base_paths.iter() {
+                                    let base_ap = AnchorPath::from(base_path);
                                     for sub_path in sub_paths.iter() {
-                                        joined_paths.push(path_join(
-                                            base_path,
-                                            sub_path,
-                                            nets.is_anchor(bid),
-                                        ));
+                                        joined_paths.push(base_ap.join(sub_path));
                                     }
                                 }
 
@@ -1016,7 +833,13 @@ impl PathMap {
                         }),
                 ),
         );
-        map.sort_by(pathmap_order);
+        map.sort_by(|a, b| {
+            let order_cmp = pathmap_order(&a.2, &b.2);
+            match &order_cmp {
+                Ordering::Equal => a.1.cmp(&b.1),
+                _ => order_cmp,
+            }
+        });
         let mut bid_map = BTreeMap::new();
         let mut path_map = BTreeMap::new();
         for (idx, (path, bid, _order)) in map.iter().enumerate() {
@@ -1028,8 +851,8 @@ impl PathMap {
         let mut id_map = IdMap::default();
         let mut title_map = IdMap::default();
         for (_, bid, _) in map.iter() {
-            if let Some(title) = nets.anchors().get(bid) {
-                if !nets.is_anchor(bid) && !title.is_empty() {
+            if let Some(title) = nets.titles().get(bid) {
+                if !nets.is_anchor(bid) && !to_anchor(title).is_empty() {
                     title_map.insert(title.clone(), *bid);
                 }
             }
@@ -1059,7 +882,13 @@ impl PathMap {
     }
 
     fn sort(&mut self) {
-        self.map.sort_by(pathmap_order);
+        self.map.sort_by(|a, b| {
+            let order_cmp = pathmap_order(&a.2, &b.2);
+            match &order_cmp {
+                Ordering::Equal => a.1.cmp(&b.1),
+                _ => order_cmp,
+            }
+        });
     }
 
     pub fn map(&self) -> &Vec<(String, Bid, Vec<u16>)> {
@@ -1071,16 +900,6 @@ impl PathMap {
     }
 
     /// Returns the doc path and doc bid that contains the input path
-    pub fn get_doc<P: AsRef<Path> + std::fmt::Debug>(
-        &self,
-        path_ref: P,
-        nets: &PathMapMap,
-    ) -> Option<(String, Bid)> {
-        let path = get_doc_path(&path_ref.as_ref().to_string_lossy()).to_string();
-        self.get(&path, nets).map(|(_net, bid)| (path, bid))
-    }
-
-    /// Returns the doc path and doc bid that contains the input path
     pub fn get_doc_from_id(
         &self,
         node: &Bid,
@@ -1088,9 +907,9 @@ impl PathMap {
     ) -> Option<(String, Bid, Vec<u16>)> {
         self.path(node, nets)
             .and_then(|(_home_net, path_ref, _order)| {
-                let doc_path = get_doc_path(&path_ref);
-                self.indexed_get(doc_path, nets)
-                    .map(|(_net, bid, order)| (doc_path.to_string(), bid, order))
+                let path_ap = AnchorPath::from(&path_ref);
+                self.indexed_get(path_ap.filepath(), nets)
+                    .map(|(_net, bid, order)| (path_ap.filepath().to_string(), bid, order))
             })
     }
 
@@ -1102,7 +921,7 @@ impl PathMap {
             .map(|bid| (self.net, *bid))
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
-                    nets.get_map(net_bid).and_then(|subnet_path_map| {
+                    nets.get_map(&net_bid.bref()).and_then(|subnet_path_map| {
                         subnet_path_map.get_from_title(&anchored_title, nets)
                     })
                 })
@@ -1120,7 +939,7 @@ impl PathMap {
             .map(|bid| (self.net, *bid))
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
-                    nets.get_map(net_bid).and_then(|subnet_path_map| {
+                    nets.get_map(&net_bid.bref()).and_then(|subnet_path_map| {
                         subnet_path_map.get_from_title_regex(title, nets)
                     })
                 })
@@ -1134,7 +953,7 @@ impl PathMap {
             .map(|bid| (self.net, *bid))
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
-                    nets.get_map(net_bid)
+                    nets.get_map(&net_bid.bref())
                         .and_then(|subnet_path_map| subnet_path_map.get_from_id(id, nets))
                 })
             })
@@ -1157,15 +976,26 @@ impl PathMap {
                 }
             })
             .or_else(|| {
+                let path_ap = AnchorPath::from(path);
                 self.subnets.iter().find_map(|net_bid| {
-                    let first_idx = self
-                        .bid_map
-                        .get(net_bid)
-                        .and_then(|idx_vec| idx_vec.first().copied())
-                        .expect("pathmap subnets to be synchronized with pathmap.bid_map");
-                    let (subnet_path, _subnet_bid, net_order) = &self.map[first_idx];
-                    relative_path(path, subnet_path).ok().and_then(|sub_path| {
-                        nets.get_map(net_bid).and_then(|subnet_path_map| {
+                    let maybe_idx = self.bid_map.get(net_bid).and_then(|idx_vec| {
+                        for idx in idx_vec.iter() {
+                            let (subnet_path, _subnet_bid, _net_order) = &self.map[*idx];
+                            if path.starts_with(subnet_path) {
+                                return Some(idx);
+                            }
+                        }
+                        None
+                    });
+
+                    let idx = maybe_idx?;
+
+                    let (subnet_path, _subnet_bid, net_order) = &self.map[*idx];
+                    let maybe_sub_path = path_ap
+                        .strip_prefix(subnet_path)
+                        .map(|sub_path| sub_path.to_string());
+                    if let Some(sub_path) = maybe_sub_path {
+                        nets.get_map(&net_bid.bref()).and_then(|subnet_path_map| {
                             subnet_path_map.indexed_get(&sub_path, nets).map(
                                 |(home_net, bid, home_order)| {
                                     let mut full_order = net_order.clone();
@@ -1174,7 +1004,9 @@ impl PathMap {
                                 },
                             )
                         })
-                    })
+                    } else {
+                        None
+                    }
                 })
             })
     }
@@ -1199,7 +1031,8 @@ impl PathMap {
                         .and_then(|idx_vec| idx_vec.first().copied())
                         .expect("pathmap subnets to be synchronized with pathmap.bid_map");
                     let (subnet_path, _subnet_bid, net_order) = &self.map[first_idx];
-                    nets.get_map(net_bid)
+                    let subnet_ap = AnchorPath::from(subnet_path);
+                    nets.get_map(&net_bid.bref())
                         .and_then(|subnet_path_map| subnet_path_map.path(bid, nets))
                         .map(|(home_net_bid, home_path, home_order)| {
                             let mut full_order = net_order.clone();
@@ -1217,11 +1050,7 @@ impl PathMap {
                             //     self.net,
                             //     res.0
                             // );
-                            (
-                                home_net_bid,
-                                path_join(subnet_path, &home_path, false),
-                                full_order,
-                            )
+                            (home_net_bid, subnet_ap.join(&home_path), full_order)
                         })
                 })
             })
@@ -1245,7 +1074,7 @@ impl PathMap {
         }
         .or_else(|| {
             self.subnets.iter().find_map(|subnet_bid| {
-                nets.get_map(subnet_bid)
+                nets.get_map(&subnet_bid.bref())
                     .and_then(|subnet_path_map| subnet_path_map.home_path(bid, nets))
             })
         })
@@ -1279,13 +1108,13 @@ impl PathMap {
         visited.insert(self.net);
         for (a_path, a_bid, _order) in self.map.iter() {
             if nets.nets().contains(a_bid) && !visited.contains(a_bid) {
-                if let Some(sub_paths) = nets.get_map(a_bid).map(|pm| pm.all_paths(nets, visited)) {
+                if let Some(sub_paths) = nets
+                    .get_map(&a_bid.bref())
+                    .map(|pm| pm.all_paths(nets, visited))
+                {
+                    let a_ap = AnchorPath::from(a_path);
                     for subnet_path in sub_paths.iter() {
-                        paths.push(format!(
-                            "{}/{}",
-                            trim_path_sep(a_path),
-                            trim_path_sep(subnet_path)
-                        ));
+                        paths.push(a_ap.join(subnet_path));
                     }
                 }
             } else {
@@ -1310,14 +1139,12 @@ impl PathMap {
         for (a_path, a_bid, _order) in self.map.iter() {
             if nets.nets().contains(a_bid) && !visited.contains(a_bid) {
                 if let Some(sub_paths) = nets
-                    .get_map(a_bid)
+                    .get_map(&a_bid.bref())
                     .map(|pm| pm.all_paths_with_bids(nets, visited))
                 {
+                    let a_ap = AnchorPath::from(a_path);
                     for (subnet_path, subnet_bid) in sub_paths.iter() {
-                        paths.push((
-                            format!("{}/{}", trim_path_sep(a_path), trim_path_sep(subnet_path)),
-                            *subnet_bid,
-                        ));
+                        paths.push((a_ap.join(subnet_path), *subnet_bid));
                     }
                 }
             } else {
@@ -1354,15 +1181,13 @@ impl PathMap {
         paths.push(("".to_string(), self.net));
         for subnet_idx in subnet_idxs.iter() {
             let (ref base, subnet_bid, _) = self.map[*subnet_idx];
+            let base_ap = AnchorPath::new(base);
             let sub_subs = nets
-                .get_map(&subnet_bid)
+                .get_map(&subnet_bid.bref())
                 .map(|pm| pm.all_net_paths(nets, visited))
                 .expect("all identified subnets to be registered with the pathmapmap");
             for (sub_sub_path, sub_sub_bid) in sub_subs.iter() {
-                paths.push((
-                    path_join(base, sub_sub_path, nets.is_anchor(sub_sub_bid)),
-                    *sub_sub_bid,
-                ));
+                paths.push((base_ap.join(sub_sub_path), *sub_sub_bid));
             }
         }
 
@@ -1415,51 +1240,6 @@ impl PathMap {
         )
     }
 
-    /// Compute what path would be generated for a new node without mutating state.
-    /// Used for speculative path generation during cache_fetch key computation.
-    ///
-    /// # Arguments
-    /// * `source` - BID of the child node being added
-    /// * `parent_path` - Path of the parent node (e.g., "file.md" for document)
-    /// * `explicit_path` - Explicit path from weight metadata (if provided)
-    /// * `nets` - PathMapMap for looking up anchors and checking collisions
-    pub fn speculative_path(
-        &self,
-        source: &Bid,
-        parent_path: &str,
-        explicit_path: Option<&str>,
-        nets: &PathMapMap,
-    ) -> Option<String> {
-        // Use parent_path directly as the base, with empty order for sibling index computation
-        let sink_path = parent_path.to_string();
-
-        // Determine the sort_key for this new child (would be max + 1)
-        // Find all existing children of this parent by matching path prefix
-        let new_index = self
-            .map
-            .iter()
-            .filter(|(path, _bid, _order)| {
-                // Find siblings: paths that start with parent_path
-                path.starts_with(&sink_path) && path != &sink_path
-            })
-            .count() as u16;
-
-        // Use existing collision detection logic
-        // Note: We use a dummy Bid::nil() for sink since we don't have the actual parent BID
-        // The sink parameter is only used for a special API check which won't apply to sections
-        let path = generate_path_name_with_collision_check(
-            source,
-            &Bid::nil(), // Dummy sink - only used for API special case which doesn't apply here
-            &sink_path,
-            explicit_path,
-            new_index,
-            nets,
-            &self.map,
-        );
-
-        Some(path)
-    }
-
     /// Process a relation event and generate path mutations
     pub fn process_event(&mut self, event: &BeliefEvent, nets: &PathMapMap) -> Vec<BeliefEvent> {
         let res = match event {
@@ -1470,7 +1250,7 @@ impl PathMap {
                         let (path, bid, order) = &mut self.map[idx];
                         *bid = *to;
                         derivatives.push(BeliefEvent::PathUpdate(
-                            self.net,
+                            self.net.bref(),
                             path.clone(),
                             *bid,
                             order.clone(),
@@ -1552,7 +1332,7 @@ impl PathMap {
             }
             if !paths.is_empty() {
                 derivatives.push(BeliefEvent::PathsRemoved(
-                    self.net,
+                    self.net.bref(),
                     paths,
                     EventOrigin::Local,
                 ));
@@ -1580,11 +1360,12 @@ impl PathMap {
             // Clone this so we don't keep a nonmutable reference into self.map;
             let (mut new_paths, new_order) = {
                 let (sink_path, sink_bid, sink_order) = &self.map[*sink_index];
+                let sink_ap = AnchorPath::from(sink_path);
                 debug_assert!(*sink_bid == *sink);
                 let mut new_order = sink_order.clone();
                 new_order.push(new_idx);
                 // Strip anchor from sink_path to avoid double anchors when generating child paths
-                let sink_path_without_anchor = get_doc_path(sink_path);
+                let sink_path_without_anchor = sink_ap.filepath();
                 // Get all paths from the weight (new format supports multiple paths)
                 let paths = new_weight.get_doc_paths();
 
@@ -1633,7 +1414,7 @@ impl PathMap {
                     for new_path in new_paths {
                         let new_entry = (new_path.clone(), *source, new_order.clone());
                         derivatives.push(BeliefEvent::PathAdded(
-                            self.net,
+                            self.net.bref(),
                             new_entry.0.clone(),
                             *source,
                             new_entry.2.clone(),
@@ -1710,7 +1491,7 @@ impl PathMap {
                             .map(|(i, _, _)| *i)
                         {
                             derivatives.push(BeliefEvent::PathsRemoved(
-                                self.net,
+                                self.net.bref(),
                                 vec![path_to_remove.clone()],
                                 EventOrigin::Local,
                             ));
@@ -1723,7 +1504,7 @@ impl PathMap {
                             // Path is kept, update the order
                             self.map[*old_idx].2 = new_order.clone();
                             derivatives.push(BeliefEvent::PathUpdate(
-                                self.net,
+                                self.net.bref(),
                                 old_path.clone(),
                                 *source,
                                 new_order.clone(),
@@ -1739,7 +1520,7 @@ impl PathMap {
                         for new_path in paths_to_add {
                             let new_entry = (new_path.clone(), *source, new_order.clone());
                             derivatives.push(BeliefEvent::PathAdded(
-                                self.net,
+                                self.net.bref(),
                                 new_path,
                                 *source,
                                 new_order.clone(),
@@ -1783,8 +1564,8 @@ impl PathMap {
                 .iter()
                 .any(|e| matches!(e, BeliefEvent::PathAdded(..)))
             {
-                if let Some(source_title) = nets.anchors.get(source) {
-                    if !nets.is_anchor(source) && !source_title.is_empty() {
+                if let Some(source_title) = nets.titles.get(source) {
+                    if !nets.is_anchor(source) && !to_anchor(source_title).is_empty() {
                         // We only get title anchors if the title anchor is non-empty
                         self.title_map.insert(source_title.clone(), *source);
                     }

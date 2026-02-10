@@ -6,6 +6,7 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     result::Result,
+    slice::from_ref,
 };
 use tokio::sync::mpsc::UnboundedSender;
 /// Utilities for parsing various document types into BeliefBases
@@ -20,11 +21,11 @@ use crate::{
     },
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
-    nodekey::{get_doc_path, to_anchor, trim_path_sep, NodeKey},
-    paths::relative_path,
+    nodekey::NodeKey,
+    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
-        buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight,
-        WeightKind, WEIGHT_SORT_KEY,
+        asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet,
+        BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, Query},
 };
@@ -315,21 +316,13 @@ impl GraphBuilder {
                 full_path.push(NETWORK_CONFIG_NAMES[0]);
             }
         }
-        let file_err = BuildonomyError::Codec(format!(
-            "Cannot parse {full_path:?}. Path has no extention type",
-        ));
-        let doc_home_path =
-            trim_path_sep(&full_path.strip_prefix(&self.repo_root)?.to_string_lossy()).to_string();
-        let ext = full_path
-            .extension()
-            .ok_or(file_err.clone())?
-            .to_str()
-            .ok_or(file_err)?;
+        let doc_path = os_path_to_string(full_path.strip_prefix(&self.repo_root)?);
+        let doc_ap = AnchorPath::from(&doc_path);
 
         let mut parsed_bids;
         let owned_codec: Box<dyn DocCodec + Send>;
 
-        if let Some(codec_factory) = CODECS.get(ext) {
+        if let Some(codec_factory) = CODECS.get(doc_ap.ext()) {
             // Create fresh codec instance from factory
             let mut codec = codec_factory();
             codec.parse(content, initial)?;
@@ -347,18 +340,12 @@ impl GraphBuilder {
             );
             for proto in codec.nodes().iter() {
                 let (bid, (source, _nodekeys, unique_oldkeys)) = self
-                    .push(
-                        proto,
-                        global_bb.clone(),
-                        false,
-                        &mut relation_event_queue,
-                        &mut missing_structure,
-                    )
+                    .push(proto, global_bb.clone(), false, &mut missing_structure)
                     .await?;
                 if !missing_structure.is_empty() {
                     tracing::debug!(
-                        "Phase 1 {}: merging missing structure onto self.session_bb",
-                        bid
+                        "Phase 1 {}: merging missing structure onto self.session_bb:",
+                        bid,
                     );
                     // Don't merge missing_structure into self.doc_bb here -- we want to preserve the
                     // relations we're building up from the parse
@@ -369,9 +356,6 @@ impl GraphBuilder {
                     missing_structure = BeliefGraph::default();
                 }
 
-                for edge_update in relation_event_queue.drain(..) {
-                    let _deriv = self.doc_bb.process_event(&edge_update)?;
-                }
                 if !source.is_from_cache() {
                     inject_context = true;
                 } else if !unique_oldkeys.is_empty() {
@@ -415,7 +399,7 @@ impl GraphBuilder {
 
                     match result {
                         GetOrCreateResult::Resolved(_, source) => {
-                            if source == NodeSource::GlobalCache {
+                            if source.is_from_cache() {
                                 inject_context = true;
                             }
                         }
@@ -493,7 +477,7 @@ impl GraphBuilder {
                             .collect::<Vec<_>>();
                         sink_docs.sort_by_key(|doc_tuple| doc_tuple.2.clone());
                         for sink_doc_id in sink_docs.into_iter() {
-                            if sink_doc_id.0 == doc_home_path {
+                            if sink_doc_id.0 == doc_path {
                                 continue;
                             }
                             let doc_id = (sink_doc_id.0, sink_doc_id.1);
@@ -556,7 +540,8 @@ impl GraphBuilder {
             owned_codec = codec;
         } else {
             return Err(BuildonomyError::Codec(format!(
-                "Cannot parse {full_path:?}. No Codec for extension type {ext} found in CodecMap"
+                "Cannot parse {full_path:?}. No Codec for extension type {} found in CodecMap",
+                doc_ap.ext()
             )));
         };
 
@@ -635,8 +620,7 @@ impl GraphBuilder {
         }
 
         let initial = ProtoBeliefNode::new(self.repo_root.as_ref(), path.as_ref())?;
-
-        let mut parent_path = PathBuf::from(&initial.path);
+        let mut parent_path = string_to_os_path(&initial.path);
         let mut parent_path_stack: Vec<PathBuf> = Vec::default();
         // If path is a sub-network node, dont count self path as a parent path
         if let Some(file_name) = parent_path.file_name() {
@@ -666,7 +650,6 @@ impl GraphBuilder {
                     &state_accum,
                     global_bb.clone(),
                     true,
-                    &mut events,
                     &mut missing_structure,
                 )
                 .await?;
@@ -692,11 +675,6 @@ impl GraphBuilder {
         //     "processing {} events and adding to our self.doc_bb",
         //     events.len()
         // );
-        for event in events.iter() {
-            self.doc_bb.process_event(event)?;
-        }
-        events.clear();
-        self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // Initialize any child links found by the last state_accum. This ensures we can sort the
         // parsed_content's relation to its parent correctly
@@ -813,10 +791,11 @@ impl GraphBuilder {
             // tracing::debug!("Ensuring our global_bb is balanced");
             self.tx.send(balance_check)?;
         }
+
         Ok(())
     }
 
-    fn get_parent_from_stack(&mut self, proto: &ProtoBeliefNode) -> (Bid, Option<String>, String) {
+    fn get_parent_from_stack(&mut self, proto: &ProtoBeliefNode) -> (Bid, String, String) {
         let mut parent_info = None;
         let mut first_run = true;
         while !self.stack.is_empty() && parent_info.is_none() {
@@ -830,80 +809,97 @@ impl GraphBuilder {
                 .last()
                 .filter(|(_stack_bid, stack_path, stack_heading)| {
                     // Extract document path from stack_path (which may contain anchors for sections)
-                    let stack_doc_path = get_doc_path(stack_path);
-                    (proto.path.starts_with(stack_doc_path)
-                        && proto.path != stack_doc_path
+                    let stack_ap = AnchorPath::from(stack_path);
+                    (proto.path.starts_with(stack_ap.filepath())
+                        && proto.path != stack_ap.filepath()
                         && !proto
                             .kind
                             .intersection(BeliefKind::Network | BeliefKind::Document)
                             .is_empty())
-                        || (proto.path == stack_doc_path && *stack_heading < proto.heading)
+                        || (proto.path == stack_ap.filepath() && *stack_heading < proto.heading)
                 })
                 .map(|(stack_bid, stack_path, _stack_heading)| {
-                    let stack_doc_path = get_doc_path(stack_path);
-                    let path_info = relative_path(&proto.path, stack_doc_path)
-                        .ok()
-                        .filter(|rel_path| !rel_path.is_empty());
+                    let proto_ap = AnchorPath::new(&proto.path);
+                    let path_info = proto_ap
+                        .strip_prefix(stack_path)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     (*stack_bid, path_info, stack_path.clone())
                 });
         }
-        parent_info.unwrap_or((self.api().bid, None, proto.path.clone()))
+        parent_info.unwrap_or((self.api().bid, "".to_string(), proto.path.clone()))
     }
 
-    /// Generate a speculative path for a section without mutating state.
+    /// Generate a speculative Nodekey::Path for for a node push.
     /// Uses PathMap's speculative_path to compute what the path would be with collision detection.
-    /// Returns (network_bid, path).
-    fn speculative_section_path(
+    /// Returns Result<NodeKey, BuildonomyError>.
+    fn speculative_path_key(
         &self,
-        parsed_node: &BeliefNode,
-        parent_bid: Bid,
-        parent_path: &str,
-    ) -> Result<(Bid, String), BuildonomyError> {
+        proto: &ProtoBeliefNode,
+    ) -> Result<Option<NodeKey>, BuildonomyError> {
         // Find the network by walking up the stack (network nodes have heading=1)
-        let parent_net = self
+        if let Some(bid) = proto
+            .document
+            .get("bid")
+            .and_then(|bid_val| bid_val.as_str())
+            .and_then(|bid_str| Bid::try_from(bid_str).ok())
+            .filter(|bid| bid.initialized())
+        {
+            return Ok(Some(NodeKey::Bid { bid }));
+        }
+
+        if proto.kind.is_network() {
+            // is network, and don't have an initialized id. Can't use an empty path because the net
+            // will be wrong. But we require Networks to have an explicit ID. Rely on that
+            let Some(network_id) = proto.id() else {
+                return Err(BuildonomyError::Codec(
+                    "Network nodes are required to have explicitly defined IDs. \
+                        The network node has no ID set."
+                        .to_string(),
+                ));
+            };
+            return Ok(Some(NodeKey::Id {
+                net: Bref::default(),
+                id: network_id,
+            }));
+        }
+        let (net, net_path) = self
             .stack
             .iter()
             .rev()
             .find(|(_bid, _path, heading)| *heading == 1)
-            .map(|(bid, _path, _heading)| *bid)
-            .unwrap_or(self.repo());
-
-        // Generate a temporary BID for the speculative computation
-        let temp_bid = if parsed_node.bid.initialized() {
-            parsed_node.bid
-        } else {
-            Bid::new(parent_bid)
-        };
-
-        // Get the PathMap for this network and compute speculative path
-        let path = {
-            let paths = self.doc_bb.paths();
-            let pathmap_arc = paths.get_map(&parent_net).ok_or_else(|| {
-                BuildonomyError::Codec(format!(
-                    "No PathMap found for network {} while computing path for '{}'",
-                    parent_net, parsed_node.title
-                ))
-            })?;
-
-            // Use title-based anchor as explicit path if title is non-empty
-            // This prevents fallback to index-based anchors (#0, #1, etc.) for new nodes
-            let explicit_path = if !parsed_node.title.is_empty() {
-                Some(to_anchor(&parsed_node.title))
-            } else {
-                None
+            .map(|(bid, path, _heading)| (*bid, path.clone()))
+            .unwrap_or((self.repo(), String::default()));
+        let pmm = self.doc_bb.paths();
+        let net_pm = pmm.get_map(&net.bref()).ok_or_else(|| {
+            BuildonomyError::Codec(format!(
+                "No PathMap found for network {} while computing path for '{:?} - {:?}'",
+                net,
+                proto.path,
+                proto.id()
+            ))
+        })?;
+        let net_anchored_child = AnchorPath::new(&proto.path)
+            .strip_prefix(&net_path)
+            .unwrap_or(&proto.path);
+        let child_ap = AnchorPath::new(net_anchored_child);
+        let path = if proto.heading > 2 {
+            let Some(section_id) = proto.id() else {
+                tracing::debug!("Cannot generate speculative key for a section node without an ID");
+                return Ok(None);
             };
-
-            pathmap_arc
-                .speculative_path(&temp_bid, parent_path, explicit_path.as_deref(), &paths)
-                .ok_or_else(|| {
-                    BuildonomyError::Codec(format!(
-                        "Failed to generate speculative path for section '{}' under parent {} (path: {})",
-                        parsed_node.title, parent_bid, parent_path
-                    ))
-                })?
+            if net_pm.get_from_id(&section_id, &pmm).is_some() {
+                tracing::debug!("Cannot generate speculative key, there already exists a node with ID '{section_id}' in this network.");
+                return Ok(None);
+            };
+            child_ap.join(as_anchor(&section_id))
+        } else {
+            child_ap.to_string()
         };
-
-        Ok((parent_net, path))
+        Ok(Some(NodeKey::Path {
+            net: net.bref(),
+            path,
+        }))
     }
 
     /// Update the parent stack, and update the stack cache with the node and its relations from the
@@ -927,36 +923,19 @@ impl GraphBuilder {
         proto: &ProtoBeliefNode,
         global_bb: B,
         as_trace: bool,
-        event_queue: &mut Vec<BeliefEvent>,
         missing_structure: &mut BeliefGraph,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
-        let (parent_bid, path_info, parent_full_path) = self.get_parent_from_stack(proto);
+        let (parent_bid, path_info, _parent_full_path) = self.get_parent_from_stack(proto);
 
         // Can't use self.doc_bb.paths() to generate keys here, because we can't assume that self.doc_bb
         // is balanced until we're out of phase 1 of parse_content.
-
         let mut parsed_node = BeliefNode::try_from(proto)?;
 
         // Generate keys based on node type
-        let mut keys = if proto.heading > 2 && !parsed_node.bid.initialized() {
-            // Section in Phase 1 (no BID yet): use speculative path computation to get collision-aware path
-            let (parent_net, speculative_path) =
-                self.speculative_section_path(&parsed_node, parent_bid, &parent_full_path)?;
-
-            let section_keys = vec![NodeKey::Path {
-                net: parent_net,
-                path: speculative_path,
-            }];
-
-            // Note: We don't add ID key here because collision detection hasn't happened yet
-            // The ID might collide with siblings and would need to fall back to Bref
-
-            section_keys
-        } else {
-            // Document OR section in Phase 2+ (with BID): use existing logic
-            parsed_node.keys(Some(self.repo()), Some(parent_bid), self.doc_bb())
-        };
-
+        let mut keys = self
+            .speculative_path_key(proto)?
+            .into_iter()
+            .collect::<Vec<_>>();
         // On top of providing us with the old state of the node (if such a state exists), this will
         // also update our session_bb to include all the old relationships tied to this node. We
         // will use this info later in terminate_stack to determine what our "affected_sink" set is,
@@ -964,7 +943,7 @@ impl GraphBuilder {
         // this node that need to be informed about changes to the node's reference ids (it's set of
         // nodekeys).
         let cache_fetch_result = self
-            .cache_fetch(&keys, global_bb.clone(), true, missing_structure)
+            .cache_fetch(&keys, global_bb.clone(), false, missing_structure)
             .await?;
 
         let (mut node, source) = match cache_fetch_result {
@@ -999,6 +978,11 @@ impl GraphBuilder {
                     parsed_node.bid = Bid::new(parent_bid);
                     NodeSource::Generated
                 };
+                // speculative_path_key returns None if the id has a collision in this document. We
+                // need to set the id to the bref at this point to control the collision
+                if proto.id().is_some() && keys.is_empty() {
+                    parsed_node.id = Some(parsed_node.bid.bref().to_string());
+                }
                 (parsed_node, source)
             }
         };
@@ -1007,100 +991,52 @@ impl GraphBuilder {
         // Network-level ID collision detection (Issue 37, Fix 2)
         // Generate ID from title if not set, then check for collision
         // This happens AFTER the main cache_fetch so we have the node's BID
-        if proto.heading > 2 {
-            // Step 1: Generate ID from title if not already set
-            if node.id.is_none() && !node.title.is_empty() {
-                node.id = Some(to_anchor(&node.title));
-                tracing::debug!(
-                    "Generated ID '{}' from title '{}' for node {}",
-                    node.id.as_ref().unwrap(),
-                    node.title,
-                    bid
-                );
+        let node_id = node.id();
+        let node_bref = node.bid.bref().to_string();
+        if !node_id.is_empty() && node_id != node_bref {
+            let net = self
+                .stack
+                .iter()
+                .rev()
+                .find(|(_bid, _path, heading)| *heading == 1)
+                .map(|(bid, _path, _heading)| *bid)
+                .unwrap_or(self.repo);
+
+            let id_key = NodeKey::Id {
+                net: net.bref(),
+                id: node_id.clone(),
+            };
+
+            // Check if this ID already exists in the network (cache + database)
+            let mut id_missing_structure = BeliefGraph::default();
+            let id_fetch_result = self
+                .cache_fetch(
+                    from_ref(&id_key),
+                    global_bb.clone(),
+                    true, // check doc_bb first
+                    &mut id_missing_structure,
+                )
+                .await?;
+
+            // Merge any missing structure from ID fetch
+            if !id_missing_structure.is_empty() {
+                missing_structure.union_mut(&id_missing_structure);
             }
 
-            // Step 2: Check for collision if ID is set
-            if let Some(section_id) = node.id.clone() {
-                // Get the network from the stack (or use repo as fallback)
-                let net = self
-                    .stack
-                    .iter()
-                    .rev()
-                    .find(|(_bid, _path, heading)| *heading == 1)
-                    .map(|(bid, _path, _heading)| *bid)
-                    .unwrap_or(self.repo);
-
-                let id_key = NodeKey::Id {
-                    net,
-                    id: section_id.clone(),
-                };
-
-                // Check if this ID already exists in the network (cache + database)
-                let mut id_missing_structure = BeliefGraph::default();
-                let id_fetch_result = self
-                    .cache_fetch(
-                        &[id_key],
-                        global_bb.clone(),
-                        true, // check doc_bb first
-                        &mut id_missing_structure,
-                    )
-                    .await?;
-
-                // Merge any missing structure from ID fetch
-                if !id_missing_structure.is_empty() {
-                    for (bid, node) in id_missing_structure.states {
-                        missing_structure.states.insert(bid, node);
-                    }
-                    for edge in id_missing_structure.relations.0.raw_edges() {
-                        let source_bid = id_missing_structure.relations.0[edge.source()];
-                        let target_bid = id_missing_structure.relations.0[edge.target()];
-                        if let Some(source_idx) = missing_structure
-                            .relations
-                            .0
-                            .node_indices()
-                            .find(|&idx| missing_structure.relations.0[idx] == source_bid)
-                        {
-                            if let Some(target_idx) = missing_structure
-                                .relations
-                                .0
-                                .node_indices()
-                                .find(|&idx| missing_structure.relations.0[idx] == target_bid)
-                            {
-                                missing_structure.relations.0.add_edge(
-                                    source_idx,
-                                    target_idx,
-                                    edge.weight.clone(),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if let GetOrCreateResult::Resolved(existing_node, existing_source) = id_fetch_result
-                {
-                    // Only check collision if node was actually found (not generated)
-                    if matches!(
-                        existing_source,
-                        NodeSource::SourceFile | NodeSource::StackCache
-                    ) {
-                        // Collision if existing node has different BID
-                        if existing_node.bid != bid {
-                            tracing::info!(
-                                "Network-level ID collision detected: '{}' already used by node {} (title='{}'). Assigning Bref to current node {} (title='{}')",
-                                section_id,
-                                existing_node.bid,
-                                existing_node.title,
-                                bid,
-                                proto.document.get("title").and_then(|v| v.as_str()).unwrap_or("<untitled>")
-                            );
-                            // First-one-wins: Clear the ID so inject_context generates Bref
-                            node.id = None;
-                            tracing::debug!(
-                                "Cleared colliding ID '{}' for node {} - Bref will be generated",
-                                section_id,
-                                bid
-                            );
-                        }
+            if let GetOrCreateResult::Resolved(existing_node, existing_source) = id_fetch_result {
+                // Only check collision if node was actually found (not generated)
+                // Collision if existing node has different BID
+                if existing_source.is_from_cache() && existing_node.bid != bid {
+                    // First-one-wins: Clear the ID so inject_context uses Bref for id
+                    node.id = Some(node_bref);
+                    // Regenerate keys since we updated our ID
+                    for key in keys.iter_mut() {
+                        if let NodeKey::Id { .. } = key {
+                            *key = NodeKey::Id {
+                                net: net.bref(),
+                                id: node.id(),
+                            };
+                        };
                     }
                 }
             }
@@ -1113,7 +1049,7 @@ impl GraphBuilder {
             // Clear all relationships in the doc_bb for this node, this way we ensure the
             // currently parsed content is processed as the source of truth for the node's content
             // and all relationships where it is the sink.
-            let mut remove_events = if let Some(node_idx) = self.doc_bb.bid_to_index(&node.bid) {
+            let remove_events = if let Some(node_idx) = self.doc_bb.bid_to_index(&node.bid) {
                 self.doc_bb
                     .relations()
                     .as_graph()
@@ -1126,7 +1062,9 @@ impl GraphBuilder {
             } else {
                 vec![]
             };
-            event_queue.append(&mut remove_events);
+            for event in remove_events.iter() {
+                let _derivative_events = self.doc_bb.process_event(event)?;
+            }
         } else {
             // We're not guaranteeing that the relationship set connected to this node is
             // comprehensive.
@@ -1138,19 +1076,17 @@ impl GraphBuilder {
         //     source = NodeSource::Merged;
         // }
 
-        // Always process NodeUpdate for network nodes to preserve their kind information, even when
-        // used as scaffolding
-        event_queue.push(BeliefEvent::NodeUpdate(
+        let _derivative_events = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
             keys.clone(),
             node.toml(),
             EventOrigin::Remote,
-        ));
+        ))?;
 
         let mut weight = Weight {
             payload: TomlTable::new(),
         };
-        if let Some(path) = path_info {
-            weight.set_doc_paths(vec![path]).ok();
+        if !path_info.is_empty() {
+            weight.set_doc_paths(vec![path_info]).ok();
         }
         // There's no one-source-of-truth for api linking, so that's the only case where the source
         // owns the edge.
@@ -1162,13 +1098,13 @@ impl GraphBuilder {
         weight
             .set(crate::properties::WEIGHT_OWNED_BY, weight_owner)
             .ok();
-        event_queue.push(BeliefEvent::RelationChange(
+        let _derivative_events = self.doc_bb.process_event(&BeliefEvent::RelationChange(
             bid,
             parent_bid,
             WeightKind::Section,
             Some(weight.clone()),
             EventOrigin::Remote,
-        ));
+        ))?;
         // For sections, use the full path with anchor from the generated keys
         // For documents/networks, use the document path
         let stack_path = if proto.heading > 2 {
@@ -1205,13 +1141,14 @@ impl GraphBuilder {
                 api_weight
                     .set(crate::properties::WEIGHT_OWNED_BY, "source")
                     .ok();
-                event_queue.push(BeliefEvent::RelationChange(
-                    bid,
-                    self.api().bid,
-                    WeightKind::Section,
-                    Some(api_weight),
-                    EventOrigin::Remote,
-                ));
+                let _derivative_events =
+                    self.doc_bb.process_event(&BeliefEvent::RelationChange(
+                        bid,
+                        self.api().bid,
+                        WeightKind::Section,
+                        Some(api_weight),
+                        EventOrigin::Remote,
+                    ))?;
             }
         }
 
@@ -1223,14 +1160,7 @@ impl GraphBuilder {
                 .difference(&current_keys)
                 .cloned(),
         );
-        // tracing::debug!(
-        //     "push: final bid={}, parsed_bid={}, got_or_created_bid={}, kind={:?}, source={:?}",
-        //     node.bid,
-        //     parsed_bid,
-        //     got_or_created_bid,
-        //     node.kind,
-        //     source
-        // );
+
         Ok((bid, (source, current_keys, unique_old)))
     }
 
@@ -1250,37 +1180,13 @@ impl GraphBuilder {
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
 
-        // DEBUG: Log asset-related push_relation calls
-        use crate::properties::asset_namespace;
-        if let NodeKey::Path { net, path } = other_key {
-            if *net == asset_namespace() {
-                tracing::info!(
-                    "[push_relation] Asset reference detected: owner={}, path={}, direction={:?}",
-                    owner_bid,
-                    path,
-                    direction
-                );
-            }
-        }
+        let other_key_regularized = other_key
+            .regularize(&self.doc_bb, *owner_bid, self.repo())
+            .expect(
+                "parse_content Phase 1 parsing ensures that we have a valid subsection \
+                structure to get paths from for all our parsed nodes",
+            );
 
-        let other_key_regularized = other_key.regularize(&self.doc_bb, *owner_bid).expect(
-            "parse_content Phase 1 parsing ensures that we have a valid subsection \
-            structure to get paths from for all our parsed nodes",
-        );
-
-        // DEBUG: Log regularized key for assets
-        match &other_key_regularized {
-            NodeKey::Path { net, path } if *net == asset_namespace() => {
-                tracing::info!(
-                    "[push_relation] Asset key regularized to Path: path={}",
-                    path
-                );
-            }
-            NodeKey::Id { net, id } if *net == asset_namespace() => {
-                tracing::info!("[push_relation] Asset key regularized to Id: id={}", id);
-            }
-            _ => {}
-        }
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
         weight.set(WEIGHT_SORT_KEY, index as u16)?;
@@ -1296,27 +1202,10 @@ impl GraphBuilder {
 
         // DEBUG: Log cache_fetch result for assets
         let is_asset = match &other_key_regularized {
-            NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => *net == asset_namespace(),
+            NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => *net == asset_namespace().bref(),
             _ => false,
         };
 
-        if is_asset {
-            match &cache_fetch_result {
-                GetOrCreateResult::Resolved(node, source) => {
-                    tracing::info!(
-                        "[push_relation] Asset RESOLVED: bid={}, source={:?}",
-                        node.bid,
-                        source
-                    );
-                }
-                GetOrCreateResult::Unresolved(unresolved) => {
-                    tracing::info!(
-                        "[push_relation] Asset UNRESOLVED: keys={:?}",
-                        unresolved.other_keys
-                    );
-                }
-            }
-        }
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
                 // Mark these nodes as traces -- we're not guaranteeing that we have all their
@@ -1328,7 +1217,7 @@ impl GraphBuilder {
                 // Special handling of external scheme links (http/https)
                 if let Some(href) = match &other_key_regularized {
                     NodeKey::Id { net, id } => {
-                        if *net == href_namespace() {
+                        if *net == href_namespace().bref() {
                             Some(id.clone())
                         } else {
                             None
@@ -1391,7 +1280,7 @@ impl GraphBuilder {
                         "Unresolved relation at index {}: {:?} -> {:?}. Index gap preserved to track missing reference.",
                         index,
                         owner_bid,
-                        other_key
+                        other_key_regularized
                     );
                     return Ok(GetOrCreateResult::Unresolved(unresolved));
                 }
@@ -1508,14 +1397,6 @@ impl GraphBuilder {
         for key in keys.iter() {
             if check_local {
                 if let Some(existing_state) = self.doc_bb.get(key) {
-                    // tracing::debug!(
-                    //     "cache_fetch: Found node in doc_bb with key {:?}. Node: bid={}, title='{}', id={:?}, kind={:?}",
-                    //     key,
-                    //     existing_state.bid,
-                    //     existing_state.title,
-                    //     existing_state.id,
-                    //     existing_state.kind
-                    // );
                     found_state = Some(existing_state);
                     source = NodeSource::SourceFile;
                     break;
@@ -1638,7 +1519,7 @@ impl GraphBuilder {
 mod tests {
     use crate::{
         codec::belief_ir::ProtoBeliefNode,
-        nodekey::to_anchor,
+        paths::to_anchor,
         properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid},
     };
     use toml_edit::{value, DocumentMut};
@@ -1648,7 +1529,7 @@ mod tests {
         title: &str,
         path: &str,
         heading: usize,
-        id: Option<String>,
+        maybe_id: Option<String>,
         bid: Option<&str>,
     ) -> ProtoBeliefNode {
         let mut doc = DocumentMut::new();
@@ -1657,7 +1538,9 @@ mod tests {
         if let Some(bid_str) = bid {
             doc.insert("bid", value(bid_str));
         }
-
+        if let Some(id) = maybe_id {
+            doc.insert("id", value(id));
+        }
         ProtoBeliefNode {
             accumulator: None,
             content: String::new(),
@@ -1668,7 +1551,6 @@ mod tests {
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading,
-            id,
         }
     }
 
@@ -1729,7 +1611,7 @@ mod tests {
         let proto2 = create_test_proto_section("Details", "test.md", 3, None, None); // No ID = collision
 
         // First node: path would be "test.md#details"
-        let path1 = format!("{}#{}", proto1.path, proto1.id.as_ref().unwrap());
+        let path1 = format!("{}#{}", proto1.path, proto1.id().unwrap());
 
         // Second node: path would be "test.md#<bref>" (placeholder for collision)
         // Since ID is None, we know collision was detected
@@ -1848,10 +1730,10 @@ mod tests {
             create_test_proto_section(title, "test.md", 3, Some(explicit_id.to_string()), None);
 
         // Speculative path should use explicit ID when no collision
-        let speculative_anchor = proto.id.as_ref().unwrap();
+        let speculative_anchor = proto.id().unwrap();
 
         assert_eq!(speculative_anchor, "my-custom-section");
-        assert_ne!(speculative_anchor, &to_anchor(title)); // Different from title-derived
+        assert_ne!(speculative_anchor, to_anchor(title)); // Different from title-derived
     }
 
     #[test]
@@ -1902,8 +1784,8 @@ mod tests {
     fn test_bref_placeholder_never_matches() {
         // Test: Newly generated Bref has negligible collision probability
 
-        let bref1 = Bid::new(Bid::nil()).namespace().to_string();
-        let bref2 = Bid::new(Bid::nil()).namespace().to_string();
+        let bref1 = Bid::new(Bid::nil()).bref().to_string();
+        let bref2 = Bid::new(Bid::nil()).bref().to_string();
 
         // Two newly generated Brefs should be different
         assert_ne!(bref1, bref2);

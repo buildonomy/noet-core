@@ -89,7 +89,7 @@ fn determine_node_id(
 ```
 
 **Why Bref for collisions:**
-- Bref is derived from BID via UUID v5 hash: `bid.namespace()`
+- Bref is derived from BID via UUID v5 hash: `bid.bref()`
 - Hash space: 16^12 = ~281 trillion possible values
 - Collision probability is astronomically low within a network
 - Already computed and available
@@ -140,7 +140,7 @@ fn inject_context(&mut self, proto: &ProtoBeliefNode) -> Result<(), BuildonomyEr
         let calculated_id = determine_node_id(
             explicit_id,
             &node.title, 
-            &node.bid.namespace(), 
+            &node.bid.bref(), 
             &existing_ids  // Contains NORMALIZED IDs only
         );
         
@@ -459,7 +459,7 @@ in their source material. Makes it easier to reference sections.
 ## References
 
 - Current parser: `codec/md.rs`
-- BID/Bref generation: `properties.rs::Bid::namespace()` (lines 180-188)
+- BID/Bref generation: `properties.rs::Bid::bref()` (lines 180-188)
 - PathMap: `paths.rs`
 - Builder: `builder.rs::push()` (lines 772-954)
 - Anchor support: GitHub, GitLab, Obsidian, mdBook, Pandoc
@@ -485,7 +485,7 @@ The noet-core identity system uses **redundant IDs** to enable **triangulation**
    - Stored in frontmatter: `bid: 01234567-89ab-cdef`
    - **noet-controlled** - generated and managed by system
 
-2. **Bref (Belief Reference)** - `bid.namespace()`
+2. **Bref (Belief Reference)** - `bid.bref()`
    - Short hash derived from BID (last 12 hex chars of UUID v5 hash)
    - Example: `a1b2c3d4e5f6`
    - Compact, human-readable for logging/display

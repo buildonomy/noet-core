@@ -240,7 +240,7 @@ pub fn speculative_path(
 // Changed collision fallback from index-based to Bref-based
 if has_collision {
     // Use Bref (BID namespace) as fallback for collision
-    terminal_path = source.namespace().to_string();
+    terminal_path = source.bref().to_string();
 }
 ```
 
@@ -309,7 +309,7 @@ if has_collision {
 
 2. **Modified `generate_path_name_with_collision_check()`** (`src/paths.rs`)
    - Changed collision fallback from index-based (`{index}-{title}`) to Bref-based (`{namespace}`)
-   - Uses `source.namespace().to_string()` for guaranteed uniqueness
+   - Uses `source.bref().to_string()` for guaranteed uniqueness
    - Aligns with architectural principle of using BID-derived values for collision resolution
 
 3. **Added `GraphBuilder::speculative_section_path()`** (`src/codec/builder.rs`)

@@ -132,7 +132,7 @@ proto.upstream.push((NodeKey::Path(net: asset_namespace(), path: make_relative_p
 
 Already implemented in `properties.rs`:
 - `UUID_NAMESPACE_ASSET` constant
-- `static_namespace()` function
+- `asset_namespace()` function
 - `buildonomy_asset_bid(hash_str)` function
 
 ### 2. Extend LinkAccumulator for Static Assets ✅ COMPLETE

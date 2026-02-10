@@ -102,14 +102,11 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     tracing::info!("Include asset BIDs from asset manifest");
     {
         // Query asset BIDs from global_bb instead of compiler.asset_manifest()
-        use noet_core::properties::asset_namespace;
         for (bid, node) in global_bb.states().iter() {
             if node.kind.contains(BeliefKind::External) {
                 written_bids.insert(*bid);
             }
         }
-        // Also include the asset_namespace network node itself
-        written_bids.insert(asset_namespace());
     }
 
     tracing::info!("Ensure written bids match cached bids");
@@ -172,7 +169,7 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
 
     tracing::info!("First parse with DbConnection as global cache");
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
-    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, true)?;
 
     // First parse - should populate DB
     let parse_results = compiler.parse_all(db.clone(), false).await?;

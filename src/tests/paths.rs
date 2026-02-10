@@ -4,7 +4,8 @@ use super::helpers::*;
 use crate::{
     event::BeliefEvent,
     nodekey::NodeKey,
-    properties::{BeliefKind, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY},
+    paths::to_anchor,
+    properties::{BeliefKind, Bref, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY},
 };
 use parking_lot::RwLock;
 use std::{collections::BTreeSet, sync::Arc};
@@ -17,15 +18,15 @@ fn test_relation_removal_triggers_reindexing() {
 
     // Get the parent doc and children from the set
     let parent_doc = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Parent Document".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Parent Document"),
         })
         .unwrap();
     let child2 = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Child 2".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Child 2"),
         })
         .unwrap();
 
@@ -124,14 +125,15 @@ fn test_parent_reindex_updates_child_order_vectors() {
 
     // Get initial grandchild order vector from PathMap
     let paths = set.paths();
-    let net_bid = paths
+    let net_bref = paths
         .nets()
         .iter()
         .find(|bid| **bid != set.api().bid)
-        .cloned();
-    assert!(net_bid.is_some());
+        .cloned()
+        .unwrap()
+        .bref();
 
-    let pm = paths.get_map(&net_bid.unwrap()).unwrap();
+    let pm = paths.get_map(&net_bref).unwrap();
     let initial_grandchild_order = pm
         .map()
         .iter()
@@ -152,7 +154,7 @@ fn test_parent_reindex_updates_child_order_vectors() {
 
     // Get final grandchild order vector
     let paths = set.paths();
-    let pm = paths.get_map(&net_bid.unwrap()).unwrap();
+    let pm = paths.get_map(&net_bref).unwrap();
     let final_grandchild_order = pm
         .map()
         .iter()
@@ -262,8 +264,8 @@ fn test_event_driven_pathmap_matches_constructor() {
         "docs metadata should match"
     );
     assert_eq!(
-        paths_event.anchors().len(),
-        paths_constructor.anchors().len(),
+        paths_event.titles().len(),
+        paths_constructor.titles().len(),
         "anchors metadata should match"
     );
 }
@@ -275,17 +277,17 @@ fn test_pathmap_multiple_paths_per_relation() {
 
     // Get the parent document and child from the balanced set
     let parent_doc = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Parent Document".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Parent Document"),
         })
         .unwrap()
         .clone();
 
     let child = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Child 1".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Child 1"),
         })
         .unwrap()
         .clone();
@@ -313,15 +315,15 @@ fn test_pathmap_multiple_paths_per_relation() {
 
     // Get the network that the parent_doc belongs to
     let network = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Test Network".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Test Network"),
         })
         .unwrap();
 
     // Get the PathMap for the Test Network (where parent_doc is a member)
     let paths = set.paths();
-    let path_map = paths.get_map(&network.bid).unwrap();
+    let path_map = paths.get_map(&network.bid.bref()).unwrap();
 
     // Verify that all three paths exist in the PathMap
     let child_entries: Vec<_> = path_map

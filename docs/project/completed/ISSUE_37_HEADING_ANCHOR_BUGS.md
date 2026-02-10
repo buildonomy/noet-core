@@ -114,7 +114,7 @@ MdEvent::Text(cow_str) => {
 - [ ] In `finalize()`, after building sections table, scan all section IDs
 - [ ] For each ID, check `ctx.belief_set().paths().net_get_from_id()` across network
 - [ ] Track collisions: if ID exists with different BID, mark for Bref replacement
-- [ ] Generate Brefs for colliding sections (use `section_bid.namespace().to_string()`)
+- [ ] Generate Brefs for colliding sections (use `section_bid.bref().to_string()`)
 - [ ] Update `ProtoBeliefNode.id` field for affected sections
 - [ ] Update heading events to inject corrected IDs
 - [ ] Add test: two files with same section titles, verify Brefs assigned

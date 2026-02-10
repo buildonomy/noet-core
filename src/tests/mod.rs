@@ -1,5 +1,5 @@
 //! Test modules for core functionality
 
 mod expression;
-mod helpers;
+pub(crate) mod helpers;
 mod paths;

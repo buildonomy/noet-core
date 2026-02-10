@@ -23,8 +23,8 @@ use crate::{
         DocCodec, CODECS,
     },
     error::BuildonomyError,
-    nodekey::{get_doc_path, href_to_nodekey, to_anchor, NodeKey},
-    paths::{path_extension, path_join, path_normalize, path_parent},
+    nodekey::{href_to_nodekey, NodeKey},
+    paths::{as_anchor, to_anchor, AnchorPath},
     properties::{asset_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
@@ -70,45 +70,39 @@ fn link_to_relation(
     dest_url: &CowStr<'_>,
     title: &CowStr<'_>,
     id: &CowStr<'_>,
-) -> Option<(NodeKey, bool)> {
+) -> Option<NodeKey> {
     match link_type {
         // Autolink like `<http://foo.bar/baz>`
-        // change to reference [foo.bar/bax][bid]
-        // with NodeKey::Path(api, http://foo.bar/baz)
-        LinkType::Autolink => Some((href_to_nodekey(dest_url), !title.is_empty())),
+        // with NodeKey::Path(href_net, http://foo.bar/baz)
+        LinkType::Autolink => Some(href_to_nodekey(dest_url)),
 
         // Email address in autolink like `<john@example.org>`
-        // change to reference [john@example.org][bid]
-        // with NodeKey::Path(api, john@example.org)
-        LinkType::Email => Some((href_to_nodekey(&format!("email:{dest_url}")), false)),
+        // with NodeKey::Path(href_net, email:john@example.org)
+        LinkType::Email => Some(href_to_nodekey(&format!("email:{dest_url}"))),
 
         // Inline link like `[foo](bar)`
-        // change to [foo][bid]
         // with NodeKey::Path(api, bar)
-        LinkType::Inline => Some((href_to_nodekey(dest_url), !title.is_empty())),
+        LinkType::Inline => Some(href_to_nodekey(dest_url)),
 
         // Reference link like `[foo][bar]`
-        // if foo matches [net:title] for the reference,
-        // change to [net:title], otherwise
-        // change to [foo][bid]
-        // with NodeKey::?(bar)
         // Reference without destination in the document, but resolved by the broken_link_callback
         LinkType::Reference => None,
-        LinkType::WikiLink { has_pothole } => Some((href_to_nodekey(title), *has_pothole)),
-        LinkType::ReferenceUnknown => Some((href_to_nodekey(dest_url), !title.is_empty())),
+        // Prioritize 'id' nodekey over 'path' for wikilinks only
+        LinkType::WikiLink { .. } => Some(href_to_nodekey(dest_url)),
+        LinkType::ReferenceUnknown => Some(href_to_nodekey(dest_url)),
 
         // Collapsed link like `[foo][]`
         // change to [[net:]title]
         // with NodeKey::?(foo)
         // Collapsed link without destination in the document, but resolved by the broken_link_callback
         LinkType::Collapsed => None,
-        LinkType::CollapsedUnknown => Some((href_to_nodekey(title), false)),
+        LinkType::CollapsedUnknown => Some(href_to_nodekey(title)),
         // Shortcut link like `[foo]`
         // change to [net:title]
         // with NodeKey::?(foo)
         LinkType::Shortcut => None,
         // Shortcut without destination in the document, but resolved by the broken_link_callback
-        LinkType::ShortcutUnknown => Some((href_to_nodekey(id), false)),
+        LinkType::ShortcutUnknown => Some(href_to_nodekey(id)),
     }
 }
 
@@ -243,7 +237,7 @@ fn parse_title_attribute(title: &str) -> TitleAttributeParts {
             // Parse Bref from BID URL-style reference
             let bid_str = word.trim_start_matches("bid://");
             if let Ok(parsed_bid) = Bid::try_from(bid_str) {
-                bref = Some(parsed_bid.namespace());
+                bref = Some(parsed_bid.bref());
             }
         } else if word.starts_with('{') {
             // Start of JSON config
@@ -291,91 +285,6 @@ fn parse_title_attribute(title: &str) -> TitleAttributeParts {
     }
 }
 
-/// Build a title attribute string from components.
-///
-/// Format: `"bref://abc123 {\"auto_title\":true} User Words"`
-///
-/// # Examples
-///
-/// ```text
-/// let attr = build_title_attribute("bref://abc123", false, None);
-/// assert_eq!(attr, "bref://abc123");
-///
-/// let attr = build_title_attribute("bref://abc123", true, Some("My Note"));
-/// assert_eq!(attr, "bref://abc123 {\"auto_title\":true} My Note");
-/// ```
-///
-/// Note: This function is tested via unit tests in the `tests` module.
-
-/// Calculate relative path from source document to target document.
-///
-/// # Arguments
-///
-/// * `from_path` - Path to source document (e.g., "docs/guide.md")
-/// * `to_path` - Path to target document (e.g., "docs/reference/api.md")
-///
-/// # Returns
-///
-/// Relative path from source to target with forward slashes (e.g., "reference/api.md").
-/// Path separators are always normalized to forward slashes for cross-platform
-/// Markdown/URL compatibility, regardless of the host OS.
-///
-/// # Examples
-///
-/// ```text
-/// let rel = make_relative_path("docs/guide.md", "docs/reference/api.md");
-/// assert_eq!(rel, "reference/api.md");
-///
-/// let rel = make_relative_path("docs/reference/types.md", "docs/guide.md");
-/// assert_eq!(rel, "../guide.md");
-/// ```
-///
-/// Note: This function is tested via unit tests in the `tests` module.
-pub(crate) fn make_relative_path(from_path: &str, to_path: &str) -> String {
-    // URL-safe path manipulation (no PathBuf to avoid Windows path separator issues)
-
-    // Get the directory containing the source document
-    let from_dir = path_parent(from_path);
-
-    // Split paths into components
-    let from_parts: Vec<&str> = if from_dir.is_empty() {
-        vec![]
-    } else {
-        from_dir.split('/').collect()
-    };
-    let to_parts: Vec<&str> = to_path.split('/').collect();
-
-    // Find common prefix length
-    let mut common_len = 0;
-    for (i, (from_part, to_part)) in from_parts.iter().zip(to_parts.iter()).enumerate() {
-        if from_part == to_part {
-            common_len = i + 1;
-        } else {
-            break;
-        }
-    }
-
-    // Build relative path
-    let mut result = Vec::new();
-
-    // Add ../ for each remaining directory in from_path
-    for _ in common_len..from_parts.len() {
-        result.push("..");
-    }
-
-    // Add remaining parts of to_path
-    for part in &to_parts[common_len..] {
-        result.push(*part);
-    }
-
-    if result.is_empty() {
-        to_path.to_string()
-    } else {
-        result.join("/")
-    }
-}
-
-#[tracing::instrument(skip_all)]
 fn check_for_link_and_push(
     events_in: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     ctx: &BeliefContext<'_>,
@@ -424,50 +333,22 @@ fn check_for_link_and_push(
                     user_words: None,
                 });
 
-            let normalized_dest_url = if link_data.dest_url.starts_with("/") {
-                tracing::warn!(
-                    "[check_for_link_and_push] noet-core cannot determine what an absolute link \
-                    is in relation to, treating link as absolute relative to our parsing context. \
-                    If this document is in a subnet, this may have surprising effects."
-                );
-                CowStr::from(path_normalize(link_data.dest_url.as_ref()))
-            } else {
-                // Get the directory containing the current document
-                let current_dir = if path_extension(&ctx.relative_path).is_none() {
-                    ctx.relative_path.as_ref()
-                } else {
-                    path_parent(&ctx.relative_path)
-                };
-                let resolved = path_join(current_dir, link_data.dest_url.as_ref(), false);
-
-                // Normalize the path (resolve .. and .) using URL-safe path_normalize
-                let normalized = path_normalize(&resolved);
-
-                // Check if normalized path backtracks above root (starts with ../)
-                if normalized.starts_with("../") || normalized == ".." {
-                    tracing::warn!(
-                        "[check_for_link_and_push] SECURITY: Link '{}' backtracks beyond repository root from '{}' - will be broken in HTML output",
-                        link_data.dest_url,
-                        ctx.relative_path
-                    );
-                }
-                CowStr::from(normalized)
-            };
             // Determine the key to use for matching
             // If title attribute contains a Bref, prioritize it
             let key = if let Some(bref) = &title_parts.bref {
-                NodeKey::Bref { bref: bref.clone() }
+                NodeKey::Bref { bref: *bref }
             } else {
                 // Otherwise parse from normalized dest_url
                 let title = CowStr::from(link_text.clone());
-                if let Some((parsed_key, _)) = link_to_relation(
+                if let Some(parsed_key) = link_to_relation(
                     &link_data.link_type,
-                    &normalized_dest_url,
+                    &link_data.dest_url,
                     &title,
                     &link_data.id,
                 ) {
                     parsed_key
                 } else {
+                    tracing::debug!("[check_for_link_and_push] Failed to parse key from dest_url, leaving link unchanged");
                     // Can't parse - leave link/image unchanged
                     link_data.link_type = match title.is_empty() || title == link_data.id {
                         true => LinkType::Shortcut,
@@ -516,40 +397,24 @@ fn check_for_link_and_push(
                 }
             };
 
-            // Regularize the key using the BeliefBase context
-            let regularized = key
-                .regularize(ctx.belief_set(), ctx.node.bid)
-                .unwrap_or(key.clone());
-
+            // Regularize the key using the BeliefContext fields directly
+            let regularized = key.regularize_unchecked(ctx.root_net, &ctx.root_path);
+            tracing::debug!(
+                "[check_for_link_and_push] Regularized key: {:?} -> {:?}",
+                key,
+                regularized
+            );
             let keys = vec![regularized];
 
             // DEBUG: Asset link tracing
-            let is_asset = if let NodeKey::Path { net, path } = &key {
-                if *net == asset_namespace() {
-                    tracing::info!(
-                        "[check_for_link_and_push] Asset link detected: path={}, is_image={}",
-                        path,
-                        link_data.is_image
-                    );
-                    true
-                } else {
-                    false
-                }
+            let is_asset = if let NodeKey::Path { net, .. } = &keys[0] {
+                *net == asset_namespace().bref()
             } else {
                 false
             };
 
-            if is_asset {
-                if let NodeKey::Path { net: _, path } = &keys[0] {
-                    tracing::info!(
-                        "[check_for_link_and_push] Asset key regularized to: path={}",
-                        path
-                    );
-                }
-            }
-
-            // Check both sources (upstream) and sinks (downstream) for the link target
-            // Assets are typically sink-owned (downstream), while document links are sources (upstream)
+            // Check both sources (upstream) and sinks (downstream) for the link target Assets and
+            // document links are sources (upstream), but its possible they're upstream as well
             let sources = ctx.sources();
             let sinks = ctx.sinks();
 
@@ -559,7 +424,7 @@ fn check_for_link_and_push(
                     .iter()
                     .find(|rel| {
                         rel.other
-                            .keys(Some(ctx.home_net), None, ctx.belief_set())
+                            .keys(Some(ctx.root_net), None, ctx.belief_set())
                             .iter()
                             .any(|ctx_source_key| ctx_source_key == link_key)
                     })
@@ -567,12 +432,19 @@ fn check_for_link_and_push(
                         // Then check sinks (downstream relations - things this document links TO, like assets)
                         sinks.iter().find(|rel| {
                             rel.other
-                                .keys(Some(ctx.home_net), None, ctx.belief_set())
+                                .keys(Some(ctx.root_net), None, ctx.belief_set())
                                 .iter()
                                 .any(|ctx_sink_key| ctx_sink_key == link_key)
                         })
                     })
             });
+
+            tracing::debug!(
+                "[check_for_link_and_push] Search complete. sources={}, sinks={}, match_found={}",
+                sources.len(),
+                sinks.len(),
+                maybe_keyed_relation.is_some()
+            );
 
             if is_asset {
                 if maybe_keyed_relation.is_some() {
@@ -590,7 +462,7 @@ fn check_for_link_and_push(
                             "[check_for_link_and_push] Sink keys: {:?}",
                             sinks[0]
                                 .other
-                                .keys(Some(ctx.home_net), None, ctx.belief_set())
+                                .keys(Some(ctx.root_net), None, ctx.belief_set())
                         );
                     }
                 }
@@ -603,42 +475,22 @@ fn check_for_link_and_push(
                     "Found relation for link: title={}, id={:?}, home_path={}",
                     relation.other.title,
                     relation.other.id,
-                    relation.relative_path
+                    relation.root_path
                 );
 
                 // 1. Calculate relative path from source to target
                 // Strip any existing anchor from home_path to avoid double anchors
-                let relative_path_without_anchor = get_doc_path(&relation.relative_path);
-                let ctx_home_doc_path = get_doc_path(&ctx.relative_path);
+                let ctx_ap = AnchorPath::from(&ctx.root_path);
 
-                let relative_path =
-                    make_relative_path(&ctx.relative_path, relative_path_without_anchor);
+                let mut relative_path = ctx_ap.path_to(&relation.root_path, true);
+                let relative_ap = AnchorPath::from(&relation.root_path);
 
-                // 2. Add anchor if target is a heading node
-                // Extract anchor from relation.other.id or from home_path
-                let maybe_anchor = relation.other.id.as_deref().or_else(|| {
-                    // If id is not set, extract anchor from home_path
-                    relation
-                        .relative_path
-                        .rfind('#')
-                        .map(|idx| &relation.relative_path[idx + 1..])
-                });
-
-                // If source and target are in the same document, use fragment-only format
-                let dest_with_anchor = if let Some(anchor) = maybe_anchor {
-                    if relative_path_without_anchor == ctx_home_doc_path {
-                        // Same document - use fragment-only format
-                        format!("#{anchor}")
-                    } else {
-                        // Different document - use relative path with anchor
-                        format!("{relative_path}#{anchor}")
-                    }
-                } else {
-                    relative_path
-                };
+                if let Some(id) = relation.other.id.as_deref() {
+                    relative_path = relative_ap.join(as_anchor(id));
+                }
 
                 // 3. Build title attribute: "bref://abc123 {config} user words"
-                let bref_str = format!("bref://{}", relation.other.bid.namespace());
+                let bref_str = format!("bref://{}", relation.other.bid.bref());
 
                 // Determine if auto_title should be enabled
                 // Default to false unless link text matches target title
@@ -674,12 +526,12 @@ fn check_for_link_and_push(
                     .map(|t| t.to_string())
                     .unwrap_or_default();
 
-                if link_data.dest_url.as_ref() != dest_with_anchor
+                if link_data.dest_url.as_ref() != relative_path
                     || original_title_attr_str != new_title_attr
                     || link_text != new_link_text
                 {
                     changed = true;
-                    link_data.dest_url = CowStr::from(dest_with_anchor);
+                    link_data.dest_url = CowStr::from(relative_path);
                     link_data.title_events = vec![MdEvent::Text(CowStr::from(new_link_text))];
 
                     tracing::debug!(
@@ -917,34 +769,25 @@ fn parse_sections_metadata(sections: &toml_edit::Item) -> HashMap<NodeKey, toml_
     if let Some(table) = sections.as_table() {
         for (key_str, value) in table.iter() {
             // Parse key as NodeKey
-            if let Ok(node_key) = NodeKey::from_str(key_str) {
-                // Extract value as TomlTable
-                if let Some(value_table) = value.as_table() {
-                    metadata.insert(node_key, value_table.clone());
+            match NodeKey::from_str(key_str) {
+                Ok(node_key) => {
+                    // Extract value as TomlTable
+                    if let Some(value_table) = value.as_table() {
+                        metadata.insert(node_key, value_table.clone());
+                    } else {
+                        tracing::warn!(
+                            "[parse_sections_metadata] Could not process {:?} as a table!",
+                            value
+                        )
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not parse section key {}. Error: {}", key_str, e);
                 }
             }
         }
     }
-
     metadata
-}
-
-/// Extract anchor from heading node (e.g., {#intro} syntax).
-/// Returns the anchor ID without the '#' prefix.
-///
-/// TODO: This is a placeholder until Issue 3 implements anchor parsing.
-/// Currently checks for "anchor" or "id" fields in the document.
-fn extract_anchor_from_node(node: &ProtoBeliefNode) -> Option<String> {
-    node.document
-        .get("anchor")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            node.document
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
 }
 
 /// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
@@ -967,11 +810,11 @@ fn find_metadata_match<'a>(
     }
 
     // Priority 2: Match by anchor (medium specificity)
-    if let Some(anchor) = extract_anchor_from_node(node) {
+    if let Some(anchor) = node.id() {
         // Try as Id variant (anchors are IDs within a document)
         let anchor_key = NodeKey::Id {
-            net: Bid::nil(),
-            id: anchor.clone(),
+            net: Bref::default(),
+            id: anchor,
         };
         if let Some(meta) = metadata.get(&anchor_key) {
             return Some((anchor_key, meta));
@@ -984,7 +827,7 @@ fn find_metadata_match<'a>(
         if let Some(title) = title_value.as_str() {
             let anchor = to_anchor(title);
             let id_key = NodeKey::Id {
-                net: Bid::nil(),
+                net: Bref::default(),
                 id: anchor,
             };
             if let Some(meta) = metadata.get(&id_key) {
@@ -1167,19 +1010,13 @@ impl DocCodec for MdCodec {
         let mut id_changed = false;
         if proto_events.0.heading > 2 {
             // This is a heading node (not document)
-            // Use ctx.node.id (which has collision-corrected value from push)
-            // Fall back to Bref if None (collision detected)
-            let final_id = ctx
-                .node
-                .id
-                .clone()
-                .unwrap_or_else(|| ctx.node.bid.namespace().to_string());
-
+            // Use ctx.node.id() (which has collision-corrected value from push)
+            let final_id = ctx.node.id();
             // Store the final ID in the proto
-            if proto_events.0.id.as_deref() != Some(&final_id) {
+            if proto_events.0.id().as_ref() != Some(&final_id) {
                 tracing::debug!(
                     "Setting section ID: proto.id={:?} -> final_id='{}' for title='{}'",
-                    proto_events.0.id,
+                    proto_events.0.id(),
                     final_id,
                     proto_events
                         .0
@@ -1188,7 +1025,6 @@ impl DocCodec for MdCodec {
                         .and_then(|v| v.as_str())
                         .unwrap_or("<untitled>")
                 );
-                proto_events.0.id = Some(final_id);
                 id_changed = true;
             }
 
@@ -1202,16 +1038,13 @@ impl DocCodec for MdCodec {
                 }
             });
 
-            // Determine if we need to inject
-            let needs_injection = proto_events.0.id.as_ref() != original_event_id.as_ref();
-
-            if needs_injection {
+            if Some(&final_id) != original_event_id.as_ref() {
                 // Mutate heading event to inject final ID and clear range
                 // Clearing the range forces cmark_resume to use event data instead of source
                 // IMPORTANT: Modify current_events, not proto_events.1 (which was taken via mem::take)
                 for (event, range) in current_events.iter_mut() {
                     if let MdEvent::Start(MdTag::Heading { id, .. }) = event {
-                        *id = proto_events.0.id.as_ref().map(|s| CowStr::from(s.clone()));
+                        *id = Some(CowStr::from(final_id.clone()));
                         *range = None; // Clear range to force writing modified ID
                         break;
                     }
@@ -1220,12 +1053,11 @@ impl DocCodec for MdCodec {
                 id_changed = true;
             }
 
-            // Store ID in document for BeliefNode conversion
-            // We do this during inject_context rather than parse to avoid spurious update events
-            if let Some(ref id) = proto_events.0.id {
-                if proto_events.0.document.get("id").is_none() {
-                    proto_events.0.document.insert("id", value(id.clone()));
-                }
+            if id_changed {
+                proto_events
+                    .0
+                    .document
+                    .insert("id", value(final_id.clone()));
             }
         }
 
@@ -1305,16 +1137,8 @@ impl DocCodec for MdCodec {
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
         // Rewrite document links to .html for HTML output and break invalid backtracking links
-        let mut relative_path = self
-            .current_events
-            .first()
-            .map(|(proto, _)| proto.path.clone())
-            .unwrap_or_default();
-        if path_extension(&relative_path).is_some() {
-            relative_path = path_parent(&relative_path).to_string();
-        }
         fn rewrite_md_links_to_html(
-            relative_path: &str,
+            root_ap: &AnchorPath,
             event: MdEvent<'static>,
         ) -> MdEvent<'static> {
             match event {
@@ -1326,45 +1150,51 @@ impl DocCodec for MdCodec {
                 }) => {
                     // Check for invalid backtracking links (detected during context injection)
                     // Even if dest_url is an anchor path,
-                    let url_str = path_normalize(&path_join(
-                        relative_path,
-                        &dest_url,
-                        dest_url.starts_with('#'),
-                    ));
-                    if url_str.starts_with("../") {
+                    let full_path = root_ap.join(&dest_url);
+                    let url_str = root_ap.path_to(&full_path, true);
+                    tracing::debug!(
+                        "doc_path (relative to base): {}\n\
+                        dest_url (relative to doc_path): {}\n\
+                        url (relative to base): {}\n\
+                        url (relative to doc dir): {}",
+                        root_ap.path,
+                        dest_url,
+                        full_path,
+                        url_str
+                    );
+                    if full_path.starts_with("../") {
                         // Break invalid backtracking link
                         return MdEvent::Start(MdTag::Link {
                             link_type,
-                            dest_url: CowStr::from("#"),
+                            dest_url: CowStr::from(format!("#{full_path}")),
                             title: CowStr::from("⚠️ Invalid link - backtracks beyond repository"),
                             id,
                         });
                     }
 
+                    let url_ap = AnchorPath::from(&url_str);
                     let should_rewrite = title.contains("bref://");
                     let new_url = if should_rewrite {
                         // Use anchor-aware extension checking
-                        if let Some(ext) = path_extension(&url_str) {
+                        if url_ap.is_anchor() {
+                            tracing::debug!("is anchor");
+                            CowStr::from(as_anchor(url_ap.anchor()))
+                        } else if !url_ap.ext().is_empty() {
                             let codec_extensions = CODECS.extensions();
-                            if codec_extensions.iter().any(|ce| ce == ext) {
+                            if codec_extensions.iter().any(|ext| ext == url_ap.ext()) {
                                 // Check if there's an anchor
-                                if let Some(anchor_idx) = url_str.find('#') {
-                                    // Replace extension before anchor: file.md#anchor -> file.html#anchor
-                                    let path_part = &url_str[..anchor_idx];
-                                    let anchor_part = &url_str[anchor_idx..];
-                                    let new_path = path_part.replace(&format!(".{}", ext), ".html");
-                                    CowStr::from(format!("{}{}", new_path, anchor_part))
-                                } else {
-                                    // No anchor: file.md -> file.html
-                                    CowStr::from(url_str.replace(&format!(".{}", ext), ".html"))
-                                }
+                                let res = CowStr::from(url_ap.replace_extension("html"));
+                                tracing::debug!("replacing {url_str} with {res}");
+                                res
                             } else {
                                 dest_url
                             }
                         } else {
+                            tracing::debug!("no extension for {url_str}");
                             dest_url
                         }
                     } else {
+                        tracing::debug!("no bref element in title attribute for {dest_url}");
                         dest_url
                     };
 
@@ -1406,39 +1236,32 @@ impl DocCodec for MdCodec {
             }
         }
 
-        // Get source path from ProtoBeliefNode's path field to compute output filename
-        let source_path = self
+        let doc_path = self
             .current_events
             .first()
-            .map(|(proto, _)| &proto.path)
-            .ok_or_else(|| {
-                BuildonomyError::Codec("Document missing for HTML generation".to_string())
-            })?;
+            .map(|(proto, _)| proto.path.clone())
+            .filter(|path| !path.is_empty())
+            .unwrap_or("document.md".to_string());
+        let doc_ap = AnchorPath::from(&doc_path);
+        // Get source path from ProtoBeliefNode's path field to compute output filename
 
         // Extract filename and convert extension to .html
         // Extract filename and convert extension to .html
         // Handle empty path (tests) by defaulting to "document.html"
-        let output_filename = if source_path.is_empty() {
-            "document.html".to_string()
-        } else {
-            // Extract filename using URL-safe string manipulation (no PathBuf)
-            let filename = source_path.rsplit('/').next().ok_or_else(|| {
-                BuildonomyError::Codec("Cannot extract filename from path".to_string())
-            })?;
-
-            if let Some(stem) = filename.strip_suffix(".md") {
-                format!("{}.html", stem)
-            } else {
-                filename.to_string()
-            }
-        };
+        if doc_ap.filestem().is_empty() {
+            return Err(BuildonomyError::Codec(format!(
+                "Markdown file has no filename! {}",
+                doc_path
+            )));
+        }
+        let output_filename = format!("{}.html", doc_ap.filestem());
 
         // Generate HTML body from markdown events
         let events = self
             .current_events
             .iter()
             .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
-            .map(|e| rewrite_md_links_to_html(&relative_path, e));
+            .map(|e| rewrite_md_links_to_html(&doc_ap, e));
 
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
@@ -1458,14 +1281,14 @@ impl DocCodec for MdCodec {
             if section_proto.heading > 2 {
                 // Get or generate section ID
                 // Sections without IDs are collision cases where Bref should be used
-                let section_id = if let Some(id) = section_proto.id.as_ref() {
+                let section_id = if let Some(id) = section_proto.id() {
                     id.clone()
                 } else {
                     // Generate Bref from BID for sections without IDs (collision cases)
                     if let Some(bid_value) = section_proto.document.get("bid") {
                         if let Some(bid_str) = bid_value.as_str() {
                             if let Ok(bid) = crate::properties::Bid::try_from(bid_str) {
-                                let bref = bid.namespace().to_string();
+                                let bref = bid.bref().to_string();
                                 tracing::debug!(
                                     "finalize() - Generated Bref '{}' for section without ID: title={:?}",
                                     bref,
@@ -1626,7 +1449,7 @@ impl DocCodec for MdCodec {
                 let link_data = link_collector.take().expect(
                     "Push relation is only true if link_data is some and the link end tag is found",
                 );
-                if let Some((node_key, _)) = link_to_relation(
+                if let Some(node_key) = link_to_relation(
                     &link_data.link_type,
                     &link_data.dest_url,
                     &CowStr::from(link_data.title_string()),
@@ -1700,13 +1523,15 @@ impl DocCodec for MdCodec {
                         HeadingLevel::H6 => 8,
                     };
                     // Capture and normalize explicit ID from {#anchor} syntax
-                    let normalized_id = id.as_ref().map(|id_str| to_anchor(id_str));
-                    let new_current = ProtoBeliefNode {
+                    let maybe_normalized_id = id.as_ref().map(|id_str| to_anchor(id_str));
+                    let mut new_current = ProtoBeliefNode {
                         path: current.path.clone(),
                         heading,
-                        id: normalized_id,
                         ..Default::default()
                     };
+                    if let Some(normalized_id) = maybe_normalized_id {
+                        new_current.document.insert("id", value(normalized_id));
+                    }
                     // Inherit the schema type from the prior parse. If the node has an explicit
                     // schema, it will overwrite this when merging the node's toml.
                     let mut proto_to_push = replace(&mut current, new_current);
@@ -1721,35 +1546,9 @@ impl DocCodec for MdCodec {
                     let title = current.accumulator.take().unwrap_or_default();
                     current.document.insert("title", value(&title));
 
-                    // Collision detection: determine final ID based on explicit ID, title, and seen IDs
                     // Only for section headings (heading > 2), not document nodes
-                    if current.heading > 2 {
-                        let explicit_id = current.id.as_deref();
-
-                        // Determine candidate ID (explicit or title-derived)
-                        let candidate = if let Some(id) = explicit_id {
-                            to_anchor(id)
-                        } else {
-                            to_anchor(&title)
-                        };
-
-                        // Check for collision
-                        let final_id = if self.seen_ids.contains(&candidate) {
-                            // Collision detected! We can't generate Bref yet (no BID at parse time)
-                            // Use None to signal that inject_context() should generate the Bref
-                            None
-                        } else {
-                            Some(candidate.clone())
-                        };
-
-                        // Track this ID to detect future collisions (only if we assigned one)
-                        if let Some(ref id) = final_id {
-                            self.seen_ids.insert(id.clone());
-                        }
-
-                        // Store final ID in node's id field
-                        // Note: We store in document during inject_context to avoid spurious update events
-                        current.id = final_id;
+                    if current.heading > 2 && current.id().is_none() {
+                        current.document.insert("id", value(to_anchor(&title)));
                     }
                 }
                 _ => {}
@@ -1784,10 +1583,8 @@ pub fn to_html(content: &str, output: &mut String) -> Result<(), BuildonomyError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        nodekey::{to_anchor, NodeKey},
-        properties::Bid,
-    };
+    use crate::tests::helpers::init_logging;
+    use crate::{nodekey::NodeKey, paths::to_anchor, properties::Bid};
     use std::collections::HashMap;
     use toml_edit::{DocumentMut, Table as TomlTable};
 
@@ -1811,13 +1608,6 @@ mod tests {
         metadata
     }
 
-    /// Extract anchor from heading node (e.g., {#intro} syntax).
-    /// Returns the normalized anchor ID without the '#' prefix.
-    fn extract_anchor_from_node(node: &ProtoBeliefNode) -> Option<String> {
-        // Return the parsed and normalized ID from heading syntax
-        node.id.clone()
-    }
-
     /// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
     fn find_metadata_match<'a>(
         node: &ProtoBeliefNode,
@@ -1836,11 +1626,11 @@ mod tests {
         }
 
         // Priority 2: Match by anchor (medium specificity)
-        if let Some(anchor) = extract_anchor_from_node(node) {
+        if let Some(anchor) = node.id() {
             // Try as Id variant (anchors are IDs within a document)
             let anchor_key = NodeKey::Id {
-                net: Bid::nil(),
-                id: anchor.clone(),
+                net: Bref::default(),
+                id: anchor,
             };
             if let Some(meta) = metadata.get(&anchor_key) {
                 return Some(meta);
@@ -1853,7 +1643,7 @@ mod tests {
             if let Some(title) = title_value.as_str() {
                 let anchor = to_anchor(title);
                 let id_key = NodeKey::Id {
-                    net: Bid::nil(),
+                    net: Bref::default(),
                     id: anchor,
                 };
                 if let Some(meta) = metadata.get(&id_key) {
@@ -1869,6 +1659,7 @@ mod tests {
 
     #[test]
     fn test_parse_sections_metadata_with_bid_keys() {
+        init_logging();
         let toml_str = r#"
 bid = "00000000-0000-0000-0000-000000000001"
 schema = "Document"
@@ -1886,7 +1677,13 @@ complexity = "medium"
 
         let metadata = parse_sections_metadata(sections);
 
-        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata.len(),
+            2,
+            "sections toml:\n{:?}\nmetadata: {:?}",
+            sections,
+            metadata
+        );
 
         let bid2 = Bid::try_from("00000000-0000-0000-0000-000000000002").unwrap();
         let key2 = NodeKey::Bid { bid: bid2 };
@@ -1908,11 +1705,11 @@ complexity = "medium"
         let toml_str = r#"
 bid = "00000000-0000-0000-0000-000000000001"
 
-[sections.introduction]
+[sections."id://introduction"]
 schema = "Section"
 complexity = "high"
 
-[sections.background]
+[sections."id://background"]
 schema = "Section"
 complexity = "low"
 "#;
@@ -1927,10 +1724,10 @@ complexity = "low"
 
         // Verify that plain string keys become NodeKey::Id
         let intro_key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "introduction".to_string(),
         };
-        assert!(metadata.contains_key(&intro_key));
+        assert!(metadata.contains_key(&intro_key), "{:?}", metadata);
     }
 
     #[test]
@@ -1984,7 +1781,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -1999,7 +1795,7 @@ schema = "Document"
     fn test_find_metadata_match_by_anchor() {
         let mut metadata = HashMap::new();
         let key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "intro".to_string(),
         };
 
@@ -2011,7 +1807,7 @@ schema = "Document"
         let mut doc = DocumentMut::new();
         doc.insert("title", value("Introduction"));
         doc.insert("anchor", value("intro"));
-
+        doc.insert("id", value("intro"));
         let node = ProtoBeliefNode {
             accumulator: None,
             content: String::new(),
@@ -2022,7 +1818,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: Some("intro".to_string()), // Normalized anchor
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -2038,7 +1833,7 @@ schema = "Document"
         let mut metadata = HashMap::new();
         // Use Id variant for title-based matching (not Title)
         let key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "introduction".to_string(),
         };
 
@@ -2060,7 +1855,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -2084,7 +1878,7 @@ schema = "Document"
 
         // Add anchor match
         let anchor_key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "intro".to_string(),
         };
         let mut anchor_table = TomlTable::new();
@@ -2107,7 +1901,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -2125,7 +1918,7 @@ schema = "Document"
 
         // Add anchor match
         let anchor_key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "intro".to_string(),
         };
         let mut anchor_table = TomlTable::new();
@@ -2134,7 +1927,7 @@ schema = "Document"
 
         // Add title match (using Id variant)
         let title_key = NodeKey::Id {
-            net: Bid::nil(),
+            net: Bref::default(),
             id: "introduction".to_string(),
         };
         let mut title_table = TomlTable::new();
@@ -2144,7 +1937,7 @@ schema = "Document"
         // Create node with anchor and title (no BID)
         let mut doc = DocumentMut::new();
         doc.insert("title", value("Introduction"));
-
+        doc.insert("id", value("intro"));
         let node = ProtoBeliefNode {
             accumulator: None,
             content: String::new(),
@@ -2155,7 +1948,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: Some("intro".to_string()), // Explicit anchor from {#intro} syntax
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -2184,7 +1976,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 4,
-            id: None,
         };
 
         let result = find_metadata_match(&node, &metadata);
@@ -2192,18 +1983,6 @@ schema = "Document"
     }
 
     // ========================================================================
-    #[test]
-    fn test_to_anchor_consistency() {
-        // Verify to_anchor() behavior for collision detection
-        assert_eq!(to_anchor("Details"), "details");
-        assert_eq!(to_anchor("Section One"), "section-one");
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
-        assert_eq!(to_anchor("My-Section!"), "my-section");
-
-        // Case insensitivity
-        assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
-        assert_eq!(to_anchor("Section"), to_anchor("section"));
-    }
 
     #[test]
     fn test_pulldown_cmark_to_cmark_writes_heading_ids() {
@@ -2294,7 +2073,6 @@ schema = "Document"
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 2,
-            id: None,
         };
 
         codec.parse(markdown.to_string(), proto).unwrap();
@@ -2304,60 +2082,9 @@ schema = "Document"
         assert!(heading_node.is_some(), "Should have heading node");
         let (proto, _) = heading_node.unwrap();
         assert_eq!(
-            proto.id.as_deref(),
+            proto.id().as_deref(),
             Some("my-section"),
             "ID should be normalized to lowercase without punctuation"
-        );
-    }
-
-    #[test]
-    fn test_id_collision_bref_fallback() {
-        // Test that Bref is used when collision is detected during parse
-        use toml_edit::DocumentMut;
-
-        let markdown = "## Details\n\n## Details";
-        let mut codec = MdCodec::new();
-
-        let mut doc = DocumentMut::new();
-        doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
-        doc.insert("schema", value("Document"));
-
-        let proto = ProtoBeliefNode {
-            accumulator: None,
-            content: String::new(),
-            document: doc,
-            upstream: Vec::new(),
-            downstream: Vec::new(),
-            path: "test.md".to_string(),
-            kind: crate::properties::BeliefKindSet::default(),
-            errors: Vec::new(),
-            heading: 2,
-            id: None,
-        };
-
-        codec.parse(markdown.to_string(), proto).unwrap();
-
-        // Verify first "Details" has title-derived ID, second has Bref
-        let heading_nodes: Vec<&(ProtoBeliefNode, MdEventQueue)> = codec
-            .current_events
-            .iter()
-            .filter(|(p, _)| p.heading > 2)
-            .collect();
-
-        assert_eq!(heading_nodes.len(), 2, "Should have 2 heading nodes");
-
-        // First should have title-derived ID
-        assert_eq!(
-            heading_nodes[0].0.id.as_deref(),
-            Some("details"),
-            "First 'Details' should have title-derived ID"
-        );
-
-        // Second should have None (collision detected, Bref will be generated in inject_context)
-        assert_eq!(
-            heading_nodes[1].0.id.as_deref(),
-            None,
-            "Second 'Details' should have None due to collision (Bref assigned in inject_context)"
         );
     }
 
@@ -2406,7 +2133,7 @@ schema = "Document"
         assert!(parts.bref.is_some());
         // BID should be converted to Bref (namespace)
         // The namespace is derived from the BID using a hash function
-        let expected_bref = Bid::try_from(bid_str).unwrap().namespace();
+        let expected_bref = Bid::try_from(bid_str).unwrap().bref();
         assert_eq!(parts.bref.unwrap().to_string(), expected_bref.to_string());
     }
 
@@ -2452,32 +2179,37 @@ schema = "Document"
 
     #[test]
     fn test_make_relative_path_same_dir() {
-        let rel = make_relative_path("docs/guide.md", "docs/api.md");
-        assert_eq!(rel, "api.md");
+        let ap = AnchorPath::from("docs/guide.md");
+        let rel = ap.join("api.md");
+        assert_eq!(rel, "docs/api.md");
     }
 
     #[test]
     fn test_make_relative_path_nested() {
-        let rel = make_relative_path("docs/guide.md", "docs/reference/api.md");
+        let ap = AnchorPath::from("docs/guide.md");
+        let rel = ap.path_to("docs/reference/api.md", true);
         assert_eq!(rel, "reference/api.md");
     }
 
     #[test]
     fn test_make_relative_path_parent() {
-        let rel = make_relative_path("docs/reference/types.md", "docs/guide.md");
-        assert_eq!(rel, "../guide.md");
+        let ap = AnchorPath::from("docs/reference/guide.md");
+        let rel = ap.join("../../docs/guide.md");
+        assert_eq!(rel, "docs/guide.md");
     }
 
     #[test]
     fn test_make_relative_path_root_to_nested() {
-        let rel = make_relative_path("README.md", "docs/guide.md");
+        let ap = AnchorPath::from("README.md");
+        let rel = ap.join("docs/guide.md");
         assert_eq!(rel, "docs/guide.md");
     }
 
     #[test]
     fn test_make_relative_path_nested_to_root() {
-        let rel = make_relative_path("docs/guide.md", "README.md");
-        assert_eq!(rel, "../README.md");
+        let ap = AnchorPath::from("docs/guide.md");
+        let rel = ap.join("README.md");
+        assert_eq!(rel, "docs/README.md");
     }
 
     #[test]
@@ -2568,7 +2300,6 @@ Mixed content.
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
             heading: 2,
-            id: None,
         };
 
         codec.parse(markdown.to_string(), proto).unwrap();
@@ -2598,7 +2329,7 @@ Mixed content.
             })
             .expect("Should find <Method Title> section");
 
-        let method_id = method_section.id.as_ref().expect("Should have ID");
+        let method_id = method_section.id().expect("Should have ID");
         assert_eq!(
             method_id, "method-title",
             "InlineHtml should contribute to ID"
@@ -2616,7 +2347,7 @@ Mixed content.
             })
             .expect("Should find code section");
 
-        let code_id = code_section.id.as_ref().expect("Should have ID");
+        let code_id = code_section.id().expect("Should have ID");
         assert_eq!(
             code_id, "using--code--in-title",
             "Code should contribute to ID (backticks become spaces)"
@@ -2634,7 +2365,7 @@ Mixed content.
             })
             .expect("Should find mixed section");
 
-        let mixed_id = mixed_section.id.as_ref().expect("Should have ID");
+        let mixed_id = mixed_section.id().expect("Should have ID");
         assert_eq!(
             mixed_id, "mixed--html--and--code--content",
             "Mixed InlineHtml and Code should contribute to ID (backticks become spaces)"
@@ -2802,6 +2533,7 @@ This section has no explicit BID.
 
     #[test]
     fn test_generate_html_link_rewriting() {
+        init_logging();
         use crate::codec::DocCodec;
 
         let markdown = r#"---
@@ -2834,11 +2566,25 @@ Already HTML [html link](./page.html "bref://doc789").
         let (_path, html_content) = &fragments[0];
 
         // Verify .md links WITH bref:// are rewritten to .html
-        assert!(html_content.contains("href=\"./other.html\""));
-        assert!(html_content.contains("href=\"docs/page.html#section-1\""));
+        assert!(
+            html_content.contains("href=\"other.html\""),
+            "path: {}\nExpected href=\"other.html\" but got:\n{}",
+            _path,
+            html_content
+        );
+        assert!(
+            html_content.contains("href=\"docs/page.html#section-1\""),
+            "path: {}\n{}",
+            _path,
+            html_content
+        );
 
         // Verify .md links WITHOUT bref:// are NOT rewritten (we didn't parse them)
-        assert!(html_content.contains("href=\"https://example.com/doc.md\""));
+        assert!(
+            html_content.contains("href=\"https://example.com/doc.md\""),
+            "Expected href=\"https://example.com/doc.md\" but got\n{}",
+            html_content
+        );
 
         // Verify already-.html links with bref:// are unchanged
         assert!(html_content.contains("href=\"./page.html\""));

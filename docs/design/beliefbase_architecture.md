@@ -315,9 +315,8 @@ pub struct PathMapMap {
 fn keys(&self, net: Bid, parent: Option<Bid>, bs: &BeliefBase) -> Vec<NodeKey> {
     vec![
         NodeKey::Bid { bid: self.bid },
-        NodeKey::Bref { bref: self.bid.namespace() },
+        NodeKey::Bref { bref: self.bid.bref() },
         NodeKey::Id { net, id: self.id.clone() },        // If id.is_some()
-        NodeKey::Title { net, title: to_anchor(&self.title) },
         NodeKey::Path { net, path: /* from PathMap */ },
     ]
 }

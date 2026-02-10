@@ -5,9 +5,9 @@ use crate::{
         DocCodec, CODECS,
     },
     error::BuildonomyError,
-    nodekey::{trim_path_sep, NodeKey},
-    paths::{path_extension, path_parent},
-    properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind},
+    nodekey::NodeKey,
+    paths::{os_path_to_string, AnchorPath},
+    properties::{BeliefKind, BeliefKindSet, BeliefNode, Bref, Weight, WeightKind},
 };
 
 use std::{
@@ -324,20 +324,15 @@ fn parse_with_fallback(
         MetadataFormat::Json => {
             // Try JSON first
             match parse_json_to_document(content) {
-                Ok(doc) => {
-                    tracing::debug!("Parsed as JSON");
-                    Ok(doc)
-                }
+                Ok(doc) => Ok(doc),
                 Err(json_err) => {
                     // tracing::debug!("JSON parsing failed, trying YAML fallback");
                     match parse_yaml_to_document(content) {
                         Ok(doc) => {
-                            tracing::debug!("Parsed as YAML");
                             Ok(doc)},
                         Err(yaml_err) => {
                             match parse_toml_to_document(content) {
                                 Ok(doc) => {
-                                    tracing::debug!("Parsed as TOML");
                                     Ok(doc)},
                                 Err(toml_err) => Err(BuildonomyError::Codec(format!(
                                     "Failed to parse as JSON, YAML, or TOML.\nJSON: {json_err}\nYAML: {yaml_err}\nTOML: {toml_err}"
@@ -352,18 +347,15 @@ fn parse_with_fallback(
             // Try TOML first
             match parse_toml_to_document(content) {
                 Ok(doc) => {
-                    tracing::debug!("Parsed as TOML");
                     Ok(doc)
                 }
                 Err(toml_err) => {
                     match parse_yaml_to_document(content) {
                         Ok(doc) => {
-                            tracing::debug!("Parsed as YAML");
                             Ok(doc)},
                         Err(yaml_err) => {
                             match parse_json_to_document(content) {
                                 Ok(doc) => {
-                                    tracing::debug!("Parsed as JSON");
                                     Ok(doc)
                                 },
                                 Err(json_err) => Err(BuildonomyError::Codec(format!(
@@ -378,10 +370,7 @@ fn parse_with_fallback(
         MetadataFormat::Yaml => {
             // Try YAML first
             match parse_yaml_to_document(content) {
-                Ok(doc) => {
-                    tracing::debug!("Parsed as YAML");
-                    Ok(doc)
-                }
+                Ok(doc) => Ok(doc),
                 Err(yaml_err) => {
                     tracing::debug!("YAML parsing failed, trying JSON fallback");
                     match parse_json_to_document(content) {
@@ -433,194 +422,9 @@ pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
     None
 }
 
-// pub fn parse_procedure(
-//     parent_bid: Bid,
-//     procedure: &toml::Value,
-// ) -> Result<Vec<ProtoBeliefNode>, BuildonomyError> {
-//     let mut protos = Vec::new();
-//     if let Some(steps) = procedure.get("steps").and_then(|s| s.as_array()) {
-//         for step in steps {
-//             protos.extend(parse_step(parent_bid, step)?);
-//         }
-//     }
-//     Ok(protos)
-// }
-
-// fn parse_step(
-//     parent_bid: Bid,
-//     step: &toml::Value,
-// ) -> Result<Vec<ProtoBeliefNode>, BuildonomyError> {
-//     let mut protos = Vec::new();
-//     let step_type = step.get("type").and_then(|t| t.as_str());
-
-//     match step_type {
-//         Some("sequence") | Some("parallel") | Some("all_of") | Some("any_of") | Some("avoid") => {
-//             let payload = step.as_table().cloned();
-//             let operator_node = ProtoBeliefNode {
-//                 bid: Some(Bid::new(parent_bid)),
-//                 kind: BeliefKind::Ephemeral.into(),
-//                 title: Some(step_type.unwrap().to_string()),
-//                 upstream: vec![(
-//                     NodeKey::Bid { bid: parent_bid },
-//                     WeightKind::Pragmatic,
-//                     payload,
-//                 )],
-//                 ..Default::default()
-//             };
-//             let operator_bid = operator_node.bid.unwrap();
-//             protos.push(operator_node);
-
-//             if let Some(steps) = step.get("steps").and_then(|s| s.as_array()) {
-//                 for sub_step in steps {
-//                     protos.extend(parse_step(operator_bid, sub_step)?);
-//                 }
-//             }
-//         }
-//         _ => {
-//             // This handles action, prompt, opens_window, and references (string)
-//             let payload = step.as_table().cloned();
-//             let mut action_node = ProtoBeliefNode {
-//                 bid: Some(Bid::new(parent_bid)),
-//                 kind: BeliefKind::Ephemeral.into(),
-//                 upstream: vec![(
-//                     NodeKey::Bid { bid: parent_bid },
-//                     WeightKind::Pragmatic,
-//                     payload,
-//                 )],
-//                 ..Default::default()
-//             };
-
-//             if let Some(id) = step.get("id").and_then(|i| i.as_str()) {
-//                 action_node.title = Some(id.to_string());
-//             }
-
-//             if let Some(reference) = step.get("reference").and_then(|r| r.as_str()) {
-//                 action_node.upstream.push((
-//                     href_to_nodekey(reference),
-//                     WeightKind::Pragmatic,
-//                     None,
-//                 ));
-//             } else if let Some(reference) = step.as_str() {
-//                 action_node.upstream.push((
-//                     href_to_nodekey(reference),
-//                     WeightKind::Pragmatic,
-//                     None,
-//                 ));
-//             }
-
-//             protos.push(action_node);
-//         }
-//     }
-
-//     Ok(protos)
-// }
-
-// /// Parse parent_connections from TOML frontmatter and convert to downstream.
-// ///
-// /// This function traverses the parent_connections array in the TOML tree and creates
-// /// one downstream_relation edge for each relationship type with non-zero intensity.
-// ///
-// /// Example TOML structure:
-// /// ```toml
-// /// [[parent_connections]]
-// /// parent_id = "asp_sarah_embodiment_rest"
-// /// notes = "Supporting rest and recovery"
-// /// [parent_connections.relationship_profile]
-// /// instrumental = 0.7
-// /// constitutive = 0.3
-// /// ```
-// ///
-// /// This creates two edges:
-// /// - (parent_id, Instrumental, {intensity: 0.7, notes: "..."})
-// /// - (parent_id, Constitutive, {intensity: 0.3, notes: "..."})
-// fn parse_parent_connections(
-//     toml_tree: &toml::Value,
-// ) -> Result<Vec<(NodeKey, WeightKind, Option<TomlTable>)>, BuildonomyError> {
-//     let mut relations = Vec::new();
-
-//     // Extract parent_connections array
-//     let connections = match toml_tree.get("parent_connections") {
-//         Some(toml::Value::Array(arr)) => arr,
-//         Some(_) => {
-//             return Err(BuildonomyError::Codec(
-//                 "parent_connections must be an array".to_string(),
-//             ))
-//         }
-//         None => return Ok(relations), // No parent_connections is fine
-//     };
-
-//     // Process each connection
-//     for conn in connections {
-//         let conn_table = match conn.as_table() {
-//             Some(table) => table,
-//             None => continue, // Skip malformed entries
-//         };
-
-//         // Extract parent_id
-//         let parent_id = match conn_table.get("parent_id").and_then(|v| v.as_str()) {
-//             Some(id) => id,
-//             None => continue, // Skip connections without parent_id
-//         };
-
-//         // Convert parent_id string to NodeKey
-//         let parent_key = href_to_nodekey(parent_id);
-
-//         // Extract relationship_profile
-//         let profile = match conn_table.get("relationship_profile") {
-//             Some(toml::Value::Table(table)) => table,
-//             _ => continue, // Skip connections without valid profile
-//         };
-
-//         // Create one edge per relationship type with non-zero intensity
-//         for (relationship_type, intensity_value) in profile {
-//             let intensity = match intensity_value.as_float() {
-//                 Some(f) => f,
-//                 None => continue, // Skip non-numeric intensities
-//             };
-
-//             // Skip zero intensities
-//             if intensity == 0.0 {
-//                 continue;
-//             }
-
-//             // Map relationship_profile field name to WeightKind
-//             let weight_kind = match relationship_type.as_str() {
-//                 "constitutive" => WeightKind::Constitutive,
-//                 "instrumental" => WeightKind::Instrumental,
-//                 "tensions_with" => WeightKind::TensionsWith,
-//                 "expressive" => WeightKind::Expresses,
-//                 // Note: Some profile fields don't map to WeightKind variants
-//                 // (exploratory, trades_off, contextual). We'll store these as
-//                 // Instrumental for now with the full profile in payload.
-//                 "exploratory" | "trades_off" | "contextual" => WeightKind::Instrumental,
-//                 _ => continue, // Skip unknown relationship types
-//             };
-
-//             // Build edge payload containing the full connection metadata
-//             let mut payload = TomlTable::new();
-//             payload.insert("intensity".to_string(), toml::Value::Float(intensity));
-
-//             // Include notes if present
-//             if let Some(notes) = conn_table.get("notes") {
-//                 payload.insert("notes".to_string(), notes.clone());
-//             }
-
-//             // Include the full relationship_profile for reference
-//             payload.insert(
-//                 "relationship_profile".to_string(),
-//                 toml::Value::Table(profile.clone()),
-//             );
-
-//             relations.push((parent_key.clone(), weight_kind, Some(payload)));
-//         }
-//     }
-
-//     Ok(relations)
-// }
-
 /// Builds a title attribute for HTML links containing bref and optional metadata.
 ///
-/// The title attribute format is: "bref://[bref] [metadata] [user_words]"
+/// The title attribute format is: `bref://[bref] [metadata] [user_words]`
 /// where metadata and user_words are optional.
 ///
 /// # Arguments
@@ -686,9 +490,6 @@ pub struct ProtoBeliefNode {
     pub kind: BeliefKindSet,
     pub errors: Vec<BuildonomyError>,
     pub heading: usize,
-    /// Explicit ID from heading anchor syntax (e.g., {#my-id})
-    /// This is the raw, unnormalized ID as parsed from markdown
-    pub id: Option<String>,
 }
 
 impl PartialEq for ProtoBeliefNode {
@@ -726,20 +527,21 @@ impl ProtoBeliefNode {
         let file_path = repo_path.as_ref().join(&rel_path);
         let mut proto = ProtoBeliefNode::from_file(&file_path)?;
 
-        proto.path =
-            trim_path_sep(&file_path.strip_prefix(repo_path)?.to_string_lossy()).to_string();
+        proto.path = os_path_to_string(file_path.strip_prefix(repo_path)?);
+        // TODO: this had strip prefix. Do we need that?
         if let Some(file_stem) = file_path.file_stem() {
             let file_stem_string = file_stem.to_string_lossy().to_string();
-            if proto.document.get("bid").is_none() {
-                if let Ok(bid) = Bid::try_from(&file_stem_string[..]) {
-                    proto.document.insert("bid", value(bid.to_string()));
-                }
-            }
             if proto.document.get("title").is_none() {
                 proto.document.insert("title", value(file_stem_string));
             }
         }
         Ok(proto)
+    }
+
+    pub fn id(&self) -> Option<String> {
+        self.document
+            .get("id")
+            .and_then(|id_val| id_val.as_str().map(|id_str| id_str.to_string()))
     }
 
     /// Parse a file or directory into a ProtoBeliefNode, discovering direct filesystem descendants.
@@ -799,24 +601,19 @@ impl ProtoBeliefNode {
             let content = fs::read_to_string(&file_path)?;
             let mut file_proto = ProtoBeliefNode::from_str(&content)?;
             proto.merge(&mut file_proto);
-            if !proto.document.contains_key("id") {
+            if proto.id().is_none() {
                 return Err(BuildonomyError::Codec(format!(
                     "Network nodes require a semantic ID. Received: {proto:?}"
                 )));
             }
 
-            // Enumerate child documents in this network directory
-            let network_dir = file_path.parent().ok_or_else(|| {
-                BuildonomyError::Codec("Network file has no parent directory".to_string())
-            })?;
-
             // Add Path references for each child document as Subsection relations
-            for doc_path in iter_net_docs(path) {
-                if let Ok(relative_path) = doc_path.strip_prefix(network_dir) {
-                    let path_str = trim_path_sep(&relative_path.to_string_lossy()).to_string();
+            for doc_path in iter_net_docs(path.as_ref()) {
+                if let Ok(relative_path) = doc_path.strip_prefix(path.as_ref()) {
+                    let path_str = os_path_to_string(relative_path);
                     if !path_str.is_empty() {
                         let node_key = NodeKey::Path {
-                            net: Bid::nil(), // Will be resolved during processing by calling Key::regularize
+                            net: Bref::default(), // Will be resolved during processing by calling Key::regularize
                             path: path_str.clone(),
                         };
                         let mut weight = Weight::default();
@@ -857,6 +654,7 @@ impl ProtoBeliefNode {
     pub fn merge(&mut self, other: &mut ProtoBeliefNode) -> bool {
         let mut changed = false;
         if self.kind != other.kind {
+            tracing::debug!("kind changed");
             changed = true;
             self.kind = self.kind.union(other.kind.0).into();
         }
@@ -882,6 +680,7 @@ impl ProtoBeliefNode {
             }
             if let Some(item) = maybe_item.take() {
                 self.document.insert_formatted(&key, item);
+                tracing::debug!("item {key_str} changed");
                 changed = true;
             }
         }
@@ -889,35 +688,33 @@ impl ProtoBeliefNode {
         let mut other_upstream = std::mem::take(&mut other.upstream);
         if self.upstream != other.upstream && !other.upstream.is_empty() {
             self.upstream.append(&mut other_upstream);
+            tracing::debug!("upstream changed");
             changed = true;
         }
 
         if self.downstream != other.downstream && !other.downstream.is_empty() {
             let mut other_downstream = std::mem::take(&mut other.downstream);
             self.downstream.append(&mut other_downstream);
+            tracing::debug!("downstream changed");
             changed = true;
         }
 
         if other.heading != usize::default() {
             self.heading = other.heading;
+            tracing::debug!("heading changed");
             changed = true;
         }
 
         if self.errors != other.errors && !other.errors.is_empty() {
             let mut other_errors = std::mem::take(&mut other.errors);
             self.errors.append(&mut other_errors);
+            tracing::debug!("errors changed");
             changed = true;
         }
 
         if self.path != other.path && !other.path.is_empty() {
             self.path = std::mem::take(&mut other.path);
-            changed = true;
-        }
-
-        // Merge id field - this is critical for collision detection
-        // If other.id is None, it means the ID was cleared due to collision
-        if self.id != other.id {
-            self.id = other.id.clone();
+            tracing::debug!("path changed");
             changed = true;
         }
 
@@ -945,8 +742,12 @@ impl ProtoBeliefNode {
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
         let mut changed = self.merge(&mut ProtoBeliefNode::try_from(ctx.node)?);
-        // I don't think this needs to be tracked as a change
-        self.path = ctx.relative_path.clone();
+        // Only update path from context for section nodes (heading > 2)
+        // Document nodes already have correct path from ProtoBeliefNode::new()
+        // Section nodes need path from PathMap because they don't have independent file paths
+        if self.heading > 2 {
+            self.path = ctx.root_path.clone();
+        }
         // We need to fold in and updates to the references stored in our schema so that we can write them out to file here.
         if self.update_schema(ctx)? {
             changed = true;
@@ -1030,7 +831,7 @@ impl ProtoBeliefNode {
                         // Naked reference: parse using NodeKey::from_str to handle all formats
                         (
                             NodeKey::from_str(id_str).unwrap_or_else(|_| NodeKey::Id {
-                                net: Bid::nil(),
+                                net: Bref::default(),
                                 id: id_str.to_string(),
                             }),
                             None,
@@ -1061,7 +862,7 @@ impl ProtoBeliefNode {
 
                         (
                             NodeKey::from_str(id_str).unwrap_or_else(|_| NodeKey::Id {
-                                net: Bid::nil(),
+                                net: Bref::default(),
                                 id: id_str.to_string(),
                             }),
                             payload,
@@ -1083,7 +884,7 @@ impl ProtoBeliefNode {
             } else if let Some(id_str) = field_value.as_str() {
                 // Single naked reference (not in an array)
                 let node_key = NodeKey::from_str(id_str).unwrap_or_else(|_| NodeKey::Id {
-                    net: Bid::nil(),
+                    net: Bref::default(),
                     id: id_str.to_string(),
                 });
                 match graph_field.direction {
@@ -1099,21 +900,7 @@ impl ProtoBeliefNode {
 
         Ok(())
     }
-}
 
-impl FromStr for ProtoBeliefNode {
-    type Err = BuildonomyError;
-    // Use JSON-first parsing with TOML fallback for cross-platform compatibility
-    // Benefits:
-    // 1. Parses parent_connections → downstream
-    // 2. Preserves unknown fields for round-trip
-    // 3. JSON default enables browser/web tool compatibility
-    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
-        Self::from_str_with_format(str, MetadataFormat::Json)
-    }
-}
-
-impl ProtoBeliefNode {
     /// Parse content with explicit format preference
     pub fn from_str_with_format(
         str: &str,
@@ -1141,27 +928,6 @@ impl ProtoBeliefNode {
             }
         }
 
-        // Validate reserved IDs
-        if let Some(id_value) = proto.document.get("id") {
-            if let Some(id_str) = id_value.as_str() {
-                if id_str == "buildonomy_api" {
-                    return Err(BuildonomyError::Codec("ID 'buildonomy_api' is reserved for the system API node and cannot be used in user files. \
-                         Please choose a different ID that does not start with 'buildonomy_'.".to_string()));
-                }
-                if id_str == "buildonomy_href_network" {
-                    return Err(BuildonomyError::Codec("ID 'buildonomy_href_network' is reserved for the system href tracking network and cannot be used in user files. \
-                         Please choose a different ID that does not start with 'buildonomy_'.".to_string()));
-                }
-                if id_str.starts_with("buildonomy_") {
-                    return Err(BuildonomyError::Codec(format!(
-                        "ID '{}' uses the reserved 'buildonomy_' prefix which is reserved for system use. \
-                         Please choose a different ID that does not start with 'buildonomy_'.",
-                        id_str
-                    )));
-                }
-            }
-        }
-
         // Remove/translate BeliefNode fields into a proto node format.
         proto.document.remove("kind");
         if let Some(mut payload) = proto.document.remove("payload") {
@@ -1179,6 +945,18 @@ impl ProtoBeliefNode {
             }
         }
         Ok(proto)
+    }
+}
+
+impl FromStr for ProtoBeliefNode {
+    type Err = BuildonomyError;
+    // Use JSON-first parsing with TOML fallback for cross-platform compatibility
+    // Benefits:
+    // 1. Parses parent_connections → downstream
+    // 2. Preserves unknown fields for round-trip
+    // 3. JSON default enables browser/web tool compatibility
+    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+        Self::from_str_with_format(str, MetadataFormat::Json)
     }
 }
 
@@ -1244,12 +1022,7 @@ impl DocCodec for ProtoBeliefNode {
         // Sort by WEIGHT_SORT_KEY
         children.sort_by_key(|(_, sort_key)| *sort_key);
 
-        // Generate HTML list of child documents
-        let title = ctx.node.display_title();
-
         let mut html = String::new();
-        html.push_str(&format!("<h1>{} Index</h1>\n", title));
-
         if let Some(description) = ctx.node.payload.get("description").and_then(|v| v.as_str()) {
             html.push_str(&format!("<p>{}</p>\n", description));
         }
@@ -1261,34 +1034,27 @@ impl DocCodec for ProtoBeliefNode {
             let mut last_subdir: Option<String> = None;
             for (edge, _sort_key) in children {
                 // Convert home_path to HTML link (replace extension with .html)
-                let mut link_path = edge.relative_path.clone();
-
+                let mut link_path = edge.root_path.clone();
+                let link_ap = AnchorPath::from(&edge.root_path);
                 // Normalize document links to .html extension
-                let codec_extensions = crate::codec::CODECS.extensions();
-                for ext in codec_extensions.iter() {
-                    if path_extension(&link_path)
-                        .filter(|link_ext| link_ext == ext)
-                        .is_some()
-                    {
-                        link_path = link_path.replace(&format!(".{}", ext), ".html");
-                        break;
-                    }
+                if CODECS.extensions().iter().any(|ext| ext == link_ap.ext()) {
+                    link_path = link_ap.replace_extension("html");
                 }
 
                 let title = edge.other.display_title();
-                let parent_dir = path_parent(link_path.as_ref()).to_string();
-                if parent_dir.is_empty() {
+                if link_ap.dir().is_empty() {
                     if last_subdir.is_some() {
+                        html.push_str("</ul></li>");
                         last_subdir = None;
-                        html.push_str("</ul>");
+                    }
+                } else if let Some(ref last_dir) = last_subdir {
+                    if link_ap.dir() != last_dir {
+                        html.push_str(&format!("</ul></li><li><span>{}</span><ul>", link_ap.dir()));
+                        last_subdir = Some(link_ap.dir().to_string());
                     }
                 } else {
-                    if let Some(ref last_dir) = last_subdir {
-                        if &parent_dir != last_dir {
-                            html.push_str("</ul><ul>");
-                            last_subdir = Some(parent_dir);
-                        }
-                    }
+                    html.push_str(&format!("<li><span>{}</span><ul>", link_ap.dir()));
+                    last_subdir = Some(link_ap.dir().to_string());
                 }
 
                 // Get bref for the child node to add to title attribute
@@ -1314,7 +1080,7 @@ impl DocCodec for ProtoBeliefNode {
                 ));
             }
             if last_subdir.is_some() {
-                html.push_str("</ul>\n");
+                html.push_str("</ul></li>\n");
             }
             html.push_str("</ul>\n");
         }
@@ -1626,7 +1392,7 @@ schema = "noet.network_config"
     #[test]
     fn test_reserved_bid_namespace_buildonomy() {
         let toml = r#"
-    bid = "6b3d2154-c0a9-437b-9324-5f62adeb9a44"
+    bid = "6b3d2154-c0a9-437b-9324-b418a9d37ad1"
     id = "test-node"
     title = "Test"
     "#;
@@ -1666,44 +1432,6 @@ schema = "noet.network_config"
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("reserved"));
-    }
-
-    #[test]
-    fn test_reserved_id_buildonomy_api() {
-        let toml = r#"
-    id = "buildonomy_api"
-    title = "Test"
-    "#;
-        let result = ProtoBeliefNode::from_str(toml);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("reserved"));
-        assert!(err_msg.contains("buildonomy_api"));
-    }
-
-    #[test]
-    fn test_reserved_id_buildonomy_href_network() {
-        let toml = r#"
-    id = "buildonomy_href_network"
-    title = "Test"
-    "#;
-        let result = ProtoBeliefNode::from_str(toml);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("reserved"));
-    }
-
-    #[test]
-    fn test_reserved_id_buildonomy_prefix() {
-        let toml = r#"
-    id = "buildonomy_custom"
-    title = "Test"
-    "#;
-        let result = ProtoBeliefNode::from_str(toml);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("reserved"));
-        assert!(err_msg.contains("buildonomy_"));
     }
 
     #[test]

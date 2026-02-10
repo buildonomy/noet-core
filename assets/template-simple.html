@@ -6,9 +6,55 @@
         <title>{{TITLE}}</title>
         <link rel="canonical" href="{{CANONICAL}}" />
         {{SCRIPT}}
+        <script>
+            // Rewrite internal links for SPA context
+            // If viewing static page directly (/pages/...), links work as-is
+            // If viewing in SPA context (/#/...), rewrite to hash routes
+            (function () {
+                // Check if we're in a static page context
+                const isStaticPage = window.location.pathname.startsWith("/pages/");
+
+                if (isStaticPage) {
+                    // Static page view - links work normally
+                    return;
+                }
+
+                // SPA context - rewrite internal links to hash routes
+                document.addEventListener("DOMContentLoaded", function () {
+                    const article = document.querySelector("article");
+                    if (!article) return;
+
+                    const links = article.querySelectorAll("a[href]");
+
+                    links.forEach(function (link) {
+                        const href = link.getAttribute("href");
+
+                        // Skip external links, anchors, and already hash-routed links
+                        if (
+                            !href ||
+                            href.startsWith("http://") ||
+                            href.startsWith("https://") ||
+                            href.startsWith("#") ||
+                            href.startsWith("mailto:")
+                        ) {
+                            return;
+                        }
+
+                        // Rewrite relative links to hash routes
+                        // e.g., "net1_dir1/hsml.html" -> "/#/net1_dir1/hsml.html"
+                        link.setAttribute("href", "/#/" + href);
+                    });
+                });
+            })();
+        </script>
     </head>
     <body>
-        <h1 class="document-title">{{TITLE}}</h1>
-        {{BODY}}
+        <nav class="spa-upgrade">
+            <a href="{{SPA_ROUTE}}">📱 View Interactive Version</a>
+        </nav>
+        <article>
+            <h1 class="document-title">{{TITLE}}</h1>
+            {{BODY}}
+        </article>
     </body>
 </html>

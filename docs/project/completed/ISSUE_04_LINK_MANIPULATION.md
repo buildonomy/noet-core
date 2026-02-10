@@ -579,7 +579,7 @@ if end_is_anchor {
 
 ## References
 
-- Bref generation: `properties.rs::Bid::namespace()` (lines 180-188)
+- Bref generation: `properties.rs::Bid::bref()` (lines 180-188)
 - CommonMark spec: https://spec.commonmark.org/0.30/#links
 - pulldown_cmark events: `Event::Start(Tag::Link { title: Option<CowStr> })`
 - Current parser: `codec/md.rs`

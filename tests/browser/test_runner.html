@@ -292,8 +292,8 @@
                     assert(ctx.node !== undefined, 'NodeContext has node field');
                     assertEqual(ctx.node.bid, doc.bid, 'NodeContext.node has correct BID');
 
-                    assert(typeof ctx.relative_path === 'string', 'NodeContext has relative_path string');
-                    log(`Relative path: ${ctx.relative_path}`, 'info');
+                    assert(typeof ctx.root_path === 'string', 'NodeContext has root_path string');
+                    log(`Root path: ${ctx.root_path}`, 'info');
 
                     assert(typeof ctx.home_net === 'string', 'NodeContext has home_net string');
                     log(`Home network: ${ctx.home_net}`, 'info');
@@ -510,6 +510,202 @@
                     log('All titles properly extracted from BeliefNode state', 'info');
                     log('Flat map structure validated (O(1) lookup, parent chain traversal)', 'info');
                     log('No cycles detected in parent chains', 'info');
+                }
+
+                // === Test Path Manipulation Functions ===
+                createSection('Path Manipulation Functions');
+                {
+                    log('Testing normalizePath...', 'info');
+
+                    // Basic normalization
+                    assertEqual(
+                        BeliefBaseWasm.normalizePath('dir/../file.html'),
+                        'file.html',
+                        'normalizePath resolves .. segments'
+                    );
+
+                    assertEqual(
+                        BeliefBaseWasm.normalizePath('dir/./file.html'),
+                        'dir/file.html',
+                        'normalizePath resolves . segments'
+                    );
+
+                    assertEqual(
+                        BeliefBaseWasm.normalizePath('dir1/dir2/../file.html'),
+                        'dir1/file.html',
+                        'normalizePath resolves nested .. segments'
+                    );
+
+                    assertEqual(
+                        BeliefBaseWasm.normalizePath('/net1_dir1/hsml.html'),
+                        '/net1_dir1/hsml.html',
+                        'normalizePath preserves leading slash (normalizes structure)'
+                    );
+
+                    log('Testing pathParts...', 'info');
+
+                    // pathParts separates path, filename, and anchor
+                    const parts1 = BeliefBaseWasm.pathParts('net1_dir1/hsml.html#section');
+                    assertEqual(parts1.path, 'net1_dir1', 'pathParts extracts directory');
+                    assertEqual(parts1.filename, 'hsml.html', 'pathParts extracts filename');
+                    assertEqual(parts1.anchor, 'section', 'pathParts extracts anchor (without # prefix)');
+
+                    const parts2 = BeliefBaseWasm.pathParts('net1_dir1/hsml.html');
+                    assertEqual(parts2.path, 'net1_dir1', 'pathParts returns directory for document');
+                    assertEqual(parts2.filename, 'hsml.html', 'pathParts returns filename');
+                    assertEqual(parts2.anchor, '', 'pathParts returns empty anchor when none');
+
+                    const parts3 = BeliefBaseWasm.pathParts('net1_dir1/subdir/file.html');
+                    assertEqual(parts3.path, 'net1_dir1/subdir', 'pathParts returns directory for nested file');
+                    assertEqual(parts3.filename, 'file.html', 'pathParts returns filename for nested file');
+
+                    log('Testing pathParent...', 'info');
+
+                    // pathParent strips anchor from document (returns document path)
+                    assertEqual(
+                        BeliefBaseWasm.pathParent('net1_dir1/hsml.html#section'),
+                        'net1_dir1/hsml.html',
+                        'pathParent strips anchor from document'
+                    );
+
+                    // pathParent returns directory for document
+                    assertEqual(
+                        BeliefBaseWasm.pathParent('net1_dir1/hsml.html'),
+                        'net1_dir1',
+                        'pathParent returns directory for document'
+                    );
+
+                    // pathParent returns parent directory for directory path
+                    assertEqual(
+                        BeliefBaseWasm.pathParent('net1_dir1/subdir'),
+                        'net1_dir1',
+                        'pathParent returns parent directory for directory path'
+                    );
+
+                    // To get directory from path with anchor, call pathParent twice
+                    const withoutAnchor = BeliefBaseWasm.pathParent('net1_dir1/hsml.html#section');
+                    const directory = BeliefBaseWasm.pathParent(withoutAnchor);
+                    assertEqual(
+                        directory,
+                        'net1_dir1',
+                        'pathParent called twice gets directory from anchored path'
+                    );
+
+                    log('Testing pathJoin...', 'info');
+
+                    // Join directory with relative file
+                    assertEqual(
+                        BeliefBaseWasm.pathJoin('net1_dir1', 'hstp.html', false),
+                        'net1_dir1/hstp.html',
+                        'pathJoin combines directory and file'
+                    );
+
+                    // Join directory path (no extension) with relative file (normalizes ..)
+                    assertEqual(
+                        BeliefBaseWasm.pathJoin('net1_dir1/subdir', '../file.html', false),
+                        'net1_dir1/file.html',
+                        'pathJoin normalizes .. in paths'
+                    );
+
+                    // Join document path (has extension) with relative file (normalizes ..)
+                    assertEqual(
+                        BeliefBaseWasm.pathJoin('net1_dir1/doc.html', '../other.html', false),
+                        'other.html',
+                        'pathJoin strips document and normalizes ..'
+                    );
+
+                    // Normalize resolves .. after join
+                    assertEqual(
+                        BeliefBaseWasm.normalizePath('net1_dir1/subdir/../file.html'),
+                        'net1_dir1/file.html',
+                        'normalizePath resolves .. after join'
+                    );
+
+                    // Join with anchor
+                    assertEqual(
+                        BeliefBaseWasm.pathJoin('net1_dir1/doc.html', 'section', true),
+                        'net1_dir1/doc.html#section',
+                        'pathJoin adds anchor with # separator'
+                    );
+
+                    log('Testing pathExtension...', 'info');
+
+                    // Extract extension
+                    assertEqual(
+                        BeliefBaseWasm.pathExtension('file.html'),
+                        'html',
+                        'pathExtension extracts extension'
+                    );
+
+                    // Extract extension with anchor
+                    assertEqual(
+                        BeliefBaseWasm.pathExtension('file.html#section'),
+                        'html',
+                        'pathExtension ignores anchor'
+                    );
+
+                    // No extension
+                    assertEqual(
+                        BeliefBaseWasm.pathExtension('directory'),
+                        '',
+                        'pathExtension returns empty for no extension'
+                    );
+
+                    log('Testing real-world scenario: hsml.html -> hstp.html', 'info');
+
+                    // Simulate clicking link in net1_dir1/hsml.html with href="hstp.html"
+                    const currentPath = 'net1_dir1/hsml.html';
+                    const relativeHref = 'hstp.html';
+
+                    // pathParts on doc returns directory
+                    const parts = BeliefBaseWasm.pathParts(currentPath);
+                    const parentDir = parts.path;
+                    assertEqual(
+                        parentDir,
+                        'net1_dir1',
+                        'pathParts.path strips document from path'
+                    );
+
+                    // pathJoin combines directory + relative file
+                    const resolvedPath = BeliefBaseWasm.pathJoin(parentDir, relativeHref, false);
+                    assertEqual(
+                        resolvedPath,
+                        'net1_dir1/hstp.html',
+                        'pathJoin creates full path to sibling document'
+                    );
+
+                    log('Testing complete relative path resolution with ..', 'info');
+
+                    // Simulate ../../other.html from net1_dir1/subdir/doc.html
+                    const deepPath = 'net1_dir1/subdir/doc.html';
+                    const upTwoLevels = '../../other.html';
+
+                    // pathParts strips doc.html -> net1_dir1/subdir
+                    const deepParts = BeliefBaseWasm.pathParts(deepPath);
+                    const deepParent = deepParts.path;
+                    assertEqual(
+                        deepParent,
+                        'net1_dir1/subdir',
+                        'pathParts.path of doc.html returns directory'
+                    );
+
+                    // pathJoin normalizes the path (resolves ..)
+                    const joined = BeliefBaseWasm.pathJoin(deepParent, upTwoLevels, false);
+                    assertEqual(
+                        joined,
+                        'other.html',
+                        'pathJoin normalizes ../../ from subdir'
+                    );
+
+                    // Verify normalizePath also works independently
+                    const normalized = BeliefBaseWasm.normalizePath('net1_dir1/subdir/../../other.html');
+                    assertEqual(
+                        normalized,
+                        'other.html',
+                        'normalizePath independently resolves complex .. sequences'
+                    );
+
+                    log('✓ Path manipulation functions work correctly', 'pass');
                 }
 
 

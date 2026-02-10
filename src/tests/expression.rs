@@ -5,7 +5,8 @@ use crate::{
     beliefbase::BeliefBase,
     event::BeliefEvent,
     nodekey::NodeKey,
-    properties::{BeliefKind, BeliefNode, Bid, Weight, WeightKind, WeightSet},
+    paths::to_anchor,
+    properties::{BeliefKind, BeliefNode, Bid, Bref, Weight, WeightKind, WeightSet},
     query::{BeliefSource, Expression, RelationPred, SetOp, StatePred},
 };
 use petgraph::{visit::EdgeRef, Direction};
@@ -61,22 +62,40 @@ fn test_evaluate_expression_state_in_bid() {
 #[test]
 fn test_evaluate_expression_state_not_in() {
     let beliefbase = create_test_beliefbase();
-    let bids: Vec<Bid> = beliefbase.states().keys().take(2).copied().collect();
 
-    let expr = Expression::StateNotIn(StatePred::Bid(bids.clone()));
+    let node2 = beliefbase
+        .states()
+        .values()
+        .find(|n| n.title == "Node 2")
+        .unwrap();
+    let node4 = beliefbase
+        .states()
+        .values()
+        .find(|n| n.title == "Node 4")
+        .unwrap();
+
+    let expr = Expression::StateNotIn(StatePred::Bid(vec![node2.bid, node4.bid]));
     let result = beliefbase.evaluate_expression(&expr);
 
-    // Should return all nodes except the specified ones
-    assert_eq!(result.states.len(), beliefbase.states().len() - 2);
-    assert!(!result.states.contains_key(&bids[0]));
-    assert!(!result.states.contains_key(&bids[1]));
+    // Should return all nodes except the specified ones, but they are connected in our test
+    // dataset, so they are in there labelled as Trace
+    assert!(result
+        .states
+        .get(&node2.bid)
+        .filter(|node| !node.kind.is_complete())
+        .is_none());
+    assert!(result
+        .states
+        .get(&node4.bid)
+        .filter(|node| !node.kind.is_complete())
+        .is_none());
 }
 
 #[test]
 fn test_evaluate_expression_state_in_namespace() {
     let beliefbase = create_test_beliefbase();
     let first_bid = *beliefbase.states().keys().next().unwrap();
-    let bref = first_bid.namespace();
+    let bref = first_bid.bref();
 
     let expr = Expression::StateIn(StatePred::InNamespace(vec![bref]));
     let result = beliefbase.evaluate_expression(&expr);
@@ -400,7 +419,7 @@ fn test_evaluate_expression_relations_follow_states() {
 fn test_evaluate_expression_state_in_bref() {
     let beliefbase = create_test_beliefbase();
     let first_bid = *beliefbase.states().keys().next().unwrap();
-    let bref = first_bid.namespace();
+    let bref = first_bid.bref();
 
     let expr = Expression::StateIn(StatePred::Bref(vec![bref]));
     let result = beliefbase.evaluate_expression(&expr);
@@ -472,15 +491,15 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
 
     let set = create_balanced_test_beliefbase();
     let doc_node = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Parent Document".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Parent Document"),
         })
         .unwrap();
     let network_node = set
-        .get(&NodeKey::Title {
-            net: Bid::nil(),
-            title: "Test Network".to_string(),
+        .get(&NodeKey::Id {
+            net: Bref::default(),
+            id: to_anchor("Test Network"),
         })
         .unwrap();
     let api_node = BeliefNode::api_state();

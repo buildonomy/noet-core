@@ -9,9 +9,10 @@ use crate::{
     error::BuildonomyError,
     event::BeliefEvent,
     nodekey::NodeKey,
+    paths::{os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
-        asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Weight, WeightKind,
-        WEIGHT_DOC_PATHS,
+        asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Bref, Weight,
+        WeightKind, WEIGHT_DOC_PATHS,
     },
     query::{BeliefSource, Expression, NeighborsExpression, Query},
 };
@@ -119,6 +120,8 @@ pub struct DocumentCompiler {
     html_script: Option<String>,
     /// Use CDN for Open Props (requires internet, smaller output)
     use_cdn: bool,
+    /// Base URL for sitemap and canonical URLs (e.g., https://username.github.io/repo)
+    base_url: Option<String>,
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
@@ -126,7 +129,7 @@ pub struct DocumentCompiler {
     processed: HashMap<PathBuf, usize>, // Track parse count per path
     max_reparse_count: usize,           // Prevent infinite loops
     /// Track BIDs of nodes updated since last reparse round
-    last_round_updates: HashSet<Bid>,
+    last_round_updates: HashSet<Bref>,
     /// Whether reparse queue is stable (no new dependencies discovered)
     reparse_stable: bool,
     /// Network files that need HTML generation deferred until all documents are parsed
@@ -138,7 +141,7 @@ pub struct DocumentCompiler {
 pub struct ParseResult {
     pub path: PathBuf,
     pub rewritten_content: Option<String>,
-    pub dependent_paths: Vec<(String, Bid)>,
+    pub dependent_paths: Vec<(String, Bref)>,
     pub diagnostics: Vec<crate::codec::ParseDiagnostic>,
 }
 
@@ -156,7 +159,16 @@ impl DocumentCompiler {
         max_reparse_count: Option<usize>,
         write: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(entry_point, tx, max_reparse_count, write, None, None, false)
+        Self::with_html_output(
+            entry_point,
+            tx,
+            max_reparse_count,
+            write,
+            None,
+            None,
+            false,
+            None,
+        )
     }
 
     /// Create a new compiler with HTML output enabled
@@ -168,6 +180,7 @@ impl DocumentCompiler {
         html_output_dir: Option<PathBuf>,
         html_script: Option<String>,
         use_cdn: bool,
+        base_url: Option<String>,
     ) -> Result<Self, BuildonomyError> {
         // Copy static assets (CSS, JS, templates) to HTML output directory if configured
         if let Some(ref html_dir) = html_output_dir {
@@ -184,6 +197,7 @@ impl DocumentCompiler {
             html_output_dir,
             html_script,
             use_cdn,
+            base_url,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -218,6 +232,7 @@ impl DocumentCompiler {
             html_output_dir: None,
             html_script: None,
             use_cdn: false,
+            base_url: None,
             builder,
             primary_queue,
             reparse_queue: VecDeque::new(),
@@ -261,7 +276,7 @@ impl DocumentCompiler {
             !proto.kind.contains(BeliefKind::Trace),
             "Expected to generate a BeliefKind::Network. Instead, our generated proto is {proto:?}"
         );
-        Ok(PathBuf::from(proto.path))
+        Ok(string_to_os_path(&proto.path))
     }
 
     /// Parse the next item in the queue, returning None if queue is empty
@@ -499,7 +514,7 @@ impl DocumentCompiler {
             .filter_map(|d| d.as_unresolved_reference())
             .collect();
 
-        let mut dependent_paths = Vec::<(String, Bid)>::new();
+        let mut dependent_paths = Vec::<(String, Bref)>::new();
 
         if !unresolved_references.is_empty() && !self.reparse_queue.contains(&path) {
             // tracing::debug!(
@@ -516,7 +531,7 @@ impl DocumentCompiler {
             // 9a. Check if this is an asset reference (NodeKey::Path with net == asset_namespace)
             let is_asset_reference = unresolved.other_keys.iter().any(|key| {
                 if let NodeKey::Path { net, .. } = key {
-                    *net == asset_namespace()
+                    *net == asset_namespace().bref()
                 } else {
                     false
                 }
@@ -902,6 +917,13 @@ impl DocumentCompiler {
                 self.generate_spa_shell().await?;
             }
         }
+
+        tracing::debug!(
+            "State of session_bb at finalize:\n{}\n{}",
+            self.builder().session_bb().clone().consume(),
+            self.builder().session_bb().paths()
+        );
+
         Ok(())
     }
 
@@ -1010,7 +1032,7 @@ impl DocumentCompiler {
             .builder
             .session_bb()
             .paths()
-            .net_get_from_path(&asset_namespace(), &repo_relative_path)
+            .net_get_from_path(&asset_namespace().bref(), &repo_relative_path)
             .map(|(_, bid)| {
                 let node = self.builder.session_bb().states().get(&bid);
                 let existing_hash = node
@@ -1163,7 +1185,7 @@ impl DocumentCompiler {
         // Extract asset path from NodeKey
         let asset_path_key = unresolved.other_keys.iter().find_map(|key| {
             if let NodeKey::Path { net, path } = key {
-                if *net == asset_namespace() {
+                if *net == asset_namespace().bref() {
                     Some(path.as_str())
                 } else {
                     None
@@ -1175,91 +1197,95 @@ impl DocumentCompiler {
 
         if let Some(asset_relative_path) = asset_path_key {
             // Resolve relative markdown link to absolute filesystem path
-            let doc_dir = path.parent().unwrap_or(path);
-            let asset_absolute_path = doc_dir.join(asset_relative_path).canonicalize();
-
-            match asset_absolute_path {
-                Ok(absolute_path) => {
-                    // Check if asset already tracked via asset_map
-                    let repo_relative_asset = absolute_path
-                        .strip_prefix(self.builder.repo_root())
-                        .unwrap_or(&absolute_path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-
-                    // Always enqueue asset files to check for content changes
-                    // even if already tracked in session_bb
-                    if !self.processed.contains_key(&absolute_path)
-                        && !self.primary_queue.contains(&absolute_path)
-                        && !self.reparse_queue.contains(&absolute_path)
-                    {
-                        tracing::debug!(
-                            "[Compiler] Queueing asset file for content check: {:?}",
-                            absolute_path
-                        );
-                        self.primary_queue.push_back(absolute_path.clone());
-                    }
-
-                    // Check if asset already tracked via BeliefBase
-                    let asset_already_tracked = self
-                        .builder
-                        .session_bb()
-                        .paths()
-                        .net_get_from_path(&asset_namespace(), &repo_relative_asset)
-                        .is_some();
-
-                    if !asset_already_tracked {
-                        // Asset not yet in session_bb - document needs reparse after asset loads
-                        tracing::info!(
-                            "[Compiler] Document {:?} references untracked asset: {:?}",
-                            path,
-                            absolute_path
-                        );
-
-                        // Add document to reparse queue (will reparse after asset is processed)
-                        if !self.reparse_queue.contains(path) {
-                            tracing::debug!(
-                                "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
-                                path
-                            );
-                            self.reparse_queue.push_back(path.clone());
-                            self.reparse_stable = false;
-                        }
-                    } else {
-                        tracing::debug!(
-                            "[Compiler] Asset already tracked: {:?}",
-                            repo_relative_asset
-                        );
-                    }
+            let path_string = os_path_to_string(path);
+            let path_ap = AnchorPath::new(&path_string);
+            let repo_root = os_path_to_string(self.builder.repo_root());
+            let asset_absolute_path = path_ap.join(asset_relative_path);
+            let asset_ap = AnchorPath::new(&asset_absolute_path);
+            if let Some(repo_relative_asset) = asset_ap.strip_prefix(&repo_root) {
+                let absolute_path = string_to_os_path(&asset_absolute_path);
+                // Always enqueue asset files to check for content changes
+                // even if already tracked in session_bb
+                if !self.processed.contains_key(&absolute_path)
+                    && !self.primary_queue.contains(&absolute_path)
+                    && !self.reparse_queue.contains(&absolute_path)
+                {
+                    tracing::debug!(
+                        "[Compiler] Queueing asset file for content check: {:?}",
+                        asset_absolute_path
+                    );
+                    self.primary_queue.push_back(absolute_path);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "[Compiler] Cannot resolve asset path {:?} from document {:?}: {}",
-                        asset_relative_path,
+
+                // Check if asset already tracked via BeliefBase
+                let asset_already_tracked = self
+                    .builder
+                    .session_bb()
+                    .paths()
+                    .net_get_from_path(&asset_namespace().bref(), repo_relative_asset)
+                    .is_some();
+
+                if !asset_already_tracked {
+                    // Asset not yet in session_bb - document needs reparse after asset loads
+                    tracing::info!(
+                        "[Compiler] Document {:?} references untracked asset: {:?}",
                         path,
-                        e
+                        asset_absolute_path
+                    );
+
+                    // Add document to reparse queue (will reparse after asset is processed)
+                    if !self.reparse_queue.contains(path) {
+                        tracing::debug!(
+                            "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
+                            path
+                        );
+                        self.reparse_queue.push_back(path.clone());
+                        self.reparse_stable = false;
+                    }
+                } else {
+                    tracing::debug!(
+                        "[Compiler] Asset already tracked: {:?}",
+                        repo_relative_asset
                     );
                     // Asset file doesn't exist - leave as unresolved reference
                 }
+            } else {
+                tracing::warn!(
+                    "[Compiler] Cannot resolve asset path {:?} from document {:?}",
+                    asset_relative_path,
+                    path,
+                );
             }
         }
     }
 
-    fn process_unresolved_reference(&mut self, path: &Path, net_dep_path_str: &str, net: Bid) {
+    fn process_unresolved_reference(&mut self, path: &Path, net_dep_path_str: &str, net_ref: Bref) {
         let repo_pathmap = self
             .builder()
             .doc_bb()
             .paths()
-            .get_map(&self.builder().repo())
+            .get_map(&self.builder().repo().bref())
             .expect("builder.repo to be instantiated after parse_content was successfully called.");
+        let Some(net) = self
+            .builder()
+            .doc_bb()
+            .paths()
+            .nets()
+            .iter()
+            .find(|net| net.bref() == net_ref)
+            .copied()
+        else {
+            tracing::warn!("self.bulder().doc_bb() does not have a network node with bref {} initialized in its pathmapmap", net_ref);
+            return;
+        };
         let full_dep_path = if let Some((_home_net, net_path, _order)) =
             repo_pathmap.path(&net, &self.builder().doc_bb().paths())
         {
             debug_assert!(_home_net == net);
             // Convert relative path to absolute
-            let dep_path_str = PathBuf::from(net_path).join(net_dep_path_str);
+            let dep_path = string_to_os_path(&AnchorPath::new(&net_path).join(net_dep_path_str));
             // Resolve relative to builder's repo_root
-            self.builder.repo_root().join(dep_path_str)
+            self.builder.repo_root().join(dep_path)
         } else {
             tracing::warn!(
                 "No connectivity between builder.repo and dependent path network {}",
@@ -1360,16 +1386,14 @@ impl DocumentCompiler {
                 for key in keys {
                     match key {
                         NodeKey::Bid { bid } => {
-                            self.last_round_updates.insert(*bid);
+                            self.last_round_updates.insert(bid.bref());
                         }
                         NodeKey::Bref { .. } => {
                             // Brefs don't have BIDs, skip
                         }
-                        NodeKey::Path { net, .. }
-                        | NodeKey::Title { net, .. }
-                        | NodeKey::Id { net, .. } => {
+                        NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => {
                             // Track network BID as a proxy for potential matches
-                            if *net != Bid::nil() {
+                            if *net != Bref::default() {
                                 self.last_round_updates.insert(*net);
                             }
                         }
@@ -1379,12 +1403,12 @@ impl DocumentCompiler {
                 self.reparse_stable = false;
             }
             BeliefEvent::PathAdded(_, _, bid, _, _) | BeliefEvent::PathUpdate(_, _, bid, _, _) => {
-                self.last_round_updates.insert(*bid);
+                self.last_round_updates.insert(bid.bref());
                 self.reparse_stable = false;
             }
             BeliefEvent::NodesRemoved(bids, _) => {
                 for bid in bids {
-                    self.last_round_updates.remove(bid);
+                    self.last_round_updates.remove(&bid.bref());
                 }
             }
             _ => {}
@@ -1632,11 +1656,18 @@ impl DocumentCompiler {
                 }
             }
 
-            // Add URL entry (public URL path, not internal pages/ path)
-            sitemap.push_str(&format!(
-                "  <url>\n    <loc>/{}</loc>\n  </url>\n",
-                html_path
-            ));
+            // Sitemap points to static content in /pages/ subdirectory
+            let static_path = format!("/pages/{}", html_path);
+
+            // Generate full URL if base_url is configured, otherwise use relative path
+            let full_url = if let Some(base) = &self.base_url {
+                format!("{}{}", base.trim_end_matches('/'), static_path)
+            } else {
+                static_path
+            };
+
+            // Add URL entry
+            sitemap.push_str(&format!("  <url>\n    <loc>{}</loc>\n  </url>\n", full_url));
         }
 
         sitemap.push_str("</urlset>\n");
@@ -1673,12 +1704,20 @@ impl DocumentCompiler {
         use crate::codec::assets::{get_template, Layout};
         let template = get_template(Layout::Simple);
 
-        // Generate canonical URL from relative path (public URL)
-        let canonical_url = format!("/{}", rel_path.display());
+        // Generate SPA route (for interactive link and canonical URL)
+        let spa_route = format!("/#/{}", rel_path.display());
+
+        // Generate canonical URL (use base URL if configured, otherwise relative)
+        let canonical_url = if let Some(base) = &self.base_url {
+            format!("{}{}", base.trim_end_matches('/'), &spa_route)
+        } else {
+            spa_route.clone()
+        };
 
         let html = template
             .replace("{{BODY}}", &html_body)
             .replace("{{CANONICAL}}", &canonical_url)
+            .replace("{{SPA_ROUTE}}", &spa_route)
             .replace("{{TITLE}}", title);
 
         // Inject optional script if configured
@@ -1745,7 +1784,7 @@ impl DocumentCompiler {
 
         // Query for the node using path from synchronized global_bb
         let nodekey = NodeKey::Path {
-            net: self.builder.repo(),
+            net: self.builder.repo().bref(),
             path: path_str.clone(),
         };
         let mut bb = BeliefBase::from(

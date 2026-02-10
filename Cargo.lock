@@ -1003,6 +1003,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hkdf"
@@ -1497,6 +1500,7 @@ dependencies = [
  "futures",
  "futures-core",
  "getrandom 0.2.17",
+ "hex",
  "http",
  "include_dir",
  "log",
@@ -1504,7 +1508,6 @@ dependencies = [
  "notify-debouncer-full",
  "once_cell",
  "parking_lot",
- "path-clean",
  "petgraph",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
@@ -1709,12 +1712,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "path-clean"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
-
-[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1862,8 +1859,9 @@ checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "pulldown-cmark-to-cmark"
-version = "20.0.1"
-source = "git+https://github.com/alyjak/pulldown-cmark-to-cmark.git?branch=upgrade_to_cmark_v0.13#57e3cc4ca6ccb339f9f9dd9944a350064caccaf4"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50793def1b900256624a709439404384204a5dc3a6ec580281bfaac35e882e90"
 dependencies = [
  "pulldown-cmark",
 ]

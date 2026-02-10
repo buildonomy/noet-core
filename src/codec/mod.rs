@@ -514,7 +514,8 @@ mod tests {
         let (output_filename, html_body) = &fragments[0];
         assert!(
             output_filename.ends_with(".html"),
-            "Output filename should end with .html"
+            "Output filename should end with .html, got: '{}'",
+            output_filename
         );
         assert!(
             html_body.contains("Test Document"),

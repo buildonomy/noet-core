@@ -421,19 +421,37 @@ function navigateToLink(href, link) {
     return;
   }
 
+  // Resolve relative paths against current document location
+  let resolvedPath = href;
+  if (!href.startsWith("/") && wasmModule) {
+    // Get current document path from hash (e.g., "/net1_dir1/hsml.html")
+    const currentHash = window.location.hash.substring(1); // Remove leading #
+
+    if (currentHash) {
+      // Get parent directory of current document using pathParts
+      const parts = wasmModule.BeliefBaseWasm.pathParts(currentHash);
+      const parentDir = parts.path;
+      // Join with the relative href
+      resolvedPath = wasmModule.BeliefBaseWasm.pathJoin(parentDir, href, false);
+      console.log(
+        `[Noet] Resolved relative path: ${href} -> ${resolvedPath} (from ${currentHash})`,
+      );
+    }
+  }
+
   // Check if it's a document link with anchor (e.g., "path/file.html#section")
-  const hashIndex = href.indexOf("#");
+  const hashIndex = resolvedPath.indexOf("#");
   if (hashIndex > 0) {
     // Split into document path and anchor
-    const docPath = href.substring(0, hashIndex);
-    const anchor = href.substring(hashIndex + 1);
+    const docPath = resolvedPath.substring(0, hashIndex);
+    const anchor = resolvedPath.substring(hashIndex + 1);
     // Navigate with full path in hash: #/path/file.html#anchor
     window.location.hash = `/${docPath}#${anchor}`;
     return;
   }
 
   // Internal document link without anchor: Navigate via hash routing
-  navigateToDocument(href);
+  navigateToDocument(resolvedPath);
 }
 
 /**
@@ -455,8 +473,24 @@ function navigateToSection(anchor) {
 
   if (targetElement) {
     targetElement.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    // Preserve current document path in hash when navigating to section
+    const currentHash = window.location.hash.substring(1); // Remove leading #
+    let newHash = anchor;
+
+    if (currentHash && wasmModule) {
+      // Use PathParts to properly parse the current path
+      const parts = wasmModule.BeliefBaseWasm.pathParts(currentHash);
+
+      // If we have a filename, reconstruct with document path + new anchor
+      if (parts.filename) {
+        const docPath = parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+        newHash = `#${docPath}${anchor}`;
+      }
+    }
+
     // Update URL hash without triggering hashchange
-    history.replaceState(null, "", anchor);
+    history.replaceState(null, "", newHash);
   } else {
     console.warn(`[Noet] Section not found: ${sectionId}`);
   }
@@ -492,6 +526,12 @@ async function handleHashChange() {
   if (anchorIndex > 0) {
     sectionAnchor = path.substring(anchorIndex);
     path = path.substring(0, anchorIndex);
+  }
+
+  // Normalize path to resolve any .. or . segments
+  // Note: normalizePath now preserves leading slashes
+  if (wasmModule) {
+    path = wasmModule.BeliefBaseWasm.normalizePath(path);
   }
 
   // If path doesn't contain .html, treat as section anchor in current doc
@@ -538,13 +578,14 @@ async function loadDocument(path, sectionAnchor = null) {
 
     const html = await response.text();
 
-    // Parse HTML and extract body content
+    // Parse HTML and extract article content (excludes nav and other non-content elements)
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
-    const bodyContent = doc.body.innerHTML;
+    const articleElement = doc.querySelector("article");
+    const bodyContent = articleElement ? articleElement.innerHTML : doc.body.innerHTML;
 
     if (!bodyContent) {
-      throw new Error("No body content found in fetched document");
+      throw new Error("No content found in fetched document");
     }
 
     // Extract and update document metadata
@@ -1244,7 +1285,7 @@ function showMetadataPanel(nodeBid) {
  * @returns {string} HTML string
  */
 function renderNodeContext(context) {
-  const { node, relative_path, home_net, related_nodes, graph } = context;
+  const { node, root_path, home_net, related_nodes, graph } = context;
 
   let html = '<div class="noet-metadata-section">';
 
@@ -1267,7 +1308,7 @@ function renderNodeContext(context) {
     html += `<dt>ID</dt><dd><code>${escapeHtml(node.id)}</code></dd>`;
   }
 
-  html += `<dt>Path</dt><dd><code>${escapeHtml(relative_path)}</code></dd>`;
+  html += `<dt>Path</dt><dd><code>${escapeHtml(root_path)}</code></dd>`;
   html += `<dt>Network</dt><dd><code>${formatBid(home_net)}</code></dd>`;
   html += "</dl>";
   html += "</div>";
