@@ -267,10 +267,30 @@ Graph: { "Section": [[...], [...]], "Epistemic": [[...], [...]] }
 - index_sync() dual implementation
 - Remaining: disable mutation methods, fix borrow scopes
 
-**Next**: 
-1. Wrap mutation methods in `#[cfg(not(target_arch = "wasm32"))]`
-2. Fix `get_context()` and `get_paths()` borrow issues
-3. Build and test WASM
+**2024-02-17 16:00**: Reset approach, need systematic edits
+- Attempted multiple full-file edits, caused merge conflicts
+- File is ~2000 lines, too large for incremental editing
+- Need focused, minimal changes to:
+  1. Add SharedLock<T> type alias (lines 35-48)
+  2. Update BeliefBase struct fields (lines 49-57)
+  3. Make empty() conditional (lines 139-168)
+  4. Make new_unbalanced() conditional (lines 157-220)
+  5. Make Clone conditional (lines 105-135)
+  6. Add WASM paths()/relations() methods (after line 240)
+  7. Add WASM errors() method (after line 251)
+  8. Make index_sync() conditional (lines 269-323)
+  9. Disable BeliefSource impl for WASM (line 1906)
+
+**Current Status**: PAUSED - Need to apply clean sequential edits
+- Have working changes for: context.rs, wasm.rs (committed)
+- Need systematic edits to: base.rs (core lock changes)
+- Then test WASM build and run browser test
+
+**Next Session**:
+1. Apply minimal edits to base.rs using exact line replacements
+2. Build WASM: `./scripts/build-full.sh`
+3. Test: `node tests/browser/test_related_nodes.js`
+4. If passing, document completion and delete scratchpad
 
 ---
 

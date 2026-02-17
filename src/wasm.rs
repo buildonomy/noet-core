@@ -811,7 +811,8 @@ impl BeliefBaseWasm {
     pub fn get_paths(&self) -> JsValue {
         use std::collections::BTreeMap;
 
-        let paths = self.inner.borrow().paths();
+        let inner = self.inner.borrow();
+        let paths = inner.paths();
 
         // Build nested map: network_bid → Vec<(path, bid, order_indices)>
         let nets: BTreeMap<String, Vec<(String, String, Vec<u16>)>> = paths

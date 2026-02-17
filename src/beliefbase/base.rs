@@ -12,10 +12,18 @@ use crate::{
         asset_namespace, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref,
         WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
     },
-    query::{BeliefSource, Expression, RelationPred, SetOp, StatePred},
     BuildonomyError,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::query::BeliefSource;
+
+use crate::query::{Expression, RelationPred, SetOp, StatePred};
+#[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
+
+#[cfg(target_arch = "wasm32")]
+use parking_lot::RwLock;
 use petgraph::{
     algo::kosaraju_scc,
     visit::{depth_first_search, Control, DfsEvent, EdgeRef},
@@ -32,15 +40,30 @@ use std::{
 
 use super::{context::BeliefContext, BeliefGraph, BidGraph};
 
+// Conditional type alias for thread-safe shared locks
+// WASM uses Rc<RefCell<T>> (single-threaded)
+// Native uses Arc<RwLock<T>> (multi-threaded)
+#[cfg(not(target_arch = "wasm32"))]
+type SharedLock<T> = Arc<RwLock<T>>;
+
+#[cfg(target_arch = "wasm32")]
+use std::{cell::RefCell, rc::Rc};
+
+#[cfg(target_arch = "wasm32")]
+type SharedLock<T> = Rc<RefCell<T>>;
+
 #[derive(Debug)]
 pub struct BeliefBase {
     states: BTreeMap<Bid, BeliefNode>,
-    relations: Arc<RwLock<BidGraph>>,
+    relations: SharedLock<BidGraph>,
+    #[cfg(not(target_arch = "wasm32"))]
     bid_to_index: RwLock<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
+    #[cfg(target_arch = "wasm32")]
+    bid_to_index: RefCell<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
     index_dirty: AtomicBool,
     brefs: BTreeMap<Bref, Bid>,
-    paths: Arc<RwLock<PathMapMap>>,
-    errors: Arc<RwLock<Vec<String>>>,
+    paths: SharedLock<PathMapMap>,
+    errors: SharedLock<Vec<String>>,
     api: BeliefNode,
 }
 
@@ -87,15 +110,32 @@ impl Default for BeliefBase {
 
 impl Clone for BeliefBase {
     fn clone(&self) -> BeliefBase {
-        BeliefBase {
-            states: self.states.clone(),
-            relations: Arc::new(RwLock::new(self.relations.read().clone())),
-            bid_to_index: RwLock::new(self.bid_to_index.read().clone()),
-            index_dirty: AtomicBool::new(self.index_dirty.load(Ordering::SeqCst)),
-            brefs: self.brefs.clone(),
-            paths: Arc::new(RwLock::new(self.paths.read().clone())),
-            errors: Arc::new(RwLock::new(self.errors.read().clone())),
-            api: self.api.clone(),
+        self.index_sync(false);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            BeliefBase {
+                states: self.states.clone(),
+                relations: Arc::new(RwLock::new(self.read_relations().clone())),
+                bid_to_index: RwLock::new(self.read_bid_index().clone()),
+                index_dirty: AtomicBool::new(false),
+                brefs: self.brefs.clone(),
+                paths: Arc::new(RwLock::new(self.read_paths().clone())),
+                errors: Arc::new(RwLock::new(self.read_errors().clone())),
+                api: self.api.clone(),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            BeliefBase {
+                states: self.states.clone(),
+                relations: Rc::new(RefCell::new(self.read_relations().clone())),
+                bid_to_index: RefCell::new(self.read_bid_index().clone()),
+                index_dirty: AtomicBool::new(false),
+                brefs: self.brefs.clone(),
+                paths: Rc::new(RefCell::new(self.read_paths().clone())),
+                errors: Rc::new(RefCell::new(self.read_errors().clone())),
+                api: self.api.clone(),
+            }
         }
     }
 }
@@ -136,16 +176,117 @@ impl Clone for BeliefBase {
 /// 2. PathMaps identify how to acquire the source starting from known network locations.
 impl BeliefBase {
     pub fn empty() -> BeliefBase {
-        BeliefBase {
-            states: BTreeMap::default(),
-            relations: Arc::new(RwLock::new(BidGraph(petgraph::Graph::new()))),
-            bid_to_index: RwLock::new(BTreeMap::default()),
-            index_dirty: AtomicBool::new(false),
-            brefs: BTreeMap::default(),
-            paths: Arc::new(RwLock::new(PathMapMap::default())),
-            errors: Arc::new(RwLock::new(Vec::new())),
-            api: BeliefNode::api_state(),
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            BeliefBase {
+                states: BTreeMap::default(),
+                relations: Arc::new(RwLock::new(BidGraph(petgraph::Graph::new()))),
+                bid_to_index: RwLock::new(BTreeMap::default()),
+                index_dirty: AtomicBool::new(false),
+                brefs: BTreeMap::default(),
+                paths: Arc::new(RwLock::new(PathMapMap::default())),
+                errors: Arc::new(RwLock::new(Vec::new())),
+                api: BeliefNode::api_state(),
+            }
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            BeliefBase {
+                states: BTreeMap::default(),
+                relations: Rc::new(RefCell::new(BidGraph(petgraph::Graph::new()))),
+                bid_to_index: RefCell::new(BTreeMap::default()),
+                index_dirty: AtomicBool::new(false),
+                brefs: BTreeMap::default(),
+                paths: Rc::new(RefCell::new(PathMapMap::default())),
+                errors: Rc::new(RefCell::new(Vec::new())),
+                api: BeliefNode::api_state(),
+            }
+        }
+    }
+
+    // Helper methods for conditional lock access
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_relations(&self) -> ArcRwLockReadGuard<RawRwLock, BidGraph> {
+        self.relations.read_arc()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_relations(&self) -> std::cell::Ref<'_, BidGraph> {
+        self.relations.borrow()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_relations(&self) -> parking_lot::ArcRwLockWriteGuard<RawRwLock, BidGraph> {
+        self.relations.write_arc()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_relations(&self) -> std::cell::RefMut<'_, BidGraph> {
+        self.relations.borrow_mut()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_paths(&self) -> ArcRwLockReadGuard<RawRwLock, PathMapMap> {
+        self.paths.read_arc()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_paths(&self) -> std::cell::Ref<'_, PathMapMap> {
+        self.paths.borrow()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_paths(&self) -> parking_lot::ArcRwLockWriteGuard<RawRwLock, PathMapMap> {
+        self.paths.write_arc()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_paths(&self) -> std::cell::RefMut<'_, PathMapMap> {
+        self.paths.borrow_mut()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_errors(&self) -> parking_lot::RwLockReadGuard<'_, Vec<String>> {
+        self.errors.read()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_errors(&self) -> std::cell::Ref<'_, Vec<String>> {
+        self.errors.borrow()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_errors(&self) -> parking_lot::RwLockWriteGuard<'_, Vec<String>> {
+        self.errors.write()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_errors(&self) -> std::cell::RefMut<'_, Vec<String>> {
+        self.errors.borrow_mut()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_bid_index(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+        self.bid_to_index.read()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_bid_index(&self) -> std::cell::Ref<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+        self.bid_to_index.borrow()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_bid_index(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+        self.bid_to_index.write()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_bid_index(&self) -> std::cell::RefMut<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+        self.bid_to_index.borrow_mut()
     }
 
     pub fn new_unbalanced(
@@ -154,9 +295,9 @@ impl BeliefBase {
         inject_api: bool,
     ) -> BeliefBase {
         let mut bs = BeliefBase::empty();
-        // Newly created RwLock, so we know there's no one else locking it.
+        // Set relations
         {
-            *bs.relations.write_arc() = relations;
+            *bs.write_relations() = relations;
         }
         bs.states = states;
         bs.brefs = BTreeMap::from_iter(bs.states.keys().map(|bid| (bid.bref(), *bid)));
@@ -165,7 +306,17 @@ impl BeliefBase {
         }
         bs.index_dirty.store(true, Ordering::SeqCst);
         bs.index_sync(false);
-        *bs.paths.write() = PathMapMap::new(bs.states(), bs.relations.clone());
+
+        // Build PathMapMap - for WASM, need to convert to Arc<RwLock<>> temporarily
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *bs.paths.write() = PathMapMap::new(bs.states(), bs.relations.clone());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let relations_arc = Arc::new(RwLock::new(bs.read_relations().clone()));
+            *bs.write_paths() = PathMapMap::new(bs.states(), relations_arc);
+        }
         bs
     }
 
@@ -185,13 +336,20 @@ impl BeliefBase {
         &self.states
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn paths(&self) -> ArcRwLockReadGuard<RawRwLock, PathMapMap> {
         self.index_sync(false);
         while self.paths.is_locked_exclusive() {
             tracing::info!("[BeliefBase] Waiting for read access to paths");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        self.paths.read_arc()
+        self.read_paths()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn paths(&self) -> std::cell::Ref<'_, PathMapMap> {
+        self.index_sync(false);
+        self.read_paths()
     }
 
     pub fn brefs(&self) -> &BTreeMap<Bref, Bid> {
@@ -199,7 +357,7 @@ impl BeliefBase {
     }
 
     pub fn errors(&self) -> Vec<String> {
-        self.errors.read().clone()
+        self.read_errors().clone()
     }
 
     /// Synchronize our indices (namely the self.paths object and our bid_to_index object), if the
@@ -210,8 +368,8 @@ impl BeliefBase {
         }
         // This block ensures we drop relations and index
         {
-            let mut relations = self.relations.write_arc();
-            let mut index = self.bid_to_index.write();
+            let mut relations = self.write_relations();
+            let mut index = self.write_bid_index();
             *index = BTreeMap::from_iter(
                 relations
                     .as_graph()
@@ -229,8 +387,14 @@ impl BeliefBase {
         self.index_dirty.store(false, Ordering::SeqCst);
 
         if bit {
-            // Rebuild paths - write to the Arc<RwLock<PathMapMap>>
+            // Rebuild paths
+            #[cfg(not(target_arch = "wasm32"))]
             let constructor_paths_map = PathMapMap::new(self.states(), self.relations.clone());
+            #[cfg(target_arch = "wasm32")]
+            let constructor_paths_map = {
+                let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
+                PathMapMap::new(self.states(), relations_arc)
+            };
             let constructor_all_paths = constructor_paths_map.all_paths();
             let constructor_paths: BTreeSet<String> = constructor_all_paths
                 .values()
@@ -244,7 +408,7 @@ impl BeliefBase {
                 .flatten()
                 .map(|(path, _, _)| path.clone())
                 .collect();
-            let mut errors = self.errors.write();
+            let mut errors = self.write_errors();
             *errors = self.built_in_test(bit);
             if event_paths != constructor_paths {
                 errors.push(format!(
@@ -263,7 +427,7 @@ impl BeliefBase {
                         .join("\n\t- ")
                 ));
             }
-            let errors = self.errors.read();
+            let errors = self.read_errors();
             if !errors.is_empty() {
                 tracing::debug!("Set isn't balanced. Errors:\n{}", errors.join("\n- "));
             }
@@ -272,16 +436,23 @@ impl BeliefBase {
 
     pub fn bid_to_index(&self, bid: &Bid) -> Option<petgraph::graph::NodeIndex> {
         self.index_sync(false);
-        self.bid_to_index.read().get(bid).copied()
+        self.read_bid_index().get(bid).copied()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn relations(&self) -> ArcRwLockReadGuard<RawRwLock, BidGraph> {
         self.index_sync(false);
         while self.relations.is_locked_exclusive() {
             tracing::info!("[BeliefBase] Waiting for read access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        self.relations.read_arc()
+        self.read_relations()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn relations(&self) -> std::cell::Ref<'_, BidGraph> {
+        self.index_sync(false);
+        self.read_relations()
     }
 
     pub fn get(&self, key: &NodeKey) -> Option<BeliefNode> {
@@ -309,7 +480,7 @@ impl BeliefBase {
         assert!(
             self.is_balanced().is_ok(),
             "get_context called on an unbalanced BeliefBase. errors: {:?}",
-            self.errors.read().clone()
+            self.read_errors().clone()
         );
         let Some(node) = self.states.get(bid) else {
             tracing::debug!("[get_context] node {bid} is not loaded");
@@ -326,6 +497,7 @@ impl BeliefBase {
             })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn consume(&mut self) -> BeliefGraph {
         let mut old_self = std::mem::take(self);
         let states = std::mem::take(&mut old_self.states);
@@ -334,7 +506,22 @@ impl BeliefBase {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let relations = std::mem::replace(
-            old_self.relations.write_arc().as_graph_mut(),
+            old_self.write_relations().as_graph_mut(),
+            petgraph::Graph::new(),
+        );
+        BeliefGraph {
+            states,
+            relations: BidGraph(relations),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn consume(&mut self) -> BeliefGraph {
+        let mut old_self = std::mem::take(self);
+        let states = std::mem::take(&mut old_self.states);
+        // No lock checking needed in WASM (single-threaded)
+        let relations = std::mem::replace(
+            old_self.write_relations().as_graph_mut(),
             petgraph::Graph::new(),
         );
         BeliefGraph {
@@ -589,7 +776,7 @@ impl BeliefBase {
     }
 
     pub fn is_balanced(&self) -> Result<(), BuildonomyError> {
-        let errors = self.errors.read();
+        let errors = self.read_errors();
         if !errors.is_empty() {
             Err(BuildonomyError::Custom(errors.join("\n- ")))
         } else {
@@ -689,7 +876,7 @@ impl BeliefBase {
         let api_net_guards = api_nodes
             .iter()
             .filter_map(|b| self.paths().get_map(&b.bref()))
-            .collect::<Vec<ArcRwLockReadGuard<_, PathMap>>>();
+            .collect::<Vec<_>>();
 
         let mut pathless_nodes = BTreeSet::default();
         let mut stateless_nodes = BTreeSet::default();
@@ -915,8 +1102,19 @@ impl BeliefBase {
 
         // Process ALL events through PathMapMap to generate and apply path mutations
         let mut path_events = {
-            let mut pmm = self.paths.write_arc();
-            pmm.process_event_queue(&event_queue, &self.relations)
+            let mut pmm = self.write_paths();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                pmm.process_event_queue(&event_queue, &self.relations)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // For WASM, convert Rc to Arc temporarily for process_event_queue
+                use parking_lot::RwLock;
+                use std::sync::Arc;
+                let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
+                pmm.process_event_queue(&event_queue, &relations_arc)
+            }
         };
 
         // Append path events to derivatives for DbConnection and other subscribers
@@ -994,8 +1192,8 @@ impl BeliefBase {
 
         let mut sink_kinds: BTreeMap<Bid, BTreeSet<WeightKind>> = BTreeMap::new();
         {
-            let relations = self.relations.read_arc();
-            let bid_to_index = self.bid_to_index.read();
+            let relations = self.read_relations();
+            let bid_to_index = self.read_bid_index();
             for bid in bids {
                 if let Some(&node_idx) = bid_to_index.get(bid) {
                     // Find all sinks that this node has edges to, and what WeightKinds
@@ -1021,7 +1219,7 @@ impl BeliefBase {
         }
 
         // Remove nodes from graph
-        let mut relations = self.relations.write_arc();
+        let mut relations = self.write_relations();
         relations
             .as_graph_mut()
             .retain_nodes(|g, idx| !bids.contains(&g[idx]));
@@ -1182,6 +1380,7 @@ impl BeliefBase {
         sink: Bid,
         new_weight_set: WeightSet,
     ) -> Vec<BeliefEvent> {
+        #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
             tracing::info!("[BeliefBase::update_relation] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1205,7 +1404,7 @@ impl BeliefBase {
 
         let source_idx = maybe_source_idx.unwrap();
         let sink_idx = maybe_sink_idx.unwrap();
-        let mut relations = self.relations.write_arc();
+        let mut relations = self.write_relations();
         let old_weight_set = {
             if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
                 relations
@@ -1266,7 +1465,7 @@ impl BeliefBase {
         };
 
         let mut changed = BTreeMap::<(_, _), BTreeMap<WeightKind, u16>>::new();
-        let mut relations = self.relations.write_arc();
+        let mut relations = self.write_relations();
         let incoming_edges = {
             relations
                 .as_graph()
@@ -1351,7 +1550,7 @@ impl BeliefBase {
         if let Some(replaced_idx) = self.bid_to_index(&replaced_bid) {
             let new_idx_opt = self.bid_to_index(&new_bid);
 
-            let mut relations = self.relations.write_arc();
+            let mut relations = self.write_relations();
             let new_idx = new_idx_opt.unwrap_or_else(|| relations.as_graph_mut().add_node(new_bid));
 
             let mut outgoing = relations
@@ -1450,11 +1649,12 @@ impl BeliefBase {
     /// Remove all relations where source or sink is not contained in the states set, or in the
     /// optional to_retain Bid set.
     pub fn trim(&mut self, to_retain: Option<BTreeSet<Bid>>) {
+        #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
             tracing::info!("[BeliefBase::trim] Waiting for write access to relations");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let mut write_relations = self.relations.write_arc();
+        let mut write_relations = self.write_relations();
         let retainable_set =
             to_retain.unwrap_or_else(|| BTreeSet::from_iter(self.states().keys().copied()));
         let to_remove = write_relations
@@ -1807,6 +2007,7 @@ impl BeliefBase {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BeliefSource for BeliefBase {
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
@@ -1856,6 +2057,7 @@ impl BeliefSource for BeliefBase {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BeliefSource for &BeliefBase {
     async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
         Ok(self.evaluate_expression(expr))
