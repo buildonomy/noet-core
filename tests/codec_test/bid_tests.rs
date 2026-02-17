@@ -8,7 +8,6 @@ use noet_core::{
     },
     db::{db_init, DbConnection, Transaction},
     event::BeliefEvent,
-    properties::BeliefKind,
 };
 use sqlx::Row;
 use std::{
@@ -99,18 +98,32 @@ async fn test_belief_set_builder_bid_generation_and_caching(
             .join("\n - ")
     );
 
-    tracing::info!("Include asset BIDs from asset manifest");
-    {
-        // Query asset BIDs from global_bb instead of compiler.asset_manifest()
-        for (bid, node) in global_bb.states().iter() {
-            if node.kind.contains(BeliefKind::External) {
-                written_bids.insert(*bid);
-            }
-        }
-    }
+    // get asset and href bid set to remove from the cached_bids comparison to written bids
+    let mut asset_bids = BTreeSet::from_iter(
+        global_bb
+            .paths()
+            .asset_map()
+            .map()
+            .iter()
+            .map(|(_path, bid, _order)| *bid),
+    );
+    asset_bids.append(&mut BTreeSet::from_iter(
+        global_bb
+            .paths()
+            .href_map()
+            .map()
+            .iter()
+            .map(|(_path, bid, _order)| *bid),
+    ));
 
     tracing::info!("Ensure written bids match cached bids");
-    let cached_bids = BTreeSet::from_iter(global_bb.states().values().map(|n| n.bid));
+    let cached_bids = BTreeSet::from_iter(
+        global_bb
+            .states()
+            .values()
+            .map(|n| n.bid)
+            .filter(|bid| !asset_bids.contains(bid)),
+    );
     debug_assert!(
         written_bids.eq(&cached_bids),
         "Written: {written_bids:?}\n\nCached: {cached_bids:?}"
