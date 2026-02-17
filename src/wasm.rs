@@ -654,10 +654,12 @@ impl BeliefBaseWasm {
         // Collect all data while holding the borrow
         let (node, root_path, home_net, related_nodes, graph) = {
             let mut inner = self.inner.borrow_mut();
+            // get_context calls index_sync internally and needs mutable access
             let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
                 Some(c) => c,
                 None => {
-                    console::warn_1(&format!("⚠️ Node not found: {}", bid).into());
+                    console::warn_1(&format!("⚠️ Node not found in context: {}", bid).into());
+                    console::log_1(&format!("   Entry point: {}", self.entry_point_bid).into());
                     return JsValue::NULL;
                 }
             };

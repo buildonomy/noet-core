@@ -1,21 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     fmt::{Display, Formatter},
-    path::{Path, PathBuf, MAIN_SEPARATOR_STR},
+    path::{Component, Path, PathBuf, MAIN_SEPARATOR_STR},
 };
 
 /// Utility function to replace separators and convert to unicode (via to_string_lossy) on os path.
 pub fn os_path_to_string<P: AsRef<Path>>(os_path_ref: P) -> String {
-    os_path_ref
+    let res = os_path_ref
         .as_ref()
         .components()
-        .map(|c| c.as_os_str().to_string_lossy())
+        .map(|c| match c {
+            Component::RootDir => Cow::from("".to_string()),
+            _ => c.as_os_str().to_string_lossy(),
+        })
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    tracing::debug!(
+        "os_path_to_string: turned {:?} into {}",
+        os_path_ref.as_ref().components(),
+        res
+    );
+    res
 }
 
 pub fn string_to_os_path(path_string: &str) -> PathBuf {
-    PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR))
+    let res = PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR));
+    tracing::debug!("string_to_os_path: turned '{}' into {:?}", path_string, res);
+    res
 }
 
 /// Turn a title string into a regularized anchor string

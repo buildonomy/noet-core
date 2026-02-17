@@ -215,8 +215,6 @@ src/beliefbase/
 ├── graph.rs         - BidGraph, BidRefGraph, BeliefGraph (lines 31-843)
 ├── base.rs          - BeliefBase implementation (lines 868-2614)
 ├── context.rs       - BeliefContext, ExtendedRelation (lines 281-385)
-├── ops.rs           - Set operations (union, intersection, etc.)
-├── query.rs         - Expression evaluation (evaluate_expression, etc.)
 └── tests.rs         - Test module (lines 2649-3003)
 ```
 
@@ -224,8 +222,6 @@ src/beliefbase/
 1. **Graph types** (`graph.rs`): BidGraph, BidRefGraph, BeliefGraph - pure data structures
 2. **Base implementation** (`base.rs`): BeliefBase with indices and synchronization
 3. **Context types** (`context.rs`): View types for navigating belief relationships
-4. **Operations** (`ops.rs`): Set algebra methods (union, diff, etc.)
-5. **Query evaluation** (`query.rs`): Expression evaluation and filtering
 6. **Tests** (`tests.rs`): Module tests
 
 **Benefits**:

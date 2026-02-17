@@ -421,6 +421,27 @@ function navigateToLink(href, link) {
     return;
   }
 
+  // Check if it's an asset (non-.html file) - open directly
+  if (!href.includes(".html")) {
+    // Asset link (PDF, image, etc.) - resolve path and open directly
+    let assetPath = href;
+
+    // Resolve relative asset paths
+    if (!href.startsWith("/") && wasmModule) {
+      const currentHash = window.location.hash.substring(1);
+      if (currentHash) {
+        const parts = wasmModule.BeliefBaseWasm.pathParts(currentHash);
+        const parentDir = parts.path;
+        assetPath = wasmModule.BeliefBaseWasm.pathJoin(parentDir, href, false);
+      }
+    }
+
+    // Open asset in new tab or download
+    console.log(`[Noet] Opening asset: ${assetPath}`);
+    window.open(`/pages/${assetPath}`, "_blank");
+    return;
+  }
+
   // Resolve relative paths against current document location
   let resolvedPath = href;
   if (!href.startsWith("/") && wasmModule) {
@@ -1344,22 +1365,64 @@ function renderNodeContext(context) {
   }
 
   // Graph Relations (organized by WeightKind)
-  if (graph && Object.keys(graph).length > 0) {
+  if (graph && graph.size > 0) {
     html += '<div class="noet-metadata-section">';
     html += "<h3>Relations</h3>";
 
-    for (const [weightKind, [sources, sinks]] of Object.entries(graph)) {
+    for (const [weightKind, [sources, sinks]] of graph.entries()) {
       if (sources.length > 0 || sinks.length > 0) {
         html += `<h4>${escapeHtml(weightKind)}</h4>`;
 
+        // Render sources (incoming links)
         if (sources.length > 0) {
-          html += '<p class="noet-metadata-label"><strong>Incoming:</strong> ';
-          html += `${sources.length} node(s) link to this</p>`;
+          html += '<div class="noet-relation-group">';
+          html += '<p class="noet-metadata-label"><strong>Sources (incoming):</strong></p>';
+          html += '<ul class="noet-relation-list">';
+
+          for (const sourceBid of sources) {
+            const sourceNode = related_nodes.get(sourceBid);
+            if (sourceNode) {
+              const sourceTitle = escapeHtml(sourceNode.title || sourceBid);
+              const sourcePath = sourceNode.path || null;
+
+              if (sourcePath) {
+                html += `<li><a href="#" class="noet-metadata-link" data-bid="${sourceBid}">${sourceTitle}</a></li>`;
+              } else {
+                html += `<li><span title="BID: ${sourceBid}">${sourceTitle}</span></li>`;
+              }
+            } else {
+              html += `<li><span title="BID: ${sourceBid}">${formatBid(sourceBid)}</span></li>`;
+            }
+          }
+
+          html += "</ul>";
+          html += "</div>";
         }
 
+        // Render sinks (outgoing links)
         if (sinks.length > 0) {
-          html += '<p class="noet-metadata-label"><strong>Outgoing:</strong> ';
-          html += `This links to ${sinks.length} node(s)</p>`;
+          html += '<div class="noet-relation-group">';
+          html += '<p class="noet-metadata-label"><strong>Sinks (outgoing):</strong></p>';
+          html += '<ul class="noet-relation-list">';
+
+          for (const sinkBid of sinks) {
+            const sinkNode = related_nodes.get(sinkBid);
+            if (sinkNode) {
+              const sinkTitle = escapeHtml(sinkNode.title || sinkBid);
+              const sinkPath = sinkNode.path || null;
+
+              if (sinkPath) {
+                html += `<li><a href="#" class="noet-metadata-link" data-bid="${sinkBid}">${sinkTitle}</a></li>`;
+              } else {
+                html += `<li><span title="BID: ${sinkBid}">${sinkTitle}</span></li>`;
+              }
+            } else {
+              html += `<li><span title="BID: ${sinkBid}">${formatBid(sinkBid)}</span></li>`;
+            }
+          }
+
+          html += "</ul>";
+          html += "</div>";
         }
       }
     }

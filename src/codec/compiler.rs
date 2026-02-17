@@ -1251,9 +1251,11 @@ impl DocumentCompiler {
                 }
             } else {
                 tracing::warn!(
-                    "[Compiler] Cannot resolve asset path {:?} from document {:?}",
+                    "[Compiler] Cannot resolve asset path {:?} from document {:?}. Absolute path: {}, repo root: {:?}",
                     asset_relative_path,
                     path,
+                    asset_absolute_path,
+                    repo_root
                 );
             }
         }
