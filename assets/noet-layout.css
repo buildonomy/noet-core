@@ -269,7 +269,8 @@ body {
     grid-area: metadata;
     background-color: var(--noet-bg-secondary);
     border-left: 1px solid var(--noet-border-primary);
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
     padding: var(--size-4);
     font-weight: var(--noet-font-weight-ui, 350);
 }
@@ -316,7 +317,6 @@ body {
         bottom: 0;
         width: 320px;
         z-index: 40;
-        overflow: hidden;
         transition: transform 0.3s var(--ease-2);
     }
 
@@ -591,7 +591,18 @@ body {
 }
 
 .noet-nav-tree__children .noet-nav-tree {
-    margin-top: var(--size-1);
+    margin-left: var(--size-2);
+}
+
+/* Metadata content area with scroll */
+.noet-metadata-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.noet-metadata-header {
+    flex-shrink: 0;
 }
 
 /* =========================================================================
@@ -705,6 +716,21 @@ body {
     list-style: none;
     padding: 0;
     margin: var(--size-2) 0;
+}
+
+/* Relation lists (sources/sinks) */
+.noet-relation-list {
+    list-style: none;
+    padding: 0;
+    margin: var(--size-2) 0;
+}
+
+.noet-relation-list li {
+    margin-bottom: var(--size-1);
+}
+
+.noet-relation-group {
+    margin-bottom: var(--size-3);
 }
 
 .noet-metadata-links li {

@@ -32,6 +32,75 @@
 //!     console.log(backlinks);
 //! }
 //! ```
+//!
+//! # ⚠️ CRITICAL: Rust→JavaScript Serialization Patterns
+//!
+//! **Problem**: Rust `BTreeMap` and `HashMap` serialize to JavaScript `Map` objects (not plain objects)
+//! when using `serde_wasm_bindgen::to_value()`. This breaks JavaScript code expecting plain objects.
+//!
+//! ## Symptoms
+//! ```javascript
+//! // JavaScript receives a Map, not a plain object:
+//! const data = wasm_function();
+//! Object.keys(data);        // Returns [] (empty array!)
+//! data[key];                // Returns undefined (bracket notation fails!)
+//! Object.entries(data);     // Returns [] (empty array!)
+//! ```
+//!
+//! ## Solutions
+//!
+//! ### Option A: Return Plain JavaScript Object (Recommended for dictionary-like data)
+//! ```rust
+//! use serde_json::json;
+//!
+//! #[wasm_bindgen]
+//! pub fn get_data(&self) -> JsValue {
+//!     let mut map = serde_json::Map::new();
+//!     for (key, value) in rust_btreemap.iter() {
+//!         map.insert(key.to_string(), json!(value));
+//!     }
+//!     let obj = serde_json::Value::Object(map);
+//!     serde_wasm_bindgen::to_value(&obj).unwrap()  // ✅ Plain object
+//! }
+//! ```
+//!
+//! ### Option B: Return JavaScript Map (When Map semantics are needed)
+//! ```rust
+//! #[wasm_bindgen]
+//! pub fn get_data(&self) -> JsValue {
+//!     let data: BTreeMap<String, Value> = ...;
+//!     serde_wasm_bindgen::to_value(&data).unwrap()  // ✅ JavaScript Map
+//! }
+//! ```
+//! **IMPORTANT**: Document in function JSDoc that it returns a Map:
+//! ```rust
+//! /// Returns a Map<string, Value> (use .get(), .size, .entries())
+//! ```
+//!
+//! ### Option C: Return Array of Tuples (Simple alternative)
+//! ```rust
+//! #[wasm_bindgen]
+//! pub fn get_data(&self) -> JsValue {
+//!     let data: Vec<(String, Value)> = btreemap.into_iter().collect();
+//!     serde_wasm_bindgen::to_value(&data).unwrap()  // ✅ Array
+//! }
+//! ```
+//!
+//! ## Checklist for New Functions
+//! - [ ] Does this function return BTreeMap/HashMap?
+//! - [ ] Does JavaScript need plain object access (obj[key], Object.keys)?
+//!   - YES → Use Option A (serde_json::Map)
+//!   - NO → Use Option B and document as Map
+//! - [ ] Add JSDoc comment showing JavaScript type
+//! - [ ] Verify viewer.js uses correct access pattern
+//!
+//! ## Current Functions Status
+//! - ✅ `get_paths()` - Returns plain object (uses serde_json)
+//! - ⚠️ `get_context()` - Returns NodeContext with Map fields (related_nodes, graph)
+//! - ⚠️ `get_nav_tree()` - Returns NavTree with Map field (nodes)
+//! - ⚠️ `query()` - Returns BeliefGraph with Map field (states)
+//!
+//! See viewer.js header for JavaScript-side usage patterns.
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -62,6 +131,9 @@ use enumset::EnumSet;
 #[cfg(feature = "wasm")]
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(feature = "wasm")]
+use js_sys::{Object, Reflect};
+
 /// Navigation tree structure for hierarchical document navigation
 ///
 /// Pre-structured tree generated in Rust for better performance than client-side tree building.
@@ -71,8 +143,10 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NavTree {
     /// Flat map of all nodes by BID (O(1) lookup)
+    /// ⚠️ JavaScript: This is a Map object! Use `.get(bid)`, `.size`, `.entries()`
     pub nodes: BTreeMap<String, NavNode>,
     /// Root node BIDs (networks) in display order
+    /// ✅ JavaScript: This is an Array. Use `[index]`
     pub roots: Vec<String>,
 }
 
@@ -124,11 +198,13 @@ pub struct NodeContext {
     /// All nodes related to this one (other end of all edges, both sources and sinks)
     /// Map from BID to RelatedNode for O(1) lookup when displaying graph relations
     /// Each RelatedNode includes the root_path needed for href generation
+    /// ⚠️ JavaScript: This is a Map object! Use `.get(bid)`, `.size`, `.entries()`
     pub related_nodes: BTreeMap<Bid, RelatedNode>,
     /// Relations by weight kind: Map<WeightKind, (sources, sinks)>
     /// Sources: BIDs of nodes linking TO this one
     /// Sinks: BIDs of nodes this one links TO
     /// Both vectors are sorted by WEIGHT_SORT_KEY edge payload value
+    /// ⚠️ JavaScript: This is a Map object! Use `.get(weightKind)`, `.size`, `.entries()`
     pub graph: HashMap<WeightKind, (Vec<Bid>, Vec<Bid>)>,
 }
 
@@ -631,11 +707,21 @@ impl BeliefBaseWasm {
     /// - External references (href/asset networks)
     /// - Full relation graph (sources, sinks)
     ///
+    /// ⚠️ **JavaScript**: `related_nodes` and `graph` are Map objects (not plain objects)!
+    ///
     /// # JavaScript Example
     /// ```javascript
     /// const ctx = bb.get_context("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`Node: ${ctx.node.title}`);
     /// console.log(`Path: ${ctx.root_path}`);
+    ///
+    /// // ⚠️ IMPORTANT: Use Map methods, NOT Object methods
+    /// console.log(`Related nodes: ${ctx.related_nodes.size}`);  // ✅ Correct
+    /// const relNode = ctx.related_nodes.get(someBid);           // ✅ Correct
+    /// for (const [bid, relNode] of ctx.related_nodes.entries()) { ... }  // ✅ Correct
+    ///
+    /// // ❌ WRONG: Object.keys(ctx.related_nodes) returns []
+    /// // ❌ WRONG: ctx.related_nodes[bid] returns undefined
     /// ```
     #[wasm_bindgen]
     pub fn get_context(&self, bid: String) -> JsValue {
@@ -785,7 +871,7 @@ impl BeliefBaseWasm {
 
     /// Get all network path maps for navigation tree generation
     ///
-    /// Returns a nested map structure:
+    /// Returns a plain JavaScript object (NOT a Map):
     /// - Top level: network BID → PathMap data
     /// - PathMap data: array of [path, bid, order_indices] tuples
     ///
@@ -794,9 +880,14 @@ impl BeliefBaseWasm {
     ///
     /// See `docs/design/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
     ///
+    /// ✅ **JavaScript**: This returns a plain object (uses serde_json serialization)
+    ///
     /// # JavaScript Example
     /// ```javascript
     /// const paths = beliefbase.get_paths();
+    /// // ✅ Plain object - use bracket notation
+    /// const networkPaths = paths[networkBid];  // ✅ Works!
+    /// Object.keys(paths);                       // ✅ Works!
     /// // paths = {
     /// //   "network_bid_1": [
     /// //     ["path/to/doc.md", "doc_bid", [0]],
@@ -809,30 +900,34 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn get_paths(&self) -> JsValue {
-        use std::collections::BTreeMap;
-
         let inner = self.inner.borrow();
         let paths = inner.paths();
 
-        // Build nested map: network_bid → Vec<(path, bid, order_indices)>
-        let nets: BTreeMap<String, Vec<(String, String, Vec<u16>)>> = paths
-            .map()
-            .iter()
-            .map(|(net_bid, pm_lock)| {
-                let pm = pm_lock.read();
-                let path_data: Vec<(String, String, Vec<u16>)> = pm
-                    .map()
-                    .iter()
-                    .map(|(path, bid, order)| (path.clone(), bid.to_string(), order.clone()))
-                    .collect();
-                (net_bid.to_string(), path_data)
-            })
-            .collect();
+        // Build plain JavaScript object using js_sys::Object
+        // Structure: { "network-bid": { "path": "bid", ... }, ... }
+        // IMPORTANT: Don't use serde_wasm_bindgen - it creates Maps, not plain objects
+        let result = Object::new();
 
-        serde_wasm_bindgen::to_value(&nets).unwrap_or_else(|e| {
-            console::error_1(&format!("Failed to serialize paths: {}", e).into());
-            JsValue::NULL
-        })
+        for net_bid in paths.nets().iter() {
+            // Get PathMap using Bref lookup
+            if let Some(pm_lock) = paths.map().get(&net_bid.bref()) {
+                let pm = pm_lock.read();
+
+                // Build nested object mapping path → bid
+                let path_obj = Object::new();
+                for (path, bid, _order) in pm.map().iter() {
+                    let path_key = JsValue::from_str(path);
+                    let bid_value = JsValue::from_str(&bid.to_string());
+                    let _ = Reflect::set(&path_obj, &path_key, &bid_value);
+                }
+
+                // Use full BID (36 chars) as key, not Bref (12 chars)
+                let net_key = JsValue::from_str(&net_bid.to_string());
+                let _ = Reflect::set(&result, &net_key, &path_obj);
+            }
+        }
+
+        result.into()
     }
 
     /// Get pre-structured navigation tree (hierarchical, ready to render)
@@ -844,12 +939,19 @@ impl BeliefBaseWasm {
     ///
     /// See `docs/design/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
     ///
+    /// ⚠️ **JavaScript**: `tree.nodes` is a Map object (not plain object)!
+    ///
     /// # JavaScript Example
     /// ```javascript
     /// const tree = beliefbase.get_nav_tree();
-    /// // tree.nodes[0].title => "Network Name"
-    /// // tree.nodes[0].children[0].title => "Document Title"
-    /// // tree.nodes[0].children[0].children[0].title => "Section Title"
+    ///
+    /// // ⚠️ IMPORTANT: tree.nodes is a Map, tree.roots is an Array
+    /// const node = tree.nodes.get(someBid);     // ✅ Correct
+    /// const count = tree.nodes.size;             // ✅ Correct
+    /// const firstRoot = tree.roots[0];           // ✅ Array access
+    ///
+    /// // ❌ WRONG: tree.nodes[bid] returns undefined
+    /// // ❌ WRONG: Object.keys(tree.nodes) returns []
     /// ```
     #[wasm_bindgen]
     pub fn get_nav_tree(&self) -> JsValue {
@@ -977,8 +1079,24 @@ impl BeliefBaseWasm {
         })
     }
 
-    /// Helper: Normalize path extension to .html
-    fn normalize_path_extension(path: &str) -> String {
+    /// Normalize path extension to .html for fetching rendered documents
+    ///
+    /// Converts source file extensions (.md, .org, etc.) to .html for the viewer to fetch.
+    /// Also handles directory paths by appending /index.html.
+    ///
+    /// # Arguments
+    /// * `path` - Path with source extension (e.g., "docs/guide.md#section")
+    ///
+    /// # Returns
+    /// Path with .html extension (e.g., "docs/guide.html#section")
+    ///
+    /// # Examples
+    /// ```javascript
+    /// const htmlPath = BeliefBaseWasm.normalizePathExtension("net1_dir1/hsml.md#definition");
+    /// // Returns: "net1_dir1/hsml.html#definition"
+    /// ```
+    #[wasm_bindgen]
+    pub fn normalize_path_extension(path: &str) -> String {
         use crate::codec::CODECS;
         use crate::paths::AnchorPath;
 

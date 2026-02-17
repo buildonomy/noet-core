@@ -37,13 +37,26 @@ echo -e "${BLUE}[1/2] Building WASM module...${NC}"
 echo -e "${YELLOW}Note: WASM builds with --features wasm --no-default-features${NC}"
 echo -e "${YELLOW}      (no service/sqlx/tokio features for browser target)${NC}\n"
 
-wasm-pack build --target web --out-dir pkg -- --features wasm --no-default-features $RELEASE_FLAG
+# Build WASM using cargo directly (wasm-pack doesn't respect --no-default-features properly)
+cargo build --target wasm32-unknown-unknown --no-default-features --features wasm $RELEASE_FLAG
+
+if [ $? -ne 0 ]; then
+    echo -e "\n${RED}✗ WASM cargo build failed${NC}"
+    exit 1
+fi
+
+# Generate JavaScript bindings using wasm-bindgen
+echo -e "${YELLOW}Generating JavaScript bindings...${NC}\n"
+mkdir -p pkg
+wasm-bindgen "target/wasm32-unknown-unknown/$CARGO_PROFILE/noet_core.wasm" \
+    --out-dir pkg \
+    --target web
 
 if [ $? -eq 0 ]; then
     echo -e "\n${GREEN}✓ WASM build successful${NC}"
     echo -e "${GREEN}  Output: pkg/noet_core.js, pkg/noet_core_bg.wasm${NC}\n"
 else
-    echo -e "\n${RED}✗ WASM build failed${NC}"
+    echo -e "\n${RED}✗ wasm-bindgen failed${NC}"
     exit 1
 fi
 

@@ -14,6 +14,44 @@
  * - Reads metadata from #noet-metadata JSON script tag
  * - Manipulates DOM containers defined in template-responsive.html
  * - Uses CSS custom properties from noet-theme-*.css
+ *
+ * ⚠️ CRITICAL: WASM Data Type Patterns
+ * =====================================
+ *
+ * Rust BTreeMap/HashMap serialize to JavaScript **Map objects**, NOT plain objects!
+ *
+ * WRONG (will fail):
+ *   const data = beliefbase.get_something();
+ *   Object.keys(data);        // ❌ Returns [] (empty!)
+ *   data[key];                // ❌ Returns undefined
+ *   Object.entries(data);     // ❌ Returns [] (empty!)
+ *
+ * CORRECT (use Map methods):
+ *   const data = beliefbase.get_something();
+ *   data.size;                // ✅ Number of entries
+ *   data.get(key);            // ✅ Get value by key
+ *   data.has(key);            // ✅ Check if key exists
+ *   data.entries();           // ✅ Iterator of [key, value]
+ *   Array.from(data.entries()); // ✅ Convert to array
+ *
+ * Current WASM Function Return Types:
+ * - get_paths()          → Plain Object (uses serde_json) ✅ Use obj[key]
+ * - get_nav_tree()       → NavTree { nodes: Map, roots: Array }
+ *   - navTree.nodes      → Map ⚠️ Use .get(bid)
+ *   - navTree.roots      → Array ✅ Use [index]
+ * - get_context()        → NodeContext { related_nodes: Map, graph: Map, ... }
+ *   - related_nodes      → Map ⚠️ Use .get(bid)
+ *   - graph              → Map ⚠️ Use .get(weightKind)
+ * - query()              → BeliefGraph { states: Map, relations: ... }
+ *   - states             → Map ⚠️ Use .get(bid) (not currently used)
+ *
+ * When adding new WASM calls:
+ * 1. Check src/wasm.rs documentation for return type
+ * 2. If function returns BTreeMap/HashMap → expect JavaScript Map
+ * 3. Use Map methods (.get, .size, .entries, .has)
+ * 4. Never use Object.keys() or bracket notation on Maps
+ *
+ * See src/wasm.rs header for Rust-side serialization patterns.
  */
 
 // =============================================================================
@@ -90,6 +128,9 @@ let expandedNodes = new Set();
 
 /** Track first navigation render to auto-expand roots only once */
 let isFirstNavRender = true;
+
+/** Pending metadata BID to show after navigation completes */
+let pendingMetadataBid = null;
 
 /** Panel collapse state (persisted to localStorage) */
 let panelState = {
@@ -281,10 +322,11 @@ function handleNavClick(event) {
   // Handle navigation link clicks
   if (target.classList.contains("noet-nav-tree__link")) {
     event.preventDefault();
-    const path = target.getAttribute("href");
-    if (path) {
-      console.log("[Noet] Navigating via hash routing to:", path);
-      window.location.hash = path;
+    const href = target.getAttribute("href");
+    const targetBid = target.getAttribute("data-bid");
+    if (href) {
+      console.log("[Noet] Navigating to:", href);
+      navigateToLink(href, target, targetBid);
     }
   }
 }
@@ -359,7 +401,7 @@ function handleContentClick(e) {
   if (selectedNodeBid === linkBid) {
     // Second click: Navigate
     if (href) {
-      navigateToLink(href, link);
+      navigateToLink(href, link, linkBid);
     }
     selectedNodeBid = null; // Reset for next interaction
     clearSelectedLinkHighlight();
@@ -371,7 +413,7 @@ function handleContentClick(e) {
       highlightSelectedLink(link);
     } else if (href) {
       // No BID available, just navigate
-      navigateToLink(href, link);
+      navigateToLink(href, link, null);
     }
   }
 }
@@ -409,8 +451,9 @@ function extractBidFromLink(link) {
  * Navigate to link target (document or section)
  * @param {string} href - Link href attribute
  * @param {HTMLElement} link - Link element (for context)
+ * @param {string|null} targetBid - Optional BID of target node to show metadata
  */
-function navigateToLink(href, link) {
+function navigateToLink(href, link, targetBid = null) {
   // Check if it's an external link
   if (href.startsWith("http://") || href.startsWith("https://")) {
     // External link: Do nothing on first click
@@ -420,12 +463,20 @@ function navigateToLink(href, link) {
 
   // Check if it's a section/anchor link within current document (starts with #)
   if (href.startsWith("#")) {
-    navigateToSection(href);
+    navigateToSection(href, targetBid);
     return;
   }
 
-  // Check if it's an asset (non-.html file) - open directly
-  if (!href.includes(".html")) {
+  // Check if it's an asset (non-document file) - open directly
+  // Check for common document extensions (fallback if normalize not available)
+  const hrefWithoutAnchor = href.split("#")[0];
+  const isDocument =
+    hrefWithoutAnchor.includes(".html") ||
+    hrefWithoutAnchor.includes(".md") ||
+    hrefWithoutAnchor.includes(".org") ||
+    hrefWithoutAnchor.includes(".rst");
+
+  if (!isDocument) {
     // Asset link (PDF, image, etc.) - resolve path and open directly
     let assetPath = href;
 
@@ -470,19 +521,30 @@ function navigateToLink(href, link) {
     const docPath = resolvedPath.substring(0, hashIndex);
     const anchor = resolvedPath.substring(hashIndex + 1);
     // Navigate with full path in hash: #/path/file.html#anchor
-    window.location.hash = `/${docPath}#${anchor}`;
+    // Ensure docPath starts with / (don't double it)
+    const hashPath = docPath.startsWith("/") ? `${docPath}#${anchor}` : `/${docPath}#${anchor}`;
+    window.location.hash = hashPath;
+    // Store targetBid for use after navigation completes
+    if (targetBid) {
+      pendingMetadataBid = targetBid;
+    }
     return;
   }
 
   // Internal document link without anchor: Navigate via hash routing
-  navigateToDocument(resolvedPath);
+  navigateToDocument(resolvedPath, targetBid);
 }
 
 /**
  * Navigate to a document via hash routing
  * @param {string} path - Document path (e.g., "/file1.html")
+ * @param {string|null} targetBid - Optional BID of target node to show metadata
  */
-function navigateToDocument(path) {
+function navigateToDocument(path, targetBid = null) {
+  // Store targetBid for use after navigation completes
+  if (targetBid) {
+    pendingMetadataBid = targetBid;
+  }
   // Update hash to trigger navigation
   window.location.hash = path;
 }
@@ -490,8 +552,9 @@ function navigateToDocument(path) {
 /**
  * Navigate to a section within current document
  * @param {string} anchor - Section anchor (e.g., "#section-id")
+ * @param {string|null} targetBid - Optional BID of target node to show metadata
  */
-function navigateToSection(anchor) {
+function navigateToSection(anchor, targetBid = null) {
   const sectionId = anchor.substring(1); // Remove leading #
   const targetElement = document.getElementById(sectionId);
 
@@ -514,7 +577,16 @@ function navigateToSection(anchor) {
     }
 
     // Update URL hash without triggering hashchange
-    history.replaceState(null, "", newHash);
+    // Ensure hash starts with # for proper URL construction
+    if (!newHash.startsWith("#")) {
+      newHash = "#" + newHash;
+    }
+    window.location.hash = newHash;
+
+    // Show metadata for section if BID provided
+    if (targetBid) {
+      showMetadataPanel(targetBid);
+    }
   } else {
     console.warn(`[Noet] Section not found: ${sectionId}`);
   }
@@ -558,14 +630,26 @@ async function handleHashChange() {
     path = wasmModule.BeliefBaseWasm.normalizePath(path);
   }
 
-  // If path doesn't contain .html, treat as section anchor in current doc
-  if (!path.includes(".html")) {
-    navigateToSection("#" + path);
+  // Normalize path extension (.md -> .html, etc.) for document check
+  let normalizedPath = path;
+  if (
+    wasmModule &&
+    wasmModule.BeliefBaseWasm &&
+    wasmModule.BeliefBaseWasm.normalize_path_extension
+  ) {
+    normalizedPath = wasmModule.BeliefBaseWasm.normalize_path_extension(path);
+  }
+
+  // If normalized path doesn't contain .html, treat as section anchor in current doc
+  if (!normalizedPath.includes(".html")) {
+    navigateToSection("#" + path, pendingMetadataBid);
+    pendingMetadataBid = null;
     return;
   }
 
   // Document path: Fetch and display
-  await loadDocument(path, sectionAnchor);
+  await loadDocument(path, sectionAnchor, pendingMetadataBid);
+  pendingMetadataBid = null;
 }
 
 /**
@@ -580,15 +664,29 @@ async function loadDefaultDocument() {
  * @param {string} path - Document path (e.g., "/file1.html" or "file1.html")
  * @param {string|null} sectionAnchor - Optional section anchor to scroll to after load
  */
-async function loadDocument(path, sectionAnchor = null) {
+async function loadDocument(path, sectionAnchor = null, targetBid = null) {
   if (!contentElement) {
     console.error("[Noet] Content element not found");
     return;
   }
 
   try {
+    // Normalize path extension (.md -> .html, etc.)
+    let normalizedPath = path;
+    if (
+      wasmModule &&
+      wasmModule.BeliefBaseWasm &&
+      wasmModule.BeliefBaseWasm.normalize_path_extension
+    ) {
+      normalizedPath = wasmModule.BeliefBaseWasm.normalize_path_extension(path);
+      console.log(`[Noet] Normalized path: ${path} -> ${normalizedPath}`);
+    } else {
+      // Fallback: simple .md to .html conversion
+      normalizedPath = path.replace(/\.md(#|$)/, ".html$1");
+    }
+
     // Ensure path starts with /
-    const normalizedPath = path.startsWith("/") ? path : "/" + path;
+    normalizedPath = normalizedPath.startsWith("/") ? normalizedPath : "/" + normalizedPath;
 
     // Fetch from /pages/ directory
     const fetchPath = `/pages${normalizedPath}`;
@@ -646,10 +744,15 @@ async function loadDocument(path, sectionAnchor = null) {
     // Scroll to section if anchor provided, otherwise scroll to top
     if (sectionAnchor) {
       setTimeout(() => {
-        navigateToSection(sectionAnchor);
+        navigateToSection(sectionAnchor, targetBid);
       }, 100); // Brief delay to ensure content is rendered
     } else {
       contentElement.scrollTo({ top: 0, behavior: "smooth" });
+      // Show metadata for document if BID provided, or try to look it up
+      const bidToShow = targetBid || getBidFromPath(path);
+      if (bidToShow) {
+        showMetadataPanel(bidToShow);
+      }
     }
   } catch (error) {
     console.error(`[Noet] Failed to load document: ${path}`, error);
@@ -669,6 +772,49 @@ async function loadDocument(path, sectionAnchor = null) {
         </div>
       </article>
     `;
+  }
+}
+
+/**
+ * Lookup BID from path using beliefbase paths
+ * @param {string} path - Document path (e.g., "net1_dir1/hsml.html" or "net1_dir1/hsml.html#section")
+ * @returns {string|null} BID if found, null otherwise
+ */
+function getBidFromPath(path) {
+  if (!beliefbase || !entryPoint) {
+    return null;
+  }
+
+  try {
+    // Get the paths map for the entry point network
+    const paths = beliefbase.get_paths();
+    const pathsMap = paths[entryPoint.bid];
+
+    if (!pathsMap) {
+      console.warn("[Noet] No paths found for entry point:", entryPoint.bid);
+      return null;
+    }
+
+    // Strip any section anchors and leading slash from the path
+    // PathMap keys don't include leading slashes
+    let cleanPath = path.split("#")[0];
+    if (cleanPath.startsWith("/")) {
+      cleanPath = cleanPath.substring(1);
+    }
+
+    // Try to find the path in the map
+    const bid = pathsMap[cleanPath];
+
+    if (bid) {
+      console.log(`[Noet] Found BID for path ${cleanPath}:`, bid);
+      return bid;
+    } else {
+      console.log(`[Noet] No BID found for path: ${cleanPath}`);
+      return null;
+    }
+  } catch (error) {
+    console.error("[Noet] Error looking up BID from path:", error);
+    return null;
   }
 }
 
@@ -1109,8 +1255,10 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
 
   // Link (or span for networks with no path)
   if (node.path && node.path.length > 0) {
+    // Ensure absolute path for hash routing
+    const absolutePath = node.path.startsWith("/") ? node.path : `/${node.path}`;
     html += `
-      <a href="#${escapeHtml(node.path)}"
+      <a href="${escapeHtml(absolutePath)}"
          class="noet-nav-tree__link${isActive ? " active" : ""}"
          data-bid="${escapeHtml(bid)}">
         ${escapeHtml(node.title)}
@@ -1387,23 +1535,6 @@ function renderNodeContext(context) {
     html += "</div>";
   }
 
-  // Related Nodes
-  if (related_nodes && Object.keys(related_nodes).length > 0) {
-    html += '<div class="noet-metadata-section">';
-    html += "<h3>Related Nodes</h3>";
-    html += `<p class="noet-metadata-count">${Object.keys(related_nodes).length} related node(s)</p>`;
-    html += '<ul class="noet-metadata-links">';
-
-    for (const [bid, relNode] of Object.entries(related_nodes)) {
-      html += `<li><a href="#" data-bid="${escapeHtml(bid)}" class="noet-node-link">`;
-      html += escapeHtml(relNode.node.title);
-      html += `</a> <code class="noet-bid-small">${formatBid(bid)}</code></li>`;
-    }
-
-    html += "</ul>";
-    html += "</div>";
-  }
-
   // Graph Relations (organized by WeightKind)
   if (graph && graph.size > 0) {
     html += '<div class="noet-metadata-section">';
@@ -1420,13 +1551,15 @@ function renderNodeContext(context) {
           html += '<ul class="noet-relation-list">';
 
           for (const sourceBid of sources) {
-            const sourceNode = related_nodes[sourceBid];
+            const sourceNode = related_nodes.get(sourceBid);
             if (sourceNode) {
               const sourceTitle = escapeHtml(sourceNode.node.title || sourceBid);
               const sourcePath = sourceNode.root_path || null;
 
               if (sourcePath) {
-                html += `<li><a href="#" class="noet-metadata-link" data-bid="${sourceBid}">${sourceTitle}</a></li>`;
+                // Ensure absolute path for hash routing
+                const absolutePath = sourcePath.startsWith("/") ? sourcePath : `/${sourcePath}`;
+                html += `<li><a href="${absolutePath}" class="noet-metadata-link" data-bid="${sourceBid}">${sourceTitle}</a></li>`;
               } else {
                 html += `<li><span title="BID: ${sourceBid}">${sourceTitle}</span></li>`;
               }
@@ -1446,13 +1579,15 @@ function renderNodeContext(context) {
           html += '<ul class="noet-relation-list">';
 
           for (const sinkBid of sinks) {
-            const sinkNode = related_nodes[sinkBid];
+            const sinkNode = related_nodes.get(sinkBid);
             if (sinkNode) {
               const sinkTitle = escapeHtml(sinkNode.node.title || sinkBid);
               const sinkPath = sinkNode.root_path || null;
 
               if (sinkPath) {
-                html += `<li><a href="#" class="noet-metadata-link" data-bid="${sinkBid}">${sinkTitle}</a></li>`;
+                // Ensure absolute path for hash routing
+                const absolutePath = sinkPath.startsWith("/") ? sinkPath : `/${sinkPath}`;
+                html += `<li><a href="${absolutePath}" class="noet-metadata-link" data-bid="${sinkBid}">${sinkTitle}</a></li>`;
               } else {
                 html += `<li><span title="BID: ${sinkBid}">${sinkTitle}</span></li>`;
               }
@@ -1574,16 +1709,17 @@ function attachMetadataLinkHandlers() {
     return;
   }
 
-  const nodeLinks = metadataContent.querySelectorAll(".noet-node-link");
-  nodeLinks.forEach((link) => {
+  // Handle both .noet-node-link and .noet-metadata-link classes
+  const metadataLinks = metadataContent.querySelectorAll(".noet-node-link, .noet-metadata-link");
+  metadataLinks.forEach((link) => {
     link.addEventListener("click", (e) => {
       e.preventDefault();
+      // Use navigateToLink for consistent path handling (like content links)
+      const href = link.getAttribute("href");
       const targetBid = link.getAttribute("data-bid");
-
-      if (targetBid) {
-        // TODO: Implement two-click navigation (Phase 1.2)
-        // For now, just show metadata for clicked node
-        showMetadataPanel(targetBid);
+      if (href) {
+        console.log("[Noet] Navigating to related node:", href);
+        navigateToLink(href, link, targetBid);
       }
     });
   });

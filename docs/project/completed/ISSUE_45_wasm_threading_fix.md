@@ -1,9 +1,10 @@
 # WASM Threading Fix: Implement wasm-bindgen-rayon
 
-**Status**: ✅ COMPLETE  
+**Status**: ✅ COMPLETE AND VERIFIED  
 **Priority**: HIGH - Blocks RelatedNode functionality in browser  
 **Created**: 2024-02-17  
-**Completed**: 2024-02-17
+**Completed**: 2024-02-17  
+**Verified**: 2024-02-17
 
 ## Problem Statement
 
@@ -313,6 +314,184 @@ Graph: { "Section": [[...], [...]], "Epistemic": [[...], [...]] }
 2. `2d44f1d` - wip: WASM threading fix - Option B partial implementation  
 3. `7a00937` - feat: Complete WASM threading fix - Option B (Rc/RefCell)
 
-**Can delete this scratchpad now** - implementation is complete and documented in commit messages.
+## Post-Implementation Issue: Map vs Object Serialization
+
+**Status**: ✅ RESOLVED (2024-02-17)
+
+### Problem
+
+Initial symptom after Option B implementation:
+```javascript
+[get_paths] Returning 5 networks total
+[Noet] Available path maps: Array []  // ← Empty!
+```
+
+PathMapMap was being populated correctly in Rust, but JavaScript received empty arrays.
+
+### Root Cause
+
+**BTreeMap/HashMap serialize to JavaScript Map objects, not plain objects** when using `serde_wasm_bindgen::to_value()`.
+
+This caused multiple issues:
+1. `Object.keys(map)` returns `[]` on Map objects
+2. `map[key]` bracket notation doesn't work on Maps (need `map.get(key)`)
+3. `Object.entries(map)` doesn't work on Maps (need `map.entries()`)
+
+### Key Insight: Bref vs BID Mismatch
+
+The paths issue had TWO problems:
+1. **Serialization**: BTreeMap → JavaScript Map (not plain object)
+2. **Key format**: PathMapMap uses Bref (12 char) as key internally, but JavaScript needed full BID (36 char) to look up entry point
+
+### Fixes Applied
+
+**1. `get_paths()` in wasm.rs**
+- Changed from `BTreeMap<String, Vec<...>>` with `serde_wasm_bindgen`
+- To `serde_json::Map` → `serde_json::Value::Object` → plain JavaScript object
+- Used `paths.nets()` (full BIDs) as keys instead of `paths.map()` keys (Brefs)
+
+**2. `viewer.js` - `related_nodes` access**
+- Line 1389: `Object.keys(related_nodes).length` → `related_nodes.size`
+- Line 1392: `Object.keys(related_nodes).length` → `related_nodes.size`
+- Line 1395: `Object.entries(related_nodes)` → `related_nodes.entries()`
+- Line 1423: `related_nodes[sourceBid]` → `related_nodes.get(sourceBid)`
+- Line 1449: `related_nodes[sinkBid]` → `related_nodes.get(sinkBid)`
+
+### Audit Results
+
+Checked all WASM→JS data transfers:
+
+**✅ Correctly using Map methods:**
+- `navTree.nodes` - uses `.get()`, `.size`, `.entries()`
+- `context.graph` - uses `.size`, `.entries()`
+
+**✅ Using plain objects (via serde_json):**
+- `get_paths()` - now returns plain object
+
+**✅ Arrays (no issue):**
+- `search()`, `get_backlinks()`, `get_forward_links()`, `get_networks()`, `get_documents()`
+
+**⚠️ Not yet used in viewer.js (potential future issue):**
+- `query()` returns `BeliefGraph` with `states: BTreeMap` - will serialize to Map
+
+### Prevention Strategy
+
+**Pattern to follow for new WASM functions:**
+
+```rust
+// ❌ BAD: BTreeMap serializes to JavaScript Map
+#[wasm_bindgen]
+pub fn get_data(&self) -> JsValue {
+    let data: BTreeMap<String, Value> = ...;
+    serde_wasm_bindgen::to_value(&data).unwrap()  // → JavaScript Map
+}
+
+// ✅ GOOD: Use serde_json for plain object
+#[wasm_bindgen]
+pub fn get_data(&self) -> JsValue {
+    use serde_json::json;
+    let mut data_map = serde_json::Map::new();
+    for (key, value) in btree_map.iter() {
+        data_map.insert(key.to_string(), json!(value));
+    }
+    let data_obj = serde_json::Value::Object(data_map);
+    serde_wasm_bindgen::to_value(&data_obj).unwrap()  // → Plain object
+}
+```
+
+**JavaScript side:**
+- If Rust returns BTreeMap/HashMap → expect JavaScript Map
+- Use `.get(key)`, `.size`, `.entries()`, `.has(key)` methods
+- Never use bracket notation `map[key]` or `Object.keys(map)`
+
+### Lesson Learned
+
+This is the **5th time** this issue has occurred. Adding to AGENTS.md:
+
+**Rule**: When serializing Rust collections to JavaScript:
+1. For BTreeMap/HashMap that JS will use as plain objects → use `serde_json::Map`
+2. For BTreeMap/HashMap that JS will use as Maps → document it clearly
+3. Always verify JavaScript access patterns match Rust serialization format
+
+## Final Documentation Added
+
+**Status**: ✅ COMPLETE (2024-02-17)
+
+Added comprehensive warnings to prevent future Map vs Object issues:
+
+### src/wasm.rs Header (Lines 35-101)
+- ⚠️ Critical warning section about BTreeMap/HashMap → JavaScript Map serialization
+- Three solution patterns with code examples:
+  - Option A: Return plain object (serde_json::Map) - Recommended
+  - Option B: Return JavaScript Map (document it clearly)
+  - Option C: Return array of tuples (simple alternative)
+- Checklist for new WASM functions
+- Status table of current functions
+
+### src/wasm.rs Struct Field Comments
+- `NavTree.nodes` - Marked as JavaScript Map with usage instructions
+- `NavTree.roots` - Marked as JavaScript Array
+- `NodeContext.related_nodes` - Marked as JavaScript Map
+- `NodeContext.graph` - Marked as JavaScript Map
+
+### src/wasm.rs Function JSDoc Updates
+- `get_context()` - Added ⚠️ warning and correct/incorrect usage examples
+- `get_paths()` - Marked as returning plain object (not Map)
+- `get_nav_tree()` - Added ⚠️ warning and correct/incorrect usage examples
+
+### assets/viewer.js Header (Lines 17-54)
+- ⚠️ Critical section on WASM Data Type Patterns
+- Wrong vs Correct usage examples
+- Current function return types reference table
+- Step-by-step checklist for adding new WASM calls
+- Cross-reference to src/wasm.rs
+
+### Debug Logging Cleanup
+- Removed temporary console.log statements from PathMapMap::new()
+- Removed temporary console.log statements from get_paths()
+- Production code now clean
+
+### Prevention Measures
+1. **Documentation at entry points** - Both Rust and JavaScript files warn about this
+2. **Inline comments** - Struct fields marked with JavaScript types
+3. **JSDoc examples** - Show correct AND incorrect patterns
+4. **Cross-references** - Each file points to the other
+5. **Checklists** - Step-by-step guides for adding new functions
+
+### Success Metrics
+- ✅ PathMap now accessible in JavaScript (53 paths for main network)
+- ✅ Related nodes now accessible (Map.get() pattern works)
+- ✅ Navigation tree nodes accessible (Map.get() pattern works)
+- ✅ All WASM functions documented with JavaScript types
+- ✅ Future developers have clear guidance
+
+**This was the 5th occurrence of this issue. With these docs in place, it should be the last.**
+
+## Final Verification (2024-02-17)
+
+**Console Output Confirms Success**:
+```
+[Noet] DEBUG paths instanceof Map: false  ✅
+[Noet] ✓ Entry point has path map with 53 paths  ✅
+[Noet] ✓ BeliefBase loaded: 60 nodes  ✅
+```
+
+**What Works Now**:
+- ✅ PathMapMap correctly populated (5 networks, 53 paths)
+- ✅ Paths accessible as plain JavaScript object (not Map)
+- ✅ Related nodes accessible via Map.get()
+- ✅ Navigation tree renders (55 nodes)
+- ✅ Metadata panel shows node context
+- ✅ Full BID keys work (not just Brefs)
+
+**Code Changes Applied**:
+1. Option B implementation (Rc/RefCell for WASM)
+2. js-sys::Object for plain object serialization
+3. Comprehensive documentation in wasm.rs and viewer.js
+4. Debug logging removed
+
+**Next Steps**: See `.scratchpad/viewer_cleanup_and_navigation.md`
+
+**This scratchpad can now be archived or deleted** - All fixes verified working in production.
 
 ---

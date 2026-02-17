@@ -15,6 +15,17 @@ categories = ["data-structures", "parsing", "database"]
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false  # Disabled: wasm-opt v108 fails with "Only 1 table definition allowed in MVP"
 
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev.features]
+default-features = false
+features = ["wasm"]
+
+[package.metadata.wasm-pack.profile.release.features]
+default-features = false
+features = ["wasm"]
+
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 
@@ -45,6 +56,7 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", features = ["console"], optional = true }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
@@ -83,7 +95,7 @@ trybuild = "1.0"
 default = ["bin"]
 bin = ["clap", "ctrlc", "tracing-subscriber"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
-wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "uuid/js", "futures"]
+wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures"]
 
 # WARNING: Do NOT use --all-features!
 # The 'wasm' and 'service' features are mutually exclusive:

@@ -1503,6 +1503,7 @@ dependencies = [
  "hex",
  "http",
  "include_dir",
+ "js-sys",
  "log",
  "notify",
  "notify-debouncer-full",

@@ -5,9 +5,9 @@
 //!
 //! # Module Organization
 //!
-//! - [`graph`]: Graph data structures (BidGraph, BidRefGraph, BeliefGraph)
-//! - [`context`]: Context types for navigating relationships (BeliefContext, ExtendedRelation)
-//! - [`base`]: Main BeliefBase implementation with state management
+//! - `graph`: Graph data structures (BidGraph, BidRefGraph, BeliefGraph)
+//! - `context`: Context types for navigating relationships (BeliefContext, ExtendedRelation)
+//! - `base`: Main BeliefBase implementation with state management
 //!
 //! # Public API
 //!

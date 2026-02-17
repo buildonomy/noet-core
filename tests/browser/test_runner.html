@@ -334,30 +334,31 @@
                 {
                     const paths = bb.get_paths();
                     assert(paths !== null && paths !== undefined, 'get_paths() returns data');
-                    assert(paths instanceof Map, 'get_paths() returns Map');
+                    assert(paths instanceof Object, 'get_paths() returns plain Object');
 
-                    const networkBids = Array.from(paths.keys());
+                    // get_paths() returns plain Object (not Map) - use Object.keys()
+                    const networkBids = Object.keys(paths);
                     assert(networkBids.length > 0, 'At least one network in paths');
                     log(`Found ${networkBids.length} networks`, 'info');
 
-                    // Check structure: network_bid → Vec<(path, bid, order_indices)>
+                    // Check structure: network_bid → Object mapping path → bid
                     for (const netBid of networkBids) {
-                        const pathData = paths.get(netBid);
-                        assert(Array.isArray(pathData), `Network ${netBid} has array of paths`);
-                        log(`  Network ${netBid}: ${pathData.length} paths`, 'info');
+                        const pathMap = paths[netBid];
+                        assert(typeof pathMap === 'object', `Network ${netBid} has path object`);
+                        const pathEntries = Object.entries(pathMap);
+                        log(`  Network ${netBid}: ${pathEntries.length} paths`, 'info');
 
                         // Check first path entry structure
-                        if (pathData.length > 0) {
-                            const [path, bid, order] = pathData[0];
+                        if (pathEntries.length > 0) {
+                            const [path, bid] = pathEntries[0];
                             assert(typeof path === 'string', 'Path is string');
                             assert(typeof bid === 'string', 'BID is string');
-                            assert(Array.isArray(order), 'Order indices is array');
-                            log(`    Example: "${path}" → ${bid} [${order.join(', ')}]`, 'info');
+                            log(`    Example: "${path}" → ${bid}`, 'info');
                         }
                     }
 
                     // Log statistics
-                    const totalPaths = Array.from(paths.values()).reduce((sum, pathArr) => sum + pathArr.length, 0);
+                    const totalPaths = Object.values(paths).reduce((sum, pathMap) => sum + Object.keys(pathMap).length, 0);
                     log(`Total paths across all networks: ${totalPaths}`, 'info');
                 }
 

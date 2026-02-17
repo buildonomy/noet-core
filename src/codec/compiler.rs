@@ -120,7 +120,7 @@ pub struct DocumentCompiler {
     html_script: Option<String>,
     /// Use CDN for Open Props (requires internet, smaller output)
     use_cdn: bool,
-    /// Base URL for sitemap and canonical URLs (e.g., https://username.github.io/repo)
+    /// Base URL for sitemap and canonical URLs (e.g., <https://username.github.io/repo>)
     base_url: Option<String>,
     builder: GraphBuilder,
     primary_queue: VecDeque<PathBuf>,
@@ -172,6 +172,7 @@ impl DocumentCompiler {
     }
 
     /// Create a new compiler with HTML output enabled
+    #[allow(clippy::too_many_arguments)]
     pub fn with_html_output(
         entry_point: impl AsRef<Path>,
         tx: Option<tokio::sync::mpsc::UnboundedSender<BeliefEvent>>,

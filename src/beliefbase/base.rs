@@ -7,7 +7,7 @@
 use crate::{
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{pathmap::pathmap_order, PathMap, PathMapMap},
+    paths::{pathmap::pathmap_order, PathMapMap},
     properties::{
         asset_namespace, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref,
         WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
