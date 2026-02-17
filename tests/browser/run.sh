@@ -90,7 +90,10 @@ echo -e "\n${GREEN}✓ All test assets present${NC}\n"
 
 # Step 4: Start HTTP server
 echo -e "${BLUE}[4/4] Starting HTTP server...${NC}"
-echo -e "${YELLOW}Server will run at: http://localhost:8000/tests/browser/test_runner.html${NC}"
+echo -e "${YELLOW}Available test pages:${NC}"
+echo -e "${YELLOW}  - http://localhost:8000/tests/browser/test_runner.html${NC}"
+echo -e "${YELLOW}  - http://localhost:8000/tests/browser/test-validation.html${NC}"
+echo -e "${YELLOW}  - http://localhost:8000/tests/browser/test-output/index.html${NC}"
 echo -e "${YELLOW}Press Ctrl+C to stop${NC}\n"
 
 # Check if python3 is available

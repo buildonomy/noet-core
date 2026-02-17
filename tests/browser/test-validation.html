@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Entry Point Validation Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h1 {
+            color: #4ec9b0;
+        }
+        .log {
+            background: #252526;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+            border-left: 3px solid #007acc;
+        }
+        .success {
+            border-left-color: #4ec9b0;
+        }
+        .error {
+            border-left-color: #f48771;
+        }
+        .warning {
+            border-left-color: #dcdcaa;
+        }
+        pre {
+            margin: 5px 0;
+            white-space: pre-wrap;
+        }
+        .timestamp {
+            color: #858585;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <h1>Entry Point Validation Test</h1>
+    <div id="output"></div>
+
+    <!-- Metadata will be loaded from test-output -->
+    <script id="noet-metadata" type="application/json"></script>
+
+    <script type="module">
+        const output = document.getElementById('output');
+
+        function log(message, type = 'info') {
+            const div = document.createElement('div');
+            div.className = `log ${type}`;
+            const time = new Date().toLocaleTimeString();
+            div.innerHTML = `<span class="timestamp">[${time}]</span> <pre>${message}</pre>`;
+            output.appendChild(div);
+            console.log(message);
+        }
+
+        async function runTest() {
+            try {
+                log('Starting validation test...', 'info');
+
+                // Load metadata from test output
+                log('Loading metadata from test-output/index.html...', 'info');
+                const metadataResponse = await fetch('./test-output/index.html');
+                const html = await metadataResponse.text();
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(html, 'text/html');
+                const metadataScript = doc.getElementById('noet-metadata');
+
+                if (!metadataScript) {
+                    throw new Error('No metadata script found in index.html');
+                }
+
+                const metadataJson = metadataScript.textContent;
+                document.getElementById('noet-metadata').textContent = metadataJson;
+
+                const entryPoint = JSON.parse(metadataJson);
+                log(`✓ Entry point loaded: ${JSON.stringify(entryPoint, null, 2)}`, 'success');
+
+                // Load WASM module
+                log('Loading WASM module...', 'info');
+                const wasmModule = await import('/pkg/noet_core.js');
+                await wasmModule.default();
+                log('✓ WASM module loaded', 'success');
+
+                // Load beliefbase.json
+                log('Loading beliefbase.json...', 'info');
+                const response = await fetch('./test-output/beliefbase.json');
+                const beliefbaseJson = await response.text();
+                const beliefbaseData = JSON.parse(beliefbaseJson);
+                log(`✓ BeliefBase JSON loaded: ${beliefbaseData.states ? Object.keys(beliefbaseData.states).length : 0} states`, 'success');
+
+                // Initialize BeliefBaseWasm
+                log('Initializing BeliefBaseWasm...', 'info');
+                const beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson, metadataJson);
+                log('✓ BeliefBaseWasm initialized', 'success');
+
+                // Validation 1: Check entry point exists in states
+                log('\n=== Validation 1: Entry point in states ===', 'info');
+                const entryPointNode = beliefbase.get_by_bid(entryPoint.bid);
+                if (entryPointNode) {
+                    log(`✓ Entry point node found: "${entryPointNode.title}" (${entryPoint.bid})`, 'success');
+                    log(`  Kind: ${entryPointNode.kind}`, 'info');
+                    log(`  Schema: ${entryPointNode.schema}`, 'info');
+                } else {
+                    log(`✗ Entry point BID not found in beliefbase.states: ${entryPoint.bid}`, 'error');
+                }
+
+                // Validation 2: Check path maps
+                log('\n=== Validation 2: Path maps ===', 'info');
+                const paths = beliefbase.get_paths();
+                const pathMapKeys = Object.keys(paths);
+                log(`Path maps available: ${pathMapKeys.length}`, 'info');
+
+                if (pathMapKeys.length > 0) {
+                    pathMapKeys.forEach(key => {
+                        const pathCount = paths[key].length;
+                        log(`  - ${key}: ${pathCount} paths`, 'info');
+                    });
+                }
+
+                if (paths[entryPoint.bid]) {
+                    log(`✓ Entry point has path map with ${paths[entryPoint.bid].length} paths`, 'success');
+                } else {
+                    log(`⚠ Entry point has no path map (may be expected for Network nodes)`, 'warning');
+                }
+
+                // Validation 3: Get documents
+                log('\n=== Validation 3: Documents ===', 'info');
+                const documents = beliefbase.get_documents();
+                log(`✓ Found ${documents.length} documents`, 'success');
+                if (documents.length > 0) {
+                    log(`  Sample: "${documents[0].title}" (${documents[0].bid})`, 'info');
+                }
+
+                // Validation 4: Get networks
+                log('\n=== Validation 4: Networks ===', 'info');
+                const networks = beliefbase.get_networks();
+                log(`✓ Found ${networks.length} networks`, 'success');
+                networks.forEach(net => {
+                    const isEntryPoint = net.bid === entryPoint.bid ? ' (ENTRY POINT)' : '';
+                    log(`  - "${net.title}" (${net.bid})${isEntryPoint}`, isEntryPoint ? 'success' : 'info');
+                });
+
+                // Validation 5: Test get_context with entry point
+                log('\n=== Validation 5: Context retrieval ===', 'info');
+                const entryCtx = beliefbase.get_context(entryPoint.bid);
+                if (entryCtx) {
+                    log(`✓ Entry point context retrieved`, 'success');
+                    log(`  Node: ${entryCtx.node.title}`, 'info');
+                    log(`  Root path: ${entryCtx.root_path}`, 'info');
+                    log(`  Related nodes: ${Object.keys(entryCtx.related_nodes).length}`, 'info');
+                    log(`  Graph weight kinds: ${Object.keys(entryCtx.graph).length}`, 'info');
+                } else {
+                    log(`✗ Failed to get context for entry point`, 'error');
+                }
+
+                // Validation 6: Test get_context with a document
+                if (documents.length > 0) {
+                    log('\n=== Validation 6: Document context ===', 'info');
+                    const doc = documents[0];
+                    log(`Testing document: "${doc.title}" (${doc.bid})`, 'info');
+
+                    const docCtx = beliefbase.get_context(doc.bid);
+                    if (docCtx) {
+                        log(`✓ Document context retrieved`, 'success');
+                        log(`  Root path: ${docCtx.root_path}`, 'info');
+                        log(`  Related nodes: ${Object.keys(docCtx.related_nodes).length}`, 'info');
+                        log(`  Graph weight kinds: ${Object.keys(docCtx.graph).join(', ')}`, 'info');
+
+                        // Show related nodes details
+                        if (Object.keys(docCtx.related_nodes).length > 0) {
+                            log('\n  Related nodes detail:', 'info');
+                            const relatedBids = Object.keys(docCtx.related_nodes).slice(0, 3);
+                            relatedBids.forEach(bid => {
+                                const relNode = docCtx.related_nodes[bid];
+                                log(`    - ${bid}`, 'info');
+                                log(`      Title: ${relNode.node.title}`, 'info');
+                                log(`      Root path: "${relNode.root_path}"`, 'info');
+                                log(`      Home net: ${relNode.home_net}`, 'info');
+                            });
+                        }
+                    } else {
+                        log(`✗ Failed to get context for document`, 'error');
+                    }
+                }
+
+                log('\n=== All validations complete ===', 'success');
+
+            } catch (error) {
+                log(`\n✗ Error: ${error.message}`, 'error');
+                console.error(error);
+            }
+        }
+
+        runTest();
+    </script>
+</body>
+</html>

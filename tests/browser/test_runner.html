@@ -308,8 +308,13 @@
                         const firstBid = Object.keys(ctx.related_nodes)[0];
                         const relatedNode = ctx.related_nodes[firstBid];
                         assert(relatedNode !== undefined, 'Can lookup related node by BID');
-                        assert(relatedNode.bid === firstBid, 'Related node has correct BID');
-                        log(`  Sample related node: ${relatedNode.title || relatedNode.bid}`, 'info');
+                        assert(relatedNode.node !== undefined, 'RelatedNode has node field');
+                        assert(relatedNode.node.bid === firstBid, 'RelatedNode.node has correct BID');
+                        assert(typeof relatedNode.root_path === 'string', 'RelatedNode has root_path string');
+                        assert(typeof relatedNode.home_net === 'string', 'RelatedNode has home_net string');
+                        log(`  Sample related node: ${relatedNode.node.title || relatedNode.node.bid}`, 'info');
+                        log(`    Path: ${relatedNode.root_path}`, 'info');
+                        log(`    Network: ${relatedNode.home_net}`, 'info');
                     }
 
                     assert(ctx.graph !== undefined, 'NodeContext has graph field');

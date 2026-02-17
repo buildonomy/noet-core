@@ -79,6 +79,9 @@ let wasmModule = null;
 /** BeliefBaseWasm instance */
 let beliefbase = null;
 
+/** Entry point metadata (Network node that roots this beliefbase) */
+let entryPoint = null;
+
 /** Navigation tree data (flat map structure from get_nav_tree()) */
 let navTree = null;
 
@@ -819,11 +822,48 @@ async function initializeWasm() {
     }
     const metadataJson = metadataScript.textContent;
 
+    // Parse and store entry point metadata
+    try {
+      entryPoint = JSON.parse(metadataJson);
+      console.log("[Noet] Entry point parsed:", entryPoint);
+
+      if (!entryPoint.bid) {
+        throw new Error("Entry point missing 'bid' field");
+      }
+    } catch (e) {
+      throw new Error(`Failed to parse entry point metadata: ${e.message}`);
+    }
+
     // Initialize BeliefBaseWasm (from_json is a constructor in WASM bindings)
     // Pass both beliefbase JSON and metadata JSON (for entry point Bid)
     beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson, metadataJson);
     console.log("[Noet] BeliefBaseWasm initialized");
-    console.log("[Noet] BeliefBase loaded successfully");
+
+    // Validate entry point exists in beliefbase
+    console.log("[Noet] Validating entry point...");
+
+    // Check 1: Entry point node exists in states
+    const entryPointNode = beliefbase.get_by_bid(entryPoint.bid);
+    if (!entryPointNode) {
+      console.error("[Noet] ❌ Entry point BID not found in beliefbase.states:", entryPoint.bid);
+      throw new Error(`Entry point node ${entryPoint.bid} not found in beliefbase`);
+    }
+    console.log("[Noet] ✓ Entry point node exists:", entryPointNode.title);
+
+    // Check 2: Entry point has a network path map
+    const paths = beliefbase.get_paths();
+    if (!paths[entryPoint.bid]) {
+      console.warn("[Noet] ⚠️ Entry point has no path map (expected for Network nodes)");
+      console.log("[Noet] Available path maps:", Object.keys(paths));
+    } else {
+      console.log("[Noet] ✓ Entry point has path map with", paths[entryPoint.bid].length, "paths");
+    }
+
+    // Check 3: Validate node count and relation count
+    const nodeCount = beliefbase.node_count();
+    console.log("[Noet] ✓ BeliefBase loaded:", nodeCount, "nodes");
+
+    console.log("[Noet] BeliefBase validation complete");
 
     // Get navigation tree (flat map structure)
     navTree = beliefbase.get_nav_tree();
@@ -1356,7 +1396,7 @@ function renderNodeContext(context) {
 
     for (const [bid, relNode] of Object.entries(related_nodes)) {
       html += `<li><a href="#" data-bid="${escapeHtml(bid)}" class="noet-node-link">`;
-      html += escapeHtml(relNode.title);
+      html += escapeHtml(relNode.node.title);
       html += `</a> <code class="noet-bid-small">${formatBid(bid)}</code></li>`;
     }
 
@@ -1380,10 +1420,10 @@ function renderNodeContext(context) {
           html += '<ul class="noet-relation-list">';
 
           for (const sourceBid of sources) {
-            const sourceNode = related_nodes.get(sourceBid);
+            const sourceNode = related_nodes[sourceBid];
             if (sourceNode) {
-              const sourceTitle = escapeHtml(sourceNode.title || sourceBid);
-              const sourcePath = sourceNode.path || null;
+              const sourceTitle = escapeHtml(sourceNode.node.title || sourceBid);
+              const sourcePath = sourceNode.root_path || null;
 
               if (sourcePath) {
                 html += `<li><a href="#" class="noet-metadata-link" data-bid="${sourceBid}">${sourceTitle}</a></li>`;
@@ -1406,10 +1446,10 @@ function renderNodeContext(context) {
           html += '<ul class="noet-relation-list">';
 
           for (const sinkBid of sinks) {
-            const sinkNode = related_nodes.get(sinkBid);
+            const sinkNode = related_nodes[sinkBid];
             if (sinkNode) {
-              const sinkTitle = escapeHtml(sinkNode.title || sinkBid);
-              const sinkPath = sinkNode.path || null;
+              const sinkTitle = escapeHtml(sinkNode.node.title || sinkBid);
+              const sinkPath = sinkNode.root_path || null;
 
               if (sinkPath) {
                 html += `<li><a href="#" class="noet-metadata-link" data-bid="${sinkBid}">${sinkTitle}</a></li>`;
