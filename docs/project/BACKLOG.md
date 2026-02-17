@@ -201,45 +201,6 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 
 **Related**: Used in `built_in_test()` to check for orphaned edges without cloning entire graph.
 
-## beliefbase.rs Module Splitting
-
-**Priority**: MEDIUM - Code maintainability improvement
-
-**Context**: `src/beliefbase.rs` is 3000+ lines and contains multiple distinct concerns. Should be split into separate module files for better organization.
-
-### Suggested Module Structure
-
-```
-src/beliefbase/
-├── mod.rs           - Public API, re-exports
-├── graph.rs         - BidGraph, BidRefGraph, BeliefGraph (lines 31-843)
-├── base.rs          - BeliefBase implementation (lines 868-2614)
-├── context.rs       - BeliefContext, ExtendedRelation (lines 281-385)
-└── tests.rs         - Test module (lines 2649-3003)
-```
-
-**Logical Groupings**:
-1. **Graph types** (`graph.rs`): BidGraph, BidRefGraph, BeliefGraph - pure data structures
-2. **Base implementation** (`base.rs`): BeliefBase with indices and synchronization
-3. **Context types** (`context.rs`): View types for navigating belief relationships
-6. **Tests** (`tests.rs`): Module tests
-
-**Benefits**:
-- Easier navigation and comprehension
-- Clearer separation of concerns
-- Faster compile times (parallel compilation of modules)
-- Reduced merge conflicts when multiple people work on beliefbase
-- Better test organization
-
-**Migration Path**:
-1. Create `src/beliefbase/` directory
-2. Move logical sections to separate files
-3. Use `pub(crate)` for internal APIs
-4. Update `mod.rs` with `pub use` re-exports to maintain API compatibility
-5. Verify all tests pass
-6. Update documentation references
-
-**Similar**: Other large modules to consider splitting: `codec/builder.rs` (1800+ lines), `paths.rs` (1100+ lines)
 
 ## Notes
 
