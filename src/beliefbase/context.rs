@@ -5,9 +5,21 @@
 //! - [`BeliefContext`]: Provides lazy access to sources and sinks for a node
 
 use crate::properties::{asset_namespace, href_namespace, BeliefNode, Bid, WeightSet};
+
+#[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{ArcRwLockReadGuard, RawRwLock};
 
+#[cfg(target_arch = "wasm32")]
+use std::cell::Ref;
+
 use super::{BeliefBase, BidGraph};
+
+// Conditional type alias for the relations guard
+#[cfg(not(target_arch = "wasm32"))]
+type RelationsGuard<'a> = ArcRwLockReadGuard<RawRwLock, BidGraph>;
+
+#[cfg(target_arch = "wasm32")]
+type RelationsGuard<'a> = Ref<'a, BidGraph>;
 
 // ExtendedRelation tracks relation information with respect to a node. 'Other' refers to the
 // external node. The self node is specified by the struture holding the ExtendedRelation (e.g. a
@@ -47,14 +59,20 @@ impl<'a> ExtendedRelation<'a> {
             }
         }
 
-        let Some((home_net, root_path)) = paths_guard
+        // Try to get path from root network
+        let (home_net, root_path) = paths_guard
             .get_map(&root_net.bref())
             .and_then(|pm| pm.path(&other_bid, &paths_guard))
             .map(|(bid, path, _order)| (bid, path))
-        else {
-            tracing::warn!("Could not find network {root_net} path to other node: {other}");
-            return None;
-        };
+            .unwrap_or_else(|| {
+                // No path found - use empty string as fallback
+                // This allows relations to nodes without paths (e.g., sections, internal nodes)
+                // The viewer can decide whether to render these as links or plain text
+                tracing::debug!(
+                    "No path found for node {other_bid} in network {root_net}, using empty path"
+                );
+                (root_net, String::new())
+            });
 
         Some(ExtendedRelation {
             home_net,
@@ -85,7 +103,7 @@ pub struct BeliefContext<'a> {
     pub root_net: Bid,
     pub home_net: Bid,
     set: &'a BeliefBase,
-    relations_guard: ArcRwLockReadGuard<RawRwLock, BidGraph>,
+    relations_guard: RelationsGuard<'a>,
 }
 
 impl<'a> BeliefContext<'a> {
@@ -96,7 +114,7 @@ impl<'a> BeliefContext<'a> {
         root_net: Bid,
         home_net: Bid,
         set: &'a BeliefBase,
-        relations_guard: ArcRwLockReadGuard<RawRwLock, BidGraph>,
+        relations_guard: RelationsGuard<'a>,
     ) -> Self {
         BeliefContext {
             node,

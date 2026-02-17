@@ -47,7 +47,7 @@ use crate::{
         asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefNode, Bid, Bref,
         WeightKind, WEIGHT_SORT_KEY,
     },
-    query::{BeliefSource, Expression, StatePred},
+    query::{Expression, StatePred},
 };
 
 #[cfg(feature = "wasm")]
@@ -100,6 +100,17 @@ pub struct NavNode {
 /// WASM-compatible node context (no lifetimes, fully owned)
 ///
 /// This is a serializable version of BeliefContext that can cross the FFI boundary.
+/// Owned version of ExtendedRelation for WASM serialization (no lifetimes)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RelatedNode {
+    /// The related node
+    pub node: BeliefNode,
+    /// Home network BID for this node
+    pub home_net: Bid,
+    /// Path relative to the home network root
+    pub root_path: String,
+}
+
 /// See `docs/design/interactive_viewer.md` § WASM Integration for specification.
 #[cfg(feature = "wasm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,8 +122,9 @@ pub struct NodeContext {
     /// Home network BID (which Network node owns this document)
     pub home_net: Bid,
     /// All nodes related to this one (other end of all edges, both sources and sinks)
-    /// Map from BID to BeliefNode for O(1) lookup when displaying graph relations
-    pub related_nodes: BTreeMap<Bid, BeliefNode>,
+    /// Map from BID to RelatedNode for O(1) lookup when displaying graph relations
+    /// Each RelatedNode includes the root_path needed for href generation
+    pub related_nodes: BTreeMap<Bid, RelatedNode>,
     /// Relations by weight kind: Map<WeightKind, (sources, sinks)>
     /// Sources: BIDs of nodes linking TO this one
     /// Sinks: BIDs of nodes this one links TO
@@ -320,7 +332,7 @@ impl BeliefBaseWasm {
 
     /// Query nodes using Expression syntax
     ///
-    /// This exposes the full BeliefSource query API to JavaScript.
+    /// This exposes the full query API to JavaScript.
     /// Returns a BeliefGraph with matching nodes and their relations.
     ///
     /// # JavaScript Example
@@ -348,13 +360,9 @@ impl BeliefBaseWasm {
 
         console::log_1(&format!("🔍 Query: {:?}", expr).into());
 
-        // Use BeliefSource trait to evaluate
+        // Evaluate expression directly (BeliefSource trait not available in WASM)
         let inner = self.inner.borrow();
-        let graph = inner.eval_unbalanced(&expr).await.map_err(|e| {
-            let msg = format!("❌ Query failed: {}", e);
-            console::error_1(&msg.clone().into());
-            JsValue::from_str(&msg)
-        })?;
+        let graph = inner.evaluate_expression(&expr);
 
         let result_count = graph.states.len();
         console::log_1(&format!("✅ Query returned {} nodes", result_count).into());
@@ -583,13 +591,7 @@ impl BeliefBaseWasm {
         let expr = Expression::StateIn(StatePred::Kind(kind_set));
         let inner = self.inner.borrow();
 
-        let graph = match futures::executor::block_on(inner.eval_unbalanced(&expr)) {
-            Ok(g) => g,
-            Err(e) => {
-                console::error_1(&format!("❌ Failed to query networks: {}", e).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
+        let graph = inner.evaluate_expression(&expr);
 
         let networks: Vec<&BeliefNode> = graph.states.values().collect();
         console::log_1(&format!("✅ Found {} networks", networks.len()).into());
@@ -613,13 +615,7 @@ impl BeliefBaseWasm {
         let expr = Expression::StateIn(StatePred::Kind(kind_set));
         let inner = self.inner.borrow();
 
-        let graph = match futures::executor::block_on(inner.eval_unbalanced(&expr)) {
-            Ok(g) => g,
-            Err(e) => {
-                console::error_1(&format!("❌ Failed to query documents: {}", e).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
+        let graph = inner.evaluate_expression(&expr);
 
         let documents: Vec<&BeliefNode> = graph.states.values().collect();
         console::log_1(&format!("✅ Found {} documents", documents.len()).into());
@@ -670,8 +666,13 @@ impl BeliefBaseWasm {
 
             // Process sources (nodes linking TO this one)
             for ext_rel in ctx.sources() {
-                // Collect all related nodes (the "other" end of the edge)
-                related_nodes.insert(ext_rel.other.bid, ext_rel.other.clone());
+                // Collect all related nodes with their path information
+                let related_node = RelatedNode {
+                    node: ext_rel.other.clone(),
+                    home_net: ext_rel.home_net,
+                    root_path: ext_rel.root_path.clone(),
+                };
+                related_nodes.insert(ext_rel.other.bid, related_node);
 
                 // Group by weight kind and collect with sort_key
                 for (kind, weight) in ext_rel.weight.weights.iter() {
@@ -686,8 +687,13 @@ impl BeliefBaseWasm {
 
             // Process sinks (nodes this one links TO)
             for ext_rel in ctx.sinks() {
-                // Collect all related nodes (the "other" end of the edge)
-                related_nodes.insert(ext_rel.other.bid, ext_rel.other.clone());
+                // Collect all related nodes with their path information
+                let related_node = RelatedNode {
+                    node: ext_rel.other.clone(),
+                    home_net: ext_rel.home_net,
+                    root_path: ext_rel.root_path.clone(),
+                };
+                related_nodes.insert(ext_rel.other.bid, related_node);
 
                 // Group by weight kind and collect with sort_key
                 for (kind, weight) in ext_rel.weight.weights.iter() {
