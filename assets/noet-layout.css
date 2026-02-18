@@ -907,6 +907,160 @@ body {
 }
 
 /* =========================================================================
+   Image Modal
+   ========================================================================= */
+
+.noet-image-wrapper {
+    cursor: pointer;
+    display: inline-block;
+    position: relative;
+    transition: opacity 0.2s var(--ease-2);
+}
+
+.noet-image-wrapper:hover {
+    opacity: 0.9;
+}
+
+.noet-image-wrapper[data-two-click="true"] {
+    outline: 2px dashed transparent;
+    outline-offset: 4px;
+    transition: outline 0.2s var(--ease-2);
+}
+
+.noet-image-wrapper[data-two-click="true"]:hover {
+    outline-color: var(--noet-border-secondary);
+}
+
+.noet-image-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.noet-image-modal__overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.8);
+    cursor: pointer;
+}
+
+.noet-image-modal__content {
+    position: relative;
+    z-index: 10000;
+    max-width: 90vw;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    padding: var(--size-4);
+    background: var(--noet-bg-primary);
+    border-radius: var(--radius-3);
+}
+
+.noet-image-modal__content img {
+    max-width: 100%;
+    max-height: calc(90vh - var(--size-8));
+    object-fit: contain;
+    border-radius: var(--radius-2);
+    box-shadow: var(--shadow-6);
+}
+
+.noet-image-modal__close {
+    position: absolute;
+    top: var(--size-1);
+    right: var(--size-1);
+    background: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    width: var(--size-6);
+    height: var(--size-6);
+    font-size: var(--font-size-3);
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--noet-text-primary);
+    transition: background-color 0.2s var(--ease-2);
+    z-index: 10001;
+}
+
+.noet-image-modal__close:hover {
+    background: var(--noet-bg-secondary);
+}
+
+/* =========================================================================
+   Header Anchors
+   ========================================================================= */
+
+.noet-header-anchor {
+    margin-left: var(--size-2);
+    font-size: 0.6em;
+    opacity: 0;
+    text-decoration: none;
+    color: var(--noet-text-tertiary);
+    transition: opacity 0.2s var(--ease-2);
+    vertical-align: middle;
+}
+
+h1:hover .noet-header-anchor,
+h2:hover .noet-header-anchor,
+h3:hover .noet-header-anchor,
+h4:hover .noet-header-anchor,
+h5:hover .noet-header-anchor,
+h6:hover .noet-header-anchor {
+    opacity: 1;
+}
+
+.noet-header-anchor:hover {
+    color: var(--noet-text-primary);
+}
+
+/* =========================================================================
+   Special Namespace Link Styles
+   ========================================================================= */
+
+.noet-external-ref {
+    color: var(--noet-text-secondary);
+    font-style: italic;
+}
+
+.noet-href-link {
+    color: var(--noet-link-color, var(--link));
+    text-decoration: none;
+    transition: color 0.2s var(--ease-2);
+}
+
+.noet-href-link:hover {
+    color: var(--noet-link-hover, var(--link-visited));
+    text-decoration: underline;
+}
+
+.noet-asset-metadata-link {
+    color: var(--noet-link-color, var(--link));
+    text-decoration: none;
+    cursor: pointer;
+    transition: color 0.2s var(--ease-2);
+}
+
+.noet-asset-metadata-link:hover {
+    color: var(--noet-link-hover, var(--link-visited));
+    text-decoration: underline;
+}
+
+.noet-asset-ref {
+    color: var(--noet-text-secondary);
+}
+
+/* =========================================================================
    Print Styles
    ========================================================================= */
 

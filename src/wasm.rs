@@ -119,6 +119,47 @@ use crate::{
     query::{Expression, StatePred},
 };
 
+/// Result containing both BID and bref for a node
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+pub struct BidBrefResult {
+    bid: Bid,
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl BidBrefResult {
+    /// Create a new BidBrefResult from a BID string
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// // Static method, not constructor
+    /// const result = BidBrefResult.from_bid_string("1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb");
+    /// if (result) {
+    ///     console.log(result.bid, result.bref);
+    /// }
+    /// ```
+    pub fn from_bid_string(bid_str: String) -> Option<BidBrefResult> {
+        match Bid::try_from(bid_str.as_str()) {
+            Ok(bid) => Some(BidBrefResult { bid }),
+            Err(_) => {
+                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid_str).into());
+                None
+            }
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn bid(&self) -> String {
+        self.bid.to_string()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn bref(&self) -> String {
+        self.bid.bref().to_string()
+    }
+}
+
 #[cfg(feature = "wasm")]
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +291,24 @@ pub struct BeliefBaseWasm {
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BeliefBaseWasm {
+    /// Get the entry point as a BidBrefResult
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const entryPoint = beliefbase.entry_point();
+    /// console.log(entryPoint.bid, entryPoint.bref);
+    /// ```
+    #[wasm_bindgen(js_name = entryPoint)]
+    pub fn entry_point(&self) -> BidBrefResult {
+        BidBrefResult {
+            bid: self.entry_point_bid,
+        }
+    }
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl BeliefBaseWasm {
     /// Normalize a URL path by resolving `..` and `.` segments.
     ///
     /// This uses the `path_normalize` function from `paths.rs` which is designed
@@ -348,18 +407,18 @@ impl BeliefBaseWasm {
         crate::paths::AnchorPath::new(path).filestem().to_string()
     }
 
-    /// Create a BeliefBase from JSON string (exported beliefbase.json) and metadata
+    /// Create a BeliefBase from JSON string (exported beliefbase.json) and entry point BID
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
     /// const response = await fetch('beliefbase.json');
     /// const json = await response.text();
-    /// const metadataScript = document.getElementById('noet-metadata');
-    /// const metadata = metadataScript.textContent;
-    /// const bb = new BeliefBaseWasm(json, metadata);
+    /// const entryBidScript = document.getElementById('noet-entry-bid');
+    /// const entryBidStr = JSON.parse(entryBidScript.textContent);
+    /// const bb = new BeliefBaseWasm(json, entryBidStr);
     /// ```
     #[wasm_bindgen(constructor)]
-    pub fn from_json(data: String, metadata: String) -> Result<BeliefBaseWasm, JsValue> {
+    pub fn from_json(data: String, entry_bid_str: String) -> Result<BeliefBaseWasm, JsValue> {
         // Parse JSON into BeliefGraph
         let graph: BeliefGraph = serde_json::from_str(&data).map_err(|e| {
             let msg = format!("❌ Failed to parse BeliefGraph JSON: {}", e);
@@ -378,22 +437,12 @@ impl BeliefBaseWasm {
             .into(),
         );
 
-        // Parse metadata to extract entry point Bid
-        let metadata_value: serde_json::Value = serde_json::from_str(&metadata).map_err(|e| {
-            let msg = format!("❌ Failed to parse metadata JSON: {}", e);
+        // Parse entry point BID string directly
+        let entry_point_bid = Bid::try_from(entry_bid_str.as_str()).map_err(|e| {
+            let msg = format!("❌ Failed to parse entry point BID: {}", e);
             console::error_1(&msg.clone().into());
             JsValue::from_str(&msg)
         })?;
-
-        let entry_point_bid = metadata_value
-            .get("bid")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Bid::try_from(s).ok())
-            .ok_or_else(|| {
-                let msg = "❌ Failed to extract entry point Bid from metadata";
-                console::error_1(&msg.into());
-                JsValue::from_str(msg)
-            })?;
 
         console::log_1(&format!("✅ Entry point Bid: {}", entry_point_bid).into());
 
@@ -523,88 +572,6 @@ impl BeliefBaseWasm {
         serde_wasm_bindgen::to_value(&results).unwrap_or(JsValue::NULL)
     }
 
-    /// Get nodes that link TO this node (backlinks)
-    ///
-    /// Returns array of nodes that reference the given BID.
-    ///
-    /// # JavaScript Example
-    /// ```javascript,ignore
-    /// const backlinks = bb.get_backlinks("01234567-89ab-cdef-0123-456789abcdef");
-    /// console.log(`${backlinks.length} nodes link here`);
-    /// ```
-    #[wasm_bindgen]
-    pub fn get_backlinks(&self, bid: String) -> JsValue {
-        let bid = match Bid::try_from(bid.as_str()) {
-            Ok(b) => b,
-            Err(_) => {
-                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
-
-        // Get context which includes sources (nodes that link to this one)
-        let mut inner = self.inner.borrow_mut();
-        let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
-            Some(ctx) => ctx,
-            None => {
-                console::warn_1(&format!("⚠️ Node not found for backlinks: {}", bid).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
-
-        // Collect source nodes (ExtendedRelation.other is already &BeliefNode)
-        let backlinks: Vec<&BeliefNode> = ctx
-            .sources()
-            .into_iter()
-            .map(|ext_rel| ext_rel.other)
-            .collect();
-
-        console::log_1(&format!("✅ Found {} backlinks", backlinks.len()).into());
-
-        serde_wasm_bindgen::to_value(&backlinks).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get nodes that this node links TO (forward links)
-    ///
-    /// Returns array of nodes referenced by the given BID.
-    ///
-    /// # JavaScript Example
-    /// ```javascript,ignore
-    /// const links = bb.get_forward_links("01234567-89ab-cdef-0123-456789abcdef");
-    /// console.log(`This node links to ${links.length} other nodes`);
-    /// ```
-    #[wasm_bindgen]
-    pub fn get_forward_links(&self, bid: String) -> JsValue {
-        let bid = match Bid::try_from(bid.as_str()) {
-            Ok(b) => b,
-            Err(_) => {
-                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
-
-        // Get context which includes sinks (nodes this one links to)
-        let mut inner = self.inner.borrow_mut();
-        let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
-            Some(ctx) => ctx,
-            None => {
-                console::warn_1(&format!("⚠️ Node not found for forward links: {}", bid).into());
-                return serde_wasm_bindgen::to_value(&Vec::<BeliefNode>::new()).unwrap();
-            }
-        };
-
-        // Collect sink nodes (ExtendedRelation.other is already &BeliefNode)
-        let forward_links: Vec<&BeliefNode> = ctx
-            .sinks()
-            .into_iter()
-            .map(|ext_rel| ext_rel.other)
-            .collect();
-
-        console::log_1(&format!("✅ Found {} forward links", forward_links.len()).into());
-
-        serde_wasm_bindgen::to_value(&forward_links).unwrap_or(JsValue::NULL)
-    }
-
     /// Get total number of nodes in the belief base
     ///
     /// # JavaScript Example
@@ -647,6 +614,83 @@ impl BeliefBaseWasm {
             None => {
                 console::warn_1(&format!("⚠️ Bref not found: {}", bref).into());
                 JsValue::NULL
+            }
+        }
+    }
+
+    /// Get bref from BID
+    ///
+    /// Converts a full BID (36 chars) to its compact bref (12 chars).
+    /// Useful for generating `bref://` links from BIDs.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const bid = "1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb";
+    /// const bref = beliefbase.get_bref_from_bid(bid);
+    /// console.log(`bref://${bref}`); // "bref://1f10cfd91cc3"
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_bref_from_bid(&self, bid: String) -> JsValue {
+        let bid = match Bid::try_from(bid.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid).into());
+                return JsValue::NULL;
+            }
+        };
+
+        // Use Bid.bref() method directly
+        let bref = bid.bref();
+        console::log_1(&format!("✅ Converted BID to bref: {}", bref).into());
+        JsValue::from_str(&bref.to_string())
+    }
+
+    /// Get BID and bref from node ID (e.g., section header id attribute)
+    ///
+    /// Looks up a node by its `id` field within a specific network.
+    /// Returns an object with both `bid` and `bref` to avoid double WASM calls.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// // Get BID and bref for a section with id="introduction"
+    /// const result = beliefbase.get_bid_from_id(entryPoint.bref, "introduction");
+    /// if (result) {
+    ///     console.log(`BID: ${result.bid}, bref: ${result.bref}`);
+    ///     const context = beliefbase.get_context(result.bid);
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_bid_from_id(&self, net_bref: String, id: String) -> Option<BidBrefResult> {
+        let bref = match Bref::try_from(net_bref.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                console::warn_1(&format!("⚠️ Invalid bref format: {}", net_bref).into());
+                return None;
+            }
+        };
+
+        let inner = self.inner.borrow();
+        let paths = inner.paths();
+
+        match paths.net_get_from_id(&bref, &id) {
+            Some((net_bid, node_bid)) => {
+                let node_bref = node_bid.bref();
+                console::log_1(
+                    &format!(
+                        "✅ Resolved id '{}' to BID: {} (bref: {}, net: {})",
+                        id, node_bid, node_bref, net_bid
+                    )
+                    .into(),
+                );
+
+                // Return struct with bid (bref computed on demand)
+                Some(BidBrefResult { bid: node_bid })
+            }
+            None => {
+                console::warn_1(
+                    &format!("⚠️ No node found with id '{}' in network {}", id, bref).into(),
+                );
+                None
             }
         }
     }
@@ -723,29 +767,10 @@ impl BeliefBaseWasm {
     /// // ❌ WRONG: Object.keys(ctx.related_nodes) returns []
     /// // ❌ WRONG: ctx.related_nodes[bid] returns undefined
     /// ```
-    #[wasm_bindgen]
-    pub fn get_context(&self, bid: String) -> JsValue {
-        let bid = match Bid::try_from(bid.as_str()) {
-            Ok(b) => b,
-            Err(_) => {
-                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid).into());
-                return JsValue::NULL;
-            }
-        };
+    fn extract_node_context(&self, ns: &Bid, bid: &Bid) -> Option<NodeContext> {
+        let mut inner = self.inner.borrow_mut();
 
-        // Collect all data while holding the borrow
-        let (node, root_path, home_net, related_nodes, graph) = {
-            let mut inner = self.inner.borrow_mut();
-            // get_context calls index_sync internally and needs mutable access
-            let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
-                Some(c) => c,
-                None => {
-                    console::warn_1(&format!("⚠️ Node not found in context: {}", bid).into());
-                    console::log_1(&format!("   Entry point: {}", self.entry_point_bid).into());
-                    return JsValue::NULL;
-                }
-            };
-
+        inner.get_context(ns, bid).map(|ctx| {
             // Collect all related nodes (other end of all edges)
             let mut related_nodes = BTreeMap::new();
             let mut graph: HashMap<WeightKind, (Vec<(Bid, u16)>, Vec<(Bid, u16)>)> = HashMap::new();
@@ -762,7 +787,7 @@ impl BeliefBaseWasm {
 
                 // Group by weight kind and collect with sort_key
                 for (kind, weight) in ext_rel.weight.weights.iter() {
-                    let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                    let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
                     graph
                         .entry(*kind)
                         .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -783,7 +808,7 @@ impl BeliefBaseWasm {
 
                 // Group by weight kind and collect with sort_key
                 for (kind, weight) in ext_rel.weight.weights.iter() {
-                    let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                    let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
                     graph
                         .entry(*kind)
                         .or_insert_with(|| (Vec::new(), Vec::new()))
@@ -808,21 +833,37 @@ impl BeliefBaseWasm {
                 })
                 .collect();
 
-            (
-                ctx.node.clone(),
-                ctx.root_path.clone(),
-                ctx.home_net,
+            NodeContext {
+                node: ctx.node.clone(),
+                root_path: ctx.root_path.clone(),
+                home_net: ctx.home_net,
                 related_nodes,
-                sorted_graph,
-            )
-        }; // Drop the borrow here
+                graph: sorted_graph,
+            }
+        })
+    }
 
-        let node_context = NodeContext {
-            node,
-            root_path,
-            home_net,
-            related_nodes,
-            graph,
+    #[wasm_bindgen]
+    pub fn get_context(&self, bid: String) -> JsValue {
+        let bid = match Bid::try_from(bid.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid).into());
+                return JsValue::NULL;
+            }
+        };
+
+        // Try multiple networks with helper function to extract data immediately
+        let Some(node_context) = self
+            .extract_node_context(&self.entry_point_bid, &bid)
+            .or_else(|| self.extract_node_context(&href_namespace(), &bid))
+            .or_else(|| self.extract_node_context(&asset_namespace(), &bid))
+        else {
+            // Not found in any namespace
+            console::warn_1(&format!("⚠️ Node not found in any context: {}", bid).into());
+            console::log_1(&format!("   Entry point: {}", self.entry_point_bid).into());
+            console::log_1(&format!("   Tried namespaces: href, asset, buildonomy").into());
+            return JsValue::NULL;
         };
 
         console::log_1(&format!("✅ Got context for node: {}", node_context.node.title).into());

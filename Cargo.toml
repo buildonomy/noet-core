@@ -93,7 +93,7 @@ tracing-subscriber = "0.3.20"
 trybuild = "1.0"
 
 [features]
-default = ["bin"]
+default = []
 bin = ["clap", "ctrlc", "tracing-subscriber"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures"]
@@ -104,10 +104,11 @@ wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", 
 # - 'service' includes sqlx, tokio runtime, file watching (requires native platform)
 #
 # Valid build commands:
-#   cargo build --features bin          # CLI with WASM for HTML generation
-#   cargo build --features "bin service" # CLI with daemon/watching features
+#   cargo build                         # Library only (no features)
 #   cargo build --features service      # Library with service features
-#   cargo build --no-default-features   # Library only
+#   cargo build --features bin          # CLI with WASM (requires pre-built WASM artifacts)
+#   cargo build --features "bin service" # CLI with daemon/watching features
+#   ./scripts/build-full.sh             # Proper two-phase build for full binary
 #   cargo test --features service       # Run tests
 #
 # Invalid:

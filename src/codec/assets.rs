@@ -270,7 +270,7 @@ pub fn get_stylesheet_urls(use_cdn: bool) -> StylesheetUrls {
 ///
 /// // Get simple template
 /// let template = assets::get_template(Layout::Simple);
-/// assert!(template.contains("<body>"));
+/// assert!(template.contains("<body "));
 /// ```
 pub fn get_template(layout: Layout) -> &'static str {
     layout.template()
@@ -368,7 +368,7 @@ mod tests {
         let template = get_template(Layout::Responsive);
         assert!(template.contains("{{CONTENT}}"));
         assert!(template.contains("{{TITLE}}"));
-        assert!(template.contains("{{METADATA}}"));
+        assert!(template.contains("{{BID}}"));
         assert!(template.contains("noet-container"));
         assert!(template.contains("noet-nav"));
         assert!(template.contains("noet-metadata"));
@@ -424,8 +424,8 @@ mod tests {
             "Missing TITLE placeholder in responsive"
         );
         assert!(
-            responsive.contains("{{METADATA}}"),
-            "Missing METADATA placeholder in responsive"
+            responsive.contains("{{BID}}"),
+            "Missing BID placeholder in responsive"
         );
     }
 }

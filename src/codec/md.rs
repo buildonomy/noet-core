@@ -25,7 +25,7 @@ use crate::{
     error::BuildonomyError,
     nodekey::{href_to_nodekey, NodeKey},
     paths::{as_anchor, to_anchor, AnchorPath},
-    properties::{asset_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
+    properties::{href_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
 pub use pulldown_cmark;
@@ -100,7 +100,7 @@ fn link_to_relation(
         // Shortcut link like `[foo]`
         // change to [net:title]
         // with NodeKey::?(foo)
-        LinkType::Shortcut => None,
+        LinkType::Shortcut => Some(href_to_nodekey(dest_url)),
         // Shortcut without destination in the document, but resolved by the broken_link_callback
         LinkType::ShortcutUnknown => Some(href_to_nodekey(id)),
     }
@@ -348,7 +348,7 @@ fn check_for_link_and_push(
                 ) {
                     parsed_key
                 } else {
-                    tracing::debug!("[check_for_link_and_push] Failed to parse key from dest_url, leaving link unchanged");
+                    tracing::debug!("[check_for_link_and_push] Failed to parse key from dest_url, leaving link unchanged. link data: {link_data:?}");
                     // Can't parse - leave link/image unchanged
                     link_data.link_type = match title.is_empty() || title == link_data.id {
                         true => LinkType::Shortcut,
@@ -406,13 +406,6 @@ fn check_for_link_and_push(
             );
             let keys = vec![regularized];
 
-            // DEBUG: Asset link tracing
-            let is_asset = if let NodeKey::Path { net, .. } = &keys[0] {
-                *net == asset_namespace().bref()
-            } else {
-                false
-            };
-
             // Check both sources (upstream) and sinks (downstream) for the link target Assets and
             // document links are sources (upstream), but its possible they're upstream as well
             let sources = ctx.sources();
@@ -426,6 +419,11 @@ fn check_for_link_and_push(
                         rel.other
                             .keys(Some(ctx.root_net), None, ctx.belief_set())
                             .iter()
+                            .chain(
+                                rel.other
+                                    .keys(Some(rel.home_net), None, ctx.belief_set())
+                                    .iter(),
+                            )
                             .any(|ctx_source_key| ctx_source_key == link_key)
                     })
                     .or_else(|| {
@@ -434,6 +432,11 @@ fn check_for_link_and_push(
                             rel.other
                                 .keys(Some(ctx.root_net), None, ctx.belief_set())
                                 .iter()
+                                .chain(
+                                    rel.other
+                                        .keys(Some(rel.home_net), None, ctx.belief_set())
+                                        .iter(),
+                                )
                                 .any(|ctx_sink_key| ctx_sink_key == link_key)
                         })
                     })
@@ -446,48 +449,31 @@ fn check_for_link_and_push(
                 maybe_keyed_relation.is_some()
             );
 
-            if is_asset {
-                if maybe_keyed_relation.is_some() {
-                    tracing::info!("[check_for_link_and_push] Asset link FOUND");
-                } else {
-                    tracing::info!("[check_for_link_and_push] Asset link NOT FOUND");
-                    tracing::info!(
-                        "[check_for_link_and_push] Available sources: {}, sinks: {}",
-                        sources.len(),
-                        sinks.len()
-                    );
-                    tracing::info!("[check_for_link_and_push] Looking for keys: {:?}", keys);
-                    if !sinks.is_empty() {
-                        tracing::info!(
-                            "[check_for_link_and_push] Sink keys: {:?}",
-                            sinks[0]
-                                .other
-                                .keys(Some(ctx.root_net), None, ctx.belief_set())
-                        );
-                    }
-                }
-            }
-
             if let Some(relation) = maybe_keyed_relation {
                 // Generate canonical format: [text](relative/path.md#anchor "bref://abc config")
 
                 tracing::debug!(
-                    "Found relation for link: title={}, id={:?}, home_path={}",
+                    "Found relation for link: title={}, id={:?}, root_path={}",
                     relation.other.title,
                     relation.other.id,
                     relation.root_path
                 );
 
-                // 1. Calculate relative path from source to target
-                // Strip any existing anchor from home_path to avoid double anchors
-                let ctx_ap = AnchorPath::from(&ctx.root_path);
+                let relative_path = if relation.home_net == href_namespace() {
+                    relation.root_path.clone()
+                } else {
+                    // 1. Calculate relative path from source to target
+                    // Strip any existing anchor from home_path to avoid double anchors
+                    let ctx_ap = AnchorPath::from(&ctx.root_path);
 
-                let mut relative_path = ctx_ap.path_to(&relation.root_path, true);
-                let relative_ap = AnchorPath::from(&relation.root_path);
+                    let mut relative_path = ctx_ap.path_to(&relation.root_path, true);
+                    let relative_ap = AnchorPath::from(&relation.root_path);
 
-                if let Some(id) = relation.other.id.as_deref() {
-                    relative_path = relative_ap.join(as_anchor(id));
-                }
+                    if let Some(id) = relation.other.id.as_deref() {
+                        relative_path = relative_ap.join(as_anchor(id));
+                    }
+                    relative_path
+                };
 
                 // 3. Build title attribute: "bref://abc123 {config} user words"
                 let bref_str = format!("bref://{}", relation.other.bid.bref());
@@ -571,11 +557,18 @@ fn check_for_link_and_push(
                     keys,
                     ctx.sources()
                         .iter()
-                        .flat_map(|extended_ref| extended_ref.other.keys(
-                            Some(ctx.home_net),
-                            None,
-                            ctx.belief_set()
-                        ))
+                        .flat_map(|extended_ref| {
+                            let mut keys =
+                                extended_ref
+                                    .other
+                                    .keys(Some(ctx.home_net), None, ctx.belief_set());
+                            keys.append(&mut extended_ref.other.keys(
+                                Some(extended_ref.home_net),
+                                None,
+                                ctx.belief_set(),
+                            ));
+                            keys
+                        })
                         .collect::<Vec<NodeKey>>()
                 );
 

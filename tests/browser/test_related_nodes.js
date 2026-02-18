@@ -94,11 +94,11 @@ async function runTests() {
     );
 
     assert(networkNode !== undefined, "Found Network node in beliefbase");
-    const metadata = JSON.stringify({ bid: networkNode.bid });
+    const entryBidString = networkNode.bid;
 
     // Initialize BeliefBase
     log("Initializing BeliefBase...", "info");
-    const bb = new wasmModule.BeliefBaseWasm(beliefbaseJson, metadata);
+    const bb = new wasmModule.BeliefBaseWasm(beliefbaseJson, entryBidString);
     assert(bb !== null, "BeliefBase initialized");
 
     // Get documents to test context

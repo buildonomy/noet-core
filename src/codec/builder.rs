@@ -25,7 +25,7 @@ use crate::{
     paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
         asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet,
-        BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_SORT_KEY,
+        BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, Query},
 };
@@ -380,6 +380,7 @@ impl GraphBuilder {
             self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
             tracing::debug!("Phase 2: Balance and process relations");
+            let mut generated_href_nodes = Vec::new();
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                 // Process upstream_relations (sink-owned, default)
                 for (index, (orig_source_key, kind, weight)) in proto.upstream.iter().enumerate() {
@@ -398,9 +399,19 @@ impl GraphBuilder {
                         .await?;
 
                     match result {
-                        GetOrCreateResult::Resolved(_, source) => {
+                        GetOrCreateResult::Resolved(node, source) => {
                             if source.is_from_cache() {
                                 inject_context = true;
+                            } else if matches!(source, NodeSource::Generated) {
+                                generated_href_nodes.push(node.bid);
+                                if let Some(const_namespace) = [asset_namespace(), href_namespace()]
+                                    .iter()
+                                    .find(|ns| node.bid.parent_bref() == ns.bref())
+                                {
+                                    if !generated_href_nodes.contains(const_namespace) {
+                                        generated_href_nodes.push(*const_namespace);
+                                    }
+                                }
                             }
                         }
                         GetOrCreateResult::Unresolved(unresolved) => {
@@ -427,9 +438,19 @@ impl GraphBuilder {
                         .await?;
 
                     match result {
-                        GetOrCreateResult::Resolved(_node, source) => {
+                        GetOrCreateResult::Resolved(node, source) => {
                             if source == NodeSource::GlobalCache {
                                 inject_context = true;
+                            } else if matches!(source, NodeSource::Generated) {
+                                generated_href_nodes.push(node.bid);
+                                if let Some(const_namespace) = [asset_namespace(), href_namespace()]
+                                    .iter()
+                                    .find(|ns| node.bid.parent_bref() == ns.bref())
+                                {
+                                    if !generated_href_nodes.contains(const_namespace) {
+                                        generated_href_nodes.push(*const_namespace);
+                                    }
+                                }
                             }
                         }
                         GetOrCreateResult::Unresolved(unresolved) => {
@@ -438,6 +459,9 @@ impl GraphBuilder {
                         }
                     }
                 }
+            }
+            if !generated_href_nodes.is_empty() {
+                parsed_bids.append(&mut generated_href_nodes);
             }
 
             // Perform this after going through all the proto relations so we don't destroy our
@@ -1256,11 +1280,13 @@ impl GraphBuilder {
                         href_node.toml(),
                         EventOrigin::Remote,
                     ));
+                    let mut href_weight = Weight::default();
+                    href_weight.set(WEIGHT_DOC_PATHS, vec![href.clone()])?;
                     update_queue.push(BeliefEvent::RelationChange(
                         href_node.bid,
                         href_namespace(),
                         WeightKind::Section,
-                        Some(weight.clone()),
+                        Some(href_weight),
                         EventOrigin::Remote,
                     ));
                     (href_node, NodeSource::Generated)

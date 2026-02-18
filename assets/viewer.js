@@ -117,9 +117,6 @@ let wasmModule = null;
 /** BeliefBaseWasm instance */
 let beliefbase = null;
 
-/** Entry point metadata (Network node that roots this beliefbase) */
-let entryPoint = null;
-
 /** Navigation tree data (flat map structure from get_nav_tree()) */
 let navTree = null;
 
@@ -386,18 +383,45 @@ function handleContentClick(e) {
     return; // Link is in nav/metadata/footer, ignore
   }
 
-  e.preventDefault();
-
   // Extract BID from title attribute (format: "bref://[bref]")
   const linkBid = extractBidFromLink(link);
   const href = link.getAttribute("href");
 
   if (!linkBid && !href) {
     console.warn("[Noet] Link has no BID or href, ignoring");
+    e.preventDefault();
     return;
   }
 
-  // Two-click logic
+  // Check if this is an href_namespace node (external link)
+  if (linkBid && beliefbase && wasmModule) {
+    const hrefNamespace = wasmModule.BeliefBaseWasm.href_namespace();
+    const context = beliefbase.get_context(linkBid);
+
+    if (context && context.home_net === hrefNamespace) {
+      // This is an external link - show metadata on first click, open in new tab on second
+      if (selectedNodeBid === linkBid) {
+        // Second click: Open in new tab
+        e.preventDefault();
+        window.open(href, "_blank", "noopener,noreferrer");
+        selectedNodeBid = null;
+        clearSelectedLinkHighlight();
+        return;
+      } else {
+        // First click: Show metadata
+        e.preventDefault();
+        showMetadataPanel(linkBid);
+        selectedNodeBid = linkBid;
+        highlightSelectedLink(link);
+        return;
+      }
+    }
+  }
+
+  // Not an href_namespace link - use normal two-click pattern
+  e.preventDefault();
+
+  // Two-click logic for internal links
   if (selectedNodeBid === linkBid) {
     // Second click: Navigate
     if (href) {
@@ -561,6 +585,9 @@ function navigateToSection(anchor, targetBid = null) {
   if (targetElement) {
     targetElement.scrollIntoView({ behavior: "smooth", block: "start" });
 
+    // Apply highlight to the navigated section
+    highlightElementById(sectionId);
+
     // Preserve current document path in hash when navigating to section
     const currentHash = window.location.hash.substring(1); // Remove leading #
     let newHash = anchor;
@@ -710,6 +737,16 @@ async function loadDocument(path, sectionAnchor = null, targetBid = null) {
       throw new Error("No content found in fetched document");
     }
 
+    // Extract BID from data-document-bid attribute on body element
+    let documentBid = null;
+    const bodyElement = doc.querySelector("body[data-document-bid]");
+    if (bodyElement) {
+      documentBid = bodyElement.getAttribute("data-document-bid");
+      console.log(`[Noet] Extracted document BID: ${documentBid}`);
+    } else {
+      console.warn("[Noet] No data-document-bid found in loaded document");
+    }
+
     // Extract and update document metadata
     const metadataScript = doc.querySelector('script[type="application/json"]#noet-metadata');
     if (metadataScript) {
@@ -736,6 +773,9 @@ async function loadDocument(path, sectionAnchor = null, targetBid = null) {
       contentElement.innerHTML = bodyContent;
     }
 
+    // Post-process the loaded content
+    processLoadedContent(contentInner || contentElement);
+
     console.log(`[Noet] Document loaded: ${path}`);
 
     // Update navigation tree highlighting
@@ -748,10 +788,12 @@ async function loadDocument(path, sectionAnchor = null, targetBid = null) {
       }, 100); // Brief delay to ensure content is rendered
     } else {
       contentElement.scrollTo({ top: 0, behavior: "smooth" });
-      // Show metadata for document if BID provided, or try to look it up
-      const bidToShow = targetBid || getBidFromPath(path);
+      // Show metadata for document if BID provided, or use extracted BID from document
+      const bidToShow = targetBid || documentBid || getBidFromPath(path);
       if (bidToShow) {
         showMetadataPanel(bidToShow);
+      } else {
+        console.warn("[Noet] No BID available to show metadata for document:", path);
       }
     }
   } catch (error) {
@@ -776,6 +818,168 @@ async function loadDocument(path, sectionAnchor = null, targetBid = null) {
 }
 
 /**
+ * Process loaded document content: wrap images in modals, add header anchors
+ * @param {HTMLElement} container - Container element with loaded content
+ */
+function processLoadedContent(container) {
+  if (!container) return;
+
+  // Find the article element within the container
+  const article = container.querySelector("article");
+  if (!article) return;
+
+  // 1. Wrap images in modal-capable divs
+  const images = article.querySelectorAll("img");
+  images.forEach((img) => {
+    // Skip if already wrapped
+    if (img.parentElement.classList.contains("noet-image-wrapper")) {
+      return;
+    }
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "noet-image-wrapper";
+
+    // Check if image has bref:// in title for two-click pattern
+    const imgTitle = img.getAttribute("title");
+    const hasBref = imgTitle && imgTitle.includes("bref://");
+
+    if (hasBref) {
+      wrapper.setAttribute("data-two-click", "true");
+      wrapper.setAttribute("data-image-title", imgTitle);
+    }
+
+    // Wrap the image
+    img.parentNode.insertBefore(wrapper, img);
+    wrapper.appendChild(img);
+
+    // Add click handler for modal
+    wrapper.addEventListener("click", (e) => {
+      const isTwoClick = wrapper.getAttribute("data-two-click") === "true";
+      const wrapperBid = extractBidFromImageTitle(wrapper.getAttribute("data-image-title"));
+
+      if (isTwoClick && wrapperBid) {
+        // Two-click pattern: first click shows metadata, second opens modal
+        if (selectedNodeBid === wrapperBid) {
+          // Second click: open modal
+          openImageModal(img);
+          selectedNodeBid = null;
+          clearSelectedLinkHighlight();
+        } else {
+          // First click: show metadata
+          showMetadataPanel(wrapperBid);
+          selectedNodeBid = wrapperBid;
+          highlightSelectedLink(wrapper);
+        }
+      } else {
+        // No bref, just open modal directly
+        openImageModal(img);
+      }
+    });
+  });
+
+  // 2. Add anchor links to headers
+  const headers = article.querySelectorAll("h1, h2, h3, h4, h5, h6");
+  headers.forEach((header) => {
+    const headerId = header.getAttribute("id");
+    if (!headerId) return;
+
+    // Skip if anchor link already exists
+    if (header.querySelector(".noet-header-anchor")) {
+      return;
+    }
+
+    // Get current document path from hash
+    const currentHash = window.location.hash.substring(1); // Remove leading #
+    let currentPath = currentHash;
+
+    // Strip existing anchor if present
+    const anchorIndex = currentPath.indexOf("#");
+    if (anchorIndex !== -1) {
+      currentPath = currentPath.substring(0, anchorIndex);
+    }
+
+    // Resolve section ID to BID and bref at document load time
+    let sectionBref = null;
+    if (beliefbase) {
+      const entryPoint = beliefbase.entryPoint();
+      const result = beliefbase.get_bid_from_id(entryPoint.bref, headerId);
+      if (result && result.bref) {
+        sectionBref = result.bref;
+      }
+    }
+
+    const anchor = document.createElement("a");
+    anchor.className = "noet-header-anchor";
+    // Use relative path without # prefix - template rewriting will convert to hash route
+    // e.g., "net1_dir1/doc.html#section" becomes "/#/net1_dir1/doc.html#section"
+    anchor.href = currentPath ? `${currentPath}#${headerId}` : `#${headerId}`;
+    anchor.textContent = "🔗";
+    anchor.setAttribute("aria-label", "Link to this section");
+
+    // Set bref:// in title for two-click pattern (only if resolved)
+    if (sectionBref) {
+      anchor.setAttribute("title", `bref://${sectionBref}`);
+    }
+
+    // Append to header
+    header.appendChild(anchor);
+  });
+}
+
+/**
+ * Extract BID from image title attribute
+ * @param {string|null} title - Image title attribute
+ * @returns {string|null} BID or null
+ */
+function extractBidFromImageTitle(title) {
+  if (!title) return null;
+
+  const match = title.match(/bref:\/\/(.+?)(?:\s|$)/);
+  if (!match) return null;
+
+  const bref = match[1];
+  if (!beliefbase) return null;
+
+  return beliefbase.get_bid_from_bref(bref);
+}
+
+/**
+ * Open image in modal view
+ * @param {HTMLImageElement} img - Image element to display
+ */
+function openImageModal(img) {
+  // Create modal overlay
+  const modal = document.createElement("div");
+  modal.className = "noet-image-modal";
+  modal.innerHTML = `
+    <div class="noet-image-modal__overlay"></div>
+    <div class="noet-image-modal__content">
+      <button class="noet-image-modal__close" aria-label="Close">&times;</button>
+      <img src="${img.src}" alt="${img.alt || ""}" />
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // Close handlers
+  const closeModal = () => {
+    modal.remove();
+  };
+
+  modal.querySelector(".noet-image-modal__close").addEventListener("click", closeModal);
+  modal.querySelector(".noet-image-modal__overlay").addEventListener("click", closeModal);
+
+  // Close on Escape key
+  const handleEscape = (e) => {
+    if (e.key === "Escape") {
+      closeModal();
+      document.removeEventListener("keydown", handleEscape);
+    }
+  };
+  document.addEventListener("keydown", handleEscape);
+}
+
+/**
  * Lookup BID from path using beliefbase paths
  * @param {string} path - Document path (e.g., "net1_dir1/hsml.html" or "net1_dir1/hsml.html#section")
  * @returns {string|null} BID if found, null otherwise
@@ -787,6 +991,7 @@ function getBidFromPath(path) {
 
   try {
     // Get the paths map for the entry point network
+    const entryPoint = beliefbase.entryPoint();
     const paths = beliefbase.get_paths();
     const pathsMap = paths[entryPoint.bid];
 
@@ -846,6 +1051,18 @@ function clearSelectedLinkHighlight() {
   const selected = document.querySelector(".noet-link-selected");
   if (selected) {
     selected.classList.remove("noet-link-selected");
+  }
+}
+
+/**
+ * Highlight an element by ID (for section navigation)
+ * @param {string} elementId - ID of element to highlight
+ */
+function highlightElementById(elementId) {
+  clearSelectedLinkHighlight();
+  const element = document.getElementById(elementId);
+  if (element) {
+    element.classList.add("noet-link-selected");
   }
 }
 
@@ -961,29 +1178,23 @@ async function initializeWasm() {
     const beliefbaseJson = await response.text();
     console.log("[Noet] BeliefBase JSON loaded successfully");
 
-    // Get metadata JSON from script tag
-    const metadataScript = document.getElementById("noet-metadata");
-    if (!metadataScript) {
-      throw new Error("Missing #noet-metadata script tag");
-    }
-    const metadataJson = metadataScript.textContent;
-
-    // Parse and store entry point metadata
-    try {
-      entryPoint = JSON.parse(metadataJson);
-      console.log("[Noet] Entry point parsed:", entryPoint);
-
-      if (!entryPoint.bid) {
-        throw new Error("Entry point missing 'bid' field");
-      }
-    } catch (e) {
-      throw new Error(`Failed to parse entry point metadata: ${e.message}`);
+    // Get entry point BID from script tag (SPA shell) or use first network from beliefbase
+    let entryBidString = null;
+    const entryBidScript = document.getElementById("noet-entry-bid");
+    if (entryBidScript) {
+      entryBidString = JSON.parse(entryBidScript.textContent);
+      console.log("[Noet] Entry point BID from script tag:", entryBidString);
+    } else {
+      throw new Error("No entry point BID found in script tag or beliefbase");
     }
 
-    // Initialize BeliefBaseWasm (from_json is a constructor in WASM bindings)
-    // Pass both beliefbase JSON and metadata JSON (for entry point Bid)
-    beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson, metadataJson);
+    // Initialize BeliefBaseWasm with beliefbase JSON and entry point BID string
+    beliefbase = new wasmModule.BeliefBaseWasm(beliefbaseJson, entryBidString);
     console.log("[Noet] BeliefBaseWasm initialized");
+
+    // Entry point is now accessible via beliefbase.entryPoint()
+    const entryPoint = beliefbase.entryPoint();
+    console.log("[Noet] Entry point BID:", entryPoint.bid, "bref:", entryPoint.bref);
 
     // Validate entry point exists in beliefbase
     console.log("[Noet] Validating entry point...");
@@ -1496,6 +1707,10 @@ function showMetadataPanel(nodeBid) {
 function renderNodeContext(context) {
   const { node, root_path, home_net, related_nodes, graph } = context;
 
+  // Get special namespace BIDs for comparison (static methods on BeliefBaseWasm)
+  const hrefNamespace = wasmModule ? wasmModule.BeliefBaseWasm.href_namespace() : null;
+  const assetNamespace = wasmModule ? wasmModule.BeliefBaseWasm.asset_namespace() : null;
+
   let html = '<div class="noet-metadata-section">';
 
   // Node Information
@@ -1555,9 +1770,25 @@ function renderNodeContext(context) {
             if (sourceNode) {
               const sourceTitle = escapeHtml(sourceNode.node.title || sourceBid);
               const sourcePath = sourceNode.root_path || null;
+              const sourceHomeNet = sourceNode.home_net;
 
-              if (sourcePath) {
-                // Ensure absolute path for hash routing
+              // Check if source is in special namespace
+              if (sourceHomeNet === hrefNamespace) {
+                // href_namespace: render as external link (don't prefix with /)
+                if (sourcePath) {
+                  html += `<li><a href="${sourcePath}" class="noet-href-link" data-bid="${sourceBid}" target="_blank" rel="noopener noreferrer">🔗 ${sourceTitle}</a></li>`;
+                } else {
+                  html += `<li><span class="noet-external-ref" title="External Reference: ${sourceBid}">🔗 ${sourceTitle}</span></li>`;
+                }
+              } else if (sourceHomeNet === assetNamespace) {
+                // asset_namespace: render as asset reference with metadata link
+                if (sourcePath) {
+                  html += `<li><a href="#" class="noet-asset-metadata-link" data-bid="${sourceBid}" data-asset-path="${sourcePath}">📎 ${sourceTitle}</a></li>`;
+                } else {
+                  html += `<li><span class="noet-asset-ref" title="Asset: ${sourceBid}">📎 ${sourceTitle}</span></li>`;
+                }
+              } else if (sourcePath) {
+                // Normal document reference
                 const absolutePath = sourcePath.startsWith("/") ? sourcePath : `/${sourcePath}`;
                 html += `<li><a href="${absolutePath}" class="noet-metadata-link" data-bid="${sourceBid}">${sourceTitle}</a></li>`;
               } else {
@@ -1583,9 +1814,25 @@ function renderNodeContext(context) {
             if (sinkNode) {
               const sinkTitle = escapeHtml(sinkNode.node.title || sinkBid);
               const sinkPath = sinkNode.root_path || null;
+              const sinkHomeNet = sinkNode.home_net;
 
-              if (sinkPath) {
-                // Ensure absolute path for hash routing
+              // Check if sink is in special namespace
+              if (sinkHomeNet === hrefNamespace) {
+                // href_namespace: render as external link (don't prefix with /)
+                if (sinkPath) {
+                  html += `<li><a href="${sinkPath}" class="noet-href-link" data-bid="${sinkBid}" target="_blank" rel="noopener noreferrer">🔗 ${sinkTitle}</a></li>`;
+                } else {
+                  html += `<li><span class="noet-external-ref" title="External Reference: ${sinkBid}">🔗 ${sinkTitle}</span></li>`;
+                }
+              } else if (sinkHomeNet === assetNamespace) {
+                // asset_namespace: render as asset reference with metadata link
+                if (sinkPath) {
+                  html += `<li><a href="#" class="noet-asset-metadata-link" data-bid="${sinkBid}" data-asset-path="${sinkPath}">📎 ${sinkTitle}</a></li>`;
+                } else {
+                  html += `<li><span class="noet-asset-ref" title="Asset: ${sinkBid}">📎 ${sinkTitle}</span></li>`;
+                }
+              } else if (sinkPath) {
+                // Normal document reference
                 const absolutePath = sinkPath.startsWith("/") ? sinkPath : `/${sinkPath}`;
                 html += `<li><a href="${absolutePath}" class="noet-metadata-link" data-bid="${sinkBid}">${sinkTitle}</a></li>`;
               } else {
@@ -1723,6 +1970,66 @@ function attachMetadataLinkHandlers() {
       }
     });
   });
+
+  // Handle asset metadata links (highlight image and show metadata)
+  const assetLinks = metadataContent.querySelectorAll(".noet-asset-metadata-link");
+  assetLinks.forEach((link) => {
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      const targetBid = link.getAttribute("data-bid");
+      const assetPath = link.getAttribute("data-asset-path");
+
+      if (targetBid && assetPath) {
+        // Find and highlight the image in content
+        highlightAssetInContent(assetPath);
+
+        // Update metadata panel to show asset's metadata
+        showMetadataPanel(targetBid);
+      }
+    });
+  });
+
+  // Handle href namespace links (external links that also show metadata)
+  const hrefLinks = metadataContent.querySelectorAll(".noet-href-link");
+  hrefLinks.forEach((link) => {
+    link.addEventListener("click", (e) => {
+      const targetBid = link.getAttribute("data-bid");
+
+      if (targetBid) {
+        // Show metadata for the href node
+        showMetadataPanel(targetBid);
+      }
+      // Don't prevent default - allow link to open in new tab
+    });
+  });
+}
+
+/**
+ * Highlight an asset (image) in the main content area
+ * @param {string} assetPath - Path to the asset
+ */
+function highlightAssetInContent(assetPath) {
+  if (!contentElement) return;
+
+  // Find image with matching src
+  const images = contentElement.querySelectorAll("img");
+  for (const img of images) {
+    if (img.src.includes(assetPath) || img.getAttribute("src") === assetPath) {
+      // Find the wrapper or use the image itself
+      const wrapper = img.closest(".noet-image-wrapper") || img;
+
+      // Clear previous highlights
+      clearSelectedLinkHighlight();
+
+      // Highlight the image wrapper
+      wrapper.classList.add("noet-link-selected");
+
+      // Scroll to the image
+      wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+
+      break;
+    }
+  }
 }
 
 // =============================================================================

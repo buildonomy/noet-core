@@ -179,13 +179,12 @@
                 const indexHtml = await indexResponse.text();
                 const parser = new DOMParser();
                 const indexDoc = parser.parseFromString(indexHtml, 'text/html');
-                const metadataScript = indexDoc.getElementById('noet-metadata');
-                assert(metadataScript, 'Metadata script tag found in index.html');
+                const entryBidScript = indexDoc.getElementById('noet-entry-bid');
+                assert(entryBidScript, 'Entry point BID script tag found in index.html');
 
-                const metadataJson = metadataScript.textContent;
-                const documentMetadata = JSON.parse(metadataJson);
-                assert(documentMetadata.bid, 'Entry point BID found in metadata');
-                log(`Entry point BID: ${documentMetadata.bid}`, 'info');
+                const entryBidString = JSON.parse(entryBidScript.textContent);
+                assert(entryBidString, 'Entry point BID found in script tag');
+                log(`Entry point BID: ${entryBidString}`, 'info');
 
                 log('Fetching beliefbase.json...', 'info');
                 const response = await fetch('./test-output/beliefbase.json');
@@ -196,7 +195,7 @@
 
                 // Create BeliefBase from JSON
                 log('Creating BeliefBaseWasm from JSON...', 'info');
-                const bb = new BeliefBaseWasm(json, metadataJson);
+                const bb = new BeliefBaseWasm(json, entryBidString);
                 log('✅ BeliefBaseWasm created successfully', 'pass');
 
                 // Test 1: Node count
@@ -237,35 +236,13 @@
                 assert(Array.isArray(searchResults), 'search() returns array');
                 log(`Search for "test" returned ${searchResults.length} results`, 'info');
 
-                // Test 6: Backlinks
-                createSection('Test 6: Backlinks');
-                if (documents.length > 0) {
-                    const doc = documents[0];
-                    const backlinks = bb.get_backlinks(doc.bid);
-                    assert(Array.isArray(backlinks), 'get_backlinks() returns array');
-                    log(`Document "${doc.title}" has ${backlinks.length} backlinks`, 'info');
-                }
-
-                // Test 7: Forward links
-                createSection('Test 7: Forward Links');
-                if (documents.length > 0) {
-                    const doc = documents[0];
-                    const forwardLinks = bb.get_forward_links(doc.bid);
-                    assert(Array.isArray(forwardLinks), 'get_forward_links() returns array');
-                    log(`Document "${doc.title}" has ${forwardLinks.length} forward links`, 'info');
-                }
-
-                // Test 8: Invalid BID handling
-                createSection('Test 8: Error Handling');
+                // Test 6: Invalid BID handling
+                createSection('Test 6: Error Handling');
                 const invalidNode = bb.get_by_bid('invalid-bid-format');
                 assertEqual(invalidNode, null, 'Invalid BID returns null');
 
-                const invalidBacklinks = bb.get_backlinks('invalid-bid');
-                assert(Array.isArray(invalidBacklinks), 'Invalid BID backlinks returns empty array');
-                assertEqual(invalidBacklinks.length, 0, 'Invalid BID backlinks array is empty');
-
-                // Test 9: Namespace functions
-                createSection('Test 9: System Namespaces');
+                // Test 7: Namespace functions
+                createSection('Test 7: System Namespaces');
                 const hrefNs = BeliefBaseWasm.href_namespace();
                 assert(typeof hrefNs === 'string', 'href_namespace() returns string');
                 assert(hrefNs.length > 0, 'href_namespace() returns non-empty string');
@@ -281,8 +258,8 @@
                 assert(apiNs.length > 0, 'buildonomy_namespace() returns non-empty string');
                 log(`API namespace: ${apiNs}`, 'info');
 
-                // Test 10: NodeContext
-                createSection('Test 10: NodeContext');
+                // Test 8: NodeContext
+                createSection('Test 8: NodeContext');
                 if (documents.length > 0) {
                     const doc = documents[0];
                     log(`Getting context for document: ${doc.title}`, 'info');
@@ -329,8 +306,8 @@
                     }
                 }
 
-                // Test 11: get_paths() - Navigation tree data
-                log('Test 11: get_paths() - Navigation tree data', 'info');
+                // Test 9: get_paths() - Navigation tree data
+                log('Test 9: get_paths() - Navigation tree data', 'info');
                 {
                     const paths = bb.get_paths();
                     assert(paths !== null && paths !== undefined, 'get_paths() returns data');
@@ -362,8 +339,8 @@
                     log(`Total paths across all networks: ${totalPaths}`, 'info');
                 }
 
-                // Test 12: get_nav_tree() - Flat map with parent/child BIDs
-                log('Test 12: get_nav_tree() - Flat map with parent/child BIDs', 'info');
+                // Test 10: get_nav_tree() - Flat map with parent/child BIDs
+                log('Test 10: get_nav_tree() - Flat map with parent/child BIDs', 'info');
                 {
                     const tree = bb.get_nav_tree();
                     console.log('DEBUG: tree =', tree);

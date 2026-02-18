@@ -454,13 +454,24 @@ impl DocumentCompiler {
         // 7a. Phase 1: Try immediate HTML generation
         if let Some(html_dir) = &self.html_output_dir {
             // Get title from first node (document node)
-            let title = codec
+            let (bid, title) = codec
                 .nodes()
                 .first()
-                .and_then(|proto| proto.document.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Untitled")
-                .to_string();
+                .map(|proto| {
+                    let title = proto
+                        .document
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Untitled")
+                        .to_string();
+                    let bid = proto
+                        .document
+                        .get("bid")
+                        .and_then(|b_val| b_val.as_str().and_then(|b| Bid::try_from(b).ok()))
+                        .unwrap_or(Bid::nil());
+                    (bid, title)
+                })
+                .unwrap_or((Bid::nil(), "No doc node found".to_string()));
 
             match codec.generate_html() {
                 Ok(fragments) => {
@@ -477,7 +488,7 @@ impl DocumentCompiler {
                         let rel_path = base_dir.join(&filename);
 
                         if let Err(e) = self
-                            .write_fragment(html_dir, &rel_path, html_body, &title)
+                            .write_fragment(html_dir, &rel_path, html_body, &title, &bid)
                             .await
                         {
                             parse_result
@@ -1556,11 +1567,8 @@ impl DocumentCompiler {
         use crate::codec::assets::{get_template, Layout};
         let template = get_template(Layout::Responsive);
 
-        // Serialize repo root node as JSON metadata
-        let metadata = serde_json::to_string(repo_node).map_err(|e| {
-            BuildonomyError::Codec(format!("Failed to serialize repo metadata: {}", e))
-        })?;
-
+        // Get BID string for entry point
+        let bid = repo_bid.to_string();
         let title = repo_node.display_title();
 
         // Get stylesheet URLs based on use_cdn parameter
@@ -1580,7 +1588,7 @@ impl DocumentCompiler {
                 r#"<div id="content-root"><p>Loading...</p></div>"#,
             )
             .replace("{{TITLE}}", &title)
-            .replace("{{METADATA}}", &metadata)
+            .replace("{{BID}}", &bid)
             .replace("{{SCRIPT}}", &script_tag)
             .replace("{{STYLESHEET_OPEN_PROPS}}", &stylesheet_urls.open_props)
             .replace("{{STYLESHEET_NORMALIZE}}", &stylesheet_urls.normalize)
@@ -1694,6 +1702,7 @@ impl DocumentCompiler {
         rel_path: &Path,
         html_body: String,
         title: &str,
+        bid: &Bid,
     ) -> Result<(), BuildonomyError> {
         let pages_dir = html_output_dir.join("pages");
         let output_path = pages_dir.join(rel_path);
@@ -1721,7 +1730,8 @@ impl DocumentCompiler {
             .replace("{{BODY}}", &html_body)
             .replace("{{CANONICAL}}", &canonical_url)
             .replace("{{SPA_ROUTE}}", &spa_route)
-            .replace("{{TITLE}}", title);
+            .replace("{{TITLE}}", title)
+            .replace("{{BID}}", &bid.to_string());
 
         // Inject optional script if configured
         let html = if let Some(script) = &self.html_script {
@@ -1848,8 +1858,8 @@ impl DocumentCompiler {
             // Join base directory with filename to get relative path
             let rel_path = base_dir.join(&filename);
 
-            // Write fragment using helper with title
-            self.write_fragment(html_output_dir, &rel_path, html_body, &title)
+            // Write fragment using helper with title and BID
+            self.write_fragment(html_output_dir, &rel_path, html_body, &title, &node.bid)
                 .await?;
         }
 

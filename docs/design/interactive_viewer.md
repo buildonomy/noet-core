@@ -219,6 +219,169 @@ Watch service has persistent database that processes events in its own loop, so 
 
 **Result**: `beliefbase.json` always contains complete graph (typically 30-50KB for medium networks, 57+ nodes in test fixtures).
 
+## BID Injection for Reliable Metadata Loading
+
+To enable reliable metadata loading on page load, document BIDs are injected directly into HTML templates during compilation, eliminating path/extension mismatch issues.
+
+### The Problem
+
+Path-based BID lookup was unreliable:
+- URL: `net1_dir1/spatial_web_standards.html`
+- PathMap key: `net1_dir1/spatial_web_standards.md`
+- Error: "No BID found for path" (extension mismatch)
+
+Extension normalization at runtime is fragile and fails for edge cases.
+
+### Solution: Compile-Time BID Injection
+
+**Template Modification** (`template-simple.html`):
+```html
+<body data-document-bid="{{BID}}">
+    <!-- content -->
+</body>
+```
+
+**Compiler Modification** (`compiler.rs`):
+```rust
+async fn write_fragment(
+    &self,
+    html_output_dir: &Path,
+    rel_path: &Path,
+    html_body: String,
+    title: &str,
+    bid: &Bid,  // ← New parameter
+) -> Result<(), BuildonomyError> {
+    // ... template loading ...
+    
+    let html = template
+        .replace("{{BODY}}", &html_body)
+        .replace("{{CANONICAL}}", &canonical_url)
+        .replace("{{SPA_ROUTE}}", &spa_route)
+        .replace("{{TITLE}}", title)
+        .replace("{{BID}}", &bid.to_string());  // ← Inject BID
+    
+    // ... write file ...
+}
+```
+
+**JavaScript Extraction** (`viewer.js`):
+```javascript
+async function loadDocument(path, sectionAnchor, targetBid) {
+    const response = await fetch(fetchPath);
+    const html = await response.text();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    
+    // Extract BID from data attribute
+    let documentBid = null;
+    const bodyElement = doc.querySelector("body[data-document-bid]");
+    if (bodyElement) {
+        documentBid = bodyElement.getAttribute("data-document-bid");
+        console.log(`[Noet] Extracted document BID: ${documentBid}`);
+    }
+    
+    // Use extracted BID for metadata (fallback chain)
+    const bidToShow = targetBid || documentBid || getBidFromPath(path);
+    if (bidToShow) {
+        showMetadataPanel(bidToShow);
+    }
+}
+```
+
+### BID Extraction During Compilation
+
+**Immediate HTML Generation (Phase 1)**:
+```rust
+// ProtoBeliefNode stores parsed TOML with "bid" field
+let bid = proto
+    .document
+    .get("bid")
+    .and_then(|b_val| b_val.as_str().map(|b| Bid::try_from(b).ok()).flatten())
+    .unwrap_or(Bid::nil());
+```
+
+**Deferred HTML Generation (Phase 2)**:
+```rust
+// BeliefBase has full node context with actual BID
+let node = bb.get(&nodekey)?;
+self.write_fragment(html_output_dir, &rel_path, html_body, &title, &node.bid)
+```
+
+### Benefits
+
+- **Extension-agnostic**: Works regardless of `.md`, `.html`, or other formats
+- **Single source of truth**: BID injected at compile time, not runtime lookup
+- **Reliable**: No path normalization or extension guessing needed
+- **Graceful degradation**: Falls back to path-based lookup if attribute missing
+
+## Multi-Network Context Queries
+
+The WASM `get_context()` method must handle nodes from different network namespaces, not just the entry point network.
+
+### The Problem
+
+Special namespace nodes (href_namespace, asset_namespace) have different home networks than the entry point:
+```
+Entry point: 1f10cfd9-19ab-6ef2-86d2-6ace77cb4a7d (user's network)
+Asset node:  1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb (asset_namespace)
+```
+
+Querying with entry point network fails: "⚠️ Node not found in context"
+
+### Solution: Multi-Network Fallback Strategy
+
+**WASM Implementation** (`wasm.rs`):
+```rust
+pub fn get_context(&self, bid: String) -> JsValue {
+    let bid = Bid::try_from(bid.as_str())?;
+    
+    let mut inner = self.inner.borrow_mut();
+    
+    // Try entry point first (fast path for regular content)
+    let ctx = match inner.get_context(&self.entry_point_bid, &bid) {
+        Some(c) => c,
+        None => {
+            // Fallback to special namespaces
+            let href_ns = href_namespace();
+            let asset_ns = asset_namespace();
+            let buildonomy_ns = buildonomy_namespace();
+            
+            inner
+                .get_context(&href_ns, &bid)
+                .or_else(|| inner.get_context(&asset_ns, &bid))
+                .or_else(|| inner.get_context(&buildonomy_ns, &bid))
+                .or_else(|| {
+                    console::warn_1(&format!(
+                        "⚠️ Node not found in any context: {}", bid
+                    ).into());
+                    None
+                })?
+        }
+    };
+    
+    // ... serialize context to JsValue ...
+}
+```
+
+### Why Multiple Networks Are Needed
+
+`BeliefBase::get_context(root_net: &Bid, bid: &Bid)` requires the correct root network:
+- Uses `root_net` to lookup path map
+- Path map contains nodes belonging to that network
+- Cross-network nodes (href/asset references) live in their own namespaces
+
+**Network Ownership**:
+- Regular content nodes → Entry point network
+- External references → `href_namespace()`
+- Images/assets → `asset_namespace()`
+- System nodes → `buildonomy_namespace()`
+
+### Performance Considerations
+
+- Entry point network checked first (most common case)
+- Only 3 additional lookups needed on cache miss
+- Each `get_context()` call has index synchronization overhead regardless
+- Fallback pattern adds negligible latency (~microseconds)
+
 ## Link Detection and Navigation
 
 ### Link BID Attribution
@@ -282,12 +445,14 @@ The two-click pattern provides contextual metadata access without interrupting r
 **Pattern Applies To**:
 - All `<a>` elements within `<article>` tag (main content area only)
 - Both internal links (documents, sections) and external links
+- **Images with bref:// in title attribute** (wrapped in clickable divs)
+- **Header anchor links** (automatically generated for all headers)
 
 **Pattern Does NOT Apply To**:
 - Navigation panel links (single-click navigation)
 - Metadata panel links (single-click navigation)
 - Header/footer links (single-click navigation)
-- Non-link elements: `<img src>`, `<script src>`, `<link href>` load normally
+- Images without bref:// in title (single-click opens modal)
 
 #### State Management
 
@@ -393,6 +558,120 @@ Two-click pattern reduces metadata panel spam while keeping information accessib
 - First click: Fast navigation (reading flow preserved)
 - Second click: Deep dive into node relationships (exploration mode)
 - Sticky panel: User intent to explore metadata maintained across links
+
+### Image Modal Integration
+
+Images in content are post-processed after document load to support modal viewing and two-click metadata preview.
+
+#### Image Wrapping
+
+All `<img>` elements are wrapped in `.noet-image-wrapper` divs:
+
+```javascript
+// In processLoadedContent()
+const images = article.querySelectorAll("img");
+images.forEach((img) => {
+    const wrapper = document.createElement("div");
+    wrapper.className = "noet-image-wrapper";
+    
+    // Check for bref:// in title attribute
+    const imgTitle = img.getAttribute("title");
+    if (imgTitle && imgTitle.includes("bref://")) {
+        wrapper.setAttribute("data-two-click", "true");
+        wrapper.setAttribute("data-image-title", imgTitle);
+    }
+    
+    img.parentNode.insertBefore(wrapper, img);
+    wrapper.appendChild(img);
+});
+```
+
+#### Two-Click Pattern for Images
+
+**Images with `bref://` in title**:
+1. First click: Show metadata panel (extract BID from title)
+2. Second click: Open full-screen modal
+
+**Images without `bref://`**:
+- Single click: Open full-screen modal directly
+
+#### Modal Behavior
+
+Full-screen image modal with:
+- Dark overlay (rgba(0,0,0,0.8))
+- Padded content container with border radius
+- Small close button (top-right, inside padding)
+- Close on: button click, overlay click, Escape key
+- Image constrained to 90vh with padding
+
+```css
+.noet-image-modal__content {
+    padding: var(--size-4);
+    background: var(--noet-bg-primary);
+    border-radius: var(--radius-3);
+}
+
+.noet-image-modal__close {
+    width: var(--size-6);
+    height: var(--size-6);
+    font-size: var(--font-size-3);
+}
+```
+
+### Header Anchor Links
+
+All headers (`h1-h6`) automatically receive anchor links for section navigation.
+
+#### Anchor Generation
+
+```javascript
+// In processLoadedContent()
+const headers = article.querySelectorAll("h1, h2, h3, h4, h5, h6");
+headers.forEach((header) => {
+    const headerId = header.getAttribute("id");
+    if (!headerId) return;
+    
+    const anchor = document.createElement("a");
+    anchor.className = "noet-header-anchor";
+    anchor.href = `#${headerId}`;
+    anchor.textContent = "🔗";
+    anchor.setAttribute("title", `bref://${headerId}`);
+    
+    header.appendChild(anchor);
+});
+```
+
+#### Visual Design
+
+- Font size: 60% of header text (subtle, not prominent)
+- Opacity: 0 by default, 1 on header hover
+- Position: Appended to end of header with margin-left
+- Vertical align: middle
+
+#### Two-Click Pattern
+
+Anchor links include `title="bref://[section-id]"`:
+1. First click: Show metadata for section node
+2. Second click: Navigate to section (scroll + highlight)
+
+### Section Navigation Highlighting
+
+When navigating to a section (via `navigateToSection()`), the target element receives visual highlight:
+
+```javascript
+function navigateToSection(anchor, targetBid) {
+    const sectionId = anchor.substring(1);
+    const targetElement = document.getElementById(sectionId);
+    
+    if (targetElement) {
+        targetElement.scrollIntoView({ behavior: "smooth", block: "start" });
+        highlightElementById(sectionId); // Apply .noet-link-selected class
+        // ... update hash and show metadata
+    }
+}
+```
+
+Uses same `.noet-link-selected` styling as two-click link highlights.
 
 ## WASM Integration
 
@@ -720,6 +999,72 @@ pub struct NodeContext {
 ```
 
 **Note**: All links in metadata drawer and nav panel bypass two-click pattern - single click navigates directly to target. Two-click pattern only applies to links in main content area (`<main class="noet-content">`).
+
+### Special Namespace Rendering
+
+Nodes in special namespaces require different rendering logic in the metadata panel.
+
+#### Namespace Detection
+
+Before rendering related nodes, check `home_net` against special namespace BIDs:
+
+```javascript
+const hrefNamespace = wasmModule.BeliefBaseWasm.href_namespace();
+const assetNamespace = wasmModule.BeliefBaseWasm.asset_namespace();
+
+// For each related node:
+if (relatedNode.home_net === hrefNamespace) {
+    // Render as external reference
+} else if (relatedNode.home_net === assetNamespace) {
+    // Render as asset with special handling
+} else {
+    // Render as normal document link
+}
+```
+
+#### href_namespace Nodes (External References)
+
+Rendered as clickable external links:
+- Icon: 🔗
+- Opens in new tab (`target="_blank" rel="noopener noreferrer"`)
+- **No slash prefix** (paths are full URLs, not internal routes)
+- On click: Shows metadata for the href node before opening
+
+```html
+<a href="https://example.com" class="noet-href-link" 
+   data-bid="..." target="_blank">🔗 Example Site</a>
+```
+
+#### asset_namespace Nodes (Images/Assets)
+
+Rendered as metadata-aware asset links:
+- Icon: 📎
+- Class: `.noet-asset-metadata-link`
+- On click from metadata panel:
+  1. Find matching image in content by src path
+  2. Highlight the image wrapper (`.noet-link-selected`)
+  3. Scroll to center the image
+  4. Update metadata panel to show asset's metadata
+
+```javascript
+// In attachMetadataLinkHandlers()
+assetLinks.forEach((link) => {
+    link.addEventListener("click", (e) => {
+        e.preventDefault();
+        const targetBid = link.getAttribute("data-bid");
+        const assetPath = link.getAttribute("data-asset-path");
+        
+        highlightAssetInContent(assetPath);
+        showMetadataPanel(targetBid);
+    });
+});
+```
+
+#### Normal Document Nodes
+
+Rendered as internal links with slash-prefixed paths:
+- Navigates via hash routing (`/#/path/to/doc.html`)
+- Single-click navigation from metadata panel
 
 ## Navigation Tree Generation
 
@@ -1154,6 +1499,61 @@ Brief overview:
 - [WASM Bindgen](https://rustwasm.github.io/docs/wasm-bindgen/) - Rust ↔ JS bridge
 
 ## Change Log
+
+### Version 0.3 (2025-02-04)
+- Added Image Modal Integration
+  - All images wrapped in `.noet-image-wrapper` divs during post-processing
+  - Two-click pattern for images with `bref://` in title attribute
+  - Full-screen modal with dark overlay, padded content, small close button
+  - Close on button, overlay, or Escape key
+  - Single-click modal for images without `bref://`
+- Added Header Anchor Links with Section ID Resolution
+  - Auto-generated anchor links (🔗) appended to all headers (`h1-h6`)
+  - Font size: 60% of header text, hidden by default, visible on hover
+  - Section IDs resolved to BIDs at document load time via PathMap lookup
+  - WASM method `get_bid_from_id(net_bref, id)` returns `BidBrefResult` with both bid and bref
+  - Anchor links set `title="bref://[bref]"` for two-click pattern support
+  - First click shows section metadata, second click navigates
+  - Section anchor hrefs use relative paths (template rewrites to hash routes)
+- Added Section Navigation Highlighting
+  - `navigateToSection()` applies `.noet-link-selected` class to target element
+  - Uses same visual highlighting as two-click link selection
+- Added Special Namespace Rendering
+  - Detect `home_net` against `href_namespace()` and `asset_namespace()`
+  - **href_namespace nodes**: Rendered as clickable external links (🔗)
+    - Opens in new tab via `window.open()` with `noopener,noreferrer`
+    - No slash prefix on paths (full URLs preserved)
+    - First click shows metadata, second click opens in new tab
+    - Detection in `handleContentClick()` prevents internal routing
+  - **asset_namespace nodes**: Rendered as metadata-aware asset links (📎)
+    - On click from metadata panel: highlights image in content + scrolls to center
+    - Updates metadata panel to show asset's metadata
+  - Normal document nodes continue with slash-prefixed internal routing
+- Added BID Injection for Reliable Metadata Loading
+  - Template modified: `<body data-document-bid="{{BID}}">`
+  - Compiler injects BID during HTML generation (both immediate and deferred phases)
+  - JavaScript extracts BID from `data-document-bid` attribute on page load
+  - Eliminates path/extension mismatch issues (`.html` vs `.md`)
+  - Fallback chain: `targetBid || documentBid || getBidFromPath(path)`
+- Added Multi-Network Context Queries
+  - WASM `get_context()` tries multiple network namespaces with fallback strategy
+  - Helper function `extract_node_context()` immediately consumes `BeliefContext` to avoid borrow conflicts
+  - First tries entry point network (fast path for regular content)
+  - Falls back to `href_namespace()`, `asset_namespace()`, `buildonomy_namespace()`
+  - Enables metadata display for special namespace nodes
+  - Returns null only after trying all known namespaces
+- Added BidBrefResult Struct
+  - WASM-exposed struct stores single `Bid`, computes both string representations on demand
+  - Getters: `bid()` returns full BID string, `bref()` returns compact bref
+  - Static method `from_bid_string()` parses BID strings with validation
+  - Used for section ID resolution and entry point representation
+- Refactored Entry Point Handling
+  - Templates store only BID string (not full BeliefNode JSON)
+  - `template-responsive.html`: `<script id="noet-entry-bid">"{{BID}}"</script>`
+  - BeliefBaseWasm stores entry_point_bid internally
+  - Access via `beliefbase.entryPoint()` getter (returns BidBrefResult)
+  - Removed separate JavaScript entryPoint variable
+  - Fallback: Finds first Network node if script tag missing (static pages)
 
 ### Version 0.2 (2025-02-04)
 - Expanded Two-Click Navigation Pattern section with full implementation details
