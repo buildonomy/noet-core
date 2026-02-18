@@ -7,11 +7,13 @@
 //! ## WASM Build Strategy
 //!
 //! For distribution (crates.io), WASM artifacts should be pre-built and included:
-//! 1. Run: `wasm-pack build --target web --out-dir pkg -- --features wasm --no-default-features`
+//! 1. Run: `./scripts/build-full.sh` (or manually build WASM as shown below)
 //! 2. Commit pkg/ directory
 //! 3. Publish to crates.io with pre-built artifacts
 //!
-//! For development, this script will build WASM if pkg/ is missing.
+//! For development, this script will build WASM if pkg/ is missing using:
+//!   cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+//!   wasm-bindgen target/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir pkg --target web
 //!
 //! ## Troubleshooting Build Hangs
 //!
@@ -68,24 +70,25 @@ fn main() {
         return;
     }
 
-    // Check if wasm-pack is installed
-    let wasm_pack_check = Command::new("wasm-pack").arg("--version").output();
+    // Check if wasm-bindgen is installed
+    let wasm_bindgen_check = Command::new("wasm-bindgen").arg("--version").output();
 
-    match wasm_pack_check {
+    match wasm_bindgen_check {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
-            println!("cargo:warning=Found wasm-pack: {}", version.trim());
+            println!("cargo:warning=Found wasm-bindgen: {}", version.trim());
         }
         _ => {
             eprintln!("\n=== ERROR ===");
-            eprintln!("wasm-pack is not installed or not in PATH");
-            eprintln!("\nTo install wasm-pack:");
-            eprintln!("  curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh");
-            eprintln!("\nOr visit: https://rustwasm.github.io/wasm-pack/installer/");
+            eprintln!("wasm-bindgen is not installed or not in PATH");
+            eprintln!("\nTo install wasm-bindgen-cli:");
+            eprintln!("  cargo install wasm-bindgen-cli");
             eprintln!("\nAlternatively, build without WASM support:");
             eprintln!("  cargo build --no-default-features");
+            eprintln!("\nOr use the build script that handles everything:");
+            eprintln!("  ./scripts/build-full.sh");
             eprintln!("=============\n");
-            panic!("wasm-pack is required to build noet-core with WASM support");
+            panic!("wasm-bindgen is required to build noet-core with WASM support");
         }
     }
 
@@ -108,40 +111,82 @@ fn main() {
 
     // Artifacts don't exist - need to build them
     println!("cargo:warning=WASM artifacts not found in pkg/");
-    println!("cargo:warning=Attempting to build with wasm-pack...");
-    println!("cargo:warning=");
-    println!("cargo:warning=NOTE: If you get feature conflicts, pre-build WASM:");
-    println!("cargo:warning=  wasm-pack build --target web --out-dir pkg -- --features wasm --no-default-features");
+    println!("cargo:warning=Building WASM module with cargo + wasm-bindgen...");
     println!("cargo:warning=");
 
-    // Run wasm-pack build
-    let status = Command::new("wasm-pack")
+    // Step 1: Build WASM module with cargo
+    println!("cargo:warning=Step 1: Building WASM with cargo...");
+    let cargo_status = Command::new("cargo")
         .current_dir(&manifest_dir)
         .arg("build")
         .arg("--target")
-        .arg("web")
-        .arg("--")
+        .arg("wasm32-unknown-unknown")
+        .arg("--no-default-features")
         .arg("--features")
         .arg("wasm")
-        .arg("--no-default-features")
         .status();
 
-    match status {
+    match cargo_status {
         Ok(status) if status.success() => {
-            println!("cargo:warning=✓ WASM build successful");
-            println!("cargo:warning=  Output: pkg/noet_core.js, pkg/noet_core_bg.wasm");
+            println!("cargo:warning=✓ WASM cargo build successful");
         }
         Ok(status) => {
             eprintln!("\n=== ERROR ===");
-            eprintln!("wasm-pack build failed with exit code: {:?}", status.code());
+            eprintln!(
+                "WASM cargo build failed with exit code: {:?}",
+                status.code()
+            );
+            eprintln!("\nTry running manually:");
+            eprintln!("  cargo build --target wasm32-unknown-unknown --no-default-features --features wasm");
             eprintln!("=============\n");
-            panic!("WASM build failed");
+            panic!("WASM cargo build failed");
         }
         Err(e) => {
             eprintln!("\n=== ERROR ===");
-            eprintln!("Failed to execute wasm-pack: {}", e);
+            eprintln!("Failed to execute cargo: {}", e);
             eprintln!("=============\n");
-            panic!("Failed to execute wasm-pack");
+            panic!("Failed to execute cargo");
+        }
+    }
+
+    // Step 2: Generate JavaScript bindings with wasm-bindgen
+    println!("cargo:warning=Step 2: Generating JavaScript bindings...");
+
+    // Create pkg directory if it doesn't exist
+    std::fs::create_dir_all(&pkg_dir).expect("Failed to create pkg/ directory");
+
+    let wasm_input = manifest_dir
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("debug")
+        .join("noet_core.wasm");
+
+    let bindgen_status = Command::new("wasm-bindgen")
+        .current_dir(&manifest_dir)
+        .arg(&wasm_input)
+        .arg("--out-dir")
+        .arg("pkg")
+        .arg("--target")
+        .arg("web")
+        .status();
+
+    match bindgen_status {
+        Ok(status) if status.success() => {
+            println!("cargo:warning=✓ wasm-bindgen successful");
+        }
+        Ok(status) => {
+            eprintln!("\n=== ERROR ===");
+            eprintln!("wasm-bindgen failed with exit code: {:?}", status.code());
+            eprintln!("\nTry running manually:");
+            eprintln!("  wasm-bindgen target/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir pkg --target web");
+            eprintln!("=============\n");
+            panic!("wasm-bindgen failed");
+        }
+        Err(e) => {
+            eprintln!("\n=== ERROR ===");
+            eprintln!("Failed to execute wasm-bindgen: {}", e);
+            eprintln!("=============\n");
+            panic!("Failed to execute wasm-bindgen");
         }
     }
 
