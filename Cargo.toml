@@ -85,6 +85,7 @@ walkdir = "2.5"
 
 [dev-dependencies]
 async-trait = "0.1.77"
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 serde_json = "1.0.117"
 tempfile = "3.19"
 test-log = { version = "0.2", features = ["trace"] }
@@ -118,3 +119,8 @@ tokio = { version = "1.40", features = ["fs", "time", "rt", "rt-multi-thread"] }
 [[bin]]
 name = "noet"
 required-features = ["bin"]
+
+[[bench]]
+name = "document_processing"
+harness = false
+required-features = ["service"]

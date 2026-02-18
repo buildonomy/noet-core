@@ -389,11 +389,19 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Run coverage with tarpaulin
-        uses: actions-rs/tarpaulin@v0.1
+      - name: Cache cargo-tarpaulin
+        uses: actions/cache@v4
+        id: cache-tarpaulin
         with:
-          version: "latest"
-          args: "--verbose --features service --workspace --timeout 300 --out xml"
+          path: ~/.cargo/bin/cargo-tarpaulin
+          key: tarpaulin-0.31.2-${{ runner.os }}
+
+      - name: Install cargo-tarpaulin
+        if: steps.cache-tarpaulin.outputs.cache-hit != 'true'
+        run: cargo install cargo-tarpaulin --version 0.31.2 --locked
+
+      - name: Run coverage with tarpaulin
+        run: cargo tarpaulin --verbose --features service --workspace --timeout 300 --out xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
@@ -444,18 +452,15 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          if [ -d "benches" ]; then
-            cargo bench --features service -- --output-format bencher | tee output.txt
-          else
-            echo "No benchmarks found, skipping"
-          fi
+          cargo bench --features service --no-fail-fast
 
       - name: Upload benchmark results
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: output.txt
+          path: |
+            target/criterion/
           retention-days: 30
 
   # Standalone crate test (Issue 7 requirement)

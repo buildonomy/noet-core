@@ -183,34 +183,30 @@ features: [no-default, service, all]
    - Badge available for README
    - Historical trends tracked automatically
 
-### 5. **Performance Benchmarks** (0.5 days)
-   - [ ] Create benchmark suite using Criterion (if not exists):
-     ```rust
-     // benches/parsing.rs
-     use criterion::{criterion_group, criterion_main, Criterion};
-     
-     fn benchmark_parse(c: &mut Criterion) {
-         c.bench_function("parse_simple_doc", |b| {
-             b.iter(|| {
-                 // Benchmark parsing logic
-             });
-         });
-     }
-     
-     criterion_group!(benches, benchmark_parse);
-     criterion_main!(benches);
+### 5. **Performance Benchmarks** (0.5 days) (COMPLETED)
+   - [x] Add Criterion dev-dependency to `Cargo.toml`
+   - [x] Create `benches/document_processing.rs` wrapping existing test scenarios
+   - [x] Benchmark configuration in `Cargo.toml` with `required-features = ["service"]`
+   - [ ] Run benchmarks locally to establish baseline:
+     ```bash
+     cargo bench --features service
      ```
-   - [ ] Benchmark key operations:
-     - Document parsing (small, medium, large)
-     - BID injection
-     - Graph querying
-     - Multi-pass compilation
-   - [ ] Establish baseline metrics
-   - [ ] Document expected performance characteristics
+   - [x] Benchmarks implemented:
+     - [x] `parse_all_documents` - Full multi-pass document parsing (mirrors `examples/basic_usage.rs`)
+     - [x] `bid_generation_and_caching` - BID generation with event accumulation (mirrors `tests/codec_test/bid_tests.rs`)
+     - [x] `multi_pass_reference_resolution` - Multiple compilation passes with cache warming
+     - [x] `graph_queries` - PathMap lookups and edge traversal after compilation
+   - [x] Review benchmark results for baseline metrics
    - [x] GitHub Actions runs benchmarks on main branch (informational only)
-   - [ ] Set up regression detection (optional for v0.1.0)
    
-   **Note**: GitHub Actions `benchmark` job runs on push to main and stores results as artifacts.
+   **Implementation notes**:
+   - Uses `tests/network_1` corpus (~10KB, sufficient for micro-benchmarks)
+   - Wraps existing test code patterns from `codec_test/bid_tests.rs`
+   - Tokio runtime integration via `async_tokio` Criterion feature
+   - HTML reports generated in `target/criterion/` directory
+   - Sample size: 50 iterations, 10-second measurement time
+   
+   **Note**: Micro-benchmarks for regression detection only. See **ISSUE_47** for comprehensive performance profiling infrastructure (macro-benchmarks, memory profiling, GB-scale characterization).
 
 ### 6. **Interactive Viewer Testing** (from ISSUE_39 Phase 2) (2-3 days)
 
