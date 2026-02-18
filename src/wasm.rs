@@ -6,7 +6,7 @@
 //!
 //! ## Usage
 //!
-//! ```javascript
+//! ```javascript,ignore
 //! import init, { BeliefBaseWasm } from './noet_wasm.js';
 //!
 //! async function main() {
@@ -39,7 +39,7 @@
 //! when using `serde_wasm_bindgen::to_value()`. This breaks JavaScript code expecting plain objects.
 //!
 //! ## Symptoms
-//! ```javascript
+//! ```javascript,ignore
 //! // JavaScript receives a Map, not a plain object:
 //! const data = wasm_function();
 //! Object.keys(data);        // Returns [] (empty array!)
@@ -50,7 +50,7 @@
 //! ## Solutions
 //!
 //! ### Option A: Return Plain JavaScript Object (Recommended for dictionary-like data)
-//! ```rust
+//! ```rust,ignore
 //! use serde_json::json;
 //!
 //! #[wasm_bindgen]
@@ -65,7 +65,7 @@
 //! ```
 //!
 //! ### Option B: Return JavaScript Map (When Map semantics are needed)
-//! ```rust
+//! ```rust,ignore
 //! #[wasm_bindgen]
 //! pub fn get_data(&self) -> JsValue {
 //!     let data: BTreeMap<String, Value> = ...;
@@ -78,7 +78,7 @@
 //! ```
 //!
 //! ### Option C: Return Array of Tuples (Simple alternative)
-//! ```rust
+//! ```rust,ignore
 //! #[wasm_bindgen]
 //! pub fn get_data(&self) -> JsValue {
 //!     let data: Vec<(String, Value)> = btreemap.into_iter().collect();
@@ -351,7 +351,7 @@ impl BeliefBaseWasm {
     /// Create a BeliefBase from JSON string (exported beliefbase.json) and metadata
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const response = await fetch('beliefbase.json');
     /// const json = await response.text();
     /// const metadataScript = document.getElementById('noet-metadata');
@@ -412,7 +412,7 @@ impl BeliefBaseWasm {
     /// Returns a BeliefGraph with matching nodes and their relations.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// // Query by BID
     /// const expr = { StateIn: { Bid: ["01234567-89ab-cdef-0123-456789abcdef"] } };
     /// const graph = await bb.query(expr);
@@ -456,7 +456,7 @@ impl BeliefBaseWasm {
     /// Returns null if node doesn't exist.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const node = bb.get_by_bid("01234567-89ab-cdef-0123-456789abcdef");
     /// if (node) {
     ///     console.log(node.title);
@@ -492,7 +492,7 @@ impl BeliefBaseWasm {
     /// For more advanced queries, use `query()` with Expression syntax.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const results = bb.search("documentation");
     /// results.forEach(node => console.log(node.title));
     /// ```
@@ -528,7 +528,7 @@ impl BeliefBaseWasm {
     /// Returns array of nodes that reference the given BID.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const backlinks = bb.get_backlinks("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`${backlinks.length} nodes link here`);
     /// ```
@@ -569,7 +569,7 @@ impl BeliefBaseWasm {
     /// Returns array of nodes referenced by the given BID.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const links = bb.get_forward_links("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`This node links to ${links.length} other nodes`);
     /// ```
@@ -608,7 +608,7 @@ impl BeliefBaseWasm {
     /// Get total number of nodes in the belief base
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// console.log(`Loaded ${bb.node_count()} nodes`);
     /// ```
     #[wasm_bindgen]
@@ -621,7 +621,7 @@ impl BeliefBaseWasm {
     /// Returns the BID corresponding to the given bref, or null if not found.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const bid = bb.get_bid_from_bref("abc123456789");
     /// if (bid) {
     ///     const node = bb.get_by_bid(bid);
@@ -656,7 +656,7 @@ impl BeliefBaseWasm {
     /// Returns array of nodes with kind "Network".
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const networks = bb.get_networks();
     /// networks.forEach(net => console.log(net.title));
     /// ```
@@ -680,7 +680,7 @@ impl BeliefBaseWasm {
     /// Returns array of nodes with kind "Document".
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const docs = bb.get_documents();
     /// console.log(`${docs.length} documents`);
     /// ```
@@ -710,7 +710,7 @@ impl BeliefBaseWasm {
     /// ⚠️ **JavaScript**: `related_nodes` and `graph` are Map objects (not plain objects)!
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const ctx = bb.get_context("01234567-89ab-cdef-0123-456789abcdef");
     /// console.log(`Node: ${ctx.node.title}`);
     /// console.log(`Path: ${ctx.root_path}`);
@@ -835,7 +835,7 @@ impl BeliefBaseWasm {
     /// See `docs/design/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const href_bid = BeliefBaseWasm.href_namespace();
     /// ```
     #[wasm_bindgen]
@@ -848,7 +848,7 @@ impl BeliefBaseWasm {
     /// See `docs/design/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const asset_bid = BeliefBaseWasm.asset_namespace();
     /// ```
     #[wasm_bindgen]
@@ -861,7 +861,7 @@ impl BeliefBaseWasm {
     /// See `docs/design/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const api_bid = BeliefBaseWasm.buildonomy_namespace();
     /// ```
     #[wasm_bindgen]
@@ -883,7 +883,7 @@ impl BeliefBaseWasm {
     /// ✅ **JavaScript**: This returns a plain object (uses serde_json serialization)
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const paths = beliefbase.get_paths();
     /// // ✅ Plain object - use bracket notation
     /// const networkPaths = paths[networkBid];  // ✅ Works!
@@ -942,7 +942,7 @@ impl BeliefBaseWasm {
     /// ⚠️ **JavaScript**: `tree.nodes` is a Map object (not plain object)!
     ///
     /// # JavaScript Example
-    /// ```javascript
+    /// ```javascript,ignore
     /// const tree = beliefbase.get_nav_tree();
     ///
     /// // ⚠️ IMPORTANT: tree.nodes is a Map, tree.roots is an Array
@@ -1091,7 +1091,7 @@ impl BeliefBaseWasm {
     /// Path with .html extension (e.g., "docs/guide.html#section")
     ///
     /// # Examples
-    /// ```javascript
+    /// ```javascript,ignore
     /// const htmlPath = BeliefBaseWasm.normalizePathExtension("net1_dir1/hsml.md#definition");
     /// // Returns: "net1_dir1/hsml.html#definition"
     /// ```

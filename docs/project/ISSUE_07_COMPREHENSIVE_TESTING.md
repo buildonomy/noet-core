@@ -1,9 +1,11 @@
 # Issue 7: Comprehensive Testing
 
 **Priority**: HIGH - Required for v0.1.0  
-**Estimated Effort**: 3-4 days
-**Dependencies**: Issues 1-6 complete (stable implementation)  
+**Estimated Effort**: 4-6 days (includes viewer testing from ISSUE_39)
+**Dependencies**: Issues 1-6 complete (stable implementation), ISSUE_39 Phase 1 complete  
 **Context**: Part of [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md) - ensures reliability before open source release
+
+**Note**: Includes testing tasks from ISSUE_39 Phase 2 (viewer accessibility, browser compatibility, performance)
 
 **CI/CD Strategy**: Repository is mirrored from GitLab to GitHub. GitHub Actions provides free runners for Linux, macOS, and Windows on public repositories, enabling comprehensive cross-platform testing without cost. See [`.github/workflows/test.yml`](../../.github/workflows/test.yml) for implementation.
 
@@ -20,6 +22,11 @@ Establish comprehensive test coverage across all feature combinations and platfo
 5. Establish performance baselines with benchmarks
 6. Document testing procedures
 7. Verify GitHub Actions CI/CD pipeline is comprehensive and reliable
+8. **Interactive viewer testing** (from ISSUE_39 Phase 2):
+   - Accessibility testing (screen readers, keyboard navigation, ARIA labels)
+   - Browser compatibility (Chrome, Firefox, Safari, Edge, mobile)
+   - Performance profiling and optimization
+   - Complete viewer documentation
 
 ## Architecture
 
@@ -205,7 +212,141 @@ features: [no-default, service, all]
    
    **Note**: GitHub Actions `benchmark` job runs on push to main and stores results as artifacts.
 
-### 6. **Testing Documentation** (0.5 days)
+### 6. **Interactive Viewer Testing** (from ISSUE_39 Phase 2) (2-3 days)
+
+**Goal**: Comprehensive testing of HTML viewer interactive features before v0.1 release.
+
+**Tasks**:
+
+#### 6.1 Accessibility Testing (1-2 days)
+- [ ] **Screen reader testing**:
+- Test with NVDA (Windows)
+- Test with JAWS (Windows)
+- Test with VoiceOver (macOS/iOS)
+- Test with TalkBack (Android)
+- Verify all interactive elements are announced correctly
+- Verify navigation tree is navigable with screen reader
+- Verify metadata panel content is readable
+- [ ] **Keyboard navigation**:
+- Tab order is logical and complete
+- All interactive elements reachable via keyboard
+- Escape key closes panels/modals
+- Enter/Space activate buttons and links
+- Arrow keys work in navigation tree
+- [ ] **ARIA labels**:
+- All buttons have `aria-label` or visible text
+- Panels have `role` and `aria-labelledby`
+- Navigation tree has proper ARIA tree structure
+- Loading states have `aria-live` regions
+- Error messages use `role="alert"`
+- [ ] **Focus management**:
+- Focus moves correctly during SPA navigation
+- Focus returns to trigger element when closing panels
+- Skip links for main content
+- No keyboard traps
+- [ ] **Lighthouse accessibility audit**:
+- Run on multiple pages
+- Target: 90+ score
+- Fix all failures and warnings
+- [ ] **axe DevTools scan**:
+- Scan all major pages
+- Target: 0 violations
+- Document and fix all issues
+
+**Files to review**:
+- `assets/viewer.js` - Add missing ARIA attributes
+- `assets/template-responsive.html` - Semantic HTML structure
+- `assets/noet-layout.css` - Focus styles, skip links
+
+#### 6.2 Browser Compatibility (1 day)
+- [ ] **Chrome/Edge** (Chromium-based):
+- Desktop (Windows, macOS, Linux)
+- Android mobile
+- Test all interactive features
+- Check console for errors
+- [ ] **Firefox**:
+- Desktop (Windows, macOS, Linux)
+- Android mobile
+- Test WASM module loading
+- Check for compatibility warnings
+- [ ] **Safari**:
+- Desktop (macOS)
+- iOS mobile (iPhone, iPad)
+- Test WebAssembly support
+- Check for Safari-specific CSS issues
+- [ ] **Edge Legacy** (if needed):
+- Test on Windows 10
+- Verify graceful degradation
+- [ ] **Browser matrix results**:
+- Document which browsers are supported
+- Document known issues and workarounds
+- Add browser compatibility notes to README
+
+**Testing checklist for each browser**:
+- [ ] Navigation tree renders correctly
+- [ ] Metadata panel displays and scrolls
+- [ ] Two-click navigation works
+- [ ] Client-side routing functions
+- [ ] Theme switching works
+- [ ] Mobile drawer behavior correct
+- [ ] No console errors or warnings
+
+#### 6.3 Performance Optimization (half day)
+- [ ] **Profile WASM loading**:
+- Measure initial WASM load time
+- Check for blocking operations
+- Consider lazy loading strategies
+- [ ] **Profile metadata queries**:
+- Measure `get_context()` call time
+- Measure `get_nav_tree()` call time
+- Profile with large networks (1000+ nodes)
+- [ ] **Profile rendering**:
+- Measure navigation tree render time
+- Measure metadata panel render time
+- Check for layout thrashing
+- [ ] **Optimize if needed**:
+- Lazy load large metadata sections
+- Cache WASM query results
+- Debounce scroll/resize handlers
+- Virtualize long lists if needed
+- [ ] **Performance benchmarks**:
+- Document baseline metrics
+- Set performance budgets
+- Add to CI if possible
+
+**Target metrics**:
+- WASM load: < 500ms
+- Navigation tree render: < 200ms
+- Metadata panel update: < 100ms
+- Smooth scrolling (60fps)
+
+#### 6.4 Viewer Documentation (half day)
+- [ ] **User-facing documentation**:
+- Document two-click navigation pattern
+- Document keyboard shortcuts
+- Document panel collapse/expand
+- Document theme switching
+- Add to README or separate VIEWER.md
+- [ ] **Developer documentation**:
+- Update `assets/viewer.js` JSDoc comments
+- Document WASM function signatures
+- Document event handlers and state management
+- Add architecture diagram if helpful
+- [ ] **Design doc updates**:
+- Update with implementation learnings
+- Document any deviations from original design
+- Add performance characteristics
+- Note accessibility considerations
+
+**Deliverables**:
+- Accessibility audit report with fixes
+- Browser compatibility matrix
+- Performance benchmark results
+- Complete viewer documentation
+
+---
+
+### 7. **Testing Documentation** (0.5 days)
    - ~~[ ] Create `docs/testing.md`:~~ **REMOVED**
      - How to run tests locally
      - Feature flag combinations
@@ -228,7 +369,7 @@ features: [no-default, service, all]
      - GitLab CI for security scanning and mirroring
      - Codecov for coverage tracking
 
-### 7. Ignored Tests Investigation and Fix (0.5-1 day)
+### 8. Ignored Tests Investigation and Fix (0.5-1 day)
 
 
 **Ignored Doctests in `src/codec/md.rs`** ✅ RESOLVED
@@ -361,7 +502,7 @@ echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
    - Check: https://github.com/notify-rs/notify/issues
    - Version: currently using notify-debouncer-full v0.3.1
 
-### 8. Service Testing Infrastructure (from Issue 10) (1-1.5 days)
+### 9. Service Testing Infrastructure (from Issue 10) (1-1.5 days)
 
 **Context**: Core library is well-tested. Service layer (`watch.rs`, feature = "service") has comprehensive rustdoc examples but minimal integration tests. Test skeleton exists at `tests/service_integration.rs`.
 
@@ -449,6 +590,27 @@ Expand `tests/service_integration.rs` skeleton to cover:
 - [ ] Service integration tests at `tests/service_integration.rs` complete and passing
 - [ ] End-to-end service layer testing (file watching → compilation → DB sync) verified
 - [x] **GitHub Actions test-summary job passes** (indicates all required tests green) ✅
+- [ ] **Interactive viewer accessibility testing complete** (ISSUE_39 Phase 2):
+  - [ ] Screen reader testing (NVDA, JAWS, VoiceOver, TalkBack)
+  - [ ] Keyboard navigation verified (Tab, Enter, Escape, Arrow keys)
+  - [ ] ARIA labels added to all interactive elements
+  - [ ] Focus management working correctly
+  - [ ] Lighthouse accessibility score 90+
+  - [ ] axe DevTools scan shows 0 violations
+- [ ] **Browser compatibility verified** (ISSUE_39 Phase 2):
+  - [ ] Chrome/Edge (desktop + mobile)
+  - [ ] Firefox (desktop + mobile)
+  - [ ] Safari (desktop + iOS)
+  - [ ] Browser compatibility matrix documented
+- [ ] **Viewer performance optimized** (ISSUE_39 Phase 2):
+  - [ ] WASM load time < 500ms
+  - [ ] Navigation tree render < 200ms
+  - [ ] Metadata panel update < 100ms
+  - [ ] Performance benchmarks documented
+- [ ] **Viewer documentation complete** (ISSUE_39 Phase 2):
+  - [ ] User guide (two-click pattern, keyboard shortcuts)
+  - [ ] Developer documentation (JSDoc, architecture)
+  - [ ] Design doc updated with implementation learnings
 
 ## Risks
 

@@ -389,11 +389,11 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
-
-      - name: Generate coverage
-        run: cargo tarpaulin --verbose --features service --workspace --timeout 300 --out xml
+      - name: Run coverage with tarpaulin
+        uses: actions-rs/tarpaulin@v0.1
+        with:
+          version: "latest"
+          args: "--verbose --features service --workspace --timeout 300 --out xml"
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
@@ -482,6 +482,11 @@ jobs:
       - name: Install wasm-bindgen-cli
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+
+      - name: Build noet-core with build-full.sh
+        run: |
+          cd noet-core
+          ./scripts/build-full.sh
 
       - name: Create standalone test project
         run: |
