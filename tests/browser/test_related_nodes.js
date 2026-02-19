@@ -75,10 +75,10 @@ async function runTests() {
   try {
     // Load WASM module
     log("Loading WASM module...", "info");
-    const wasmModule = await import(join(projectRoot, "pkg/noet_core.js"));
+    const wasmModule = await import(join(projectRoot, "target/wasm-build/pkg/noet_core.js"));
 
     // Load WASM binary directly for Node.js (fetch doesn't work in Node)
-    const wasmBuffer = await readFile(join(projectRoot, "pkg/noet_core_bg.wasm"));
+    const wasmBuffer = await readFile(join(projectRoot, "target/wasm-build/pkg/noet_core_bg.wasm"));
     await wasmModule.default(wasmBuffer);
     log("WASM module loaded", "pass");
 

@@ -96,31 +96,37 @@ fn main() {
     // Clear parent build's feature flags to avoid inheritance
     // The nested WASM build uses isolated features (wasm only), so we clear
     // the parent's BIN and SERVICE flags to prevent feature conflicts
-    let cargo_status = Command::new("cargo")
+    let cargo_output = Command::new("cargo")
         .current_dir(&manifest_dir)
         .env("CARGO_TARGET_DIR", &wasm_target_dir)
         .env_remove("CARGO_FEATURE_BIN")
         .env_remove("CARGO_FEATURE_SERVICE")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTFLAGS")
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
         .arg("--no-default-features")
         .arg("--features")
         .arg("wasm")
-        .status();
+        .output();
 
-    match cargo_status {
-        Ok(status) if status.success() => {
+    match cargo_output {
+        Ok(output) if output.status.success() => {
             // WASM compilation successful
         }
-        Ok(status) => {
+        Ok(output) => {
             eprintln!("\n=== ERROR ===");
             eprintln!(
                 "WASM cargo build failed with exit code: {:?}",
-                status.code()
+                output.status.code()
             );
+            eprintln!("\n--- STDOUT ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("\n--- STDERR ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             eprintln!("\nTry running manually:");
-            eprintln!("  cargo build --target wasm32-unknown-unknown --no-default-features --features wasm");
+            eprintln!("  CARGO_TARGET_DIR=target/wasm-build cargo build --target wasm32-unknown-unknown --no-default-features --features wasm");
             eprintln!("=============\n");
             panic!("WASM cargo build failed");
         }
@@ -142,22 +148,29 @@ fn main() {
         .join("debug")
         .join("noet_core.wasm");
 
-    let bindgen_status = Command::new("wasm-bindgen")
+    let bindgen_output = Command::new("wasm-bindgen")
         .current_dir(&manifest_dir)
         .arg(&wasm_input)
         .arg("--out-dir")
         .arg(&pkg_dir)
         .arg("--target")
         .arg("web")
-        .status();
+        .output();
 
-    match bindgen_status {
-        Ok(status) if status.success() => {
+    match bindgen_output {
+        Ok(output) if output.status.success() => {
             println!("cargo:warning=WASM build complete");
         }
-        Ok(status) => {
+        Ok(output) => {
             eprintln!("\n=== ERROR ===");
-            eprintln!("wasm-bindgen failed with exit code: {:?}", status.code());
+            eprintln!(
+                "wasm-bindgen failed with exit code: {:?}",
+                output.status.code()
+            );
+            eprintln!("\n--- STDOUT ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("\n--- STDERR ---");
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             eprintln!("\nTry running manually:");
             eprintln!("  wasm-bindgen target/wasm-build/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir target/wasm-build/pkg --target web");
             eprintln!("=============\n");

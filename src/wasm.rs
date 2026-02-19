@@ -773,7 +773,8 @@ impl BeliefBaseWasm {
         inner.get_context(ns, bid).map(|ctx| {
             // Collect all related nodes (other end of all edges)
             let mut related_nodes = BTreeMap::new();
-            let mut graph: HashMap<WeightKind, (Vec<(Bid, u16)>, Vec<(Bid, u16)>)> = HashMap::new();
+            type GraphMap = HashMap<WeightKind, (Vec<(Bid, u16)>, Vec<(Bid, u16)>)>;
+            let mut graph: GraphMap = HashMap::new();
 
             // Process sources (nodes linking TO this one)
             for ext_rel in ctx.sources() {
@@ -862,7 +863,11 @@ impl BeliefBaseWasm {
             // Not found in any namespace
             console::warn_1(&format!("⚠️ Node not found in any context: {}", bid).into());
             console::log_1(&format!("   Entry point: {}", self.entry_point_bid).into());
-            console::log_1(&format!("   Tried namespaces: href, asset, buildonomy").into());
+            console::log_1(
+                &"   Tried namespaces: href, asset, buildonomy"
+                    .to_string()
+                    .into(),
+            );
             return JsValue::NULL;
         };
 
@@ -1040,9 +1045,7 @@ impl BeliefBaseWasm {
             };
 
             // Skip reserved BIDs (system namespaces and API nodes)
-            if net_bid.is_reserved() {
-                continue;
-            } else if subnet_prefixes.contains_key(&net_bid) {
+            if net_bid.is_reserved() || subnet_prefixes.contains_key(net_bid) {
                 continue;
             }
 
@@ -1194,7 +1197,7 @@ impl BeliefBaseWasm {
 
         // Re-attach anchor fragment if present
         if !anchor_path.anchor().is_empty() {
-            normalized.push_str("#");
+            normalized.push('#');
             normalized.push_str(anchor_path.anchor());
         }
 

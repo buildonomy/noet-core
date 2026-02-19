@@ -4,6 +4,8 @@
 //! with the full WatchService setup including database synchronization.
 
 #[cfg(feature = "service")]
+use filetime::{set_file_mtime, FileTime};
+#[cfg(feature = "service")]
 use noet_core::{
     db::{db_init, DbConnection},
     event::Event,
@@ -124,11 +126,16 @@ fn test_stale_file_detection_and_reparse() {
     // Drain initial events
     while rx.try_recv().is_ok() {}
 
-    // Wait a moment to ensure mtime will be different
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait to ensure mtime will be different
+    std::thread::sleep(Duration::from_secs(2));
 
     // Modify the file
     std::fs::write(&doc_path, "# Modified Content\n\nThis is new!").unwrap();
+
+    // Explicitly set mtime to a future value to ensure it's different
+    // This works around filesystem timestamp resolution issues on Windows
+    let future_mtime = FileTime::from_unix_time(initial_mtime + 10, 0);
+    set_file_mtime(&doc_path, future_mtime).unwrap();
 
     // Wait for file watcher to detect change, debounce, and reparse
     std::thread::sleep(Duration::from_secs(7));

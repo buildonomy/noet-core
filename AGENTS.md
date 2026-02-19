@@ -720,6 +720,22 @@ Agent should explicitly state:
 
 ## Project-Specific Context
 
+### Project Documentation
+
+**Key documents for understanding the project**:
+- **`README.md`** - Project overview, quick start, installation
+- **`CONTRIBUTING.md`** - Development workflow, code standards, CI/CD, project structure
+- **`docs/architecture.md`** - High-level architecture and core concepts
+- **`docs/design/beliefbase_architecture.md`** - Detailed technical specification
+- **`docs/project/DOCUMENTATION_STRATEGY.md`** - How documentation is organized
+- **`.github/workflows/test.yml`** - CI pipeline with platform-specific testing patterns
+
+**When starting work**:
+- Check `CONTRIBUTING.md` for development conventions
+- Review `docs/architecture.md` to understand core concepts
+- Read design specs in `docs/design/` for implementation details
+- Examine `.github/workflows/test.yml` for testing patterns and CI reproduction steps
+
 ### Issue Resolution Workflow
 
 This project follows a structured issue resolution process for human-AI collaboration:

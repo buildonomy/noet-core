@@ -2,6 +2,29 @@
 # Comprehensive cross-platform testing (Linux, macOS, Windows)
 # Tests multiple Rust versions and feature flag combinations
 # Provides free CI/CD for platform testing per Issue 7
+#
+# ## Testing Patterns & Gotchas
+#
+# ### WASM Module Testing
+# The `wasm` module is gated on #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+# This means `cargo clippy --all-features` on native targets (x86_64/aarch64) will NOT check WASM code
+# because target_arch = "wasm32" is false.
+#
+# To check WASM code locally:
+#   cargo clippy --target wasm32-unknown-unknown --features wasm -- -D warnings
+#
+# CI catches this via build.rs nested WASM build (see lint job below).
+#
+# ### Platform-Specific Testing
+# - Windows: Path separators (use string_to_os_path() for DB paths), filesystem timestamp resolution
+# - All platforms: Use filetime crate for deterministic mtime testing
+# - Feature isolation: WASM builds in target/wasm-build/ to avoid native target file locks
+#
+# ### Reproducing CI Failures Locally
+# 1. Install wasm32 target: rustup target add wasm32-unknown-unknown
+# 2. Install wasm-bindgen: cargo install wasm-bindgen-cli --version 0.2.108
+# 3. Run same commands as CI jobs below (cargo build/test/clippy with same flags)
+# 4. Check feature combinations: no-default, service, bin, "bin service"
 
 name: Comprehensive Testing
 
