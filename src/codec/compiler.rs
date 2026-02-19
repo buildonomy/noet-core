@@ -361,10 +361,9 @@ impl DocumentCompiler {
         };
 
         // 3a. Check if this is an asset file (not a known document codec extension)
-        if !file_path.is_dir()
-            && !CODECS.has_codec_for_path(&file_path) {
-                return self.process_asset(path).await;
-            }
+        if !file_path.is_dir() && !CODECS.has_codec_for_path(&file_path) {
+            return self.process_asset(path).await;
+        }
 
         // 4. Try to read the file
         let content = {

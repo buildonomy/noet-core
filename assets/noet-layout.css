@@ -157,6 +157,7 @@ body {
 .noet-nav__content {
     flex: 1;
     padding: var(--size-4);
+    padding-bottom: calc(var(--size-4) + 70px); /* Extra padding to clear footer */
     overflow-y: auto;
     font-weight: var(--noet-font-weight-ui, 350);
 }
@@ -214,6 +215,7 @@ body {
 
 .noet-content__inner {
     padding: var(--size-4);
+    padding-bottom: calc(var(--size-4) + 70px); /* Extra padding to clear footer */
     background-color: var(--noet-bg-primary);
     min-height: 100%;
 }
@@ -222,6 +224,7 @@ body {
 @media (max-width: 1023px) {
     .noet-content__inner {
         padding: var(--size-8) var(--size-4);
+        padding-bottom: calc(var(--size-8) + 70px); /* Extra padding to clear footer */
     }
 }
 
@@ -599,6 +602,7 @@ body {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    padding-bottom: 70px; /* Extra padding to clear footer */
 }
 
 .noet-metadata-header {
