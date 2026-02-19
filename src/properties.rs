@@ -1053,6 +1053,7 @@ impl BeliefNode {
     pub fn id(&self) -> String {
         self.id
             .clone()
+            .filter(|id| !id.is_empty())
             .or_else(|| {
                 if !self.title.is_empty() {
                     Some(to_anchor(&self.title))

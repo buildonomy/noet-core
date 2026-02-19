@@ -6,21 +6,38 @@ use std::{
 };
 
 /// Utility function to replace separators and convert to unicode (via to_string_lossy) on os path.
+/// On Windows, strips the `\\?\` UNC prefix but preserves drive letters for canonical path representation.
 pub fn os_path_to_string<P: AsRef<Path>>(os_path_ref: P) -> String {
+    #[cfg(windows)]
+    use std::path::Prefix;
+
     let res = os_path_ref
         .as_ref()
         .components()
-        .map(|c| match c {
-            Component::RootDir => Cow::from("".to_string()),
-            _ => c.as_os_str().to_string_lossy(),
+        .filter_map(|c| match c {
+            Component::RootDir => Some(Cow::from("".to_string())),
+            #[cfg(windows)]
+            Component::Prefix(prefix) => {
+                // Extract drive letter from prefix, skip \\?\ verbatim prefix
+                match prefix.kind() {
+                    Prefix::VerbatimDisk(letter) | Prefix::Disk(letter) => {
+                        // Convert drive letter (e.g., b'C') to "C:"
+                        Some(Cow::from(format!("{}:", letter as char)))
+                    }
+                    _ => {
+                        // For other prefix types (UNC, VerbatimUNC, etc.), include as-is
+                        Some(prefix.as_os_str().to_string_lossy())
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            Component::Prefix(_) => None,
+            Component::Normal(s) => Some(s.to_string_lossy()),
+            Component::CurDir => Some(Cow::from(".")),
+            Component::ParentDir => Some(Cow::from("..")),
         })
         .collect::<Vec<_>>()
         .join("/");
-    tracing::debug!(
-        "os_path_to_string: turned {:?} into {}",
-        os_path_ref.as_ref().components(),
-        res
-    );
     res
 }
 

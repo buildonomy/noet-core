@@ -2,7 +2,10 @@ use crate::{
     beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     error::BuildonomyError,
     event::BeliefEvent,
-    paths::AnchorPath,
+    paths::{
+        path::{os_path_to_string, string_to_os_path},
+        AnchorPath,
+    },
     properties::{BeliefKind, BeliefNode, BeliefRelation, Bid, Bref, WeightKind, WeightSet},
     query::{push_string_expr, AsSql, BeliefSource, Expression, StatePred},
 };
@@ -31,7 +34,7 @@ pub const BELIEF_CACHE_DB: &str = "sqlite:belief_cache.db";
 pub struct Transaction<'a> {
     qb: QueryBuilder<'a, Sqlite>,
     pub staged: usize,
-    mtime_updates: BTreeMap<PathBuf, i64>,
+    mtime_updates: BTreeMap<String, i64>,
 }
 
 impl<'a> Default for Transaction<'a> {
@@ -61,8 +64,7 @@ impl<'a> Transaction<'a> {
             let mut mtime_qb =
                 QueryBuilder::<Sqlite>::new("INSERT OR REPLACE INTO file_mtimes (path, mtime) ");
             mtime_qb.push_values(self.mtime_updates.iter(), |mut b, (path, mtime)| {
-                b.push_bind(path.to_string_lossy().to_string())
-                    .push_bind(*mtime);
+                b.push_bind(path.clone()).push_bind(*mtime);
             });
             mtime_qb.build().execute(connection).await?;
             self.mtime_updates.clear();
@@ -80,39 +82,49 @@ impl<'a> Transaction<'a> {
         );
 
         match fs::metadata(path) {
-            Ok(metadata) => match metadata.modified() {
-                Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {
-                    Ok(duration) => {
-                        let mtime = duration.as_secs() as i64;
-                        self.mtime_updates.insert(path.to_path_buf(), mtime);
-                        tracing::debug!(
-                            "[Transaction] Successfully tracked mtime {} for {:?}",
-                            mtime,
-                            path
-                        );
+            Ok(metadata) => {
+                match metadata.modified() {
+                    Ok(modified) => {
+                        match modified.duration_since(SystemTime::UNIX_EPOCH) {
+                            Ok(duration) => {
+                                let mtime = duration.as_secs() as i64;
+                                let path_str = os_path_to_string(path);
+                                self.mtime_updates.insert(path_str.clone(), mtime);
+                                tracing::info!(
+                                    "[Transaction]   ✓ Successfully tracked mtime {} for {:?}",
+                                    mtime,
+                                    path
+                                );
+                                tracing::info!(
+                                    "[Transaction]   mtime_updates.len() = {}",
+                                    self.mtime_updates.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[Transaction]   ✗ Failed to get duration since epoch for {:?}: {}",
+                                    path,
+                                    e
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "[Transaction] Failed to get duration since epoch for {:?}: {}",
+                            "[Transaction]   ✗ Failed to get modified time for {:?}: {}",
                             path,
                             e
                         );
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "[Transaction] Failed to get modified time for {:?}: {}",
-                        path,
-                        e
-                    );
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(
-                    "[Transaction] Failed to get metadata for {:?}: {} (path may not exist or be inaccessible)",
+                    "[Transaction]   ✗ Failed to get metadata for {:?}: {} (path may not exist or be inaccessible)",
                     path,
                     e
                 );
+                tracing::warn!("[Transaction]   errno/kind: {:?}", e.kind());
             }
         }
         Ok(())
@@ -403,7 +415,7 @@ impl DbConnection {
 
         Ok(rows
             .into_iter()
-            .map(|(path, mtime)| (PathBuf::from(path), mtime))
+            .map(|(path, mtime)| (string_to_os_path(&path), mtime))
             .collect())
     }
 }

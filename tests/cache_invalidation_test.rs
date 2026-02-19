@@ -127,14 +127,17 @@ fn test_stale_file_detection_and_reparse() {
     while rx.try_recv().is_ok() {}
 
     // Wait to ensure mtime will be different
-    std::thread::sleep(Duration::from_secs(2));
+    // Windows NTFS has 2-second resolution for write times (per Microsoft docs)
+    std::thread::sleep(Duration::from_secs(3));
 
     // Modify the file
     std::fs::write(&doc_path, "# Modified Content\n\nThis is new!").unwrap();
 
-    // Explicitly set mtime to a future value to ensure it's different
-    // This works around filesystem timestamp resolution issues on Windows
-    let future_mtime = FileTime::from_unix_time(initial_mtime + 10, 0);
+    // Explicitly set mtime to current time + 60 seconds to ensure it's different
+    // Use FileTime::now() instead of unix timestamp arithmetic to avoid NTFS rounding issues
+    // The file watcher has a 2-second debounce, so this happens before the reparse
+    let current_time = FileTime::now();
+    let future_mtime = FileTime::from_unix_time(current_time.unix_seconds() + 60, 0);
     set_file_mtime(&doc_path, future_mtime).unwrap();
 
     // Wait for file watcher to detect change, debounce, and reparse
