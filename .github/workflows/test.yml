@@ -187,10 +187,10 @@ jobs:
           key: examples-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build examples
-        run: cargo build --examples --features service
+        run: cargo build --examples --features bin
 
       - name: Run basic_usage example
-        run: cargo run --example basic_usage --features service
+        run: cargo run --example basic_usage --features bin
 
   # WASM interface test
   wasm-interface:
@@ -288,9 +288,6 @@ jobs:
 
       - name: Run clippy (bin)
         run: cargo clippy --features bin --all-targets -- -D warnings
-
-      - name: Run clippy (service)
-        run: cargo clippy --features service --all-targets -- -D warnings
 
   # Documentation generation
   docs:
@@ -401,7 +398,7 @@ jobs:
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
 
       - name: Run coverage with tarpaulin
-        run: cargo tarpaulin --verbose --features service --workspace --timeout 300 --out xml
+        run: cargo tarpaulin --verbose --features bin --workspace --timeout 300 --out xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
@@ -452,7 +449,7 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          cargo bench --features service --no-fail-fast
+          cargo bench --features bin --no-fail-fast
 
       - name: Upload benchmark results
         if: success()
@@ -500,7 +497,7 @@ jobs:
           cargo init --name standalone_test
 
           # Add noet-core as path dependency using cargo add
-          cargo add noet-core --path ../noet-core --features service
+          cargo add noet-core --path ../noet-core --features bin
 
           # Create minimal example using public API
           cat > src/main.rs << 'EOF'

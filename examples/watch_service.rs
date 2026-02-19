@@ -13,14 +13,14 @@
 //! cargo run --features service --example watch_service -- /path/to/workspace
 //! ```
 
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 use noet_core::{
     config::NetworkRecord,
     event::{BeliefEvent, Event},
     properties::{BeliefNode, Bid},
     watch::WatchService,
 };
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 use std::{
     env,
     path::PathBuf,
@@ -30,7 +30,7 @@ use std::{
 };
 
 /// Example: Basic WatchService with single network
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Example 1: Basic Watch Service ===\n");
 
@@ -91,7 +91,7 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
 }
 
 /// Example: Multiple networks with configuration
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn example_multiple_networks(workspace_root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Example 2: Multiple Networks with Configuration ===\n");
 
@@ -139,7 +139,7 @@ fn example_multiple_networks(workspace_root: PathBuf) -> Result<(), Box<dyn std:
 }
 
 /// Example: Event processing with detailed logging
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn example_event_processing(workspace_root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Example 3: Detailed Event Processing ===\n");
 
@@ -221,7 +221,7 @@ Some content here.
 }
 
 /// Example: Long-running service with graceful shutdown
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Example 4: Long-Running Service ===\n");
     println!("This example runs until Ctrl-C is pressed\n");
@@ -286,7 +286,7 @@ fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::erro
 // Helper structures and functions
 
 #[derive(Default)]
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 struct EventStats {
     node_updates: usize,
     nodes_removed: usize,
@@ -296,7 +296,7 @@ struct EventStats {
     ping_events: usize,
 }
 
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 impl EventStats {
     fn total(&self) -> usize {
         self.node_updates
@@ -308,7 +308,7 @@ impl EventStats {
     }
 }
 
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
     match event {
         BeliefEvent::NodeUpdate(keys, _toml, origin) => {
@@ -373,7 +373,7 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
     }
 }
 
-#[cfg(feature = "service")]
+#[cfg(feature = "bin")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get workspace root from command line or use current directory
     let workspace_root = env::args()
@@ -428,5 +428,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "service"))]
+#[cfg(not(feature = "bin"))]
 fn main() {}

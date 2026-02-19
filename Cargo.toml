@@ -94,7 +94,7 @@ trybuild = "1.0"
 
 [features]
 default = []
-bin = ["clap", "ctrlc", "tracing-subscriber"]
+bin = ["clap", "ctrlc", "tracing-subscriber", "service"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures"]
 
