@@ -136,6 +136,59 @@ let panelState = {
 };
 
 // =============================================================================
+// Path Manipulation Helpers
+// =============================================================================
+
+/**
+ * Get current document path from hash without anchor
+ * @returns {string} Document path (e.g., "net1_dir1/doc.html")
+ */
+function getCurrentDocPath() {
+  const hash = window.location.hash.substring(1);
+  if (!hash || !wasmModule) return "";
+
+  const parts = wasmModule.BeliefBaseWasm.pathParts(hash);
+  return parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+}
+
+/**
+ * Parse hash into document path and anchor
+ * @param {string} hash - Hash string (with or without leading #)
+ * @returns {{path: string, anchor: string|null}} Parsed path and anchor
+ * @example
+ * parseHashPath("#doc.html#section") → { path: "doc.html", anchor: "section" }
+ * parseHashPath("dir/doc.html") → { path: "dir/doc.html", anchor: null }
+ * parseHashPath("#section") → { path: "section", anchor: null }
+ */
+function parseHashPath(hash) {
+  const cleanHash = hash.startsWith("#") ? hash.substring(1) : hash;
+  if (!cleanHash || !wasmModule) {
+    return { path: cleanHash, anchor: null };
+  }
+
+  const parts = wasmModule.BeliefBaseWasm.pathParts(cleanHash);
+  const path = parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+  const anchor = parts.anchor || null;
+
+  return { path, anchor };
+}
+
+/**
+ * Remove anchor from path
+ * @param {string} path - Path with optional anchor (e.g., "doc.html#section")
+ * @returns {string} Path without anchor (e.g., "doc.html")
+ * @example
+ * stripAnchor("doc.html#section") → "doc.html"
+ * stripAnchor("dir/doc.html") → "dir/doc.html"
+ */
+function stripAnchor(path) {
+  if (!path || !wasmModule) return path;
+
+  const parts = wasmModule.BeliefBaseWasm.pathParts(path);
+  return parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+}
+
+// =============================================================================
 // Initialization
 // =============================================================================
 
@@ -539,14 +592,13 @@ function navigateToLink(href, link, targetBid = null) {
   }
 
   // Check if it's a document link with anchor (e.g., "path/file.html#section")
-  const hashIndex = resolvedPath.indexOf("#");
-  if (hashIndex > 0) {
-    // Split into document path and anchor
-    const docPath = resolvedPath.substring(0, hashIndex);
-    const anchor = resolvedPath.substring(hashIndex + 1);
+  const parsed = parseHashPath(resolvedPath);
+  if (parsed.anchor) {
     // Navigate with full path in hash: #/path/file.html#anchor
-    // Ensure docPath starts with / (don't double it)
-    const hashPath = docPath.startsWith("/") ? `${docPath}#${anchor}` : `/${docPath}#${anchor}`;
+    // Ensure path starts with / (don't double it)
+    const hashPath = parsed.path.startsWith("/")
+      ? `${parsed.path}#${parsed.anchor}`
+      : `/${parsed.path}#${parsed.anchor}`;
     window.location.hash = hashPath;
     // Store targetBid for use after navigation completes
     if (targetBid) {
@@ -644,12 +696,9 @@ async function handleHashChange() {
   }
 
   // Check if path contains a section anchor (e.g., /file.html#section-id)
-  let sectionAnchor = null;
-  const anchorIndex = path.indexOf("#");
-  if (anchorIndex > 0) {
-    sectionAnchor = path.substring(anchorIndex);
-    path = path.substring(0, anchorIndex);
-  }
+  const parsed = parseHashPath(path);
+  let sectionAnchor = parsed.anchor ? `#${parsed.anchor}` : null;
+  path = parsed.path;
 
   // Normalize path to resolve any .. or . segments
   // Note: normalizePath now preserves leading slashes
@@ -888,15 +937,8 @@ function processLoadedContent(container) {
       return;
     }
 
-    // Get current document path from hash
-    const currentHash = window.location.hash.substring(1); // Remove leading #
-    let currentPath = currentHash;
-
-    // Strip existing anchor if present
-    const anchorIndex = currentPath.indexOf("#");
-    if (anchorIndex !== -1) {
-      currentPath = currentPath.substring(0, anchorIndex);
-    }
+    // Get current document path from hash (without anchor)
+    const currentPath = getCurrentDocPath();
 
     // Resolve section ID to BID and bref at document load time
     let sectionBref = null;
@@ -1002,7 +1044,7 @@ function getBidFromPath(path) {
 
     // Strip any section anchors and leading slash from the path
     // PathMap keys don't include leading slashes
-    let cleanPath = path.split("#")[0];
+    let cleanPath = stripAnchor(path);
     if (cleanPath.startsWith("/")) {
       cleanPath = cleanPath.substring(1);
     }

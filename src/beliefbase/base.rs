@@ -1723,14 +1723,17 @@ impl BeliefBase {
             }
             StatePred::NetPathIn(net) => {
                 let paths_guard = self.paths();
-                let path_bid_pairs = paths_guard
+                let path_bid_tuples = paths_guard
                     .get_map(&net.bref())
                     .map(|pm| {
-                        pm.all_net_paths(&paths_guard, &mut std::collections::BTreeSet::new())
+                        pm.recursive_map(&paths_guard, &mut std::collections::BTreeSet::new())
                     })
                     .unwrap_or_default();
                 // Extract just the bids from (path, bid) tuples
-                let bids: Vec<Bid> = path_bid_pairs.iter().map(|(_path, bid)| *bid).collect();
+                let bids: Vec<Bid> = path_bid_tuples
+                    .iter()
+                    .map(|(_path, bid, _order)| *bid)
+                    .collect();
                 BTreeMap::from_iter(
                     bids.iter()
                         .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
@@ -2023,7 +2026,12 @@ impl BeliefSource for BeliefBase {
         Ok(self
             .paths()
             .get_map(&network_bid.bref())
-            .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
+            .map(|pm| {
+                pm.recursive_map(&self.paths(), &mut BTreeSet::default())
+                    .into_iter()
+                    .map(|(path, bid, _order)| (path, bid))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -2070,7 +2078,12 @@ impl BeliefSource for &BeliefBase {
         Ok(self
             .paths()
             .get_map(&network_bid.bref())
-            .map(|pm| pm.all_net_paths(&self.paths(), &mut BTreeSet::default()))
+            .map(|pm| {
+                pm.recursive_map(&self.paths(), &mut BTreeSet::default())
+                    .into_iter()
+                    .map(|(path, bid, _order)| (path, bid))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 

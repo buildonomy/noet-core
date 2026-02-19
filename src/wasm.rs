@@ -170,7 +170,7 @@ use serde_json;
 use enumset::EnumSet;
 
 #[cfg(feature = "wasm")]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[cfg(feature = "wasm")]
 use js_sys::{Object, Reflect};
@@ -1005,6 +1005,33 @@ impl BeliefBaseWasm {
         let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
         let mut root_nodes: Vec<String> = Vec::new();
 
+        // First pass: Build map of subnet BIDs to their parent path prefixes
+        // This is needed because subnet documents have paths relative to the subnet,
+        // but NavTree needs full paths including the subnet directory prefix
+        let mut subnet_prefixes: BTreeMap<Bid, String> = BTreeMap::new();
+        let mut visited = BTreeSet::default();
+
+        for (net_bref, pm_lock) in paths.map().iter() {
+            let net_bid_for_prefix = match brefs.get(net_bref) {
+                Some(bid) => bid,
+                None => continue,
+            };
+
+            if net_bid_for_prefix.is_reserved() {
+                continue;
+            }
+
+            let pm = pm_lock.read();
+
+            // Find subnet entries in this PathMap and record their prefixes
+            for (path, bid, _order_indices) in pm.map().iter() {
+                // Check if this bid is a network (subnet)
+                if paths.nets().contains(bid) && *bid != *net_bid_for_prefix {
+                    subnet_prefixes.insert(*bid, path.clone());
+                }
+            }
+        }
+
         for (net_bref, pm_lock) in paths.map().iter() {
             // Resolve Bref to Bid
             let net_bid = match brefs.get(net_bref) {
@@ -1014,6 +1041,8 @@ impl BeliefBaseWasm {
 
             // Skip reserved BIDs (system namespaces and API nodes)
             if net_bid.is_reserved() {
+                continue;
+            } else if subnet_prefixes.contains_key(&net_bid) {
                 continue;
             }
 
@@ -1045,7 +1074,7 @@ impl BeliefBaseWasm {
             let mut stack: Vec<(String, usize)> = Vec::new();
             stack.push((network_bid_str.clone(), 0)); // Network is at depth 0
 
-            for (path, bid, order_indices) in pm.map().iter() {
+            for (path, bid, order_indices) in pm.recursive_map(&paths, &mut visited).iter() {
                 let depth = order_indices.len();
                 let bid_str = bid.to_string();
 

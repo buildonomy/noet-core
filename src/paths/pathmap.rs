@@ -1156,17 +1156,17 @@ impl PathMap {
     }
 
     /// Return a list of all networks connected to this subnet (always includes self as ("", self.net))
-    pub fn all_net_paths(
+    pub fn recursive_map(
         &self,
         nets: &PathMapMap,
         visited: &mut BTreeSet<Bid>,
-    ) -> Vec<(String, Bid)> {
+    ) -> Vec<(String, Bid, Vec<u16>)> {
         let mut paths = Vec::default();
         if visited.contains(&self.net) {
             return paths;
         }
         visited.insert(self.net);
-        let mut subnet_idxs = self
+        let subnet_idxs = self
             .subnets()
             .iter()
             .map(|net_bid| {
@@ -1177,20 +1177,25 @@ impl PathMap {
                 idx_vec[0]
             })
             .collect::<Vec<usize>>();
-        subnet_idxs.sort();
-        paths.push(("".to_string(), self.net));
-        for subnet_idx in subnet_idxs.iter() {
-            let (ref base, subnet_bid, _) = self.map[*subnet_idx];
-            let base_ap = AnchorPath::new(base);
-            let sub_subs = nets
-                .get_map(&subnet_bid.bref())
-                .map(|pm| pm.all_net_paths(nets, visited))
-                .expect("all identified subnets to be registered with the pathmapmap");
-            for (sub_sub_path, sub_sub_bid) in sub_subs.iter() {
-                paths.push((base_ap.join(sub_sub_path), *sub_sub_bid));
+
+        for (idx, (elem_path, elem_bid, elem_order)) in self.map.iter().enumerate() {
+            if subnet_idxs.contains(&idx) {
+                let mut subs = nets
+                    .get_map(&elem_bid.bref())
+                    .map(|pm| pm.recursive_map(nets, visited))
+                    .expect("all identified subnets to be registered with the pathmapmap");
+                let sub_ap = AnchorPath::new(elem_path);
+                for tuple in subs.iter_mut() {
+                    tuple.0 = sub_ap.join(&tuple.0);
+                    let mut new_order = elem_order.clone();
+                    new_order.append(&mut tuple.2.clone());
+                    tuple.2 = new_order;
+                }
+                paths.append(&mut subs);
+            } else {
+                paths.push((elem_path.clone(), *elem_bid, elem_order.clone()));
             }
         }
-
         paths
     }
 
