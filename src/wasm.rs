@@ -1176,24 +1176,17 @@ impl BeliefBaseWasm {
         let anchor_path = AnchorPath::new(path);
         let filepath = anchor_path.filepath();
 
-        // Check all registered codec extensions
-        let mut normalized = filepath.to_string();
-        let mut found_extension = false;
-        for ext in CODECS.extensions() {
-            let ext_str = format!(".{}", ext);
-            if filepath.ends_with(&ext_str) {
-                let base = &filepath[..filepath.len() - ext_str.len()];
-                normalized = format!("{}.html", base);
-                found_extension = true;
-                break;
-            }
-        }
-
-        // If no codec extension found and no .html extension, treat as directory
-        if !found_extension && !filepath.ends_with(".html") {
-            // Directory path - append /index.html
-            normalized = format!("{}/index.html", filepath);
-        }
+        // Check if this is a codec document path
+        let normalized = if CODECS.has_codec_for_anchor_path(&anchor_path) {
+            // Replace codec extension with .html
+            anchor_path.replace_extension("html")
+        } else if !filepath.ends_with(".html") {
+            // No codec extension and no .html - treat as directory
+            format!("{}/index.html", filepath)
+        } else {
+            // Already has .html extension
+            filepath.to_string()
+        };
 
         // Re-attach anchor fragment if present
         if !anchor_path.anchor().is_empty() {

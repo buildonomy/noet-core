@@ -82,42 +82,38 @@ impl<'a> Transaction<'a> {
         );
 
         match fs::metadata(path) {
-            Ok(metadata) => {
-                match metadata.modified() {
-                    Ok(modified) => {
-                        match modified.duration_since(SystemTime::UNIX_EPOCH) {
-                            Ok(duration) => {
-                                let mtime = duration.as_secs() as i64;
-                                let path_str = os_path_to_string(path);
-                                self.mtime_updates.insert(path_str.clone(), mtime);
-                                tracing::info!(
-                                    "[Transaction]   ✓ Successfully tracked mtime {} for {:?}",
-                                    mtime,
-                                    path
-                                );
-                                tracing::info!(
-                                    "[Transaction]   mtime_updates.len() = {}",
-                                    self.mtime_updates.len()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[Transaction]   ✗ Failed to get duration since epoch for {:?}: {}",
-                                    path,
-                                    e
-                                );
-                            }
-                        }
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let mtime = duration.as_secs() as i64;
+                        let path_str = os_path_to_string(path);
+                        self.mtime_updates.insert(path_str.clone(), mtime);
+                        tracing::info!(
+                            "[Transaction]   ✓ Successfully tracked mtime {} for {:?}",
+                            mtime,
+                            path
+                        );
+                        tracing::info!(
+                            "[Transaction]   mtime_updates.len() = {}",
+                            self.mtime_updates.len()
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "[Transaction]   ✗ Failed to get modified time for {:?}: {}",
+                            "[Transaction]   ✗ Failed to get duration since epoch for {:?}: {}",
                             path,
                             e
                         );
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "[Transaction]   ✗ Failed to get modified time for {:?}: {}",
+                        path,
+                        e
+                    );
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(
                     "[Transaction]   ✗ Failed to get metadata for {:?}: {} (path may not exist or be inaccessible)",

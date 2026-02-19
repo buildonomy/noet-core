@@ -513,6 +513,17 @@ impl WatchService {
         let compiler_ref = network_syncer.compiler.clone();
         let work_notifier = network_syncer.work_notifier.clone();
 
+        // Trigger initial parse of the network
+        {
+            let mut compiler = compiler_ref.write();
+            compiler.enqueue(repo_path);
+            tracing::info!(
+                "[WatchService] Enqueued network root for initial parse: {:?}",
+                repo_path
+            );
+        }
+        work_notifier.notify_one();
+
         let ignored_write_paths = network_syncer.ignored_write_paths.clone();
         let debouncer_codec_extensions = self.codecs.extensions();
         let mut debouncer = new_debouncer(
@@ -559,17 +570,26 @@ impl WatchService {
                                             }
 
                                             // Check if extension is a registered codec
-                                            if let Some(ext) = p.extension() {
+                                            let has_codec_ext = if let Some(ext) = p.extension() {
                                                 let ext_str = ext.to_str().unwrap_or("");
-                                                if debouncer_codec_extensions
+                                                debouncer_codec_extensions
                                                     .iter()
                                                     .any(|ce| ce.as_str() == ext_str)
-                                                {
-                                                    return true;
-                                                }
-                                            }
+                                            } else {
+                                                false
+                                            };
 
-                                            false
+                                            // Also check if filestem matches (for .noet files)
+                                            let has_codec_stem = if let Some(file_name) = p.file_name() {
+                                                let file_name_str = file_name.to_str().unwrap_or("");
+                                                // Check against NETWORK_CONFIG_NAMES
+                                                use crate::codec::belief_ir::NETWORK_CONFIG_NAMES;
+                                                NETWORK_CONFIG_NAMES.contains(&file_name_str)
+                                            } else {
+                                                false
+                                            };
+
+                                            has_codec_ext || has_codec_stem
                                         })
                                         .collect();
 

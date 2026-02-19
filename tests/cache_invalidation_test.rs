@@ -16,19 +16,19 @@ use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
 #[cfg(feature = "service")]
 use tempfile::TempDir;
 
-/// Helper to create a test network with BeliefNetwork.toml
+/// Helper to create a test network with .noet file
 #[cfg(feature = "service")]
 fn create_test_network(temp_dir: &TempDir) -> PathBuf {
     let network_path = temp_dir.path().join("test_network");
     std::fs::create_dir(&network_path).unwrap();
 
-    // Create BeliefNetwork.toml
+    // Create .noet file
     let network_toml = r#"
 id = "test-network"
 title = "Test Network"
 text = "A test belief network for cache invalidation testing"
 "#;
-    std::fs::write(network_path.join("BeliefNetwork.toml"), network_toml).unwrap();
+    std::fs::write(network_path.join(".noet"), network_toml).unwrap();
 
     network_path
 }

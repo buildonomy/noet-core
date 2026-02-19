@@ -151,9 +151,9 @@ fn example_event_processing(workspace_root: PathBuf) -> Result<(), Box<dyn std::
         println!("Creating example network at: {}", network_path.display());
         std::fs::create_dir_all(&network_path)?;
 
-        // Create BeliefNetwork.toml
+        // Create .noet file
         std::fs::write(
-            network_path.join("BeliefNetwork.toml"),
+            network_path.join(".noet"),
             r#"id = "example-network"
 title = "Example Network"
 "#,

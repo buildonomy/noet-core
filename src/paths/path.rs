@@ -103,7 +103,8 @@ impl<'a> AnchorPath<'a> {
         // top is a dir, not a file
         if ext_sep.is_none()
             && dir_sep.is_some()
-            && !path[dir_sep.map(|idx| idx + 1).unwrap()..anc_sep.unwrap_or(path.len())].is_empty()
+            && !path[dir_sep.map(|idx| idx + 1).unwrap_or(0)..anc_sep.unwrap_or(path.len())]
+                .is_empty()
         {
             dir_sep = anc_sep;
         }
@@ -181,6 +182,58 @@ impl<'a> AnchorPath<'a> {
         let stop_idx = self.anc_sep.unwrap_or(self.path.len());
         let start_idx = self.ext_sep.map(|idx| idx + 1).unwrap_or(stop_idx);
         &self.path[start_idx..stop_idx]
+    }
+
+    /// Get both filestem and extension as a tuple
+    ///
+    /// Returns (filestem, extension) where both are string slices.
+    /// For files without extensions, ext will be an empty string.
+    /// For paths treated as directories (like `.noet`), filestem will be empty
+    /// but the filename can be retrieved separately.
+    ///
+    /// # Examples
+    /// ```
+    /// use noet_core::paths::path::AnchorPath;
+    ///
+    /// let ap = AnchorPath::new("dir/file.md");
+    /// assert_eq!(ap.path_parts(), ("file", "md"));
+    ///
+    /// // For extensionless files like .noet, filestem is empty (treated as directory)
+    /// // Use filename() to get the actual name
+    /// let ap = AnchorPath::new(".noet");
+    /// assert_eq!(ap.path_parts(), ("", ""));
+    /// assert_eq!(ap.filename(), "");
+    ///
+    /// let ap = AnchorPath::new("dir/.noet#anchor");
+    /// assert_eq!(ap.path_parts(), ("", ""));
+    /// ```
+    pub fn path_parts(&self) -> (&'a str, &'a str) {
+        (self.filestem(), self.ext())
+    }
+
+    /// Get codec lookup keys (filestem or filename, and extension)
+    ///
+    /// For normal files: returns (filestem, ext)
+    /// For extensionless files like .noet: returns (filename, "")
+    /// This handles the case where AnchorPath treats extensionless paths as directories.
+    pub fn codec_parts(&self) -> (&'a str, &'a str) {
+        let stem = self.filestem();
+        let ext = self.ext();
+
+        // If filestem is empty, extract the last path component manually
+        // This handles cases like "/dir/.noet" where .noet is treated as a directory
+        if stem.is_empty() {
+            // Find the last '/' to get the final component
+            let filepath = self.filepath();
+            let last_component = if let Some(pos) = filepath.rfind('/') {
+                &filepath[pos + 1..]
+            } else {
+                filepath
+            };
+            (last_component, ext)
+        } else {
+            (stem, ext)
+        }
     }
 
     pub fn filepath(&self) -> &'a str {

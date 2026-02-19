@@ -1173,8 +1173,7 @@ impl DocCodec for MdCodec {
                             tracing::debug!("is anchor");
                             CowStr::from(as_anchor(url_ap.anchor()))
                         } else if !url_ap.ext().is_empty() {
-                            let codec_extensions = CODECS.extensions();
-                            if codec_extensions.iter().any(|ext| ext == url_ap.ext()) {
+                            if CODECS.has_codec_for_anchor_path(&url_ap) {
                                 // Check if there's an anchor
                                 let res = CowStr::from(url_ap.replace_extension("html"));
                                 tracing::debug!("replacing {url_str} with {res}");

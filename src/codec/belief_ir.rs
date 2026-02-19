@@ -30,27 +30,24 @@ pub enum MetadataFormat {
     Yaml,
 }
 
-/// Standard filenames designating a directory as the root of a BeliefNetwork.
-/// Priority order: YAML → JSON → TOML for consistency with metadata parsing.
-/// Supports extension synonyms: .yaml/.yml, .json/.jsn, .toml/.tml
-pub const NETWORK_CONFIG_NAMES: &[&str] = &[
-    "BeliefNetwork.yaml",
-    "BeliefNetwork.yml",
-    "BeliefNetwork.json",
-    "BeliefNetwork.jsn",
-    "BeliefNetwork.toml",
-    "BeliefNetwork.tml",
-];
+/// Standard filename designating a directory as the root of a BeliefNetwork.
+/// The `.noet` file is a hidden file that can contain YAML, JSON, or TOML format.
+/// Format is auto-detected via fallback parsing (YAML → JSON → TOML).
+pub const NETWORK_CONFIG_NAMES: &[&str] = &[".noet"];
 
 /// Iterates through a directory subtree, filtering to return a sorted list of network directories
-/// (directories containing a BeliefNetwork.json or BeliefNetwork.toml file), as well as file paths
+/// (directories containing a .noet file), as well as file paths
 /// matching known codec extensions.
 fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
     fn is_hidden(entry: &DirEntry) -> bool {
         entry
             .file_name()
             .to_str()
-            .map(|s| s.starts_with("."))
+            .map(|s| {
+                s.starts_with(".")
+                    // Allow .noet files through
+                    && !NETWORK_CONFIG_NAMES.contains(&s)
+            })
             .unwrap_or(false)
     }
     let mut subnets = Vec::default();
@@ -60,31 +57,29 @@ fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
         .filter_map(|e| e.ok().map(|e| e.into_path()))
         .filter_map(|mut p| {
             if p.is_file() {
-                if p.extension()
-                    .and_then(|e| e.to_str())
-                    .filter(|&e| CODECS.extensions().iter().any(|ce| ce.as_str() == e))
-                    .is_some()
-                {
+                // First check if this is a network config file (.noet)
+                if let Some(file_name) = p.file_name() {
+                    let file_name_str = file_name.to_string_lossy();
+                    if NETWORK_CONFIG_NAMES
+                        .iter()
+                        .any(|&name| name == file_name_str.as_ref())
+                    {
+                        // This is a network config file - return its parent directory
+                        p.pop();
+                        if !p.eq(&path.as_ref()) {
+                            subnets.push(p.clone());
+                            return Some(p);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+
+                // Then check if this has a registered codec
+                if CODECS.has_codec_for_path(&p) {
                     if subnets.iter().any(|subnet_path| p.starts_with(subnet_path)) {
                         // Don't include subnet files
                         None
-                    } else if let Some(file_name) = p.file_name() {
-                        let file_name_str = file_name.to_string_lossy();
-                        if NETWORK_CONFIG_NAMES
-                            .iter()
-                            .any(|&name| name == file_name_str.as_ref())
-                        {
-                            p.pop();
-                            if !p.eq(&path.as_ref()) {
-                                subnets.push(p.clone());
-
-                                Some(p)
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some(p)
-                        }
                     } else {
                         Some(p)
                     }
@@ -410,10 +405,27 @@ pub fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)> {
     for filename in NETWORK_CONFIG_NAMES {
         let path = dir.join(filename);
         if path.exists() {
-            // Extract extension and map to format
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if let Some(format) = extension_to_format(ext) {
+            // For .noet (extensionless), detect format by trying to read content
+            if path.extension().is_none() {
+                // Try to detect format by reading first few bytes
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let trimmed = content.trim_start();
+                    let format = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                        MetadataFormat::Json
+                    } else if trimmed.starts_with('[') || trimmed.contains('=') {
+                        MetadataFormat::Toml
+                    } else {
+                        // Default to YAML for extensionless files
+                        MetadataFormat::Yaml
+                    };
                     return Some((path, format));
+                }
+            } else {
+                // Extract extension and map to format for legacy names
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if let Some(format) = extension_to_format(ext) {
+                        return Some((path, format));
+                    }
                 }
             }
         }
@@ -1037,7 +1049,7 @@ impl DocCodec for ProtoBeliefNode {
                 let mut link_path = edge.root_path.clone();
                 let link_ap = AnchorPath::from(&edge.root_path);
                 // Normalize document links to .html extension
-                if CODECS.extensions().iter().any(|ext| ext == link_ap.ext()) {
+                if CODECS.has_codec_for_anchor_path(&link_ap) {
                     link_path = link_ap.replace_extension("html");
                 }
 
@@ -1248,7 +1260,7 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let json_path = temp_dir.path().join("BeliefNetwork.json");
+        let json_path = temp_dir.path().join(".noet");
         fs::write(&json_path, r#"{"bid": "test"}"#).unwrap();
 
         let result = detect_network_file(temp_dir.path());
@@ -1265,7 +1277,7 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+        let toml_path = temp_dir.path().join(".noet");
         fs::write(&toml_path, r#"bid = "test""#).unwrap();
 
         let result = detect_network_file(temp_dir.path());
@@ -1282,20 +1294,17 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let yaml_path = temp_dir.path().join("BeliefNetwork.yaml");
-        let json_path = temp_dir.path().join("BeliefNetwork.json");
-        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+        let noet_path = temp_dir.path().join(".noet");
 
-        fs::write(&yaml_path, r#"bid: "yaml""#).unwrap();
-        fs::write(&json_path, r#"{"bid": "json"}"#).unwrap();
-        fs::write(&toml_path, r#"bid = "toml""#).unwrap();
+        // Write YAML format to .noet
+        fs::write(&noet_path, r#"bid: "yaml""#).unwrap();
 
         let result = detect_network_file(temp_dir.path());
         assert!(result.is_some());
 
         let (path, format) = result.unwrap();
-        assert_eq!(path, yaml_path, "Should prefer YAML when all three exist");
         assert_eq!(format, MetadataFormat::Yaml);
+        assert_eq!(path, noet_path);
     }
 
     #[test]
@@ -1304,21 +1313,17 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let json_path = temp_dir.path().join("BeliefNetwork.json");
-        let toml_path = temp_dir.path().join("BeliefNetwork.toml");
+        let noet_path = temp_dir.path().join(".noet");
 
-        fs::write(&json_path, r#"{"bid": "json"}"#).unwrap();
-        fs::write(&toml_path, r#"bid = "toml""#).unwrap();
+        // Write JSON format to .noet
+        fs::write(&noet_path, r#"{"bid": "json"}"#).unwrap();
 
         let result = detect_network_file(temp_dir.path());
         assert!(result.is_some());
 
         let (path, format) = result.unwrap();
-        assert_eq!(
-            path, json_path,
-            "Should prefer JSON over TOML when YAML absent"
-        );
         assert_eq!(format, MetadataFormat::Json);
+        assert_eq!(path, noet_path);
     }
 
     #[test]
@@ -1342,7 +1347,7 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let yml_path = temp_dir.path().join("BeliefNetwork.yml");
+        let yml_path = temp_dir.path().join(".noet");
 
         fs::write(&yml_path, r#"bid: "yaml-synonym""#).unwrap();
 
@@ -1360,7 +1365,7 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let jsn_path = temp_dir.path().join("BeliefNetwork.jsn");
+        let jsn_path = temp_dir.path().join(".noet");
 
         fs::write(&jsn_path, r#"{"bid": "json-synonym"}"#).unwrap();
 
@@ -1378,7 +1383,7 @@ schema = "noet.network_config"
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let tml_path = temp_dir.path().join("BeliefNetwork.tml");
+        let tml_path = temp_dir.path().join(".noet");
 
         fs::write(&tml_path, r#"bid = "toml-synonym""#).unwrap();
 

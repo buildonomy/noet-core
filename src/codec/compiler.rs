@@ -57,14 +57,14 @@ use toml_edit::value;
 /// Consider this document structure:
 /// ```text
 /// network/
-///   ├── BeliefNetwork.toml
+///   ├── .noet
 ///   ├── README.md           → references sub_1.md, sub_2.md
 ///   ├── sub_1.md            → references sub_2.md
 ///   └── sub_2.md
 /// ```
 ///
 /// Parse sequence:
-/// 1. **Parse BeliefNetwork.toml** (primary queue)
+/// 1. **Parse .noet** (primary queue)
 ///    - Discovers README.md, sub_1.md, sub_2.md via `ProtoBeliefNode::from_file`
 ///    - Adds them to primary queue in lexical order
 ///
@@ -246,7 +246,7 @@ impl DocumentCompiler {
         })
     }
 
-    /// Initialize a directory as a BeliefNetwork by placing a BeliefNetwork.toml file with the
+    /// Initialize a directory as a BeliefNetwork by placing a .noet file with the
     /// input arguments at that location.
     pub async fn create_network_file<P>(
         repo_path: P,
@@ -349,7 +349,7 @@ impl DocumentCompiler {
         // 3. Determine the actual file path (may differ from path if path is a directory)
         let file_path = if path.is_dir() {
             // BeliefNetwork directories are enqueued as the directory, not the contained
-            // BeliefNetwork.json or BeliefNetwork.toml file.
+            // .noet file.
             if let Some((detected_path, _format)) = detect_network_file(&path) {
                 detected_path
             } else {
@@ -361,13 +361,10 @@ impl DocumentCompiler {
         };
 
         // 3a. Check if this is an asset file (not a known document codec extension)
-        if !file_path.is_dir() {
-            if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
-                if CODECS.get(ext).is_none() {
-                    return self.process_asset(path).await;
-                }
+        if !file_path.is_dir()
+            && !CODECS.has_codec_for_path(&file_path) {
+                return self.process_asset(path).await;
             }
-        }
 
         // 4. Try to read the file
         let content = {
@@ -993,7 +990,7 @@ impl DocumentCompiler {
         // 3. Determine the actual file path (may differ from path if path is a directory)
         let file_path = if path.is_dir() {
             // BeliefNetwork directories are enqueued as the directory, not the contained
-            // BeliefNetwork.json or BeliefNetwork.toml file.
+            // .noet file.
             if let Some((detected_path, _format)) = detect_network_file(&path) {
                 detected_path
             } else {
@@ -1766,6 +1763,7 @@ impl DocumentCompiler {
             };
             full_path = path;
         }
+        let filestem = full_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let ext = full_path
             .extension()
             .and_then(|s| s.to_str())
@@ -1775,7 +1773,7 @@ impl DocumentCompiler {
                 BuildonomyError::Codec(msg)
             })?;
 
-        let codec_factory = CODECS.get(ext).ok_or_else(|| {
+        let codec_factory = CODECS.get(filestem, ext).ok_or_else(|| {
             let msg = format!("No codec available for .{} files", ext);
             tracing::warn!("{}", msg);
             BuildonomyError::Codec(msg)

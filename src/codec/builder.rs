@@ -146,7 +146,7 @@ impl GraphBuilder {
             false => {
                 let invalid_err = BuildonomyError::Codec(format!(
                     "GraphBuilder initialization failed. Received root path {repo_root:?}. \
-                     Expected a directory or path to a BeliefNetwork.json or BeliefNetwork.toml file"
+                     Expected a directory or path to a .noet file"
                 ));
                 if let Some(path_name) = repo_root.file_name() {
                     let file_name_str = path_name.to_string_lossy();
@@ -322,7 +322,8 @@ impl GraphBuilder {
         let mut parsed_bids;
         let owned_codec: Box<dyn DocCodec + Send>;
 
-        if let Some(codec_factory) = CODECS.get(doc_ap.ext()) {
+        let (filestem, ext) = doc_ap.codec_parts();
+        if let Some(codec_factory) = CODECS.get(filestem, ext) {
             // Create fresh codec instance from factory
             let mut codec = codec_factory();
             codec.parse(content, initial)?;
@@ -1224,12 +1225,6 @@ impl GraphBuilder {
             .cache_fetch(&other_keys, global_bb.clone(), true, missing_structure)
             .await?;
 
-        // DEBUG: Log cache_fetch result for assets
-        let is_asset = match &other_key_regularized {
-            NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => *net == asset_namespace().bref(),
-            _ => false,
-        };
-
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
                 // Mark these nodes as traces -- we're not guaranteeing that we have all their
@@ -1397,16 +1392,6 @@ impl GraphBuilder {
             Some(weight),
             EventOrigin::Remote,
         ));
-
-        // DEBUG: Log relation creation for assets
-        if is_asset {
-            tracing::info!(
-                "[push_relation] Created RelationChange: source={}, sink={}, kind={:?}",
-                source_bid,
-                sink_bid,
-                kind
-            );
-        }
 
         Ok(GetOrCreateResult::Resolved(other_node, other_node_source))
     }

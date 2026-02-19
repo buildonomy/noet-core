@@ -21,18 +21,19 @@ use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
 use tempfile::TempDir;
 
 /// Helper to create a test directory with sample documents
+/// Helper to create a test network with .noet file
 #[cfg(feature = "service")]
 fn create_test_network(temp_dir: &TempDir) -> PathBuf {
     let network_path = temp_dir.path().join("test_network");
     std::fs::create_dir(&network_path).unwrap();
 
-    // Create BeliefNetwork.toml
+    // Create .noet file
     let network_toml = r#"
 id = "test-network"
 title = "Test Network"
 text = "A test belief network"
 "#;
-    std::fs::write(network_path.join("BeliefNetwork.toml"), network_toml).unwrap();
+    std::fs::write(network_path.join(".noet"), network_toml).unwrap();
 
     // Create a sample markdown document
     let doc1 = r#"# Document 1

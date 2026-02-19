@@ -733,18 +733,34 @@ mod tests {
                 path: "net/.dir#achor".to_string()
             })
         );
+        // .toml files are now treated as assets (not BeliefNetwork documents)
         assert_eq!(
             "net/dir/file.toml".parse::<NodeKey>(),
             Ok(NodeKey::Path {
-                net: default_bref,
+                net: asset_namespace().bref(),
                 path: "net/dir/file.toml".to_string()
             })
         );
         assert_eq!(
             "file.toml".parse::<NodeKey>(),
             Ok(NodeKey::Path {
-                net: default_bref,
+                net: asset_namespace().bref(),
                 path: "file.toml".to_string()
+            })
+        );
+        // .noet files are BeliefNetwork documents (not assets)
+        assert_eq!(
+            "net/dir/.noet".parse::<NodeKey>(),
+            Ok(NodeKey::Path {
+                net: default_bref,
+                path: "net/dir/.noet".to_string()
+            })
+        );
+        assert_eq!(
+            ".noet".parse::<NodeKey>(),
+            Ok(NodeKey::Path {
+                net: default_bref,
+                path: ".noet".to_string()
             })
         );
         assert_eq!(
@@ -784,23 +800,24 @@ mod tests {
         );
 
         // Test path strings with explicit network
+        // .toml files are assets, so they use asset_namespace regardless of specified network
+        let asset_bref = asset_namespace().bref();
         assert_eq!(
             format!("{net_bref}/file.toml").parse::<NodeKey>(),
             Ok(NodeKey::Path {
-                net: net_bref,
+                net: asset_bref,
                 path: "file.toml".to_string()
             })
         );
         assert_eq!(
             format!("{net_bid}/file.toml").parse::<NodeKey>(),
             Ok(NodeKey::Path {
-                net: net_bref,
+                net: asset_bref,
                 path: "file.toml".to_string()
             })
         );
 
-        // Test asset paths use asset_namespace regardless of specified network
-        let asset_bref = asset_namespace().bref();
+        // Test other asset paths also use asset_namespace
         assert_eq!(
             "net/dir/file.png".parse::<NodeKey>(),
             Ok(NodeKey::Path {
