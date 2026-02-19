@@ -52,6 +52,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a new network file with ID and title
+    Init {
+        /// Path where the network file should be created (default: current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Network ID (will prompt if not provided)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Network title (will prompt if not provided)
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Optional network summary
+        #[arg(long)]
+        summary: Option<String>,
+    },
+
     /// Parse a document or directory once and display diagnostics
     Parse {
         /// Path to the document or directory to parse
@@ -137,6 +156,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init {
+            path,
+            id,
+            title,
+            summary,
+        } => {
+            use std::io::Write;
+
+            // Get ID - either from CLI or prompt
+            let network_id = if let Some(id) = id {
+                id
+            } else {
+                print!("Enter network ID: ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                input.trim().to_string()
+            };
+
+            if network_id.is_empty() {
+                eprintln!("Error: Network ID cannot be empty");
+                std::process::exit(1);
+            }
+
+            // Get title - either from CLI or prompt
+            let network_title = if let Some(title) = title {
+                Some(title)
+            } else {
+                print!("Enter network title: ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            };
+
+            // Get summary if provided (no prompt if not on CLI)
+            let network_summary = summary;
+
+            // Create network file
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            runtime.block_on(async {
+                DocumentCompiler::create_network_file(
+                    &path,
+                    &network_id,
+                    network_title,
+                    network_summary,
+                )
+                .await
+            })?;
+
+            // Network file is always named .noet
+            let full_path = path.join(".noet");
+
+            println!("✓ Network file created: {}", full_path.display());
+            Ok(())
+        }
+
         Commands::Parse {
             path,
             verbose,

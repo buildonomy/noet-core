@@ -203,6 +203,7 @@ const BUILTIN_EXTENSIONS: &[&str] = &["md"];
 /// - `(None, Some("md"), factory)` - Match all `.md` files
 /// - `(Some(".noet"), None, factory)` - Match files named `.noet`
 /// - `(Some("config"), Some("toml"), factory)` - Match `config.toml` files
+#[cfg(not(target_arch = "wasm32"))]
 type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 
 /// [ ] Need to iterate out protobeliefstate
@@ -605,6 +606,18 @@ impl CodecMap {
 
     pub fn extensions(&self) -> Vec<String> {
         BUILTIN_EXTENSIONS.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Check if a codec exists for the given anchor path (WASM version).
+    ///
+    /// This is a simplified version for WASM that only checks built-in extensions.
+    pub fn has_codec_for_anchor_path(&self, anchor_path: &crate::paths::path::AnchorPath) -> bool {
+        let ext = anchor_path.ext();
+        if !ext.is_empty() {
+            BUILTIN_EXTENSIONS.contains(&ext)
+        } else {
+            false
+        }
     }
 }
 

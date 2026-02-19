@@ -1177,7 +1177,7 @@ impl BeliefBaseWasm {
         let filepath = anchor_path.filepath();
 
         // Check if this is a codec document path
-        let normalized = if CODECS.has_codec_for_anchor_path(&anchor_path) {
+        let mut normalized = if CODECS.has_codec_for_anchor_path(&anchor_path) {
             // Replace codec extension with .html
             anchor_path.replace_extension("html")
         } else if !filepath.ends_with(".html") {
