@@ -44,9 +44,9 @@ const TEMPLATE_RESPONSIVE: &str = include_str!("../../assets/template-responsive
 /// Only included when bin feature is enabled (for CLI with HTML generation)
 /// Note: WASM is compiled with --features wasm --no-default-features (different from main build)
 #[cfg(feature = "bin")]
-const WASM_JS_GLUE: &[u8] = include_bytes!("../../pkg/noet_core.js");
+const WASM_JS_GLUE: &[u8] = include_bytes!("../../target/wasm-build/pkg/noet_core.js");
 #[cfg(feature = "bin")]
-const WASM_BINARY: &[u8] = include_bytes!("../../pkg/noet_core_bg.wasm");
+const WASM_BINARY: &[u8] = include_bytes!("../../target/wasm-build/pkg/noet_core_bg.wasm");
 
 /// Available HTML layout templates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

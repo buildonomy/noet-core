@@ -77,7 +77,7 @@ test-output/                   # Ad-hoc testing at project root
 
 GitHub Actions runs automatically:
 - Cross-platform tests (Linux, macOS, Windows)
-- Multiple Rust versions (stable, beta, MSRV 1.85)
+- Multiple Rust versions (stable, beta, MSRV 1.88)
 - Feature combinations
 - Formatting, linting, docs, examples, coverage
 

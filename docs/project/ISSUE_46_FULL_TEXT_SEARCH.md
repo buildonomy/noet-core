@@ -1,13 +1,49 @@
 # Issue 46: Full-Text Search with Tantivy
 
+**STATUS**: SUPERSEDED - Split into ISSUE_48 (MVP) and ISSUE_49 (Production)
+
 **Priority**: HIGH
-**Estimated Effort**: 16-24 days
+**Estimated Effort**: 16-24 days (SPLIT: 5-7 days MVP + 8-12 days Production)
 **Dependencies**: None (integrates with existing daemon/service architecture)
 **Version**: 0.1
 
-## Summary
+---
+
+## Superseded Notice
+
+This issue has been split into two focused issues:
+
+1. **ISSUE_48: Full-Text Search MVP - Embedded WASM** (5-7 days)
+   - Per-network indexing architecture
+   - Embedded Tantivy in WASM for static HTML output
+   - Keyword + fuzzy search
+   - Memory budget management (50/50 BeliefBase + search)
+   - Works with `noet parse` and `noet watch`
+
+2. **ISSUE_49: Full-Text Search Production - Scalable Service** (8-12 days)
+   - Event stream integration for incremental updates
+   - Daemon mode integration
+   - HTTP API with Docker container
+   - GB-scale performance benchmarking
+   - Production deployment guide
+
+**Rationale for split**: 
+- MVP establishes per-network indexing architecture (critical foundation)
+- Production adds scaling, daemon integration, and deployment
+- Allows earlier delivery of basic search functionality
+- Cleaner separation of concerns (embedded vs. service)
+
+See `.scratchpad/search_architecture_review.md` for architectural deep dive.
+
+---
+
+## Original Issue Content (For Reference)
+
+## Summary (Original)
 
 Implement full-text search capability using Tantivy to support both local daemon (editor workflow) and CI/CD deployment (GitHub Pages + search container) use cases. The system must scale to GB-level document collections with incremental indexing, stemming, and rich query features.
+
+**Note**: This has been refined and split into ISSUE_48 (MVP) and ISSUE_49 (Production) based on architectural review.
 
 ## Goals
 

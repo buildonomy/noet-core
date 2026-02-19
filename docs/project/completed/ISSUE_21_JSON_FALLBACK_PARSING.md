@@ -175,7 +175,7 @@ fn detect_network_file(dir: &Path) -> Option<(PathBuf, MetadataFormat)>;
 - [x] Made `serde_json` a core dependency (was optional)
 - [x] Create `parse_json_to_document()` helper
 - [x] Create `parse_toml_to_document()` helper
-- [x] Add `serde_yaml = "0.9"` as core dependency (MSRV 1.85 compatible)
+- [x] Add `serde_yaml = "0.9"` as core dependency (MSRV 1.88 compatible)
 - [x] Create `parse_yaml_to_document()` helper
 - [x] Implement multi-format conversion: YAML → JSON::Value → TOML (reuses existing `json_to_toml_string`)
 - [x] Handle type edge cases:

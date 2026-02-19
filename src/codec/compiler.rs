@@ -905,7 +905,10 @@ impl DocumentCompiler {
                 continue;
             }
 
-            let asset_absolute_path = self.builder.repo_root().join(repo_relative_path);
+            let asset_absolute_path = self
+                .builder
+                .repo_root()
+                .join(string_to_os_path(repo_relative_path));
 
             if !self.processed.contains_key(&asset_absolute_path) {
                 tracing::info!(
@@ -1942,7 +1945,7 @@ impl DocumentCompiler {
 
             // Copy to canonical location (once per content hash)
             if !copied_canonical.contains(&canonical) {
-                let repo_full_path = self.builder.repo_root().join(asset_path);
+                let repo_full_path = self.builder.repo_root().join(string_to_os_path(asset_path));
 
                 // Verify source file exists
                 if !repo_full_path.exists() {
@@ -1977,7 +1980,9 @@ impl DocumentCompiler {
             }
 
             // Create hardlink at semantic path in pages/ subdirectory (where HTML documents are)
-            let html_full_path = html_output_dir.join("pages").join(asset_path);
+            let html_full_path = html_output_dir
+                .join("pages")
+                .join(string_to_os_path(asset_path));
 
             // Create parent directories for semantic path
             if let Some(parent) = html_full_path.parent() {

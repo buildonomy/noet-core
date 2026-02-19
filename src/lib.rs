@@ -251,7 +251,7 @@ pub mod properties;
 pub mod query;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
 #[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod watch;

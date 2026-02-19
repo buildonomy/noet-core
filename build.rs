@@ -6,25 +6,32 @@
 //!
 //! ## WASM Build Strategy
 //!
-//! For distribution (crates.io), WASM artifacts should be pre-built and included:
-//! 1. Run: `./scripts/build-full.sh` (or manually build WASM as shown below)
-//! 2. Commit pkg/ directory
+//! **Standard approach:**
+//!   cargo build --features bin                # Automatically builds WASM if missing
+//!   cargo build --features "bin service"      # Full features including daemon
+//!
+//! **For distribution (crates.io):**
+//! 1. Pre-build WASM: `cargo build --features bin`
+//! 2. Commit target/wasm-build/pkg/ directory
 //! 3. Publish to crates.io with pre-built artifacts
 //!
-//! For development, this script will build WASM if pkg/ is missing using:
-//!   cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
-//!   wasm-bindgen target/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir pkg --target web
+//! ## How Automatic WASM Build Works
 //!
-//! ## Troubleshooting Build Hangs
+//! When `bin` feature is enabled and target/wasm-build/pkg/ is missing, this script:
+//! 1. Uses isolated target directory (target/wasm-build/) to avoid file locks
+//! 2. Clears CARGO_FEATURE_SERVICE/BIN env vars (prevents feature conflicts)
+//! 3. Spawns: `cargo build --target wasm32-unknown-unknown --no-default-features --features wasm`
+//! 4. Runs: `wasm-bindgen target/wasm-build/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir target/wasm-build/pkg --target web`
+//! 5. Original build continues with WASM artifacts embedded from target/wasm-build/pkg/
 //!
-//! If builds hang with "waiting for file lock on artifact directory":
-//! 1. Kill stale cargo processes: `killall cargo`
-//! 2. Clean build state: `cargo clean`
-//! 3. Remove WASM artifacts: `rm -rf pkg/`
-//! 4. Retry build
+//! The isolated target directory eliminates file lock conflicts between parent and nested builds.
 //!
-//! This happens when wasm-pack gets interrupted (Ctrl+C, timeout, crash) and
-//! leaves stale locks in target/.cargo-lock.
+//! ## Troubleshooting Build Issues
+//!
+//! If you encounter problems:
+//! 1. Clean all build artifacts: `cargo clean` (this includes target/wasm-build/)
+//! 2. Verify wasm-bindgen is installed: `cargo install wasm-bindgen-cli`
+//! 3. Check that wasm32-unknown-unknown target is installed: `rustup target add wasm32-unknown-unknown`
 
 use std::env;
 use std::path::PathBuf;
@@ -36,37 +43,12 @@ fn main() {
     println!("cargo:rerun-if-changed=src/beliefbase.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
-    // Guard against incompatible feature combinations
-    // The `wasm` and `service` features are mutually exclusive
-    let has_wasm = env::var("CARGO_FEATURE_WASM").is_ok();
-    let has_service = env::var("CARGO_FEATURE_SERVICE").is_ok();
-
-    if has_wasm && has_service {
-        eprintln!("\n=== ERROR ===");
-        eprintln!("Incompatible feature combination detected!");
-        eprintln!("Cannot build with both 'wasm' and 'service' features enabled.");
-        eprintln!("\nThe 'wasm' feature (for browser WASM) is incompatible with:");
-        eprintln!("  - 'service' (filesystem, tokio runtime, sqlx, file watching)");
-        eprintln!("\nValid build commands:");
-        eprintln!("  cargo build --features bin              # CLI with WASM for HTML generation");
-        eprintln!("  cargo build --features service          # Library with service features");
-        eprintln!("  cargo build --no-default-features       # Library only");
-        eprintln!("\nFor full features (CLI + daemon + WASM):");
-        eprintln!("  ./scripts/build-full.sh                 # Two-phase build");
-        eprintln!("\nDo NOT use:");
-        eprintln!("  cargo build --all-features              # ❌ Invalid combination");
-        eprintln!("  cargo build --features \"wasm service\"   # ❌ Invalid combination");
-        eprintln!("=============\n");
-        panic!("Incompatible features: wasm + service");
-    }
-
     // Check if we should verify/build WASM
     // WASM is needed when the bin feature is enabled (for CLI with HTML generation)
     let should_have_wasm = env::var("CARGO_FEATURE_BIN").is_ok();
 
     if !should_have_wasm {
-        println!("cargo:warning=Skipping WASM check (bin feature not enabled)");
-        println!("cargo:warning=WASM is only needed when building the CLI binary");
+        // Not building with bin feature - skip WASM build
         return;
     }
 
@@ -75,8 +57,7 @@ fn main() {
 
     match wasm_bindgen_check {
         Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            println!("cargo:warning=Found wasm-bindgen: {}", version.trim());
+            // wasm-bindgen available
         }
         _ => {
             eprintln!("\n=== ERROR ===");
@@ -84,9 +65,7 @@ fn main() {
             eprintln!("\nTo install wasm-bindgen-cli:");
             eprintln!("  cargo install wasm-bindgen-cli");
             eprintln!("\nAlternatively, build without WASM support:");
-            eprintln!("  cargo build --no-default-features");
-            eprintln!("\nOr use the build script that handles everything:");
-            eprintln!("  ./scripts/build-full.sh");
+            eprintln!("  cargo build --features service");
             eprintln!("=============\n");
             panic!("wasm-bindgen is required to build noet-core with WASM support");
         }
@@ -94,7 +73,10 @@ fn main() {
 
     // Get the manifest directory (project root)
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let pkg_dir = manifest_dir.join("pkg");
+
+    // Use wasm-build target directory for both compilation and pkg/ artifacts
+    let wasm_target_dir = manifest_dir.join("target").join("wasm-build");
+    let pkg_dir = wasm_target_dir.join("pkg");
 
     // Check if pkg/ already exists and has fresh artifacts
     let wasm_file = pkg_dir.join("noet_core_bg.wasm");
@@ -104,20 +86,21 @@ fn main() {
 
     // Check if artifacts exist (pre-built or from previous build)
     if artifacts_exist {
-        println!("cargo:warning=✓ Using pre-built WASM artifacts from pkg/");
-        println!("cargo:warning=  (noet_core.js, noet_core_bg.wasm)");
+        // Using cached WASM - no output needed
         return;
     }
 
     // Artifacts don't exist - need to build them
-    println!("cargo:warning=WASM artifacts not found in pkg/");
-    println!("cargo:warning=Building WASM module with cargo + wasm-bindgen...");
-    println!("cargo:warning=");
+    println!("cargo:warning=Compiling WASM module for HTML generation...");
 
-    // Step 1: Build WASM module with cargo
-    println!("cargo:warning=Step 1: Building WASM with cargo...");
+    // Clear parent build's feature flags to avoid inheritance
+    // The nested WASM build uses isolated features (wasm only), so we clear
+    // the parent's BIN and SERVICE flags to prevent feature conflicts
     let cargo_status = Command::new("cargo")
         .current_dir(&manifest_dir)
+        .env("CARGO_TARGET_DIR", &wasm_target_dir)
+        .env_remove("CARGO_FEATURE_BIN")
+        .env_remove("CARGO_FEATURE_SERVICE")
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
@@ -128,7 +111,7 @@ fn main() {
 
     match cargo_status {
         Ok(status) if status.success() => {
-            println!("cargo:warning=✓ WASM cargo build successful");
+            // WASM compilation successful
         }
         Ok(status) => {
             eprintln!("\n=== ERROR ===");
@@ -150,13 +133,11 @@ fn main() {
     }
 
     // Step 2: Generate JavaScript bindings with wasm-bindgen
-    println!("cargo:warning=Step 2: Generating JavaScript bindings...");
 
     // Create pkg directory if it doesn't exist
     std::fs::create_dir_all(&pkg_dir).expect("Failed to create pkg/ directory");
 
-    let wasm_input = manifest_dir
-        .join("target")
+    let wasm_input = wasm_target_dir
         .join("wasm32-unknown-unknown")
         .join("debug")
         .join("noet_core.wasm");
@@ -165,20 +146,20 @@ fn main() {
         .current_dir(&manifest_dir)
         .arg(&wasm_input)
         .arg("--out-dir")
-        .arg("pkg")
+        .arg(&pkg_dir)
         .arg("--target")
         .arg("web")
         .status();
 
     match bindgen_status {
         Ok(status) if status.success() => {
-            println!("cargo:warning=✓ wasm-bindgen successful");
+            println!("cargo:warning=WASM build complete");
         }
         Ok(status) => {
             eprintln!("\n=== ERROR ===");
             eprintln!("wasm-bindgen failed with exit code: {:?}", status.code());
             eprintln!("\nTry running manually:");
-            eprintln!("  wasm-bindgen target/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir pkg --target web");
+            eprintln!("  wasm-bindgen target/wasm-build/wasm32-unknown-unknown/debug/noet_core.wasm --out-dir target/wasm-build/pkg --target web");
             eprintln!("=============\n");
             panic!("wasm-bindgen failed");
         }
@@ -192,11 +173,9 @@ fn main() {
 
     // Verify artifacts were created
     if !wasm_file.exists() {
-        panic!("WASM build succeeded but pkg/noet_core_bg.wasm not found");
+        panic!("WASM build succeeded but target/wasm-build/pkg/noet_core_bg.wasm not found");
     }
     if !js_file.exists() {
-        panic!("WASM build succeeded but pkg/noet_core.js not found");
+        panic!("WASM build succeeded but target/wasm-build/pkg/noet_core.js not found");
     }
-
-    println!("cargo:warning=✓ WASM artifacts ready for embedding");
 }

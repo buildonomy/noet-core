@@ -202,6 +202,37 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 **Related**: Used in `built_in_test()` to check for orphaned edges without cloning entire graph.
 
 
+## BeliefBase and Search Index Sharding (from Issue 48/50)
+
+**Priority**: MEDIUM - Performance improvement for large repositories
+
+**Context**: ISSUE_48 implements per-network search index sharding. ISSUE_50 extends this paradigm to BeliefBase JSON export/loading with unified ShardManager.
+
+### Unified Sharding Architecture
+- Per-network sharding for both BeliefBase JSON and search indices
+- Unified ShardManager API for consistent memory management
+- 200MB total budget: 50% BeliefBase + 50% search indices
+- User selects which networks to load (controls memory footprint)
+- Automatic sharding when total size exceeds 10MB threshold
+
+### Implementation Status
+- ISSUE_48 (Search MVP): Establishes per-network indexing architecture
+- ISSUE_50 (BeliefBase Sharding): Extends pattern to beliefbase.json
+- Both share ShardManager abstraction for consistency
+
+### Future Enhancements
+- Per-document sharding for very large networks (1000+ documents)
+- Server-side shard streaming (fetch on-demand)
+- IndexedDB caching for loaded shards
+- Compression for shard JSON (gzip, brotli)
+- Network dependency resolution (auto-load referenced networks)
+- Shard preloading based on navigation patterns
+
+**Related Files**:
+- Export: `src/codec/compiler.rs::export_beliefbase_json()`
+- Loading: `assets/viewer.js::initializeWasm()`
+- Sharding: `src/shard/manager.rs` (to be implemented)
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

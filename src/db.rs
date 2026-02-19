@@ -72,14 +72,49 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn track_file_mtime(&mut self, path: &Path) -> Result<(), BuildonomyError> {
-        let metadata = fs::metadata(path)?;
-        let mtime = metadata
-            .modified()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| BuildonomyError::Io(format!("SystemTimeError: {}", e)))?
-            .as_secs() as i64;
+        tracing::debug!("[Transaction] track_file_mtime called for path: {:?}", path);
+        tracing::debug!(
+            "[Transaction] path exists: {}, path is_absolute: {}",
+            path.exists(),
+            path.is_absolute()
+        );
 
-        self.mtime_updates.insert(path.to_path_buf(), mtime);
+        match fs::metadata(path) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let mtime = duration.as_secs() as i64;
+                        self.mtime_updates.insert(path.to_path_buf(), mtime);
+                        tracing::debug!(
+                            "[Transaction] Successfully tracked mtime {} for {:?}",
+                            mtime,
+                            path
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[Transaction] Failed to get duration since epoch for {:?}: {}",
+                            path,
+                            e
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "[Transaction] Failed to get modified time for {:?}: {}",
+                        path,
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "[Transaction] Failed to get metadata for {:?}: {} (path may not exist or be inaccessible)",
+                    path,
+                    e
+                );
+            }
+        }
         Ok(())
     }
 
@@ -467,8 +502,8 @@ fn get_all_document_paths(
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0
                 row_results.splice(start_idx..start_idx + 1, sub_results.into_iter());
                 // Increment indices to account for our splice
-                for next_idx in (row_nets_index + 1)..row_nets.len() {
-                    row_nets[next_idx].0 += incr;
+                for net in row_nets.iter_mut().skip(row_nets_index + 1) {
+                    net.0 += incr;
                 }
             }
         }
@@ -562,8 +597,8 @@ fn get_network_paths(
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0
                 row_results.splice(start_idx..start_idx + 1, sub_results.into_iter());
                 // Increment indices to account for our splice
-                for next_idx in (row_nets_index + 1)..row_nets.len() {
-                    row_nets[next_idx].0 += incr;
+                for net in row_nets.iter_mut().skip(row_nets_index + 1) {
+                    net.0 += incr;
                 }
             }
         }

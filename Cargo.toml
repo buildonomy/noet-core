@@ -7,7 +7,7 @@ documentation = "https://docs.rs/noet-core"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/buildonomy/noet-core"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 readme = "README.md"
 keywords = ["knowledge-management", "hypergraph", "markdown", "sync", "graph"]
 categories = ["data-structures", "parsing", "database"]
@@ -94,25 +94,25 @@ trybuild = "1.0"
 
 [features]
 default = []
-bin = ["clap", "ctrlc", "tracing-subscriber", "service"]
-service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http"]
+bin = ["clap", "tracing-subscriber", "wasm"]
+service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures"]
 
-# WARNING: Do NOT use --all-features!
-# The 'wasm' and 'service' features are mutually exclusive:
-# - 'wasm' is for browser WASM (no filesystem, no native I/O)
-# - 'service' includes sqlx, tokio runtime, file watching (requires native platform)
+# Feature Notes:
+# - 'wasm' is for browser WASM target (no filesystem, no native I/O)
+# - 'service' includes daemon, file watching, database sync (native platform only)
+# - 'bin' is the CLI with parsing and HTML generation (includes embedded WASM)
+#   (build.rs compiles WASM separately with isolated target directory)
 #
 # Valid build commands:
 #   cargo build                         # Library only (no features)
-#   cargo build --features service      # Library with service features
-#   cargo build --features bin          # CLI with WASM (requires pre-built WASM artifacts)
-#   cargo build --features "bin service" # CLI with daemon/watching features
-#   ./scripts/build-full.sh             # Proper two-phase build for full binary
+#   cargo build --features service      # Library with daemon/watch features
+#   cargo build --features bin          # CLI for parsing and HTML generation
+#   cargo build --features "bin service" # CLI with all features
 #   cargo test --features service       # Run tests
 #
-# Invalid:
-#   cargo build --all-features  # ❌ Combines incompatible features
+# Note: The 'wasm' feature is for the WASM target build, not the native build.
+# When building with 'bin', build.rs automatically compiles a separate WASM module.
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.40", features = ["fs", "time", "rt", "rt-multi-thread"] }

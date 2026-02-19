@@ -79,7 +79,7 @@ Current features in `Cargo.toml`:
 - [x] Created comprehensive test matrix workflow
 - [x] Matrix dimensions: OS (3) × Rust (2) × Features (3) = 18 combinations
 - [x] Parallel execution for fast feedback
-- [x] Separate jobs for: MSRV, examples, lint, docs, security, coverage, standalone
+- [x] Separate jobs for: MSRV (1.88), examples, lint, docs, security, coverage, standalone
 - [x] Artifact uploads for documentation and coverage reports
 - [x] Summary job for branch protection
 - [x] **All CI checks passing** (test matrix, MSRV, examples, lint, docs, standalone)
@@ -93,7 +93,7 @@ features: [no-default, service, all]
 ```
 
 **Additional Jobs**:
-- MSRV check (Rust 1.85) ✅
+- MSRV check (Rust 1.88) ✅
 - Example verification ✅
 - Lint (rustfmt + clippy) ✅
 - Documentation generation ✅
@@ -107,7 +107,7 @@ features: [no-default, service, all]
 - [x] Fixed security audit: Configured `audit.toml` to ignore acceptable warnings (paste unmaintained, stale rsa lockfile entry)
 - [x] Fixed standalone test: Replaced manual Cargo.toml editing with `cargo add` command
 - [x] Fixed Windows path tests: Normalized paths to forward slashes for cross-platform Markdown compatibility
-- [x] Fixed MSRV compatibility: Locked `time` to 0.3.45, `reactive_stores` to 0.1.x (0.3.x requires non-existent Rust 1.88)
+- [x] Fixed MSRV compatibility: Updated MSRV to 1.88 to support required dependencies (`time` 0.3.47+ requires Rust 1.88)
 - [x] Updated `Cargo.toml`: sqlx with `default-features = false` to exclude unused MySQL/PostgreSQL backends
 
 **Success Criteria** ✅:
@@ -153,7 +153,7 @@ features: [no-default, service, all]
    - [x] Verifies public API works in isolation
    - [x] **Verify CI standalone test passes** - Fixed and passing ✅
    - [x] **Test with different Rust versions via GitHub Actions** (stable, beta, MSRV) - All passing ✅
-   - [x] **Document minimum supported Rust version (MSRV)**: **Rust 1.85** - Specified in Cargo.toml
+   - [x] **Document minimum supported Rust version (MSRV)**: **Rust 1.88** - Specified in Cargo.toml
    
    **GitHub Actions workflow**:
    ```yaml
@@ -573,7 +573,7 @@ Expand `tests/service_integration.rs` skeleton to cover:
 - [x] **Tests verified on all 3 platforms: Linux, macOS, Windows** (via GitHub Actions) ✅
 - [x] **Standalone crate test successful** (via GitHub Actions) ✅
 - [x] **Security audit passing** with documented rationale in `audit.toml` ✅
-- [x] **MSRV compatibility fixed** (Rust 1.85.1) ✅
+- [x] **MSRV compatibility fixed** (Rust 1.88) ✅
 - [x] **Windows path compatibility fixed** ✅
 - [ ] Test coverage report generated and reviewed (Codecov integrated)
 - [ ] Performance baselines established (benchmarks run on main)
@@ -627,7 +627,7 @@ Expand `tests/service_integration.rs` skeleton to cover:
 
 ## Open Questions
 
-1. ~~What's our minimum supported Rust version (MSRV)?~~ **RESOLVED: 1.85 (specified in Cargo.toml)**
+1. ~~What's our minimum supported Rust version (MSRV)?~~ **RESOLVED: 1.88 (specified in Cargo.toml, updated from 1.85 due to `time` crate dependency)**
 2. ~~Should we test on Rust beta/nightly, or just stable?~~ **RESOLVED: Testing stable + beta**
 3. Coverage target: 70%, 80%, or best-effort?
 4. Which benchmark results should we publish?

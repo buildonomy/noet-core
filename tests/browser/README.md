@@ -124,7 +124,7 @@ This provides a realistic test environment for WASM functionality.
 ### WASM module won't load
 - Check browser console for CORS errors
 - Ensure HTTP server is running (not `file://` protocol)
-- Verify `pkg/noet_core_bg.wasm` exists and is ~2.1MB
+- Verify `target/wasm-build/pkg/noet_core_bg.wasm` exists and is ~2.1MB
 
 ### beliefbase.json not found
 - Run `./target/debug/noet parse tests/network_1 --html-output tests/browser/test-output`
@@ -132,7 +132,7 @@ This provides a realistic test environment for WASM functionality.
 
 ### Tests fail with "Module not found"
 - Ensure WASM was built with: `wasm-pack build --target web`
-- Check that `pkg/noet_core.js` exists
+- Check that `target/wasm-build/pkg/noet_core.js` exists
 
 ### Console shows no logs
 - WASM methods log to console automatically
