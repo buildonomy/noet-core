@@ -110,7 +110,7 @@ enum Commands {
         #[arg(long)]
         cdn: bool,
 
-        /// Base URL for sitemap and canonical URLs (e.g., https://username.github.io/repo)
+        /// Base URL for sitemap and canonical URLs (e.g., <https://username.github.io/repo>)
         /// Can also be set via NOET_BASE_URL environment variable
         #[arg(long)]
         base_url: Option<String>,

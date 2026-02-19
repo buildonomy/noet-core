@@ -66,12 +66,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          # Clean up pre-installed tools to save space
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.features }}
+          cache-on-failure: false
 
       - name: Cache wasm-bindgen-cli
         uses: actions/cache@v4
@@ -83,26 +97,6 @@ jobs:
       - name: Install wasm-bindgen-cli
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-index-
-
-      - name: Cache cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ matrix.features }}-
-            ${{ runner.os }}-${{ matrix.rust }}-cargo-
-            ${{ runner.os }}-cargo-
 
       - name: Build (no default features)
         if: matrix.features == 'no-default'
@@ -176,14 +170,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: msrv
 
       - name: Check MSRV
         run: |
@@ -213,14 +203,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: examples-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: examples
 
       - name: Build examples
         run: cargo build --examples --features service
@@ -256,14 +242,10 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: wasm-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: wasm-test
 
       - name: Build WASM module
         run: cargo build --features bin
@@ -310,14 +292,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: lint
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -348,14 +326,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: docs-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: docs
 
       - name: Generate documentation
         run: cargo doc --no-deps --all-features
@@ -433,6 +407,11 @@ jobs:
         if: steps.cache-tarpaulin.outputs.cache-hit != 'true'
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+
       - name: Run coverage with tarpaulin
         run: cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
 
@@ -474,14 +453,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bench
 
       - name: Run benchmarks
         run: |
