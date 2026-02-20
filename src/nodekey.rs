@@ -346,12 +346,6 @@ impl FromStr for NodeKey {
             remainder
         };
 
-        if remainder.is_empty() {
-            return Err(BuildonomyError::Serialization(format!(
-                "Cannot construct a NodeKey from an empty value. Received {}",
-                s
-            )));
-        }
         // For bare strings (no scheme), check if entire string is BID/Bref before network parsing
         if scheme_str.is_empty() {
             if let Ok(bid) = Bid::try_from(remainder) {
@@ -371,9 +365,11 @@ impl FromStr for NodeKey {
             }
         }
         // For bid:// and bref:// schemes without a slash, skip network parsing
-        // The entire string IS the bid/bref value
-        let skip_network =
-            matches!(scheme, NodeKeyScheme::Bid | NodeKeyScheme::Bref) && first_slash_pos.is_none();
+        // The entire string IS the bid/bref/id value
+        let skip_network = matches!(
+            scheme,
+            NodeKeyScheme::Bid | NodeKeyScheme::Bref | NodeKeyScheme::Id
+        ) && first_slash_pos.is_none();
 
         let (net, network_parsed) = if skip_network || potential_network.is_empty() {
             (Bid::nil().bref(), false)
@@ -704,6 +700,16 @@ mod tests {
         assert_eq!(format!("id://{id_str}").parse::<NodeKey>(), Ok(id_nil_nk));
 
         assert!(String::new().parse::<NodeKey>().is_err());
+
+        // Test that id::bref works
+        let id_bref_nk = NodeKey::Id {
+            net: Bid::nil().bref(),
+            id: net_bref.to_string(),
+        };
+        assert_eq!(
+            format!("id://{net_bref}").parse::<NodeKey>(),
+            Ok(id_bref_nk.clone())
+        );
 
         // Test bare strings without slashes (treated as normalized Id)
         let title_str = " Abc 123 789";
