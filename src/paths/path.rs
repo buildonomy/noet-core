@@ -278,11 +278,12 @@ impl<'a> AnchorPath<'a> {
     /// See tests module for examples.
     pub fn normalize(&self) -> String {
         let mut components = Vec::new();
+        let mut final_components = Vec::new();
         let mut pop_dist = 0;
-        for part in self.filepath().split('/') {
+        for (idx, part) in self.filepath().split('/').enumerate() {
             match part {
                 "" => {
-                    if components.is_empty() {
+                    if idx == 0 {
                         // Preserve absolute paths
                         components.push("")
                     }
@@ -303,7 +304,8 @@ impl<'a> AnchorPath<'a> {
                         0
                     };
                     if pop_diff > 0 {
-                        components = vec![".."; pop_diff];
+                        final_components.append(&mut vec![".."; pop_diff]);
+                        components.clear();
                         pop_dist = 0;
                     } else if pop_dist > 0 {
                         let idx = components.len() - pop_dist;
@@ -312,10 +314,11 @@ impl<'a> AnchorPath<'a> {
                             push_part = false;
                             pop_dist -= 1;
                         } else {
-                            for _ in 0..pop_dist {
-                                components.pop();
+                            while pop_dist > 0 {
+                                pop_dist -= 1;
+                                let res = components.pop();
+                                debug_assert!(res.is_some());
                             }
-                            pop_dist = 0;
                         }
                     }
                     if push_part {
@@ -324,11 +327,18 @@ impl<'a> AnchorPath<'a> {
                 }
             }
         }
-        for _ in 0..pop_dist {
-            components.pop();
+        if pop_dist > components.len() {
+            let pop_diff = pop_dist - components.len();
+            final_components.append(&mut vec![".."; pop_diff]);
+            components.clear();
+        } else {
+            for _ in 0..pop_dist {
+                components.pop();
+            }
         }
+        final_components.append(&mut components);
 
-        let filepath = components.join("/");
+        let filepath = final_components.join("/");
         let res = if !self.anchor().is_empty() {
             format!("{}#{}", filepath, self.anchor())
         } else {
@@ -368,11 +378,11 @@ impl<'a> AnchorPath<'a> {
 
         // Check if to_path starts with anchor - handle same-document anchors
         if to_clean.path.starts_with('#') {
-            return to_clean.to_string();
-        }
-
-        if to_clean.is_absolute() && !from_clean.is_absolute() {
-            return to_clean.to_string();
+            return normalized_to;
+        } else if to_clean.is_absolute() && !from_clean.is_absolute() {
+            return normalized_to;
+        } else if rooted && to_clean.path.starts_with("../") {
+            return normalized_to;
         }
 
         let joined_string = if !rooted {
@@ -418,19 +428,13 @@ impl<'a> AnchorPath<'a> {
         if common_len == 0 && from_clean.is_absolute() {
             return joined_string;
         }
-
-        let from_backtrack_len = if rooted {
-            to_parts.iter().filter(|part| **part == "..").count()
-        } else {
-            0
-        };
         // Build relative path
         let mut result = Vec::new();
 
         // Add ../ for each remaining directory in from_path
 
-        if (from_parts.len() - from_backtrack_len) > common_len {
-            for _ in common_len..(from_parts.len() - from_backtrack_len) {
+        if from_parts.len() > common_len {
+            for _ in common_len..from_parts.len() {
                 result.push("..".to_string());
             }
         }
@@ -645,6 +649,15 @@ mod tests {
             AnchorPath::from("../../dir/file.md").normalize(),
             "../../dir/file.md"
         );
+        assert_eq!(AnchorPath::from("dir/.././file.md").normalize(), "file.md");
+        assert_eq!(
+            AnchorPath::from("/dir/.././file.md").normalize(),
+            "/file.md"
+        );
+        assert_eq!(
+            AnchorPath::from("..//../dir/.././file.md").normalize(),
+            "../../file.md"
+        );
         assert_eq!(
             AnchorPath::from("/dir/.//file.md").normalize(),
             "/dir/file.md"
@@ -660,6 +673,10 @@ mod tests {
 
         let rel = AnchorPath::from("docs/guide.md").path_to("../docs/reference/api.md", true);
         assert_eq!(rel, "../docs/reference/api.md");
+
+        let rel =
+            AnchorPath::from("docs/guide.md").path_to("../..//../docs/../reference/./api.md", true);
+        assert_eq!(rel, "../../../reference/api.md");
         // relative to docs, move down two directories, then move back into a
 
         // different docs directory
