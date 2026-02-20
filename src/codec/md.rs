@@ -114,6 +114,7 @@ struct LinkAccumulator {
     range: Option<Range<usize>>,
     title_events: Vec<MdEvent<'static>>,
     is_image: bool,
+    title: CowStr<'static>,
 }
 
 impl LinkAccumulator {
@@ -123,6 +124,7 @@ impl LinkAccumulator {
                 link_type,
                 dest_url,
                 id,
+                title,
                 ..
             }) => Some(LinkAccumulator {
                 link_type: *link_type,
@@ -131,12 +133,13 @@ impl LinkAccumulator {
                 range: range.clone(),
                 title_events: vec![],
                 is_image: false,
+                title: title.clone().into_static(),
             }),
             MdEvent::Start(MdTag::Image {
                 link_type,
                 dest_url,
                 id,
-                ..
+                title,
             }) => Some(LinkAccumulator {
                 link_type: *link_type,
                 dest_url: dest_url.clone().into_static(),
@@ -144,6 +147,7 @@ impl LinkAccumulator {
                 range: range.clone(),
                 title_events: vec![],
                 is_image: true,
+                title: title.clone().into_static(),
             }),
             _ => None,
         }
@@ -292,46 +296,29 @@ fn check_for_link_and_push(
     stop_event: Option<&MdEvent<'_>>,
 ) -> bool {
     let mut changed = false;
-    let mut collector: Option<LinkAccumulator> = None;
+    let mut collector_stack: Vec<LinkAccumulator> = Vec::new();
     let mut maybe_event = events_in.pop_front();
     while let Some((event, range)) = maybe_event.take() {
         let stop_event_match = stop_event.filter(|e| **e == event).is_some();
         let mut process_link = false;
-        let mut original_title_attr: Option<CowStr<'static>> = None;
-
-        if let MdEvent::Start(MdTag::Link { title, .. }) = &event {
-            debug_assert!(collector.is_none());
-            collector = LinkAccumulator::new(&event, &range);
-            // Store the original title attribute for parsing
-            original_title_attr = Some(title.clone().into_static());
-        } else if let MdEvent::Start(MdTag::Image { title, .. }) = &event {
-            debug_assert!(collector.is_none());
-            collector = LinkAccumulator::new(&event, &range);
-            // Store the original title attribute for parsing (though images use alt text)
-            original_title_attr = Some(title.clone().into_static());
-        } else if let Some(link_accumulator) = collector.as_mut() {
+        if let Some(link_accumulator) = LinkAccumulator::new(&event, &range) {
+            collector_stack.push(link_accumulator);
+        } else if let Some(link_accumulator) = collector_stack.last_mut() {
             process_link = link_accumulator.push(&event, &range);
         }
 
         // Don't push events if we're collecting a link
-        if collector.is_none() {
+        if collector_stack.is_empty() {
             events_out.push_back((event, range));
         } else if process_link {
-            let mut link_data = collector
-                .take()
-                .expect("Process_link is only true if collector is some.");
+            let mut link_data = collector_stack
+                .pop()
+                .expect("Process_link is only true if collector stack is not empty.");
 
             let link_text = link_data.title_string();
 
             // Parse the title attribute to check for existing Bref
-            let title_parts = original_title_attr
-                .as_ref()
-                .map(|t| parse_title_attribute(t.as_ref()))
-                .unwrap_or(TitleAttributeParts {
-                    bref: None,
-                    auto_title: false,
-                    user_words: None,
-                });
+            let title_parts = parse_title_attribute(link_data.title.as_ref());
 
             // Determine the key to use for matching
             // If title attribute contains a Bref, prioritize it
@@ -358,14 +345,14 @@ fn check_for_link_and_push(
                         MdEvent::Start(MdTag::Image {
                             link_type: link_data.link_type,
                             dest_url: link_data.dest_url,
-                            title: original_title_attr.unwrap_or(CowStr::from("")),
+                            title: link_data.title,
                             id: link_data.id,
                         })
                     } else {
                         MdEvent::Start(MdTag::Link {
                             link_type: link_data.link_type,
                             dest_url: link_data.dest_url,
-                            title: original_title_attr.unwrap_or(CowStr::from("")),
+                            title: link_data.title,
                             id: link_data.id,
                         })
                     };
@@ -507,13 +494,8 @@ fn check_for_link_and_push(
                 };
 
                 // 5. Check if link changed
-                let original_title_attr_str = original_title_attr
-                    .as_ref()
-                    .map(|t| t.to_string())
-                    .unwrap_or_default();
-
                 if link_data.dest_url.as_ref() != relative_path
-                    || original_title_attr_str != new_title_attr
+                    || link_data.title.as_ref() != new_title_attr
                     || link_text != new_link_text
                 {
                     changed = true;
@@ -576,14 +558,14 @@ fn check_for_link_and_push(
                     MdEvent::Start(MdTag::Image {
                         link_type: link_data.link_type,
                         dest_url: link_data.dest_url,
-                        title: original_title_attr.unwrap_or(CowStr::from("")),
+                        title: link_data.title,
                         id: link_data.id,
                     })
                 } else {
                     MdEvent::Start(MdTag::Link {
                         link_type: link_data.link_type,
                         dest_url: link_data.dest_url,
-                        title: original_title_attr.unwrap_or(CowStr::from("")),
+                        title: link_data.title,
                         id: link_data.id,
                     })
                 };
@@ -1418,7 +1400,7 @@ impl DocCodec for MdCodec {
             }
         }
         let mut proto_events = VecDeque::new();
-        let mut link_collector: Option<LinkAccumulator> = None;
+        let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
             &self.content,
             buildonomy_md_options(),
@@ -1430,15 +1412,14 @@ impl DocCodec for MdCodec {
         .into_offset_iter()
         {
             if let Some(link_data) = LinkAccumulator::new(event.borrow(), &Some(offset.clone())) {
-                debug_assert!(link_collector.is_none());
-                link_collector = Some(link_data);
+                link_stack.push(link_data);
             }
             let mut push_relation = false;
-            if let Some(link_data) = link_collector.as_mut() {
+            if let Some(link_data) = link_stack.last_mut() {
                 push_relation = link_data.push(event.borrow(), &Some(offset.clone()));
             }
             if push_relation {
-                let link_data = link_collector.take().expect(
+                let link_data = link_stack.pop().expect(
                     "Push relation is only true if link_data is some and the link end tag is found",
                 );
                 if let Some(node_key) = link_to_relation(

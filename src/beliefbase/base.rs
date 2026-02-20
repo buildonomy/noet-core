@@ -720,11 +720,18 @@ impl BeliefBase {
             .iter()
             .filter(|(k, _v)| !parsed_edges.contains_key(k))
         {
-            events.push(BeliefEvent::RelationRemoved(
-                *source,
-                *sink,
-                EventOrigin::Remote,
-            ));
+            let sink_is_complete = old_set
+                .states()
+                .get(sink)
+                .filter(|n| n.kind.is_complete())
+                .is_some();
+            if sink_is_complete {
+                events.push(BeliefEvent::RelationRemoved(
+                    *source,
+                    *sink,
+                    EventOrigin::Remote,
+                ));
+            }
         }
 
         // Phase 4: New edges
@@ -1119,6 +1126,7 @@ impl BeliefBase {
 
         // Append path events to derivatives for DbConnection and other subscribers
         derivative_events.append(&mut path_events);
+        tracing::debug!("processed: {event:?}\nderivatives: {derivative_events:?}");
 
         Ok(derivative_events)
     }

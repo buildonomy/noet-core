@@ -444,14 +444,6 @@ impl GraphBuilder {
                                 inject_context = true;
                             } else if matches!(source, NodeSource::Generated) {
                                 generated_href_nodes.push(node.bid);
-                                if let Some(const_namespace) = [asset_namespace(), href_namespace()]
-                                    .iter()
-                                    .find(|ns| node.bid.parent_bref() == ns.bref())
-                                {
-                                    if !generated_href_nodes.contains(const_namespace) {
-                                        generated_href_nodes.push(*const_namespace);
-                                    }
-                                }
                             }
                         }
                         GetOrCreateResult::Unresolved(unresolved) => {

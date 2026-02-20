@@ -377,11 +377,10 @@ impl<'a> AnchorPath<'a> {
         let to_clean = AnchorPath::from(&normalized_to);
 
         // Check if to_path starts with anchor - handle same-document anchors
-        if to_clean.path.starts_with('#') {
-            return normalized_to;
-        } else if to_clean.is_absolute() && !from_clean.is_absolute() {
-            return normalized_to;
-        } else if rooted && to_clean.path.starts_with("../") {
+        if to_clean.path.starts_with('#')
+            || to_clean.is_absolute() && !from_clean.is_absolute()
+            || (rooted && to_clean.path.starts_with("../"))
+        {
             return normalized_to;
         }
 

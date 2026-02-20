@@ -18,7 +18,7 @@ Here's a reference to a PDF document:
 
 Testing the same asset referenced multiple times:
 
-![Test Image Again](./assets/test_image.png)
+![Test Image Again. [With a link in the title](https://google.com)](./assets/test_image.png)
 
 ## Nested Path Reference
 
