@@ -1535,12 +1535,26 @@ impl DocCodec for MdCodec {
                 MdEvent::End(MdTagEnd::Heading(_)) => {
                     // We should never encounter a heading end tag before a heading start tag, and
                     // we initialize title_accum to Some(String::new) in the start tag.
-                    let title = current.accumulator.take().unwrap_or_default();
-                    current.document.insert("title", value(&title));
+                    if current
+                        .accumulator
+                        .as_ref()
+                        .filter(|title| !title.is_empty())
+                        .is_some()
+                    {
+                        let title = current.accumulator.take().unwrap_or_default();
+                        current.document.insert("title", value(&title));
 
-                    // Only for section headings (heading > 2), not document nodes
-                    if current.heading > 2 && current.id().is_none() {
-                        current.document.insert("id", value(to_anchor(&title)));
+                        // Only for section headings (heading > 2), not document nodes
+                        if current.heading > 2 && current.id().is_none() {
+                            current.document.insert("id", value(to_anchor(&title)));
+                        }
+                    } else {
+                        // Don't count this as a new section --- glue it back onto the last proto
+                        if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
+                            current = last_proto;
+                            last_event_vec.append(&mut proto_events);
+                            proto_events = last_event_vec;
+                        }
                     }
                 }
                 _ => {}

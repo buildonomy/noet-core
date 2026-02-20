@@ -42,9 +42,7 @@ pub fn os_path_to_string<P: AsRef<Path>>(os_path_ref: P) -> String {
 }
 
 pub fn string_to_os_path(path_string: &str) -> PathBuf {
-    let res = PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR));
-    tracing::debug!("string_to_os_path: turned '{}' into {:?}", path_string, res);
-    res
+    PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR))
 }
 
 /// Turn a title string into a regularized anchor string

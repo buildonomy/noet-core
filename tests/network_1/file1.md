@@ -17,3 +17,13 @@ Term B
 
 - [Link to Section A][#section-a]
 - [Link to net1_dir1 file1 section a][/net1_dir1/hsml.md#definition]
+
+
+##
+
+--- 
+
+## Empty Section above
+
+This section has content. Above section is empty even though it has a horizontal rule. It has no
+semantic content.

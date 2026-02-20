@@ -666,7 +666,6 @@ impl ProtoBeliefNode {
     pub fn merge(&mut self, other: &mut ProtoBeliefNode) -> bool {
         let mut changed = false;
         if self.kind != other.kind {
-            tracing::debug!("kind changed");
             changed = true;
             self.kind = self.kind.union(other.kind.0).into();
         }
@@ -692,7 +691,6 @@ impl ProtoBeliefNode {
             }
             if let Some(item) = maybe_item.take() {
                 self.document.insert_formatted(&key, item);
-                tracing::debug!("item {key_str} changed");
                 changed = true;
             }
         }
@@ -700,33 +698,28 @@ impl ProtoBeliefNode {
         let mut other_upstream = std::mem::take(&mut other.upstream);
         if self.upstream != other.upstream && !other.upstream.is_empty() {
             self.upstream.append(&mut other_upstream);
-            tracing::debug!("upstream changed");
             changed = true;
         }
 
         if self.downstream != other.downstream && !other.downstream.is_empty() {
             let mut other_downstream = std::mem::take(&mut other.downstream);
             self.downstream.append(&mut other_downstream);
-            tracing::debug!("downstream changed");
             changed = true;
         }
 
         if other.heading != usize::default() {
             self.heading = other.heading;
-            tracing::debug!("heading changed");
             changed = true;
         }
 
         if self.errors != other.errors && !other.errors.is_empty() {
             let mut other_errors = std::mem::take(&mut other.errors);
             self.errors.append(&mut other_errors);
-            tracing::debug!("errors changed");
             changed = true;
         }
 
         if self.path != other.path && !other.path.is_empty() {
             self.path = std::mem::take(&mut other.path);
-            tracing::debug!("path changed");
             changed = true;
         }
 
