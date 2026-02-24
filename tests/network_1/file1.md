@@ -16,7 +16,7 @@ Term B
 ## Section B
 
 - [Link to Section A][#section-a]
-- [Link to net1_dir1 file1 section a][/net1_dir1/hsml.md#definition]
+- [Link to hsml Definition subsection a][id://hsml-definition]
 
 
 ##

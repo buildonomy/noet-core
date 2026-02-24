@@ -20,17 +20,8 @@ Same-document anchor:
 
 ## Explicit Brefs
 
-User-provided Bref in title attribute:
-[Custom Text](./file1.md "bref://abc123456789")
-
-Bref with auto_title enabled:
-[Auto Title](./file1.md "bref://abc123456789 {\"auto_title\":true}")
-
-Bref with user words:
-[Link Text](./file1.md "bref://abc123456789 Custom annotation here")
-
-Full format:
-[Link](./file1.md "bref://abc123456789 {\"auto_title\":true} See this section")
+With user words:
+[Link Text](./file1.md "Custom annotation here")
 
 ## Nested Directory Links
 
@@ -59,9 +50,6 @@ First link:
 
 Second link with different text:
 [Second Reference](./file1.md)
-
-Third link with manual Bref:
-[Third Reference](./file1.md "bref://def456789012")
 
 ## Expected Transformations
 

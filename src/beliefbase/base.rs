@@ -1126,8 +1126,14 @@ impl BeliefBase {
 
         // Append path events to derivatives for DbConnection and other subscribers
         derivative_events.append(&mut path_events);
-        tracing::debug!("processed: {event:?}\nderivatives: {derivative_events:?}");
-
+        // tracing::debug!(
+        //     "[process_event]: {event:?}\nderivatives:\n- {}",
+        //     derivative_events
+        //         .iter()
+        //         .map(|e| format!("{e:?}"))
+        //         .collect::<Vec<_>>()
+        //         .join("\n- ")
+        // );
         Ok(derivative_events)
     }
 

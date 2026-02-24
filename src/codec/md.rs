@@ -8,8 +8,11 @@ use pulldown_cmark_to_cmark::{
 use std::{
     borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque},
+    fs::File,
+    io::{BufRead, BufReader, Read},
     mem::replace,
     ops::Range,
+    path::Path,
     result::Result,
     str::FromStr,
 };
@@ -18,14 +21,11 @@ use toml_edit::value;
 
 use crate::{
     beliefbase::BeliefContext,
-    codec::{
-        belief_ir::{build_title_attribute, detect_schema_from_path, ProtoBeliefNode},
-        DocCodec, CODECS,
-    },
+    codec::{belief_ir::ProtoBeliefNode, DocCodec, CODECS},
     error::BuildonomyError,
     nodekey::{href_to_nodekey, NodeKey},
-    paths::{as_anchor, to_anchor, AnchorPath},
-    properties::{href_namespace, BeliefNode, Bid, Bref, Weight, WeightKind},
+    paths::{as_anchor, os_path_to_string, to_anchor, AnchorPath},
+    properties::{href_namespace, BeliefKind, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
 pub use pulldown_cmark;
@@ -205,6 +205,39 @@ struct TitleAttributeParts {
     user_words: Option<String>,
 }
 
+/// Builds a title attribute for HTML links containing bref and optional metadata.
+///
+/// The title attribute format is: `bref://[bref] [metadata] [user_words]`
+/// where metadata and user_words are optional.
+///
+/// # Arguments
+/// * `bref` - The bref string (should already include "bref://" prefix)
+/// * `auto_title` - If true, adds {"auto_title":true} metadata
+/// * `user_words` - Optional user-provided text to append
+///
+/// # Examples
+/// ```
+/// use noet_core::codec::belief_ir::build_title_attribute;
+/// let attr = build_title_attribute("bref://abc123", false, None);
+/// assert_eq!(attr, "bref://abc123");
+///
+/// let attr = build_title_attribute("bref://abc123", true, Some("My Note"));
+/// assert_eq!(attr, "bref://abc123 {\"auto_title\":true} My Note");
+/// ```
+pub fn build_title_attribute(bref: &str, auto_title: bool, user_words: Option<&str>) -> String {
+    let mut parts = vec![bref.to_string()];
+
+    if auto_title {
+        parts.push("{\"auto_title\":true}".to_string());
+    }
+
+    if let Some(words) = user_words {
+        parts.push(words.to_string());
+    }
+
+    parts.join(" ")
+}
+
 /// Parse a markdown link title attribute to extract Bref, config, and user words.
 ///
 /// Format: `"bref://abc123 {\"auto_title\":true} User Description"`
@@ -335,7 +368,6 @@ fn check_for_link_and_push(
                 ) {
                     parsed_key
                 } else {
-                    tracing::debug!("[check_for_link_and_push] Failed to parse key from dest_url, leaving link unchanged. link data: {link_data:?}");
                     // Can't parse - leave link/image unchanged
                     link_data.link_type = match title.is_empty() || title == link_data.id {
                         true => LinkType::Shortcut,
@@ -386,11 +418,6 @@ fn check_for_link_and_push(
 
             // Regularize the key using the BeliefContext fields directly
             let regularized = key.regularize_unchecked(ctx.root_net, &ctx.root_path);
-            tracing::debug!(
-                "[check_for_link_and_push] Regularized key: {:?} -> {:?}",
-                key,
-                regularized
-            );
             let keys = vec![regularized];
 
             // Check both sources (upstream) and sinks (downstream) for the link target Assets and
@@ -429,22 +456,8 @@ fn check_for_link_and_push(
                     })
             });
 
-            tracing::debug!(
-                "[check_for_link_and_push] Search complete. sources={}, sinks={}, match_found={}",
-                sources.len(),
-                sinks.len(),
-                maybe_keyed_relation.is_some()
-            );
-
             if let Some(relation) = maybe_keyed_relation {
                 // Generate canonical format: [text](relative/path.md#anchor "bref://abc config")
-
-                tracing::debug!(
-                    "Found relation for link: title={}, id={:?}, root_path={}",
-                    relation.other.title,
-                    relation.other.id,
-                    relation.root_path
-                );
 
                 let relative_path = if relation.home_net == href_namespace() {
                     relation.root_path.clone()
@@ -501,17 +514,6 @@ fn check_for_link_and_push(
                     changed = true;
                     link_data.dest_url = CowStr::from(relative_path);
                     link_data.title_events = vec![MdEvent::Text(CowStr::from(new_link_text))];
-
-                    tracing::debug!(
-                        "Transformed link to canonical format: dest={}, title_attr={}, text={}",
-                        link_data.dest_url,
-                        new_title_attr,
-                        link_data
-                            .title_events
-                            .first()
-                            .map(|e| format!("{e:?}"))
-                            .unwrap_or_default()
-                    );
                 }
 
                 let start_event = if link_data.is_image {
@@ -825,12 +827,46 @@ fn merge_metadata_into_node(node: &mut ProtoBeliefNode, metadata: &toml_edit::Ta
     }
 }
 
-/// Determine node ID with collision detection.
-/// Priority: explicit ID > title-derived ID > bref (on collision)
+pub fn to_html(content: &str, output: &mut String) -> Result<(), BuildonomyError> {
+    let parser = MdParser::new_ext(content, buildonomy_md_options());
+    pulldown_cmark::html::write_html_fmt(output, parser)?;
+    Ok(())
+}
+
+fn read_frontmatter<R: Read>(reader: R) -> std::io::Result<Option<String>> {
+    let mut buf_reader = BufReader::new(reader);
+    let mut frontmatter = String::new();
+    let mut line = String::new();
+
+    // Read first line to check if frontmatter exists
+    buf_reader.read_line(&mut line)?;
+    if line.trim() != "---" {
+        // No frontmatter
+        return Ok(None);
+    }
+
+    // Read until we hit the second delimiter
+    loop {
+        line.clear();
+        let bytes_read = buf_reader.read_line(&mut line)?;
+
+        if bytes_read == 0 {
+            // EOF before closing delimiter
+            return Ok(None);
+        }
+
+        if line.trim() == "---" {
+            // Found closing delimiter - return frontmatter without the delimiter
+            return Ok(Some(frontmatter));
+        }
+
+        frontmatter.push_str(&line);
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct MdCodec {
-    current_events: Vec<ProtoNodeWithEvents>,
+    pub current_events: Vec<ProtoNodeWithEvents>,
     content: String,
     /// Track which section keys have been matched during inject_context phase
     matched_sections: HashSet<NodeKey>,
@@ -914,6 +950,55 @@ impl MdCodec {
 }
 
 impl DocCodec for MdCodec {
+    /// Parse a path into a proto node by reading the metadata frontmatter (if any)
+    fn proto(
+        &self,
+        repo_path: &Path,
+        path: &Path,
+    ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+        if !repo_path.exists() {
+            return Err(BuildonomyError::Codec(format!(
+                "[ProtoBeliefState::new] Root repository path does not exist: {:?}",
+                repo_path
+            )));
+        };
+        let rel_path = match path.is_relative() {
+            true => path.to_path_buf(),
+            false => path.canonicalize()?.strip_prefix(repo_path)?.to_path_buf(),
+        };
+        let file_path = repo_path.join(&rel_path);
+        if rel_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .filter(|&ext| ext == "md")
+            .is_none()
+        {
+            tracing::debug!(
+                "MdCodec::proto called with path {rel_path:?}, which has a non-'md' \
+            file extension. Returning None"
+            );
+            return Ok(None);
+        }
+        let reader = File::open(&file_path)?;
+        let frontmatter = read_frontmatter(reader)?;
+
+        let mut proto = if let Some(fm) = frontmatter {
+            if !fm.is_empty() {
+                ProtoBeliefNode::from_str(&fm)?
+            } else {
+                ProtoBeliefNode::default()
+            }
+        } else {
+            // No frontmatter is fine for regular markdown documents
+            ProtoBeliefNode::default()
+        };
+        proto.path = os_path_to_string(&rel_path);
+        // Document heading
+        proto.heading = 2;
+        proto.kind.insert(BeliefKind::Document);
+        Ok(Some(proto))
+    }
+
     /// convert proto,
     /// insert bid into source if proto.bid is none
     /// rewrite links according to builder.doc_bb relations
@@ -967,17 +1052,6 @@ impl DocCodec for MdCodec {
                 // Merge metadata into the heading node
                 merge_metadata_into_node(&mut proto_events.0, metadata_table);
                 sections_metadata_merged = true;
-
-                tracing::debug!(
-                    "Matched heading '{}' to section metadata via key: {:?}",
-                    proto_events
-                        .0
-                        .document
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<untitled>"),
-                    matched_key
-                );
             }
         }
 
@@ -989,17 +1063,6 @@ impl DocCodec for MdCodec {
             let final_id = ctx.node.id();
             // Store the final ID in the proto
             if proto_events.0.id().as_ref() != Some(&final_id) {
-                tracing::debug!(
-                    "Setting section ID: proto.id={:?} -> final_id='{}' for title='{}'",
-                    proto_events.0.id(),
-                    final_id,
-                    proto_events
-                        .0
-                        .document
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<untitled>")
-                );
                 id_changed = true;
             }
 
@@ -1039,7 +1102,7 @@ impl DocCodec for MdCodec {
         // Only update frontmatter for document nodes (heading == 2), never for section nodes (heading > 2)
         // Section metadata stays in document-level "sections" table (Issue 02)
         if (frontmatter_changed.is_some() || sections_metadata_merged || id_changed)
-            && proto_events.0.heading == 2
+            && proto_events.0.heading <= 2
         {
             let metadata_string = proto_events.0.as_frontmatter();
             update_or_insert_frontmatter(&mut current_events, &metadata_string)?;
@@ -1154,15 +1217,11 @@ impl DocCodec for MdCodec {
                         if url_ap.is_anchor() {
                             tracing::debug!("is anchor");
                             CowStr::from(as_anchor(url_ap.anchor()))
-                        } else if !url_ap.ext().is_empty() {
-                            if CODECS.has_codec_for_anchor_path(&url_ap) {
-                                // Check if there's an anchor
-                                let res = CowStr::from(url_ap.replace_extension("html"));
-                                tracing::debug!("replacing {url_str} with {res}");
-                                res
-                            } else {
-                                dest_url
-                            }
+                        } else if CODECS.get(&url_ap).is_some() {
+                            // Check if there's an anchor
+                            let res = CowStr::from(url_ap.replace_extension("html"));
+                            tracing::debug!("replacing {url_str} with {res}");
+                            res
                         } else {
                             tracing::debug!("no extension for {url_str}");
                             dest_url
@@ -1386,19 +1445,14 @@ impl DocCodec for MdCodec {
 
     fn parse(
         &mut self,
-        content: String,
+        content: &str,
         mut current: ProtoBeliefNode,
     ) -> Result<(), BuildonomyError> {
         // Initial parse and format to try and make pulldown_cmark <-> pulldown_cmark_to_cmark idempotent
-        self.content = content;
+        self.content = content.to_string();
         self.current_events = Vec::default();
         self.matched_sections.clear();
         self.seen_ids.clear();
-        if let Some(schema) = detect_schema_from_path(&current.path) {
-            if current.document.get("schema").is_none() {
-                current.document.insert("schema", value(schema));
-            }
-        }
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
@@ -1509,6 +1563,18 @@ impl DocCodec for MdCodec {
                     // schema, it will overwrite this when merging the node's toml.
                     let mut proto_to_push = replace(&mut current, new_current);
                     proto_to_push.traverse_schema()?;
+
+                    if proto_to_push.id().is_none() {
+                        if let Some(title) = proto_to_push
+                            .document
+                            .get("title")
+                            .and_then(|title_val| title_val.as_str().map(|str| str.to_string()))
+                        {
+                            proto_to_push
+                                .document
+                                .insert("id", value(to_anchor(&title)));
+                        }
+                    }
                     let proto_to_push_events = std::mem::take(&mut proto_events);
                     self.current_events
                         .push((proto_to_push, proto_to_push_events));
@@ -1524,11 +1590,6 @@ impl DocCodec for MdCodec {
                     {
                         let title = current.accumulator.take().unwrap_or_default();
                         current.document.insert("title", value(&title));
-
-                        // Only for section headings (heading > 2), not document nodes
-                        if current.heading > 2 && current.id().is_none() {
-                            current.document.insert("id", value(to_anchor(&title)));
-                        }
                     } else {
                         // Don't count this as a new section --- glue it back onto the last proto
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
@@ -1543,6 +1604,15 @@ impl DocCodec for MdCodec {
             proto_events.push_back((event.into_static(), Some(offset)));
         }
         current.traverse_schema()?;
+        if current.id().is_none() {
+            if let Some(title) = current
+                .document
+                .get("title")
+                .and_then(|title_val| title_val.as_str().map(|str| str.to_string()))
+            {
+                current.document.insert("id", value(to_anchor(&title)));
+            }
+        }
         self.current_events.push((current, proto_events));
         // tracing::debug!("Parsed a total of {} nodes", self.current_events.len());
 
@@ -1559,12 +1629,6 @@ impl DocCodec for MdCodec {
 
         Ok(())
     }
-}
-
-pub fn to_html(content: &str, output: &mut String) -> Result<(), BuildonomyError> {
-    let parser = MdParser::new_ext(content, buildonomy_md_options());
-    pulldown_cmark::html::write_html_fmt(output, parser)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2062,7 +2126,7 @@ schema = "Document"
             heading: 2,
         };
 
-        codec.parse(markdown.to_string(), proto).unwrap();
+        codec.parse(markdown, proto).unwrap();
 
         // Verify ID was normalized from title during parse
         let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
@@ -2289,7 +2353,7 @@ Mixed content.
             heading: 2,
         };
 
-        codec.parse(markdown.to_string(), proto).unwrap();
+        codec.parse(markdown, proto).unwrap();
         let nodes = codec.nodes();
 
         // Should have 4 nodes: document + 3 sections
@@ -2444,9 +2508,7 @@ Install the software.
             .insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
         proto.document.insert("title", value("Test Document"));
 
-        codec
-            .parse(markdown.to_string(), proto)
-            .expect("Parse failed");
+        codec.parse(markdown, proto).expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
@@ -2500,9 +2562,7 @@ This section has no explicit BID.
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
         proto.document.insert("title", value("Minimal Doc"));
 
-        codec
-            .parse(markdown.to_string(), proto)
-            .expect("Parse failed");
+        codec.parse(markdown, proto).expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
@@ -2543,9 +2603,7 @@ Already HTML [html link](./page.html "bref://doc789").
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
         proto.document.insert("title", value("Link Test"));
 
-        codec
-            .parse(markdown.to_string(), proto)
-            .expect("Parse failed");
+        codec.parse(markdown, proto).expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
@@ -2555,9 +2613,7 @@ Already HTML [html link](./page.html "bref://doc789").
         // Verify .md links WITH bref:// are rewritten to .html
         assert!(
             html_content.contains("href=\"other.html\""),
-            "path: {}\nExpected href=\"other.html\" but got:\n{}",
-            _path,
-            html_content
+            "path: {_path}\nExpected href=\"other.html\" but got:\n{html_content}"
         );
         assert!(
             html_content.contains("href=\"docs/page.html#section-1\""),
@@ -2569,16 +2625,24 @@ Already HTML [html link](./page.html "bref://doc789").
         // Verify .md links WITHOUT bref:// are NOT rewritten (we didn't parse them)
         assert!(
             html_content.contains("href=\"https://example.com/doc.md\""),
-            "Expected href=\"https://example.com/doc.md\" but got\n{}",
-            html_content
+            "Expected href=\"https://example.com/doc.md\" but got\n{html_content}"
         );
 
-        // Verify already-.html links with bref:// are unchanged
-        assert!(html_content.contains("href=\"./page.html\""));
+        // Verify already-.html links with bref:// are normalized
+        assert!(
+            html_content.contains("href=\"./page.html\""),
+            "Expected href=\"./page.html\", received\n{html_content}"
+        );
 
         // Verify only links with bref:// were rewritten
-        assert!(!html_content.contains("href=\"./other.md\""));
-        assert!(!html_content.contains("href=\"docs/page.md#"));
+        assert!(
+            !html_content.contains("href=\"./other.md\""),
+            "Expected not to have href=\"./other.html\", received\n{html_content}"
+        );
+        assert!(
+            !html_content.contains("href=\"docs/page.md#"),
+            "Expected not to have href=\"docs/page.md#\", received\n{html_content}"
+        );
     }
 
     // Note: Integration test for static asset tracking needed with full GraphBuilder flow

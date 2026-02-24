@@ -451,12 +451,7 @@ impl FromStr for NodeKey {
                         net: href_namespace().bref(),
                         id: s.to_string(),
                     });
-                } else if !nk_ap.ext().is_empty()
-                    && !CODECS
-                        .extensions()
-                        .iter()
-                        .any(|codec_ext| codec_ext == nk_ap.ext())
-                {
+                } else if CODECS.get(&nk_ap).is_none() {
                     path_net = asset_namespace().bref();
                 }
                 NodeKey::Path {
@@ -613,8 +608,14 @@ mod tests {
 
         // Anchors
         let key: NodeKey = "#section".parse().unwrap();
-        assert!(matches!(key, NodeKey::Path { net, path }
-        if net == Bref::default() && path == "#section"));
+        let key_clone = key.clone();
+        assert!(
+            matches!(key, NodeKey::Path { net, path }
+        if net == Bref::default() && path == "#section"),
+            "expected net: {}, and path: #section. Received: {key_clone:?}. asset_namespace: {}",
+            Bref::default(),
+            asset_namespace().bref()
+        );
 
         // Absolute paths
         let key: NodeKey = "/docs/council/README.md".parse().unwrap();
@@ -733,10 +734,10 @@ mod tests {
 
         // Strings with path indicators (/, #, .) become Paths
         assert_eq!(
-            "net/.dir/#achor".parse::<NodeKey>(),
+            "net/.hidden#achor".parse::<NodeKey>(),
             Ok(NodeKey::Path {
                 net: default_bref,
-                path: "net/.dir#achor".to_string()
+                path: "net/.hidden#achor".to_string()
             })
         );
         // .toml files are now treated as assets (not BeliefNetwork documents)
@@ -754,19 +755,19 @@ mod tests {
                 path: "file.toml".to_string()
             })
         );
-        // .noet files are BeliefNetwork documents (not assets)
+        // index.md files are BeliefNetwork documents (not assets)
         assert_eq!(
-            "net/dir/.noet".parse::<NodeKey>(),
+            "net/dir/index.md".parse::<NodeKey>(),
             Ok(NodeKey::Path {
                 net: default_bref,
-                path: "net/dir/.noet".to_string()
+                path: "net/dir/index.md".to_string()
             })
         );
         assert_eq!(
-            ".noet".parse::<NodeKey>(),
+            "index.md".parse::<NodeKey>(),
             Ok(NodeKey::Path {
                 net: default_bref,
-                path: ".noet".to_string()
+                path: "index.md".to_string()
             })
         );
         assert_eq!(

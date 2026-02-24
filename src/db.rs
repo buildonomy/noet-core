@@ -74,13 +74,6 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn track_file_mtime(&mut self, path: &Path) -> Result<(), BuildonomyError> {
-        tracing::debug!("[Transaction] track_file_mtime called for path: {:?}", path);
-        tracing::debug!(
-            "[Transaction] path exists: {}, path is_absolute: {}",
-            path.exists(),
-            path.is_absolute()
-        );
-
         match fs::metadata(path) {
             Ok(metadata) => match metadata.modified() {
                 Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {
@@ -88,15 +81,6 @@ impl<'a> Transaction<'a> {
                         let mtime = duration.as_secs() as i64;
                         let path_str = os_path_to_string(path);
                         self.mtime_updates.insert(path_str.clone(), mtime);
-                        tracing::info!(
-                            "[Transaction]   ✓ Successfully tracked mtime {} for {:?}",
-                            mtime,
-                            path
-                        );
-                        tracing::info!(
-                            "[Transaction]   mtime_updates.len() = {}",
-                            self.mtime_updates.len()
-                        );
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -173,9 +157,9 @@ impl<'a> Transaction<'a> {
                 self.track_file_mtime(path)?;
             }
             BeliefEvent::BalanceCheck => {
-                tracing::debug!(
-                    "BalanceCheck: DB *should* be balanced now but we're not checking."
-                );
+                // tracing::debug!(
+                //     "BalanceCheck: DB *should* be balanced now but we're not checking."
+                // );
             }
             BeliefEvent::BuiltInTest => {
                 tracing::debug!(
@@ -423,17 +407,8 @@ fn get_all_document_paths(
 ) -> NestedNetFuture {
     Box::pin(async move {
         if processed_nets.contains(&network_bid) {
-            tracing::debug!(
-                "[get_all_document_paths] Skipping already processed network: {}",
-                network_bid
-            );
             return Ok(vec![]);
         }
-
-        tracing::debug!(
-            "[get_all_document_paths] Querying paths for network: {}",
-            network_bid
-        );
 
         let rows =
             sqlx::query_as::<_, (String, String)>("SELECT path, target FROM paths WHERE net = ?")
@@ -484,12 +459,6 @@ fn get_all_document_paths(
             let mut sub_results =
                 get_all_document_paths(pool.clone(), *new_net, newly_processed_for_call).await?;
 
-            tracing::debug!(
-                "[get_all_document_paths] Subnet {} returned {} documents",
-                new_net,
-                sub_results.len()
-            );
-
             if !sub_results.is_empty() {
                 let Some(row_nets_index) = row_nets.iter().position(|elem| elem.1 == *new_net)
                 else {
@@ -526,17 +495,8 @@ fn get_network_paths(
 ) -> NestedNetFuture {
     Box::pin(async move {
         if processed_nets.contains(&network_bid) {
-            tracing::debug!(
-                "[get_network_paths] Skipping already processed network: {}",
-                network_bid
-            );
             return Ok(vec![]);
         }
-
-        tracing::debug!(
-            "[get_network_paths] Querying paths for network: {}",
-            network_bid
-        );
 
         let rows =
             sqlx::query_as::<_, (String, String)>("SELECT path, target FROM paths WHERE net = ?")
@@ -578,12 +538,6 @@ fn get_network_paths(
             newly_processed_for_call.remove(new_net);
             let mut sub_results =
                 get_network_paths(pool.clone(), *new_net, newly_processed_for_call).await?;
-
-            tracing::debug!(
-                "[get_network_paths] Subnet {} returned {} documents",
-                new_net,
-                sub_results.len()
-            );
 
             if !sub_results.is_empty() {
                 let Some(row_nets_index) = row_nets.iter().position(|elem| elem.1 == *new_net)

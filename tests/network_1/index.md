@@ -1,3 +1,6 @@
+---
 title = "noet-core BeliefNetwork example"
 id = "belief-network-test-1"
-text = "Small Test directory for BeliefBase codec"
+---
+
+A small test directory for BeliefBase codec testing.

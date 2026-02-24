@@ -49,7 +49,6 @@ impl<'a> ExtendedRelation<'a> {
         for const_net in [asset_namespace(), href_namespace()] {
             if let Some(pm) = paths_guard.get_map(&const_net.bref()) {
                 if let Some((_bid, elem_path, _order)) = pm.path(&other_bid, &paths_guard) {
-                    tracing::debug!("Found const net node. Path: {elem_path}");
                     return Some(ExtendedRelation {
                         other,
                         home_net: const_net,

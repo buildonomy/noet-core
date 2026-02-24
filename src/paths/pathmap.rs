@@ -12,6 +12,7 @@ use std::{
 
 use crate::{
     beliefbase::BidGraph,
+    codec::network::NETWORK_NAME,
     event::{BeliefEvent, EventOrigin},
     paths::path::{as_anchor, to_anchor, AnchorPath},
     properties::{
@@ -242,15 +243,24 @@ impl fmt::Display for PathMapMap {
             });
             write!(
                 f,
-                "\n{}: {} anchored paths:\n\t{}\n\n",
+                "\n{}: {} anchored paths:\n{}\n\n",
                 net_bref,
                 net_anchor.unwrap_or_default(),
                 net_pm
                     .map()
                     .iter()
-                    .map(|(path, bid, _order)| format!("{} <- \"{}\"", bid.bref(), path))
+                    .map(|(path, bid, order)| format!(
+                        "{}\t{} <- \"{}\"",
+                        order
+                            .iter()
+                            .map(|idx| idx.to_string())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                        bid.bref(),
+                        path,
+                    ))
                     .collect::<Vec<_>>()
-                    .join("\n\t")
+                    .join("\n")
             )?;
         }
         Ok(())
@@ -817,21 +827,24 @@ impl PathMap {
         // );
 
         let mut map = Vec::from_iter(
-            vec![(String::from(""), net, Vec::<u16>::default())]
-                .into_iter()
-                .chain(
-                    inverted_path_map
-                        .into_iter()
-                        .flat_map(|(bid, (order, paths))| {
-                            if nets.nets().contains(&bid) && bid != net && !subnets.contains(&bid) {
-                                subnets.insert(bid);
-                            }
-                            // Generate a separate map entry for each path to this bid
-                            paths
-                                .into_iter()
-                                .map(move |path| (path, bid, order.clone()))
-                        }),
-                ),
+            vec![
+                (String::from(""), net, Vec::<u16>::default()),
+                (NETWORK_NAME.to_string(), net, Vec::<u16>::default()),
+            ]
+            .into_iter()
+            .chain(
+                inverted_path_map
+                    .into_iter()
+                    .flat_map(|(bid, (order, paths))| {
+                        if nets.nets().contains(&bid) && bid != net && !subnets.contains(&bid) {
+                            subnets.insert(bid);
+                        }
+                        // Generate a separate map entry for each path to this bid
+                        paths
+                            .into_iter()
+                            .map(move |path| (path, bid, order.clone()))
+                    }),
+            ),
         );
         map.sort_by(|a, b| {
             let order_cmp = pathmap_order(&a.2, &b.2);
@@ -1291,9 +1304,6 @@ impl PathMap {
             }
             _ => Vec::default(),
         };
-        // if !res.is_empty() {
-        //     tracing::debug!("{} derivatives: {:?}", event, res);
-        // }
         res
     }
 
@@ -1361,6 +1371,7 @@ impl PathMap {
         };
         // Reverse the iterator so that we can manipulate self.map from back to front and not
         // destroy our index mappings while we mutate the map.
+        let mut processed_path_set = BTreeSet::<String>::default();
         for (sink_index, sub_indices) in sink_sub_indices.iter().rev() {
             // Clone this so we don't keep a nonmutable reference into self.map;
             let (mut new_paths, new_order) = {
@@ -1404,6 +1415,8 @@ impl PathMap {
                 (new_paths, new_order)
             };
             new_paths.sort();
+            new_paths.retain(|path| !processed_path_set.contains(path));
+            processed_path_set.append(&mut BTreeSet::from_iter(new_paths.iter().cloned()));
 
             let source_sub_indices = sub_indices
                 .iter()

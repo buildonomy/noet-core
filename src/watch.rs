@@ -244,8 +244,8 @@
 use crate::{
     beliefbase::BeliefGraph,
     codec::{
-        belief_ir::{detect_network_file, ProtoBeliefNode},
         compiler::{CompilerStats, DocumentCompiler},
+        network::detect_network_file,
         CodecMap,
     },
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
@@ -402,7 +402,6 @@ impl WatchService {
 
         for record in added_networks.iter() {
             let path = PathBuf::from(&record.path);
-            ProtoBeliefNode::try_from(&record.node)?.write(&path)?;
             self.enable_network_syncer(&path)?;
         }
         for str_path in removed_networks.iter() {
@@ -525,7 +524,7 @@ impl WatchService {
         work_notifier.notify_one();
 
         let ignored_write_paths = network_syncer.ignored_write_paths.clone();
-        let debouncer_codec_extensions = self.codecs.extensions();
+        let debouncer_codec = self.codecs.clone();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
@@ -569,27 +568,7 @@ impl WatchService {
                                                 }
                                             }
 
-                                            // Check if extension is a registered codec
-                                            let has_codec_ext = if let Some(ext) = p.extension() {
-                                                let ext_str = ext.to_str().unwrap_or("");
-                                                debouncer_codec_extensions
-                                                    .iter()
-                                                    .any(|ce| ce.as_str() == ext_str)
-                                            } else {
-                                                false
-                                            };
-
-                                            // Also check if filestem matches (for .noet files)
-                                            let has_codec_stem = if let Some(file_name) = p.file_name() {
-                                                let file_name_str = file_name.to_str().unwrap_or("");
-                                                // Check against NETWORK_CONFIG_NAMES
-                                                use crate::codec::belief_ir::NETWORK_CONFIG_NAMES;
-                                                NETWORK_CONFIG_NAMES.contains(&file_name_str)
-                                            } else {
-                                                false
-                                            };
-
-                                            has_codec_ext || has_codec_stem
+                                            debouncer_codec.path_get(&p).is_some()
                                         })
                                         .collect();
 
@@ -802,7 +781,7 @@ impl FileUpdateSyncer {
 
                                 // If path is a directory, it might be a BeliefNetwork directory
                                 if path_to_ignore.is_dir() {
-                                    if let Some((network_file_path, _format)) = detect_network_file(&path_to_ignore) {
+                                    if let Some(network_file_path) = detect_network_file(&path_to_ignore) {
                                         tracing::trace!("[DocumentCompiler] Resolved BeliefNetwork directory {:?} -> file {:?}", path_to_ignore, network_file_path);
                                         path_to_ignore = network_file_path;
                                     }
@@ -826,7 +805,7 @@ impl FileUpdateSyncer {
                             // Spawn task to remove path from ignore list after delay
                             let mut path_for_removal = result.path.clone();
                             if path_for_removal.is_dir() {
-                                if let Some((network_file_path, _format)) = detect_network_file(&path_for_removal) {
+                                if let Some(network_file_path) = detect_network_file(&path_for_removal) {
                                     path_for_removal = network_file_path;
                                 }
                             }

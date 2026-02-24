@@ -1,3 +1,8 @@
+---
+id = "hstp"
+title = "Hyperspace Transaction Protocol"
+---
+
 ## Definition
 > Definition of the symbol, explicitly referencing any and all symbolic dependencies that underpin
 > the concept represented by the symbol.

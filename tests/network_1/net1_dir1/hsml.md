@@ -1,4 +1,4 @@
-## Definition
+## Definition {#hsml-definition}
 
 As defined by the [[The Spatial Web Standards]]:
 

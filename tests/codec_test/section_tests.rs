@@ -1,7 +1,10 @@
 //! Section metadata enrichment and handling tests
 
 use noet_core::{
-    beliefbase::BeliefBase, codec::DocumentCompiler, event::BeliefEvent, properties::WeightKind,
+    beliefbase::BeliefBase,
+    codec::{network::detect_network_file, DocumentCompiler},
+    event::BeliefEvent,
+    properties::WeightKind,
 };
 use std::fs;
 use test_log::test;
@@ -338,9 +341,7 @@ async fn test_sections_round_trip_preservation() -> Result<(), Box<dyn std::erro
         if let Some(ref content) = result.rewritten_content {
             let mut write_path = result.path.clone();
             if write_path.is_dir() {
-                if let Some((detected, _)) =
-                    noet_core::codec::belief_ir::detect_network_file(&write_path)
-                {
+                if let Some(detected) = detect_network_file(&write_path) {
                     write_path = detected;
                 }
             }

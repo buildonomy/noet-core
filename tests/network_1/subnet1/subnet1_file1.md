@@ -8,3 +8,8 @@ meaningful for embodying your personal and organizational values.
 ## Section A
 
 Section A text.
+
+![image](../assets/test_image.png)
+
+
+[External Link](https://github.com/buildonomy/noet-core)

@@ -15,14 +15,15 @@ use toml::value::Table as TomlTable;
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
     codec::{
-        belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
+        belief_ir::ProtoBeliefNode,
         diagnostic::ParseDiagnostic,
-        DocCodec, CODECS,
+        network::{detect_network_file, NETWORK_NAME},
+        DocCodec, NetworkCodec, CODECS,
     },
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
+    paths::{as_anchor, path::string_to_os_path, AnchorPath},
     properties::{
         asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet,
         BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
@@ -140,32 +141,15 @@ impl GraphBuilder {
     where
         P: AsRef<std::path::Path> + std::fmt::Debug,
     {
-        let mut repo_root = PathBuf::from(repo_path.as_ref()).canonicalize()?;
-        match repo_root.is_dir() {
-            true => Ok(()),
-            false => {
-                let invalid_err = BuildonomyError::Codec(format!(
-                    "GraphBuilder initialization failed. Received root path {repo_root:?}. \
-                     Expected a directory or path to a .noet file"
-                ));
-                if let Some(path_name) = repo_root.file_name() {
-                    let file_name_str = path_name.to_string_lossy();
-                    if NETWORK_CONFIG_NAMES
-                        .iter()
-                        .any(|&name| name == file_name_str.as_ref())
-                    {
-                        repo_root.pop();
-                        Ok(())
-                    } else {
-                        tracing::warn!("{:?}", &invalid_err);
-                        Err(invalid_err)
-                    }
-                } else {
-                    tracing::warn!("{:?}", &invalid_err);
-                    Err(invalid_err)
-                }
-            }
-        }?;
+        let canonicalized_path = PathBuf::from(repo_path.as_ref()).canonicalize()?;
+        let Some(mut repo_root) = detect_network_file(canonicalized_path.as_ref()) else {
+            return Err(BuildonomyError::Codec(format!(
+                "GraphBuilder initialization failed. Received root path {repo_path:?}. \
+                 Expected a directory or path to a index.md file"
+            )));
+        };
+        // network index file is now network dir
+        repo_root.pop();
 
         let tx = match maybe_tx.take() {
             Some(tx) => tx,
@@ -291,7 +275,7 @@ impl GraphBuilder {
         global_bb: B,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
         tracing::debug!("Phase 0: initialize stack");
-        let mut full_path = input_path.as_ref().canonicalize()?.to_path_buf();
+        let full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let initial = self
             .initialize_stack(input_path.as_ref(), global_bb.clone())
             .await?;
@@ -307,26 +291,16 @@ impl GraphBuilder {
         // Track diagnostics during parsing (unresolved references, warnings, etc.)
         let mut diagnostics = Vec::<ParseDiagnostic>::new();
 
-        if input_path.as_ref().is_dir() {
-            // Detect network file (JSON or TOML)
-            if let Some((detected_path, _format)) = detect_network_file(&full_path) {
-                full_path = detected_path;
-            } else {
-                // Default to first in NETWORK_CONFIG_NAMES (JSON)
-                full_path.push(NETWORK_CONFIG_NAMES[0]);
-            }
-        }
-        let doc_path = os_path_to_string(full_path.strip_prefix(&self.repo_root)?);
+        let doc_path = initial.path.clone();
         let doc_ap = AnchorPath::from(&doc_path);
 
         let mut parsed_bids;
         let owned_codec: Box<dyn DocCodec + Send>;
 
-        let (filestem, ext) = doc_ap.codec_parts();
-        if let Some(codec_factory) = CODECS.get(filestem, ext) {
+        if let Some(codec_factory) = CODECS.get(&doc_ap) {
             // Create fresh codec instance from factory
             let mut codec = codec_factory();
-            codec.parse(content, initial)?;
+            codec.parse(&content, initial)?;
 
             let mut inject_context = false;
             parsed_bids = Vec::with_capacity(codec.nodes().len());
@@ -517,10 +491,35 @@ impl GraphBuilder {
                         .doc_bb
                         .get_context(&self.repo(), bid)
                         .expect("Set should be balanced here");
+                    let old_node = ctx.node.toml();
                     // Inject proto text into our self set here, because inject context is where the
                     // markdown parser generates section-specific text fields regardless of whether
                     // it changes the markdown itself due to the injected context.
                     if let Some(updated_node) = codec.inject_context(proto, &ctx)? {
+                        if old_node != updated_node.toml() {
+                            is_changed = true;
+                            let _derivatives =
+                                self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
+                                    vec![NodeKey::Bid {
+                                        bid: updated_node.bid,
+                                    }],
+                                    updated_node.toml(),
+                                    EventOrigin::Remote,
+                                ))?;
+                        }
+                    }
+                }
+
+                // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
+                tracing::debug!("Phase 4b: codec finalization");
+                let finalized_nodes = codec.finalize()?;
+                for (_proto, updated_node) in finalized_nodes {
+                    let old_toml = self
+                        .doc_bb
+                        .states()
+                        .get(&updated_node.bid)
+                        .map(|node| node.toml());
+                    if Some(updated_node.toml()) != old_toml {
                         is_changed = true;
                         let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
@@ -531,26 +530,16 @@ impl GraphBuilder {
                         ))?;
                     }
                 }
-
-                // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
-                tracing::debug!("Phase 4b: codec finalization");
-                let finalized_nodes = codec.finalize()?;
-                for (_proto, updated_node) in finalized_nodes {
-                    is_changed = true;
-                    let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
-                        vec![NodeKey::Bid {
-                            bid: updated_node.bid,
-                        }],
-                        updated_node.toml(),
-                        EventOrigin::Remote,
-                    ))?;
-                    tracing::debug!("phase 4b finalize node update derivs: {:?}", _derivatives);
-                }
             }
 
             if is_changed {
                 tracing::debug!("Generating source");
-                maybe_content = codec.generate_source();
+                let maybe_new_content = codec.generate_source();
+                if let Some(new_content) = maybe_new_content.as_ref() {
+                    if new_content != &content {
+                        maybe_content = maybe_new_content;
+                    }
+                }
             }
 
             // Store owned codec to return
@@ -607,61 +596,72 @@ impl GraphBuilder {
             self.tx.send(api_node_event)?;
         }
 
-        // Fetch asset_namespace from global_bb to populate session_bb with known assets
+        // Fetch const_namespaces from global_bb to populate session_bb with known assets
         // This enables asset content change detection by populating PathMap with existing paths
-        use crate::properties::asset_namespace;
-        let asset_ns_key = NodeKey::Bid {
-            bid: asset_namespace(),
-        };
-        if let Some(asset_ns_node) = global_bb.get_async(&asset_ns_key).await? {
-            // Process asset namespace node into session_bb
-            let asset_ns_event = BeliefEvent::NodeUpdate(
-                vec![asset_ns_key.clone()],
-                asset_ns_node.toml(),
-                EventOrigin::Remote,
-            );
-            self.session_bb.process_event(&asset_ns_event)?;
+        for const_node in &[BeliefNode::asset_network(), BeliefNode::href_network()] {
+            let key = NodeKey::Bid {
+                bid: const_node.bid,
+            };
+            if let Some(const_ns_node) = global_bb.get_async(&key).await? {
+                // Process asset namespace node into session_bb
+                let const_ns_event = BeliefEvent::NodeUpdate(
+                    vec![key.clone()],
+                    const_ns_node.toml(),
+                    EventOrigin::Remote,
+                );
+                self.session_bb.process_event(&const_ns_event)?;
 
-            // Fetch all assets connected to this namespace
-            // Use eval to get the namespace and its relations
-            let asset_expr = Expression::from(&asset_ns_key);
-            let asset_graph = global_bb.eval(&asset_expr).await?;
+                // Fetch all assets connected to this namespace
+                // Use eval to get the namespace and its relations
+                let const_expr = Expression::from(&key);
+                let const_graph = global_bb.eval(&const_expr).await?;
 
-            // Merge the fetched asset graph into session_bb
-            self.session_bb.merge(&asset_graph);
+                // Merge the fetched asset graph into session_bb
+                self.session_bb.merge(&const_graph);
 
-            tracing::debug!(
-                "[initialize_stack] Loaded {} assets from global cache",
-                asset_graph.states.len().saturating_sub(1) // -1 for namespace node itself
-            );
+                tracing::debug!(
+                    "[initialize_stack] Loaded {} {} assets from global cache",
+                    const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
+                    const_node.display_title()
+                );
+            }
         }
 
-        let initial = ProtoBeliefNode::new(self.repo_root.as_ref(), path.as_ref())?;
+        let initial_factory = CODECS
+            .path_get(path.as_ref())
+            .ok_or(BuildonomyError::Codec(format!(
+                "Could not find codec for path type {path:?}"
+            )))?;
+        let initial_codec = initial_factory();
+        let initial = initial_codec
+            .proto(self.repo_root.as_ref(), path.as_ref())?
+            .ok_or(BuildonomyError::Codec(format!(
+                "Codec could not resolve path '{path:?}' into a proto node"
+            )))?;
         let mut parent_path = string_to_os_path(&initial.path);
         let mut parent_path_stack: Vec<PathBuf> = Vec::default();
         // If path is a sub-network node, dont count self path as a parent path
-        if let Some(file_name) = parent_path.file_name() {
-            let file_name_str = file_name.to_string_lossy();
-            if NETWORK_CONFIG_NAMES
-                .iter()
-                .any(|&name| name == file_name_str.as_ref())
-            {
-                parent_path.pop();
-            }
+        if parent_path
+            .file_name()
+            .and_then(|os_str| os_str.to_str())
+            .filter(|&file_name| file_name == NETWORK_NAME)
+            .is_some()
+        {
+            parent_path.pop();
         }
         while parent_path.pop() {
-            // Check for either JSON or TOML network file
-            if detect_network_file(&self.repo_root.join(&parent_path)).is_some() {
-                parent_path_stack.push(parent_path.clone());
-            }
+            parent_path_stack.push(parent_path.clone());
         }
-        parent_path_stack.reverse();
-        let maybe_content_parent_path = parent_path_stack.last();
         let mut maybe_content_parent_proto = None;
         let mut missing_structure = BeliefGraph::default();
         let mut events = Vec::<BeliefEvent>::default();
-        for path in parent_path_stack.iter() {
-            let state_accum = ProtoBeliefNode::new(self.repo_root.as_path(), path.as_path())?;
+        let net_codec = NetworkCodec::default();
+        while let Some(path) = parent_path_stack.pop() {
+            let Some(state_accum) = net_codec.proto(self.repo_root.as_path(), path.as_path())?
+            else {
+                continue;
+            };
+
             let (ancestor, (_source, _, _)) = self
                 .push(
                     &state_accum,
@@ -680,9 +680,7 @@ impl GraphBuilder {
                 self.session_bb.merge(&missing_structure);
                 missing_structure = BeliefGraph::default(); // reset for next interation
             }
-            if Some(path) == maybe_content_parent_path {
-                maybe_content_parent_proto = Some((ancestor, state_accum));
-            }
+            maybe_content_parent_proto = Some((ancestor, state_accum));
         }
 
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
@@ -802,6 +800,7 @@ impl GraphBuilder {
 
         let events_is_empty = tx_events.is_empty();
         for event in tx_events.into_iter() {
+            tracing::debug!("{event:?}");
             self.tx.send(event)?;
         }
         if !events_is_empty {
@@ -1525,7 +1524,25 @@ mod tests {
         paths::to_anchor,
         properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid},
     };
+    use std::path::Path;
     use toml_edit::{value, DocumentMut};
+
+    /// Helper: Create a test network directory with index.md file
+    fn create_test_network(dir: &Path) {
+        std::fs::write(
+            dir.join("index.md"),
+            r#"---
+id: "test-network"
+title: "Test Network"
+---
+
+# Test Network
+
+Test network for unit tests.
+"#,
+        )
+        .unwrap();
+    }
 
     /// Helper: Create a test ProtoBeliefNode for a section heading
     fn create_test_proto_section(
@@ -1822,6 +1839,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         // Simulate stack with document and section with anchor
@@ -1856,6 +1874,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         let doc_bid = Bid::new(builder.api().bid);
@@ -1889,6 +1908,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         let doc_bid = Bid::new(builder.api().bid);
@@ -1922,6 +1942,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         // Setup: network (heading=1) and document (heading=2)
@@ -1953,6 +1974,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         // Root network > Subnet > Document
@@ -1993,6 +2015,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         // Empty stack
@@ -2016,6 +2039,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
         let mut builder = super::GraphBuilder::new(temp_dir.path(), Some(tx)).unwrap();
 
         let doc_bid = Bid::new(builder.api().bid);

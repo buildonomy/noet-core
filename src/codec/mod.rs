@@ -38,21 +38,18 @@
 //! Codecs can be registered by **file extension** or **file stem** (filename):
 //!
 //! - **By extension**: `(None, Some("md"))` - matches all `.md` files
-//! - **By stem**: `(Some(".noet"), None)` - matches files named `.noet` (regardless of location)
+//! - **By stem**: `(Some("index"), Some("md"))` - matches files named `index.md` (regardless of location)
 //! - **By directory**: `(Some("docs"), None)` - can match directory names (if AnchorPath treats them as directories)
 //!
 //! This flexible registration enables:
-//! - Single files: `.noet` (BeliefNetwork metadata)
+//! - Single files: `index.md` (BeliefNetwork metadata)
 //! - File patterns: `.md`, `.toml`, `.json`
 //! - Directory structures: `.github/`, `node_modules/` (when treated as units)
 //!
 //! ## Built-in Codecs
 //!
 //! - **Markdown** (`.md`) - via [`md::MdCodec`]
-//! - **BeliefNetwork** (`.noet`) - via [`belief_ir::ProtoBeliefNode`]
-//!
-//! The `.noet` file uses stem-based registration to avoid conflicts with generic `.yml`, `.json`, or `.toml` files
-//! in repositories. It's a hidden file that can contain YAML, JSON, or TOML format (auto-detected via fallback parsing).
+//! - **NetworkCodec** (`index.md`) - via [`md::NetworkCodec`]
 //!
 //! Register custom codecs via [`CodecMap::insert`] (by extension) or [`CodecMap::insert_codec`] (by stem/extension):
 //!
@@ -139,10 +136,18 @@ pub use assets::Layout;
 #[cfg(not(target_arch = "wasm32"))]
 use parking_lot::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use std::{result::Result, sync::Arc, time::Duration};
+use std::{path::Path, result::Result, sync::Arc, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{beliefbase::BeliefContext, error::BuildonomyError, properties::BeliefNode};
+use crate::{
+    beliefbase::BeliefContext,
+    codec::{md::MdCodec, network::NetworkCodec},
+    error::BuildonomyError,
+    paths::os_path_to_string,
+    properties::BeliefNode,
+};
+
+use crate::paths::AnchorPath;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod assets;
@@ -156,6 +161,8 @@ pub mod compiler;
 pub mod diagnostic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod md;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod network;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod schema_registry;
 
@@ -183,7 +190,7 @@ pub type CodecFactory = fn() -> Box<dyn DocCodec + Send>;
 ///
 /// Access via `CODECS` to register or retrieve codecs. Supports registration by:
 /// - File extension: `CODECS.insert("md".to_string(), factory)`
-/// - File stem: `CODECS.insert_codec(Some(".noet".to_string()), None, factory)`
+/// - File stem: `CODECS.insert_codec(Some("index".to_string()), Some("md".to_string()), factory)`
 /// - Both: `CODECS.insert_codec(Some("config".to_string()), Some("toml".to_string()), factory)`
 #[cfg(not(target_arch = "wasm32"))]
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
@@ -193,7 +200,7 @@ pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 
 /// List of built-in codec extensions (synchronized between WASM and non-WASM builds).
-const BUILTIN_EXTENSIONS: &[&str] = &["md"];
+pub const BUILTIN_EXTENSIONS: &[&str] = &["md"];
 
 /// Codec registration entry: (optional_stem, optional_extension, factory).
 ///
@@ -201,7 +208,7 @@ const BUILTIN_EXTENSIONS: &[&str] = &["md"];
 ///
 /// # Examples
 /// - `(None, Some("md"), factory)` - Match all `.md` files
-/// - `(Some(".noet"), None, factory)` - Match files named `.noet`
+/// - `(Some("index"), Some("md"), factory)` - Match files named `index.md`
 /// - `(Some("config"), Some("toml"), factory)` - Match `config.toml` files
 #[cfg(not(target_arch = "wasm32"))]
 type CodecEntry = (Option<String>, Option<String>, CodecFactory);
@@ -213,10 +220,17 @@ type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 ///     configuration toml
 #[cfg(not(target_arch = "wasm32"))]
 pub trait DocCodec: Sync {
+    /// Parse a path into a proto node by reading the metadata frontmatter (if any)
+    fn proto(
+        &self,
+        repo_path: &Path,
+        path: &Path,
+    ) -> Result<Option<ProtoBeliefNode>, BuildonomyError>;
+
     fn parse(
         &mut self,
         // The source content to be parsed by the DocCodec implementation
-        content: String,
+        content: &str,
         // Contains the builder root-path relative information to seed the parse with
         current: ProtoBeliefNode,
     ) -> Result<(), BuildonomyError>;
@@ -368,84 +382,42 @@ impl CodecMap {
     /// use noet_core::codec::CODECS;
     ///
     /// let path = Path::new("/tmp/document.md");
-    /// assert!(CODECS.has_codec_for_path(&path)); // true for .md extension
+    /// assert!(CODECS.path_get(&path).is_some()); // true for .md extension
     ///
-    /// let path = Path::new("/tmp/.noet");
-    /// assert!(CODECS.has_codec_for_path(&path)); // true for .noet stem
+    /// // Noet networks directories are identified by index.md file name
+    /// let path = Path::new("/tmp/index.md");
+    /// assert!(CODECS.path_get(&path).is_some()); // true for index.md
+    ///
     /// ```
-    pub fn has_codec_for_path(&self, path: &std::path::Path) -> bool {
-        let filestem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        self.get(filestem, ext).is_some()
-    }
-
-    /// Check if a codec exists for the given `AnchorPath`.
-    ///
-    /// Uses `codec_parts()` to extract the appropriate stem/extension for codec matching,
-    /// handling special cases like extensionless files (`.noet`) which AnchorPath may
-    /// treat as directories.
-    ///
-    /// # Example
-    /// ```
-    /// use noet_core::codec::CODECS;
-    /// use noet_core::paths::path::AnchorPath;
-    ///
-    /// let ap = AnchorPath::new("docs/README.md");
-    /// assert!(CODECS.has_codec_for_anchor_path(&ap)); // true for .md extension
-    ///
-    /// let ap = AnchorPath::new("/tmp/.noet");
-    /// assert!(CODECS.has_codec_for_anchor_path(&ap)); // true for .noet stem
-    /// ```
-    pub fn has_codec_for_anchor_path(&self, path: &crate::paths::path::AnchorPath) -> bool {
-        let (filestem, ext) = path.codec_parts();
-        self.get(filestem, ext).is_some()
+    pub fn path_get(&self, path: &std::path::Path) -> Option<CodecFactory> {
+        let string_path = os_path_to_string(path);
+        let ap = AnchorPath::new(&string_path);
+        self.get(&ap)
     }
 
     /// Create a new `CodecMap` with built-in codecs registered.
     ///
     /// Built-in codecs:
     /// - Markdown: registered by extension `.md`
-    /// - BeliefNetwork: registered by stem `.noet`
+    /// - NetworkCodec: registered by constand file name `index.md`
     pub fn create() -> Self {
         let map = CodecMap(Arc::new(RwLock::new(vec![
             // Markdown files by extension
-            (
-                None,
-                Some("md".to_string()),
-                || Box::new(md::MdCodec::new()),
-            ),
-            // BeliefNetwork files by stem (hidden file .noet)
-            (Some(".noet".to_string()), None, || {
-                Box::new(ProtoBeliefNode::default())
+            (None, Some("md".to_string()), || Box::new(MdCodec::new())),
+            // Network files by constant filename index.md
+            (Some("index".to_string()), Some("md".to_string()), || {
+                Box::new(NetworkCodec::default())
             }),
+            (None, None, || Box::new(NetworkCodec::default())),
         ])));
-        debug_assert!({
-            BUILTIN_EXTENSIONS
-                .iter()
-                .all(|ext| map.get_by_extension(ext).is_some())
-        });
         map
-    }
-
-    /// Insert a codec by extension (simple API).
-    ///
-    /// This is a convenience method that calls `insert_codec(None, Some(extension), factory)`.
-    ///
-    /// # Example
-    /// ```
-    /// use noet_core::codec::{CODECS, ProtoBeliefNode};
-    ///
-    /// CODECS.insert("org".to_string(), || Box::new(ProtoBeliefNode::default()));
-    /// ```
-    pub fn insert(&self, extension: String, factory: CodecFactory) {
-        self.insert_codec(None, Some(extension), factory);
     }
 
     /// Insert a codec with optional stem and extension (advanced API).
     ///
     /// At least one of `stem` or `extension` must be `Some`. This method enables:
     /// - Registration by extension: `insert_codec(None, Some("md"), factory)`
-    /// - Registration by stem: `insert_codec(Some(".noet"), None, factory)`
+    /// - Registration by stem: `insert_codec(Some("special-name"), None, factory)`
     /// - Registration by both: `insert_codec(Some("config"), Some("toml"), factory)`
     ///
     /// # Panics
@@ -467,11 +439,6 @@ impl CodecMap {
         extension: Option<String>,
         factory: CodecFactory,
     ) {
-        assert!(
-            stem.is_some() || extension.is_some(),
-            "At least one of stem or extension must be Some"
-        );
-
         while self.0.is_locked() {
             tracing::debug!("[CodecMap::insert_codec] Waiting for write access");
             std::thread::sleep(Duration::from_millis(100));
@@ -496,51 +463,43 @@ impl CodecMap {
     ///
     /// # Example
     /// ```
-    /// use noet_core::codec::CODECS;
+    /// use noet_core::{codec::CODECS, paths::AnchorPath};
     ///
     /// // Match by extension
-    /// let factory = CODECS.get("README", "md");
+    /// let factory = CODECS.get(&AnchorPath::new("README.md"));
     /// assert!(factory.is_some());
     ///
-    /// // Match by stem
-    /// let factory = CODECS.get(".noet", "");
+    /// // Match by constant name (factory is a different constructor than .md)
+    /// let factory = CODECS.get(&AnchorPath::new("index.md"));
     /// assert!(factory.is_some());
     ///
     /// // No match
-    /// let factory = CODECS.get("unknown", "xyz");
+    /// let factory = CODECS.get(&AnchorPath::new("unknown.xyz"));
     /// assert!(factory.is_none());
     /// ```
-    pub fn get(&self, filestem: &str, ext: &str) -> Option<CodecFactory> {
+    pub fn get(&self, ap: &AnchorPath) -> Option<CodecFactory> {
         while self.0.is_locked_exclusive() {
             tracing::debug!("[CodecMap::get] Waiting for read access");
             std::thread::sleep(Duration::from_millis(100));
         }
         let reader = self.0.read_arc();
+        let (filestem, ext) = ap.path_parts();
         reader
             .iter()
             .find(|(codec_stem, codec_ext, _)| {
                 // Match if stem matches (when codec has a stem registered)
                 let stem_matches = codec_stem.as_ref().is_some_and(|s| s == filestem);
                 // Match if extension matches (when codec has an extension registered)
-                let ext_matches = codec_ext.as_ref().is_some_and(|e| e == ext);
-                stem_matches || ext_matches
+                let ext_matches =
+                    codec_ext.as_ref().is_some_and(|e| e == ext) || codec_ext.is_none();
+                stem_matches && ext_matches
             })
-            .map(|(_, _, factory)| *factory)
-    }
-
-    /// Get codec factory by extension only (simple API).
-    ///
-    /// This is a convenience method for retrieving codecs registered by extension.
-    /// For stem-based lookups, use `get()` instead.
-    pub fn get_by_extension(&self, ext: &str) -> Option<CodecFactory> {
-        while self.0.is_locked_exclusive() {
-            tracing::debug!("[CodecMap::get_by_extension] Waiting for read access");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let reader = self.0.read_arc();
-        reader
-            .iter()
-            .find(|(_, codec_ext, _)| codec_ext.as_ref().is_some_and(|e| e == ext))
+            .or(reader
+                .iter()
+                .find(|(_codec_stem, codec_ext, _)| codec_ext.as_ref().is_some_and(|e| e == ext)))
+            .or(reader.iter().find(|(codec_stem, codec_ext, _)| {
+                codec_stem.is_none() && codec_ext.is_none() && filestem.is_empty() && ext.is_empty()
+            }))
             .map(|(_, _, factory)| *factory)
     }
 
@@ -556,7 +515,15 @@ impl CodecMap {
         let reader = self.0.read_arc();
         reader
             .iter()
-            .filter_map(|(_, codec_ext, _)| codec_ext.clone())
+            .filter_map(|(codec_stem, codec_ext, _)| {
+                if codec_ext.is_some() {
+                    codec_ext.clone()
+                } else if codec_ext.is_none() && codec_stem.is_none() {
+                    Some("".to_string())
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -611,24 +578,44 @@ impl CodecMap {
     /// Check if a codec exists for the given anchor path (WASM version).
     ///
     /// This is a simplified version for WASM that only checks built-in extensions.
-    pub fn has_codec_for_anchor_path(&self, anchor_path: &crate::paths::path::AnchorPath) -> bool {
+    pub fn get(&self, anchor_path: &AnchorPath) -> Option<()> {
         let ext = anchor_path.ext();
-        if !ext.is_empty() {
-            BUILTIN_EXTENSIONS.contains(&ext)
+        if BUILTIN_EXTENSIONS.contains(&ext) {
+            Some(())
         } else {
-            false
+            None
         }
     }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use crate::{codec::md::MdCodec, tests::helpers::init_logging};
+
     use super::*;
+
+    /// Helper: Create a test network directory with index.md file
+    fn create_test_network(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("index.md"),
+            r#"---
+id: "test-network"
+title: "Test Network"
+---
+
+# Test Network
+
+Test network for unit tests.
+"#,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn test_codec_factory_creates_fresh_instances() {
         // Get codec factory for markdown
-        let factory = CODECS.get("README", "md").expect("md codec should exist");
+        let ap = AnchorPath::new("README.md");
+        let factory = CODECS.get(&ap).expect("md codec should exist");
 
         // Create two instances
         let codec1 = factory();
@@ -650,13 +637,25 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_extensions() {
+        init_logging();
+        use crate::paths::as_extension;
+        let map = CodecMap::create();
+        for ext in BUILTIN_EXTENSIONS.iter() {
+            let ap_str = format!("foo{}", as_extension(ext));
+            let ap = AnchorPath::new(&ap_str);
+            assert!(map.get(&ap).is_some());
+        }
+    }
+
+    #[test]
     fn test_codec_factory_stems() {
         let patterns = CODECS.registered_patterns();
 
         // Verify BeliefNetwork codec is registered by stem
         assert!(patterns
             .iter()
-            .any(|(stem, _)| stem.as_ref().is_some_and(|s| s == ".noet")));
+            .any(|(stem, _)| stem.as_ref().is_some_and(|s| s == "index")));
 
         // Verify markdown codec is registered by extension
         assert!(patterns
@@ -666,21 +665,16 @@ mod tests {
 
     #[test]
     fn test_codec_factory_get_nonexistent() {
-        let result = CODECS.get("nonexistent", "xyz");
-        assert!(result.is_none());
+        let ap = AnchorPath::new("nonexistent.xyz");
+        let result = CODECS.get(&ap);
+        assert!(result.is_none(), "result: {result:?}");
     }
 
     #[test]
     fn test_codec_factory_get_by_stem() {
-        // Test that .noet filestem matches BeliefNetwork codec
-        let result = CODECS.get(".noet", "");
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_codec_factory_get_by_extension() {
-        // Test that .md extension matches markdown codec
-        let result = CODECS.get("README", "md");
+        // Test that index.md filestem matches BeliefNetwork codec
+        let ap = AnchorPath::new("index.md");
+        let result = CODECS.get(&ap);
         assert!(result.is_some());
     }
 
@@ -691,7 +685,7 @@ mod tests {
         for builtin in BUILTIN_EXTENSIONS {
             assert!(
                 extensions.contains(&builtin.to_string()),
-                "Missing builtin extension: {}",
+                "Missing builtin extension: '{}'",
                 builtin
             );
         }
@@ -703,11 +697,11 @@ mod tests {
 
         // Insert a custom codec by stem
         codecs.insert_codec(Some("custom".to_string()), None, || {
-            Box::new(ProtoBeliefNode::default())
+            Box::new(MdCodec::default())
         });
 
         // Verify it can be retrieved
-        let result = codecs.get("custom", "");
+        let result = codecs.get(&AnchorPath::new("custom.xyz"));
         assert!(result.is_some());
     }
 
@@ -716,15 +710,15 @@ mod tests {
         use crate::paths::path::AnchorPath;
 
         // Test with full path
-        let ap = AnchorPath::new("/tmp/.tmpm0D4CB/.noet");
-        let (stem, ext) = ap.codec_parts();
+        let ap = AnchorPath::new("/tmp/.tmpm0D4CB/index.md");
+        let (stem, ext) = ap.path_parts();
 
-        assert_eq!(stem, ".noet", "Codec stem should be .noet");
-        assert_eq!(ext, "", "Extension should be empty");
+        assert_eq!(stem, "index", "Codec stem should be index");
+        assert_eq!(ext, "md", "Extension should be empty");
 
         // Verify codec lookup works
-        let result = CODECS.get(stem, ext);
-        assert!(result.is_some(), "Should find codec for .noet filestem");
+        let result = CODECS.get(&ap);
+        assert!(result.is_some(), "Should find codec for index.md");
     }
 
     #[tokio::test]
@@ -734,6 +728,7 @@ mod tests {
 
         // Create temporary directory with a test markdown file
         let temp_dir = TempDir::new().unwrap();
+        create_test_network(temp_dir.path());
         let test_file = temp_dir.path().join("test.md");
         let content = "# Test Document\n\nThis is a test.";
         std::fs::write(&test_file, content).unwrap();
@@ -747,7 +742,11 @@ mod tests {
             .parse_content(&test_file, content.to_string(), session_bb)
             .await;
 
-        assert!(result.is_ok(), "parse_content should succeed");
+        assert!(
+            result.is_ok(),
+            "parse_content should succeed: {:?}",
+            result.as_ref().err()
+        );
         let with_codec = result.unwrap();
         let parse_result = with_codec.result;
         let codec = with_codec.codec;
@@ -772,6 +771,7 @@ mod tests {
 
         // Create temporary directory with a test markdown file
         let temp_dir = TempDir::new().unwrap();
+        create_test_network(temp_dir.path());
         let test_file = temp_dir.path().join("test.md");
         let content = "# Test Document\n\nThis is a test with a [link](other.md).";
         std::fs::write(&test_file, content).unwrap();

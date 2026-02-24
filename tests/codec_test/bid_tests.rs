@@ -3,7 +3,7 @@
 use noet_core::{
     beliefbase::BeliefBase,
     codec::{
-        belief_ir::{detect_network_file, NETWORK_CONFIG_NAMES},
+        network::{detect_network_file, NETWORK_NAME},
         DocumentCompiler, CODECS,
     },
     db::{db_init, DbConnection, Transaction},
@@ -61,11 +61,11 @@ async fn test_belief_set_builder_bid_generation_and_caching(
             let mut write_path = parse_result.path.clone();
             if write_path.is_dir() {
                 // Detect network file (JSON or TOML)
-                if let Some((detected_path, _format)) = detect_network_file(&write_path) {
+                if let Some(detected_path) = detect_network_file(&write_path) {
                     write_path = detected_path;
                 } else {
                     // Default to first in NETWORK_CONFIG_NAMES (JSON)
-                    write_path.push(NETWORK_CONFIG_NAMES[0]);
+                    write_path.push(NETWORK_NAME);
                 }
             }
             *doc_entry += 1;
@@ -234,8 +234,9 @@ async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::erro
         tracing::debug!("Second parse - doc {:?}", parse_result.path);
         if parse_result.rewritten_content.is_some() {
             tracing::warn!(
-                "Document {:?} has rewritten content on second parse - indicates BID instability",
-                parse_result.path
+                "Document {:?} has rewritten content on second parse - indicates BID instability:\n{}",
+                parse_result.path,
+                parse_result.rewritten_content.clone().unwrap()
             );
         }
         // This assertion will fail if the cache lookup is broken

@@ -214,8 +214,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
             })?;
 
-            // Network file is always named .noet
-            let full_path = path.join(".noet");
+            // Network file is always named index.md
+            let full_path = path.join("index.md");
 
             println!("✓ Network file created: {}", full_path.display());
             Ok(())

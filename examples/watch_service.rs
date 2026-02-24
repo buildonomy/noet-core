@@ -151,11 +151,17 @@ fn example_event_processing(workspace_root: PathBuf) -> Result<(), Box<dyn std::
         println!("Creating example network at: {}", network_path.display());
         std::fs::create_dir_all(&network_path)?;
 
-        // Create .noet file
+        // Create index.md file
         std::fs::write(
-            network_path.join(".noet"),
-            r#"id = "example-network"
-title = "Example Network"
+            network_path.join("index.md"),
+            r#"---
+id: "example-network"
+title: "Example Network"
+---
+
+# Example Network
+
+This is an example network for testing the watch service.
 "#,
         )?;
 

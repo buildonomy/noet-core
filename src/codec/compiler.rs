@@ -2,14 +2,15 @@ use crate::{
     beliefbase::BeliefBase,
     codec::{
         assets::get_stylesheet_urls,
-        belief_ir::{detect_network_file, ProtoBeliefNode, NETWORK_CONFIG_NAMES},
+        belief_ir::ProtoBeliefNode,
         builder::GraphBuilder,
-        UnresolvedReference, CODECS,
+        network::{detect_network_file, NetworkCodec, NETWORK_NAME},
+        DocCodec, UnresolvedReference, CODECS,
     },
     error::BuildonomyError,
     event::BeliefEvent,
     nodekey::NodeKey,
-    paths::{os_path_to_string, path::string_to_os_path, AnchorPath},
+    paths::{os_path_to_string, string_to_os_path, AnchorPath},
     properties::{
         asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Bref, Weight,
         WeightKind, WEIGHT_DOC_PATHS,
@@ -21,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -57,7 +59,7 @@ use toml_edit::value;
 /// Consider this document structure:
 /// ```text
 /// network/
-///   ├── .noet
+///   ├── index.md
 ///   ├── README.md           → references sub_1.md, sub_2.md
 ///   ├── sub_1.md            → references sub_2.md
 ///   └── sub_2.md
@@ -246,7 +248,7 @@ impl DocumentCompiler {
         })
     }
 
-    /// Initialize a directory as a BeliefNetwork by placing a .noet file with the
+    /// Initialize a directory as a BeliefNetwork by placing an index.md file with the
     /// input arguments at that location.
     pub async fn create_network_file<P>(
         repo_path: P,
@@ -257,7 +259,18 @@ impl DocumentCompiler {
     where
         P: AsRef<std::path::Path> + std::fmt::Debug,
     {
-        let mut proto = ProtoBeliefNode::new(&repo_path, &repo_path).unwrap_or_default();
+        let net_codec = NetworkCodec::default();
+        if net_codec
+            .proto(repo_path.as_ref(), repo_path.as_ref())?
+            .is_some()
+        {
+            return Err(BuildonomyError::Codec(format!(
+                "Network file at path {repo_path:?} is already initialized."
+            )));
+        }
+
+        let mut proto = ProtoBeliefNode::default();
+
         proto.document.insert("id", value(id));
         if let Some(title) = maybe_title {
             proto.document.insert("title", value(title));
@@ -266,18 +279,14 @@ impl DocumentCompiler {
             proto.document.insert("text", value(summary));
         }
 
-        proto.write(&repo_path)?;
-        proto = ProtoBeliefNode::new(&repo_path, &repo_path)?;
-        debug_assert!(
-            proto
-                .kind.is_network(),
-            "Expected to generate an anchored BeliefKind::Network. Instead, our generated proto is {proto:?}"
-        );
-        debug_assert!(
-            !proto.kind.contains(BeliefKind::Trace),
-            "Expected to generate a BeliefKind::Network. Instead, our generated proto is {proto:?}"
-        );
-        Ok(string_to_os_path(&proto.path))
+        let mut file_path = repo_path.as_ref().to_path_buf();
+        if !file_path.is_dir() {
+            file_path.pop();
+        }
+        file_path.push(NETWORK_NAME);
+        let mut file = fs::File::create(&file_path)?;
+        file.write_all(&format!("---{}\n---\n", proto.document).into_bytes())?;
+        Ok(file_path)
     }
 
     /// Parse the next item in the queue, returning None if queue is empty
@@ -349,19 +358,20 @@ impl DocumentCompiler {
         // 3. Determine the actual file path (may differ from path if path is a directory)
         let file_path = if path.is_dir() {
             // BeliefNetwork directories are enqueued as the directory, not the contained
-            // .noet file.
-            if let Some((detected_path, _format)) = detect_network_file(&path) {
+            // index file.
+            if let Some(detected_path) = detect_network_file(&path) {
                 detected_path
             } else {
-                // Default to first in NETWORK_CONFIG_NAMES (JSON)
-                path.join(NETWORK_CONFIG_NAMES[0])
+                return Err(BuildonomyError::Codec(
+                    "Cannot parse a directory without an index file".to_string(),
+                ));
             }
         } else {
             path.clone()
         };
 
         // 3a. Check if this is an asset file (not a known document codec extension)
-        if !file_path.is_dir() && !CODECS.has_codec_for_path(&file_path) {
+        if !file_path.is_dir() && CODECS.path_get(&file_path).is_none() {
             return self.process_asset(path).await;
         }
 
@@ -422,11 +432,6 @@ impl DocumentCompiler {
 
         // 7. Write rewritten content if available
         if let Some(contents) = parse_result.rewritten_content.as_ref() {
-            tracing::debug!(
-                "[Compiler] Rewritten content available for {:?}, write={}",
-                file_path,
-                self.write
-            );
             if self.write {
                 tracing::info!("[Compiler] Writing rewritten content to {:?}", file_path);
                 if let Err(e) = tokio::fs::write(&file_path, contents).await {
@@ -436,8 +441,6 @@ impl DocumentCompiler {
                         .push(crate::codec::ParseDiagnostic::warning(format!(
                             "Failed to write rewritten content: {e}"
                         )));
-                } else {
-                    tracing::debug!("[Compiler] Successfully wrote file: {:?}", file_path);
                 }
             } else {
                 tracing::debug!(
@@ -662,7 +665,7 @@ impl DocumentCompiler {
                         // Network will re-scan and discover file is gone
                         let mut parent = path.as_path();
                         while let Some(p) = parent.parent() {
-                            if ProtoBeliefNode::from_file(p).is_ok() {
+                            if detect_network_file(p).is_some() {
                                 tracing::info!(
                                     "Enqueueing parent network for deleted file: {}",
                                     p.display()
@@ -989,12 +992,13 @@ impl DocumentCompiler {
         // 3. Determine the actual file path (may differ from path if path is a directory)
         let file_path = if path.is_dir() {
             // BeliefNetwork directories are enqueued as the directory, not the contained
-            // .noet file.
-            if let Some((detected_path, _format)) = detect_network_file(&path) {
+            // index.md file.
+            if let Some(detected_path) = detect_network_file(&path) {
                 detected_path
             } else {
-                // Default to first in NETWORK_CONFIG_NAMES (JSON)
-                path.join(NETWORK_CONFIG_NAMES[0])
+                return Err(BuildonomyError::Codec(
+                    "Cannot parse a directory without an index file".to_string(),
+                ));
             }
         } else {
             path.clone()
@@ -1745,6 +1749,7 @@ impl DocumentCompiler {
         Ok(())
     }
 
+    /// The paths we're provided come from the builder. they should already be relative to repo_root
     async fn generate_html_for_path<B: BeliefSource + Clone>(
         &self,
         source_path: &Path,
@@ -1752,49 +1757,13 @@ impl DocumentCompiler {
         global_bb: B,
     ) -> Result<(), BuildonomyError> {
         // Get file extension
-        let mut full_path = self.builder.repo_root().join(source_path);
-        if source_path.extension().is_none() {
-            let Some((path, _format)) = detect_network_file(&full_path) else {
-                return Err(BuildonomyError::Codec(format!(
-                    "Could not determine extension for {:?}",
-                    full_path
-                )));
-            };
-            full_path = path;
-        }
-        let filestem = full_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = full_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                let msg = format!("Could not determine extension for {:?}", full_path);
-                tracing::warn!("{}", msg);
-                BuildonomyError::Codec(msg)
-            })?;
-
-        let codec_factory = CODECS.get(filestem, ext).ok_or_else(|| {
-            let msg = format!("No codec available for .{} files", ext);
+        let path_str = os_path_to_string(source_path);
+        let source_path_ap = AnchorPath::new(&path_str);
+        let codec_factory = CODECS.get(&source_path_ap).ok_or_else(|| {
+            let msg = format!("No codec available for {} files", source_path_ap);
             tracing::warn!("{}", msg);
             BuildonomyError::Codec(msg)
         })?;
-        // Get codec factory for this file type
-
-        // the paths we're provided come from the builder. they are already relative to repo_root
-        let path_str = source_path
-            .strip_prefix(self.builder.repo_root())
-            .unwrap_or(source_path)
-            .to_string_lossy()
-            .to_string();
-
-        tracing::debug!(
-            "[generate_html_for_path] repo_root '{:?}'",
-            self.builder.repo_root()
-        );
-        tracing::debug!(
-            "[generate_html_for_path] Looking up path in PathMap: '{}'",
-            path_str
-        );
-
         // Query for the node using path from synchronized global_bb
         let nodekey = NodeKey::Path {
             net: self.builder.repo().bref(),
@@ -1961,12 +1930,6 @@ impl DocumentCompiler {
                 // Copy file to canonical location
                 tokio::fs::copy(&repo_full_path, &canonical).await?;
                 copied_canonical.insert(canonical.clone());
-
-                tracing::debug!(
-                    "[Compiler] Copied asset to canonical: {} -> {}",
-                    repo_full_path.display(),
-                    canonical.display()
-                );
             } else {
                 tracing::debug!(
                     "[Compiler] Duplicate content detected: {} (hash: {}) - reusing canonical {}",
@@ -1993,13 +1956,7 @@ impl DocumentCompiler {
 
             // Try to create hardlink, fall back to copy if hardlink fails
             match tokio::fs::hard_link(&canonical, &html_full_path).await {
-                Ok(_) => {
-                    tracing::debug!(
-                        "[Compiler] Hardlinked asset: {} -> {}",
-                        html_full_path.display(),
-                        canonical.display()
-                    );
-                }
+                Ok(_) => {}
                 Err(e) => {
                     // Hardlink failed (maybe filesystem doesn't support it), fall back to copy
                     tracing::debug!(
@@ -2054,12 +2011,30 @@ pub struct CompilerStats {
 mod tests {
     use super::*;
 
+    /// Helper: Create a test network directory with index.md file
+    fn create_test_network(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("index.md"),
+            r#"---
+id: "test-network"
+title: "Test Network"
+---
+
+# Test Network
+
+Test network for unit tests.
+"#,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_compiler_creation() {
         // This is a basic structure test - actual functional tests would require
         // setting up a test filesystem and mock cache
-        let temp_dir = std::env::temp_dir();
-        let result = DocumentCompiler::new(&temp_dir, None, Some(5), false);
+        let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
+        let result = DocumentCompiler::new(temp_dir.path(), None, Some(5), false);
         assert!(result.is_ok());
 
         let compiler = result.unwrap();
@@ -2071,10 +2046,11 @@ mod tests {
 
     #[test]
     fn test_enqueue_deduplication() {
-        let temp_dir = std::env::temp_dir();
-        let mut compiler = DocumentCompiler::new(&temp_dir, None, None, false).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
+        let mut compiler = DocumentCompiler::new(temp_dir.path(), None, None, false).unwrap();
 
-        let test_path = temp_dir.join("test.md");
+        let test_path = temp_dir.path().join("test.md");
         compiler.enqueue(&test_path);
         let initial_len = compiler.total_queue_len();
 
@@ -2085,8 +2061,9 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let temp_dir = std::env::temp_dir();
-        let compiler = DocumentCompiler::new(&temp_dir, None, None, false).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
+        let compiler = DocumentCompiler::new(temp_dir.path(), None, None, false).unwrap();
 
         let stats = compiler.stats();
         assert_eq!(stats.primary_queue_len, 1);
