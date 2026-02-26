@@ -976,43 +976,86 @@ impl BeliefBase {
         }
 
         // tracing::debug!("Check invariant #2");
+        //
+        // Network nodes are a special case: their incoming Section edges come from two
+        // independent sort spaces — document children at [0..NETWORK_SECTION_SORT_KEY-1]
+        // and anchor/heading children at [NETWORK_SECTION_SORT_KEY, *] — so the global
+        // incoming key set is not a single contiguous [0..N). Instead we verify each
+        // group independently.
+        let paths_guard = self.paths();
+        let net_bids = paths_guard.nets();
+        let doc_bids = paths_guard.docs();
+
         for node in self.states().values() {
             let bid = &node.bid;
+            // Collect incoming sort keys per WeightKind, keyed by whether the source is a
+            // document (in doc_bids) or an anchor (not in doc_bids). Only matters for nets.
             let mut kind_map: BTreeMap<WeightKind, Vec<u16>> = BTreeMap::new();
+            // For network sinks: separate doc-sourced and anchor-sourced keys.
+            let mut kind_map_docs: BTreeMap<WeightKind, Vec<u16>> = BTreeMap::new();
+            let mut kind_map_anchors: BTreeMap<WeightKind, Vec<u16>> = BTreeMap::new();
+            let is_net = net_bids.contains(bid);
+
             if let Some(node_idx) = self.bid_to_index(bid) {
                 for edge in relations
                     .as_graph()
                     .edges_directed(node_idx, Direction::Incoming)
                 {
+                    let source_bid = relations.as_graph()[edge.source()];
                     for (kind, weight_data) in edge.weight().weights.iter() {
                         let sort_key: u16 = weight_data
                             .get(crate::properties::WEIGHT_SORT_KEY)
                             .unwrap_or(0);
-                        kind_map.entry(*kind).or_default().push(sort_key);
+                        if is_net {
+                            if doc_bids.contains(&source_bid) {
+                                kind_map_docs.entry(*kind).or_default().push(sort_key);
+                            } else {
+                                kind_map_anchors.entry(*kind).or_default().push(sort_key);
+                            }
+                        } else {
+                            kind_map.entry(*kind).or_default().push(sort_key);
+                        }
                     }
                 }
             }
 
-            for (kind, mut indices) in kind_map {
-                indices.sort();
-                if node.kind.contains(BeliefKind::Trace) {
-                    // If we have a trace node, the best we can check is to ensure there are no
-                    // duplicates in our indices
-                    let mut deduped = indices.clone();
-                    deduped.dedup();
-                    if indices.len() != deduped.len() {
-                        errors.push(format!(
-                         "[BeliefBase::build_in_test invariant 2] {bid} (tagged as trace) {kind:?} edges \
-                         contains duplicate edge indices. Received {indices:?}"
-                     ))
+            if is_net {
+                // For network nodes, verify docs and anchors are each independently contiguous.
+                for (label, map) in [("doc", &kind_map_docs), ("anchor", &kind_map_anchors)] {
+                    for (kind, mut indices) in map.clone() {
+                        indices.sort();
+                        let expected: Vec<u16> = (0..indices.len() as u16).collect();
+                        if indices != expected {
+                            errors.push(format!(
+                                "[BeliefBase::built_in_test invariant 2] {bid} (network) \
+                                {kind:?} {label} edges are not correctly sorted. \
+                                Received {indices:?}, Expected: {expected:?}"
+                            ));
+                        }
                     }
-                } else {
-                    let expected: Vec<u16> = (0..indices.len() as u16).collect();
-                    if indices != expected {
-                        errors.push(format!(
-                            "[BeliefBase::built_in_test invariant 2] {bid} {kind:?} edges are not \
-                            correctly sorted. Received {indices:?}, Expected: {expected:?}"
-                        ));
+                }
+            } else {
+                for (kind, mut indices) in kind_map {
+                    indices.sort();
+                    if node.kind.contains(BeliefKind::Trace) {
+                        // If we have a trace node, the best we can check is to ensure there are no
+                        // duplicates in our indices
+                        let mut deduped = indices.clone();
+                        deduped.dedup();
+                        if indices.len() != deduped.len() {
+                            errors.push(format!(
+                                "[BeliefBase::build_in_test invariant 2] {bid} (tagged as trace) {kind:?} edges \
+                                contains duplicate edge indices. Received {indices:?}"
+                            ))
+                        }
+                    } else {
+                        let expected: Vec<u16> = (0..indices.len() as u16).collect();
+                        if indices != expected {
+                            errors.push(format!(
+                                "[BeliefBase::built_in_test invariant 2] {bid} {kind:?} edges are not \
+                                correctly sorted. Received {indices:?}, Expected: {expected:?}"
+                            ));
+                        }
                     }
                 }
             }

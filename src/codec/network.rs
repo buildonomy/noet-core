@@ -193,6 +193,10 @@ impl DocCodec for NetworkCodec {
         self.0.inject_context(node, ctx)
     }
 
+    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+        self.0.finalize()
+    }
+
     fn generate_source(&self) -> Option<String> {
         self.0.generate_source()
     }

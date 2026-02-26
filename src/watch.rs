@@ -568,7 +568,7 @@ impl WatchService {
                                                 }
                                             }
 
-                                            debouncer_codec.path_get(&p).is_some()
+                                            debouncer_codec.path_get(p).is_some()
                                         })
                                         .collect();
 

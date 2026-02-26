@@ -1,6 +1,25 @@
 /// Defines [PathMapMap], and [PathMap], who's primary job is to generate and
 /// maintain relative paths between [BeliefNodes] within a [BeliefBase], even
 /// when the relations within that set are changing.
+///
+/// # Network Sort-Space Reservation
+///
+/// `u16::MAX` (`NETWORK_SECTION_SORT_KEY`) is a reserved sentinel sort key used to
+/// separate a network's two structural roles in its own PathMap:
+///
+/// - Sort positions `[0..u16::MAX-1]`: document children of the network (normal address space)
+/// - Sort position `[u16::MAX]`: the network's own `index.md` content plane (gateway slot)
+///
+/// This mirrors the IP LAN gateway analogy: just as a LAN reserves an address for the
+/// network control interface, PathMap reserves `u16::MAX` for the index.md subsection tree.
+/// The `"index.md"` hardcoded entry in every network PathMap carries this order, and the
+/// DFS in `PathMap::new` overrides the sort key to `u16::MAX` for anchor (heading/section)
+/// children of the network root so their paths are correctly computed as
+/// `[u16::MAX, heading_idx]` rather than colliding with document paths at `[heading_idx]`.
+///
+/// `process_relation_update` uses `nets.is_anchor(source)` to select the correct parent
+/// entry when a network node has both a `""` (document parent, order `[]`) and an
+/// `"index.md"` (section parent, order `[u16::MAX]`) entry in its `bid_map`.
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 use petgraph::visit::{depth_first_search, Control, DfsEvent};
 use std::{
@@ -21,6 +40,13 @@ use crate::{
     },
     query::WrappedRegex,
 };
+
+/// Reserved sort key for a network node's own `index.md` content plane.
+///
+/// Documents are children of the network at sort positions `[0..NETWORK_SECTION_SORT_KEY-1]`.
+/// Headings/anchors parsed from `index.md` are children of the network at sort positions
+/// `[NETWORK_SECTION_SORT_KEY, heading_idx]`, keeping the two sort spaces non-colliding.
+pub const NETWORK_SECTION_SORT_KEY: u16 = u16::MAX;
 
 /// [IdMap] tracks the mapping between semantic IDs (from TOML schema) and BIDs.
 /// IDs provide globally unique references like "asp_sarah_embodiment_rest".
@@ -737,7 +763,16 @@ impl PathMap {
                         vec![anchorized_path]
                     };
 
-                    let sub_path_info = (vec![*weight], all_paths);
+                    // When the direct parent is the network root and the source is an
+                    // anchor (heading/section), nest it under NETWORK_SECTION_SORT_KEY.
+                    // The anchor's own sort key becomes the second element, placing it at
+                    // [NETWORK_SECTION_SORT_KEY, anchor_idx] — fully non-colliding with
+                    // document children at [doc_idx] (i.e. [0..NETWORK_SECTION_SORT_KEY-1]).
+                    let sub_path_info = if sink == net && nets.is_anchor(&source) {
+                        (vec![NETWORK_SECTION_SORT_KEY, *weight], all_paths)
+                    } else {
+                        (vec![*weight], all_paths)
+                    };
 
                     stack.get_mut(&sink).map(|path_info| {
                         path_info.1.insert(source, sub_path_info);
@@ -833,7 +868,11 @@ impl PathMap {
         let mut map = Vec::from_iter(
             vec![
                 (String::from(""), net, Vec::<u16>::default()),
-                (NETWORK_NAME.to_string(), net, Vec::<u16>::default()),
+                (
+                    NETWORK_NAME.to_string(),
+                    net,
+                    vec![NETWORK_SECTION_SORT_KEY],
+                ),
             ]
             .into_iter()
             .chain(
@@ -1324,13 +1363,36 @@ impl PathMap {
     ) -> Vec<BeliefEvent> {
         // FIXME: This isn't checking for loops at all
         let mut derivatives = Vec::default();
-        let sink_sub_indices = self.source_sub_indices(sink, false);
+        let mut sink_sub_indices = self.source_sub_indices(sink, false);
         if sink_sub_indices.is_empty() {
             return derivatives;
         }
         if nets.nets.contains(sink) && self.net != *sink {
             return derivatives;
         }
+
+        // When sink is the network root, it has two entries in bid_map:
+        //   - "" at order [] — parent for document children
+        //   - "index.md" at order [NETWORK_SECTION_SORT_KEY] — parent for anchor/heading children
+        //
+        // Select only the entry appropriate for this source so that new_order is computed
+        // from the correct base. Without this filter, both entries would contribute a
+        // new_order and headings would incorrectly land at [heading_idx] instead of
+        // [NETWORK_SECTION_SORT_KEY, heading_idx].
+        if *sink == self.net && sink_sub_indices.len() > 1 {
+            let source_is_anchor = nets.is_anchor(source);
+            sink_sub_indices.retain(|(sink_index, _sub_indices)| {
+                let sink_order = &self.map[*sink_index].2;
+                if source_is_anchor {
+                    // Headings belong under the "index.md" entry (order starts with NETWORK_SECTION_SORT_KEY)
+                    sink_order.first() == Some(&NETWORK_SECTION_SORT_KEY)
+                } else {
+                    // Documents belong under the "" entry (empty order)
+                    sink_order.is_empty()
+                }
+            });
+        }
+
         let Some(new_weight) = weightset.get(&self.kind) else {
             // This looks exactly like a removal event to this pathmap.
             // collect all the sources to the source -- we have to remove them as well as their

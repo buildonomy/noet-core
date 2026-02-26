@@ -91,6 +91,10 @@
 //!         todo!();
 //!     }
 //!
+//!     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+//!         Ok(Vec::new())
+//!     }
+//!
 //!     fn generate_source(&self) -> Option<String> {
 //!         todo!();
 //!     }
@@ -259,10 +263,11 @@ pub trait DocCodec: Sync {
     ///
     /// Returns a vector of (ProtoBeliefNode, BeliefNode) pairs for nodes that were modified
     /// during finalization and need NodeUpdate events emitted.
-    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
-        // Default implementation: no finalization needed
-        Ok(Vec::new())
-    }
+    ///
+    /// Every implementor must explicitly handle this. Codecs that wrap other codecs (e.g.,
+    /// `NetworkCodec` wrapping `MdCodec`) must delegate to the inner codec's `finalize()`.
+    /// Codecs with no finalization logic should return `Ok(Vec::new())`.
+    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError>;
 
     fn generate_source(&self) -> Option<String>;
 
@@ -410,7 +415,8 @@ impl CodecMap {
     /// - Markdown: registered by extension `.md`
     /// - NetworkCodec: registered by constand file name `index.md`
     pub fn create() -> Self {
-        let map = CodecMap(Arc::new(RwLock::new(vec![
+        
+        CodecMap(Arc::new(RwLock::new(vec![
             // Markdown files by extension
             (None, Some("md".to_string()), || Box::new(MdCodec::new())),
             // Network files by constant filename index.md
@@ -418,8 +424,7 @@ impl CodecMap {
                 Box::new(NetworkCodec::default())
             }),
             (None, None, || Box::new(NetworkCodec::default())),
-        ])));
-        map
+        ])))
     }
 
     /// Insert a codec with optional stem and extension (advanced API).

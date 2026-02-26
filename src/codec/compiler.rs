@@ -10,7 +10,7 @@ use crate::{
     error::BuildonomyError,
     event::BeliefEvent,
     nodekey::NodeKey,
-    paths::{os_path_to_string, string_to_os_path, AnchorPath},
+    paths::{os_path_to_string, string_to_os_path, AnchorPath, AnchorPathBuf},
     properties::{
         asset_namespace, buildonomy_namespace, BeliefKind, BeliefNode, Bid, Bref, Weight,
         WeightKind, WEIGHT_DOC_PATHS,
@@ -1211,68 +1211,60 @@ impl DocumentCompiler {
         });
 
         if let Some(asset_relative_path) = asset_path_key {
-            // Resolve relative markdown link to absolute filesystem path
-            let path_string = os_path_to_string(path);
-            let path_ap = AnchorPath::new(&path_string);
+            // asset_relative_path is already repo-relative: regularize_unchecked in nodekey.rs
+            // already resolved the document-relative reference (e.g. ../assets/img.png) against
+            // the owner's network-relative path, producing a repo-relative result
+            // (e.g. subnet1/assets/img.png). Joining against the document's absolute path again
+            // would double the subnet prefix. Instead, join only against repo_root.
             let repo_root = os_path_to_string(self.builder.repo_root());
-            let asset_absolute_path = path_ap.join(asset_relative_path);
-            if let Some(repo_relative_asset) = asset_absolute_path
+            let asset_absolute_path = AnchorPathBuf::from(repo_root.clone())
                 .as_anchor_path()
-                .strip_prefix(&repo_root)
+                .join(asset_relative_path);
+            let repo_relative_asset: &str = asset_relative_path;
+
+            let absolute_path = string_to_os_path(&asset_absolute_path);
+            // Always enqueue asset files to check for content changes
+            // even if already tracked in session_bb
+            if !self.processed.contains_key(&absolute_path)
+                && !self.primary_queue.contains(&absolute_path)
+                && !self.reparse_queue.contains(&absolute_path)
             {
-                let absolute_path = string_to_os_path(&*asset_absolute_path);
-                // Always enqueue asset files to check for content changes
-                // even if already tracked in session_bb
-                if !self.processed.contains_key(&absolute_path)
-                    && !self.primary_queue.contains(&absolute_path)
-                    && !self.reparse_queue.contains(&absolute_path)
-                {
+                tracing::debug!(
+                    "[Compiler] Queueing asset file for content check: {:?}",
+                    asset_absolute_path
+                );
+                self.primary_queue.push_back(absolute_path);
+            }
+
+            // Check if asset already tracked via BeliefBase
+            let asset_already_tracked = self
+                .builder
+                .session_bb()
+                .paths()
+                .net_get_from_path(&asset_namespace().bref(), repo_relative_asset)
+                .is_some();
+
+            if !asset_already_tracked {
+                // Asset not yet in session_bb - document needs reparse after asset loads
+                tracing::info!(
+                    "[Compiler] Document {:?} references untracked asset: {:?}",
+                    path,
+                    asset_absolute_path
+                );
+
+                // Add document to reparse queue (will reparse after asset is processed)
+                if !self.reparse_queue.contains(path) {
                     tracing::debug!(
-                        "[Compiler] Queueing asset file for content check: {:?}",
-                        asset_absolute_path
+                        "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
+                        path
                     );
-                    self.primary_queue.push_back(absolute_path);
-                }
-
-                // Check if asset already tracked via BeliefBase
-                let asset_already_tracked = self
-                    .builder
-                    .session_bb()
-                    .paths()
-                    .net_get_from_path(&asset_namespace().bref(), repo_relative_asset)
-                    .is_some();
-
-                if !asset_already_tracked {
-                    // Asset not yet in session_bb - document needs reparse after asset loads
-                    tracing::info!(
-                        "[Compiler] Document {:?} references untracked asset: {:?}",
-                        path,
-                        asset_absolute_path
-                    );
-
-                    // Add document to reparse queue (will reparse after asset is processed)
-                    if !self.reparse_queue.contains(path) {
-                        tracing::debug!(
-                            "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
-                            path
-                        );
-                        self.reparse_queue.push_back(path.clone());
-                        self.reparse_stable = false;
-                    }
-                } else {
-                    tracing::debug!(
-                        "[Compiler] Asset already tracked: {:?}",
-                        repo_relative_asset
-                    );
-                    // Asset file doesn't exist - leave as unresolved reference
+                    self.reparse_queue.push_back(path.clone());
+                    self.reparse_stable = false;
                 }
             } else {
-                tracing::warn!(
-                    "[Compiler] Cannot resolve asset path {:?} from document {:?}. Absolute path: {}, repo root: {:?}",
-                    asset_relative_path,
-                    path,
-                    asset_absolute_path,
-                    repo_root
+                tracing::debug!(
+                    "[Compiler] Asset already tracked: {:?}",
+                    repo_relative_asset
                 );
             }
         }
@@ -1770,10 +1762,16 @@ impl DocumentCompiler {
             tracing::warn!("{}", msg);
             BuildonomyError::Codec(msg)
         })?;
-        // Query for the node using path from synchronized global_bb
+        // Query for the node using repo-relative path. source_path is an absolute filesystem
+        // path (stored in self.deferred_html), but PathMapMap only stores repo-relative paths.
+        // Strip the repo root prefix before constructing the NodeKey.
+        let repo_relative_str = source_path
+            .strip_prefix(self.builder.repo_root())
+            .map(os_path_to_string)
+            .unwrap_or_else(|_| path_str.clone());
         let nodekey = NodeKey::Path {
             net: self.builder.repo().bref(),
-            path: path_str.clone(),
+            path: repo_relative_str.clone(),
         };
         let mut bb = BeliefBase::from(
             global_bb

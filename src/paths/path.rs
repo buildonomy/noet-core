@@ -103,7 +103,7 @@ impl<'a> AnchorPath<'a> {
 
         // Find param separator before anchor
         let param_search_range = 0..anc_sep.unwrap_or(path.len());
-        let param_sep = path[param_search_range.clone()].rfind('?').map(|idx| idx);
+        let param_sep = path[param_search_range.clone()].rfind('?');
 
         // Find schema separator (: before any /, ?, or #)
         let sch_sep = if let Some(colon_idx) = path.find(':') {
