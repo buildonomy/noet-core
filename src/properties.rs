@@ -121,6 +121,19 @@ pub fn asset_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_ASSET)
 }
 
+/// All reserved/const namespaces. Used by `is_reserved()` and anywhere
+/// the full set of system namespaces is needed.
+pub fn const_namespaces() -> [Bid; 3] {
+    [buildonomy_namespace(), href_namespace(), asset_namespace()]
+}
+
+/// Namespaces that track external content anchored to the parsed repo (hrefs, assets).
+/// Excludes `buildonomy_namespace` which is structural/API — its paths are not
+/// anchored to the parsed root in the same way.
+pub fn content_namespaces() -> [Bid; 2] {
+    [href_namespace(), asset_namespace()]
+}
+
 /// Generate a versioned API BID within the Buildonomy namespace
 ///
 /// This creates a deterministic BID by:
@@ -249,15 +262,9 @@ impl Bid {
     /// - User-generated BIDs will have different parent namespace bytes
     pub fn is_reserved(&self) -> bool {
         let namespace = self.parent_bref();
-        [
-            buildonomy_namespace().bref(),
-            asset_namespace().bref(),
-            href_namespace().bref(),
-            buildonomy_namespace().parent_bref(),
-            asset_namespace().parent_bref(),
-            href_namespace().parent_bref(),
-        ]
-        .contains(&namespace)
+        const_namespaces()
+            .iter()
+            .any(|ns| namespace == ns.bref() || namespace == ns.parent_bref())
             || self.is_nil()
     }
 
@@ -1088,7 +1095,14 @@ impl BeliefNode {
         }
         let id = self.id();
         if !id.is_empty() {
-            ids.push(NodeKey::Id { net, id });
+            if content_namespaces().contains(&ns) {
+                // Content namespace nodes (href, asset) have ids that are locations
+                // (URLs, file paths). These parse as NodeKey::Path via from_str,
+                // so generate a Path key so cache lookups match from_str output.
+                ids.push(NodeKey::Path { net, path: id });
+            } else {
+                ids.push(NodeKey::Id { net, id });
+            }
         }
         if let Some(net_pm) = bs.paths().get_map(&ns.bref()) {
             if self.bid != Bid::nil() {
@@ -1108,7 +1122,7 @@ impl BeliefNode {
                     net_pm.path(&parent, &bs.paths())
                 {
                     let ns_path_ap = AnchorPath::from(&ns_relative_parent_path);
-                    let path = ns_path_ap.join(as_anchor(&self.title));
+                    let path: String = ns_path_ap.join(as_anchor(&self.title)).into_string();
                     if path != ns_relative_parent_path {
                         ids.push(NodeKey::Path { net, path })
                     }

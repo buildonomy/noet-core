@@ -23,9 +23,9 @@ use crate::{
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{as_anchor, path::string_to_os_path, AnchorPath},
+    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath, AnchorPathBuf},
     properties::{
-        asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefKindSet,
+        buildonomy_namespace, content_namespaces, href_namespace, BeliefKind, BeliefKindSet,
         BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, Query},
@@ -379,7 +379,7 @@ impl GraphBuilder {
                                 inject_context = true;
                             } else if matches!(source, NodeSource::Generated) {
                                 generated_href_nodes.push(node.bid);
-                                if let Some(const_namespace) = [asset_namespace(), href_namespace()]
+                                if let Some(const_namespace) = content_namespaces()
                                     .iter()
                                     .find(|ns| node.bid.parent_bref() == ns.bref())
                                 {
@@ -598,10 +598,8 @@ impl GraphBuilder {
 
         // Fetch const_namespaces from global_bb to populate session_bb with known assets
         // This enables asset content change detection by populating PathMap with existing paths
-        for const_node in &[BeliefNode::asset_network(), BeliefNode::href_network()] {
-            let key = NodeKey::Bid {
-                bid: const_node.bid,
-            };
+        for const_bid in &content_namespaces() {
+            let key = NodeKey::Bid { bid: *const_bid };
             if let Some(const_ns_node) = global_bb.get_async(&key).await? {
                 // Process asset namespace node into session_bb
                 let const_ns_event = BeliefEvent::NodeUpdate(
@@ -620,9 +618,9 @@ impl GraphBuilder {
                 self.session_bb.merge(&const_graph);
 
                 tracing::debug!(
-                    "[initialize_stack] Loaded {} {} assets from global cache",
+                    "[initialize_stack] Loaded {} assets from global cache for namespace {}",
                     const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
-                    const_node.display_title()
+                    const_bid
                 );
             }
         }
@@ -908,7 +906,7 @@ impl GraphBuilder {
                 tracing::debug!("Cannot generate speculative key, there already exists a node with ID '{section_id}' in this network.");
                 return Ok(None);
             };
-            child_ap.join(as_anchor(&section_id))
+            child_ap.join(as_anchor(&section_id)).into_string()
         } else {
             child_ap.to_string()
         };
@@ -1196,12 +1194,56 @@ impl GraphBuilder {
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
 
-        let other_key_regularized = other_key
+        let mut other_key_regularized = other_key
             .regularize(&self.doc_bb, *owner_bid, self.repo())
             .expect(
                 "parse_content Phase 1 parsing ensures that we have a valid subsection \
                 structure to get paths from for all our parsed nodes",
             );
+
+        // Phase 2: Resolve boundary-escaping paths using the filesystem repo_root.
+        // After regularize, a path starting with "../" means the join against the
+        // network-relative owner_path escaped the network boundary. We can resolve
+        // this by constructing the absolute path and stripping the repo_root prefix.
+        if let NodeKey::Path { ref net, ref path } = other_key_regularized {
+            if path.starts_with("../") {
+                let repo_root_str = os_path_to_string(&self.repo_root);
+                let mut abs_ap = AnchorPathBuf::from(repo_root_str.clone());
+                // Get the owner's network-relative path for context
+                if let Some((_home_net, owner_path, _order)) = self
+                    .doc_bb
+                    .paths()
+                    .get_map(&self.repo().bref())
+                    .and_then(|pm| pm.path(owner_bid, &self.doc_bb.paths()))
+                {
+                    abs_ap.push(&owner_path);
+                }
+                abs_ap.push(path);
+                // Normalize resolves the ../s against the absolute prefix
+                let normalized = abs_ap.normalize();
+                if let Some(repo_relative) =
+                    normalized.as_anchor_path().strip_prefix(&repo_root_str)
+                {
+                    tracing::debug!(
+                        "[push_relation] Resolved boundary-escaping path '{}' to \
+                         repo-relative '{}'",
+                        path,
+                        repo_relative
+                    );
+                    other_key_regularized = NodeKey::Path {
+                        net: *net,
+                        path: repo_relative.to_string(),
+                    };
+                } else {
+                    tracing::warn!(
+                        "[push_relation] Path '{}' escapes repo boundary even after \
+                         filesystem resolution (resolved to '{}'). Skipping relation.",
+                        path,
+                        normalized
+                    );
+                }
+            }
+        }
 
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
@@ -1226,9 +1268,9 @@ impl GraphBuilder {
             GetOrCreateResult::Unresolved(ref unresolved_initial) => {
                 // Special handling of external scheme links (http/https)
                 if let Some(href) = match &other_key_regularized {
-                    NodeKey::Id { net, id } => {
+                    NodeKey::Path { net, path } => {
                         if *net == href_namespace().bref() {
-                            Some(id.clone())
+                            Some(path.clone())
                         } else {
                             None
                         }

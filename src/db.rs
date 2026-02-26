@@ -473,7 +473,7 @@ fn get_all_document_paths(
                 {
                     let base_ap = AnchorPath::from(&row_results[start_idx].0);
                     for (sub_path, _bid) in sub_results.iter_mut() {
-                        *sub_path = base_ap.join(&sub_path);
+                        *sub_path = base_ap.join(&sub_path).into_string();
                     }
                 }
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0
@@ -553,7 +553,7 @@ fn get_network_paths(
                 {
                     let base_ap = AnchorPath::from(&row_results[start_idx].0);
                     for (sub_path, _bid) in sub_results.iter_mut() {
-                        *sub_path = base_ap.join(&sub_path);
+                        *sub_path = base_ap.join(&sub_path).into_string();
                     }
                 }
                 let incr = sub_results.len() - 1; // since not empty, this is always >= 0

@@ -118,7 +118,9 @@ fn generate_path_name_with_collision_check(
 ) -> String {
     let mut terminal_path = generate_terminal_path(source, sink, explicit_path, index, nets);
     let sink_ap = AnchorPath::from(sink_path);
-    let mut full_path = sink_ap.join(nets.anchorize(source, &terminal_path));
+    let mut full_path: String = sink_ap
+        .join(nets.anchorize(source, &terminal_path))
+        .into_string();
 
     // Check for collision with a different bid
     let has_collision = existing_map
@@ -129,7 +131,9 @@ fn generate_path_name_with_collision_check(
         // Use Bref (BID namespace) as fallback for collision
         terminal_path = source.bref().to_string();
     }
-    full_path = sink_ap.join(nets.anchorize(source, &terminal_path));
+    full_path = sink_ap
+        .join(nets.anchorize(source, &terminal_path))
+        .into_string();
     // Since the Bref is unique per BID, this should guarantee we don't have any collisions
     debug_assert!(!existing_map
         .iter()
@@ -801,7 +805,7 @@ impl PathMap {
                                 for base_path in source_base_paths.iter() {
                                     let base_ap = AnchorPath::from(base_path);
                                     for sub_path in sub_paths.iter() {
-                                        joined_paths.push(base_ap.join(sub_path));
+                                        joined_paths.push(base_ap.join(sub_path).into_string());
                                     }
                                 }
 
@@ -1063,7 +1067,11 @@ impl PathMap {
                             //     self.net,
                             //     res.0
                             // );
-                            (home_net_bid, subnet_ap.join(&home_path), full_order)
+                            (
+                                home_net_bid,
+                                subnet_ap.join(&home_path).into_string(),
+                                full_order,
+                            )
                         })
                 })
             })
@@ -1127,7 +1135,7 @@ impl PathMap {
                 {
                     let a_ap = AnchorPath::from(a_path);
                     for subnet_path in sub_paths.iter() {
-                        paths.push(a_ap.join(subnet_path));
+                        paths.push(a_ap.join(subnet_path).into_string());
                     }
                 }
             } else {
@@ -1157,7 +1165,7 @@ impl PathMap {
                 {
                     let a_ap = AnchorPath::from(a_path);
                     for (subnet_path, subnet_bid) in sub_paths.iter() {
-                        paths.push((a_ap.join(subnet_path), *subnet_bid));
+                        paths.push((a_ap.join(subnet_path).into_string(), *subnet_bid));
                     }
                 }
             } else {
@@ -1199,7 +1207,7 @@ impl PathMap {
                     .expect("all identified subnets to be registered with the pathmapmap");
                 let sub_ap = AnchorPath::new(elem_path);
                 for tuple in subs.iter_mut() {
-                    tuple.0 = sub_ap.join(&tuple.0);
+                    tuple.0 = sub_ap.join(&tuple.0).into_string();
                     let mut new_order = elem_order.clone();
                     new_order.append(&mut tuple.2.clone());
                     tuple.2 = new_order;
@@ -1226,7 +1234,7 @@ impl PathMap {
             for (idx, (_path, _bid, order)) in self.map[*sink_start..].iter().enumerate() {
                 if !order.starts_with(sink_order) {
                     break;
-                } else if sink_order == order || (!order.len() != sink_order.len() + 1 && direct) {
+                } else if sink_order == order || (order.len() != sink_order.len() + 1 && direct) {
                     continue;
                 } else {
                     sink_subs.push(idx + *sink_start);
@@ -1415,6 +1423,15 @@ impl PathMap {
                 (new_paths, new_order)
             };
             new_paths.sort();
+            // Track which paths were filtered out by dedup so the update branch doesn't
+            // mistake them for removals. A path already in processed_path_set was handled
+            // by a prior iteration (e.g., a different parent entry for the same sink node)
+            // and should not be removed from the map.
+            let deduped_paths: BTreeSet<String> = new_paths
+                .iter()
+                .filter(|p| processed_path_set.contains(p.as_str()))
+                .cloned()
+                .collect();
             new_paths.retain(|path| !processed_path_set.contains(path));
             processed_path_set.append(&mut BTreeSet::from_iter(new_paths.iter().cloned()));
 
@@ -1493,9 +1510,15 @@ impl PathMap {
                     let new_paths_set: std::collections::BTreeSet<String> =
                         new_paths.iter().cloned().collect();
 
-                    // Paths to remove: in old but not in new
-                    let paths_to_remove: Vec<String> =
-                        old_paths.difference(&new_paths_set).cloned().collect();
+                    // Paths to remove: in old but not in new, EXCLUDING paths that were
+                    // filtered by processed_path_set dedup. Those paths were already handled
+                    // by a prior iteration for a different parent entry of the same sink —
+                    // they still belong in the map and must not be removed.
+                    let paths_to_remove: Vec<String> = old_paths
+                        .difference(&new_paths_set)
+                        .filter(|p| !deduped_paths.contains(p.as_str()))
+                        .cloned()
+                        .collect();
 
                     // Paths to add: in new but not in old
                     let paths_to_add: Vec<String> =

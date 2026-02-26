@@ -16,8 +16,7 @@ use super::common::generate_test_root;
 async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing sections metadata enrichment (Issue 02)");
 
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
 
     let mut global_bb = BeliefBase::empty();
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
@@ -199,8 +198,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
 async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing unmatched sections are garbage collected during finalize()");
 
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
 
     let mut global_bb = BeliefBase::empty();
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
@@ -251,8 +249,7 @@ async fn test_sections_garbage_collection() -> Result<(), Box<dyn std::error::Er
 async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing priority matching: BID > Anchor > Title");
 
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
 
     let mut global_bb = BeliefBase::empty();
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
@@ -323,8 +320,7 @@ async fn test_sections_priority_matching() -> Result<(), Box<dyn std::error::Err
 async fn test_sections_round_trip_preservation() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing round-trip: matched sections preserved, unmatched removed");
 
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
 
     let mut global_bb = BeliefBase::empty();
     let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();

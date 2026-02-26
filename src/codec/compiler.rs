@@ -1216,9 +1216,11 @@ impl DocumentCompiler {
             let path_ap = AnchorPath::new(&path_string);
             let repo_root = os_path_to_string(self.builder.repo_root());
             let asset_absolute_path = path_ap.join(asset_relative_path);
-            let asset_ap = AnchorPath::new(&asset_absolute_path);
-            if let Some(repo_relative_asset) = asset_ap.strip_prefix(&repo_root) {
-                let absolute_path = string_to_os_path(&asset_absolute_path);
+            if let Some(repo_relative_asset) = asset_absolute_path
+                .as_anchor_path()
+                .strip_prefix(&repo_root)
+            {
+                let absolute_path = string_to_os_path(&*asset_absolute_path);
                 // Always enqueue asset files to check for content changes
                 // even if already tracked in session_bb
                 if !self.processed.contains_key(&absolute_path)
@@ -1300,7 +1302,11 @@ impl DocumentCompiler {
         {
             debug_assert!(_home_net == net);
             // Convert relative path to absolute
-            let dep_path = string_to_os_path(&AnchorPath::new(&net_path).join(net_dep_path_str));
+            let dep_path = string_to_os_path(
+                &AnchorPath::new(&net_path)
+                    .join(net_dep_path_str)
+                    .into_string(),
+            );
             // Resolve relative to builder's repo_root
             self.builder.repo_root().join(dep_path)
         } else {

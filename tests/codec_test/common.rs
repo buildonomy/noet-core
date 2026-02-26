@@ -2,7 +2,10 @@
 
 use noet_core::{error::BuildonomyError, properties::Bid};
 use serde::Deserialize;
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 use toml::from_str;
 
@@ -20,8 +23,13 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<
     Ok(())
 }
 
-pub fn generate_test_root(test_net: &str) -> Result<TempDir, BuildonomyError> {
-    // 1. Create a temporary directory for the test repository
+/// Create a temp directory and copy test network content into a named subdirectory.
+///
+/// Returns `(TempDir, PathBuf)` where the `PathBuf` is the content root
+/// (e.g. `tempdir/network_1/`). The subdirectory preserves the network name so
+/// that relative paths like `../network_1/assets/img.png` (parent-and-back
+/// roundtrips) resolve correctly via the filesystem.
+pub fn generate_test_root(test_net: &str) -> Result<(TempDir, PathBuf), BuildonomyError> {
     let temp_dir = tempfile::tempdir()?;
     tracing::debug!(
         "generating test root. Files: {}",
@@ -31,11 +39,14 @@ pub fn generate_test_root(test_net: &str) -> Result<TempDir, BuildonomyError> {
             .collect::<Vec<String>>()
             .join(", ")
     );
-    let test_root = temp_dir.path().to_path_buf();
+    // Copy into a subdirectory named after the network so that relative paths
+    // like `../network_1/assets/img.png` (parent-and-back roundtrips) resolve
+    // correctly — the parent directory contains the named subdirectory.
+    let test_root = temp_dir.path().join(test_net);
     let content_root = Path::new("tests").join(test_net);
     tracing::debug!("Copying content from {:?}", content_root);
     copy_dir_all(&content_root, &test_root)?;
-    Ok(temp_dir)
+    Ok((temp_dir, test_root))
 }
 
 #[derive(Debug, Default, Deserialize)]

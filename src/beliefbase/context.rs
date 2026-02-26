@@ -4,7 +4,7 @@
 //! - [`ExtendedRelation`]: Tracks relation information with respect to a node
 //! - [`BeliefContext`]: Provides lazy access to sources and sinks for a node
 
-use crate::properties::{asset_namespace, href_namespace, BeliefNode, Bid, WeightSet};
+use crate::properties::{content_namespaces, BeliefNode, Bid, WeightSet};
 
 #[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{ArcRwLockReadGuard, RawRwLock};
@@ -44,34 +44,31 @@ impl<'a> ExtendedRelation<'a> {
             return None;
         };
 
-        // Treat const namespaces differently, just return their path
         let paths_guard = set.paths();
-        for const_net in [asset_namespace(), href_namespace()] {
-            if let Some(pm) = paths_guard.get_map(&const_net.bref()) {
-                if let Some((_bid, elem_path, _order)) = pm.path(&other_bid, &paths_guard) {
-                    return Some(ExtendedRelation {
-                        other,
-                        home_net: const_net,
-                        root_path: elem_path,
-                        weight,
-                    });
-                }
-            }
-        }
-
-        // Try to get path from root network
-        let (home_net, root_path) = paths_guard
-            .get_map(&root_net.bref())
-            .and_then(|pm| pm.path(&other_bid, &paths_guard))
-            .map(|(bid, path, _order)| (bid, path))
+        // Try to get path from root network or const networks
+        let fallback_nets = content_namespaces();
+        let (home_net, root_path) = std::iter::once(root_net)
+            .chain(fallback_nets.iter().copied())
+            .find_map(|ns| {
+                paths_guard
+                    .get_map(&ns.bref())
+                    .and_then(|pm| pm.path(&other_bid, &paths_guard))
+                    .map(|(home_network, path, _order)| (home_network, path))
+            })
             .unwrap_or_else(|| {
-                // No path found - use empty string as fallback
-                // This allows relations to nodes without paths (e.g., sections, internal nodes)
-                // The viewer can decide whether to render these as links or plain text
+                // No path found in any PathMap — determine home_net from the node itself.
+                // Content namespace nodes (href, asset) may not be in a PathMap yet
+                // during incremental parsing, but we can detect them via parent_bref.
+                let fallback_net = content_namespaces()
+                    .iter()
+                    .find(|cns| other.bid.parent_bref() == cns.bref())
+                    .copied()
+                    .unwrap_or(root_net);
                 tracing::debug!(
-                    "No path found for node {other_bid} in network {root_net}, using empty path"
+                    "No path found for node {other_bid} in network {root_net}, \
+                     using fallback net {fallback_net} with empty path"
                 );
-                (root_net, String::new())
+                (fallback_net, String::new())
             });
 
         Some(ExtendedRelation {

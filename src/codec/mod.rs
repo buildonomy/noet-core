@@ -55,15 +55,24 @@
 //!
 //! ```rust
 //! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode}, properties::BeliefNode};
+//! use std::path::Path;
 //!
 //! #[derive(Default, Clone)]
 //! struct MyCustomCodec;
 //!
 //! impl DocCodec for MyCustomCodec {
+//!     fn proto(
+//!         &self,
+//!         repo_path: &Path,
+//!         path: &Path,
+//!     ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+//!         todo!();
+//!     }
+//!
 //!     fn parse(
 //!         &mut self,
 //!         // The source content to be parsed by the DocCodec implementation
-//!         content: String,
+//!         content: &str,
 //!         // Contains the builder root-path relative information to seed the parse with
 //!         current: ProtoBeliefNode,
 //!     ) -> Result<(), BuildonomyError> {
@@ -87,7 +96,7 @@
 //!     }
 //! }
 //! // Register by extension (simple API)
-//! CODECS.insert("myext".to_string(), || Box::new(MyCustomCodec));
+//! CODECS.insert_codec(None, Some("myext".to_string()), || Box::new(MyCustomCodec));
 //!
 //! // Register by stem (advanced API)
 //! CODECS.insert_codec(Some(".myfile".to_string()), None, || Box::new(MyCustomCodec));
@@ -425,13 +434,13 @@ impl CodecMap {
     ///
     /// # Example
     /// ```
-    /// use noet_core::codec::{CODECS, ProtoBeliefNode};
+    /// use noet_core::codec::{CODECS, md::MdCodec};
     ///
     /// // Match files named .myconfig (regardless of extension)
-    /// CODECS.insert_codec(Some(".myconfig".to_string()), None, || Box::new(ProtoBeliefNode::default()));
+    /// CODECS.insert_codec(Some(".myconfig".to_string()), None, || Box::new(MdCodec::default()));
     ///
     /// // Match config.toml files specifically
-    /// CODECS.insert_codec(Some("config".to_string()), Some("toml".to_string()), || Box::new(ProtoBeliefNode::default()));
+    /// CODECS.insert_codec(Some("config".to_string()), Some("toml".to_string()), || Box::new(MdCodec::default()));
     /// ```
     pub fn insert_codec(
         &self,

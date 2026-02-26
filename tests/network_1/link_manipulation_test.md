@@ -29,7 +29,7 @@ Link to file in subdirectory:
 [Subnet File](./subnet1/subnet1_file1.md)
 
 Link from root to nested with anchor:
-[Nested Section](./net1_dir1/hsml.md#definition)
+[Nested Section](./net1_dir1/hsml.md#hsml-definition)
 
 ## Section Headings {#explicit-brefs}
 

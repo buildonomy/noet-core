@@ -8,6 +8,8 @@
 //!
 //! Tests focus on observable behavior rather than internal implementation details.
 
+mod common;
+
 #[cfg(feature = "service")]
 use noet_core::{
     config::NetworkRecord,
@@ -16,38 +18,9 @@ use noet_core::{
     watch::WatchService,
 };
 #[cfg(feature = "service")]
-use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
+use std::{sync::mpsc::channel, time::Duration};
 #[cfg(feature = "service")]
 use tempfile::TempDir;
-
-/// Helper to create a test directory with sample documents
-/// Helper to create a test network with .noet file
-#[cfg(feature = "service")]
-fn create_test_network(temp_dir: &TempDir) -> PathBuf {
-    let network_path = temp_dir.path().join("test_network");
-    std::fs::create_dir(&network_path).unwrap();
-
-    // Create .noet file
-    let network_toml = r#"
-id = "test-network"
-title = "Test Network"
-text = "A test belief network"
-"#;
-    std::fs::write(network_path.join(".noet"), network_toml).unwrap();
-
-    // Create a sample markdown document
-    let doc1 = r#"# Document 1
-
-This is a test document.
-
-## Section 1
-
-Some content here.
-"#;
-    std::fs::write(network_path.join("doc1.md"), doc1).unwrap();
-
-    network_path
-}
 
 #[test]
 #[cfg(feature = "service")]
@@ -74,7 +47,7 @@ fn test_watch_service_enable_disable_network_syncer() {
     // Test enabling and disabling network syncer
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     let (tx, _rx) = channel::<Event>();
 
@@ -105,9 +78,11 @@ fn test_watch_service_enable_disable_network_syncer() {
 fn test_file_modification_triggers_reparse() {
     // Test that modifying a file triggers automatic reparsing
     // Note: This test can be flaky due to file system notification timing
+    common::init_logging();
+
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
     let doc_path = network_path.join("doc1.md");
 
     let (tx, rx) = channel::<Event>();
@@ -162,7 +137,7 @@ fn test_multiple_file_changes_processed() {
     // Test that multiple file changes are all processed
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     let (tx, _rx) = channel::<Event>();
 
@@ -196,7 +171,7 @@ fn test_service_handles_empty_files() {
     // Test that empty files don't crash the service
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create an empty file
     std::fs::write(network_path.join("empty.md"), "").unwrap();
@@ -224,7 +199,7 @@ fn test_shutdown_cleanup() {
     // Test that WatchService cleans up properly when dropped
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     let (tx, _rx) = channel::<Event>();
 
@@ -253,7 +228,7 @@ fn test_get_set_networks() {
     // Test get_networks and set_networks operations
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     let (tx, _rx) = channel::<Event>();
 

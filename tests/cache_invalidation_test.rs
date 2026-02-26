@@ -3,6 +3,8 @@
 //! These tests verify that file modification time tracking works correctly
 //! with the full WatchService setup including database synchronization.
 
+mod common;
+
 #[cfg(feature = "service")]
 use filetime::{set_file_mtime, FileTime};
 #[cfg(feature = "service")]
@@ -12,31 +14,9 @@ use noet_core::{
     watch::WatchService,
 };
 #[cfg(feature = "service")]
-use std::{path::PathBuf, sync::mpsc::channel, time::Duration};
+use std::{sync::mpsc::channel, time::Duration};
 #[cfg(feature = "service")]
 use tempfile::TempDir;
-
-/// Helper to create a test network with index.md file
-#[cfg(feature = "service")]
-fn create_test_network(temp_dir: &TempDir) -> PathBuf {
-    let network_path = temp_dir.path().join("test_network");
-    std::fs::create_dir(&network_path).unwrap();
-
-    // Create index.md file
-    let network_content = r#"---
-id: "test-network"
-title: "Test Network"
-text: "A test belief network for cache invalidation testing"
----
-
-# Test Network
-
-A test belief network for cache invalidation testing.
-"#;
-    std::fs::write(network_path.join("index.md"), network_content).unwrap();
-
-    network_path
-}
 
 #[test]
 #[cfg(feature = "service")]
@@ -44,7 +24,7 @@ fn test_mtime_tracking() {
     // Test that file mtimes are tracked in the database after parsing
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create a test document
     let doc_path = network_path.join("test.md");
@@ -95,7 +75,7 @@ fn test_stale_file_detection_and_reparse() {
     // Test that modified files are detected as stale and re-parsed
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create a test document
     let doc_path = network_path.join("test.md");
@@ -191,7 +171,7 @@ fn test_multiple_files_mtime_tracking() {
     // Test that mtimes are tracked for multiple files
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create multiple test documents
     std::fs::write(network_path.join("doc1.md"), "# Document 1\n").unwrap();
@@ -243,7 +223,7 @@ fn test_deleted_file_handling() {
     // Test that deleted files are handled gracefully
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create a test document
     let doc_path = network_path.join("to_delete.md");
@@ -294,7 +274,7 @@ fn test_unchanged_files_keep_same_mtime() {
     // Test that unchanged files don't have their mtime updated unnecessarily
     let temp_dir = TempDir::new().unwrap();
     let root_dir = temp_dir.path().to_path_buf();
-    let network_path = create_test_network(&temp_dir);
+    let network_path = common::create_test_network(&temp_dir);
 
     // Create a test document
     let doc_path = network_path.join("unchanged.md");

@@ -23,12 +23,11 @@ use super::common::{extract_bids_from_content, generate_test_root};
 async fn test_belief_set_builder_bid_generation_and_caching(
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Initialize global_bb (BeliefBase) and other necessary dependencies.");
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
     tracing::info!(
         "Test dir is {:?}. Test dir contents: {}",
         test_root,
-        fs::read_dir(&test_tempdir)
+        fs::read_dir(&test_root)
             .unwrap()
             .map(|f| format!("{f:?}"))
             .collect::<Vec<String>>()
@@ -172,8 +171,7 @@ async fn test_belief_set_builder_bid_generation_and_caching(
 #[test(tokio::test)]
 async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing cache stability with DbConnection (Issue 34)");
-    let test_tempdir = generate_test_root("network_1")?;
-    let test_root = test_tempdir.path().to_path_buf();
+    let (_test_tempdir, test_root) = generate_test_root("network_1")?;
 
     // Initialize DB in test directory
     let db_path = test_root.join("belief_cache.db");

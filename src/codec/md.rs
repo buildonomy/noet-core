@@ -217,7 +217,7 @@ struct TitleAttributeParts {
 ///
 /// # Examples
 /// ```
-/// use noet_core::codec::belief_ir::build_title_attribute;
+/// use noet_core::codec::md::build_title_attribute;
 /// let attr = build_title_attribute("bref://abc123", false, None);
 /// assert_eq!(attr, "bref://abc123");
 ///
@@ -325,6 +325,7 @@ fn parse_title_attribute(title: &str) -> TitleAttributeParts {
 fn check_for_link_and_push(
     events_in: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     ctx: &BeliefContext<'_>,
+    doc_path: &str,
     events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     stop_event: Option<&MdEvent<'_>>,
 ) -> bool {
@@ -416,8 +417,9 @@ fn check_for_link_and_push(
                 }
             };
 
-            // Regularize the key using the BeliefContext fields directly
-            let regularized = key.regularize_unchecked(ctx.root_net, &ctx.root_path);
+            // Normalize the key against the repo-relative doc path, then regularize
+            let normalized = key.resolve_against(doc_path);
+            let regularized = normalized.regularize_unchecked(ctx.root_net, &ctx.root_path);
             let keys = vec![regularized];
 
             // Check both sources (upstream) and sinks (downstream) for the link target Assets and
@@ -470,7 +472,7 @@ fn check_for_link_and_push(
                     let relative_ap = AnchorPath::from(&relation.root_path);
 
                     if let Some(id) = relation.other.id.as_deref() {
-                        relative_path = relative_ap.join(as_anchor(id));
+                        relative_path = relative_ap.join(as_anchor(id)).into();
                     }
                     relative_path
                 };
@@ -838,8 +840,18 @@ fn read_frontmatter<R: Read>(reader: R) -> std::io::Result<Option<String>> {
     let mut frontmatter = String::new();
     let mut line = String::new();
 
-    // Read first line to check if frontmatter exists
-    buf_reader.read_line(&mut line)?;
+    // Skip leading blank lines, then check for frontmatter delimiter
+    loop {
+        let bytes_read = buf_reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            // EOF before finding any content
+            return Ok(None);
+        }
+        if !line.trim().is_empty() {
+            break;
+        }
+        line.clear();
+    }
     if line.trim() != "---" {
         // No frontmatter
         return Ok(None);
@@ -1108,8 +1120,13 @@ impl DocCodec for MdCodec {
             update_or_insert_frontmatter(&mut current_events, &metadata_string)?;
         }
 
-        let link_changed =
-            check_for_link_and_push(&mut current_events, ctx, &mut proto_events.1, None);
+        let link_changed = check_for_link_and_push(
+            &mut current_events,
+            ctx,
+            &node.path,
+            &mut proto_events.1,
+            None,
+        );
         let maybe_text = if frontmatter_changed.is_some()
             || sections_metadata_merged
             || link_changed
@@ -1482,6 +1499,7 @@ impl DocCodec for MdCodec {
                     &CowStr::from(link_data.title_string()),
                     &link_data.id.clone(),
                 ) {
+                    let node_key = node_key.resolve_against(&current.path);
                     let title = link_data.title_string();
                     let payload = if !title.is_empty()
                         && title != link_data.dest_url.as_ref()
