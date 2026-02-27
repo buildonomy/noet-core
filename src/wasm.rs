@@ -321,7 +321,7 @@ impl BeliefBaseWasm {
     /// The normalized path as a string
     #[wasm_bindgen(js_name = normalizePath)]
     pub fn normalize_path(path: &str) -> String {
-        crate::paths::AnchorPath::new(path).normalize()
+        crate::paths::AnchorPath::new(path).normalize().to_string()
     }
 
     /// Parse a path into its components: directory, filename, and anchor.
@@ -361,9 +361,9 @@ impl BeliefBaseWasm {
             } else {
                 format!("#{}", end)
             };
-            base_path.join(end_with_hash)
+            base_path.join(end_with_hash).to_string()
         } else {
-            base_path.join(end)
+            base_path.join(end).to_string()
         }
     }
 

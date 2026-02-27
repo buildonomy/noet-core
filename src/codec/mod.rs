@@ -49,9 +49,9 @@
 //! ## Built-in Codecs
 //!
 //! - **Markdown** (`.md`) - via [`md::MdCodec`]
-//! - **NetworkCodec** (`index.md`) - via [`md::NetworkCodec`]
+//! - **NetworkCodec** (`index.md`) - via [`network::NetworkCodec`]
 //!
-//! Register custom codecs via [`CodecMap::insert`] (by extension) or [`CodecMap::insert_codec`] (by stem/extension):
+//! Register custom codecs via [`CodecMap::insert_codec`] (by stem/extension):
 //!
 //! ```rust
 //! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode}, properties::BeliefNode};
@@ -161,6 +161,12 @@ use crate::{
 };
 
 use crate::paths::AnchorPath;
+
+/// Standard filename designating a directory as the root of a BeliefNetwork.
+///
+/// Defined here (ungated) so it is accessible on all targets including wasm32.
+/// The full network codec logic lives in [`network`] (non-wasm only).
+pub const NETWORK_NAME: &str = "index.md";
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod assets;
@@ -415,7 +421,6 @@ impl CodecMap {
     /// - Markdown: registered by extension `.md`
     /// - NetworkCodec: registered by constand file name `index.md`
     pub fn create() -> Self {
-        
         CodecMap(Arc::new(RwLock::new(vec![
             // Markdown files by extension
             (None, Some("md".to_string()), || Box::new(MdCodec::new())),

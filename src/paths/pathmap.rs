@@ -31,7 +31,7 @@ use std::{
 
 use crate::{
     beliefbase::BidGraph,
-    codec::network::NETWORK_NAME,
+    codec::NETWORK_NAME,
     event::{BeliefEvent, EventOrigin},
     paths::path::{as_anchor, to_anchor, AnchorPath},
     properties::{
