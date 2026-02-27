@@ -16,6 +16,7 @@ use std::{
     result::Result,
     str::FromStr,
 };
+use titlecase::titlecase;
 /// Utilities for parsing various document types into BeliefBases
 use toml_edit::value;
 
@@ -987,7 +988,7 @@ impl DocCodec for MdCodec {
         {
             tracing::debug!(
                 "MdCodec::proto called with path {rel_path:?}, which has a non-'md' \
-            file extension. Returning None"
+                file extension. Returning None"
             );
             return Ok(None);
         }
@@ -1004,6 +1005,18 @@ impl DocCodec for MdCodec {
             // No frontmatter is fine for regular markdown documents
             ProtoBeliefNode::default()
         };
+        if let Some(filestem) = rel_path
+            .file_stem()
+            .filter(|stem| !stem.is_empty())
+            .and_then(|stem| stem.to_str())
+        {
+            let title = filestem
+                .split("_")
+                .map(|word| titlecase(word))
+                .collect::<Vec<_>>()
+                .join(" ");
+            proto.document.insert("title", value(title));
+        }
         proto.path = os_path_to_string(&rel_path);
         // Document heading
         proto.heading = 2;
@@ -1600,16 +1613,21 @@ impl DocCodec for MdCodec {
                 MdEvent::End(MdTagEnd::Heading(_)) => {
                     // We should never encounter a heading end tag before a heading start tag, and
                     // we initialize title_accum to Some(String::new) in the start tag.
+                    let title = current.accumulator.take().unwrap_or_default();
                     if current
                         .accumulator
                         .as_ref()
-                        .filter(|title| !title.is_empty())
+                        .filter(|proto_title| {
+                            !proto_title.is_empty()
+                                && proto_title.to_lowercase() != title.to_lowercase()
+                        })
                         .is_some()
                     {
-                        let title = current.accumulator.take().unwrap_or_default();
                         current.document.insert("title", value(&title));
                     } else {
-                        // Don't count this as a new section --- glue it back onto the last proto
+                        // Don't count this as a new section --- glue it back onto the last proto --
+                        // the title doesn't 'split' it either because it's empty, or its the same
+                        // as the last section
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
                             last_event_vec.append(&mut proto_events);
