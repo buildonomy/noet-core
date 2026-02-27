@@ -198,8 +198,13 @@ impl NodeKey {
     /// This is a lower-level API that doesn't perform security boundary checks.
     /// Prefer `regularize()` when possible.
     #[tracing::instrument(skip(self))]
-    pub fn regularize_unchecked(&self, base_net: Bid, owner_path: &str) -> NodeKey {
-        let base_ap = AnchorPath::from(owner_path);
+    pub fn regularize_unchecked(
+        &self,
+        base_net: Bid,
+        owner_path: &str,
+        base_abs_path: &str,
+    ) -> NodeKey {
+        let owner_ap = AnchorPath::new(base_abs_path).join(owner_path);
         match self {
             NodeKey::Path {
                 net: link_base,
@@ -227,7 +232,12 @@ impl NodeKey {
                         path: normalized_link_buf.into(),
                     };
                 }
-                if normalized_link_buf.as_anchor_path().is_absolute() {
+                if normalized_link_buf.as_anchor_path().is_absolute()
+                    && !normalized_link_buf
+                        .as_anchor_path()
+                        .path
+                        .starts_with(base_abs_path)
+                {
                     tracing::warn!(
                         "[Nodekey::regularize] NodeKey::Path supplied with an \
                         absolute path {}, but without an anchoring network. The meaning of \
@@ -242,17 +252,26 @@ impl NodeKey {
                     };
                 }
 
-                let join_path = base_ap.join(&normalized_link_buf);
-                if join_path.starts_with("../") {
+                let join_path = owner_ap.join(&normalized_link_buf);
+                let normalized_path =
+                    AnchorPath::new(base_abs_path).path_to(join_path.as_anchor_path().path, false);
+                // tracing::debug!(
+                //     "\n\
+                //     owner_path: {owner_path}\n\
+                //     base_absolute_path: {base_abs_path}\n\
+                //     join_path (owner.join(normalized target)): {join_path}\n\
+                //     normalized_path (base_abs_path.path_to(link_abs_path)): {normalized_path}"
+                // );
+                if normalized_path.starts_with("../") {
                     tracing::warn!(
                         "[NodeKey::regularize] The normalized and regularized path \
-                        exceeds the supplied relative path boundary. This may \
+                        exceeds the supplied repo path boundary. This may \
                         result in unexpected behavior. Initial path: {}, relative \
                         to path: {}",
                         link_path,
                         join_path,
                     );
-                }
+                };
 
                 // Preserve the original net for asset paths; assign base_net for
                 // default-net paths (codec documents like .md).
@@ -263,7 +282,7 @@ impl NodeKey {
                 };
                 NodeKey::Path {
                     net: resolved_net,
-                    path: join_path.into(),
+                    path: normalized_path,
                 }
             }
             NodeKey::Id { net, id } => {
@@ -291,6 +310,7 @@ impl NodeKey {
         cache: &BeliefBase,
         key_owner: Bid,
         root_net: Bid,
+        root_abs_path: &str,
     ) -> Result<NodeKey, BuildonomyError> {
         // Get network and path from the relative_to node
         let (_home_net, owner_path) = cache
@@ -306,7 +326,7 @@ impl NodeKey {
             })?;
         // It's ok to put base_rooted_path in regardless of what rel_net, because we only use
         // that argument in the case that self == NodeKey::Path
-        Ok(self.regularize_unchecked(root_net, &owner_path))
+        Ok(self.regularize_unchecked(root_net, &owner_path, root_abs_path))
     }
 
     /// Regularize relative references to absolute within network context (async).
@@ -318,12 +338,13 @@ impl NodeKey {
         cache: &C,
         key_owner: Bid,
         root_net: Bid,
+        root_abs_path: &str,
     ) -> Result<NodeKey, BuildonomyError> {
         // Query for the relative_to node to get its path
         let keys = vec![key_owner, root_net];
         let query_expr = Expression::StateIn(StatePred::Bid(keys));
         let cache = BeliefBase::from(cache.eval(&query_expr).await?);
-        self.regularize(&cache, key_owner, root_net)
+        self.regularize(&cache, key_owner, root_net, root_abs_path)
     }
 
     /// Parse a string into a NodeKey with network resolution using a [crate::beliefbase::BeliefBase] (sync).
@@ -1112,7 +1133,21 @@ mod tests {
                 path: "assets/test_image.png".to_string()
             }
         );
-        let result = key.regularize_unchecked(base_net, "asset_tracking_test.md");
+        let result =
+            key.regularize_unchecked(base_net, "asset_tracking_test.md", "/home/user/code/repo");
+        assert_eq!(
+            result,
+            NodeKey::Path {
+                net: asset_bref,
+                path: "assets/test_image.png".to_string()
+            }
+        );
+
+        let result = key.regularize_unchecked(
+            base_net,
+            "/home/user/code/repo/asset_tracking_test.md",
+            "/home/user/code/repo",
+        );
         assert_eq!(
             result,
             NodeKey::Path {
@@ -1131,7 +1166,8 @@ mod tests {
                 path: "../assets/test_image.png".to_string()
             }
         );
-        let result = key.regularize_unchecked(base_net, "subnet1/subnet1_file1.md");
+        let result =
+            key.regularize_unchecked(base_net, "subnet1/subnet1_file1.md", "/home/user/code/repo");
         assert_eq!(
             result,
             NodeKey::Path {
@@ -1142,7 +1178,7 @@ mod tests {
 
         // Asset path that's already repo-relative (no ..) still works
         let key: NodeKey = "assets/diagram.pdf".parse().unwrap();
-        let result = key.regularize_unchecked(base_net, "docs/readme.md");
+        let result = key.regularize_unchecked(base_net, "docs/readme.md", "/home/user/code/repo/");
         assert_eq!(
             result,
             NodeKey::Path {
@@ -1161,7 +1197,7 @@ mod tests {
                 path: "../other.md".to_string()
             }
         );
-        let result = key.regularize_unchecked(base_net, "subnet1/file.md");
+        let result = key.regularize_unchecked(base_net, "subnet1/file.md", "/home/user/code/repo");
         assert_eq!(
             result,
             NodeKey::Path {
@@ -1175,7 +1211,7 @@ mod tests {
             net: href_namespace().bref(),
             path: "https://example.com/page".to_string(),
         };
-        let result = key.regularize_unchecked(base_net, "docs/file.md");
+        let result = key.regularize_unchecked(base_net, "docs/file.md", "/home/user/code/repo");
         assert_eq!(result, key);
     }
 

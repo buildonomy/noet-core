@@ -54,7 +54,7 @@
 //! Register custom codecs via [`CodecMap::insert_codec`] (by stem/extension):
 //!
 //! ```rust
-//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode}, properties::BeliefNode};
+//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode, ParseDiagnostic}, properties::BeliefNode};
 //! use std::path::Path;
 //!
 //! #[derive(Default, Clone)]
@@ -63,7 +63,6 @@
 //! impl DocCodec for MyCustomCodec {
 //!     fn proto(
 //!         &self,
-//!         repo_path: &Path,
 //!         path: &Path,
 //!     ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
 //!         todo!();
@@ -87,11 +86,12 @@
 //!         &mut self,
 //!         node: &ProtoBeliefNode,
 //!         ctx: &BeliefContext<'_>,
+//!         diagnostics: &mut Vec<ParseDiagnostic>,
 //!     ) -> Result<Option<BeliefNode>, BuildonomyError> {
 //!         todo!();
 //!     }
 //!
-//!     fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+//!     fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
 //!         Ok(Vec::new())
 //!     }
 //!
@@ -193,7 +193,7 @@ pub use builder::GraphBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 pub use compiler::DocumentCompiler;
 #[cfg(not(target_arch = "wasm32"))]
-pub use diagnostic::{ParseDiagnostic, UnresolvedReference};
+pub use diagnostic::{byte_offset_to_location, ParseDiagnostic, UnresolvedReference};
 #[cfg(not(target_arch = "wasm32"))]
 pub use schema_registry::SCHEMAS;
 
@@ -240,11 +240,7 @@ type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 #[cfg(not(target_arch = "wasm32"))]
 pub trait DocCodec: Sync {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
-    fn proto(
-        &self,
-        repo_path: &Path,
-        path: &Path,
-    ) -> Result<Option<ProtoBeliefNode>, BuildonomyError>;
+    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError>;
 
     fn parse(
         &mut self,
@@ -256,10 +252,16 @@ pub trait DocCodec: Sync {
 
     fn nodes(&self) -> Vec<ProtoBeliefNode>;
 
+    /// Inject resolved context into a parsed node, optionally returning an updated `BeliefNode`.
+    ///
+    /// Any author-visible warnings or errors discovered during context injection (e.g. unresolved
+    /// links, malformed frontmatter) should be pushed onto `diagnostics` rather than emitted via
+    /// `tracing`. This ensures they flow through `ParseContentResult` to the CLI and LSP layers.
     fn inject_context(
         &mut self,
         node: &ProtoBeliefNode,
         ctx: &BeliefContext<'_>,
+        diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError>;
 
     /// Called after all inject_context() calls complete, allowing the codec to:
@@ -267,13 +269,19 @@ pub trait DocCodec: Sync {
     /// - Emit events for nodes modified during finalization
     /// - Log diagnostics for unmatched metadata
     ///
+    /// Any author-visible warnings discovered during finalization should be pushed onto
+    /// `diagnostics` rather than emitted via `tracing`.
+    ///
     /// Returns a vector of (ProtoBeliefNode, BeliefNode) pairs for nodes that were modified
     /// during finalization and need NodeUpdate events emitted.
     ///
     /// Every implementor must explicitly handle this. Codecs that wrap other codecs (e.g.,
     /// `NetworkCodec` wrapping `MdCodec`) must delegate to the inner codec's `finalize()`.
     /// Codecs with no finalization logic should return `Ok(Vec::new())`.
-    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError>;
+    fn finalize(
+        &mut self,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError>;
 
     fn generate_source(&self) -> Option<String>;
 
@@ -785,6 +793,7 @@ Test network for unit tests.
 
     #[tokio::test]
     async fn test_dual_phase_html_generation() {
+        init_logging();
         use crate::codec::builder::GraphBuilder;
         use tempfile::TempDir;
 

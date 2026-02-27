@@ -280,6 +280,13 @@ impl ProtoBeliefNode {
             .and_then(|id_val| id_val.as_str().map(|id_str| id_str.to_string()))
     }
 
+    pub fn title(&self) -> String {
+        self.document
+            .get("title")
+            .and_then(|title_val| title_val.as_str().map(|title_str| title_str.to_string()))
+            .unwrap_or_default()
+    }
+
     pub fn merge(&mut self, other: &mut ProtoBeliefNode) -> bool {
         let mut changed = false;
         if self.kind != other.kind {

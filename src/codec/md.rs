@@ -1,3 +1,4 @@
+use petgraph::Direction;
 use pulldown_cmark::{
     BrokenLink, CowStr, Event as MdEvent, HeadingLevel, LinkType, MetadataBlockKind, Options,
     Parser as MdParser, Tag as MdTag, TagEnd as MdTagEnd,
@@ -22,7 +23,12 @@ use toml_edit::value;
 
 use crate::{
     beliefbase::BeliefContext,
-    codec::{belief_ir::ProtoBeliefNode, DocCodec, CODECS},
+    codec::{
+        belief_ir::ProtoBeliefNode,
+        byte_offset_to_location,
+        diagnostic::{ParseDiagnostic, UnresolvedReference},
+        DocCodec, CODECS,
+    },
     error::BuildonomyError,
     nodekey::{href_to_nodekey, NodeKey},
     paths::{as_anchor, os_path_to_string, to_anchor, AnchorPath},
@@ -89,7 +95,7 @@ fn link_to_relation(
         // Reference without destination in the document, but resolved by the broken_link_callback
         LinkType::Reference => None,
         // Prioritize 'id' nodekey over 'path' for wikilinks only
-        LinkType::WikiLink { .. } => Some(href_to_nodekey(dest_url)),
+        LinkType::WikiLink { .. } => Some(href_to_nodekey(&format!("id:{dest_url}"))),
         LinkType::ReferenceUnknown => Some(href_to_nodekey(dest_url)),
 
         // Collapsed link like `[foo][]`
@@ -326,9 +332,11 @@ fn parse_title_attribute(title: &str) -> TitleAttributeParts {
 fn check_for_link_and_push(
     events_in: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     ctx: &BeliefContext<'_>,
-    doc_path: &str,
+    doc_abs_path: &str,
+    source: &str,
     events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     stop_event: Option<&MdEvent<'_>>,
+    diagnostics: &mut Vec<ParseDiagnostic>,
 ) -> bool {
     let mut changed = false;
     let mut collector_stack: Vec<LinkAccumulator> = Vec::new();
@@ -419,8 +427,18 @@ fn check_for_link_and_push(
             };
 
             // Normalize the key against the repo-relative doc path, then regularize
-            let normalized = key.resolve_against(doc_path);
-            let regularized = normalized.regularize_unchecked(ctx.root_net, &ctx.root_path);
+            let normalized_abs = key.resolve_against(doc_abs_path);
+            let ctx_filepath = AnchorPath::new(&ctx.root_path).filepath();
+            if !doc_abs_path.ends_with(&ctx_filepath) {
+                panic!(
+                    "Context path and proto path do not match! Proto abs path: \"{doc_abs_path}\" \
+                    repo relative path: \"{ctx_filepath}\".\nbase paths: {}",
+                    ctx.beliefbase().paths()
+                );
+            };
+            let root_abs_path = &doc_abs_path[0..(doc_abs_path.len() - ctx_filepath.len())];
+            let regularized =
+                normalized_abs.regularize_unchecked(ctx.root_net, &ctx.root_path, root_abs_path);
             let keys = vec![regularized];
 
             // Check both sources (upstream) and sinks (downstream) for the link target Assets and
@@ -434,11 +452,11 @@ fn check_for_link_and_push(
                     .iter()
                     .find(|rel| {
                         rel.other
-                            .keys(Some(ctx.root_net), None, ctx.belief_set())
+                            .keys(Some(ctx.root_net), None, ctx.beliefbase())
                             .iter()
                             .chain(
                                 rel.other
-                                    .keys(Some(rel.home_net), None, ctx.belief_set())
+                                    .keys(Some(rel.home_net), None, ctx.beliefbase())
                                     .iter(),
                             )
                             .any(|ctx_source_key| ctx_source_key == link_key)
@@ -447,11 +465,11 @@ fn check_for_link_and_push(
                         // Then check sinks (downstream relations - things this document links TO, like assets)
                         sinks.iter().find(|rel| {
                             rel.other
-                                .keys(Some(ctx.root_net), None, ctx.belief_set())
+                                .keys(Some(ctx.root_net), None, ctx.beliefbase())
                                 .iter()
                                 .chain(
                                     rel.other
-                                        .keys(Some(rel.home_net), None, ctx.belief_set())
+                                        .keys(Some(rel.home_net), None, ctx.beliefbase())
                                         .iter(),
                                 )
                                 .any(|ctx_sink_key| ctx_sink_key == link_key)
@@ -536,28 +554,21 @@ fn check_for_link_and_push(
                 };
                 events_out.push_back((start_event, None));
             } else {
-                // No matching relation found - leave link unchanged
-                tracing::info!(
-                    "Returned context does not have any source edges matching potential link(s)\n\
-                     \tsource_links: {:?}.\n\
-                     \tctx sink links: {:?}",
-                    keys,
-                    ctx.sources()
-                        .iter()
-                        .flat_map(|extended_ref| {
-                            let mut keys =
-                                extended_ref
-                                    .other
-                                    .keys(Some(ctx.home_net), None, ctx.belief_set());
-                            keys.append(&mut extended_ref.other.keys(
-                                Some(extended_ref.home_net),
-                                None,
-                                ctx.belief_set(),
-                            ));
-                            keys
-                        })
-                        .collect::<Vec<NodeKey>>()
-                );
+                // No matching relation found - leave link unchanged and emit a diagnostic
+                let location = link_data
+                    .range
+                    .as_ref()
+                    .map(|r| byte_offset_to_location(source, r.start));
+                let unresolved = UnresolvedReference {
+                    direction: Direction::Outgoing,
+                    self_path: doc_abs_path.to_string(),
+                    other_keys: keys.clone(),
+                    reference_location: location,
+                    ..UnresolvedReference::default()
+                };
+                tracing::warn!("{unresolved:?}");
+                tracing::warn!("sources: {sources:?}",);
+                diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
 
                 let start_event = if link_data.is_image {
                     MdEvent::Start(MdTag::Image {
@@ -964,35 +975,25 @@ impl MdCodec {
 
 impl DocCodec for MdCodec {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
-    fn proto(
-        &self,
-        repo_path: &Path,
-        path: &Path,
-    ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
-        if !repo_path.exists() {
+    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+        if path.is_relative() {
             return Err(BuildonomyError::Codec(format!(
-                "[ProtoBeliefState::new] Root repository path does not exist: {:?}",
-                repo_path
+                "[ProtoBeliefState::new] supplied path must be absolute. Received \"{path:?}\""
             )));
         };
-        let rel_path = match path.is_relative() {
-            true => path.to_path_buf(),
-            false => path.canonicalize()?.strip_prefix(repo_path)?.to_path_buf(),
-        };
-        let file_path = repo_path.join(&rel_path);
-        if rel_path
+        if path
             .extension()
             .and_then(|ext| ext.to_str())
             .filter(|&ext| ext == "md")
             .is_none()
         {
             tracing::debug!(
-                "MdCodec::proto called with path {rel_path:?}, which has a non-'md' \
+                "MdCodec::proto called with path \"{path:?}\", which has a non-'md' \
                 file extension. Returning None"
             );
             return Ok(None);
         }
-        let reader = File::open(&file_path)?;
+        let reader = File::open(path)?;
         let frontmatter = read_frontmatter(reader)?;
 
         let mut proto = if let Some(fm) = frontmatter {
@@ -1005,19 +1006,21 @@ impl DocCodec for MdCodec {
             // No frontmatter is fine for regular markdown documents
             ProtoBeliefNode::default()
         };
-        if let Some(filestem) = rel_path
-            .file_stem()
-            .filter(|stem| !stem.is_empty())
-            .and_then(|stem| stem.to_str())
-        {
-            let title = filestem
-                .split("_")
-                .map(|word| titlecase(word))
-                .collect::<Vec<_>>()
-                .join(" ");
-            proto.document.insert("title", value(title));
+        if proto.title().is_empty() {
+            if let Some(filestem) = path
+                .file_stem()
+                .filter(|stem| !stem.is_empty())
+                .and_then(|stem| stem.to_str())
+            {
+                let title = filestem
+                    .split("_")
+                    .map(titlecase)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                proto.document.insert("title", value(title));
+            }
         }
-        proto.path = os_path_to_string(&rel_path);
+        proto.path = os_path_to_string(path);
         // Document heading
         proto.heading = 2;
         proto.kind.insert(BeliefKind::Document);
@@ -1038,6 +1041,7 @@ impl DocCodec for MdCodec {
         &mut self,
         node: &ProtoBeliefNode,
         ctx: &BeliefContext<'_>,
+        diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
         // Phase 2: Section Metadata Enrichment ("Look Up" Pattern)
         // Extract sections metadata BEFORE taking mutable borrow
@@ -1137,8 +1141,10 @@ impl DocCodec for MdCodec {
             &mut current_events,
             ctx,
             &node.path,
+            &self.content,
             &mut proto_events.1,
             None,
+            diagnostics,
         );
         let maybe_text = if frontmatter_changed.is_some()
             || sections_metadata_merged
@@ -1205,10 +1211,7 @@ impl DocCodec for MdCodec {
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
         // Rewrite document links to .html for HTML output and break invalid backtracking links
-        fn rewrite_md_links_to_html(
-            root_ap: &AnchorPath,
-            event: MdEvent<'static>,
-        ) -> MdEvent<'static> {
+        fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
                 MdEvent::Start(MdTag::Link {
                     link_type,
@@ -1216,31 +1219,7 @@ impl DocCodec for MdCodec {
                     title,
                     id,
                 }) => {
-                    // Check for invalid backtracking links (detected during context injection)
-                    // Even if dest_url is an anchor path,
-                    let full_path = root_ap.join(&dest_url);
-                    let url_str = root_ap.path_to(&full_path, true);
-                    tracing::debug!(
-                        "doc_path (relative to base): {}\n\
-                        dest_url (relative to doc_path): {}\n\
-                        url (relative to base): {}\n\
-                        url (relative to doc dir): {}",
-                        root_ap.path,
-                        dest_url,
-                        full_path,
-                        url_str
-                    );
-                    if full_path.starts_with("../") {
-                        // Break invalid backtracking link
-                        return MdEvent::Start(MdTag::Link {
-                            link_type,
-                            dest_url: CowStr::from(format!("#{full_path}")),
-                            title: CowStr::from("⚠️ Invalid link - backtracks beyond repository"),
-                            id,
-                        });
-                    }
-
-                    let url_ap = AnchorPath::from(&url_str);
+                    let url_ap = AnchorPath::from(&dest_url);
                     let should_rewrite = title.contains("bref://");
                     let new_url = if should_rewrite {
                         // Use anchor-aware extension checking
@@ -1250,10 +1229,10 @@ impl DocCodec for MdCodec {
                         } else if CODECS.get(&url_ap).is_some() {
                             // Check if there's an anchor
                             let res = CowStr::from(url_ap.replace_extension("html"));
-                            tracing::debug!("replacing {url_str} with {res}");
+                            tracing::debug!("replacing {dest_url} with {res}");
                             res
                         } else {
-                            tracing::debug!("no extension for {url_str}");
+                            tracing::debug!("no extension for {dest_url}");
                             dest_url
                         }
                     } else {
@@ -1268,63 +1247,35 @@ impl DocCodec for MdCodec {
                         id,
                     })
                 }
-                MdEvent::Start(MdTag::Image {
-                    link_type,
-                    dest_url,
-                    title,
-                    id,
-                }) => {
-                    // Check for invalid backtracking images (detected during context injection)
-                    let url_str = dest_url.to_string();
-                    if url_str.starts_with("../") {
-                        // Break invalid backtracking image with red X data URI
-                        let data_uri = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M2 2 L14 14 M14 2 L2 14' stroke='%23ff0000' stroke-width='2'/%3E%3C/svg%3E";
-                        return MdEvent::Start(MdTag::Image {
-                            link_type,
-                            dest_url: CowStr::from(data_uri),
-                            title: CowStr::from("⚠️ Invalid image - backtracks beyond repository"),
-                            id,
-                        });
-                    }
-
-                    // Images don't need link rewriting, pass through unchanged
-                    MdEvent::Start(MdTag::Image {
-                        link_type,
-                        dest_url,
-                        title,
-                        id,
-                    })
-                }
                 _ => event,
             }
         }
 
-        let doc_path = self
+        let doc_abs_path = self
             .current_events
             .first()
             .map(|(proto, _)| proto.path.clone())
             .filter(|path| !path.is_empty())
             .unwrap_or("document.md".to_string());
-        let doc_ap = AnchorPath::from(&doc_path);
+        let doc_abs_ap = AnchorPath::from(&doc_abs_path);
         // Get source path from ProtoBeliefNode's path field to compute output filename
 
         // Extract filename and convert extension to .html
         // Extract filename and convert extension to .html
         // Handle empty path (tests) by defaulting to "document.html"
-        if doc_ap.filestem().is_empty() {
+        if doc_abs_ap.filestem().is_empty() {
             return Err(BuildonomyError::Codec(format!(
-                "Markdown file has no filename! {}",
-                doc_path
+                "Markdown file has no filename! {doc_abs_path}",
             )));
         }
-        let output_filename = format!("{}.html", doc_ap.filestem());
+        let output_filename = format!("{}.html", doc_abs_ap.filestem());
 
         // Generate HTML body from markdown events
         let events = self
             .current_events
             .iter()
             .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
-            .map(|e| rewrite_md_links_to_html(&doc_ap, e));
+            .map(|e| rewrite_md_links_to_html(e));
 
         let mut html_body = String::new();
         pulldown_cmark::html::push_html(&mut html_body, events);
@@ -1332,7 +1283,10 @@ impl DocCodec for MdCodec {
         Ok(vec![(output_filename, html_body)])
     }
 
-    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+    fn finalize(
+        &mut self,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
         let mut modified_nodes = Vec::new();
 
         // Step 1: Build sections table from all section nodes (heading > 2)
@@ -1359,24 +1313,24 @@ impl DocCodec for MdCodec {
                                 );
                                 bref
                             } else {
-                                tracing::warn!(
-                                    "finalize() - Section has invalid BID, skipping: title={:?}",
+                                diagnostics.push(ParseDiagnostic::warning(format!(
+                                    "Section has invalid BID, skipping: title={:?}",
                                     section_proto.document.get("title").and_then(|v| v.as_str())
-                                );
+                                )));
                                 continue;
                             }
                         } else {
-                            tracing::warn!(
-                                "finalize() - Section BID is not a string, skipping: title={:?}",
+                            diagnostics.push(ParseDiagnostic::warning(format!(
+                                "Section BID is not a string, skipping: title={:?}",
                                 section_proto.document.get("title").and_then(|v| v.as_str())
-                            );
+                            )));
                             continue;
                         }
                     } else {
-                        tracing::warn!(
-                            "finalize() - Section has no BID, skipping: title={:?}",
+                        diagnostics.push(ParseDiagnostic::warning(format!(
+                            "Section has no BID, skipping: title={:?}",
                             section_proto.document.get("title").and_then(|v| v.as_str())
-                        );
+                        )));
                         continue;
                     }
                 };
@@ -1613,26 +1567,26 @@ impl DocCodec for MdCodec {
                 MdEvent::End(MdTagEnd::Heading(_)) => {
                     // We should never encounter a heading end tag before a heading start tag, and
                     // we initialize title_accum to Some(String::new) in the start tag.
-                    let title = current.accumulator.take().unwrap_or_default();
-                    if current
-                        .accumulator
-                        .as_ref()
-                        .filter(|proto_title| {
-                            !proto_title.is_empty()
-                                && proto_title.to_lowercase() != title.to_lowercase()
-                        })
-                        .is_some()
+                    let accum_title = current.accumulator.take().unwrap_or_default();
+                    let current_title = current.title();
+                    // Heading 3 is an h1. heading 1 == network, heading 2 == document
+                    let is_document_heading =
+                        self.current_events.len() == 1 && current.heading == 3;
+                    if accum_title.is_empty() || current_title == accum_title || is_document_heading
                     {
-                        current.document.insert("title", value(&title));
-                    } else {
                         // Don't count this as a new section --- glue it back onto the last proto --
                         // the title doesn't 'split' it either because it's empty, or its the same
                         // as the last section
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
+                            if is_document_heading && !accum_title.is_empty() {
+                                current.document.insert("title", value(accum_title));
+                            }
                             last_event_vec.append(&mut proto_events);
                             proto_events = last_event_vec;
                         }
+                    } else {
+                        current.document.insert("title", value(accum_title));
                     }
                 }
                 _ => {}
@@ -2149,6 +2103,7 @@ schema = "Document"
         let mut doc = DocumentMut::new();
         doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
         doc.insert("schema", value("Document"));
+        doc.insert("title", value("My Document"));
 
         let proto = ProtoBeliefNode {
             accumulator: None,
@@ -2166,7 +2121,16 @@ schema = "Document"
 
         // Verify ID was normalized from title during parse
         let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
-        assert!(heading_node.is_some(), "Should have heading node");
+        assert!(
+            heading_node.is_some(),
+            "Should have heading node. codec events:\n{}",
+            codec
+                .current_events
+                .iter()
+                .map(|(proto, events)| format!("{}\n{events:?}", proto.document))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let (proto, _) = heading_node.unwrap();
         assert_eq!(
             proto.id().as_deref(),

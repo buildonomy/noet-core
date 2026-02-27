@@ -2,6 +2,11 @@
 //!
 //! This module provides types for tracking parsing diagnostics, particularly unresolved
 //! references that need to be resolved in subsequent parse passes.
+//!
+//! # Position Utilities
+//!
+//! Use [`byte_offset_to_location`] to convert a byte offset into a source string into a
+//! 1-based `(line, column)` pair suitable for human-readable diagnostic messages.
 
 use crate::{
     nodekey::NodeKey,
@@ -240,6 +245,35 @@ impl ParseDiagnostic {
     }
 }
 
+/// Convert a byte offset within a source string to a 1-based `(line, column)` pair.
+///
+/// Both line and column are 1-based (matching compiler convention).
+/// If `offset` exceeds the length of `source`, it is clamped to `source.len()`.
+///
+/// # Examples
+///
+/// ```
+/// use noet_core::codec::byte_offset_to_location;
+///
+/// let src = "hello\nworld\n";
+/// assert_eq!(byte_offset_to_location(src, 0),  (1, 1));  // 'h'
+/// assert_eq!(byte_offset_to_location(src, 5),  (1, 6));  // '\n'
+/// assert_eq!(byte_offset_to_location(src, 6),  (2, 1));  // 'w'
+/// assert_eq!(byte_offset_to_location(src, 11), (2, 6));  // '\n'
+/// assert_eq!(byte_offset_to_location(src, 99), (3, 1));  // clamped past end
+/// ```
+pub fn byte_offset_to_location(source: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(source.len());
+    let before = &source[..clamped];
+    let line = before.chars().filter(|&c| c == '\n').count() + 1;
+    let col = before
+        .rfind('\n')
+        .map(|i| clamped - i - 1)
+        .unwrap_or(clamped)
+        + 1;
+    (line, col)
+}
+
 impl std::fmt::Display for ParseDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -263,6 +297,61 @@ impl std::fmt::Display for ParseDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- byte_offset_to_location tests ---
+
+    #[test]
+    fn test_byte_offset_start_of_string() {
+        assert_eq!(byte_offset_to_location("hello", 0), (1, 1));
+    }
+
+    #[test]
+    fn test_byte_offset_mid_line() {
+        assert_eq!(byte_offset_to_location("hello world", 6), (1, 7));
+    }
+
+    #[test]
+    fn test_byte_offset_at_newline() {
+        // The newline character itself is still on line 1
+        assert_eq!(byte_offset_to_location("hello\nworld", 5), (1, 6));
+    }
+
+    #[test]
+    fn test_byte_offset_start_of_second_line() {
+        assert_eq!(byte_offset_to_location("hello\nworld", 6), (2, 1));
+    }
+
+    #[test]
+    fn test_byte_offset_mid_second_line() {
+        assert_eq!(byte_offset_to_location("hello\nworld", 8), (2, 3));
+    }
+
+    #[test]
+    fn test_byte_offset_multi_line() {
+        let src = "line1\nline2\nline3";
+        assert_eq!(byte_offset_to_location(src, 12), (3, 1)); // start of "line3"
+        assert_eq!(byte_offset_to_location(src, 14), (3, 3)); // "ne" into "line3"
+    }
+
+    #[test]
+    fn test_byte_offset_equals_len() {
+        let src = "hello\n";
+        // offset == len: one past the final newline, should be line 2, col 1
+        assert_eq!(byte_offset_to_location(src, src.len()), (2, 1));
+    }
+
+    #[test]
+    fn test_byte_offset_beyond_len_clamped() {
+        let src = "hi";
+        // offset > len: clamp to len (end of string, same line)
+        assert_eq!(byte_offset_to_location(src, 999), (1, 3));
+    }
+
+    #[test]
+    fn test_byte_offset_empty_string() {
+        assert_eq!(byte_offset_to_location("", 0), (1, 1));
+        assert_eq!(byte_offset_to_location("", 5), (1, 1));
+    }
 
     #[test]
     fn test_unresolved_reference_creation() {

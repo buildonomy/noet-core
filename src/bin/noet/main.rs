@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Parse all documents (events sent to processor)
                 let cache = compiler.builder().doc_bb().clone();
-                compiler.parse_all(cache, force).await?;
+                let parse_results = compiler.parse_all(cache, force).await?;
 
                 // Get stats
                 let stats = compiler.stats();
@@ -302,20 +302,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     compiler.finalize_html(&final_bb).await?;
                 }
 
-                println!("\n=== Parse Results ===");
-                println!("Primary queue: {}", stats.primary_queue_len);
-                println!("Reparse queue: {}", stats.reparse_queue_len);
-                println!("Processed: {}", stats.processed_count);
-                println!("Total parses: {}", stats.total_parses);
-                println!("Pending dependencies: {}", stats.pending_dependencies_count);
+                // Collect and report diagnostics
+                let mut warning_count = 0usize;
+                let mut error_count = 0usize;
+                for result in &parse_results {
+                    for diagnostic in &result.diagnostics {
+                        match diagnostic {
+                            noet_core::codec::ParseDiagnostic::Warning(msg) => {
+                                eprintln!("warning: {msg}");
+                                warning_count += 1;
+                            }
+                            noet_core::codec::ParseDiagnostic::ParseError {
+                                message,
+                                attempt_count,
+                            } => {
+                                eprintln!(
+                                    "error: {} (after {} attempt{})",
+                                    message,
+                                    attempt_count,
+                                    if *attempt_count == 1 { "" } else { "s" }
+                                );
+                                error_count += 1;
+                            }
+                            noet_core::codec::ParseDiagnostic::Info(msg) => {
+                                if verbose {
+                                    eprintln!("info: {msg}");
+                                }
+                            }
+                            // UnresolvedReference entries that survive to this point are
+                            // compiler-internal sink dependencies; not shown to the author.
+                            noet_core::codec::ParseDiagnostic::UnresolvedReference(_) => {}
+                        }
+                    }
+                }
 
-                if write {
-                    println!("\n=== Write Results ===");
-                    println!("Files processed: {}", stats.processed_count);
-                    println!("Note: Only modified files are written back");
+                if warning_count > 0 || error_count > 0 {
+                    eprintln!(
+                        "\n{} warning{}, {} error{}",
+                        warning_count,
+                        if warning_count == 1 { "" } else { "s" },
+                        error_count,
+                        if error_count == 1 { "" } else { "s" },
+                    );
+                }
+
+                if verbose {
+                    println!("\n=== Parse Results ===");
+                    println!("Primary queue: {}", stats.primary_queue_len);
+                    println!("Reparse queue: {}", stats.reparse_queue_len);
+                    println!("Processed: {}", stats.processed_count);
+                    println!("Total parses: {}", stats.total_parses);
+                    println!("Pending dependencies: {}", stats.pending_dependencies_count);
+
+                    if write {
+                        println!("\n=== Write Results ===");
+                        println!("Files processed: {}", stats.processed_count);
+                        println!("Note: Only modified files are written back");
+                    }
+                } else {
+                    println!(
+                        "Processed {} file{} ({} parse{})",
+                        stats.processed_count,
+                        if stats.processed_count == 1 { "" } else { "s" },
+                        stats.total_parses,
+                        if stats.total_parses == 1 { "" } else { "s" },
+                    );
                 }
 
                 // HTML generation and export handled by finalize_html above
+
+                if error_count > 0 {
+                    std::process::exit(1);
+                }
 
                 Ok::<(), noet_core::BuildonomyError>(())
             })?;

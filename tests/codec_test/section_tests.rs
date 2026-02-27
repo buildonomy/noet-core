@@ -40,18 +40,22 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
 
     // Find the document node for sections_test.md
     // Use title since path is tracked in relations, not in node itself
-    let doc_bid = global_bb
+    let doc_node = global_bb
         .states()
         .values()
-        .find(|node| node.title.contains("Sections Test Document"))
-        .map(|node| node.bid);
+        .find(|node| node.title.contains("Sections Test Document"));
 
     assert!(
-        doc_bid.is_some(),
+        doc_node.is_some(),
         "Should find sections_test.md document node"
     );
-    let doc_bid = doc_bid.unwrap();
+    let doc_node = doc_node.unwrap();
 
+    assert!(
+        doc_node.kind.is_document(),
+        "sections_test.md should be colored as a document. Received kind: {}",
+        doc_node.kind
+    );
     // Find heading nodes that are children of this document
     let heading_nodes: Vec<_> = global_bb
         .states()
@@ -63,7 +67,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
                 .as_graph()
                 .edges_connecting(
                     global_bb.bid_to_index(&node.bid).unwrap(),
-                    global_bb.bid_to_index(&doc_bid).unwrap(),
+                    global_bb.bid_to_index(&doc_node.bid).unwrap(),
                 )
                 .any(|edge| edge.weight().weights.contains_key(&WeightKind::Section))
         })

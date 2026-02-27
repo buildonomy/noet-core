@@ -1,6 +1,7 @@
 use crate::{
     beliefbase::BeliefContext,
     codec::{
+        diagnostic::ParseDiagnostic,
         md::{build_title_attribute, MdCodec},
         DocCodec, ProtoBeliefNode, CODECS,
     },
@@ -122,21 +123,15 @@ impl DocCodec for NetworkCodec {
     ///
     /// The codec abstraction provides this flexibility without changing the compiler or
     /// builder layers. See [crate::codec] for details on how to swap out `CODECS`.
-    fn proto(
-        &self,
-        repo_path: &Path,
-        path: &Path,
-    ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
-        let file_path = repo_path.join(path);
-        let Some(network_filepath) = detect_network_file(&file_path) else {
+    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+        let Some(network_filepath) = detect_network_file(path) else {
             return Ok(None);
         };
         let network_dir = network_filepath.parent().expect(
             "detect network file returns a path where path.is_file() is true, \
             therefore path.parent() must succeed.",
         );
-        let rel_path = network_filepath.strip_prefix(repo_path)?;
-        let Some(mut proto) = MdCodec::new().proto(repo_path, rel_path)? else {
+        let Some(mut proto) = MdCodec::new().proto(network_filepath.as_ref())? else {
             return Ok(None);
         };
         if proto.id().is_none() {
@@ -144,25 +139,25 @@ impl DocCodec for NetworkCodec {
                 "Network nodes require a semantic ID. Received: {proto:?}"
             )));
         }
-        let rel_str = os_path_to_string(rel_path);
-        proto.path = AnchorPath::new(&rel_str).dir().to_string();
+        proto.path = os_path_to_string(network_dir);
         proto.kind.insert(BeliefKind::Network);
         proto.heading = 1;
         for doc_path in iter_net_docs(network_dir) {
-            if let Ok(relative_path) = doc_path.strip_prefix(network_dir) {
-                let path_str = os_path_to_string(relative_path);
-                if !path_str.is_empty() {
-                    let node_key = NodeKey::Path {
-                        // net will be resolved during processing by calling Key::regularize
-                        net: Bref::default(),
-                        path: path_str.clone(),
-                    };
-                    let mut weight = Weight::default();
-                    weight.set_doc_paths(vec![path_str]).ok();
-                    proto
-                        .upstream
-                        .push((node_key, WeightKind::Section, Some(weight)));
-                }
+            let relative_path = doc_path.strip_prefix(network_dir).expect(
+                "We are iterating network dir, we should be getting absolute paths returned.",
+            );
+            let path_str = os_path_to_string(relative_path);
+            if !path_str.is_empty() {
+                let node_key = NodeKey::Path {
+                    // net will be resolved during processing by calling Key::regularize
+                    net: Bref::default(),
+                    path: path_str.clone(),
+                };
+                let mut weight = Weight::default();
+                weight.set_doc_paths(vec![path_str]).ok();
+                proto
+                    .upstream
+                    .push((node_key, WeightKind::Section, Some(weight)));
             }
         }
 
@@ -189,12 +184,16 @@ impl DocCodec for NetworkCodec {
         &mut self,
         node: &ProtoBeliefNode,
         ctx: &BeliefContext<'_>,
+        diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
-        self.0.inject_context(node, ctx)
+        self.0.inject_context(node, ctx, diagnostics)
     }
 
-    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
-        self.0.finalize()
+    fn finalize(
+        &mut self,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+        self.0.finalize(diagnostics)
     }
 
     fn generate_source(&self) -> Option<String> {
@@ -269,7 +268,7 @@ impl DocCodec for NetworkCodec {
 
                 // Get bref for the child node to add to title attribute
                 let bref_attr = ctx
-                    .belief_set()
+                    .beliefbase()
                     .brefs()
                     .iter()
                     .find_map(|(bref, bid)| {

@@ -260,10 +260,7 @@ impl DocumentCompiler {
         P: AsRef<std::path::Path> + std::fmt::Debug,
     {
         let net_codec = NetworkCodec::default();
-        if net_codec
-            .proto(repo_path.as_ref(), repo_path.as_ref())?
-            .is_some()
-        {
+        if net_codec.proto(repo_path.as_ref())?.is_some() {
             return Err(BuildonomyError::Codec(format!(
                 "Network file at path {repo_path:?} is already initialized."
             )));
@@ -725,7 +722,55 @@ impl DocumentCompiler {
             results.push(result);
         }
 
+        // All passes complete. Any UnresolvedReference entries that originated from
+        // link-resolution failures (not cross-document sink dependencies) are now permanent
+        // author errors. Promote them to Warning so callers see clean, actionable output.
+        Self::promote_unresolved_to_warnings(&mut results);
+
         Ok(results)
+    }
+
+    /// Promote lingering link-resolution `UnresolvedReference` diagnostics to `Warning`.
+    ///
+    /// After all parse passes are complete, any `UnresolvedReference` that came from a link in
+    /// a document that never resolved is a permanent author error. Sink dependencies
+    /// (`is_sink_dependency() == true`, `Direction::Incoming`) are compiler-internal ordering
+    /// signals and are left unchanged; they will have resolved or been dropped by this point.
+    ///
+    /// This keeps `UnresolvedReference` as the compiler's internal multi-pass signal while
+    /// ensuring the `Vec<ParseResult>` handed to the CLI and LSP layer contains only
+    /// author-facing variants (`Warning`, `ParseError`, `Info`).
+    fn promote_unresolved_to_warnings(results: &mut [ParseResult]) {
+        for result in results.iter_mut() {
+            let path_str = result.path.display().to_string();
+            let mut promoted = Vec::with_capacity(result.diagnostics.len());
+            for diagnostic in result.diagnostics.drain(..) {
+                match diagnostic {
+                    crate::codec::ParseDiagnostic::UnresolvedReference(ref u)
+                        if !u.is_sink_dependency() =>
+                    {
+                        let (line, col) = u.reference_location.unwrap_or((0, 0));
+                        let keys_str = u
+                            .other_keys
+                            .iter()
+                            .map(|k| format!("{k:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let msg = if line > 0 {
+                            format!(
+                                "{}:{}:{}: unresolved link — tried [{}]",
+                                path_str, line, col, keys_str
+                            )
+                        } else {
+                            format!("{}: unresolved link — tried [{}]", path_str, keys_str)
+                        };
+                        promoted.push(crate::codec::ParseDiagnostic::warning(msg));
+                    }
+                    other => promoted.push(other),
+                }
+            }
+            result.diagnostics = promoted;
+        }
     }
 
     pub fn cache(&self) -> &BeliefBase {
@@ -2074,5 +2119,237 @@ Test network for unit tests.
         assert_eq!(stats.reparse_queue_len, 0);
         assert_eq!(stats.processed_count, 0);
         assert_eq!(stats.total_parses, 0);
+    }
+
+    // --- Diagnostic promotion tests ---
+
+    #[test]
+    fn test_promote_unresolved_to_warnings_converts_outgoing() {
+        use crate::codec::diagnostic::UnresolvedReference;
+        use crate::nodekey::NodeKey;
+        use crate::properties::{Bid, WeightKind};
+        use petgraph::Direction;
+
+        let net_bref = Bid::default().bref();
+        let unresolved = UnresolvedReference {
+            direction: Direction::Outgoing,
+            self_bid: Bid::nil(),
+            self_net: Bid::nil(),
+            self_path: "docs/page.md".to_string(),
+            other_keys: vec![NodeKey::Path {
+                net: net_bref,
+                path: "docs/missing.md".to_string(),
+            }],
+            weight_kind: WeightKind::Epistemic,
+            weight_data: None,
+            reference_location: Some((10, 3)),
+        };
+
+        let mut results = vec![ParseResult {
+            path: std::path::PathBuf::from("docs/page.md"),
+            rewritten_content: None,
+            dependent_paths: vec![],
+            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+                unresolved,
+            )],
+        }];
+
+        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
+
+        assert_eq!(results[0].diagnostics.len(), 1);
+        match &results[0].diagnostics[0] {
+            crate::codec::ParseDiagnostic::Warning(msg) => {
+                assert!(msg.contains("unresolved link"), "message: {msg}");
+                assert!(msg.contains("10:3"), "expected line:col in message: {msg}");
+                assert!(
+                    msg.contains("docs/page.md"),
+                    "expected path in message: {msg}"
+                );
+            }
+            other => panic!("Expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_promote_unresolved_to_warnings_preserves_sink_dependency() {
+        use crate::codec::diagnostic::UnresolvedReference;
+        use crate::nodekey::NodeKey;
+        use crate::properties::{Bid, WeightKind};
+        use petgraph::Direction;
+
+        let net_bref = Bid::default().bref();
+        // Sink dependency: Direction::Incoming with a Path key — compiler ordering signal
+        let sink_dep = UnresolvedReference {
+            direction: Direction::Incoming,
+            self_bid: Bid::nil(),
+            self_net: Bid::nil(),
+            self_path: "docs/page.md".to_string(),
+            other_keys: vec![NodeKey::Path {
+                net: net_bref,
+                path: "docs/other.md".to_string(),
+            }],
+            weight_kind: WeightKind::Epistemic,
+            weight_data: None,
+            reference_location: None,
+        };
+
+        let mut results = vec![ParseResult {
+            path: std::path::PathBuf::from("docs/page.md"),
+            rewritten_content: None,
+            dependent_paths: vec![],
+            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(sink_dep)],
+        }];
+
+        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
+
+        // Sink dependency must NOT be promoted — it stays as UnresolvedReference
+        assert_eq!(results[0].diagnostics.len(), 1);
+        assert!(
+            matches!(
+                &results[0].diagnostics[0],
+                crate::codec::ParseDiagnostic::UnresolvedReference(_)
+            ),
+            "Sink dependency should remain as UnresolvedReference"
+        );
+    }
+
+    #[test]
+    fn test_promote_unresolved_without_location() {
+        use crate::codec::diagnostic::UnresolvedReference;
+        use crate::nodekey::NodeKey;
+        use crate::properties::{Bid, WeightKind};
+        use petgraph::Direction;
+
+        let net_bref = Bid::default().bref();
+        let unresolved = UnresolvedReference {
+            direction: Direction::Outgoing,
+            self_bid: Bid::nil(),
+            self_net: Bid::nil(),
+            self_path: "docs/page.md".to_string(),
+            other_keys: vec![NodeKey::Path {
+                net: net_bref,
+                path: "docs/missing.md".to_string(),
+            }],
+            weight_kind: WeightKind::Epistemic,
+            weight_data: None,
+            reference_location: None, // no location available
+        };
+
+        let mut results = vec![ParseResult {
+            path: std::path::PathBuf::from("docs/page.md"),
+            rewritten_content: None,
+            dependent_paths: vec![],
+            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+                unresolved,
+            )],
+        }];
+
+        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
+
+        match &results[0].diagnostics[0] {
+            crate::codec::ParseDiagnostic::Warning(msg) => {
+                assert!(msg.contains("unresolved link"), "message: {msg}");
+                // No line:col when location is absent
+                assert!(
+                    !msg.contains(":0:0"),
+                    "should not contain :0:0 in message: {msg}"
+                );
+            }
+            other => panic!("Expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_promote_preserves_non_unresolved_diagnostics() {
+        let mut results = vec![ParseResult {
+            path: std::path::PathBuf::from("docs/page.md"),
+            rewritten_content: None,
+            dependent_paths: vec![],
+            diagnostics: vec![
+                crate::codec::ParseDiagnostic::warning("existing warning"),
+                crate::codec::ParseDiagnostic::Info("info message".to_string()),
+                crate::codec::ParseDiagnostic::parse_error("parse failed", 1),
+            ],
+        }];
+
+        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
+
+        // All three non-UnresolvedReference diagnostics must pass through unchanged
+        assert_eq!(results[0].diagnostics.len(), 3);
+        assert!(matches!(
+            &results[0].diagnostics[0],
+            crate::codec::ParseDiagnostic::Warning(_)
+        ));
+        assert!(matches!(
+            &results[0].diagnostics[1],
+            crate::codec::ParseDiagnostic::Info(_)
+        ));
+        assert!(matches!(
+            &results[0].diagnostics[2],
+            crate::codec::ParseDiagnostic::ParseError { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_broken_link_produces_warning_in_parse_result() {
+        use crate::beliefbase::BeliefBase;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
+
+        // Write a document with a link that references a node that does not exist
+        std::fs::write(
+            temp_dir.path().join("page.md"),
+            r#"---
+title = "Page"
+---
+
+# Page
+
+This has a [broken link](nonexistent.md "bref://000000000000000000000000").
+"#,
+        )
+        .unwrap();
+
+        let global_bb = BeliefBase::default();
+        let mut compiler = DocumentCompiler::new(temp_dir.path(), None, Some(2), false).unwrap();
+        let results = compiler.parse_all(global_bb, false).await.unwrap();
+
+        // After all passes, there must be at least one Warning diagnostic mentioning
+        // "unresolved link" somewhere across the results (the broken bref link).
+        let warning_msgs: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.diagnostics.iter())
+            .filter_map(|d| match d {
+                crate::codec::ParseDiagnostic::Warning(msg) => Some(msg.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // No raw UnresolvedReference should survive after promotion
+        let leftover_unresolved = results
+            .iter()
+            .flat_map(|r| r.diagnostics.iter())
+            .filter(|d| {
+                matches!(
+                    d,
+                    crate::codec::ParseDiagnostic::UnresolvedReference(u)
+                        if !u.is_sink_dependency()
+                )
+            })
+            .count();
+        assert_eq!(
+            leftover_unresolved, 0,
+            "No outgoing UnresolvedReference should remain after parse_all"
+        );
+
+        assert!(
+            !warning_msgs.is_empty(),
+            "Expected at least one unresolved link warning; diagnostics: {results:#?}"
+        );
+        assert!(
+            warning_msgs.iter().any(|m| m.contains("unresolved link")),
+            "Warning should mention 'unresolved link'; warnings: {warning_msgs:?}"
+        );
     }
 }

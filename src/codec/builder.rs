@@ -23,7 +23,7 @@ use crate::{
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath, AnchorPathBuf},
+    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
         buildonomy_namespace, content_namespaces, href_namespace, BeliefKind, BeliefKindSet,
         BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
@@ -495,7 +495,9 @@ impl GraphBuilder {
                     // Inject proto text into our self set here, because inject context is where the
                     // markdown parser generates section-specific text fields regardless of whether
                     // it changes the markdown itself due to the injected context.
-                    if let Some(updated_node) = codec.inject_context(proto, &ctx)? {
+                    if let Some(updated_node) =
+                        codec.inject_context(proto, &ctx, &mut diagnostics)?
+                    {
                         if old_node != updated_node.toml() {
                             is_changed = true;
                             let _derivatives =
@@ -512,7 +514,7 @@ impl GraphBuilder {
 
                 // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
                 tracing::debug!("Phase 4b: codec finalization");
-                let finalized_nodes = codec.finalize()?;
+                let finalized_nodes = codec.finalize(&mut diagnostics)?;
                 for (_proto, updated_node) in finalized_nodes {
                     let old_toml = self
                         .doc_bb
@@ -570,7 +572,7 @@ impl GraphBuilder {
     /// Initializes internal variables for parsing and merging
     async fn initialize_stack<P: AsRef<Path> + Debug, B: BeliefSource + Clone>(
         &mut self,
-        path: P,
+        abs_path: P,
         global_bb: B,
     ) -> Result<ProtoBeliefNode, BuildonomyError> {
         // self.parsed_content.clear();
@@ -626,15 +628,15 @@ impl GraphBuilder {
         }
 
         let initial_factory = CODECS
-            .path_get(path.as_ref())
+            .path_get(abs_path.as_ref())
             .ok_or(BuildonomyError::Codec(format!(
-                "Could not find codec for path type {path:?}"
+                "Could not find codec for path type {abs_path:?}"
             )))?;
         let initial_codec = initial_factory();
         let initial = initial_codec
-            .proto(self.repo_root.as_ref(), path.as_ref())?
+            .proto(abs_path.as_ref())?
             .ok_or(BuildonomyError::Codec(format!(
-                "Codec could not resolve path '{path:?}' into a proto node"
+                "Codec could not resolve path '{abs_path:?}' into a proto node"
             )))?;
         let mut parent_path = string_to_os_path(&initial.path);
         let mut parent_path_stack: Vec<PathBuf> = Vec::default();
@@ -655,9 +657,12 @@ impl GraphBuilder {
         let mut events = Vec::<BeliefEvent>::default();
         let net_codec = NetworkCodec::default();
         while let Some(path) = parent_path_stack.pop() {
-            let Some(state_accum) = net_codec.proto(self.repo_root.as_path(), path.as_path())?
-            else {
-                continue;
+            let Some(state_accum) = net_codec.proto(path.as_ref())? else {
+                if path == self.repo_root {
+                    break;
+                } else {
+                    continue;
+                }
             };
 
             let (ancestor, (_source, _, _)) = self
@@ -679,6 +684,9 @@ impl GraphBuilder {
                 missing_structure = BeliefGraph::default(); // reset for next interation
             }
             maybe_content_parent_proto = Some((ancestor, state_accum));
+            if path == self.repo_root {
+                break;
+            }
         }
 
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
@@ -1193,57 +1201,17 @@ impl GraphBuilder {
     ) -> Result<GetOrCreateResult, BuildonomyError> {
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
-
-        let mut other_key_regularized = other_key
-            .regularize(&self.doc_bb, *owner_bid, self.repo())
+        let other_key_regularized = other_key
+            .regularize(
+                &self.doc_bb,
+                *owner_bid,
+                self.repo(),
+                &os_path_to_string(&self.repo_root),
+            )
             .expect(
                 "parse_content Phase 1 parsing ensures that we have a valid subsection \
                 structure to get paths from for all our parsed nodes",
             );
-
-        // Phase 2: Resolve boundary-escaping paths using the filesystem repo_root.
-        // After regularize, a path starting with "../" means the join against the
-        // network-relative owner_path escaped the network boundary. We can resolve
-        // this by constructing the absolute path and stripping the repo_root prefix.
-        if let NodeKey::Path { ref net, ref path } = other_key_regularized {
-            if path.starts_with("../") {
-                let repo_root_str = os_path_to_string(&self.repo_root);
-                let mut abs_ap = AnchorPathBuf::from(repo_root_str.clone());
-                // Get the owner's network-relative path for context
-                if let Some((_home_net, owner_path, _order)) = self
-                    .doc_bb
-                    .paths()
-                    .get_map(&self.repo().bref())
-                    .and_then(|pm| pm.path(owner_bid, &self.doc_bb.paths()))
-                {
-                    abs_ap.push(&owner_path);
-                }
-                abs_ap.push(path);
-                // Normalize resolves the ../s against the absolute prefix
-                let normalized = abs_ap.normalize();
-                if let Some(repo_relative) =
-                    normalized.as_anchor_path().strip_prefix(&repo_root_str)
-                {
-                    tracing::debug!(
-                        "[push_relation] Resolved boundary-escaping path '{}' to \
-                         repo-relative '{}'",
-                        path,
-                        repo_relative
-                    );
-                    other_key_regularized = NodeKey::Path {
-                        net: *net,
-                        path: repo_relative.to_string(),
-                    };
-                } else {
-                    tracing::warn!(
-                        "[push_relation] Path '{}' escapes repo boundary even after \
-                         filesystem resolution (resolved to '{}'). Skipping relation.",
-                        path,
-                        normalized
-                    );
-                }
-            }
-        }
 
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();

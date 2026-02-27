@@ -99,7 +99,7 @@ pub struct BeliefContext<'a> {
     pub root_path: String,
     pub root_net: Bid,
     pub home_net: Bid,
-    set: &'a BeliefBase,
+    bb: &'a BeliefBase,
     relations_guard: RelationsGuard<'a>,
 }
 
@@ -110,7 +110,7 @@ impl<'a> BeliefContext<'a> {
         root_path: String,
         root_net: Bid,
         home_net: Bid,
-        set: &'a BeliefBase,
+        bb: &'a BeliefBase,
         relations_guard: RelationsGuard<'a>,
     ) -> Self {
         BeliefContext {
@@ -118,14 +118,14 @@ impl<'a> BeliefContext<'a> {
             root_path,
             root_net,
             home_net,
-            set,
+            bb,
             relations_guard,
         }
     }
 
     /// Get a reference to the underlying BeliefBase
-    pub fn belief_set(&self) -> &'a BeliefBase {
-        self.set
+    pub fn beliefbase(&self) -> &'a BeliefBase {
+        self.bb
     }
 
     /// Lazily compute source relations for this node
@@ -139,7 +139,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if sink_bid == self.node.bid {
-                    ExtendedRelation::new(source_bid, self.root_net, &edge.weight, self.set)
+                    ExtendedRelation::new(source_bid, self.root_net, &edge.weight, self.bb)
                 } else {
                     None
                 }
@@ -158,7 +158,7 @@ impl<'a> BeliefContext<'a> {
                 let source_bid = graph[edge.source()];
                 let sink_bid = graph[edge.target()];
                 if source_bid == self.node.bid {
-                    ExtendedRelation::new(sink_bid, self.root_net, &edge.weight, self.set)
+                    ExtendedRelation::new(sink_bid, self.root_net, &edge.weight, self.bb)
                 } else {
                     None
                 }
