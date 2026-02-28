@@ -86,8 +86,8 @@ auto_normalize = true  # normalize format on write
 // belief_ir.rs
 pub const NETWORK_CONFIG_NAME: &str = "BeliefNetwork.toml";
 
-impl FromStr for ProtoBeliefNode {
-    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+impl FromStr for IRNode {
+    fn from_str(str: &str) -> Result<IRNode, BuildonomyError> {
         // Parse as TOML only
         proto.document = proto.content.parse::<DocumentMut>()?;
     }
@@ -110,17 +110,17 @@ pub enum MetadataFormat {
     Toml,
 }
 
-impl ProtoBeliefNode {
+impl IRNode {
     // Parse with format preference from network config
     pub fn from_str_with_format(
         str: &str, 
         preferred_format: MetadataFormat
-    ) -> Result<ProtoBeliefNode, BuildonomyError> {
+    ) -> Result<IRNode, BuildonomyError> {
         // Try preferred format first, then fallback
     }
     
     // Existing method maintains YAML-first default
-    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+    fn from_str(str: &str) -> Result<IRNode, BuildonomyError> {
         Self::from_str_with_format(str, MetadataFormat::Yaml)
     }
 }
@@ -246,7 +246,7 @@ fn parse_with_fallback(
 - [x] Update `iter_net_docs()` to check for `.json` and `.toml` files
 - [x] Add `.yaml` and `.yml` to network file detection (plus `.jsn`, `.tml` synonyms)
 - [x] Create `detect_network_file()` public function returning `(path, format)`
-- [x] Update `ProtoBeliefNode::from_file()` to handle all three formats
+- [x] Update `IRNode::from_file()` to handle all three formats
 - [x] Priority order: YAML → JSON → TOML (consistent with metadata parsing)
 
 **Implemented network detection logic**:
@@ -296,7 +296,7 @@ This step has been dropped. Network-level format configuration adds complexity w
 
 **Original scope** (not implemented):
 - [ ] Parse network file and extract `config` object
-- [ ] Store network config in `ProtoBeliefNode` for network nodes
+- [ ] Store network config in `IRNode` for network nodes
 - [ ] Pass network config down to child document parsing
 - [ ] Respect `default_metadata_format` preference
 - [ ] Implement `strict_format` validation (if enabled, reject non-default)
@@ -310,7 +310,7 @@ pub struct NetworkConfig {
     pub auto_normalize: bool,
 }
 
-impl ProtoBeliefNode {
+impl IRNode {
     // Add network_config field
     pub network_config: Option<NetworkConfig>,
     
@@ -320,20 +320,20 @@ impl ProtoBeliefNode {
     }
     
     // Use config when parsing child documents
-    fn parse_child_with_network_config(&self, content: &str) -> Result<ProtoBeliefNode> {
+    fn parse_child_with_network_config(&self, content: &str) -> Result<IRNode> {
         let format = self.network_config
             .as_ref()
             .map(|c| c.default_metadata_format)
             .unwrap_or(MetadataFormat::Json);
         
-        ProtoBeliefNode::from_str_with_format(content, format)
+        IRNode::from_str_with_format(content, format)
     }
 }
 ```
 
 ### 5. Update FromStr Implementation (0.5 days) ✅
 
-- [x] Keep `ProtoBeliefNode::from_str()` defaulting to JSON-first (preserves backward compatibility)
+- [x] Keep `IRNode::from_str()` defaulting to JSON-first (preserves backward compatibility)
 - [x] `from_str_with_format()` method already exists for explicit format preference
 - [x] Three-way fallback implemented in `parse_with_fallback()`:
   - JSON-first: JSON → YAML → TOML
@@ -539,8 +539,8 @@ rationale = "Supports network goal"
 
 - Current implementation: `src/codec/belief_ir.rs`
 - Network file detection: `iter_net_docs()` (lines 31-79)
-- Schema traversal: `ProtoBeliefNode::traverse_schema()` (lines 623-753)
-- Parsing: `ProtoBeliefNode::from_str()` (lines 756-787)
+- Schema traversal: `IRNode::traverse_schema()` (lines 623-753)
+- Parsing: `IRNode::from_str()` (lines 756-787)
 - Related: Issue 1 (Schema Registry) - network config schema registration
 - Related: Issue 2 (Multi-Node TOML Parsing) - may need JSON support there too
 - Related: ROADMAP_HTML_RENDERING Phase 1 - multi-format support enables flexible HTML workflows

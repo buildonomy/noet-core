@@ -3,7 +3,7 @@ use crate::{
     codec::{
         diagnostic::ParseDiagnostic,
         md::{build_title_attribute, MdCodec},
-        DocCodec, ProtoBeliefNode, CODECS,
+        DocCodec, IRNode, CODECS,
     },
     error::BuildonomyError,
     nodekey::NodeKey,
@@ -101,7 +101,7 @@ pub struct NetworkCodec(MdCodec);
 
 impl DocCodec for NetworkCodec {
     /// Parse a path into a proto network node, if detect_network_file returns Some, then populate
-    /// that ProtoBeliefNode, discovering direct filesystem descendants and setting path and kind
+    /// that IRNode, discovering direct filesystem descendants and setting path and kind
     /// correctly.
     ///
     /// This method handles filesystem traversal to discover a network's direct children.
@@ -117,13 +117,13 @@ impl DocCodec for NetworkCodec {
     /// This filesystem-based implementation is just one strategy. The [`crate::codec::CODECS`] map
     /// allows swapping implementations at runtime for different environments:
     ///
-    /// - **Native/Desktop**: Use this `ProtoBeliefNode` with direct filesystem access
-    /// - **Browser/WASM**: Swap in a `BrowserProtoBeliefNode` that reads from IndexedDB
-    /// - **Testing**: Swap in a `MockProtoBeliefNode` with in-memory content
+    /// - **Native/Desktop**: Use this `IRNode` with direct filesystem access
+    /// - **Browser/WASM**: Swap in a `BrowserIRNode` that reads from IndexedDB
+    /// - **Testing**: Swap in a `MockIRNode` with in-memory content
     ///
     /// The codec abstraction provides this flexibility without changing the compiler or
     /// builder layers. See [crate::codec] for details on how to swap out `CODECS`.
-    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+    fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError> {
         let Some(network_filepath) = detect_network_file(path) else {
             return Ok(None);
         };
@@ -164,7 +164,7 @@ impl DocCodec for NetworkCodec {
         Ok(Some(proto))
     }
 
-    fn parse(&mut self, content: &str, current: ProtoBeliefNode) -> Result<(), BuildonomyError> {
+    fn parse(&mut self, content: &str, current: IRNode) -> Result<(), BuildonomyError> {
         self.0.parse(content, current)?;
         let Some(first_tuple) = self.0.current_events.first_mut() else {
             return Err(BuildonomyError::Codec(
@@ -176,13 +176,13 @@ impl DocCodec for NetworkCodec {
         Ok(())
     }
 
-    fn nodes(&self) -> Vec<ProtoBeliefNode> {
+    fn nodes(&self) -> Vec<IRNode> {
         self.0.nodes()
     }
 
     fn inject_context(
         &mut self,
-        node: &ProtoBeliefNode,
+        node: &IRNode,
         ctx: &BeliefContext<'_>,
         diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
@@ -192,7 +192,7 @@ impl DocCodec for NetworkCodec {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
         self.0.finalize(diagnostics)
     }
 

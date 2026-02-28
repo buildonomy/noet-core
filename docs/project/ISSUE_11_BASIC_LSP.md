@@ -144,7 +144,7 @@ struct NoetLanguageServer {
 - [ ] Add trait method: `fn get_link_ranges(&self) -> Vec<LinkPosition>`
 - [ ] Add trait method: `fn supports_positions(&self) -> bool { false }` (default: opt-in)
 - [ ] Document position tracking contract in trait documentation
-- [ ] Position data is codec-internal - NOT stored in ProtoBeliefNode or BeliefNode
+- [ ] Position data is codec-internal - NOT stored in IRNode or BeliefNode
 
 **Changes to `src/codec/diagnostic.rs`**:
 - [ ] Add `range: Option<Range>` field to `ParseDiagnostic`
@@ -163,7 +163,7 @@ struct NoetLanguageServer {
   - Add internal position tracking for frontmatter blocks
   - Track individual TOML field positions if possible
   - Implement position query methods
-- [ ] Position data lives only in codec instances, never in ProtoBeliefNode or BeliefNode
+- [ ] Position data lives only in codec instances, never in IRNode or BeliefNode
 
 **Changes to `src/codec/builder.rs` (GraphBuilder)**:
 - [ ] Add `position_index: Option<PositionIndex>` field to GraphBuilder
@@ -388,7 +388,7 @@ async fn main() {
   
 5. Modify DocCodec trait to return diagnostics:
    ```rust
-   fn parse(...) -> Result<(Vec<ProtoBeliefNode>, Vec<ParseDiagnostic>)>
+   fn parse(...) -> Result<(Vec<IRNode>, Vec<ParseDiagnostic>)>
    ```
   
 **Integration Points**:

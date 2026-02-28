@@ -199,7 +199,7 @@ Simplified codebase to always use responsive template for interactive SPA.
 - Interactive SPA requires consistent structure across all documents
 - `layout` field is obsolete - all documents use same interactive viewer
 - Simplifies codebase and reduces CLI complexity
-- Network index pages still use simple template (from `ProtoBeliefNode`)
+- Network index pages still use simple template (from `IRNode`)
 
 **Files modified**:
 - `src/codec/mod.rs` - Updated trait definition
@@ -559,7 +559,7 @@ All success criteria achieved:
 **Decision**: Single responsive template with progressive enhancement
 - Removed layout enum (Simple vs Responsive)
 - All documents use same interactive viewer structure
-- Network index pages use simple template (from ProtoBeliefNode)
+- Network index pages use simple template (from IRNode)
 
 ### Link Normalization
 **Decision**: Each codec's responsibility (not trait-level abstraction)

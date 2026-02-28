@@ -230,7 +230,7 @@ fn parse_sections_metadata(sections: &TomlValue) -> HashMap<NodeKey, TomlTable> 
 }
 
 // Match heading node to sections metadata
-fn find_metadata_match(node: &ProtoBeliefNode, metadata: &HashMap<NodeKey, TomlTable>) 
+fn find_metadata_match(node: &IRNode, metadata: &HashMap<NodeKey, TomlTable>) 
     -> Option<&TomlTable> 
 {
     // Try BID first (most explicit)
@@ -297,13 +297,13 @@ Implemented with comprehensive unit tests in `src/codec/md.rs::tests`:
   - Parses TOML sections field into HashMap for matching
   - Implemented and tested
 
-- [x] `find_metadata_match(node: &ProtoBeliefNode, metadata: &HashMap<NodeKey, Table>) -> Option<(NodeKey, &Table)>` (L490+)
+- [x] `find_metadata_match(node: &IRNode, metadata: &HashMap<NodeKey, Table>) -> Option<(NodeKey, &Table)>` (L490+)
   - Priority matching: BID > Anchor > Title
   - Uses `to_anchor()` for title slugification
   - Returns matched (key, metadata) tuple or None
   - Implemented and tested
 
-- [x] `merge_metadata_into_node(node: &mut ProtoBeliefNode, metadata: &TomlTable)` (L538-545)
+- [x] `merge_metadata_into_node(node: &mut IRNode, metadata: &TomlTable)` (L538-545)
   - Merges metadata into proto.document non-destructively
   - Preserves existing fields (doesn't overwrite title, text, bid)
   - Implemented and tested
@@ -317,7 +317,7 @@ Modify `MdCodec::inject_context()` to enrich heading nodes using direct table ac
 ```rust
 fn inject_context(
     &mut self,
-    node: &ProtoBeliefNode,
+    node: &IRNode,
     ctx: &BeliefContext<'_>,
 ) -> Result<Option<BeliefNode>, BuildonomyError> {
     // NEW: Heading nodes look up to document for sections metadata
@@ -380,7 +380,7 @@ Implemented `finalize()` in MdCodec (L850-920) - called after all inject_context
 
 ```rust
 impl DocCodec for MdCodec {
-    fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+    fn finalize(&mut self) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
         let mut modified_nodes = Vec::new();
         
         // Access document's sections table directly

@@ -106,7 +106,7 @@ After all inject_context() calls:
 
 **File**: `src/codec/md.rs`
 
-**parse()**: Extract `sections` from frontmatter, store in `ProtoBeliefNode.document`
+**parse()**: Extract `sections` from frontmatter, store in `IRNode.document`
 
 **inject_context()** (for section nodes):
 ```rust
@@ -136,7 +136,7 @@ if let Some(sections_map) = sections_metadata {
 **finalize()**: Build `sections` table from all section nodes
 
 ```rust
-fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+fn finalize(&mut self) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
     let mut modified_nodes = Vec::new();
     
     // 1. Collect all section nodes (heading > 2)
@@ -192,8 +192,8 @@ fn finalize(&mut self) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyE
 ### Parsing (Read Path)
 
 ```
-1. parse() extracts frontmatter → ProtoBeliefNode.document["sections"]
-2. parse() creates heading nodes → ProtoBeliefNode(heading > 2)
+1. parse() extracts frontmatter → IRNode.document["sections"]
+2. parse() creates heading nodes → IRNode(heading > 2)
 3. inject_context(document) → BID assigned
 4. inject_context(section1) → match to sections[key], merge metadata
 5. inject_context(section2) → match to sections[key], merge metadata

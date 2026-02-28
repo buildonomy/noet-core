@@ -41,7 +41,7 @@
 
 **Implementations:**
 - `MdCodec`: Returns body HTML from markdown AST, link rewriting for resolved refs
-- `ProtoBeliefNode`: `should_defer()` returns true for networks, stubbed for Phase 4
+- `IRNode`: `should_defer()` returns true for networks, stubbed for Phase 4
 
 **Compiler Integration:**
 - `parse_next()` calls `codec.generate_html()` immediately after parsing
@@ -95,7 +95,7 @@ html_output/
 - Updated `generate_html_for_path()` to call `generate_deferred_html(ctx)` instead of `generate_html()`
 - Deferred generation receives full BeliefContext with graph relationships
 
-**ProtoBeliefNode Implementation:**
+**IRNode Implementation:**
 - Queries `ctx.sources()` for incoming edges with `WeightKind::Section` (subsection relationships)
 - Sorts children by `WEIGHT_SORT_KEY` for deterministic ordering
 - Generates HTML list with:
@@ -108,7 +108,7 @@ html_output/
 **Files Modified:**
 - `src/codec/mod.rs` - Added `generate_deferred_html()` trait method with documentation
 - `src/codec/compiler.rs` - Updated `generate_html_for_path()` to use deferred method
-- `src/codec/belief_ir.rs` - Implemented network index generation in ProtoBeliefNode
+- `src/codec/belief_ir.rs` - Implemented network index generation in IRNode
 
 **Result**: ✅ Networks generate index pages listing child documents, 152/152 tests pass
 
@@ -363,11 +363,11 @@ codec.generate_html() → Vec<(PathBuf, html_body_content)>
 
 ```rust
 pub trait DocCodec: Send + Sync {
-    fn nodes(&self) -> Vec<ProtoBeliefNode>;
+    fn nodes(&self) -> Vec<IRNode>;
     
     fn inject_context(
         &mut self,
-        node: &ProtoBeliefNode,
+        node: &IRNode,
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError>;
     
@@ -631,7 +631,7 @@ lazy_static! {
     static ref CODECS: HashMap<&'static str, CodecFactory> = {
         let mut map = HashMap::new();
         map.insert("md", || Box::new(MdCodec::default()));
-        map.insert("toml", || Box::new(ProtoBeliefNode::default()));
+        map.insert("toml", || Box::new(IRNode::default()));
         // ...
         map
     };
@@ -752,7 +752,7 @@ Codecs focus on content generation only.
 
 1. Add `generated_fragments` tracking to compiler
 2. Implement `generate_deferred_html()` with context lookup
-3. Update ProtoBeliefNode to use deferred generation for networks
+3. Update IRNode to use deferred generation for networks
 4. Add error handling (skip and warn)
 5. Test network indices generate correctly
 
@@ -817,10 +817,10 @@ impl DocCodec for MdCodec {
 }
 ```
 
-### ProtoBeliefNode (Deferred-Only for Networks)
+### IRNode (Deferred-Only for Networks)
 
 ```rust
-impl DocCodec for ProtoBeliefNode {
+impl DocCodec for IRNode {
     fn should_defer(&self) -> bool {
         self.kind.contains(BeliefKind::Network)
     }
@@ -927,13 +927,13 @@ impl DocCodec for MdCodec {
 - [x] All fragments in `pages/` subdirectory
 - [x] Canonical URLs in all fragments
 - [x] MdCodec uses immediate generation
-- [x] ProtoBeliefNode.should_defer() returns true for networks
+- [x] IRNode.should_defer() returns true for networks
 - [x] No singleton state bugs
 - [x] All 152 tests pass
 
 **Phase 4-6 (Remaining):**
 - [ ] `generate_deferred_html()` implemented in compiler
-- [ ] ProtoBeliefNode generates network indices using BeliefContext
+- [ ] IRNode generates network indices using BeliefContext
 - [ ] Layout::Responsive used only for SPA shell
 - [ ] Single `index.html` at root with repo metadata
 - [ ] `sitemap.xml` generated with public URLs

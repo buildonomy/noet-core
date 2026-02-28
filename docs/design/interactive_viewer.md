@@ -291,7 +291,7 @@ async function loadDocument(path, sectionAnchor, targetBid) {
 
 **Immediate HTML Generation (Phase 1)**:
 ```rust
-// ProtoBeliefNode stores parsed TOML with "bid" field
+// IRNode stores parsed TOML with "bid" field
 let bid = proto
     .document
     .get("bid")

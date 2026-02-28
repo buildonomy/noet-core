@@ -36,7 +36,7 @@ Source Files (*.md, *.toml)
     ↓
 [Lexing & Parsing] ← DocCodec implementations (TomlCodec, MdCodec)
     ↓
-ProtoBeliefNode (Intermediate Representation)
+IRNode (Intermediate Representation)
     ↓
 [Reference Resolution & Linking] ← GraphBuilder
     ↓
@@ -50,7 +50,7 @@ Event Stream
 Each stage has distinct responsibilities:
 
 - **DocumentCompiler**: Build system/compiler driver - orchestrates multi-pass compilation, manages work queue
-- **DocCodec**: Lexer/parser - syntax analysis, producing unlinked ProtoBeliefNodes
+- **DocCodec**: Lexer/parser - syntax analysis, producing unlinked IRNodes
 - **GraphBuilder**: Semantic analyzer + linker - parsing context and reference resolution
 - **BeliefBase**: Compiled IR - optimized graph representation with fast lookup indices
 - **Runtime Applications**: Execution layer - query, traversal, and domain-specific logic
@@ -553,7 +553,7 @@ User files **cannot** use reserved identifiers. Parsing fails with clear errors:
 - `"buildonomy_href_network"` - Href tracking network
 - Any ID starting with `"buildonomy_"` prefix
 
-**Validation in `ProtoBeliefNode::from_str_with_format()`:**
+**Validation in `IRNode::from_str_with_format()`:**
 
 ```rust
 // Check reserved BID
@@ -610,7 +610,7 @@ Error: `BID '6b3d2154-c0a9-437b-9324-5f62adeb9a44' is reserved for system use...
 - `BeliefBase.api` field is read-only (no setter methods)
 - If API node gets merged/replaced during parsing (bug), it causes issues
   - This was the root cause of Issue 24 (test file used reserved BID)
-  - Now prevented by validation in `ProtoBeliefNode` parsing
+  - Now prevented by validation in `IRNode` parsing
 
 #### Implementation Details
 
@@ -767,7 +767,7 @@ The complete compilation system consists of multiple cooperating layers:
 
 **Data Flow:**
 1. File watcher detects changes → triggers parsing
-2. Parser uses DocCodec → produces ProtoBeliefNodes
+2. Parser uses DocCodec → produces IRNodes
 3. Builder resolves references → emits BeliefEvents
 4. Events update database and application state
 5. Applications query BeliefBase for graph traversal
@@ -900,7 +900,7 @@ pub struct GraphBuilder {
    - For each file:
      - Detect schema type from file path
      - Select appropriate `DocCodec` (TomlCodec, MdCodec)
-     - Parse into `ProtoBeliefNode` instances
+     - Parse into `IRNode` instances
 
 3. **Stack-Based Structural Parsing**:
    - Markdown headings create a nested structure
@@ -1147,9 +1147,9 @@ The `DocCodec` trait defines the contract for file format parsers:
 
 ```rust
 pub trait DocCodec {
-    fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError>;
-    fn nodes(&self) -> Vec<ProtoBeliefNode>;
-    fn inject_context(&mut self, node: &ProtoBeliefNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn parse(&mut self, content: String, current: IRNode) -> Result<(), BuildonomyError>;
+    fn nodes(&self) -> Vec<IRNode>;
+    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
     
     // HTML Generation API (dual-phase)
@@ -1170,7 +1170,7 @@ impl CodecMap {
     pub fn create() -> Self {
         let map = CodecMap(Arc::new(RwLock::new(vec![
             ("md".to_string(), || Box::new(md::MdCodec::new())),
-            ("toml".to_string(), || Box::new(ProtoBeliefNode::default())),
+            ("toml".to_string(), || Box::new(IRNode::default())),
             // ... other codecs
         ])));
         map
@@ -1210,7 +1210,7 @@ HTML generation happens in two phases to handle different codec needs:
 
 **Example: Network Index Generation**
 ```rust
-impl DocCodec for ProtoBeliefNode {
+impl DocCodec for IRNode {
     fn should_defer(&self) -> bool {
         self.kind.contains(BeliefKind::Network)
     }
@@ -1249,13 +1249,13 @@ impl DocCodec for ProtoBeliefNode {
   - Rewrites internal links to `.html` extension
   - Extracts headings for structural hierarchy
 
-- **ProtoBeliefNode** (belief_ir.rs): Deferred generation for networks
+- **IRNode** (belief_ir.rs): Deferred generation for networks
   - Parses TOML/JSON/YAML files
   - Schema-aware: detects schema from path or frontmatter
   - Networks defer to query child documents from context
   - Generates index pages listing subsections
 
-**Key Responsibility**: Codecs are **syntax-only** for parsing. They produce ProtoBeliefNodes with unresolved references (NodeKey instances). The builder handles semantic analysis and linking. For HTML generation, codecs are **presentation-only** — they return body content, compiler wraps with templates.
+**Key Responsibility**: Codecs are **syntax-only** for parsing. They produce IRNodes with unresolved references (NodeKey instances). The builder handles semantic analysis and linking. For HTML generation, codecs are **presentation-only** — they return body content, compiler wraps with templates.
 
 ### 3.6. The Document Stack: Nested Structure Parsing
 
@@ -1346,7 +1346,7 @@ Content for section 2.
 ```
 
 **Parsing Steps**:
-1. MdCodec extracts frontmatter → ProtoBeliefNode with `id`, `title`, `schema`
+1. MdCodec extracts frontmatter → IRNode with `id`, `title`, `schema`
 2. Codec parses headings → Creates hierarchy nodes for each section
 3. Builder resolves references and creates structural relationships
 4. BeliefBase stores nodes with Subsection edges representing hierarchy
@@ -1508,7 +1508,7 @@ The system already implements multi-pass reference resolution via the DocumentCo
 **Decision**: **Defer** - Current approach provides valuable architectural feedback during development. File-level recovery is sufficient for most use cases.
 
 When needed, fine-grained error recovery within documents could be implemented by:
-- Extending `ProtoBeliefNode` with an `errors: Vec<ParseError>` field
+- Extending `IRNode` with an `errors: Vec<ParseError>` field
 - Allowing partial node construction (e.g., node created but some relationships failed)
 - Marking invalid nodes with `BeliefKind::Invalid` flag for UI feedback
 

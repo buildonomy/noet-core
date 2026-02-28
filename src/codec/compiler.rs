@@ -2,10 +2,10 @@ use crate::{
     beliefbase::BeliefBase,
     codec::{
         assets::get_stylesheet_urls,
-        belief_ir::ProtoBeliefNode,
+        belief_ir::IRNode,
         builder::GraphBuilder,
         network::{detect_network_file, NetworkCodec, NETWORK_NAME},
-        DocCodec, UnresolvedReference, CODECS,
+        DocCodec, ParseDiagnostic, UnresolvedReference, CODECS,
     },
     error::BuildonomyError,
     event::BeliefEvent,
@@ -67,7 +67,7 @@ use toml_edit::value;
 ///
 /// Parse sequence:
 /// 1. **Parse .noet** (primary queue)
-///    - Discovers README.md, sub_1.md, sub_2.md via `ProtoBeliefNode::from_file`
+///    - Discovers README.md, sub_1.md, sub_2.md via `IRNode::from_file`
 ///    - Adds them to primary queue in lexical order
 ///
 /// 2. **Parse README.md** (primary queue)
@@ -266,7 +266,7 @@ impl DocumentCompiler {
             )));
         }
 
-        let mut proto = ProtoBeliefNode::default();
+        let mut proto = IRNode::default();
 
         proto.document.insert("id", value(id));
         if let Some(title) = maybe_title {
@@ -548,7 +548,7 @@ impl DocumentCompiler {
             if is_asset_reference {
                 self.process_asset_reference(&path, unresolved);
             } else {
-                let Some((net_dep_path_str, net)) = unresolved.as_sink_dependency() else {
+                let Some((net_dep_path_str, net)) = unresolved.as_unresolved_source() else {
                     continue;
                 };
                 self.process_unresolved_reference(&path, &net_dep_path_str, net);
@@ -725,6 +725,12 @@ impl DocumentCompiler {
         // All passes complete. Any UnresolvedReference entries that originated from
         // link-resolution failures (not cross-document sink dependencies) are now permanent
         // author errors. Promote them to Warning so callers see clean, actionable output.
+        //
+        // However, a file may have been parsed multiple times (reparse queue). Only promote
+        // UnresolvedReference diagnostics from a given parse attempt if that file has no
+        // later parse result that is free of unresolved refs. In other words: if a later
+        // reparse succeeded (produced zero UnresolvedReference diagnostics for that path),
+        // the earlier attempt's unresolved refs are stale and must be suppressed.
         Self::promote_unresolved_to_warnings(&mut results);
 
         Ok(results)
@@ -734,21 +740,109 @@ impl DocumentCompiler {
     ///
     /// After all parse passes are complete, any `UnresolvedReference` that came from a link in
     /// a document that never resolved is a permanent author error. Sink dependencies
-    /// (`is_sink_dependency() == true`, `Direction::Incoming`) are compiler-internal ordering
+    /// (`is_unresolved_source() == true`, `Direction::Incoming`) are compiler-internal ordering
     /// signals and are left unchanged; they will have resolved or been dropped by this point.
     ///
     /// This keeps `UnresolvedReference` as the compiler's internal multi-pass signal while
     /// ensuring the `Vec<ParseResult>` handed to the CLI and LSP layer contains only
     /// author-facing variants (`Warning`, `ParseError`, `Info`).
     fn promote_unresolved_to_warnings(results: &mut [ParseResult]) {
-        for result in results.iter_mut() {
+        // For each path, find the index of the last parse result that contains at least one
+        // non-sink-dependency UnresolvedReference. If a later result for the same path exists
+        // with zero such diagnostics, the earlier attempt's unresolved refs were resolved on
+        // reparse and must not be promoted to warnings.
+        //
+        // Build a set of (path, result-index) pairs whose UnresolvedReference entries are
+        // stale — i.e., the same path has a subsequent result with no unresolved refs.
+        let mut last_unresolved_idx: HashMap<PathBuf, usize> = HashMap::new();
+        let mut last_clean_idx: HashMap<PathBuf, usize> = HashMap::new();
+
+        for (idx, result) in results.iter().enumerate() {
+            // A result is only "clean" (meaning its links resolved) if it has:
+            // - no unresolved refs of any direction (both outgoing link failures and incoming
+            //   unresolved-source signals indicate still-pending work), AND
+            // - no ParseError (which is a max-reparse sentinel meaning we gave up, not that
+            //   links resolved — treating sentinels as clean would suppress warnings from
+            //   the last real parse attempt).
+            let has_unresolved = result
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ParseDiagnostic::UnresolvedReference(_)));
+            let has_parse_error = result
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ParseDiagnostic::ParseError { .. }));
+            if has_unresolved {
+                last_unresolved_idx.insert(result.path.clone(), idx);
+            } else if !has_parse_error {
+                last_clean_idx.insert(result.path.clone(), idx);
+            }
+        }
+
+        // A result's unresolved refs are stale if either:
+        // 1. A later clean result exists for the same path (the links resolved on reparse), OR
+        // 2. A later result with outgoing unresolved refs exists for the same path (emit only
+        //    from the final failing attempt, not every intermediate attempt).
+        //
+        // `last_unresolved_idx` holds the index of the LAST result with outgoing unresolved
+        // refs per path. Any earlier result with outgoing unresolved refs for that path is
+        // therefore stale — it was superseded by a later attempt (whether that later attempt
+        // resolved them or failed again).
+
+        // Collect the set of ALL indices that have outgoing unresolved refs per path, keyed by
+        // path, so we can mark all but the last one as stale.
+        let mut all_unresolved_indices: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for (idx, result) in results.iter().enumerate() {
+            let has_unresolved = result
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ParseDiagnostic::UnresolvedReference(_)));
+            if has_unresolved {
+                all_unresolved_indices
+                    .entry(result.path.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
+        let stale: HashSet<usize> = last_unresolved_idx
+            .iter()
+            .flat_map(|(path, &last_unresolved_idx_for_path)| {
+                // Earlier unresolved attempts for this path (all but the last).
+                let earlier: Vec<usize> = all_unresolved_indices
+                    .get(path)
+                    .map(|v| {
+                        v.iter()
+                            .copied()
+                            .filter(|&i| i < last_unresolved_idx_for_path)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // If a later clean result exists, the last unresolved attempt is also stale.
+                let last_also_stale: Option<usize> = last_clean_idx
+                    .get(path)
+                    .filter(|&&clean_idx| clean_idx > last_unresolved_idx_for_path)
+                    .map(|_| last_unresolved_idx_for_path);
+
+                earlier
+                    .into_iter()
+                    .chain(last_also_stale)
+                    .collect::<Vec<usize>>()
+            })
+            .collect();
+
+        for (idx, result) in results.iter_mut().enumerate() {
             let path_str = result.path.display().to_string();
             let mut promoted = Vec::with_capacity(result.diagnostics.len());
             for diagnostic in result.diagnostics.drain(..) {
                 match diagnostic {
-                    crate::codec::ParseDiagnostic::UnresolvedReference(ref u)
-                        if !u.is_sink_dependency() =>
-                    {
+                    ParseDiagnostic::UnresolvedReference(ref u) => {
+                        if stale.contains(&idx) {
+                            // This attempt's unresolved ref was resolved on a later reparse;
+                            // drop it silently.
+                            continue;
+                        }
                         let (line, col) = u.reference_location.unwrap_or((0, 0));
                         let keys_str = u
                             .other_keys
@@ -2171,15 +2265,16 @@ Test network for unit tests.
     }
 
     #[test]
-    fn test_promote_unresolved_to_warnings_preserves_sink_dependency() {
+    fn test_promote_unresolved_to_warnings_promotes_unresolved_source() {
         use crate::codec::diagnostic::UnresolvedReference;
         use crate::nodekey::NodeKey;
         use crate::properties::{Bid, WeightKind};
         use petgraph::Direction;
 
         let net_bref = Bid::default().bref();
-        // Sink dependency: Direction::Incoming with a Path key — compiler ordering signal
-        let sink_dep = UnresolvedReference {
+        // Unresolved source: Direction::Incoming — the source node of a relation could not be
+        // found. These are now promoted to warnings just like outgoing unresolved refs.
+        let unresolved_source = UnresolvedReference {
             direction: Direction::Incoming,
             self_bid: Bid::nil(),
             self_net: Bid::nil(),
@@ -2197,19 +2292,21 @@ Test network for unit tests.
             path: std::path::PathBuf::from("docs/page.md"),
             rewritten_content: None,
             dependent_paths: vec![],
-            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(sink_dep)],
+            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+                unresolved_source,
+            )],
         }];
 
         DocumentCompiler::promote_unresolved_to_warnings(&mut results);
 
-        // Sink dependency must NOT be promoted — it stays as UnresolvedReference
+        // Unresolved source must be promoted to a Warning, not left as UnresolvedReference
         assert_eq!(results[0].diagnostics.len(), 1);
         assert!(
             matches!(
                 &results[0].diagnostics[0],
-                crate::codec::ParseDiagnostic::UnresolvedReference(_)
+                crate::codec::ParseDiagnostic::Warning(_)
             ),
-            "Sink dependency should remain as UnresolvedReference"
+            "Unresolved source should be promoted to Warning"
         );
     }
 
@@ -2334,7 +2431,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
                 matches!(
                     d,
                     crate::codec::ParseDiagnostic::UnresolvedReference(u)
-                        if !u.is_sink_dependency()
+                        if !u.is_unresolved_source()
                 )
             })
             .count();

@@ -129,7 +129,7 @@ schema: Action
 **Injection Rules (in `md.rs::inject_context()`):**
 
 ```rust
-fn inject_context(&mut self, proto: &ProtoBeliefNode) -> Result<(), BuildonomyError> {
+fn inject_context(&mut self, proto: &IRNode) -> Result<(), BuildonomyError> {
     for node in self.nodes() {
         let explicit_id = if heading_has_anchor(&heading_text) {
             Some(extract_anchor_id(&heading_text))
@@ -245,7 +245,7 @@ Currently we ignore these fields: `id: _`, `classes: _`, `attrs: _`
 
 1. **No custom parsing needed** - just uncomment `ENABLE_HEADING_ATTRIBUTES`
 2. **Capture `id` field** during parse (change `id: _` to `id`)
-3. **Store in ProtoBeliefNode.document** as "id" or "anchor" field
+3. **Store in IRNode.document** as "id" or "anchor" field
 4. **Issue 2 already checks** for "id"/"anchor" fields in `extract_anchor_from_node()`
 5. **BID and anchor matching** will automatically start working!
 
@@ -267,7 +267,7 @@ Currently we ignore these fields: `id: _`, `classes: _`, `attrs: _`
 **Status**: ✅ Implemented in Phase 1
 
 - ✅ Enabled `Options::ENABLE_HEADING_ATTRIBUTES`
-- ✅ Added `id: Option<String>` field to `ProtoBeliefNode`
+- ✅ Added `id: Option<String>` field to `IRNode`
 - ✅ Captured and normalized `id` field during heading parse
 - ✅ Test `test_pulldown_cmark_to_cmark_writes_heading_ids` verifies write-back behavior
 
@@ -335,7 +335,7 @@ for (event, _range) in proto_events.1.iter_mut() {
 ```
 
 **Why this is critical**:
-- pulldown_cmark_to_cmark writes the **event's `id` field**, not ProtoBeliefNode.id
+- pulldown_cmark_to_cmark writes the **event's `id` field**, not IRNode.id
 - Without this: `{#My-ID!}` → normalized to `my-id` → but writes back `{#My-ID!}` (wrong!)
 - Without this: collision detected → assign Bref → but never injected into markdown
 - Test `test_pulldown_cmark_to_cmark_writes_heading_ids` verifies this behavior
@@ -383,7 +383,7 @@ in their source material. Makes it easier to reference sections.
 **Status**: No changes needed - already supports NodeKey::Id
 
 - ✅ `BeliefNode::keys()` already includes `NodeKey::Id { net, id }` when `self.id` is Some
-- ✅ ID comes from `BeliefNode.id` field (populated from ProtoBeliefNode via inject_context)
+- ✅ ID comes from `BeliefNode.id` field (populated from IRNode via inject_context)
 - ✅ Triangulation enabled: BID, Bref, ID, Title, Path all valid for same node
 - ✅ Issue 2 section matching works via ID key
 
@@ -696,7 +696,7 @@ bid: abc123
 - Phase 3: Notify sinks of ID changes, queue rewrites
 
 **DocCodec** (`md.rs`):
-- `parse()`: Extract IDs from source, store in ProtoBeliefNode
+- `parse()`: Extract IDs from source, store in IRNode
 - `inject_context()`: Generate/inject anchors based on collision state
 - `generate_source()`: Write anchors only when necessary (Bref collision)
 
@@ -739,7 +739,7 @@ pulldown_cmark's `ENABLE_HEADING_ATTRIBUTES` option provides **automatic anchor 
 
 1. **Enable the option** (1 line uncomment)
 2. **Capture `id` field** during parse (change `id: _` to `id`)
-3. **Store in ProtoBeliefNode** (`document.insert("id", ...)`)
+3. **Store in IRNode** (`document.insert("id", ...)`)
 4. **Collision detection** (Bref fallback when title-based ID collides)
 5. **Selective injection** (only write `{#bref}` when needed for collision)
 6. **Update `BeliefNode::keys()`** to include ID-based NodeKey

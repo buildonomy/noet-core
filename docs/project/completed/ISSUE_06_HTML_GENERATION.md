@@ -1279,7 +1279,7 @@ All Phase 1.5 deliverables complete:
 - `src/wasm.rs` - NEW 380-line module with JavaScript bindings and console logging
 - `src/lib.rs` - Added wasm module export, excluded service modules from WASM
 - `src/codec/mod.rs` - Dual implementation: full CodecMap vs lightweight registry
-- `src/properties.rs` - Made ProtoBeliefNode imports conditional
+- `src/properties.rs` - Made IRNode imports conditional
 - `src/nodekey.rs` - Works with lightweight CodecMap in WASM
 
 **Build Output**: Successfully generates `pkg/noet_core_bg.wasm` (2.1MB) ✅

@@ -141,11 +141,11 @@ impl RustdocLinker {
 use syn::{File, Item, ItemMod, ItemStruct, ItemFn};
 
 pub struct RsCodec {
-    parsed_items: Vec<ProtoBeliefNode>,
+    parsed_items: Vec<IRNode>,
 }
 
 impl DocCodec for RsCodec {
-    fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<()> {
+    fn parse(&mut self, content: String, current: IRNode) -> Result<()> {
         // Parse Rust source with syn
         let syntax_tree: File = syn::parse_str(&content)?;
         
@@ -163,16 +163,16 @@ impl DocCodec for RsCodec {
         Ok(())
     }
     
-    fn nodes(&self) -> Vec<ProtoBeliefNode> {
+    fn nodes(&self) -> Vec<IRNode> {
         self.parsed_items.clone()
     }
 }
 
 impl RsCodec {
-    fn parse_struct(&mut self, struct_: ItemStruct, parent: &ProtoBeliefNode) -> Result<()> {
+    fn parse_struct(&mut self, struct_: ItemStruct, parent: &IRNode) -> Result<()> {
         let doc_comment = self.extract_doc_comment(&struct_.attrs);
         
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             kind: NodeKind::Section, // Or custom "RustStruct" kind
             title: struct_.ident.to_string(),
             payload: toml::map! {
@@ -248,7 +248,7 @@ impl RsCodec {
 ### Phase 3: RsCodec Implementation (3-4 days)
 
 - [ ] Create `RsCodec` that parses Rust source with `syn`
-- [ ] Extract modules, structs, functions, traits into ProtoBeliefNodes
+- [ ] Extract modules, structs, functions, traits into IRNodes
 - [ ] Parse doc comments and extract BID references
 - [ ] Register RsCodec for `.rs` file extension
 - [ ] Generate unified BeliefBase including code + design

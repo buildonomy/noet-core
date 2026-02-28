@@ -143,7 +143,7 @@ fn generate_html(&mut self, script: Option<&str>, use_cdn: bool)
 - `group_by_directory()`: Group paths by directory for organized display
 
 **Questions**:
-- How to access belief base from `ProtoBeliefNode`? (Need context from compiler)
+- How to access belief base from `IRNode`? (Need context from compiler)
 - Should we pass `BeliefBase` reference to `generate_html()`? Or defer to compiler?
 
 ### 2. Remove `compiler.rs::generate_network_indices()` (1 hour)
@@ -206,11 +206,11 @@ fn generate_html(&mut self, script: Option<&str>, use_cdn: bool)
 ## Risks
 
 ### Risk 1: Belief Base Access from DocCodec
-**Problem**: `generate_html()` needs document list, but `ProtoBeliefNode` doesn't have belief base reference
+**Problem**: `generate_html()` needs document list, but `IRNode` doesn't have belief base reference
 
 **Mitigation**: 
 - Option A: Pass document list as parameter to `generate_html()`
-- Option B: Add belief base reference to `ProtoBeliefNode` (architectural change)
+- Option B: Add belief base reference to `IRNode` (architectural change)
 - Option C: Compiler calls helper method to build content, passes to `generate_html()`
 
 **Decision**: TBD during implementation (likely Option A or C)

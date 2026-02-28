@@ -75,7 +75,7 @@ This file tracks optional enhancements and future work extracted from completed 
 
 ### Network-Level Format Preferences
 - Parse network file and extract `config` object
-- Store network config in `ProtoBeliefNode` for network nodes
+- Store network config in `IRNode` for network nodes
 - Pass network config down to child document parsing
 - Respect `default_metadata_format` preference
 - Implement `strict_format` validation (if enabled, reject non-default format)

@@ -15,7 +15,7 @@ use toml::value::Table as TomlTable;
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
     codec::{
-        belief_ir::ProtoBeliefNode,
+        belief_ir::IRNode,
         diagnostic::ParseDiagnostic,
         network::{detect_network_file, NETWORK_NAME},
         DocCodec, NetworkCodec, CODECS,
@@ -574,7 +574,7 @@ impl GraphBuilder {
         &mut self,
         abs_path: P,
         global_bb: B,
-    ) -> Result<ProtoBeliefNode, BuildonomyError> {
+    ) -> Result<IRNode, BuildonomyError> {
         // self.parsed_content.clear();
         // self.parsed_structure.clear();
         // self.parsed_structure.insert(self.api().bid);
@@ -817,7 +817,7 @@ impl GraphBuilder {
         Ok(())
     }
 
-    fn get_parent_from_stack(&mut self, proto: &ProtoBeliefNode) -> (Bid, String, String) {
+    fn get_parent_from_stack(&mut self, proto: &IRNode) -> (Bid, String, String) {
         let mut parent_info = None;
         let mut first_run = true;
         while !self.stack.is_empty() && parent_info.is_none() {
@@ -857,7 +857,7 @@ impl GraphBuilder {
     /// Returns Result<NodeKey, BuildonomyError>.
     fn speculative_path_key(
         &self,
-        proto: &ProtoBeliefNode,
+        proto: &IRNode,
     ) -> Result<Option<NodeKey>, BuildonomyError> {
         // Find the network by walking up the stack (network nodes have heading=1)
         if let Some(bid) = proto
@@ -942,7 +942,7 @@ impl GraphBuilder {
     /// content that they should change their references.
     async fn push<B: BeliefSource + Clone>(
         &mut self,
-        proto: &ProtoBeliefNode,
+        proto: &IRNode,
         global_bb: B,
         as_trace: bool,
         missing_structure: &mut BeliefGraph,
@@ -1530,7 +1530,7 @@ impl GraphBuilder {
 #[cfg(test)]
 mod tests {
     use crate::{
-        codec::belief_ir::ProtoBeliefNode,
+        codec::belief_ir::IRNode,
         paths::to_anchor,
         properties::{BeliefKind, BeliefKindSet, BeliefNode, Bid},
     };
@@ -1554,14 +1554,14 @@ Test network for unit tests.
         .unwrap();
     }
 
-    /// Helper: Create a test ProtoBeliefNode for a section heading
+    /// Helper: Create a test IRNode for a section heading
     fn create_test_proto_section(
         title: &str,
         path: &str,
         heading: usize,
         maybe_id: Option<String>,
         bid: Option<&str>,
-    ) -> ProtoBeliefNode {
+    ) -> IRNode {
         let mut doc = DocumentMut::new();
         doc.insert("title", value(title));
         doc.insert("schema", value("Document"));
@@ -1571,7 +1571,7 @@ Test network for unit tests.
         if let Some(id) = maybe_id {
             doc.insert("id", value(id));
         }
-        ProtoBeliefNode {
+        IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,

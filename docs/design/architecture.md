@@ -21,7 +21,7 @@ Source Files (*.md, *.toml)
     ↓
 [Parse] → Syntax analysis via DocCodec
     ↓
-ProtoBeliefNode (Intermediate Representation)
+IRNode (Intermediate Representation)
     ↓
 [Link] → Reference resolution via GraphBuilder
     ↓
@@ -308,9 +308,9 @@ noet-core supports **multiple document formats** through a pluggable codec syste
 
 ```rust
 pub trait DocCodec {
-    fn parse(&mut self, content: String, current: ProtoBeliefNode) -> Result<(), BuildonomyError>;
-    fn nodes(&self) -> Vec<ProtoBeliefNode>;
-    fn inject_context(&mut self, node: &ProtoBeliefNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn parse(&mut self, content: String, current: IRNode) -> Result<(), BuildonomyError>;
+    fn nodes(&self) -> Vec<IRNode>;
+    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
     
     // HTML Generation API
@@ -335,11 +335,11 @@ CODECS.insert("org".to_string(), || Box::new(OrgModeCodec::new()));
 
 **Built-in codecs**:
 - **MdCodec** (`.md`) - Markdown with frontmatter, immediate HTML generation
-- **ProtoBeliefNode** (`.toml`, `.json`, `.yaml`) - Schema-aware, deferred generation for networks
+- **IRNode** (`.toml`, `.json`, `.yaml`) - Schema-aware, deferred generation for networks
 
-**Key principle**: Codecs handle **syntax only** (parsing documents into `ProtoBeliefNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity). HTML generation is **presentation** (codecs return body content, compiler wraps with templates).
+**Key principle**: Codecs handle **syntax only** (parsing documents into `IRNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity). HTML generation is **presentation** (codecs return body content, compiler wraps with templates).
 
-**Example**: MdCodec parses headings into a stack-based hierarchy, generates HTML from AST immediately. ProtoBeliefNode (network nodes) defer HTML generation until full context is available to query child documents.
+**Example**: MdCodec parses headings into a stack-based hierarchy, generates HTML from AST immediately. IRNode (network nodes) defer HTML generation until full context is available to query child documents.
 
 **For detailed specification** including the document stack algorithm and codec implementation details, see [`beliefbase_architecture.md` § 3.5-3.6](./beliefbase_architecture.md#35-doccodec-the-frontend-interface).
 
@@ -383,7 +383,7 @@ CODECS.insert("org".to_string(), || Box::new(OrgModeCodec::new()));
    ↓
 2. DocumentCompiler enqueues modified files
    ↓
-3. DocCodec parses file → ProtoBeliefNodes
+3. DocCodec parses file → IRNodes
    ↓
 4. GraphBuilder resolves references → BeliefEvents
    ↓

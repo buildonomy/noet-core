@@ -166,7 +166,7 @@ The compiler lacks file modification time tracking, causing it to serve stale co
 - For each cached path:
   - `fs::metadata(path)` to get current mtime
   - Compare: `current_mtime > cached_mtime` → stale
-  - If file deleted → find parent network with `ProtoBeliefNode::from_file()`
+  - If file deleted → find parent network with `IRNode::from_file()`
   - Clock skew detection: warn on suspicious mtimes
 - If `force=true`: all cached paths treated as stale
 - Updated `parse_all(cache, force)` signature to accept force parameter

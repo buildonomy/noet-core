@@ -46,7 +46,7 @@ use crate::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::codec::belief_ir::ProtoBeliefNode;
+use crate::codec::belief_ir::IRNode;
 
 pub(crate) mod enumset_list {
     // Copied from enumset_derive/src/lib.rs SerdeRepr::List (line 475 in version 0.10.1)
@@ -1241,10 +1241,10 @@ impl TryFrom<&str> for BeliefNode {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl TryFrom<&ProtoBeliefNode> for BeliefNode {
+impl TryFrom<&IRNode> for BeliefNode {
     type Error = BuildonomyError;
 
-    fn try_from(proto: &ProtoBeliefNode) -> Result<Self, Self::Error> {
+    fn try_from(proto: &IRNode) -> Result<Self, Self::Error> {
         let mut doc = proto.document.clone();
         Ok(BeliefNode {
             bid: doc

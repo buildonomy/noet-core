@@ -99,7 +99,7 @@ During `finish_parse_session()` or event stream processing:
 
 **File**: `src/properties.rs` or `src/codec/belief_ir.rs`
 
-Add content hash to `ProtoBeliefNode`:
+Add content hash to `IRNode`:
 - Hash section title + text content (stable, reproducible)
 - Use Blake3 or similar fast hash
 - Store in `BeliefNode` for comparison
@@ -226,5 +226,5 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 
 - `src/codec/compiler.rs` - Event stream processing
 - `src/event.rs` - Belief event types
-- `src/codec/belief_ir.rs` - ProtoBeliefNode structure
+- `src/codec/belief_ir.rs` - IRNode structure
 - `docs/design/section_metadata_manifest.md` - Section tracking architecture

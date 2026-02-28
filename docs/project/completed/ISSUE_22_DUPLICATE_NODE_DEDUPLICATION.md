@@ -39,7 +39,7 @@ More content...
 
 ```rust
 async fn push(...) -> Result<...> {
-    // Line ~809: Convert ProtoBeliefNode to BeliefNode
+    // Line ~809: Convert IRNode to BeliefNode
     let mut parsed_node = BeliefNode::try_from(proto)?;
     
     // Line ~810: Generate keys from parsed node

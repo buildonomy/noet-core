@@ -54,7 +54,7 @@
 //! Register custom codecs via [`CodecMap::insert_codec`] (by stem/extension):
 //!
 //! ```rust
-//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, ProtoBeliefNode, ParseDiagnostic}, properties::BeliefNode};
+//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, IRNode, ParseDiagnostic}, properties::BeliefNode};
 //! use std::path::Path;
 //!
 //! #[derive(Default, Clone)]
@@ -64,7 +64,7 @@
 //!     fn proto(
 //!         &self,
 //!         path: &Path,
-//!     ) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+//!     ) -> Result<Option<IRNode>, BuildonomyError> {
 //!         todo!();
 //!     }
 //!
@@ -73,25 +73,25 @@
 //!         // The source content to be parsed by the DocCodec implementation
 //!         content: &str,
 //!         // Contains the builder root-path relative information to seed the parse with
-//!         current: ProtoBeliefNode,
+//!         current: IRNode,
 //!     ) -> Result<(), BuildonomyError> {
 //!         todo!();
 //!     }
 //!
-//!     fn nodes(&self) -> Vec<ProtoBeliefNode> {
+//!     fn nodes(&self) -> Vec<IRNode> {
 //!         todo!();
 //!     }
 //!
 //!     fn inject_context(
 //!         &mut self,
-//!         node: &ProtoBeliefNode,
+//!         node: &IRNode,
 //!         ctx: &BeliefContext<'_>,
 //!         diagnostics: &mut Vec<ParseDiagnostic>,
 //!     ) -> Result<Option<BeliefNode>, BuildonomyError> {
 //!         todo!();
 //!     }
 //!
-//!     fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+//!     fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
 //!         Ok(Vec::new())
 //!     }
 //!
@@ -187,7 +187,7 @@ pub mod schema_registry;
 
 // Re-export for backward compatibility
 #[cfg(not(target_arch = "wasm32"))]
-pub use belief_ir::ProtoBeliefNode;
+pub use belief_ir::IRNode;
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::GraphBuilder;
 #[cfg(not(target_arch = "wasm32"))]
@@ -240,17 +240,17 @@ type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 #[cfg(not(target_arch = "wasm32"))]
 pub trait DocCodec: Sync {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
-    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError>;
+    fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError>;
 
     fn parse(
         &mut self,
         // The source content to be parsed by the DocCodec implementation
         content: &str,
         // Contains the builder root-path relative information to seed the parse with
-        current: ProtoBeliefNode,
+        current: IRNode,
     ) -> Result<(), BuildonomyError>;
 
-    fn nodes(&self) -> Vec<ProtoBeliefNode>;
+    fn nodes(&self) -> Vec<IRNode>;
 
     /// Inject resolved context into a parsed node, optionally returning an updated `BeliefNode`.
     ///
@@ -259,7 +259,7 @@ pub trait DocCodec: Sync {
     /// `tracing`. This ensures they flow through `ParseContentResult` to the CLI and LSP layers.
     fn inject_context(
         &mut self,
-        node: &ProtoBeliefNode,
+        node: &IRNode,
         ctx: &BeliefContext<'_>,
         diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError>;
@@ -272,7 +272,7 @@ pub trait DocCodec: Sync {
     /// Any author-visible warnings discovered during finalization should be pushed onto
     /// `diagnostics` rather than emitted via `tracing`.
     ///
-    /// Returns a vector of (ProtoBeliefNode, BeliefNode) pairs for nodes that were modified
+    /// Returns a vector of (IRNode, BeliefNode) pairs for nodes that were modified
     /// during finalization and need NodeUpdate events emitted.
     ///
     /// Every implementor must explicitly handle this. Codecs that wrap other codecs (e.g.,
@@ -281,7 +281,7 @@ pub trait DocCodec: Sync {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError>;
+    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError>;
 
     fn generate_source(&self) -> Option<String>;
 

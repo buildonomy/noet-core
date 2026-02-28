@@ -135,12 +135,12 @@ impl UnresolvedReference {
     }
 
     /// Check if this diagnostic represents a sink dependency
-    pub fn is_sink_dependency(&self) -> bool {
+    pub fn is_unresolved_source(&self) -> bool {
         self.direction == Direction::Incoming
     }
 
     /// Get the sink path if this is a sink dependency
-    pub fn as_sink_dependency(&self) -> Option<(String, Bref)> {
+    pub fn as_unresolved_source(&self) -> Option<(String, Bref)> {
         if self.direction == Direction::Incoming {
             if let Some(NodeKey::Path { net, path }) = self
                 .other_keys

@@ -245,7 +245,7 @@ fn parse_with_fallback(
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ProtoBeliefNode {
+pub struct IRNode {
     pub accumulator: Option<String>,
     /// Original TOML content for reference
     pub content: String,
@@ -259,7 +259,7 @@ pub struct ProtoBeliefNode {
     pub heading: usize,
 }
 
-impl PartialEq for ProtoBeliefNode {
+impl PartialEq for IRNode {
     fn eq(&self, other: &Self) -> bool {
         self.document
             .as_table()
@@ -273,21 +273,20 @@ impl PartialEq for ProtoBeliefNode {
 
 // impl Eq for BeliefBase {}
 
-impl ProtoBeliefNode {
+impl IRNode {
     pub fn id(&self) -> Option<String> {
         self.document
             .get("id")
             .and_then(|id_val| id_val.as_str().map(|id_str| id_str.to_string()))
     }
 
-    pub fn title(&self) -> String {
+    pub fn title(&self) -> Option<String> {
         self.document
             .get("title")
             .and_then(|title_val| title_val.as_str().map(|title_str| title_str.to_string()))
-            .unwrap_or_default()
     }
 
-    pub fn merge(&mut self, other: &mut ProtoBeliefNode) -> bool {
+    pub fn merge(&mut self, other: &mut IRNode) -> bool {
         let mut changed = false;
         if self.kind != other.kind {
             changed = true;
@@ -370,9 +369,9 @@ impl ProtoBeliefNode {
         &mut self,
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
-        let mut changed = self.merge(&mut ProtoBeliefNode::try_from(ctx.node)?);
+        let mut changed = self.merge(&mut IRNode::try_from(ctx.node)?);
         // Only update path from context for section nodes (heading > 2)
-        // Document nodes already have correct path from ProtoBeliefNode::new()
+        // Document nodes already have correct path from IRNode::new()
         // Section nodes need path from PathMap because they don't have independent file paths
         if self.heading > 2 {
             self.path = ctx.root_path.clone();
@@ -534,8 +533,8 @@ impl ProtoBeliefNode {
     pub fn from_str_with_format(
         str: &str,
         preferred_format: MetadataFormat,
-    ) -> Result<ProtoBeliefNode, BuildonomyError> {
-        let mut proto = ProtoBeliefNode::default();
+    ) -> Result<IRNode, BuildonomyError> {
+        let mut proto = IRNode::default();
         proto.content = str.trim().to_string();
 
         // Parse with format preference and fallback
@@ -577,24 +576,24 @@ impl ProtoBeliefNode {
     }
 }
 
-impl FromStr for ProtoBeliefNode {
+impl FromStr for IRNode {
     type Err = BuildonomyError;
     // Use JSON-first parsing with TOML fallback for cross-platform compatibility
     // Benefits:
     // 1. Parses parent_connections → downstream
     // 2. Preserves unknown fields for round-trip
     // 3. JSON default enables browser/web tool compatibility
-    fn from_str(str: &str) -> Result<ProtoBeliefNode, BuildonomyError> {
+    fn from_str(str: &str) -> Result<IRNode, BuildonomyError> {
         Self::from_str_with_format(str, MetadataFormat::Json)
     }
 }
 
-impl TryFrom<&BeliefNode> for ProtoBeliefNode {
+impl TryFrom<&BeliefNode> for IRNode {
     type Error = BuildonomyError;
 
     fn try_from(src: &BeliefNode) -> Result<Self, Self::Error> {
         let content = to_string(src)?;
-        let mut proto = ProtoBeliefNode::from_str(&content)?;
+        let mut proto = IRNode::from_str(&content)?;
         proto.kind = src.kind.clone();
         Ok(proto)
     }
@@ -613,7 +612,7 @@ mod tests {
             "parent_connections": []
         }"#;
 
-        let result = ProtoBeliefNode::from_str(json_content);
+        let result = IRNode::from_str(json_content);
         assert!(result.is_ok(), "JSON parsing should succeed");
 
         let proto = result.unwrap();
@@ -632,7 +631,7 @@ title = "Test Node"
 parent_connections = []
 "#;
 
-        let result = ProtoBeliefNode::from_str(toml_content);
+        let result = IRNode::from_str(toml_content);
         assert!(result.is_ok(), "TOML parsing should succeed via fallback");
 
         let proto = result.unwrap();
@@ -646,7 +645,7 @@ parent_connections = []
     fn test_parse_with_format_json_first() {
         let json_content = r#"{"title": "JSON Test"}"#;
 
-        let result = ProtoBeliefNode::from_str_with_format(json_content, MetadataFormat::Json);
+        let result = IRNode::from_str_with_format(json_content, MetadataFormat::Json);
         assert!(result.is_ok());
 
         let proto = result.unwrap();
@@ -660,7 +659,7 @@ parent_connections = []
     fn test_parse_with_format_toml_first() {
         let toml_content = r#"title = "TOML Test""#;
 
-        let result = ProtoBeliefNode::from_str_with_format(toml_content, MetadataFormat::Toml);
+        let result = IRNode::from_str_with_format(toml_content, MetadataFormat::Toml);
         assert!(result.is_ok());
 
         let proto = result.unwrap();
@@ -699,7 +698,7 @@ parent_connections = []
     id = "test-node"
     title = "Test"
     "#;
-        let result = ProtoBeliefNode::from_str(toml);
+        let result = IRNode::from_str(toml);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("reserved"));
@@ -713,7 +712,7 @@ parent_connections = []
     id = "test-node"
     title = "Test"
     "#;
-        let result = ProtoBeliefNode::from_str(toml);
+        let result = IRNode::from_str(toml);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("reserved"));
@@ -731,7 +730,7 @@ parent_connections = []
     "#,
             derived_bid
         );
-        let result = ProtoBeliefNode::from_str(&toml);
+        let result = IRNode::from_str(&toml);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("reserved"));
@@ -743,7 +742,7 @@ parent_connections = []
     id = "my-custom-node"
     title = "Test"
     "#;
-        let result = ProtoBeliefNode::from_str(toml);
+        let result = IRNode::from_str(toml);
         assert!(result.is_ok());
     }
 
@@ -754,7 +753,7 @@ parent_connections = []
     id = "my-custom-node"
     title = "Test"
     "#;
-        let result = ProtoBeliefNode::from_str(toml);
+        let result = IRNode::from_str(toml);
         assert!(result.is_ok());
     }
 
@@ -767,7 +766,7 @@ title: "Test YAML Node"
 parent_connections: []
 "#;
 
-        let result = ProtoBeliefNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
+        let result = IRNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
         assert!(result.is_ok(), "YAML parsing should succeed");
 
         let proto = result.unwrap();
@@ -785,7 +784,7 @@ schema: "test.schema"
 title: "YAML First Test"
 "#;
 
-        let result = ProtoBeliefNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
+        let result = IRNode::from_str_with_format(yaml_content, MetadataFormat::Yaml);
         assert!(result.is_ok());
 
         let proto = result.unwrap();

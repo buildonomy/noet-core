@@ -61,7 +61,7 @@ Two-phase collision detection:
 2. **Finalize**: Network-scoped collision detection before writing sections table
    - Check all candidate IDs against network PathMap
    - Replace colliding IDs with Brefs (using section's BID)
-   - Update both `ProtoBeliefNode.id` and heading events
+   - Update both `IRNode.id` and heading events
 
 ### Problem 3: InlineHtml Not Accumulated for Titles
 
@@ -115,7 +115,7 @@ MdEvent::Text(cow_str) => {
 - [ ] For each ID, check `ctx.belief_set().paths().net_get_from_id()` across network
 - [ ] Track collisions: if ID exists with different BID, mark for Bref replacement
 - [ ] Generate Brefs for colliding sections (use `section_bid.bref().to_string()`)
-- [ ] Update `ProtoBeliefNode.id` field for affected sections
+- [ ] Update `IRNode.id` field for affected sections
 - [ ] Update heading events to inject corrected IDs
 - [ ] Add test: two files with same section titles, verify Brefs assigned
 - [ ] Add test: verify existing unique IDs preserved

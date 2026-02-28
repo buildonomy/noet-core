@@ -1,5 +1,5 @@
 /// Test automatic schema migration from old relationship_profile to new relationship_semantics
-use noet_core::codec::belief_ir::ProtoBeliefNode;
+use noet_core::codec::belief_ir::IRNode;
 use std::str::FromStr;
 
 #[test]
@@ -20,7 +20,7 @@ exploratory = 0.3
 "#;
 
     // Parse the old format
-    let mut proto = ProtoBeliefNode::from_str(old_format).expect("Failed to parse old format");
+    let mut proto = IRNode::from_str(old_format).expect("Failed to parse old format");
     // Trigger schema traversal (which includes migration) - simulating what parse() does
     // For testing, we manually specify the schema type
     proto.traverse_schema().expect("Failed to traverse schema");
@@ -81,7 +81,7 @@ notes = "This uses new relationship_semantics format"
 "#;
 
     // Parse the new format - no migration should occur
-    let proto = ProtoBeliefNode::from_str(new_format).expect("Failed to parse new format");
+    let proto = IRNode::from_str(new_format).expect("Failed to parse new format");
     let output = proto.as_frontmatter();
 
     // Should still have relationship_semantics
@@ -116,7 +116,7 @@ instrumental = 0.0
 expressive = 0.01
 "#;
 
-    let mut proto = ProtoBeliefNode::from_str(old_format).expect("Failed to parse");
+    let mut proto = IRNode::from_str(old_format).expect("Failed to parse");
     proto.traverse_schema().expect("Failed to traverse schema");
     let migrated = proto.as_frontmatter();
 
@@ -155,7 +155,7 @@ instrumental = 0.7
 expressive = 0.5
 "#;
 
-    let mut proto = ProtoBeliefNode::from_str(old_format).expect("Failed to parse");
+    let mut proto = IRNode::from_str(old_format).expect("Failed to parse");
     proto.traverse_schema().expect("Failed to traverse schema");
     let migrated = proto.as_frontmatter();
 

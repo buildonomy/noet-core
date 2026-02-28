@@ -383,7 +383,7 @@ self.session_bb.relations()
    - Recommendation: Remove by v1.0.0
 
 4. **Rename related types too?**
-   - `ProtoBeliefNode` → keep as is (still a belief node, just proto)
+   - `IRNode` → keep as is (still a belief node, just proto)
    - `BeliefEvent` → keep as is (events about beliefs)
    - `BeliefNode` → keep as is (domain concept)
    - `BeliefKind` → keep as is (domain concept)

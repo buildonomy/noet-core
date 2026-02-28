@@ -131,7 +131,7 @@ Source Files (*.md, *.toml)
     ↓
 [Parse] → DocCodec implementations
     ↓
-ProtoBeliefNode (IR)
+IRNode (IR)
     ↓
 [Link] → GraphBuilder (multi-pass)
     ↓

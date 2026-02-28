@@ -149,7 +149,7 @@ Test file hardcoded reserved BID. Fixed by changing to unique UUID.
 - `buildonomy_api_bid(version: &str) -> Bid` - Generates versioned API BIDs in reserved namespace
 - `is_reserved_bid(bid: &Bid) -> bool` - Checks if BID falls in reserved namespace
 
-**Validation logic in `ProtoBeliefNode::from_str_with_format()`:**
+**Validation logic in `IRNode::from_str_with_format()`:**
 ```rust
 if let Some(bid_value) = proto.document.get("bid") {
     if let Some(bid_str) = bid_value.as_str() {

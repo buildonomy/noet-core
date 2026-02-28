@@ -24,7 +24,7 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        belief_ir::ProtoBeliefNode,
+        belief_ir::IRNode,
         byte_offset_to_location,
         diagnostic::{ParseDiagnostic, UnresolvedReference},
         DocCodec, CODECS,
@@ -44,7 +44,7 @@ type MdEventWithRange = (MdEvent<'static>, Option<Range<usize>>);
 type MdEventQueue = VecDeque<MdEventWithRange>;
 
 /// A proto node paired with its markdown event queue
-type ProtoNodeWithEvents = (ProtoBeliefNode, MdEventQueue);
+type ProtoNodeWithEvents = (IRNode, MdEventQueue);
 
 pub fn buildonomy_md_options() -> Options {
     let mut md_options = Options::empty();
@@ -781,11 +781,11 @@ fn parse_sections_metadata(sections: &toml_edit::Item) -> HashMap<NodeKey, toml_
     metadata
 }
 
-/// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
+/// Find metadata match for a IRNode with priority: BID > Anchor > Title.
 ///
 /// Returns a reference to the matching metadata table if found.
 fn find_metadata_match<'a>(
-    node: &ProtoBeliefNode,
+    node: &IRNode,
     metadata: &'a HashMap<NodeKey, toml_edit::Table>,
 ) -> Option<(NodeKey, &'a toml_edit::Table)> {
     // Priority 1: Match by BID (most explicit)
@@ -830,9 +830,9 @@ fn find_metadata_match<'a>(
     None
 }
 
-/// Merge metadata from a TomlTable into a ProtoBeliefNode's document.
+/// Merge metadata from a TomlTable into a IRNode's document.
 /// Preserves existing fields, adds new fields from metadata.
-fn merge_metadata_into_node(node: &mut ProtoBeliefNode, metadata: &toml_edit::Table) {
+fn merge_metadata_into_node(node: &mut IRNode, metadata: &toml_edit::Table) {
     for (key, value) in metadata.iter() {
         // Don't overwrite existing fields in the node
         if !node.document.contains_key(key) {
@@ -975,7 +975,7 @@ impl MdCodec {
 
 impl DocCodec for MdCodec {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
-    fn proto(&self, path: &Path) -> Result<Option<ProtoBeliefNode>, BuildonomyError> {
+    fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError> {
         if path.is_relative() {
             return Err(BuildonomyError::Codec(format!(
                 "[ProtoBeliefState::new] supplied path must be absolute. Received \"{path:?}\""
@@ -998,15 +998,15 @@ impl DocCodec for MdCodec {
 
         let mut proto = if let Some(fm) = frontmatter {
             if !fm.is_empty() {
-                ProtoBeliefNode::from_str(&fm)?
+                IRNode::from_str(&fm)?
             } else {
-                ProtoBeliefNode::default()
+                IRNode::default()
             }
         } else {
             // No frontmatter is fine for regular markdown documents
-            ProtoBeliefNode::default()
+            IRNode::default()
         };
-        if proto.title().is_empty() {
+        if proto.title().unwrap_or_default().is_empty() {
             if let Some(filestem) = path
                 .file_stem()
                 .filter(|stem| !stem.is_empty())
@@ -1030,7 +1030,7 @@ impl DocCodec for MdCodec {
     /// convert proto,
     /// insert bid into source if proto.bid is none
     /// rewrite links according to builder.doc_bb relations
-    fn nodes(&self) -> Vec<ProtoBeliefNode> {
+    fn nodes(&self) -> Vec<IRNode> {
         self.current_events
             .iter()
             .map(|(proto, _)| proto.clone())
@@ -1039,7 +1039,7 @@ impl DocCodec for MdCodec {
 
     fn inject_context(
         &mut self,
-        node: &ProtoBeliefNode,
+        node: &IRNode,
         ctx: &BeliefContext<'_>,
         diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
@@ -1185,7 +1185,7 @@ impl DocCodec for MdCodec {
             Ok(Some(new_node_with_text))
         } else if sections_metadata_merged || frontmatter_changed.is_some() {
             // No text regeneration needed, but metadata was merged or context changed
-            // Create new BeliefNode from the updated ProtoBeliefNode
+            // Create new BeliefNode from the updated IRNode
             match BeliefNode::try_from(&proto_events.0) {
                 Ok(new_node) => Ok(Some(new_node)),
                 Err(e) => {
@@ -1258,7 +1258,7 @@ impl DocCodec for MdCodec {
             .filter(|path| !path.is_empty())
             .unwrap_or("document.md".to_string());
         let doc_abs_ap = AnchorPath::from(&doc_abs_path);
-        // Get source path from ProtoBeliefNode's path field to compute output filename
+        // Get source path from IRNode's path field to compute output filename
 
         // Extract filename and convert extension to .html
         // Extract filename and convert extension to .html
@@ -1286,7 +1286,7 @@ impl DocCodec for MdCodec {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(ProtoBeliefNode, BeliefNode)>, BuildonomyError> {
+    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
         let mut modified_nodes = Vec::new();
 
         // Step 1: Build sections table from all section nodes (heading > 2)
@@ -1430,7 +1430,7 @@ impl DocCodec for MdCodec {
     fn parse(
         &mut self,
         content: &str,
-        mut current: ProtoBeliefNode,
+        mut current: IRNode,
     ) -> Result<(), BuildonomyError> {
         // Initial parse and format to try and make pulldown_cmark <-> pulldown_cmark_to_cmark idempotent
         self.content = content.to_string();
@@ -1496,13 +1496,13 @@ impl DocCodec for MdCodec {
                          accum to Some in the start tag",
                     );
 
-                    match ProtoBeliefNode::from_str(&toml_string) {
+                    match IRNode::from_str(&toml_string) {
                         Ok(mut proto) => {
                             current.merge(&mut proto);
                         }
                         Err(e) => {
                             // Fallback to simple deserialization if TomlCodec fails
-                            tracing::warn!("ProtoBeliefNode toml parse failed: {:?}", e);
+                            tracing::warn!("IRNode toml parse failed: {:?}", e);
                             current.errors.push(e);
                         }
                     };
@@ -1536,7 +1536,7 @@ impl DocCodec for MdCodec {
                     };
                     // Capture and normalize explicit ID from {#anchor} syntax
                     let maybe_normalized_id = id.as_ref().map(|id_str| to_anchor(id_str));
-                    let mut new_current = ProtoBeliefNode {
+                    let mut new_current = IRNode {
                         path: current.path.clone(),
                         heading,
                         ..Default::default()
@@ -1550,11 +1550,7 @@ impl DocCodec for MdCodec {
                     proto_to_push.traverse_schema()?;
 
                     if proto_to_push.id().is_none() {
-                        if let Some(title) = proto_to_push
-                            .document
-                            .get("title")
-                            .and_then(|title_val| title_val.as_str().map(|str| str.to_string()))
-                        {
+                        if let Some(title) = proto_to_push.title() {
                             proto_to_push
                                 .document
                                 .insert("id", value(to_anchor(&title)));
@@ -1568,15 +1564,16 @@ impl DocCodec for MdCodec {
                     // We should never encounter a heading end tag before a heading start tag, and
                     // we initialize title_accum to Some(String::new) in the start tag.
                     let accum_title = current.accumulator.take().unwrap_or_default();
-                    let current_title = current.title();
+                    let current_title = current.title().unwrap_or_default();
                     // Heading 3 is an h1. heading 1 == network, heading 2 == document
                     let is_document_heading =
                         self.current_events.len() == 1 && current.heading == 3;
                     if accum_title.is_empty() || current_title == accum_title || is_document_heading
                     {
-                        // Don't count this as a new section --- glue it back onto the last proto --
-                        // the title doesn't 'split' it either because it's empty, or its the same
-                        // as the last section
+                        // Don't count this as a new section --- glue it back onto the last proto for these cases:
+                        // 1. the new title is empty,
+                        // 2. it's the same as the last section title, or
+                        // 3. its an h1 at the start of the document with no prior content
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
                             if is_document_heading && !accum_title.is_empty() {
@@ -1649,9 +1646,9 @@ mod tests {
         metadata
     }
 
-    /// Find metadata match for a ProtoBeliefNode with priority: BID > Anchor > Title.
+    /// Find metadata match for a IRNode with priority: BID > Anchor > Title.
     fn find_metadata_match<'a>(
-        node: &ProtoBeliefNode,
+        node: &IRNode,
         metadata: &'a HashMap<NodeKey, TomlTable>,
     ) -> Option<&'a TomlTable> {
         // Priority 1: Match by BID (most explicit)
@@ -1812,7 +1809,7 @@ schema = "Document"
         doc.insert("bid", value("00000000-0000-0000-0000-000000000002"));
         doc.insert("title", value("Introduction"));
 
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -1849,7 +1846,7 @@ schema = "Document"
         doc.insert("title", value("Introduction"));
         doc.insert("anchor", value("intro"));
         doc.insert("id", value("intro"));
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -1886,7 +1883,7 @@ schema = "Document"
         let mut doc = DocumentMut::new();
         doc.insert("title", value("Introduction"));
 
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -1932,7 +1929,7 @@ schema = "Document"
         doc.insert("anchor", value("intro"));
         doc.insert("title", value("Introduction"));
 
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -1979,7 +1976,7 @@ schema = "Document"
         let mut doc = DocumentMut::new();
         doc.insert("title", value("Introduction"));
         doc.insert("id", value("intro"));
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -2007,7 +2004,7 @@ schema = "Document"
         let mut doc = DocumentMut::new();
         doc.insert("title", value("Introduction"));
 
-        let node = ProtoBeliefNode {
+        let node = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -2105,7 +2102,7 @@ schema = "Document"
         doc.insert("schema", value("Document"));
         doc.insert("title", value("My Document"));
 
-        let proto = ProtoBeliefNode {
+        let proto = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -2341,7 +2338,7 @@ Mixed content.
         doc.insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
         doc.insert("title", value("Test Document"));
 
-        let proto = ProtoBeliefNode {
+        let proto = IRNode {
             accumulator: None,
             content: String::new(),
             document: doc,
@@ -2502,7 +2499,7 @@ Install the software.
 "#;
 
         let mut codec = MdCodec::new();
-        let mut proto = ProtoBeliefNode::default();
+        let mut proto = IRNode::default();
         proto
             .document
             .insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
@@ -2556,7 +2553,7 @@ This section has no explicit BID.
 "#;
 
         let mut codec = MdCodec::new();
-        let mut proto = ProtoBeliefNode::default();
+        let mut proto = IRNode::default();
         proto
             .document
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
@@ -2597,7 +2594,7 @@ Already HTML [html link](./page.html "bref://doc789").
 "#;
 
         let mut codec = MdCodec::new();
-        let mut proto = ProtoBeliefNode::default();
+        let mut proto = IRNode::default();
         proto
             .document
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
@@ -2646,5 +2643,5 @@ Already HTML [html link](./page.html "bref://doc789").
     }
 
     // Note: Integration test for static asset tracking needed with full GraphBuilder flow
-    // MdCodec::parse only creates ProtoBeliefNodes; relations are created by GraphBuilder
+    // MdCodec::parse only creates IRNodes; relations are created by GraphBuilder
 }

@@ -134,8 +134,8 @@ This is the largest impact area - PathMap builds the path tree from relations.
 
 - [x] `GraphBuilder::push()`: Build `Vec<String>` for doc_paths
 - [x] `GraphBuilder::push_relation()`: Accumulate paths into vector
-- [x] `ProtoBeliefNode::from_file()`: Parse `doc_paths` array from TOML
-- [x] `ProtoBeliefNode::write()`: Serialize `doc_paths` as TOML array
+- [x] `IRNode::from_file()`: Parse `doc_paths` array from TOML
+- [x] `IRNode::write()`: Serialize `doc_paths` as TOML array
 
 **Pattern for accumulating paths**:
 ```rust
@@ -161,7 +161,7 @@ if !paths.contains(&new_path) {
 
 - [x] `test_weight_set_operations`: Use `WEIGHT_DOC_PATHS` and `Vec<String>`
 - [x] PathMap tests: Add test for multiple paths per relation
-- [x] ProtoBeliefNode tests: Test parsing/serializing `doc_paths` arrays
+- [x] IRNode tests: Test parsing/serializing `doc_paths` arrays
 - [x] Add migration test: Old format → New format conversion (via backward compat helper)
 
 ## Testing Requirements
@@ -278,7 +278,7 @@ if !paths.contains(&new_path) {
 - `src/properties.rs:544-548` - `WEIGHT_DOC_PATH` constant
 - `src/paths.rs:1152-1170` - `generate_path_name()` 
 - `src/paths.rs:1344-1351` - `process_relation_update()` path handling
-- `src/codec/belief_ir.rs:783-793` - ProtoBeliefNode path parsing
+- `src/codec/belief_ir.rs:783-793` - IRNode path parsing
 - `src/codec/builder.rs:979-981` - GraphBuilder path setting
 
 ## Notes

@@ -78,7 +78,7 @@ noet-procedures/
 
 ```rust
 impl DocCodec for ProcedureCodec {
-    fn parse(&mut self, content: &str, initial: ProtoBeliefNode) -> Result<()> {
+    fn parse(&mut self, content: &str, initial: IRNode) -> Result<()> {
         // 1. Parse TOML frontmatter (document node)
         let doc_node = parse_procedure_frontmatter(content)?;
         
@@ -99,8 +99,8 @@ impl DocCodec for ProcedureCodec {
     }
 }
 
-fn generate_nodes_from_steps(steps: &TomlValue) -> Result<Vec<ProtoBeliefNode>> {
-    // Recursively generate ProtoBeliefNodes from steps array
+fn generate_nodes_from_steps(steps: &TomlValue) -> Result<Vec<IRNode>> {
+    // Recursively generate IRNodes from steps array
     // Each step becomes a node, substeps become child nodes
     // Sets heading field for parent-child relationships
     // This is the OPPOSITE of MdCodec (schema-driven, not content-driven)
@@ -152,7 +152,7 @@ The noet product will extend `noet-procedures` with:
 
 2. **Implement Steps-to-Nodes Generation** (2 days)
    - [ ] Parse `steps` field from TOML frontmatter
-   - [ ] Recursively generate ProtoBeliefNodes from steps array
+   - [ ] Recursively generate IRNodes from steps array
    - [ ] Set `heading` field for parent-child relationships (substeps)
    - [ ] Handle step types: action, prompt, sequence, parallel, any_of, all_of
    - [ ] Set appropriate BIDs for step nodes

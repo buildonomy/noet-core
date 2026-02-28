@@ -9,12 +9,12 @@
 
 The Schema Registry (`schema_registry.rs`) currently exists as scaffolding but lacks the capability to automatically translate structured payload fields into BeliefGraph edges. This issue tracks productionizing the registry to enable schema-driven edge generation, reducing bespoke codec logic and enabling extensible content types.
 
-On top of that, ProtoBeliefNode is the wrong place to perform traversal! A NodeUpdate event should generate the RelationChange events that its schema-defined payload represents. Otherwise, the `GraphBuilder::parse_content` is the only way that will generate the defined relation events, which is likely to break idempotency in strange ways.
+On top of that, IRNode is the wrong place to perform traversal! A NodeUpdate event should generate the RelationChange events that its schema-defined payload represents. Otherwise, the `GraphBuilder::parse_content` is the only way that will generate the defined relation events, which is likely to break idempotency in strange ways.
 
 ## Goals
 
 1. **Define GraphField semantics** for common payload-to-edge patterns
-2. **Implement automatic edge generation** in `ProtoBeliefNode::traverse_schema()`
+2. **Implement automatic edge generation** in `IRNode::traverse_schema()`
 3. **Support map-based references** (e.g., Network's `asset_manifest` field)
 4. **Enable reverse translation** (edges → payload during context injection)
 5. **Register built-in schemas** (Network, Document, Section) in `SchemaRegistry::create()`
@@ -27,7 +27,7 @@ On top of that, ProtoBeliefNode is the wrong place to perform traversal! A NodeU
 Currently, when a BeliefNode has structured payload fields that reference other nodes, codecs must manually:
 1. Parse payload structure
 2. Extract BIDs/NodeKeys
-3. Create `ProtoBeliefNode.upstream` or `downstream` entries
+3. Create `IRNode.upstream` or `downstream` entries
 4. Reverse process during `inject_context()` to rebuild payload
 
 **Example (Issue 29 - Asset Manifest):**
@@ -40,7 +40,7 @@ Currently, when a BeliefNode has structured payload fields that reference other 
     }
 }
 
-// Must manually translate to ProtoBeliefNode edges:
+// Must manually translate to IRNode edges:
 network_proto.upstream.push((
     NodeKey::Bid("bid:asset-ns:sha256-abc"),
     WeightKind::Pragmatic,
@@ -132,7 +132,7 @@ role = "reviewer"
 - [ ] Document pattern matching logic
 
 ### 2. Implement Forward Translation (1 day)
-- [ ] Update `ProtoBeliefNode::traverse_schema()` to iterate GraphFields
+- [ ] Update `IRNode::traverse_schema()` to iterate GraphFields
 - [ ] Implement extraction logic for each GraphFieldType
 - [ ] Generate upstream/downstream entries with correct WeightKind
 - [ ] Preserve metadata in edge payloads
@@ -244,7 +244,7 @@ role = "reviewer"
 
 ### Architecture References
 - `src/codec/schema_registry.rs` - Current scaffolding
-- `src/codec/belief_ir.rs:ProtoBeliefNode::traverse_schema()` - Integration point
+- `src/codec/belief_ir.rs:IRNode::traverse_schema()` - Integration point
 - `docs/design/beliefbase_architecture.md` - Schema vs Kind distinction
 
 ### Future Enhancements

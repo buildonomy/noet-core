@@ -125,7 +125,7 @@ pub enum ClientEvent {
     UpdateContent { path: PathBuf, content: String },
     
     /// Client has created a new node
-    CreateNode { proto: ProtoBeliefNode },
+    CreateNode { proto: IRNode },
     
     /// Client has modified node properties
     UpdateNode { bid: Bid, updates: HashMap<String, Value> },
