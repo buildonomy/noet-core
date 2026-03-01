@@ -24,7 +24,7 @@ use toml_edit::value;
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        belief_ir::IRNode,
+        belief_ir::{IRNode, IntermediateRelation},
         byte_offset_to_location,
         diagnostic::{ParseDiagnostic, UnresolvedReference},
         DocCodec, CODECS,
@@ -336,7 +336,7 @@ fn check_for_link_and_push(
     source: &str,
     events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     stop_event: Option<&MdEvent<'_>>,
-    diagnostics: &mut Vec<ParseDiagnostic>,
+    _diagnostics: &mut Vec<ParseDiagnostic>,
 ) -> bool {
     let mut changed = false;
     let mut collector_stack: Vec<LinkAccumulator> = Vec::new();
@@ -444,37 +444,21 @@ fn check_for_link_and_push(
             // Check both sources (upstream) and sinks (downstream) for the link target Assets and
             // document links are sources (upstream), but its possible they're upstream as well
             let sources = ctx.sources();
-            let sinks = ctx.sinks();
 
             let maybe_keyed_relation = keys.iter().find_map(|link_key| {
-                // First check sources (upstream relations - documents linking TO this node)
-                sources
-                    .iter()
-                    .find(|rel| {
-                        rel.other
-                            .keys(Some(ctx.root_net), None, ctx.beliefbase())
-                            .iter()
-                            .chain(
-                                rel.other
-                                    .keys(Some(rel.home_net), None, ctx.beliefbase())
-                                    .iter(),
-                            )
-                            .any(|ctx_source_key| ctx_source_key == link_key)
-                    })
-                    .or_else(|| {
-                        // Then check sinks (downstream relations - things this document links TO, like assets)
-                        sinks.iter().find(|rel| {
+                // First check sources (upstream relations - documents this node sources from (links
+                // to))
+                sources.iter().find(|rel| {
+                    rel.other
+                        .keys(Some(ctx.root_net), None, ctx.beliefbase())
+                        .iter()
+                        .chain(
                             rel.other
-                                .keys(Some(ctx.root_net), None, ctx.beliefbase())
-                                .iter()
-                                .chain(
-                                    rel.other
-                                        .keys(Some(rel.home_net), None, ctx.beliefbase())
-                                        .iter(),
-                                )
-                                .any(|ctx_sink_key| ctx_sink_key == link_key)
-                        })
-                    })
+                                .keys(Some(rel.home_net), None, ctx.beliefbase())
+                                .iter(),
+                        )
+                        .any(|ctx_source_key| ctx_source_key == link_key)
+                })
             });
 
             if let Some(relation) = maybe_keyed_relation {
@@ -560,7 +544,7 @@ fn check_for_link_and_push(
                     .as_ref()
                     .map(|r| byte_offset_to_location(source, r.start));
                 let unresolved = UnresolvedReference {
-                    direction: Direction::Outgoing,
+                    direction: Direction::Incoming,
                     self_path: doc_abs_path.to_string(),
                     other_keys: keys.clone(),
                     reference_location: location,
@@ -568,7 +552,7 @@ fn check_for_link_and_push(
                 };
                 tracing::warn!("{unresolved:?}");
                 tracing::warn!("sources: {sources:?}",);
-                diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
+                // diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
 
                 let start_event = if link_data.is_image {
                     MdEvent::Start(MdTag::Image {
@@ -1427,11 +1411,7 @@ impl DocCodec for MdCodec {
         Ok(modified_nodes)
     }
 
-    fn parse(
-        &mut self,
-        content: &str,
-        mut current: IRNode,
-    ) -> Result<(), BuildonomyError> {
+    fn parse(&mut self, content: &str, mut current: IRNode) -> Result<(), BuildonomyError> {
         // Initial parse and format to try and make pulldown_cmark <-> pulldown_cmark_to_cmark idempotent
         self.content = content.to_string();
         self.current_events = Vec::default();
@@ -1478,9 +1458,12 @@ impl DocCodec for MdCodec {
                     } else {
                         None
                     };
-                    current
-                        .upstream
-                        .push((node_key, WeightKind::Epistemic, payload));
+                    let mut relation =
+                        IntermediateRelation::new(node_key, WeightKind::Epistemic, payload);
+                    if let Some(byte_offset) = link_data.range.as_ref().map(|r| r.start) {
+                        relation = relation.with_location(byte_offset);
+                    }
+                    current.upstream.push(relation);
                 }
             }
 

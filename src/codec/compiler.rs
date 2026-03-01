@@ -18,6 +18,7 @@ use crate::{
     query::{BeliefSource, Expression, NeighborsExpression, Query},
 };
 
+use petgraph::Direction;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -333,7 +334,10 @@ impl DocumentCompiler {
                 rewritten_content: None,
                 dependent_paths: Vec::new(),
                 diagnostics: vec![crate::codec::ParseDiagnostic::parse_error(
-                    format!("Max reparse limit ({}) reached", self.max_reparse_count),
+                    format!(
+                        "{:?}: Max reparse limit ({}) reached",
+                        path, self.max_reparse_count
+                    ),
                     parse_count,
                 )],
             }));
@@ -851,9 +855,13 @@ impl DocumentCompiler {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let msg = if line > 0 {
+                            let dir = match u.direction {
+                                Direction::Incoming => "+",
+                                Direction::Outgoing => "-",
+                            };
                             format!(
-                                "{}:{}:{}: unresolved link — tried [{}]",
-                                path_str, line, col, keys_str
+                                "{}:{}:{}: unresolved link [{}] — tried [{}]",
+                                path_str, line, col, dir, keys_str
                             )
                         } else {
                             format!("{}: unresolved link — tried [{}]", path_str, keys_str)

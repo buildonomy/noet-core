@@ -244,6 +244,42 @@ fn parse_with_fallback(
     }
 }
 
+/// A single relation entry in an [`IRNode`]'s upstream or downstream list.
+///
+/// Carries the target key, weight metadata, and — when available — the source
+/// location in the document where the relation was declared. The location is used
+/// to produce precise diagnostic messages when the relation cannot be resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntermediateRelation {
+    /// The key identifying the other node in this relation.
+    pub key: NodeKey,
+    /// The weight kind (edge type) of this relation.
+    pub kind: WeightKind,
+    /// Optional weight payload (e.g., title text, sort data).
+    pub weight: Option<Weight>,
+    /// Byte offset into the source document where this relation was declared, if known.
+    /// Populated by codec parsers that have access to byte ranges (e.g., `MdCodec`).
+    /// `None` for relations derived from serialized data (TOML schema fields).
+    /// Convert to `(line, col)` at display time via [`crate::codec::byte_offset_to_location`].
+    pub location: Option<usize>,
+}
+
+impl IntermediateRelation {
+    pub fn new(key: NodeKey, kind: WeightKind, weight: Option<Weight>) -> Self {
+        Self {
+            key,
+            kind,
+            weight,
+            location: None,
+        }
+    }
+
+    pub fn with_location(mut self, byte_offset: usize) -> Self {
+        self.location = Some(byte_offset);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct IRNode {
     pub accumulator: Option<String>,
@@ -251,8 +287,8 @@ pub struct IRNode {
     pub content: String,
     /// TOML document that preserves key order and formatting
     pub document: DocumentMut,
-    pub upstream: Vec<(NodeKey, WeightKind, Option<Weight>)>,
-    pub downstream: Vec<(NodeKey, WeightKind, Option<Weight>)>,
+    pub upstream: Vec<IntermediateRelation>,
+    pub downstream: Vec<IntermediateRelation>,
     pub path: String,
     pub kind: BeliefKindSet,
     pub errors: Vec<BuildonomyError>,
@@ -266,8 +302,8 @@ impl PartialEq for IRNode {
             .to_string()
             .eq(&other.document.as_table().to_string())
             && self.kind.eq(&other.kind)
-            && self.upstream.iter().eq(other.upstream.iter())
-            && self.downstream.iter().eq(other.downstream.iter())
+            && self.upstream.eq(&other.upstream)
+            && self.downstream.eq(&other.downstream)
     }
 }
 
@@ -502,10 +538,18 @@ impl IRNode {
                     // Add to appropriate edge list based on direction enum
                     match graph_field.direction {
                         EdgeDirection::Downstream => {
-                            self.downstream.push((node_key, weight_kind, payload));
+                            self.downstream.push(IntermediateRelation::new(
+                                node_key,
+                                weight_kind,
+                                payload,
+                            ));
                         }
                         EdgeDirection::Upstream => {
-                            self.upstream.push((node_key, weight_kind, payload));
+                            self.upstream.push(IntermediateRelation::new(
+                                node_key,
+                                weight_kind,
+                                payload,
+                            ));
                         }
                     }
                 }
@@ -517,10 +561,15 @@ impl IRNode {
                 });
                 match graph_field.direction {
                     EdgeDirection::Downstream => {
-                        self.downstream.push((node_key, weight_kind, None));
+                        self.downstream.push(IntermediateRelation::new(
+                            node_key,
+                            weight_kind,
+                            None,
+                        ));
                     }
                     EdgeDirection::Upstream => {
-                        self.upstream.push((node_key, weight_kind, None));
+                        self.upstream
+                            .push(IntermediateRelation::new(node_key, weight_kind, None));
                     }
                 }
             }

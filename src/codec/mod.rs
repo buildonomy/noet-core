@@ -187,7 +187,7 @@ pub mod schema_registry;
 
 // Re-export for backward compatibility
 #[cfg(not(target_arch = "wasm32"))]
-pub use belief_ir::IRNode;
+pub use belief_ir::{IRNode, IntermediateRelation};
 #[cfg(not(target_arch = "wasm32"))]
 pub use builder::GraphBuilder;
 #[cfg(not(target_arch = "wasm32"))]

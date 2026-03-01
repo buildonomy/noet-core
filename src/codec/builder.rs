@@ -31,7 +31,7 @@ use crate::{
     query::{BeliefSource, Expression, Query},
 };
 
-use super::UnresolvedReference;
+use super::{belief_ir::IntermediateRelation, UnresolvedReference};
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum NodeSource {
@@ -358,15 +358,14 @@ impl GraphBuilder {
             let mut generated_href_nodes = Vec::new();
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                 // Process upstream_relations (sink-owned, default)
-                for (index, (orig_source_key, kind, weight)) in proto.upstream.iter().enumerate() {
+                for (index, relation) in proto.upstream.iter().enumerate() {
                     let result = self
                         .push_relation(
-                            orig_source_key,
-                            kind,
-                            weight,
+                            relation,
                             bid,
                             Direction::Incoming, // upstream_relations are sink-owned
                             index,
+                            &content,
                             global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
@@ -397,15 +396,14 @@ impl GraphBuilder {
                 }
 
                 // Process downstream_relations (source-owned)
-                for (index, (orig_sink_key, kind, payload)) in proto.downstream.iter().enumerate() {
+                for (index, relation) in proto.downstream.iter().enumerate() {
                     let result = self
                         .push_relation(
-                            orig_sink_key,
-                            kind,
-                            payload,
+                            relation,
                             bid,
                             Direction::Outgoing, // downstream_relations are source-owned
                             index,
+                            &content,
                             global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
@@ -650,7 +648,11 @@ impl GraphBuilder {
             parent_path.pop();
         }
         while parent_path.pop() {
-            parent_path_stack.push(parent_path.clone());
+            if parent_path.strip_prefix(self.repo_root()).is_ok() {
+                parent_path_stack.push(parent_path.clone());
+            } else {
+                break;
+            }
         }
         let mut maybe_content_parent_proto = None;
         let mut missing_structure = BeliefGraph::default();
@@ -658,11 +660,7 @@ impl GraphBuilder {
         let net_codec = NetworkCodec::default();
         while let Some(path) = parent_path_stack.pop() {
             let Some(state_accum) = net_codec.proto(path.as_ref())? else {
-                if path == self.repo_root {
-                    break;
-                } else {
-                    continue;
-                }
+                continue;
             };
 
             let (ancestor, (_source, _, _)) = self
@@ -684,9 +682,6 @@ impl GraphBuilder {
                 missing_structure = BeliefGraph::default(); // reset for next interation
             }
             maybe_content_parent_proto = Some((ancestor, state_accum));
-            if path == self.repo_root {
-                break;
-            }
         }
 
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
@@ -700,14 +695,13 @@ impl GraphBuilder {
         // Initialize any child links found by the last state_accum. This ensures we can sort the
         // parsed_content's relation to its parent correctly
         if let Some((parent_bid, parent_proto)) = maybe_content_parent_proto {
-            for (index, (source_key, kind, payload)) in parent_proto.upstream.iter().enumerate() {
+            for (index, relation) in parent_proto.upstream.iter().enumerate() {
                 self.push_relation(
-                    source_key,
-                    kind,
-                    payload,
+                    relation,
                     &parent_bid,
                     Direction::Incoming, // upstream_relations are sink-owned
                     index,
+                    "", // no source text available at stack-init time; location will be None
                     global_bb.clone(),
                     &mut events,
                     &mut missing_structure,
@@ -721,6 +715,15 @@ impl GraphBuilder {
                 self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
             }
         }
+        tracing::debug!(
+            "[initialize_stack]:\n{}",
+            self.stack
+                .iter()
+                .enumerate()
+                .map(|(idx, (_bid, path, heading))| format!("{idx}: {heading}. {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         Ok(initial)
     }
 
@@ -855,10 +858,7 @@ impl GraphBuilder {
     /// Generate a speculative Nodekey::Path for for a node push.
     /// Uses PathMap's speculative_path to compute what the path would be with collision detection.
     /// Returns Result<NodeKey, BuildonomyError>.
-    fn speculative_path_key(
-        &self,
-        proto: &IRNode,
-    ) -> Result<Option<NodeKey>, BuildonomyError> {
+    fn speculative_path_key(&self, proto: &IRNode) -> Result<Option<NodeKey>, BuildonomyError> {
         // Find the network by walking up the stack (network nodes have heading=1)
         if let Some(bid) = proto
             .document
@@ -1189,16 +1189,18 @@ impl GraphBuilder {
     #[allow(clippy::too_many_arguments)]
     async fn push_relation<B: BeliefSource + Clone>(
         &mut self,
-        other_key: &NodeKey,
-        kind: &WeightKind,
-        maybe_weight: &Option<Weight>,
+        relation: &IntermediateRelation,
         owner_bid: &Bid,
         direction: Direction,
         index: usize,
+        source: &str,
         global_bb: B,
         update_queue: &mut Vec<BeliefEvent>,
         missing_structure: &mut BeliefGraph,
     ) -> Result<GetOrCreateResult, BuildonomyError> {
+        let other_key = &relation.key;
+        let kind = &relation.kind;
+        let maybe_weight = &relation.weight;
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
         let other_key_regularized = other_key
@@ -1225,7 +1227,6 @@ impl GraphBuilder {
         let cache_fetch_result = self
             .cache_fetch(&other_keys, global_bb.clone(), true, missing_structure)
             .await?;
-
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
                 // Mark these nodes as traces -- we're not guaranteeing that we have all their
@@ -1290,6 +1291,9 @@ impl GraphBuilder {
                     let mut unresolved = unresolved_initial.clone();
                     unresolved.direction = direction;
                     unresolved.self_bid = *owner_bid;
+                    unresolved.reference_location = relation
+                        .location
+                        .map(|offset| crate::codec::byte_offset_to_location(source, offset));
                     let pmm_guard = self.doc_bb.paths();
                     let (owner_home_net, owner_home_path) =
                     pmm_guard.api_map().home_path(owner_bid, &pmm_guard).expect(

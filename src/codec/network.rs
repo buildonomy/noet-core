@@ -1,6 +1,7 @@
 use crate::{
     beliefbase::BeliefContext,
     codec::{
+        belief_ir::IntermediateRelation,
         diagnostic::ParseDiagnostic,
         md::{build_title_attribute, MdCodec},
         DocCodec, IRNode, CODECS,
@@ -155,9 +156,11 @@ impl DocCodec for NetworkCodec {
                 };
                 let mut weight = Weight::default();
                 weight.set_doc_paths(vec![path_str]).ok();
-                proto
-                    .upstream
-                    .push((node_key, WeightKind::Section, Some(weight)));
+                proto.upstream.push(IntermediateRelation::new(
+                    node_key,
+                    WeightKind::Section,
+                    Some(weight),
+                ));
             }
         }
 
