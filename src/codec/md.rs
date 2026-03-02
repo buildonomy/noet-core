@@ -550,8 +550,8 @@ fn check_for_link_and_push(
                     reference_location: location,
                     ..UnresolvedReference::default()
                 };
-                tracing::warn!("{unresolved:?}");
-                tracing::warn!("sources: {sources:?}",);
+                tracing::debug!("{unresolved:?}");
+                tracing::debug!("sources: {sources:?}",);
                 // diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
 
                 let start_event = if link_data.is_image {
@@ -1212,7 +1212,12 @@ impl DocCodec for MdCodec {
                             CowStr::from(as_anchor(url_ap.anchor()))
                         } else if CODECS.get(&url_ap).is_some() {
                             // Check if there's an anchor
-                            let res = CowStr::from(url_ap.replace_extension("html"));
+                            let res = CowStr::from(
+                                url_ap
+                                    .normalize()
+                                    .as_anchor_path()
+                                    .replace_extension("html"),
+                            );
                             tracing::debug!("replacing {dest_url} with {res}");
                             res
                         } else {

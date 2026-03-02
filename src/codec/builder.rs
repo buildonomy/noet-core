@@ -185,7 +185,7 @@ impl GraphBuilder {
             tx,
         };
 
-        tracing::info!(
+        tracing::debug!(
             "Initializing GraphBuilder for repo_path: {:?}",
             repo_path.as_ref()
         );
@@ -793,7 +793,7 @@ impl GraphBuilder {
                     BeliefEvent::BuiltInTest => {}
                 }
             }
-            tracing::info!(
+            tracing::debug!(
                 "Diff events ({}): NodeUpdate({}), NodeRemoved({}), NodeRenamed({}), RelationChange({}), RelationRemoved({}), RelationUpdate({}), PathsAdded({}), PathsRemoved({})",
                 tx_events.len(),
                 node_update_count,
@@ -1253,13 +1253,6 @@ impl GraphBuilder {
                         update_queue.push(BeliefEvent::NodeUpdate(
                             href_net_node.keys(Some(buildonomy_namespace()), None, &self.doc_bb),
                             href_net_node.toml(),
-                            EventOrigin::Remote,
-                        ));
-                        update_queue.push(BeliefEvent::RelationChange(
-                            href_namespace(),
-                            buildonomy_namespace(),
-                            WeightKind::Section,
-                            Some(Weight::default()),
                             EventOrigin::Remote,
                         ));
                     }

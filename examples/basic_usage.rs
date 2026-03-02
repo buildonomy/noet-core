@@ -115,6 +115,7 @@ async fn main() -> Result<(), BuildonomyError> {
                 ParseDiagnostic::UnresolvedReference(..) => {
                     unresolved.push(idx);
                 }
+                ParseDiagnostic::ReparseLimitExceeded => {}
                 ParseDiagnostic::ParseError { .. } => {
                     parse_error.push(idx);
                 }

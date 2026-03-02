@@ -177,6 +177,8 @@ pub enum ParseDiagnostic {
     /// once the target document is parsed.
     UnresolvedReference(UnresolvedReference),
 
+    ReparseLimitExceeded,
+
     /// A recoverable parse error (syntax error, IO error, etc.)
     ///
     /// The file remains in the parse queue and may be retried. Unlike fatal errors
@@ -283,6 +285,9 @@ impl std::fmt::Display for ParseDiagnostic {
                     "Unresolved reference in {:?}: {:?} -> {:?}",
                     unresolved.self_path, unresolved.self_bid, unresolved.other_keys
                 )
+            }
+            Self::ReparseLimitExceeded => {
+                write!(f, "File's reparse limit was exceeded")
             }
             Self::ParseError {
                 message,

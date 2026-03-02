@@ -1804,14 +1804,16 @@ function renderNodeContext(context) {
         // Render sources (incoming links)
         if (sources.length > 0) {
           html += '<div class="noet-relation-group">';
-          html += '<p class="noet-metadata-label"><strong>Sources (incoming):</strong></p>';
+          html += '<p class="noet-metadata-label"><strong>Dependencies:</strong></p>';
           html += '<ul class="noet-relation-list">';
 
           for (const sourceBid of sources) {
             const sourceNode = related_nodes.get(sourceBid);
             if (sourceNode) {
               const sourceTitle = escapeHtml(sourceNode.node.title || sourceBid);
-              const sourcePath = sourceNode.root_path || null;
+              const sourcePath = wasmModule.BeliefBaseWasm.normalize_path_extension(
+                sourceNode.root_path,
+              );
               const sourceHomeNet = sourceNode.home_net;
 
               // Check if source is in special namespace
@@ -1848,14 +1850,16 @@ function renderNodeContext(context) {
         // Render sinks (outgoing links)
         if (sinks.length > 0) {
           html += '<div class="noet-relation-group">';
-          html += '<p class="noet-metadata-label"><strong>Sinks (outgoing):</strong></p>';
+          html += '<p class="noet-metadata-label"><strong>Referenced by:</strong></p>';
           html += '<ul class="noet-relation-list">';
 
           for (const sinkBid of sinks) {
             const sinkNode = related_nodes.get(sinkBid);
             if (sinkNode) {
               const sinkTitle = escapeHtml(sinkNode.node.title || sinkBid);
-              const sinkPath = sinkNode.root_path || null;
+              const sinkPath = wasmModule.BeliefBaseWasm.normalize_path_extension(
+                sinkNode.root_path,
+              );
               const sinkHomeNet = sinkNode.home_net;
 
               // Check if sink is in special namespace

@@ -525,21 +525,14 @@ pub trait BeliefSource: Sync {
         expr: &Expression,
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
 
-    /// Get all paths for a network as (path, target_bid) pairs.
-    /// Useful for querying asset manifests or all documents in a network.
-    /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
-    fn get_network_paths(
-        &self,
-        _network_bid: Bid,
-    ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send;
-
     /// Get all document paths (including documents in subnets) for a network as (path, bid) pairs.
     /// Unlike get_network_paths which returns only network nodes, this returns all documents.
     /// Useful for sitemap generation and comprehensive document enumeration.
     /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
-    fn get_all_document_paths(
+    fn get_all_paths(
         &self,
         _network_bid: Bid,
+        _include_index: bool,
     ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send {
         async { Ok(Vec::new()) }
     }

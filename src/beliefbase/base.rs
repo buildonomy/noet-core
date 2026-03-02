@@ -1449,9 +1449,9 @@ impl BeliefBase {
             // Skip if either node has been removed
             tracing::warn!(
                 "Skipping update_relation({} -[{}]-> {}), source is missing: {}, sink is missing: {}, index_dirty: {}",
-                source,
+                self.states().get(&source).map(|n| n.display_title()).unwrap_or(source.to_string()),
                 new_weight_set.weights.keys().map(|k| k.to_string()).collect::<Vec<String>>().join(", "),
-                sink,
+                self.states().get(&sink).map(|n| n.display_title()).unwrap_or(sink.to_string()),
                 maybe_source_idx.is_none(),
                 maybe_sink_idx.is_none(),
                 self.index_dirty.load(Ordering::SeqCst)
@@ -2076,9 +2076,10 @@ impl BeliefSource for BeliefBase {
     /// Get all paths for a network as (path, target_bid) pairs.
     /// Useful for querying asset manifests or all documents in a network.
     /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
-    async fn get_network_paths(
+    async fn get_all_paths(
         &self,
         network_bid: Bid,
+        include_index: bool,
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
@@ -2086,23 +2087,14 @@ impl BeliefSource for BeliefBase {
             .map(|pm| {
                 pm.recursive_map(&self.paths(), &mut BTreeSet::default())
                     .into_iter()
-                    .map(|(path, bid, _order)| (path, bid))
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
-    async fn get_all_document_paths(
-        &self,
-        network_bid: Bid,
-    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
-        Ok(self
-            .paths()
-            .get_map(&network_bid.bref())
-            .map(|pm| {
-                pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
-                    .into_iter()
-                    .filter(|(path, _bid)| !path.is_empty())
+                    .filter_map(|(path, bid, order)| {
+                        // Filter out network index files and subsections
+                        if !include_index && order.iter().any(|idx| *idx == u16::MAX) {
+                            None
+                        } else {
+                            Some((path, bid))
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default())
@@ -2128,9 +2120,10 @@ impl BeliefSource for &BeliefBase {
         Ok(self.evaluate_expression(expr))
     }
 
-    async fn get_network_paths(
+    async fn get_all_paths(
         &self,
         network_bid: Bid,
+        include_index: bool,
     ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
         Ok(self
             .paths()
@@ -2138,23 +2131,16 @@ impl BeliefSource for &BeliefBase {
             .map(|pm| {
                 pm.recursive_map(&self.paths(), &mut BTreeSet::default())
                     .into_iter()
-                    .map(|(path, bid, _order)| (path, bid))
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
-    async fn get_all_document_paths(
-        &self,
-        network_bid: Bid,
-    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
-        Ok(self
-            .paths()
-            .get_map(&network_bid.bref())
-            .map(|pm| {
-                pm.all_paths_with_bids(&self.paths(), &mut BTreeSet::default())
-                    .into_iter()
-                    .filter(|(path, _bid)| !path.is_empty())
+                    .filter_map(|(path, bid, order)| {
+                        // Filter out network index files and subsections
+                        if path.is_empty()
+                            || !include_index && order.iter().any(|idx| *idx == u16::MAX)
+                        {
+                            None
+                        } else {
+                            Some((path, bid))
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default())

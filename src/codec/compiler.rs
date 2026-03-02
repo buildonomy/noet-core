@@ -311,7 +311,7 @@ impl DocumentCompiler {
         } else {
             self.finalize().await?;
             let Some(path) = self.primary_queue.front().cloned() else {
-                tracing::info!("[Compiler] No cached assets to verify, parsing complete");
+                tracing::debug!("[Compiler] No cached assets to verify, parsing complete");
                 return Ok(None);
             };
             path
@@ -323,7 +323,7 @@ impl DocumentCompiler {
         if parse_count >= self.max_reparse_count {
             // Max retries reached - remove from queues and return with error diagnostic
             self.remove_from_queues(&path);
-            tracing::warn!(
+            tracing::debug!(
                 "[Compiler] Max reparse limit reached for {:?} ({} attempts)",
                 path,
                 parse_count
@@ -333,19 +333,13 @@ impl DocumentCompiler {
                 path: path.clone(),
                 rewritten_content: None,
                 dependent_paths: Vec::new(),
-                diagnostics: vec![crate::codec::ParseDiagnostic::parse_error(
-                    format!(
-                        "{:?}: Max reparse limit ({}) reached",
-                        path, self.max_reparse_count
-                    ),
-                    parse_count,
-                )],
+                diagnostics: vec![ParseDiagnostic::ReparseLimitExceeded],
             }));
         }
 
         // 2b. Increment parse count
         *self.processed.entry(path.clone()).or_insert(0) += 1;
-        tracing::info!(
+        tracing::debug!(
             "\n \
             Parsing file {}\n \
             ============={}\n \
@@ -434,7 +428,7 @@ impl DocumentCompiler {
         // 7. Write rewritten content if available
         if let Some(contents) = parse_result.rewritten_content.as_ref() {
             if self.write {
-                tracing::info!("[Compiler] Writing rewritten content to {:?}", file_path);
+                tracing::debug!("[Compiler] Writing rewritten content to {:?}", file_path);
                 if let Err(e) = tokio::fs::write(&file_path, contents).await {
                     // Write error - add as warning but continue
                     parse_result
@@ -615,16 +609,13 @@ impl DocumentCompiler {
         );
 
         let mut stale_files = if force {
-            tracing::info!(
+            tracing::debug!(
                 "Force re-parse enabled, will re-parse {} files",
                 doc_paths.len()
             );
             doc_paths
         } else {
-            // Query cached mtimes
-            let cached_mtimes = cache.get_file_mtimes().await?;
             let mut stale = Vec::new();
-
             for path in doc_paths {
                 // Check current filesystem mtime
                 match fs::metadata(&path) {
@@ -640,7 +631,7 @@ impl DocumentCompiler {
 
                         if let Some(cached_mtime) = cached_mtimes.get(&path) {
                             if current_mtime > *cached_mtime {
-                                tracing::info!(
+                                tracing::debug!(
                                     "File modified: {} (cached: {}, current: {})",
                                     path.display(),
                                     cached_mtime,
@@ -667,7 +658,7 @@ impl DocumentCompiler {
                         let mut parent = path.as_path();
                         while let Some(p) = parent.parent() {
                             if detect_network_file(p).is_some() {
-                                tracing::info!(
+                                tracing::debug!(
                                     "Enqueueing parent network for deleted file: {}",
                                     p.display()
                                 );
@@ -713,7 +704,7 @@ impl DocumentCompiler {
             } else {
                 "modified/deleted files, will re-parse"
             };
-            tracing::info!("Found {} files to {}", stale_files.len(), action);
+            tracing::debug!("Found {} files to {}", stale_files.len(), action);
 
             for path in stale_files {
                 self.enqueue(path);
@@ -775,7 +766,7 @@ impl DocumentCompiler {
             let has_parse_error = result
                 .diagnostics
                 .iter()
-                .any(|d| matches!(d, ParseDiagnostic::ParseError { .. }));
+                .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
             if has_unresolved {
                 last_unresolved_idx.insert(result.path.clone(), idx);
             } else if !has_parse_error {
@@ -866,8 +857,9 @@ impl DocumentCompiler {
                         } else {
                             format!("{}: unresolved link — tried [{}]", path_str, keys_str)
                         };
-                        promoted.push(crate::codec::ParseDiagnostic::warning(msg));
+                        promoted.push(ParseDiagnostic::warning(msg));
                     }
+                    ParseDiagnostic::ReparseLimitExceeded => {}
                     other => promoted.push(other),
                 }
             }
@@ -1030,18 +1022,16 @@ impl DocumentCompiler {
 
     async fn finalize(&mut self) -> Result<(), BuildonomyError> {
         // Both queues empty - check if there are cached assets to verify
-        tracing::info!("[Compiler] Both queues empty, checking for cached assets");
+        tracing::debug!("[Compiler] Both queues empty, checking for cached assets");
 
         // Query session_bb for assets discovered during this parse session
         // (mtime-based invalidation via check_stale_files handles cached assets)
         let assets: Vec<(String, Bid)> = self
             .builder
             .session_bb()
-            .get_network_paths(asset_namespace())
+            .get_all_paths(asset_namespace(), false)
             .await
             .unwrap_or_default();
-
-        tracing::info!("[Compiler] Found {} cached assets to check", assets.len());
 
         // Enqueue any assets not yet processed in this session
         let mut newly_enqueued = 0;
@@ -1057,7 +1047,7 @@ impl DocumentCompiler {
                 .join(string_to_os_path(repo_relative_path));
 
             if !self.processed.contains_key(&asset_absolute_path) {
-                tracing::info!(
+                tracing::debug!(
                     "[Compiler] Enqueuing cached asset for content check: {:?}",
                     asset_absolute_path
                 );
@@ -1067,7 +1057,7 @@ impl DocumentCompiler {
         }
 
         if newly_enqueued > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "[Compiler] Enqueued {} cached assets for content verification",
                 newly_enqueued
             );
@@ -1077,13 +1067,12 @@ impl DocumentCompiler {
             if self.html_output_dir().is_some() {
                 self.generate_spa_shell().await?;
             }
+            tracing::debug!(
+                "State of session_bb at finalize:\n{}\n{}",
+                self.builder().session_bb().clone().consume(),
+                self.builder().session_bb().paths()
+            );
         }
-
-        tracing::debug!(
-            "State of session_bb at finalize:\n{}\n{}",
-            self.builder().session_bb().clone().consume(),
-            self.builder().session_bb().paths()
-        );
 
         Ok(())
     }
@@ -1117,7 +1106,7 @@ impl DocumentCompiler {
 
         // Query synchronized global_bb for asset manifest
         let asset_manifest: BTreeMap<String, Bid> = global_bb
-            .get_all_document_paths(asset_namespace())
+            .get_all_paths(asset_namespace(), false)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1155,7 +1144,7 @@ impl DocumentCompiler {
         let parse_count = self.processed.get(&path).copied().unwrap_or(0);
 
         // This is an asset file - process it as a static asset
-        tracing::info!("[Compiler] Detected asset file: {:?}", file_path);
+        tracing::debug!("[Compiler] Detected asset file: {:?}", file_path);
 
         // Read file bytes and compute SHA256 hash
         let file_bytes = match tokio::fs::read(&file_path).await {
@@ -1217,7 +1206,7 @@ impl DocumentCompiler {
             }
             Some((bid, existing_hash)) => {
                 // Path exists with DIFFERENT hash → Content changed
-                tracing::info!(
+                tracing::debug!(
                     "[Compiler] Asset content changed: {:?} (BID: {}, old hash: {}, new hash: {})",
                     repo_relative_path,
                     bid,
@@ -1229,7 +1218,7 @@ impl DocumentCompiler {
             None => {
                 // Path doesn't exist → New asset, generate stable UUID
                 let new_bid = Bid::new(asset_namespace());
-                tracing::info!(
+                tracing::debug!(
                     "[Compiler] New asset discovered: {:?} (BID: {})",
                     repo_relative_path,
                     new_bid
@@ -1327,7 +1316,7 @@ impl DocumentCompiler {
                 .tx()
                 .send(BeliefEvent::FileParsed(path.clone()))?;
 
-            tracing::info!(
+            tracing::debug!(
                 "[Compiler] Asset processed successfully: {:?}",
                 repo_relative_path
             );
@@ -1393,7 +1382,7 @@ impl DocumentCompiler {
 
             if !asset_already_tracked {
                 // Asset not yet in session_bb - document needs reparse after asset loads
-                tracing::info!(
+                tracing::debug!(
                     "[Compiler] Document {:?} references untracked asset: {:?}",
                     path,
                     asset_absolute_path
@@ -1616,7 +1605,7 @@ impl DocumentCompiler {
         // Write to file
         tokio::fs::write(&json_path, json_string).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Exported BeliefGraph to {} ({:.2} MB, {} states, {} relations)",
             json_path.display(),
             file_size_mb,
@@ -1636,7 +1625,7 @@ impl DocumentCompiler {
         crate::codec::assets::extract_assets(html_output_dir, use_cdn)?;
 
         let mode = if use_cdn { "CDN" } else { "local" };
-        tracing::info!(
+        tracing::debug!(
             "Extracted static assets to {}/assets (mode: {})",
             html_output_dir.display(),
             mode
@@ -1667,13 +1656,13 @@ impl DocumentCompiler {
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[generate_deferred_html] Generating HTML for {} deferred network files",
             self.deferred_html.len()
         );
 
         for file_path in self.deferred_html.iter() {
-            tracing::info!(
+            tracing::debug!(
                 "[generate_deferred_html] Generating HTML for file at path={:?}",
                 file_path
             );
@@ -1747,7 +1736,7 @@ impl DocumentCompiler {
         let index_path = html_output_dir.join("index.html");
         tokio::fs::write(&index_path, html).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "[generate_spa_shell] Wrote SPA shell: {}",
             index_path.display()
         );
@@ -1768,11 +1757,11 @@ impl DocumentCompiler {
         // Get all document paths from the repository network (including subnets)
         let repo_bid = self.builder.repo();
         let document_paths: Vec<(String, Bid)> = global_bb
-            .get_all_document_paths(repo_bid)
+            .get_all_paths(repo_bid, true)
             .await
             .unwrap_or_default();
 
-        tracing::info!(
+        tracing::debug!(
             "[generate_sitemap] Found {} document paths for sitemap",
             document_paths.len()
         );
@@ -1835,7 +1824,7 @@ impl DocumentCompiler {
         let sitemap_path = html_output_dir.join("sitemap.xml");
         tokio::fs::write(&sitemap_path, sitemap).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "[generate_sitemap] Wrote sitemap: {}",
             sitemap_path.display()
         );
@@ -2014,7 +2003,7 @@ impl DocumentCompiler {
             return Ok(());
         };
 
-        tracing::info!(
+        tracing::debug!(
             "[Compiler] Creating asset hardlinks for {} assets",
             manifest_data.len()
         );
@@ -2120,7 +2109,7 @@ impl DocumentCompiler {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[Compiler] Asset hardlinks created: {} unique files, {} total paths",
             copied_canonical.len(),
             manifest_data.len()

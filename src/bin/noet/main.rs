@@ -31,7 +31,7 @@
 use clap::{Parser, Subcommand};
 #[cfg(feature = "service")]
 mod dev_server;
-use noet_core::codec::compiler::DocumentCompiler;
+use noet_core::codec::{compiler::DocumentCompiler, diagnostic::ParseDiagnostic};
 #[cfg(feature = "service")]
 use noet_core::event::Event;
 #[cfg(feature = "service")]
@@ -308,11 +308,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for result in &parse_results {
                     for diagnostic in &result.diagnostics {
                         match diagnostic {
-                            noet_core::codec::ParseDiagnostic::Warning(msg) => {
+                            ParseDiagnostic::Warning(msg) => {
                                 eprintln!("warning: {msg}");
                                 warning_count += 1;
                             }
-                            noet_core::codec::ParseDiagnostic::ParseError {
+                            ParseDiagnostic::ReparseLimitExceeded => {
+                                eprintln!("\"{:?}\": Reparse limit exceeded", result.path);
+                            }
+                            ParseDiagnostic::ParseError {
                                 message,
                                 attempt_count,
                             } => {
@@ -324,14 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 error_count += 1;
                             }
-                            noet_core::codec::ParseDiagnostic::Info(msg) => {
+                            ParseDiagnostic::Info(msg) => {
                                 if verbose {
                                     eprintln!("info: {msg}");
                                 }
                             }
                             // UnresolvedReference entries that survive to this point are
                             // compiler-internal sink dependencies; not shown to the author.
-                            noet_core::codec::ParseDiagnostic::UnresolvedReference(_) => {}
+                            ParseDiagnostic::UnresolvedReference(_) => {}
                         }
                     }
                 }

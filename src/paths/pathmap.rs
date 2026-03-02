@@ -1185,36 +1185,6 @@ impl PathMap {
         paths
     }
 
-    /// Return a list of all paths with their BIDs connected to this subnet
-    pub fn all_paths_with_bids(
-        &self,
-        nets: &PathMapMap,
-        visited: &mut BTreeSet<Bid>,
-    ) -> Vec<(String, Bid)> {
-        let mut paths = Vec::default();
-        if visited.contains(&self.net) {
-            return paths;
-        }
-        visited.insert(self.net);
-        for (a_path, a_bid, _order) in self.map.iter() {
-            if nets.nets().contains(a_bid) && !visited.contains(a_bid) {
-                if let Some(sub_paths) = nets
-                    .get_map(&a_bid.bref())
-                    .map(|pm| pm.all_paths_with_bids(nets, visited))
-                {
-                    let a_ap = AnchorPath::from(a_path);
-                    for (subnet_path, subnet_bid) in sub_paths.iter() {
-                        paths.push((a_ap.join(subnet_path).into_string(), *subnet_bid));
-                    }
-                }
-            } else {
-                paths.push((a_path.clone(), *a_bid));
-            }
-        }
-
-        paths
-    }
-
     /// Return a list of all networks connected to this subnet (always includes self as ("", self.net))
     pub fn recursive_map(
         &self,

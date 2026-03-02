@@ -250,7 +250,11 @@ impl DocCodec for NetworkCodec {
                 let link_ap = AnchorPath::from(&edge.root_path);
                 // Normalize document links to .html extension
                 if CODECS.get(&link_ap).is_some() {
-                    link_path = link_ap.replace_extension("html");
+                    if link_ap.is_dir() {
+                        link_path = link_ap.join("index.html").into_string();
+                    } else {
+                        link_ap.replace_extension("html");
+                    }
                 }
 
                 let title = edge.other.display_title();

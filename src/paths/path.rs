@@ -197,6 +197,10 @@ impl<'a> AnchorPath<'a> {
         self.anc_sep.filter(|idx| *idx == 0).is_some()
     }
 
+    pub fn is_dir(&self) -> bool {
+        self.ext_sep.is_none()
+    }
+
     /// Check if this path has a URL schema (e.g., `http:`, `file:`, `https:`)
     ///
     /// # Examples
