@@ -116,7 +116,7 @@ fn link_to_relation(
 #[derive(Debug, Clone)]
 struct LinkAccumulator {
     link_type: LinkType,
-    dest_url: CowStr<'static>,
+    rel_url: CowStr<'static>,
     id: CowStr<'static>,
     range: Option<Range<usize>>,
     title_events: Vec<MdEvent<'static>>,
@@ -135,7 +135,7 @@ impl LinkAccumulator {
                 ..
             }) => Some(LinkAccumulator {
                 link_type: *link_type,
-                dest_url: dest_url.clone().into_static(),
+                rel_url: dest_url.clone().into_static(),
                 id: id.clone().into_static(),
                 range: range.clone(),
                 title_events: vec![],
@@ -149,7 +149,7 @@ impl LinkAccumulator {
                 title,
             }) => Some(LinkAccumulator {
                 link_type: *link_type,
-                dest_url: dest_url.clone().into_static(),
+                rel_url: dest_url.clone().into_static(),
                 id: id.clone().into_static(),
                 range: range.clone(),
                 title_events: vec![],
@@ -372,7 +372,7 @@ fn check_for_link_and_push(
                 let title = CowStr::from(link_text.clone());
                 if let Some(parsed_key) = link_to_relation(
                     &link_data.link_type,
-                    &link_data.dest_url,
+                    &link_data.rel_url,
                     &title,
                     &link_data.id,
                 ) {
@@ -386,14 +386,14 @@ fn check_for_link_and_push(
                     let start_event = if link_data.is_image {
                         MdEvent::Start(MdTag::Image {
                             link_type: link_data.link_type,
-                            dest_url: link_data.dest_url,
+                            dest_url: link_data.rel_url,
                             title: link_data.title,
                             id: link_data.id,
                         })
                     } else {
                         MdEvent::Start(MdTag::Link {
                             link_type: link_data.link_type,
-                            dest_url: link_data.dest_url,
+                            dest_url: link_data.rel_url,
                             title: link_data.title,
                             id: link_data.id,
                         })
@@ -441,8 +441,8 @@ fn check_for_link_and_push(
                 normalized_abs.regularize_unchecked(ctx.root_net, &ctx.root_path, root_abs_path);
             let keys = vec![regularized];
 
-            // Check both sources (upstream) and sinks (downstream) for the link target Assets and
-            // document links are sources (upstream), but its possible they're upstream as well
+            // Check sources (upstream) for the link target. Assets and document links are sources
+            // (upstream)
             let sources = ctx.sources();
 
             let maybe_keyed_relation = keys.iter().find_map(|link_key| {
@@ -472,11 +472,17 @@ fn check_for_link_and_push(
                     let ctx_ap = AnchorPath::from(&ctx.root_path);
 
                     let mut relative_path = ctx_ap.path_to(&relation.root_path, true);
-                    let relative_ap = AnchorPath::from(&relation.root_path);
+                    let relative_ap = AnchorPath::from(&relative_path);
 
-                    if let Some(id) = relation.other.id.as_deref() {
-                        relative_path = relative_ap.join(as_anchor(id)).into();
+                    if relation.other.kind.is_anchor() {
+                        if let Some(id) = relation.other.id.as_deref() {
+                            relative_path = relative_ap.join(as_anchor(id)).into();
+                        }
                     }
+                    tracing::debug!(
+                        "path_to(from: {ctx_ap}, -> to: {}) => {relative_path}",
+                        relation.root_path
+                    );
                     relative_path
                 };
 
@@ -512,26 +518,26 @@ fn check_for_link_and_push(
                 };
 
                 // 5. Check if link changed
-                if link_data.dest_url.as_ref() != relative_path
+                if link_data.rel_url.as_ref() != relative_path
                     || link_data.title.as_ref() != new_title_attr
                     || link_text != new_link_text
                 {
                     changed = true;
-                    link_data.dest_url = CowStr::from(relative_path);
+                    link_data.rel_url = CowStr::from(relative_path);
                     link_data.title_events = vec![MdEvent::Text(CowStr::from(new_link_text))];
                 }
 
                 let start_event = if link_data.is_image {
                     MdEvent::Start(MdTag::Image {
                         link_type: link_data.link_type,
-                        dest_url: link_data.dest_url,
+                        dest_url: link_data.rel_url,
                         title: CowStr::from(new_title_attr),
                         id: link_data.id,
                     })
                 } else {
                     MdEvent::Start(MdTag::Link {
                         link_type: link_data.link_type,
-                        dest_url: link_data.dest_url,
+                        dest_url: link_data.rel_url,
                         title: CowStr::from(new_title_attr),
                         id: link_data.id,
                     })
@@ -557,14 +563,14 @@ fn check_for_link_and_push(
                 let start_event = if link_data.is_image {
                     MdEvent::Start(MdTag::Image {
                         link_type: link_data.link_type,
-                        dest_url: link_data.dest_url,
+                        dest_url: link_data.rel_url,
                         title: link_data.title,
                         id: link_data.id,
                     })
                 } else {
                     MdEvent::Start(MdTag::Link {
                         link_type: link_data.link_type,
-                        dest_url: link_data.dest_url,
+                        dest_url: link_data.rel_url,
                         title: link_data.title,
                         id: link_data.id,
                     })
@@ -1447,14 +1453,14 @@ impl DocCodec for MdCodec {
                 );
                 if let Some(node_key) = link_to_relation(
                     &link_data.link_type,
-                    &link_data.dest_url,
+                    &link_data.rel_url,
                     &CowStr::from(link_data.title_string()),
                     &link_data.id.clone(),
                 ) {
                     let node_key = node_key.resolve_against(&current.path);
                     let title = link_data.title_string();
                     let payload = if !title.is_empty()
-                        && title != link_data.dest_url.as_ref()
+                        && title != link_data.rel_url.as_ref()
                         && title != link_data.id.as_ref()
                     {
                         let mut weight = Weight::default();

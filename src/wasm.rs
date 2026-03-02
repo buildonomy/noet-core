@@ -885,8 +885,8 @@ impl BeliefBaseWasm {
     /// const href_bid = BeliefBaseWasm.href_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn href_namespace() -> String {
-        href_namespace().to_string()
+    pub fn href_namespace() -> BidBrefResult {
+        BidBrefResult(href_namespace())
     }
 
     /// Get asset namespace BID (images/PDFs/attachments tracking network)
@@ -898,8 +898,8 @@ impl BeliefBaseWasm {
     /// const asset_bid = BeliefBaseWasm.asset_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn asset_namespace() -> String {
-        asset_namespace().to_string()
+    pub fn asset_namespace() -> BidBrefResult {
+        BidBrefResult(asset_namespace())
     }
 
     /// Get buildonomy namespace BID (API node for version management)
@@ -911,8 +911,8 @@ impl BeliefBaseWasm {
     /// const api_bid = BeliefBaseWasm.buildonomy_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn buildonomy_namespace() -> String {
-        buildonomy_namespace().to_string()
+    pub fn buildonomy_namespace() -> BidBrefResult {
+        BidBrefResult(buildonomy_namespace())
     }
 
     /// Get all network path maps for navigation tree generation
