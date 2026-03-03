@@ -11,6 +11,13 @@
  *   First click  → showMetadataPanel(bid)  [via callbacks.showMetadataPanel]
  *   Second click → openImageModal(img)
  *
+ * External asset highlighting (highlightExternalInContent):
+ *   Called from the metadata panel when the user clicks a relation link that
+ *   points to an asset or external href embedded in the content. Searches the
+ *   article for any element whose src or href contains the given path —
+ *   covering <img>, <a href="...pdf">, and plain anchor hrefs — then scrolls
+ *   to and highlights the first match.
+ *
  * Circular-import note:
  *   showMetadataPanel lives in metadata.js. Rather than importing it directly
  *   (which would create a metadata↔content cycle through routing), it is
@@ -74,22 +81,60 @@ export function highlightElementById(elementId) {
 }
 
 /**
- * Highlight an asset (image) in the main content area and scroll it into view.
- * @param {string} assetPath - Partial or full path matching the image src
+ * Highlight an external element in the currently loaded article content and
+ * scroll it into view.
+ *
+ * Every link and image produced by the content pipeline carries a
+ * `title="bref://..."` attribute. We resolve `targetBid` against those title
+ * attributes so the lookup works uniformly for images, PDF anchors, and
+ * external href anchors without having to match against src/href substrings.
+ *
+ * For <img> elements the highlight is applied to the closest
+ * .noet-image-wrapper ancestor (if present) so the CSS outline covers the
+ * whole wrapper, not just the bare <img>.
+ *
+ * @param {string} targetBid - BID of the external node to locate in the article
+ * @returns {boolean} true if a matching element was found and highlighted
  */
-export function highlightAssetInContent(assetPath) {
-  if (!state.contentElement) return;
+export function highlightExternalInContent(targetBid) {
+  if (!state.contentElement || !targetBid || !state.beliefbase) return false;
 
-  const images = state.contentElement.querySelectorAll("img");
-  for (const img of images) {
-    if (img.src.includes(assetPath) || img.getAttribute("src") === assetPath) {
-      const wrapper = img.closest(".noet-image-wrapper") || img;
-      clearSelectedLinkHighlight();
-      wrapper.classList.add("noet-link-selected");
-      wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
-      break;
-    }
+  const article = state.contentElement.querySelector("article") || state.contentElement;
+
+  // Every pipeline-generated link/image has title="bref://... [optional metadata]"
+  // Select all elements that could carry such a title.
+  const candidates = article.querySelectorAll("[title]");
+
+  console.log(
+    `[Noet] highlightExternalInContent: searching for BID: ${targetBid}, candidates: ${candidates.length}`,
+  );
+  for (const el of candidates) {
+    const title = el.getAttribute("title") || "";
+    if (!title.includes("bref://")) continue;
+
+    // Resolve the bref in the title to a BID and compare
+    const brefMatch = title.match(/bref:\/\/(\S+)/);
+    if (!brefMatch) continue;
+
+    const resolvedBid = state.beliefbase.get_bid_from_bref(brefMatch[1]);
+    console.log(
+      `[Noet] highlightExternalInContent: candidate <${el.tagName.toLowerCase()}> bref=${brefMatch[1]} -> resolvedBid=${resolvedBid} (match=${resolvedBid === targetBid})`,
+      el,
+    );
+    if (resolvedBid !== targetBid) continue;
+
+    // Match found — determine the highlight target
+    const highlightTarget = el.tagName === "IMG" ? el.closest(".noet-image-wrapper") || el : el;
+
+    console.log(`[Noet] highlightExternalInContent: matched, highlighting`, highlightTarget);
+    clearSelectedLinkHighlight();
+    highlightTarget.classList.add("noet-link-selected");
+    highlightTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+    return true;
   }
+
+  console.warn(`[Noet] highlightExternalInContent: no element found for BID: ${targetBid}`);
+  return false;
 }
 
 // =============================================================================
@@ -187,9 +232,6 @@ function injectHeaderAnchors(article) {
     // Skip if anchor already injected
     if (header.querySelector(".noet-header-anchor")) return;
 
-    // Resolve the current document path for constructing the href
-    const currentPath = getCurrentDocPath();
-
     // Attempt to resolve section bref via WASM for two-click support
     let sectionBref = null;
     if (state.beliefbase) {
@@ -202,7 +244,7 @@ function injectHeaderAnchors(article) {
 
     const anchor = document.createElement("a");
     anchor.className = "noet-header-anchor";
-    anchor.href = currentPath ? `${currentPath}#${headerId}` : `#${headerId}`;
+    anchor.href = `#${headerId}`;
     anchor.textContent = "🔗";
     anchor.setAttribute("aria-label", "Link to this section");
 

@@ -104,6 +104,27 @@ export const state = {
   isFirstNavRender: true,
 
   /**
+   * The docPathKey of the currently loaded document (e.g. "file1.html" or
+   * "subnet1/subnet1_file1.html"), or null if no document has been successfully
+   * fetched yet. Null serves the same purpose as the former `documentLoaded`
+   * boolean — distinguishing the shell's placeholder <article> (present on
+   * force-refresh before loadDocument() completes) from real loaded content.
+   * Set on successful loadDocument(); reset to null at the start of each load.
+   * Used by handleHashChange for same-doc short-circuit without re-reading
+   * window.location.hash (which already reflects the new target by the time
+   * hashchange fires).
+   */
+  currentDocPath: null,
+
+  /**
+   * Asset/href node BID to highlight in content once the next document load
+   * completes. Set by the metadata panel external link handler when the owner
+   * document is not currently loaded. Consumed by loadDocument() after content
+   * is injected and post-processed.
+   */
+  pendingHighlightPath: null,
+
+  /**
    * BID to show in the metadata panel once the next navigation completes.
    * Set before a hash change is triggered so the handler can pick it up.
    */
@@ -141,4 +162,11 @@ export const callbacks = {
    * @type {((href: string, link: HTMLElement, targetBid: string|null) => void)|null}
    */
   navigateToLink: null,
+
+  /**
+   * Highlight an external asset (image, PDF link, or href anchor) in the
+   * currently loaded content and scroll it into view.
+   * @type {((assetPath: string) => void)|null}
+   */
+  highlightExternalInContent: null,
 };

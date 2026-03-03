@@ -591,6 +591,11 @@ pub const WEIGHT_DOC_PATH: &str = "doc_path";
 /// Key for storing document paths in Weight payload (supports multiple paths per relation)
 pub const WEIGHT_DOC_PATHS: &str = "doc_paths";
 
+/// Key for storing the link display text in Weight payload.
+/// Set during markdown parse when the author writes custom link text (e.g., `[My Label](target.md)`).
+/// Only present when the link text differs from the target node's title.
+pub const WEIGHT_LINK_TITLE: &str = "title";
+
 impl Weight {
     pub fn full() -> Weight {
         let mut weight = Weight {

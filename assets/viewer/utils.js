@@ -19,6 +19,19 @@ export function escapeHtml(text) {
 }
 
 /**
+ * Extract the bref from a BID string.
+ * A bref is the last 12 hex characters of the UUID with hyphens stripped.
+ * e.g. "1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb" → "0e90d9cb2fdb"
+ * @param {string} bid - BID string
+ * @returns {string} bref (12 hex chars) or empty string if invalid
+ */
+export function brefFromBid(bid) {
+  if (!bid || typeof bid !== "string") return "";
+  const hex = bid.replace(/-/g, "");
+  return hex.slice(-12);
+}
+
+/**
  * Format BID for display — shows first 8 and last 4 characters.
  * Full BID is preserved in the value; this is display-only truncation.
  * @param {string} bid - BID string

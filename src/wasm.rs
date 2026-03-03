@@ -109,6 +109,57 @@ use wasm_bindgen::prelude::*;
 use web_sys::console;
 
 #[cfg(feature = "wasm")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "wasm")]
+use tracing_subscriber::reload;
+
+// Reload handle for runtime log level control.
+// Stores the handle as a type-erased boxed trait so we don't expose the full
+// subscriber type in the module signature.
+#[cfg(feature = "wasm")]
+static LOG_LEVEL_HANDLE: OnceLock<
+    reload::Handle<tracing_subscriber::filter::LevelFilter, tracing_subscriber::Registry>,
+> = OnceLock::new();
+
+/// Initialise the tracing→console subscriber.
+///
+/// Called automatically via `#[wasm_bindgen(start)]`. Safe to call multiple
+/// times — subsequent calls are no-ops.
+///
+/// Default log level:
+/// - **debug builds** (`debug_assertions` on): `DEBUG`
+/// - **release builds**: `WARN`
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(start)]
+pub fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+
+    #[cfg(debug_assertions)]
+    let default_level = tracing_subscriber::filter::LevelFilter::DEBUG;
+    #[cfg(not(debug_assertions))]
+    let default_level = tracing_subscriber::filter::LevelFilter::WARN;
+
+    let wasm_layer = tracing_wasm::WASMLayer::new(
+        tracing_wasm::WASMLayerConfigBuilder::new()
+            .set_max_level(tracing::Level::TRACE) // actual gate is the reload filter below
+            .build(),
+    );
+
+    let (filter, handle) = reload::Layer::new(default_level);
+
+    // Ignore error — if a subscriber is already set (e.g. in tests) we just skip.
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(wasm_layer)
+        .try_init();
+
+    // Store handle regardless of whether try_init succeeded; on failure the
+    // OnceLock stays empty and set_log_level becomes a no-op.
+    let _ = LOG_LEVEL_HANDLE.set(handle);
+}
+
+#[cfg(feature = "wasm")]
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
     nodekey::NodeKey,
@@ -119,44 +170,35 @@ use crate::{
     query::{Expression, StatePred},
 };
 
-/// Result containing both BID and bref for a node
+/// Plain serialisable result returned as a JS object `{ bid, bref }`.
+///
+/// Returned as `JsValue` (via `serde_wasm_bindgen::to_value`) so JavaScript
+/// receives a real plain object rather than an opaque wasm-bindgen handle.
+///
+/// # JavaScript Example
+/// ```javascript,ignore
+/// const result = beliefbase.entryPoint();
+/// console.log(result.bid);   // "1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb"
+/// console.log(result.bref);  // "0e90d9cb2fdb"
+/// ```
 #[cfg(feature = "wasm")]
-#[wasm_bindgen]
+#[derive(serde::Serialize)]
 pub struct BidBrefResult {
-    bid: Bid,
+    pub bid: String,
+    pub bref: String,
 }
 
 #[cfg(feature = "wasm")]
-#[wasm_bindgen]
 impl BidBrefResult {
-    /// Create a new BidBrefResult from a BID string
-    ///
-    /// # JavaScript Example
-    /// ```javascript,ignore
-    /// // Static method, not constructor
-    /// const result = BidBrefResult.from_bid_string("1f10cfd9-1cc3-6a93-86f9-0e90d9cb2fdb");
-    /// if (result) {
-    ///     console.log(result.bid, result.bref);
-    /// }
-    /// ```
-    pub fn from_bid_string(bid_str: String) -> Option<BidBrefResult> {
-        match Bid::try_from(bid_str.as_str()) {
-            Ok(bid) => Some(BidBrefResult { bid }),
-            Err(_) => {
-                console::warn_1(&format!("⚠️ Invalid BID format: {}", bid_str).into());
-                None
-            }
+    pub fn from_bid(bid: Bid) -> Self {
+        BidBrefResult {
+            bid: bid.to_string(),
+            bref: bid.bref().to_string(),
         }
     }
 
-    #[wasm_bindgen(getter)]
-    pub fn bid(&self) -> String {
-        self.bid.to_string()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn bref(&self) -> String {
-        self.bid.bref().to_string()
+    pub fn to_js(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap_or(JsValue::NULL)
     }
 }
 
@@ -224,6 +266,9 @@ pub struct RelatedNode {
     pub home_net: Bid,
     /// Path relative to the home network root
     pub root_path: String,
+    /// The link display text stored on the edge during parse, if it differed from the target's title.
+    /// Use as fallback when `node.title` is empty: `node.title || link_title || node.bid`
+    pub link_title: Option<String>,
 }
 
 /// See `docs/design/interactive_viewer.md` § WASM Integration for specification.
@@ -257,6 +302,8 @@ pub struct PathParts {
     path: String,
     filename: String,
     anchor: String,
+    has_schema: bool,
+    schema: String,
 }
 
 #[cfg(feature = "wasm")]
@@ -276,6 +323,21 @@ impl PathParts {
     pub fn anchor(&self) -> String {
         self.anchor.clone()
     }
+
+    /// Whether the path contains a URL schema (e.g. `https`, `file`, `mailto`).
+    /// True for any path of the form `schema:...` — use this to distinguish
+    /// external URLs from internal document paths before attempting path joining.
+    #[wasm_bindgen(getter, js_name = hasSchema)]
+    pub fn has_schema(&self) -> bool {
+        self.has_schema
+    }
+
+    /// The schema portion of the path (e.g. `"https"` for `https://example.com`).
+    /// Returns an empty string when `has_schema` is false.
+    #[wasm_bindgen(getter)]
+    pub fn schema(&self) -> String {
+        self.schema.clone()
+    }
 }
 
 /// WASM wrapper around BeliefBase for browser use
@@ -291,18 +353,40 @@ pub struct BeliefBaseWasm {
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl BeliefBaseWasm {
-    /// Get the entry point as a BidBrefResult
+    /// Set the WASM tracing log level at runtime.
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
-    /// const entryPoint = beliefbase.entry_point();
+    /// BeliefBaseWasm.set_log_level("debug");  // verbose
+    /// BeliefBaseWasm.set_log_level("info");
+    /// BeliefBaseWasm.set_log_level("warn");   // default in release builds
+    /// BeliefBaseWasm.set_log_level("error");
+    /// BeliefBaseWasm.set_log_level("off");    // silence all tracing
+    /// ```
+    #[wasm_bindgen]
+    pub fn set_log_level(level: &str) {
+        use std::str::FromStr;
+        let filter = tracing_subscriber::filter::LevelFilter::from_str(level)
+            .unwrap_or(tracing_subscriber::filter::LevelFilter::WARN);
+        if let Some(handle) = LOG_LEVEL_HANDLE.get() {
+            if let Err(e) = handle.modify(|f| *f = filter) {
+                console::warn_1(&format!("⚠️ Failed to set log level: {e}").into());
+            } else {
+                console::log_1(&format!("[Noet] Log level set to: {level}").into()).into()
+            }
+        }
+    }
+
+    /// Get the entry point as a plain JS object `{ bid, bref }`.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const entryPoint = beliefbase.entryPoint();
     /// console.log(entryPoint.bid, entryPoint.bref);
     /// ```
     #[wasm_bindgen(js_name = entryPoint)]
-    pub fn entry_point(&self) -> BidBrefResult {
-        BidBrefResult {
-            bid: self.entry_point_bid,
-        }
+    pub fn entry_point(&self) -> JsValue {
+        BidBrefResult::from_bid(self.entry_point_bid).to_js()
     }
 }
 
@@ -340,6 +424,8 @@ impl BeliefBaseWasm {
             path: anchor_path.dir().to_string(),
             filename: anchor_path.filename().to_string(),
             anchor: anchor_path.anchor().to_string(),
+            has_schema: anchor_path.has_schema(),
+            schema: anchor_path.schema().to_string(),
         }
     }
 
@@ -660,12 +746,12 @@ impl BeliefBaseWasm {
     /// }
     /// ```
     #[wasm_bindgen]
-    pub fn get_bid_from_id(&self, net_bref: String, id: String) -> Option<BidBrefResult> {
+    pub fn get_bid_from_id(&self, net_bref: String, id: String) -> JsValue {
         let bref = match Bref::try_from(net_bref.as_str()) {
             Ok(b) => b,
             Err(_) => {
                 console::warn_1(&format!("⚠️ Invalid bref format: {}", net_bref).into());
-                return None;
+                return JsValue::NULL;
             }
         };
 
@@ -683,14 +769,13 @@ impl BeliefBaseWasm {
                     .into(),
                 );
 
-                // Return struct with bid (bref computed on demand)
-                Some(BidBrefResult { bid: node_bid })
+                BidBrefResult::from_bid(node_bid).to_js()
             }
             None => {
                 console::warn_1(
                     &format!("⚠️ No node found with id '{}' in network {}", id, bref).into(),
                 );
-                None
+                JsValue::NULL
             }
         }
     }
@@ -782,7 +867,8 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: ext_rel.root_path.clone(),
+                    root_path: crate::codec::normalize_path_extension_impl(&ext_rel.root_path),
+                    link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
 
@@ -803,7 +889,8 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: ext_rel.root_path.clone(),
+                    root_path: crate::codec::normalize_path_extension_impl(&ext_rel.root_path),
+                    link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
 
@@ -836,7 +923,7 @@ impl BeliefBaseWasm {
 
             NodeContext {
                 node: ctx.node.clone(),
-                root_path: ctx.root_path.clone(),
+                root_path: crate::codec::normalize_path_extension_impl(&ctx.root_path),
                 home_net: ctx.home_net,
                 related_nodes,
                 graph: sorted_graph,
@@ -885,8 +972,27 @@ impl BeliefBaseWasm {
     /// const href_bid = BeliefBaseWasm.href_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn href_namespace() -> BidBrefResult {
-        BidBrefResult(href_namespace())
+    pub fn href_namespace() -> JsValue {
+        BidBrefResult::from_bid(href_namespace()).to_js()
+    }
+
+    /// Get all content namespace BIDs (href + asset — namespaces that track external
+    /// content anchored to the parsed repo). Path resolution for these namespaces is
+    /// relative to the entry-point network root, unlike most sub-networks.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const contentNets = BeliefBaseWasm.content_namespaces();
+    /// // contentNets is an Array of { bid, bref } objects
+    /// const isContent = contentNets.some(ns => ns.bid === node.home_net);
+    /// ```
+    #[wasm_bindgen]
+    pub fn content_namespaces() -> JsValue {
+        let results: Vec<BidBrefResult> = crate::properties::content_namespaces()
+            .iter()
+            .map(|bid| BidBrefResult::from_bid(*bid))
+            .collect();
+        serde_wasm_bindgen::to_value(&results).unwrap_or(JsValue::NULL)
     }
 
     /// Get asset namespace BID (images/PDFs/attachments tracking network)
@@ -898,8 +1004,8 @@ impl BeliefBaseWasm {
     /// const asset_bid = BeliefBaseWasm.asset_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn asset_namespace() -> BidBrefResult {
-        BidBrefResult(asset_namespace())
+    pub fn asset_namespace() -> JsValue {
+        BidBrefResult::from_bid(asset_namespace()).to_js()
     }
 
     /// Get buildonomy namespace BID (API node for version management)
@@ -911,8 +1017,8 @@ impl BeliefBaseWasm {
     /// const api_bid = BeliefBaseWasm.buildonomy_namespace();
     /// ```
     #[wasm_bindgen]
-    pub fn buildonomy_namespace() -> BidBrefResult {
-        BidBrefResult(buildonomy_namespace())
+    pub fn buildonomy_namespace() -> JsValue {
+        BidBrefResult::from_bid(buildonomy_namespace()).to_js()
     }
 
     /// Get all network path maps for navigation tree generation
@@ -1170,34 +1276,13 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn normalize_path_extension(path: &str) -> String {
-        use crate::codec::CODECS;
-        use crate::paths::AnchorPath;
-
-        let anchor_path = AnchorPath::new(path);
-        let filepath = anchor_path.filepath();
-
-        // Check if this is a codec document path
-        let mut normalized = if CODECS.get(&anchor_path).is_some() {
-            // Replace codec extension with .html
-            anchor_path.replace_extension("html")
-        } else if !filepath.ends_with(".html") {
-            // No codec extension and no .html - treat as directory
-            format!("{}/index.html", filepath)
-        } else {
-            // Already has .html extension
-            filepath.to_string()
-        };
-
-        // Re-attach anchor fragment if present
-        if !anchor_path.anchor().is_empty() {
-            normalized.push('#');
-            normalized.push_str(anchor_path.anchor());
-        }
-
-        normalized
+        crate::codec::normalize_path_extension_impl(path)
     }
 }
 
 // Module is only compiled when wasm feature is enabled
 #[cfg(not(feature = "wasm"))]
 compile_error!("wasm module should only be compiled with wasm feature enabled");
+
+// Canonical tests for normalize_path_extension_impl live in codec/mod.rs
+// where the function is defined, and run with `cargo test --features wasm`.

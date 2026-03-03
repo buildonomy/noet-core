@@ -53,6 +53,7 @@ regex = "1.10.5"
 serde_json = "1.0.117"
 serde_yaml = "0.9"
 serde-wasm-bindgen = { version = "0.6", optional = true }
+tracing-wasm = { version = "0.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
@@ -96,9 +97,9 @@ trybuild = "1.0"
 
 [features]
 default = []
-bin = ["clap", "tracing-subscriber", "wasm"]
+bin = ["clap", "dep:tracing-subscriber", "wasm"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
-wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures"]
+wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber"]
 
 # Feature Notes:
 # - 'wasm' is for browser WASM target (no filesystem, no native I/O)

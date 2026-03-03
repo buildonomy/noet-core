@@ -604,7 +604,12 @@ impl CodecMap {
 
     /// Check if a codec exists for the given anchor path (WASM version).
     ///
-    /// This is a simplified version for WASM that only checks built-in extensions.
+    /// Only matches built-in document extensions (e.g. "md") so that
+    /// normalize_path_extension can replace them with .html.
+    ///
+    /// Empty-extension paths (network/directory entries) and non-codec extensions
+    /// (.pdf, .png, etc.) deliberately return None — normalize_path_extension
+    /// handles those cases itself via the ext.is_empty() branch.
     pub fn get(&self, anchor_path: &AnchorPath) -> Option<()> {
         let ext = anchor_path.ext();
         if BUILTIN_EXTENSIONS.contains(&ext) {
@@ -613,6 +618,61 @@ impl CodecMap {
             None
         }
     }
+}
+
+/// Normalise a path for the viewer to fetch as a rendered HTML document.
+///
+/// Rules (in priority order):
+/// 1. Empty extension                    → network/directory entry, append `/index.html`
+/// 2. Already `.html`                    → leave unchanged
+/// 3. Known codec extension (e.g. `.md`) → replace with `.html` (anchor already included)
+/// 4. Any other extension (`.pdf`, etc.) → asset path, leave unchanged
+///
+/// Anchor fragments (e.g. `#section`) are preserved in all cases.
+/// Note: `replace_extension` already includes the anchor in its output, so we
+/// must not re-attach it for case 3.
+///
+/// This function is always compiled (not gated on `wasm32`) so it can be
+/// unit-tested with the native test runner. The `#[wasm_bindgen]` method in
+/// `wasm.rs` delegates to this function.
+pub fn normalize_path_extension_impl(path: &str) -> String {
+    use crate::paths::AnchorPath;
+
+    let anchor_path = AnchorPath::new(path);
+    let filepath = anchor_path.filepath();
+    let ext = anchor_path.ext();
+
+    // Case 1: empty extension — network/directory entry.
+    // Must be checked before CODECS.get() because the non-WASM codec map
+    // registers the NetworkCodec with an empty stem+ext match and would
+    // otherwise intercept these paths and produce "mynetwork.html" instead
+    // of "mynetwork/index.html".
+    if ext.is_empty() {
+        return format!("{}/index.html", filepath);
+    }
+
+    // Case 2: already .html — leave unchanged (re-attach anchor below)
+    if filepath.ends_with(".html") {
+        let mut result = filepath.to_string();
+        if !anchor_path.anchor().is_empty() {
+            result.push('#');
+            result.push_str(anchor_path.anchor());
+        }
+        return result;
+    }
+
+    // Case 3: known codec extension — replace_extension already preserves the anchor
+    if CODECS.get(&anchor_path).is_some() {
+        return anchor_path.replace_extension("html");
+    }
+
+    // Case 4: non-codec, non-html extension (.pdf, .png, …) — asset, leave unchanged
+    let mut result = filepath.to_string();
+    if !anchor_path.anchor().is_empty() {
+        result.push('#');
+        result.push_str(anchor_path.anchor());
+    }
+    result
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -662,6 +722,80 @@ Test network for unit tests.
         // Verify built-in markdown codec is registered
         assert!(extensions.contains(&"md".to_string()));
     }
+
+    // --- normalize_path_extension_impl ---
+    #[test]
+    fn test_normalize_codec_extension_md() {
+        assert_eq!(
+            normalize_path_extension_impl("docs/guide.md"),
+            "docs/guide.html"
+        );
+    }
+
+    #[test]
+    fn test_normalize_codec_extension_md_with_anchor() {
+        assert_eq!(
+            normalize_path_extension_impl("net1/hsml.md#definition"),
+            "net1/hsml.html#definition"
+        );
+    }
+
+    #[test]
+    fn test_normalize_already_html() {
+        assert_eq!(
+            normalize_path_extension_impl("pages/index.html"),
+            "pages/index.html"
+        );
+    }
+
+    #[test]
+    fn test_normalize_already_html_with_anchor() {
+        assert_eq!(
+            normalize_path_extension_impl("pages/doc.html#section"),
+            "pages/doc.html#section"
+        );
+    }
+
+    #[test]
+    fn test_normalize_asset_pdf() {
+        // Non-codec extension — asset, leave unchanged
+        assert_eq!(
+            normalize_path_extension_impl("assets/test_doc.pdf"),
+            "assets/test_doc.pdf"
+        );
+    }
+
+    #[test]
+    fn test_normalize_asset_png() {
+        assert_eq!(
+            normalize_path_extension_impl("images/photo.png"),
+            "images/photo.png"
+        );
+    }
+
+    #[test]
+    fn test_normalize_network_empty_path() {
+        // Empty path — directory entry, append /index.html
+        assert_eq!(normalize_path_extension_impl(""), "/index.html");
+    }
+
+    #[test]
+    fn test_normalize_network_dir_path() {
+        assert_eq!(
+            normalize_path_extension_impl("mynetwork"),
+            "mynetwork/index.html"
+        );
+    }
+
+    #[test]
+    fn test_normalize_nested_dir_path() {
+        assert_eq!(
+            normalize_path_extension_impl("net/subdir"),
+            "net/subdir/index.html"
+        );
+    }
+
+    // --- existing tests ---
 
     #[test]
     fn test_builtin_extensions() {

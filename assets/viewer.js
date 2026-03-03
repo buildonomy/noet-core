@@ -42,10 +42,15 @@ import { updateNavTreeHighlight } from "./viewer/navigation.js";
 import {
   clearSelectedLinkHighlight,
   highlightSelectedLink,
-  highlightAssetInContent,
+  highlightExternalInContent,
 } from "./viewer/content.js";
 import { showMetadataPanel, closeMetadataPanel } from "./viewer/metadata.js";
-import { handleHashChange, loadDefaultDocument, navigateToLink } from "./viewer/routing.js";
+import {
+  handleHashChange,
+  loadDefaultDocument,
+  navigateToLink,
+  navigateToSection,
+} from "./viewer/routing.js";
 import { initializeWasm } from "./viewer/wasm.js";
 
 // =============================================================================
@@ -65,7 +70,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   callbacks.showMetadataPanel = showMetadataPanel;
   callbacks.updateNavTreeHighlight = updateNavTreeHighlight;
   callbacks.navigateToLink = navigateToLink;
-  callbacks.highlightAssetInContent = highlightAssetInContent;
+  callbacks.highlightExternalInContent = highlightExternalInContent;
 
   // 4. Attach DOM event listeners
   setupEventListeners();
@@ -77,6 +82,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 6. Load WASM and BeliefBase (non-blocking — theme/basic features still work if this fails)
   try {
     await initializeWasm();
+    // Expose BeliefBaseWasm on window.noet for browser console use.
+    // Usage: noet.set_log_level('debug')
+    //        noet.href_namespace()
+    window.noet = state.wasmModule.BeliefBaseWasm;
   } catch (error) {
     console.error(
       "[Noet] WASM initialization failed (theme and basic features still work):",
@@ -193,7 +202,7 @@ function setupEventListeners() {
 
   // Reset two-click selection on click outside content
   document.addEventListener("click", (e) => {
-    if (!e.target.closest(".noet-content")) {
+    if (!e.target.closest(".noet-content") && !e.target.closest(".noet-metadata")) {
       state.selectedNodeBid = null;
       clearSelectedLinkHighlight();
     }
@@ -240,6 +249,21 @@ function handleContentClick(e) {
 
   // Ignore links outside .noet-content (nav, metadata, footer)
   if (!link.closest(".noet-content")) return;
+
+  // Header anchors (🔗) are direct-navigation links — call navigateToSection
+  // immediately without the two-click metadata pattern. We must NOT let the
+  // browser follow the bare href because the page is served from /pages/ and
+  // the browser would resolve #id relative to that origin instead of the SPA root.
+  if (link.classList.contains("noet-header-anchor")) {
+    e.preventDefault();
+    const headerId = link.getAttribute("href"); // bare "#id"
+    if (headerId && headerId.startsWith("#")) {
+      // Resolve the section BID from the title attribute so the metadata panel syncs.
+      const sectionBid = extractBidFromLink(link);
+      navigateToSection(headerId, sectionBid);
+    }
+    return;
+  }
 
   const linkBid = extractBidFromLink(link);
   const href = link.getAttribute("href");

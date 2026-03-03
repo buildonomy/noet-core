@@ -26,6 +26,19 @@
 //!
 //! The isolated target directory eliminates file lock conflicts between parent and nested builds.
 //!
+//! ## Staleness detection
+//!
+//! We always run the inner `cargo build` (cargo's incremental compilation handles
+//! no-op cases efficiently). To avoid re-running wasm-bindgen unnecessarily, we
+//! write a fingerprint file (`target/wasm-build/pkg/wasm-bindgen.fingerprint`)
+//! containing the mtime of the compiled wasm at the time wasm-bindgen last ran.
+//! On subsequent builds we compare the current compiled wasm mtime against the
+//! stored fingerprint; if they match, wasm-bindgen is skipped.
+//!
+//! This avoids the previous flawed approach of comparing pkg/ mtime against src/
+//! mtime, which broke when a native `cargo build --lib` touched target/ files
+//! without changing any sources.
+//!
 //! ## Troubleshooting Build Issues
 //!
 //! If you encounter problems:
@@ -34,8 +47,42 @@
 //! 3. Check that wasm32-unknown-unknown target is installed: `rustup target add wasm32-unknown-unknown`
 
 use std::env;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
+
+/// Compute a simple FNV-1a 64-bit hash of a file's contents.
+/// Used to detect whether the compiled wasm has actually changed between builds,
+/// since cargo updates artifact mtimes on every build regardless of whether
+/// anything was recompiled.
+fn hash_file(path: &PathBuf) -> Option<u64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher: u64 = 0xcbf29ce484222325; // FNV offset basis
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            hasher ^= byte as u64;
+            hasher = hasher.wrapping_mul(0x100000001b3); // FNV prime
+        }
+    }
+    Some(hasher)
+}
+
+/// Read a stored hash fingerprint from a file.
+fn read_fingerprint(path: &PathBuf) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Write a hash fingerprint to a file.
+fn write_fingerprint(path: &PathBuf, hash: u64) {
+    let _ = std::fs::write(path, hash.to_string());
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=src/wasm.rs");
@@ -82,15 +129,11 @@ fn main() {
     let wasm_file = pkg_dir.join("noet_core_bg.wasm");
     let js_file = pkg_dir.join("noet_core.js");
 
-    let artifacts_exist = wasm_file.exists() && js_file.exists();
-
-    // Check if artifacts exist (pre-built or from previous build)
-    if artifacts_exist {
-        // Using cached WASM - no output needed
-        return;
-    }
-
-    // Artifacts don't exist - need to build them
+    // Always run the inner cargo build — cargo's own incremental compilation
+    // handles the "nothing changed" case efficiently and correctly. Our previous
+    // src/ mtime heuristic was unreliable: a native `cargo build --lib` can
+    // touch files under target/ without changing src/, making pkg/ appear newer
+    // than sources and causing the WASM build to be skipped even after real changes.
     println!("cargo:warning=Compiling WASM module for HTML generation...");
 
     // Clear parent build's feature flags to avoid inheritance
@@ -138,15 +181,51 @@ fn main() {
         }
     }
 
-    // Step 2: Generate JavaScript bindings with wasm-bindgen
+    // Step 2: Generate JavaScript bindings with wasm-bindgen.
+    //
+    // Staleness check: we store the mtime of the compiled wasm at the time
+    // wasm-bindgen last ran in a fingerprint file. If the current compiled wasm
+    // mtime matches the stored fingerprint, wasm-bindgen output is still valid.
+    //
+    // We cannot rely on comparing pkg/ mtime vs deps/ mtime directly because
+    // cargo updates the deps/ artifact mtime on every successful build (even
+    // no-ops), which would always make it appear newer than pkg/.
 
     // Create pkg directory if it doesn't exist
     std::fs::create_dir_all(&pkg_dir).expect("Failed to create pkg/ directory");
 
-    let wasm_input = wasm_target_dir
+    // Prefer the deps/ artifact (always updated by cargo) over the top-level
+    // hardlink (whose mtime cargo does not update on no-op builds).
+    let deps_wasm = wasm_target_dir
         .join("wasm32-unknown-unknown")
         .join("debug")
+        .join("deps")
         .join("noet_core.wasm");
+    let wasm_input = if deps_wasm.exists() {
+        deps_wasm.clone()
+    } else {
+        wasm_target_dir
+            .join("wasm32-unknown-unknown")
+            .join("debug")
+            .join("noet_core.wasm")
+    };
+
+    let fingerprint_file = pkg_dir.join("wasm-bindgen.fingerprint");
+    let skip_bindgen = if wasm_file.exists() && js_file.exists() && wasm_input.exists() {
+        // Compare stored hash against current compiled wasm hash.
+        // Cargo updates artifact mtimes on every build even when nothing recompiled,
+        // so mtime comparison is unreliable — content hash is the correct signal.
+        let stored = read_fingerprint(&fingerprint_file);
+        let current = hash_file(&wasm_input);
+        matches!((stored, current), (Some(s), Some(c)) if s == c)
+    } else {
+        false
+    };
+
+    if skip_bindgen {
+        println!("cargo:warning=WASM build complete (wasm unchanged, skipping wasm-bindgen)");
+        return;
+    }
 
     let bindgen_output = Command::new("wasm-bindgen")
         .current_dir(&manifest_dir)
@@ -159,6 +238,11 @@ fn main() {
 
     match bindgen_output {
         Ok(output) if output.status.success() => {
+            // Record the compiled wasm hash so we can skip wasm-bindgen next
+            // time if the wasm content hasn't changed.
+            if let Some(hash) = hash_file(&wasm_input) {
+                write_fingerprint(&fingerprint_file, hash);
+            }
             println!("cargo:warning=WASM build complete");
         }
         Ok(output) => {

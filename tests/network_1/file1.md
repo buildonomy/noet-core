@@ -27,3 +27,5 @@ Term B
 
 This section has content. Above section is empty even though it has a horizontal rule. It has no
 semantic content.
+
+[Here is a link to a section with href and asset links][id:multiple-references]

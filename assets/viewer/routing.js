@@ -20,7 +20,11 @@
 
 import { state, callbacks } from "./state.js";
 import { escapeHtml } from "./utils.js";
-import { processLoadedContent, clearSelectedLinkHighlight, highlightElementById } from "./content.js";
+import {
+  processLoadedContent,
+  clearSelectedLinkHighlight,
+  highlightElementById,
+} from "./content.js";
 import { getBidFromPath } from "./wasm.js";
 
 // =============================================================================
@@ -36,8 +40,20 @@ export function getCurrentDocPath() {
   const hash = window.location.hash.substring(1);
   if (!hash || !state.wasmModule) return "";
 
-  const parts = state.wasmModule.BeliefBaseWasm.pathParts(hash);
-  return parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+  return docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(hash));
+}
+
+/**
+ * Canonical comparison key for a document path: "dir/filename" with no
+ * leading slash. Used wherever two paths need to be compared for same-doc
+ * identity regardless of whether they arrived with or without a leading "/".
+ *
+ * @param {PathParts} parts - Result of BeliefBaseWasm.pathParts(...)
+ * @returns {string} e.g. "net1/doc.html" or "doc.html"
+ */
+function docPathKey(parts) {
+  const joined = parts.path ? `${parts.path}/${parts.filename}` : parts.filename;
+  return joined.startsWith("/") ? joined.substring(1) : joined;
 }
 
 /**
@@ -132,6 +148,19 @@ export async function handleHashChange() {
     return;
   }
 
+  // If we're already on this document and only the anchor changed, scroll to
+  // the section instead of reloading the whole document.
+  // Guard: only short-circuit if a real document has been fetched —
+  // on a force-refresh the hash already contains the full doc#anchor form but
+  // loadDocument() hasn't run yet (the shell's placeholder <article> is not enough).
+  const normalizedNew = docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath));
+  const normalizedCurrent = state.currentDocPath;
+  if (normalizedCurrent && normalizedCurrent === normalizedNew && sectionAnchor) {
+    navigateToSection(sectionAnchor, state.pendingMetadataBid);
+    state.pendingMetadataBid = null;
+    return;
+  }
+
   await loadDocument(path, sectionAnchor, state.pendingMetadataBid);
   state.pendingMetadataBid = null;
 }
@@ -166,6 +195,8 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     return;
   }
 
+  state.currentDocPath = null;
+
   try {
     // --- 1. Normalise path ---
     let normalizedPath = path;
@@ -194,6 +225,20 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     // --- 3. Parse ---
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
+
+    // Rewrite relative src attributes to absolute /pages/<dir>/... paths before
+    // extracting innerHTML. The shell's <base href="/pages/"> handles root-relative
+    // documents, but subdirectory documents (e.g. /pages/subnet1/doc.html) may
+    // contain src paths like "../assets/img.png" that resolve incorrectly against
+    // the base tag. DOMParser has no base URL, so we must make them absolute here.
+    const fetchBase = fetchPath.substring(0, fetchPath.lastIndexOf("/") + 1);
+    doc.querySelectorAll("[src]").forEach((el) => {
+      const src = el.getAttribute("src");
+      if (src && !src.startsWith("/") && !src.includes("://")) {
+        el.setAttribute("src", fetchBase + src);
+      }
+    });
+
     const articleElement = doc.querySelector("article");
     const bodyContent = articleElement ? articleElement.innerHTML : doc.body.innerHTML;
 
@@ -237,6 +282,7 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     // --- 6. Post-process ---
     processLoadedContent(contentInner || state.contentElement);
 
+    state.currentDocPath = docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath));
     console.log(`[Noet] Document loaded: ${path}`);
 
     // --- 7. Nav highlight + metadata ---
@@ -255,11 +301,45 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
       }
     }
 
+    // Consume pending external-element highlight (set by metadata panel when the
+    // owner document was not loaded at click time). Runs after section navigation
+    // so the setTimeout fires after navigateToSection's synchronous showMetadataPanel
+    // call, ensuring the asset node ends up in the panel rather than the section node.
+    const pendingHighlight = state.pendingHighlightPath;
+    state.pendingHighlightPath = null;
+
     // --- 8. Scroll to section ---
     if (sectionAnchor) {
+      // Resolve the section BID so the metadata panel can show it.
+      // targetBid may be null on a force-refresh (no pendingMetadataBid was set),
+      // so derive it from the section ID via WASM if possible.
+      let sectionBid = targetBid;
+      if (!sectionBid && state.beliefbase) {
+        const sectionId = sectionAnchor.substring(1); // strip leading "#"
+        const entryPoint = state.beliefbase.entryPoint();
+        const result = state.beliefbase.get_bid_from_id(entryPoint.bref, sectionId);
+        if (result) {
+          sectionBid = result.bid;
+        }
+      }
       setTimeout(() => {
-        navigateToSection(sectionAnchor, targetBid);
+        navigateToSection(sectionAnchor, sectionBid);
       }, 100); // brief delay to ensure content is rendered
+    }
+
+    // Fire pending highlight after content and section navigation have settled.
+    // Uses a longer delay than section scroll (150 vs 100) so it runs after
+    // navigateToSection's synchronous showMetadataPanel, letting the asset node
+    // win in the panel.
+    if (pendingHighlight) {
+      setTimeout(() => {
+        if (callbacks.highlightExternalInContent) {
+          callbacks.highlightExternalInContent(pendingHighlight);
+        }
+        if (callbacks.showMetadataPanel) {
+          callbacks.showMetadataPanel(pendingHighlight);
+        }
+      }, 150);
     }
   } catch (error) {
     console.error(`[Noet] Failed to load document: ${path}`, error);
@@ -329,13 +409,17 @@ export function navigateToSection(anchor, targetBid = null) {
       newHash = "#" + newHash;
     }
 
-    window.location.hash = newHash;
+    // Use replaceState with an absolute URL anchored to the SPA root ("/").
+    // A bare hash like "#doc#section" is a relative URL — the browser resolves
+    // it against the current fetch URL (/pages/doc.html), producing
+    // /pages/#doc#section instead of /#doc#section.
+    history.replaceState(null, "", "/" + newHash);
 
     if (targetBid && callbacks.showMetadataPanel) {
       callbacks.showMetadataPanel(targetBid);
     }
   } else {
-    console.warn(`[Noet] Section not found: ${sectionId}`);
+    console.warn(`[Noet] Section not found: ${sectionId}`, new Error().stack);
   }
 }
 
@@ -361,38 +445,43 @@ export function navigateToLink(href, link, targetBid = null) {
     return;
   }
 
-  // Resolve relative paths before namespace checks
-  let resolvedPath = href;
-  if (!href.startsWith("/") && state.wasmModule) {
-    const currentHash = window.location.hash.substring(1);
-    if (currentHash) {
-      const parts = state.wasmModule.BeliefBaseWasm.pathParts(currentHash);
-      const parentDir = parts.path;
-      resolvedPath = state.wasmModule.BeliefBaseWasm.pathJoin(parentDir, href, false);
-      console.log(`[Noet] Resolved relative path: ${href} -> ${resolvedPath}`);
-    }
-  }
-
-  // 2. External href_namespace link
+  // 2. External href_namespace link — open original href directly, no path resolution
   if (
     targetBid &&
     state.wasmModule &&
     targetBid.endsWith(state.wasmModule.BeliefBaseWasm.href_namespace().bref)
   ) {
-    console.log(`[Noet] Opening external link: ${resolvedPath}`);
-    window.open(resolvedPath, "_blank", "noopener,noreferrer");
+    console.log(`[Noet] Opening external link: ${href}`);
+    window.open(href, "_blank", "noopener,noreferrer");
     return;
   }
 
-  // 3. Asset link
+  // 3. Asset link — open original href directly, no path resolution
   if (
     targetBid &&
     state.wasmModule &&
     targetBid.endsWith(state.wasmModule.BeliefBaseWasm.asset_namespace().bref)
   ) {
-    console.log(`[Noet] Opening asset: ${resolvedPath}`);
-    window.open(`/pages/${resolvedPath}`, "_blank");
+    console.log(`[Noet] Opening asset: /pages/${href}`);
+    window.open(`/pages/${href}`, "_blank");
     return;
+  }
+
+  // Resolve relative paths for internal document links only.
+  // pathParts(href).hasSchema is the structural check — external URLs
+  // (https://, file://, etc.) must never be passed through pathJoin.
+  let resolvedPath = href;
+  if (state.wasmModule) {
+    const hrefParts = state.wasmModule.BeliefBaseWasm.pathParts(href);
+    if (!hrefParts.hasSchema && !href.startsWith("/")) {
+      const currentHash = window.location.hash.substring(1);
+      if (currentHash) {
+        const currentParts = state.wasmModule.BeliefBaseWasm.pathParts(currentHash);
+        const parentDir = currentParts.path;
+        resolvedPath = state.wasmModule.BeliefBaseWasm.pathJoin(parentDir, href, false);
+        console.log(`[Noet] Resolved relative path: ${href} -> ${resolvedPath}`);
+      }
+    }
   }
 
   // 4. Internal document link (possibly with section anchor)

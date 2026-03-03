@@ -13,6 +13,14 @@
  *   state.beliefbase   — the BeliefBaseWasm instance
  *   state.navTree      — NavTree { nodes: Map, roots: Array }
  *
+ * Log level control (Rust tracing → browser console):
+ *   setLogLevel("debug")  // verbose; default in debug WASM builds
+ *   setLogLevel("info")
+ *   setLogLevel("warn")   // default in release WASM builds
+ *   setLogLevel("error")
+ *   setLogLevel("off")
+ *   Must be called after initializeWasm() resolves.
+ *
  * ⚠️  WASM Data Type Patterns
  * ===========================
  * Rust BTreeMap/HashMap serialize to JavaScript **Map objects**, NOT plain objects.
@@ -28,6 +36,27 @@
 
 import { state } from "./state.js";
 import { buildNavigation } from "./navigation.js";
+
+// =============================================================================
+// Log level control
+// =============================================================================
+
+/**
+ * Set the Rust tracing log level for the WASM module at runtime.
+ *
+ * Must be called after initializeWasm() resolves (requires state.wasmModule).
+ * Valid levels: "trace", "debug", "info", "warn", "error", "off"
+ * Default in debug builds: "debug". Default in release builds: "warn".
+ *
+ * @param {string} level
+ */
+export function setLogLevel(level) {
+  if (!state.wasmModule) {
+    console.warn("[Noet] setLogLevel called before WASM module loaded; level will not be applied");
+    return;
+  }
+  state.wasmModule.BeliefBaseWasm.set_log_level(level);
+}
 
 // =============================================================================
 // Public API

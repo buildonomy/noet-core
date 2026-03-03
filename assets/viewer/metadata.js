@@ -12,7 +12,15 @@
  *   would create a routing↔metadata cycle), it is invoked via
  *   callbacks.navigateToLink registered in viewer.js at startup.
  *
- *   highlightAssetInContent lives in content.js. Same pattern applies.
+ *   highlightExternalInContent lives in content.js. Same pattern applies.
+ *
+ * Asset link click behaviour (attachMetadataLinkHandlers):
+ *   When the user clicks a relation link for an external node (asset or href),
+ *   the metadata panel is always showing a node from the currently loaded
+ *   document (opening the metadata panel requires navigating to that document
+ *   first). We therefore always highlight the external element directly in the
+ *   current document content, then update the panel to show the asset's own
+ *   metadata so the user sees it in context.
  */
 
 import { state, callbacks } from "./state.js";
@@ -95,13 +103,6 @@ export function updateMetadataPanel() {
 function renderNodeContext(context) {
   const { node, root_path, home_net, related_nodes, graph } = context;
 
-  const hrefNamespace = state.wasmModule
-    ? state.wasmModule.BeliefBaseWasm.href_namespace()
-    : null;
-  const assetNamespace = state.wasmModule
-    ? state.wasmModule.BeliefBaseWasm.asset_namespace()
-    : null;
-
   let html = '<div class="noet-metadata-section">';
 
   // ---- Node Information ----
@@ -149,8 +150,8 @@ function renderNodeContext(context) {
     for (const [weightKind, [sources, sinks]] of graph.entries()) {
       if (sources.length > 0 || sinks.length > 0) {
         html += `<h4>${escapeHtml(weightKind)}</h4>`;
-        html += renderRelationGroup(sources, "Dependencies", related_nodes, hrefNamespace, assetNamespace);
-        html += renderRelationGroup(sinks, "Referenced by", related_nodes, hrefNamespace, assetNamespace);
+        html += renderRelationGroup(sources, "Dependencies", related_nodes);
+        html += renderRelationGroup(sinks, "Referenced by", related_nodes);
       }
     }
 
@@ -167,30 +168,29 @@ function renderNodeContext(context) {
  * @param {string[]} bids
  * @param {string} label - Section heading text ("Dependencies" or "Referenced by")
  * @param {Map<string, Object>} related_nodes
- * @param {Object|null} hrefNamespace
- * @param {Object|null} assetNamespace
  * @returns {string}
  */
-function renderRelationGroup(bids, label, related_nodes, hrefNamespace, assetNamespace) {
+function renderRelationGroup(bids, label, related_nodes) {
   if (bids.length === 0) return "";
 
   let html = '<div class="noet-relation-group">';
   html += `<p class="noet-metadata-label"><strong>${label}:</strong></p>`;
   html += '<ul class="noet-relation-list">';
+  const hrefNamespace = state.wasmModule ? state.wasmModule.BeliefBaseWasm.href_namespace() : null;
 
   for (const bid of bids) {
     const relNode = related_nodes.get(bid);
     if (relNode) {
-      const title = escapeHtml(relNode.node.title || bid);
-      const path = state.wasmModule
-        ? state.wasmModule.BeliefBaseWasm.normalize_path_extension(relNode.root_path)
-        : relNode.root_path;
-      const homeNet = relNode.home_net;
+      const title = escapeHtml(relNode.node.title || relNode.link_title || bid);
+      const kinds = Array.isArray(relNode.node.kind) ? relNode.node.kind : [];
+      const isExternal = kinds.includes("External");
+      const isHref = relNode.home_net === hrefNamespace?.bid;
+      const path = relNode.root_path;
 
-      if (homeNet === hrefNamespace || homeNet === assetNamespace) {
-        const icon = homeNet === hrefNamespace ? "🔗" : "📎";
+      if (isExternal) {
+        const icon = isHref ? "🔗" : "📎";
         if (path) {
-          html += `<li><a href="#" class="noet-asset-metadata-link" data-bid="${bid}" data-asset-path="${path}">${icon} ${title}</a></li>`;
+          html += `<li><span role="button" tabindex="0" class="noet-external-link" data-bid="${bid}" data-asset-path="${path}">${icon} ${title}</span></li>`;
         } else {
           html += `<li><span class="noet-asset-ref" title="Asset: ${bid}">📎 ${title}</span></li>`;
         }
@@ -237,21 +237,59 @@ function attachMetadataLinkHandlers() {
     });
   });
 
-  // Asset / href metadata links (highlight image or show asset metadata)
-  const assetLinks = state.metadataContent.querySelectorAll(
-    ".noet-asset-metadata-link, .noet-href-link",
-  );
+  // Asset / href relation links — if the owner document is currently loaded,
+  // highlight directly. If not, navigate to the owner doc first and defer the
+  // highlight via pending state so loadDocument() executes it after injection.
+  const assetLinks = state.metadataContent.querySelectorAll(".noet-external-link[role='button']");
   assetLinks.forEach((link) => {
+    link.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        link.click();
+      }
+    });
     link.addEventListener("click", (e) => {
-      e.preventDefault();
+      e.stopPropagation();
       const targetBid = link.getAttribute("data-bid");
-      const assetPath = link.getAttribute("data-asset-path");
 
-      if (targetBid && assetPath) {
-        if (callbacks.highlightAssetInContent) {
-          callbacks.highlightAssetInContent(assetPath);
+      if (!targetBid) {
+        console.warn("[Noet] External link: missing data-bid on element", link);
+        return;
+      }
+
+      // Determine whether the owner document (the node whose metadata panel is
+      // currently open) is the same as the loaded document.
+      const ownerBid = state.selectedNodeBid;
+      const ownerContext =
+        ownerBid && state.beliefbase ? state.beliefbase.get_context(ownerBid) : null;
+      // root_path is already normalized to .html by Rust (may include #anchor).
+      // Strip leading slash for comparison with state.currentDocPath.
+      const ownerFullPath = ownerContext
+        ? ownerContext.root_path.startsWith("/")
+          ? ownerContext.root_path.substring(1)
+          : ownerContext.root_path
+        : null;
+      // Strip anchor for doc-level comparison only.
+      const ownerDocPath = ownerFullPath ? ownerFullPath.split("#")[0] : null;
+
+      const ownerIsLoaded = !ownerDocPath || ownerDocPath === state.currentDocPath;
+
+      if (ownerIsLoaded) {
+        // Owner doc is loaded — highlight directly, then show asset metadata.
+        if (callbacks.highlightExternalInContent) {
+          callbacks.highlightExternalInContent(targetBid);
         }
         showMetadataPanel(targetBid);
+      } else {
+        // Owner doc not loaded — navigate there, deferring highlight + metadata.
+        state.pendingHighlightPath = targetBid;
+        state.pendingMetadataBid = targetBid;
+        // Navigate to the owner doc, landing at the section anchor if available
+        const navPath = ownerFullPath.startsWith("/") ? ownerFullPath : `/${ownerFullPath}`;
+        console.log("[Noet] External link: owner doc not loaded, navigating to:", navPath);
+        if (callbacks.navigateToLink) {
+          callbacks.navigateToLink(navPath, null, ownerBid);
+        }
       }
     });
   });

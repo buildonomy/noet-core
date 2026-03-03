@@ -400,59 +400,53 @@ During HTML generation, **all links** (internal and external) are marked with BI
 
 ### Internal vs External Detection
 
-**Algorithm**:
-1. Extract NodeKey from `title="bref://[bref]"` attribute via `NodeKey::from_str()`
-2. Resolve to BID: Call `beliefbase.get(&node_key)` to get node
-3. Call `beliefbase.get_context(bid)` to fetch node context
-4. Check `context.home_net` to determine link type:
-   - **`home_net == href_namespace()`**: External web link (open in new tab or navigate away)
-   - **`home_net == asset_namespace()`**: Static asset (display inline or download)
-   - **`home_net == buildonomy_namespace()`**: Network node (navigate to network index)
-   - **Any other network BID**: Document network link
-     - If network is in current beliefbase: Internal link (fetch HTML, inject into DOM)
-     - If network not loaded: External link (open in new tab)
+Detection happens at navigation dispatch time in `navigateToLink()` (`routing.js`), not at click time. The BID stored in the link's `data-bid` attribute (or resolved from `title="bref://..."`) is compared against the namespace BIDs returned by `BeliefBaseWasm.href_namespace()` and `BeliefBaseWasm.asset_namespace()`.
 
-**Special Namespaces** (from `src/properties.rs`):
+**Algorithm** (in `navigateToLink`):
+1. If `href.startsWith("#")` → section anchor, call `navigateToSection()` directly
+2. If `targetBid.endsWith(href_namespace().bref)` → external URL, `window.open(href, "_blank")`
+3. If `targetBid.endsWith(asset_namespace().bref)` → static asset, `window.open("/pages/" + href, "_blank")`
+4. Otherwise → internal document link; resolve relative path via `pathJoin`, then `navigateToDocument()`
+
+**Key**: namespace checks are done against the target node's BID suffix (parent's bref), which encodes network membership. External URLs and assets are identified this way without needing a `get_context()` call.
+
+**Special Namespaces** (from `src/properties.rs`, exposed via WASM):
 - `href_namespace()`: External URLs (http://, https://)
-- `asset_namespace()`: Static assets (images, CSS, fonts)
+- `asset_namespace()`: Static assets (images, PDFs, etc.)
 - `buildonomy_namespace()`: Network metadata nodes
 
 **Multiple Networks**: A beliefbase may contain multiple document networks (root + subnetworks). All are considered "internal" for navigation purposes.
 
-**External Link Handling**:
-- **First click**: Show metadata panel with link context (analyze frequency/cross-references)
-- **Second click**: Open external link in new tab (after reviewing metadata)
-- Same two-click pattern as internal links (consistency)
-
-**Use Case**: Link frequency analysis
-- See how often external links are cross-referenced within docs
-- Identify critical external dependencies
-- Track citation patterns across documentation
-- Context before leaving site (review metadata first)
+**Relative path resolution**: Before the namespace checks, relative hrefs (no leading `/`, no URL schema) are resolved against the current document's directory via `BeliefBaseWasm.pathJoin()`. Namespace checks run first for external/asset links so that URLs like `https://...` are never passed through `pathJoin`.
 
 **Special Cases**:
-- Anchor links (`#section-id`): Scroll to section AND update metadata panel (same two-click pattern)
-- Asset links in `<a>` tags (`asset_namespace()`): Show metadata first, download on second click
-- Images/scripts (`<img src>`, `<script src>`): Load normally (not intercepted)
-- Missing BID: Treat as external (fail gracefully)
+- Section anchor links (`href="#id"`): Dispatched to `navigateToSection()` before any namespace check
+- Images/scripts (`<img src>`, `<script src>`): Not intercepted by click handler; relative `src` attributes are rewritten to absolute `/pages/...` paths when content is injected (see URL Routing)
+- Missing BID: Falls through to internal document routing (fails gracefully if path is invalid)
 
 ### Two-Click Navigation Pattern
 
-The two-click pattern provides contextual metadata access without interrupting reading flow. Links within the main content area require two clicks: first to show metadata, second to navigate.
+The two-click pattern provides contextual metadata access without interrupting reading flow. All `<a>` elements within `<article>` that carry a `title="bref://..."` attribute require two clicks: first to show metadata, second to navigate. The namespace of the target node determines *where* the second click goes, not *whether* two clicks are required.
 
 #### Scope
 
 **Pattern Applies To**:
-- All `<a>` elements within `<article>` tag (main content area only)
-- Both internal links (documents, sections) and external links
+- All `<a>` elements within `<article>` that have a `title="bref://..."` attribute (internal doc links, section links, external href links, asset links)
 - **Images with bref:// in title attribute** (wrapped in clickable divs)
-- **Header anchor links** (automatically generated for all headers)
+
+**Second-click destination by node type**:
+- `href_namespace` node → `window.open(href, "_blank")` (external URL)
+- `asset_namespace` node → `window.open("/pages/" + href, "_blank")` (static asset)
+- Section anchor → `navigateToSection()` (scroll + metadata)
+- Internal document → `navigateToDocument()` → `loadDocument()`
 
 **Pattern Does NOT Apply To**:
 - Navigation panel links (single-click navigation)
 - Metadata panel links (single-click navigation)
 - Header/footer links (single-click navigation)
 - Images without bref:// in title (single-click opens modal)
+- `<a>` elements without a resolvable bref (fall through to direct `navigateToLink()`)
+- **Header anchor links** (`.noet-header-anchor`): special-cased in `handleContentClick`; see Header Anchor Links section
 
 #### State Management
 
@@ -496,21 +490,22 @@ article.addEventListener('click', (e) => {
 #### Second Click Behavior
 
 **Internal Document Link**:
-1. Fetch full HTML document from server
-2. Extract `<article>` content via DOM parsing
-3. Replace current `<article>` with fetched content
-4. Update URL via hash routing (`window.location.hash`)
-5. Reset `selectedBid = null`
+1. Call `navigateToLink(href, link, linkBid)` → `navigateToDocument()` → set `window.location.hash`
+2. `hashchange` fires → `handleHashChange()` → `loadDocument()`
+3. Fetch full HTML from `/pages/<path>`, inject `<article>` content
+4. Reset `selectedNodeBid = null`
 
 **Section/Anchor Link**:
-1. Scroll to target section smoothly
-2. Highlight section temporarily (CSS animation)
-3. Update URL hash (`#section-id`)
-4. Reset `selectedBid = null`
+1. Call `navigateToLink("#id", link, linkBid)` → `navigateToSection()`
+2. Scroll to target section smoothly
+3. Update URL via `history.replaceState()` (no hashchange fired)
+4. Show metadata panel for section node
+5. Reset `selectedNodeBid = null`
 
-**External Link**:
-1. Open link in new tab/window
-2. Reset `selectedBid = null`
+**External Link** (`href_namespace` node in content):
+- No second-click gate. Once the link is highlighted (first click showed metadata),
+  clicking the `<a>` element calls `navigateToLink()` which dispatches immediately
+  to `window.open()` via the namespace check.
 
 #### Click Reset Scenarios
 
@@ -625,18 +620,24 @@ All headers (`h1-h6`) automatically receive anchor links for section navigation.
 #### Anchor Generation
 
 ```javascript
-// In processLoadedContent()
+// In injectHeaderAnchors() — called from processLoadedContent()
 const headers = article.querySelectorAll("h1, h2, h3, h4, h5, h6");
 headers.forEach((header) => {
     const headerId = header.getAttribute("id");
     if (!headerId) return;
-    
+
+    // Resolve section bref via WASM for metadata panel support
+    const entryPoint = state.beliefbase.entryPoint();
+    const result = state.beliefbase.get_bid_from_id(entryPoint.bref, headerId);
+
     const anchor = document.createElement("a");
     anchor.className = "noet-header-anchor";
     anchor.href = `#${headerId}`;
     anchor.textContent = "🔗";
-    anchor.setAttribute("title", `bref://${headerId}`);
-    
+    if (result?.bref) {
+        anchor.setAttribute("title", `bref://${result.bref}`);
+    }
+
     header.appendChild(anchor);
 });
 ```
@@ -648,11 +649,27 @@ headers.forEach((header) => {
 - Position: Appended to end of header with margin-left
 - Vertical align: middle
 
-#### Two-Click Pattern
+#### Click Behaviour
 
-Anchor links include `title="bref://[section-id]"`:
-1. First click: Show metadata for section node
-2. Second click: Navigate to section (scroll + highlight)
+Header anchors are **special-cased** in `handleContentClick()` — they bypass the two-click pattern entirely:
+
+```javascript
+if (link.classList.contains("noet-header-anchor")) {
+    e.preventDefault();
+    const headerId = link.getAttribute("href"); // "#section-id"
+    const sectionBid = extractBidFromLink(link); // from title="bref://..."
+    navigateToSection(headerId, sectionBid);
+    return;
+}
+```
+
+A single click:
+1. Calls `navigateToSection()` directly
+2. Scrolls to and highlights the target section
+3. Updates the URL via `history.replaceState()` to `/#doc.html#section-id`
+4. Shows the section's metadata in the panel
+
+**Rationale**: Header anchors are navigation/sharing affordances, not content links. Requiring two clicks to follow a section anchor would be surprising and inconsistent with user expectations.
 
 ### Section Navigation Highlighting
 
@@ -1024,40 +1041,58 @@ if (relatedNode.home_net === hrefNamespace) {
 
 #### href_namespace Nodes (External References)
 
-Rendered as clickable external links:
+Rendered as clickable role-button spans (not `<a>` tags — avoids spurious hashchange):
 - Icon: 🔗
-- Opens in new tab (`target="_blank" rel="noopener noreferrer"`)
-- **No slash prefix** (paths are full URLs, not internal routes)
-- On click: Shows metadata for the href node before opening
-
-```html
-<a href="https://example.com" class="noet-href-link" 
-   data-bid="..." target="_blank">🔗 Example Site</a>
-```
+- `role="button" tabindex="0"` with `data-bid` and `data-asset-path` attributes
+- On click: owner-doc check → highlight + show asset metadata (see below)
 
 #### asset_namespace Nodes (Images/Assets)
 
 Rendered as metadata-aware asset links:
 - Icon: 📎
-- Class: `.noet-asset-metadata-link`
+- Same `role="button"` pattern as href nodes
 - On click from metadata panel:
-  1. Find matching image in content by src path
-  2. Highlight the image wrapper (`.noet-link-selected`)
-  3. Scroll to center the image
-  4. Update metadata panel to show asset's metadata
+  1. Resolve `state.currentDocPath` against the owner node's `root_path` (stripped of anchor)
+  2. **If owner doc is loaded**: call `highlightExternalInContent(targetBid)` directly, then `showMetadataPanel(targetBid)`
+  3. **If owner doc is not loaded**: set `state.pendingHighlightPath = targetBid` and `state.pendingMetadataBid = targetBid`, then navigate to the owner doc (with section anchor if present). `loadDocument()` consumes the pending state after injection.
 
 ```javascript
 // In attachMetadataLinkHandlers()
 assetLinks.forEach((link) => {
     link.addEventListener("click", (e) => {
-        e.preventDefault();
+        e.stopPropagation();
         const targetBid = link.getAttribute("data-bid");
-        const assetPath = link.getAttribute("data-asset-path");
-        
-        highlightAssetInContent(assetPath);
-        showMetadataPanel(targetBid);
+
+        const ownerContext = state.beliefbase.get_context(state.selectedNodeBid);
+        const ownerParts = state.wasmModule.BeliefBaseWasm.pathParts(ownerContext.root_path);
+        const ownerDocPath = /* strip leading slash from dir+filename */;
+        const ownerIsLoaded = !ownerDocPath || ownerDocPath === state.currentDocPath;
+
+        if (ownerIsLoaded) {
+            callbacks.highlightExternalInContent(targetBid);
+            showMetadataPanel(targetBid);
+        } else {
+            state.pendingHighlightPath = targetBid;
+            state.pendingMetadataBid = targetBid;
+            callbacks.navigateToLink(`/${ownerDocPath}#${ownerParts.anchor}`, null, ownerBid);
+        }
     });
 });
+```
+
+`loadDocument()` fires pending highlight at 150ms (after section scroll at 100ms) so the asset node wins in the panel:
+
+```javascript
+// After processLoadedContent(), before sectionAnchor block
+const pendingHighlight = state.pendingHighlightPath;
+state.pendingHighlightPath = null;
+// ...sectionAnchor setTimeout at 100ms...
+if (pendingHighlight) {
+    setTimeout(() => {
+        callbacks.highlightExternalInContent(pendingHighlight);
+        callbacks.showMetadataPanel(pendingHighlight);
+    }, 150);
+}
 ```
 
 #### Normal Document Nodes
@@ -1294,71 +1329,61 @@ function renderNode(node, tree, expandedSet, parentUl) {
 
 ### URL Routing
 
-**Strategy**: History API with pushState
-- Use `history.pushState()` to update full URL path when navigating between documents
-- Use URL hash for within-document section navigation: `doc.html#section-id`
-- Browser back/forward works via `popstate` event
-- Bookmarkable and shareable
+**Strategy**: Hash-based routing via `window.location.hash` and `hashchange` event.
 
-**Document Navigation** (SPA):
+All document navigation encodes the target as a URL hash: `/#doc.html` or `/#dir/doc.html#section-id`. The SPA shell is always served from `/`; the hash is the entire routing state.
+
+**Hash format**: `#<doc-path>[#<section-id>]`
+- `#asset_tracking_test.html` — document root
+- `#subnet1/subnet1_file1.html#section-a` — document + section
+- `#` or empty — loads default `index.html`
+
+**Document Navigation**:
 ```javascript
-// Navigate to different document
-function navigateToDocument(href, anchor = null) {
-    // Update URL
-    const newUrl = anchor ? `${href}#${anchor}` : href;
-    history.pushState({ href, anchor }, '', newUrl);
-    
-    // Fetch and inject content
-    fetchAndInjectDocument(href);
-    
-    // Scroll to anchor if present
-    if (anchor) {
-        setTimeout(() => {
-            document.getElementById(anchor)?.scrollIntoView({ behavior: 'smooth' });
-        }, 100); // Wait for DOM update
-    }
+// navigateToDocument() in routing.js
+function navigateToDocument(path, targetBid = null) {
+    if (targetBid) state.pendingMetadataBid = targetBid;
+    window.location.hash = path; // fires hashchange
 }
 
-// Handle browser back/forward
-window.addEventListener('popstate', (e) => {
-    if (e.state && e.state.href) {
-        fetchAndInjectDocument(e.state.href);
-        if (e.state.anchor) {
-            document.getElementById(e.state.anchor)?.scrollIntoView({ behavior: 'smooth' });
-        }
-    }
-});
-```
-
-**Section Navigation** (within same document):
-```javascript
-// Navigate to section in current document
-function navigateToSection(sectionId) {
-    const currentPath = window.location.pathname + window.location.search;
-    history.pushState({ anchor: sectionId }, '', `${currentPath}#${sectionId}`);
-    document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth' });
-    highlightNavItem(sectionId);
+// handleHashChange() — entry point for all hash-based routing
+async function handleHashChange() {
+    state.selectedNodeBid = null;
+    // Parse hash with BeliefBaseWasm.pathParts() to split doc path and section anchor
+    // Dispatch:
+    //   empty hash          → loadDefaultDocument()
+    //   no .html in path    → navigateToSection() (bare anchor in current doc)
+    //   same doc + anchor   → navigateToSection() (short-circuit, no reload)
+    //   otherwise           → loadDocument(path, sectionAnchor, pendingMetadataBid)
 }
-
-// Handle hash changes (for direct hash links)
-window.addEventListener('hashchange', () => {
-    const sectionId = window.location.hash.slice(1);
-    if (sectionId) {
-        document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth' });
-        highlightNavItem(sectionId);
-    }
-});
 ```
 
-**Benefits**:
-- Clean URLs: `https://example.com/docs/guide.html` and `https://example.com/docs/guide.html#installation`
-- Full path updates on document navigation (SPA routing)
-- Hash updates on section navigation (within document)
-- Browser back/forward works automatically (popstate)
-- Bookmarkable and shareable
-- No backend needed: Works with static hosting (paths are actual files)
+**Section Navigation** (within same document — no reload):
+```javascript
+// navigateToSection() in routing.js
+function navigateToSection(anchor, targetBid = null) {
+    document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth" });
+    highlightElementById(sectionId);
+    // Reconstruct full hash: "#doc.html#section-id"
+    history.replaceState(null, "", "/" + newHash); // absolute URL, no hashchange fired
+    if (targetBid) showMetadataPanel(targetBid);
+}
+```
 
-**Navigation Context**: Full nav tree with highlighted current section provides better context than breadcrumbs. Nav tree shows full hierarchy, siblings, and children - always visible without needing to scroll.
+`replaceState` is used (not `pushState`) to avoid polluting browser history with every section scroll. `history.replaceState` with an absolute URL (`"/" + hash`) prevents the browser from resolving the hash relative to `/pages/` (where documents are fetched from).
+
+**Document loading** (`loadDocument()`):
+1. Normalise path extension (`.md` → `.html`) via `normalize_path_extension()`
+2. Fetch from `/pages/<normalizedPath>`
+3. Parse with `DOMParser`; rewrite relative `src` attributes to absolute `/pages/<dir>/...` paths before extracting `innerHTML`. The shell's `<base href="/pages/">` handles root-level documents, but subdirectory documents (e.g. `/pages/subnet1/doc.html`) may contain paths like `../assets/img.png` that resolve incorrectly against the base tag. `href` attributes on `<a>` elements are intentionally left as-is — the SPA click handler intercepts all `<a>` clicks and resolves relative hrefs via `pathJoin()` at navigation time.
+4. Extract `<article>` content and `data-document-bid`
+5. Inject into `.noet-content__inner`; post-process (image wrapping, header anchors)
+6. If section anchor: resolve section BID from `get_bid_from_id(entryPoint.bref, sectionId)`, then call `navigateToSection()`
+7. If no anchor: scroll to top, show document metadata panel
+
+**Same-doc short-circuit**: `state.currentDocPath` holds the `docPathKey` of the currently loaded document (e.g. `"file1.html"` or `"subnet1/doc.html"`), or `null` if no document has been successfully loaded yet. `handleHashChange` compares `state.currentDocPath` against `docPathKey(pathParts(newHash))` — if they match and a section anchor is present, it calls `navigateToSection()` directly without re-fetching. `currentDocPath` is read rather than re-deriving from `window.location.hash` because the hash has already been updated to the new target by the time `hashchange` fires.
+
+**Force-refresh handling**: On a hard reload at `/#doc.html#section-id`, `state.currentDocPath` is `null` (no document has been fetched yet), so the short-circuit is skipped and `loadDocument()` runs. The section BID is resolved after load via WASM rather than relying on `pendingMetadataBid`.
 
 ## Query Builder UI (Step 3)
 
@@ -1499,6 +1524,73 @@ Brief overview:
 - [WASM Bindgen](https://rustwasm.github.io/docs/wasm-bindgen/) - Rust ↔ JS bridge
 
 ## Change Log
+
+### Version 0.5 (2026-03-02)
+
+- **Cross-document external asset highlight** — the metadata panel external link
+  handler now checks whether the owner document (the node whose metadata is
+  displayed) is the currently loaded document via `state.currentDocPath`. If not,
+  it sets `state.pendingHighlightPath` and `state.pendingMetadataBid` and navigates
+  to the owner doc; `loadDocument()` fires the highlight and panel update after
+  injection. If the owner is already loaded, highlight and panel update happen
+  immediately (existing behaviour preserved).
+- **`documentLoaded` consolidated into `currentDocPath`** — the boolean
+  `state.documentLoaded` is removed; `state.currentDocPath !== null` serves the
+  same purpose while also providing the loaded path for same-doc comparisons.
+  `handleHashChange` now reads `state.currentDocPath` (set on successful load,
+  cleared on load start) instead of re-deriving from `window.location.hash`,
+  fixing a race where the hash was already the new target when the comparison ran,
+  causing cross-document anchor links to incorrectly short-circuit to
+  `navigateToSection()` on the wrong document.
+- **Relative `href` rewrite removed from `loadDocument()`** — only `src`
+  attributes are rewritten to absolute `/pages/<dir>/...` paths. `<a href>`
+  attributes are left as the literal attribute value (relative); the SPA click
+  handler resolves them via `pathJoin()` at navigation time. Rewriting hrefs
+  was prepending `/pages/` to document link paths, corrupting SPA hash routing.
+
+### Version 0.4 (2026-03-02)
+
+- **Corrected Internal vs External Detection** — link type is now determined at
+  navigation dispatch time (`navigateToLink()`) by comparing `targetBid` suffix
+  against `href_namespace().bref` and `asset_namespace().bref`. No `get_context()`
+  call needed for routing. Namespace checks run before any relative-path resolution
+  so that external URLs are never passed through `pathJoin()`.
+- **External links bypass two-click gate in content** — once an external href node
+  is highlighted (after the metadata panel relation link was clicked), clicking the
+  `<a>` in the article dispatches immediately to `window.open()` via namespace check.
+  No second-click accumulator needed.
+- **Header anchors bypass two-click pattern** — `.noet-header-anchor` clicks are
+  special-cased in `handleContentClick()` and call `navigateToSection()` directly.
+  Single click: scroll + URL update + metadata panel. Rationale: header anchors are
+  navigation/sharing affordances, not content links.
+- **URL Routing rewritten** — uses `hashchange` + `history.replaceState()` (not
+  `pushState`/`popstate`). Full routing state lives in the URL hash. Section
+  navigation uses `replaceState` with an absolute URL to avoid browser resolving
+  the hash relative to `/pages/`. Same-doc short-circuit guards on
+  `state.documentLoaded` (not DOM presence) to handle force-refresh correctly.
+- **Relative asset path rewriting** — `loadDocument()` rewrites relative `src` and
+  content `href` attributes in the parsed document to absolute `/pages/<dir>/...`
+  paths before extracting `innerHTML`. Prevents 404s when injected into the SPA
+  shell served from `/`.
+- **Section BID resolved on force-refresh** — when navigating directly to
+  `/#doc.html#section-id`, the section BID is derived after load via
+  `get_bid_from_id(entryPoint.bref, sectionId)` so the metadata panel shows the
+  correct section node even when `pendingMetadataBid` was never set.
+- **`PathParts` extended** — `has_schema` (bool) and `schema` (string) getters
+  added to the WASM-exposed `PathParts` struct. Used in `navigateToLink()` to
+  guard `pathJoin()` against external URLs structurally rather than by string
+  search.
+- **`docPathKey()` helper** — canonical same-doc comparison in `routing.js` uses
+  `pathParts()` + `docPathKey()` (strips leading `/` from assembled `dir/filename`)
+  instead of manual `startsWith("/") ? substring(1) : ...` on both sides.
+- **Viewer refactored into ESM modules** — monolithic `viewer.js` split into 9
+  modules under `assets/viewer/` (`state.js`, `utils.js`, `theme.js`, `panels.js`,
+  `navigation.js`, `content.js`, `metadata.js`, `routing.js`, `wasm.js`).
+  Circular import cycles broken via callback registry in `state.js`.
+- **External asset highlighting** — clicking a relation link in the metadata panel
+  for an `href_namespace` or `asset_namespace` node calls
+  `highlightExternalInContent(targetBid)` directly (no owner-doc navigation logic;
+  the metadata panel is always showing a node from the currently loaded document).
 
 ### Version 0.3 (2025-02-04)
 - Added Image Modal Integration
