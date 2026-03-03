@@ -641,7 +641,13 @@ impl BeliefBase {
             if let Some(set_node) = new_set.states().get(node_bid) {
                 let new_node = set_node.clone();
                 let should_update = if let Some(old_node) = old_set.states().get(node_bid) {
-                    new_node.toml() != old_node.toml()
+                    // Strip Trace from the cached (old) node before comparing: Trace is an
+                    // ephemeral bookkeeping flag meaning "incomplete relation set loaded from
+                    // cache". It is never written to source files and must not trigger a
+                    // NodeUpdate when it is the sole difference between session_bb and doc_bb.
+                    let mut old_node_normalized = old_node.clone();
+                    old_node_normalized.kind.remove(BeliefKind::Trace);
+                    new_node.toml() != old_node_normalized.toml()
                 } else {
                     true
                 };
