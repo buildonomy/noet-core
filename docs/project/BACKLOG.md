@@ -233,6 +233,68 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 - Loading: `assets/viewer.js::initializeWasm()`
 - Sharding: `src/shard/manager.rs` (to be implemented)
 
+## Windows WatchService mtime Tracking Failure
+
+**Priority**: MEDIUM - CI reliability on Windows
+
+**Context**: `cache_invalidation_test.rs` tests (`test_mtime_tracking`, `test_stale_file_detection_and_reparse`, `test_multiple_files_mtime_tracking`, `test_unchanged_files_keep_same_mtime`, `test_deleted_file_handling`) consistently fail on `windows-latest` CI with the `service` feature. The symptom is that `test.md` is never tracked — only `index.md` appears in the DB mtime table after initial parse.
+
+### Observed Symptom
+```
+test.md should have mtime tracked.
+Found mtimes: {
+  "C:\\\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpXXX\\test_network\\index.md": ...,
+  "C:\\\\Users\\runneradmin\\AppData\\Local\\Temp\\.tmpXXX\\test_network\\index.md": ...
+}
+```
+Two issues visible: (1) `test.md` never emits `FileParsed`, (2) `index.md` is stored twice under both the 8.3 short name (`RUNNER~1`) and the full name (`runneradmin`).
+
+### Suspected Root Causes
+1. **`WatchService` initial parse ordering**: On Windows, the filesystem watcher may not deliver events for files added before the watcher starts, or event delivery is racy. `test.md` is created before `WatchService::enable_network_syncer` is called, so the initial scan may not reliably pick it up.
+2. **Windows 8.3 short names**: `os_path_to_string` is called with short-name paths in some cases (e.g. from the watcher callback), producing duplicate DB entries that fail lookup. Fix: canonicalize in `Transaction::track_file_mtime` via `fs::canonicalize(path).unwrap_or(path)` before `os_path_to_string`.
+
+### Investigation Steps
+1. Add tracing to `WatchService::enable_network_syncer` initial scan to confirm whether `test.md` is being enqueued for parse on Windows.
+2. Check `FileParsed` event emission path — does the compiler emit it for all files or only modified ones on restart?
+3. Apply `fs::canonicalize` in `track_file_mtime` (`src/db.rs`) and verify it resolves the duplicate-entry symptom.
+4. Consider adding a `std::thread::sleep` or explicit flush barrier in the test to rule out timing issues.
+
+### Related
+- Prior fix: commit `1a7f3fb` ("Fix mtime resolution on windows") addressed separator handling in `os_path_to_string` but did not resolve the underlying parse-ordering issue.
+- `src/db.rs` `Transaction::track_file_mtime`
+- `src/codec/compiler.rs` `DocumentCompiler::parse_next` (emits `FileParsed`)
+- `tests/cache_invalidation_test.rs`
+
+**Status**: Pre-existing, non-blocking for Linux/macOS. Needs Windows-native debugging.
+
+## `check_for_link_and_push` Bail-Out Refactor
+
+**Priority**: LOW - Code quality improvement
+
+**Context**: `src/codec/md.rs::check_for_link_and_push` has three separate code paths that emit an unmodified link and continue the event loop: "Can't parse", "path mismatch", and potentially future bail-out cases. All three duplicate the same ~15 lines of link-event reconstruction.
+
+### Current Duplication
+Each bail-out path manually reconstructs the original `Start(Link/Image)`, title events, and `End` event from `link_data`, then sets `link_type`, pushes to `events_out`, and calls `continue`. This is error-prone — a future change to link event structure must be applied in multiple places.
+
+### Proposed Fix
+Extract a helper:
+
+```rust
+fn emit_unchanged_link(
+    link_data: LinkAccumulator,
+    end_range: Option<Range<usize>>,
+    events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
+)
+```
+
+All three bail-out paths call this helper, then `continue` the loop.
+
+### Related
+- `src/codec/md.rs` `check_for_link_and_push` — "Can't parse" branch (~L380) and "path mismatch" branch (~L480)
+- Introduced during cross-platform path normalization fixes (session adding `strip_ext`/`drop_index_suffix`)
+
+**Status**: Low risk, purely mechanical refactor. No behaviour change intended.
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

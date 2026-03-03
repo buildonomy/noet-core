@@ -336,7 +336,7 @@ fn check_for_link_and_push(
     source: &str,
     events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     stop_event: Option<&MdEvent<'_>>,
-    _diagnostics: &mut Vec<ParseDiagnostic>,
+    diagnostics: &mut Vec<ParseDiagnostic>,
 ) -> bool {
     let mut changed = false;
     let mut collector_stack: Vec<LinkAccumulator> = Vec::new();
@@ -456,21 +456,75 @@ fn check_for_link_and_push(
                 }
             }
 
-            /// Further reduce a stem: if it ends in "/index", drop that segment so that
-            /// "subnet1/index" and "subnet1" compare equal.
+            /// Further reduce a stem: if it ends in "/index" or equals "index" (top-level
+            /// network root whose ctx.root_path is "index.md"), drop that segment so that
+            /// "subnet1/index", "subnet1", "/abs/path/to/dir", and "index" all compare equal
+            /// against their counterpart.
             fn drop_index_suffix(p: &str) -> &str {
-                p.strip_suffix("/index").unwrap_or(p)
+                p.strip_suffix("/index")
+                    .or_else(|| if p == "index" { Some("") } else { None })
+                    .unwrap_or(p)
             }
 
             let ctx_stem = drop_index_suffix(strip_ext(ctx_filepath));
             let doc_stem = drop_index_suffix(strip_ext(doc_abs_path));
 
             if !doc_stem.ends_with(ctx_stem) {
-                panic!(
-                    "Context path and proto path do not match! Proto abs path: \"{doc_abs_path}\" \
-                    repo relative path: \"{ctx_filepath}\".\nbase paths: {}",
-                    ctx.beliefbase().paths()
+                // Mismatch means we cannot safely compute root_abs_path.
+                // Emit the link unchanged (same as the "Can't parse" path above) and
+                // record a diagnostic rather than panicking or producing garbage paths.
+                tracing::warn!(
+                    "[check_for_link_and_push] Path mismatch: proto abs path \"{doc_abs_path}\" \
+                    does not align with ctx repo-relative path \"{ctx_filepath}\". \
+                    Leaving link unchanged."
                 );
+                diagnostics.push(ParseDiagnostic::warning(format!(
+                    "Could not rewrite link: document path \"{doc_abs_path}\" \
+                    does not align with context path \"{ctx_filepath}\""
+                )));
+                let link_text_cow = CowStr::from(link_text.clone());
+                link_data.link_type = match link_text.is_empty() || link_text_cow == link_data.id {
+                    true => LinkType::Shortcut,
+                    false => LinkType::Reference,
+                };
+                let start_event = if link_data.is_image {
+                    MdEvent::Start(MdTag::Image {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.rel_url,
+                        title: link_data.title,
+                        id: link_data.id,
+                    })
+                } else {
+                    MdEvent::Start(MdTag::Link {
+                        link_type: link_data.link_type,
+                        dest_url: link_data.rel_url,
+                        title: link_data.title,
+                        id: link_data.id,
+                    })
+                };
+                events_out.push_back((start_event, None));
+                for title_event in link_data.title_events.into_iter() {
+                    events_out.push_back((title_event, None));
+                }
+                let new_range = match (link_data.range, range) {
+                    (Some(link_range), Some(link_end_range)) => {
+                        Some(link_range.start..link_end_range.end)
+                    }
+                    (Some(link_range), _) => Some(link_range.clone()),
+                    (_, Some(link_end_range)) => Some(link_end_range.clone()),
+                    _ => None,
+                };
+                let end_event = if link_data.is_image {
+                    MdEvent::End(MdTagEnd::Image)
+                } else {
+                    MdEvent::End(MdTagEnd::Link)
+                };
+                events_out.push_back((end_event, new_range));
+                if stop_event_match {
+                    break;
+                }
+                maybe_event = events_in.pop_front();
+                continue;
             };
             // root_abs_path is the absolute prefix before the repo-relative portion.
             let root_abs_path = &doc_stem[0..(doc_stem.len() - ctx_stem.len())];
