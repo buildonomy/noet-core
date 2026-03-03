@@ -365,9 +365,22 @@ impl DocumentCompiler {
             if let Some(detected_path) = detect_network_file(&path) {
                 detected_path
             } else {
-                return Err(BuildonomyError::Codec(
-                    "Cannot parse a directory without an index file".to_string(),
-                ));
+                // A directory with no index file is a broken link target — emit a warning
+                // and drop it. Don't abort the build (per Issue 29 Q1 decision).
+                tracing::warn!(
+                    "[Compiler] Linked path is a directory with no index file: {:?}",
+                    path
+                );
+                self.remove_from_queues(&path);
+                return Ok(Some(ParseResult {
+                    path: path.clone(),
+                    rewritten_content: None,
+                    dependent_paths: Vec::new(),
+                    diagnostics: vec![crate::codec::ParseDiagnostic::warning(format!(
+                        "Linked path is a directory with no index file: {}",
+                        path.display()
+                    ))],
+                }));
             }
         } else {
             path.clone()
@@ -1133,23 +1146,30 @@ impl DocumentCompiler {
         &mut self,
         path: PathBuf,
     ) -> Result<Option<ParseResult>, BuildonomyError> {
-        // 3. Determine the actual file path (may differ from path if path is a directory)
-        let file_path = if path.is_dir() {
-            // BeliefNetwork directories are enqueued as the directory, not the contained
-            // index.md file.
-            if let Some(detected_path) = detect_network_file(&path) {
-                detected_path
-            } else {
-                return Err(BuildonomyError::Codec(
-                    "Cannot parse a directory without an index file".to_string(),
-                ));
-            }
-        } else {
-            path.clone()
-        };
-
         // 2a. Check parse count before attempting
         let parse_count = self.processed.get(&path).copied().unwrap_or(0);
+
+        // process_asset is only reached for non-codec paths. A directory here means
+        // parse_next already confirmed there is no index file (belief-network dirs are
+        // routed before this call). Treat it as a broken link: emit a warning and drop.
+        if path.is_dir() {
+            tracing::warn!(
+                "[Compiler] Asset queue received a directory (no index file): {:?}",
+                path
+            );
+            self.remove_from_queues(&path);
+            return Ok(Some(ParseResult {
+                path: path.clone(),
+                rewritten_content: None,
+                dependent_paths: Vec::new(),
+                diagnostics: vec![crate::codec::ParseDiagnostic::warning(format!(
+                    "Linked path is a directory with no index file: {}",
+                    path.display()
+                ))],
+            }));
+        }
+
+        let file_path = path.clone();
 
         // This is an asset file - process it as a static asset
         tracing::debug!("[Compiler] Detected asset file: {:?}", file_path);
