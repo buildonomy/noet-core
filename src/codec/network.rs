@@ -77,9 +77,12 @@ fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
                     }
                 }
 
-                // Then check if this has a registered codec
-
-                if CODECS.get(&p_ap).is_some() {
+                // Then check if this has a registered codec.
+                // Use new_file since p.is_file() is confirmed above — this prevents
+                // extensionless files (Gemfile, Makefile, etc.) from being classified
+                // as directories by AnchorPath and matching the (None, None) wildcard.
+                let p_ap_file = AnchorPath::new_file(&p_str);
+                if CODECS.get(&p_ap_file).is_some() {
                     if subnets.iter().any(|subnet_path| p.starts_with(subnet_path)) {
                         // Don't include subnet files
                         None

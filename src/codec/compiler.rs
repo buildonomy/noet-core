@@ -416,9 +416,11 @@ impl DocumentCompiler {
         };
 
         // 5. Try to parse the content
+        // Use file_path (resolved index.md) rather than path (directory) so that
+        // parse_content's codec lookup succeeds. For non-directory paths they are identical.
         let (mut parse_result, codec) = match self
             .builder
-            .parse_content(&path, content, global_bb.clone())
+            .parse_content(&file_path, content, global_bb.clone())
             .await
         {
             Ok(with_codec) => (with_codec.result, with_codec.codec),

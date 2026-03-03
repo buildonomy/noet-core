@@ -1074,7 +1074,11 @@ impl MdCodec {
                         if url_ap.is_anchor() {
                             tracing::debug!("is anchor");
                             CowStr::from(as_anchor(url_ap.anchor()))
-                        } else if CODECS.get(&url_ap).is_some() {
+                        } else if !url_ap.ext().is_empty() && CODECS.get(&url_ap).is_some() {
+                            // Only rewrite links that have a known codec extension (e.g. .md).
+                            // Extensionless paths (Gemfile, Makefile, bare dirs) must not be
+                            // rewritten — they have no extension for CODECS to match cleanly
+                            // and the (None,None) wildcard would produce wrong "Gemfile/index.html".
                             let res = CowStr::from(
                                 url_ap
                                     .normalize()
@@ -1084,7 +1088,7 @@ impl MdCodec {
                             tracing::debug!("replacing {dest_url} with {res}");
                             res
                         } else {
-                            tracing::debug!("no extension for {dest_url}");
+                            tracing::debug!("no codec extension for {dest_url}, leaving unchanged");
                             dest_url
                         }
                     } else {

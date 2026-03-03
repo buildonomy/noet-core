@@ -437,7 +437,16 @@ impl CodecMap {
     /// ```
     pub fn path_get(&self, path: &std::path::Path) -> Option<CodecFactory> {
         let string_path = os_path_to_string(path);
-        let ap = AnchorPath::new(&string_path);
+        // Use new_file when the OS path is a known file so that extensionless filenames
+        // (Gemfile, Makefile, …) are not misclassified as directories and do not
+        // accidentally match the (None, None) NetworkCodec wildcard entry.
+        // Actual directories (belief-network roots) are still handled by new() via the
+        // is_dir() check in parse_next before path_get is ever called.
+        let ap = if path.is_file() {
+            AnchorPath::new_file(&string_path)
+        } else {
+            AnchorPath::new(&string_path)
+        };
         self.get(&ap)
     }
 
@@ -454,6 +463,11 @@ impl CodecMap {
             (Some("index".to_string()), Some("md".to_string()), || {
                 Box::new(NetworkCodec::default())
             }),
+            // (None, None) matches bare directory paths (no stem, no ext) so that
+            // parse_content / initialize_stack can look up a codec for network root dirs
+            // (e.g. `/repo/subnet/`). Extension-less *files* (Gemfile, Makefile, etc.) look
+            // identical to AnchorPath, so callers that have filesystem access MUST guard
+            // against them via `path.is_dir()` BEFORE calling CODECS.path_get / CODECS.get.
             (None, None, || Box::new(NetworkCodec::default())),
         ])))
     }
@@ -882,6 +896,33 @@ Test network for unit tests.
         // Verify it can be retrieved
         let result = codecs.get(&AnchorPath::new("custom.xyz"));
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_path_get_extensionless_file_is_not_a_codec() {
+        // Extensionless files like Gemfile and Makefile must NOT match the (None, None)
+        // NetworkCodec wildcard. path_get uses AnchorPath::new_file when path.is_file(),
+        // so this test requires a real file on disk.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let gemfile = temp_dir.path().join("Gemfile");
+        std::fs::write(&gemfile, "source 'https://rubygems.org'\n").unwrap();
+        let makefile = temp_dir.path().join("Makefile");
+        std::fs::write(&makefile, "all:\n\techo hi\n").unwrap();
+
+        assert!(
+            CODECS.path_get(&gemfile).is_none(),
+            "Gemfile should not match any codec"
+        );
+        assert!(
+            CODECS.path_get(&makefile).is_none(),
+            "Makefile should not match any codec"
+        );
+
+        // Sanity-check: a real directory does match (via the (None,None) wildcard)
+        assert!(
+            CODECS.path_get(temp_dir.path()).is_some(),
+            "A directory should still match the NetworkCodec wildcard"
+        );
     }
 
     #[test]

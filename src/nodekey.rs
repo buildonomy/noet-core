@@ -613,7 +613,10 @@ impl FromStr for NodeKey {
                     )));
                 }
                 let mut path_net = net;
-                if CODECS.get(&norm_ap).is_none() {
+                // Only reclassify as asset when the path has a file extension that
+                // no codec recognises. Anchor-only paths (#section) and extensionless
+                // paths (directories, Gemfile-style names) stay in the document net.
+                if !norm_ap.ext().is_empty() && CODECS.get(&norm_ap).is_none() {
                     path_net = asset_namespace().bref();
                 }
                 Ok(NodeKey::Path {
@@ -646,7 +649,10 @@ impl FromStr for NodeKey {
                 let norm_input = value_str.strip_prefix('/').unwrap_or(&value_str);
                 let norm_ap = AnchorPath::new(norm_input);
                 let norm_path: String = norm_ap.normalize().into();
-                if CODECS.get(&norm_ap).is_none() {
+                // Only reclassify as asset when the path has a file extension that
+                // no codec recognises. Anchor-only paths (#section) and extensionless
+                // paths (directories, Gemfile-style names) stay in the document net.
+                if !norm_ap.ext().is_empty() && CODECS.get(&norm_ap).is_none() {
                     path_net = asset_namespace().bref();
                 }
                 Ok(NodeKey::Path {

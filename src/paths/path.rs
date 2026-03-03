@@ -194,6 +194,47 @@ impl<'a> AnchorPath<'a> {
         }
     }
 
+    /// Construct an `AnchorPath` that treats the input as a **file** path even when the
+    /// filename has no extension. `AnchorPath::new` classifies extensionless paths as
+    /// directories (`ext_sep = None`, `is_dir() == true`, `filestem() == ""`). This
+    /// constructor forces `ext_sep` to point just past the last filename character so that:
+    ///
+    /// - `is_dir()` → `false`
+    /// - `filestem()` → the full filename (`"Gemfile"`, `"Makefile"`, …)
+    /// - `ext()` → `""` (no real extension; `ext()` is guarded against the out-of-range
+    ///   sentinel value)
+    /// - `filename()` → the full filename
+    ///
+    /// Use this whenever you have a filesystem path that is known to be a file (not a
+    /// directory) and needs to be distinguishable from a bare directory path inside
+    /// `AnchorPath` logic (e.g. codec lookup, `is_dir()` checks).
+    ///
+    /// Paths that already have an extension are returned unchanged (same as `new`).
+    /// Trailing-slash paths and empty strings are also returned unchanged.
+    pub fn new_file(path: &'a str) -> AnchorPath<'a> {
+        let mut ap = Self::new(path);
+        if ap.ext_sep.is_none() {
+            let path_end = ap.param_sep.or(ap.anc_sep).unwrap_or(path.len());
+            // Only override when there is an actual filename component (non-empty, not
+            // a bare "/" or trailing slash).
+            if path_end > 0 && path.as_bytes().get(path_end - 1).copied() != Some(b'/') {
+                // Set ext_sep = path_end so that:
+                //   filestem() stop_idx = path_end  → returns the whole filename
+                //   ext() start_idx = path_end + 1  → clamped to "" by the guard in ext()
+                ap.ext_sep = Some(path_end);
+                // Undo the "top is a dir" dir_sep promotion that new() may have applied.
+                let path_start = ap
+                    .host_sep
+                    .or_else(|| ap.sch_sep.map(|i| i + 1))
+                    .unwrap_or(0);
+                ap.dir_sep = path[path_start..path_end]
+                    .rfind('/')
+                    .map(|i| i + path_start);
+            }
+        }
+        ap
+    }
+
     pub fn is_absolute(&self) -> bool {
         self.dir().starts_with('/')
     }
@@ -513,6 +554,11 @@ impl<'a> AnchorPath<'a> {
     pub fn ext(&self) -> &'a str {
         let stop_idx = self.param_sep.or(self.anc_sep).unwrap_or(self.path.len());
         let start_idx = self.ext_sep.map(|idx| idx + 1).unwrap_or(stop_idx);
+        // Guard: new_file() sets ext_sep = path_end, making start_idx = path_end + 1 > stop_idx.
+        // In that case there is no extension — return an empty slice.
+        if start_idx > stop_idx {
+            return &self.path[stop_idx..stop_idx];
+        }
         &self.path[start_idx..stop_idx]
     }
 
