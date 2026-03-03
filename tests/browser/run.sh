@@ -51,12 +51,13 @@ rm -rf "$TEST_OUTPUT"
 mkdir -p "$TEST_OUTPUT"
 
 # Parse network_1 with HTML output
-./target/debug/noet parse tests/network_1 --html-output "$TEST_OUTPUT" 2>&1 | grep -E "(Parsed|Exported|documents)"
+./target/debug/noet parse tests/network_1 --html-output "$TEST_OUTPUT" 2>&1 | grep -E "(Parsed|Exported|documents)" || true
+NOET_EXIT=${PIPESTATUS[0]}
 
-if [ $? -eq 0 ]; then
+if [ "$NOET_EXIT" -eq 0 ]; then
     echo -e "${GREEN}✓ Test data generated${NC}\n"
 else
-    echo -e "${RED}✗ Failed to generate test data${NC}"
+    echo -e "${RED}✗ Failed to generate test data (noet exited $NOET_EXIT)${NC}"
     exit 1
 fi
 
@@ -65,8 +66,8 @@ echo -e "${BLUE}[3/4] Verifying test assets...${NC}"
 
 REQUIRED_FILES=(
     "$TEST_OUTPUT/beliefbase.json"
-    "$PROJECT_ROOT/pkg/noet_core.js"
-    "$PROJECT_ROOT/pkg/noet_core_bg.wasm"
+    "$PROJECT_ROOT/target/wasm-build/pkg/noet_core.js"
+    "$PROJECT_ROOT/target/wasm-build/pkg/noet_core_bg.wasm"
     "$SCRIPT_DIR/test_runner.html"
 )
 
@@ -147,7 +148,7 @@ if command -v python3 &> /dev/null; then
 
         try {
             // Load WASM module
-            const wasmModule = await import('./assets/noet_core.js');
+            const wasmModule = await import('/target/wasm-build/pkg/noet_core.js');
             await wasmModule.default();
             log('✓ WASM module loaded', 'pass');
 

@@ -372,7 +372,7 @@ impl BeliefBaseWasm {
             if let Err(e) = handle.modify(|f| *f = filter) {
                 console::warn_1(&format!("⚠️ Failed to set log level: {e}").into());
             } else {
-                console::log_1(&format!("[Noet] Log level set to: {level}").into()).into()
+                console::log_1(&format!("[Noet] Log level set to: {level}").into());
             }
         }
     }

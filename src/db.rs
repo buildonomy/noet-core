@@ -18,7 +18,7 @@ use sqlx::{
     ConnectOptions, Row,
 };
 use sqlx::{migrate::MigrationType, Pool, QueryBuilder};
-use std::{collections::BTreeMap, fmt::Debug, result::Result, u16};
+use std::{collections::BTreeMap, fmt::Debug, result::Result};
 use std::{
     collections::BTreeSet,
     fs,
