@@ -428,15 +428,52 @@ fn check_for_link_and_push(
 
             // Normalize the key against the repo-relative doc path, then regularize
             let normalized_abs = key.resolve_against(doc_abs_path);
+            // ctx.root_path may differ from doc_abs_path (node.path) in several ways:
+            //   1. Network dir form:  doc="/tmp/.../subnet1"   ctx="subnet1/index.md"
+            //   2. Index file form:   doc="/tmp/.../subnet1/index.md"  ctx="subnet1"
+            //   3. Extensionless key: doc="/tmp/.../test.md"   ctx="test"
+            //
+            // We need to find root_abs_path = the absolute prefix that, when concatenated
+            // with ctx_filepath, gives doc_abs_path (modulo extension differences).
+            //
+            // Strategy: normalise both to an extensionless stem using plain string ops so
+            // that Windows absolute paths (C://...) are not misinterpreted as URLs by
+            // AnchorPath. Forward slashes are always used here (os_path_to_string guarantees
+            // that by the time paths reach the codec layer).
             let ctx_filepath = AnchorPath::new(&ctx.root_path).filepath();
-            if !doc_abs_path.ends_with(&ctx_filepath) {
+
+            /// Strip the file extension from a forward-slash path string.
+            /// "subnet1/index.md" → "subnet1/index"
+            /// "test.md"          → "test"
+            /// "subnet1"          → "subnet1"   (no extension — unchanged)
+            fn strip_ext(p: &str) -> &str {
+                // Only consider the portion after the last '/'
+                let last_slash = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+                if let Some(dot) = p[last_slash..].rfind('.') {
+                    &p[..last_slash + dot]
+                } else {
+                    p
+                }
+            }
+
+            /// Further reduce a stem: if it ends in "/index", drop that segment so that
+            /// "subnet1/index" and "subnet1" compare equal.
+            fn drop_index_suffix(p: &str) -> &str {
+                p.strip_suffix("/index").unwrap_or(p)
+            }
+
+            let ctx_stem = drop_index_suffix(strip_ext(ctx_filepath));
+            let doc_stem = drop_index_suffix(strip_ext(doc_abs_path));
+
+            if !doc_stem.ends_with(ctx_stem) {
                 panic!(
                     "Context path and proto path do not match! Proto abs path: \"{doc_abs_path}\" \
                     repo relative path: \"{ctx_filepath}\".\nbase paths: {}",
                     ctx.beliefbase().paths()
                 );
             };
-            let root_abs_path = &doc_abs_path[0..(doc_abs_path.len() - ctx_filepath.len())];
+            // root_abs_path is the absolute prefix before the repo-relative portion.
+            let root_abs_path = &doc_stem[0..(doc_stem.len() - ctx_stem.len())];
             let regularized =
                 normalized_abs.regularize_unchecked(ctx.root_net, &ctx.root_path, root_abs_path);
             let keys = vec![regularized];

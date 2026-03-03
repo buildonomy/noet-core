@@ -130,8 +130,13 @@ impl<'a> AnchorPath<'a> {
 
         if let Some(sch_idx) = sch_sep {
             let after_schema = sch_idx + 1;
-            // Check if we have // after the schema (indicates hierarchical URL with authority)
-            if after_schema + 1 < path.len()
+            // Check if we have // after the schema (indicates hierarchical URL with authority).
+            // A single-character schema is a Windows drive letter (e.g. "C://path") — the "//"
+            // is an absolute path, not a hostname authority. Zero-length ("://path") and
+            // multi-character schemas (http, ftp, file, …) do have a real hostname authority.
+            let schema_is_url = sch_idx != 1;
+            if schema_is_url
+                && after_schema + 1 < path.len()
                 && path.as_bytes()[after_schema] == b'/'
                 && path.as_bytes()[after_schema + 1] == b'/'
             {
@@ -1557,7 +1562,9 @@ mod tests {
         assert!(ap.has_schema());
         assert_eq!(ap.schema(), "custom-protocol");
 
-        // Single letter schema (Windows drive letter)
+        // Single letter token before colon is a Windows drive letter.
+        // It is detected as a schema (for backward compat with single-slash form "C:/..."),
+        // but the "//" form "C://..." must NOT trigger hostname parsing.
         let ap = AnchorPath::new("c:/Windows/file.txt");
         assert!(ap.has_schema());
         assert_eq!(ap.schema(), "c");
@@ -1638,6 +1645,75 @@ mod tests {
         assert_eq!(ap.dir(), "/");
         assert_eq!(ap.filepath(), "/");
         assert_eq!(ap.filename(), "");
+    }
+
+    #[test]
+    fn test_windows_absolute_paths() {
+        // Windows absolute paths produced by os_path_to_string use forward slashes and
+        // may have double-slash after the drive letter: "C://Users/...".
+        // The drive letter "C" must NOT be treated as a URL schema with "Users" as hostname.
+
+        // Double-slash form (what os_path_to_string produces on Windows)
+        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/test.md");
+        assert!(ap.has_schema(), "drive letter still detected as schema");
+        assert!(!ap.has_hostname(), "C:// must not produce a hostname");
+        assert_eq!(ap.schema(), "C");
+        assert_eq!(ap.hostname(), "");
+        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp");
+        assert_eq!(ap.filename(), "test.md");
+        assert_eq!(ap.filestem(), "test");
+        assert_eq!(ap.ext(), "md");
+        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/test.md");
+
+        // Directory path (no extension) — double-slash drive form
+        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert!(ap.has_schema());
+        assert!(!ap.has_hostname());
+        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert_eq!(ap.filename(), "");
+        assert_eq!(ap.filestem(), "");
+        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+
+        // Network index path
+        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/subnet1/index.md");
+        assert!(ap.has_schema());
+        assert!(!ap.has_hostname());
+        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert_eq!(ap.filename(), "index.md");
+        assert_eq!(ap.filestem(), "index");
+        assert_eq!(ap.ext(), "md");
+        assert_eq!(
+            ap.filepath(),
+            "//Users/RUNNER/AppData/Local/Temp/subnet1/index.md"
+        );
+
+        // With anchor fragment
+        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/test.md#section");
+        assert!(ap.has_schema());
+        assert!(!ap.has_hostname());
+        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/test.md");
+        assert_eq!(ap.anchor(), "section");
+
+        // Lowercase drive letter
+        let ap = AnchorPath::new("c://tmp/project/docs/guide.md");
+        assert!(ap.has_schema());
+        assert!(!ap.has_hostname());
+        assert_eq!(ap.dir(), "//tmp/project/docs");
+        assert_eq!(ap.filestem(), "guide");
+        assert_eq!(ap.ext(), "md");
+
+        // Real URL schemas (>=2 chars) must still parse hostname correctly
+        let ap = AnchorPath::new("https://example.com/path/file.html");
+        assert!(ap.has_schema());
+        assert!(ap.has_hostname());
+        assert_eq!(ap.schema(), "https");
+        assert_eq!(ap.hostname(), "example.com");
+        assert_eq!(ap.filepath(), "/path/file.html");
+
+        let ap = AnchorPath::new("file:///tmp/test.md");
+        assert!(ap.has_schema());
+        assert_eq!(ap.schema(), "file");
+        assert_eq!(ap.filepath(), "/tmp/test.md");
     }
 
     #[test]
