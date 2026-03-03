@@ -69,6 +69,16 @@ enum Commands {
         /// Optional network summary
         #[arg(long)]
         summary: Option<String>,
+
+        /// Insert a <!-- network-children --> placement marker in the body to control where the
+        /// auto-generated child listing appears. If neither flag is passed, you will be prompted.
+        #[arg(long, overrides_with = "no_children_marker")]
+        children_marker: bool,
+
+        /// Skip the <!-- network-children --> placement marker. If neither flag is passed, you
+        /// will be prompted.
+        #[arg(long, overrides_with = "children_marker")]
+        no_children_marker: bool,
     },
 
     /// Parse a document or directory once and display diagnostics
@@ -161,6 +171,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             id,
             title,
             summary,
+            children_marker,
+            no_children_marker,
         } => {
             use std::io::Write;
 
@@ -199,6 +211,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Get summary if provided (no prompt if not on CLI)
             let network_summary = summary;
 
+            // Determine whether to insert the network-children placement marker.
+            // If neither --children-marker nor --no-children-marker was passed, prompt.
+            let insert_children_marker = if children_marker {
+                true
+            } else if no_children_marker {
+                false
+            } else {
+                print!("Insert child listing placement marker? [Y/n]: ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_lowercase();
+                // Empty input or 'y'/'yes' → true; anything else → false
+                trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+            };
+
             // Create network file
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -210,6 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &network_id,
                     network_title,
                     network_summary,
+                    insert_children_marker,
                 )
                 .await
             })?;

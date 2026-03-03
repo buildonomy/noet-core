@@ -336,7 +336,7 @@ pub trait DocCodec: Sync {
         Ok(vec![])
     }
 
-    /// Generate HTML fragments with full BeliefContext (deferred phase).
+    /// Generate HTML with full BeliefContext (deferred phase).
     ///
     /// Called after all parsing completes, with full context available.
     /// Use for codecs that need to query relationships (e.g., network indices listing children).
@@ -345,44 +345,62 @@ pub trait DocCodec: Sync {
     ///
     /// # Parameters
     /// - `ctx`: BeliefContext with full graph relationships and metadata
+    /// - `existing_html_path`: Absolute path to the HTML file already written by the immediate
+    ///   `generate_html()` phase. The codec may read this file, modify it in place, and return
+    ///   `Ok(None)` to signal that the write is complete. If the file does not exist (e.g.
+    ///   `html_output_dir` was not configured at parse time), the codec should fall back to
+    ///   returning a body fragment for the compiler to write via `write_fragment`.
     ///
     /// # Returns
-    /// Same format as `generate_html()` - output filenames and HTML body content.
-    /// Filenames are resolved relative to the source file's directory (from ctx.path).
+    /// - `Ok(None)` — codec handled the write itself (in-place modification). Compiler does
+    ///   nothing further. Also the correct return value when there is nothing to write.
+    /// - `Ok(Some((filename, body)))` — compiler calls `write_fragment` to write the body.
+    ///   `filename` is relative to the source file's directory.
+    /// - `Err(_)` — generation failed.
+    ///
+    /// # Sentinel Protocol
+    ///
+    /// Codecs that want to splice context-dependent content into authored prose should emit a
+    /// sentinel string from `generate_html()` at the desired injection point. The sentinel
+    /// survives `write_fragment`'s template wrapping (it sits inside `{{BODY}}`). The deferred
+    /// phase reads the on-disk file, replaces the sentinel, and writes back.
+    ///
+    /// If the sentinel is absent from the existing file, the codec should log
+    /// `tracing::info!` and return `Ok(None)` — its absence is intentional (author opt-out
+    /// or future config).
     ///
     /// # Example: Network Index
     /// ```ignore
-    /// fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(String, String)>, BuildonomyError> {
-    ///     // Query child documents via Subsection edges
-    ///     let mut children: Vec<_> = ctx.sources.iter()
-    ///         .filter(|edge| edge.weight.get(WeightKind::Subsection).is_some())
-    ///         .collect();
+    /// fn generate_deferred_html(
+    ///     &self,
+    ///     ctx: &BeliefContext,
+    ///     existing_html_path: &Path,
+    /// ) -> Result<Option<(String, String)>, BuildonomyError> {
+    ///     let listing_html = /* build child listing from ctx */;
     ///
-    ///     // Sort by WEIGHT_SORT_KEY
-    ///     children.sort_by_key(|edge| {
-    ///         edge.weight.get(WeightKind::Subsection)
-    ///             .and_then(|w| w.get("sort"))
-    ///             .and_then(|v| v.as_integer())
-    ///     });
-    ///
-    ///     // Generate HTML list
-    ///     let html = format!("<ul>{}</ul>",
-    ///         children.iter()
-    ///             .map(|edge| format!("<li><a href='{}'>{}</a></li>",
-    ///                 edge.other_path, edge.other.display_title()))
-    ///             .collect::<String>()
-    ///     );
-    ///
-    ///     Ok(vec![("index.html".to_string(), html)])
+    ///     if existing_html_path.exists() {
+    ///         let mut content = std::fs::read_to_string(existing_html_path)?;
+    ///         if content.contains(SENTINEL) {
+    ///             content = content.replace(SENTINEL, &listing_html);
+    ///             std::fs::write(existing_html_path, content)?;
+    ///             Ok(None)
+    ///         } else {
+    ///             tracing::info!("sentinel not found in {:?}, skipping injection", existing_html_path);
+    ///             Ok(None)
+    ///         }
+    ///     } else {
+    ///         Ok(Some(("index.html".to_string(), listing_html)))
+    ///     }
     /// }
     /// ```
     ///
-    /// Default implementation returns empty vec (no deferred generation).
+    /// Default implementation returns `Ok(None)` (nothing to write).
     fn generate_deferred_html(
         &self,
         _ctx: &BeliefContext<'_>,
-    ) -> Result<Vec<(String, String)>, BuildonomyError> {
-        Ok(vec![])
+        _existing_html_path: &std::path::Path,
+    ) -> Result<Option<(String, String)>, BuildonomyError> {
+        Ok(None)
     }
 }
 

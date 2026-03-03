@@ -1166,14 +1166,20 @@ impl BeliefBaseWasm {
             // Flat map for all nodes in this network
             let mut nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
 
-            // Create network node
+            // Create network node — resolve its own index path from the PathMap.
+            // The network's own BID is stored under the empty-string key ("") in its PathMap,
+            // which normalize_path_extension_impl converts to "/index.html".
+            let net_root_path = pm
+                .path(net_bid, &paths)
+                .map(|(_home_net, raw_path, _order)| Self::normalize_path_extension(&raw_path))
+                .unwrap_or_default();
             let network_bid_str = net_bid.to_string();
             nodes_map.insert(
                 network_bid_str.clone(),
                 NavNode {
                     bid: network_bid_str.clone(),
                     title: net_title,
-                    path: String::new(), // Networks don't have paths
+                    path: net_root_path,
                     parent: None,
                     children: Vec::new(),
                 },

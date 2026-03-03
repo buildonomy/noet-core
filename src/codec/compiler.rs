@@ -256,6 +256,7 @@ impl DocumentCompiler {
         id: &str,
         maybe_title: Option<String>,
         maybe_summary: Option<String>,
+        insert_children_marker: bool,
     ) -> Result<PathBuf, BuildonomyError>
     where
         P: AsRef<std::path::Path> + std::fmt::Debug,
@@ -283,7 +284,14 @@ impl DocumentCompiler {
         }
         file_path.push(NETWORK_NAME);
         let mut file = fs::File::create(&file_path)?;
-        file.write_all(&format!("---{}\n---\n", proto.document).into_bytes())?;
+        let mut body = format!("---{}\n---\n", proto.document);
+        if insert_children_marker {
+            body.push_str(&format!(
+                "\n{}\n",
+                crate::codec::network::NETWORK_CHILDREN_MARKER
+            ));
+        }
+        file.write_all(body.as_bytes())?;
         Ok(file_path)
     }
 
@@ -1943,9 +1951,8 @@ impl DocumentCompiler {
         // Generate HTML using fresh codec instance (deferred generation)
         let codec = codec_factory();
 
-        // Get title and generate fragments based on context availability
+        // Get title for write_fragment fallback path
         let title = ctx.node.display_title().to_string();
-        let fragments = codec.generate_deferred_html(&ctx)?;
 
         // Convert absolute path to repo-relative path
         let repo_relative_path = source_path
@@ -1963,13 +1970,39 @@ impl DocumentCompiler {
             repo_relative_path.parent().unwrap_or(Path::new(""))
         };
 
-        for (filename, html_body) in fragments.into_iter() {
-            // Join base directory with filename to get relative path
-            let rel_path = base_dir.join(&filename);
+        // Compute the expected on-disk HTML output path so the deferred codec can read and
+        // modify it in place (sentinel replacement). This mirrors write_fragment's layout:
+        // html_output_dir / "pages" / base_dir / filename.
+        //
+        // For network nodes the deferred output filename is always "index.html".
+        let deferred_filename_buf;
+        let deferred_filename = if ctx.node.kind.is_network() {
+            "index.html"
+        } else {
+            deferred_filename_buf = format!(
+                "{}.html",
+                source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document")
+            );
+            deferred_filename_buf.as_str()
+        };
+        let existing_html_path = html_output_dir
+            .join("pages")
+            .join(base_dir)
+            .join(deferred_filename);
 
-            // Write fragment using helper with title and BID
-            self.write_fragment(html_output_dir, &rel_path, html_body, &title, &node.bid)
-                .await?;
+        match codec.generate_deferred_html(&ctx, &existing_html_path)? {
+            None => {
+                // Codec handled the write itself (in-place sentinel replacement). Nothing to do.
+            }
+            Some((filename, html_body)) => {
+                // Codec returned a fragment — write it via write_fragment as normal.
+                let rel_path = base_dir.join(&filename);
+                self.write_fragment(html_output_dir, &rel_path, html_body, &title, &node.bid)
+                    .await?;
+            }
         }
 
         Ok(())

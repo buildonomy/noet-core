@@ -961,6 +961,67 @@ impl MdCodec {
             }
         }
     }
+
+    /// Render all parsed events to an HTML body string, rewriting document links to `.html`.
+    ///
+    /// This is the shared rendering kernel used by both `generate_html` (which derives the
+    /// output filename from the source path) and `NetworkCodec::generate_html` (which always
+    /// uses `index.html` as the output filename). Keeping the rendering logic in one place
+    /// ensures link-rewriting behaviour stays consistent across both code paths.
+    pub fn render_html_body(&self) -> String {
+        fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
+            match event {
+                MdEvent::Start(MdTag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => {
+                    let url_ap = AnchorPath::from(&dest_url);
+                    let should_rewrite = title.contains("bref://");
+                    let new_url = if should_rewrite {
+                        if url_ap.is_anchor() {
+                            tracing::debug!("is anchor");
+                            CowStr::from(as_anchor(url_ap.anchor()))
+                        } else if CODECS.get(&url_ap).is_some() {
+                            let res = CowStr::from(
+                                url_ap
+                                    .normalize()
+                                    .as_anchor_path()
+                                    .replace_extension("html"),
+                            );
+                            tracing::debug!("replacing {dest_url} with {res}");
+                            res
+                        } else {
+                            tracing::debug!("no extension for {dest_url}");
+                            dest_url
+                        }
+                    } else {
+                        tracing::debug!("no bref element in title attribute for {dest_url}");
+                        dest_url
+                    };
+
+                    MdEvent::Start(MdTag::Link {
+                        link_type,
+                        dest_url: new_url,
+                        title,
+                        id,
+                    })
+                }
+                _ => event,
+            }
+        }
+
+        let events = self
+            .current_events
+            .iter()
+            .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
+            .map(rewrite_md_links_to_html);
+
+        let mut html_body = String::new();
+        pulldown_cmark::html::push_html(&mut html_body, events);
+        html_body
+    }
 }
 
 impl DocCodec for MdCodec {
@@ -1200,52 +1261,6 @@ impl DocCodec for MdCodec {
     }
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
-        // Rewrite document links to .html for HTML output and break invalid backtracking links
-        fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
-            match event {
-                MdEvent::Start(MdTag::Link {
-                    link_type,
-                    dest_url,
-                    title,
-                    id,
-                }) => {
-                    let url_ap = AnchorPath::from(&dest_url);
-                    let should_rewrite = title.contains("bref://");
-                    let new_url = if should_rewrite {
-                        // Use anchor-aware extension checking
-                        if url_ap.is_anchor() {
-                            tracing::debug!("is anchor");
-                            CowStr::from(as_anchor(url_ap.anchor()))
-                        } else if CODECS.get(&url_ap).is_some() {
-                            // Check if there's an anchor
-                            let res = CowStr::from(
-                                url_ap
-                                    .normalize()
-                                    .as_anchor_path()
-                                    .replace_extension("html"),
-                            );
-                            tracing::debug!("replacing {dest_url} with {res}");
-                            res
-                        } else {
-                            tracing::debug!("no extension for {dest_url}");
-                            dest_url
-                        }
-                    } else {
-                        tracing::debug!("no bref element in title attribute for {dest_url}");
-                        dest_url
-                    };
-
-                    MdEvent::Start(MdTag::Link {
-                        link_type,
-                        dest_url: new_url,
-                        title,
-                        id,
-                    })
-                }
-                _ => event,
-            }
-        }
-
         let doc_abs_path = self
             .current_events
             .first()
@@ -1253,11 +1268,9 @@ impl DocCodec for MdCodec {
             .filter(|path| !path.is_empty())
             .unwrap_or("document.md".to_string());
         let doc_abs_ap = AnchorPath::from(&doc_abs_path);
-        // Get source path from IRNode's path field to compute output filename
 
-        // Extract filename and convert extension to .html
-        // Extract filename and convert extension to .html
-        // Handle empty path (tests) by defaulting to "document.html"
+        // Extract filename and convert extension to .html.
+        // Handle empty path (tests) by defaulting to "document.html".
         if doc_abs_ap.filestem().is_empty() {
             return Err(BuildonomyError::Codec(format!(
                 "Markdown file has no filename! {doc_abs_path}",
@@ -1265,17 +1278,7 @@ impl DocCodec for MdCodec {
         }
         let output_filename = format!("{}.html", doc_abs_ap.filestem());
 
-        // Generate HTML body from markdown events
-        let events = self
-            .current_events
-            .iter()
-            .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
-            .map(|e| rewrite_md_links_to_html(e));
-
-        let mut html_body = String::new();
-        pulldown_cmark::html::push_html(&mut html_body, events);
-
-        Ok(vec![(output_filename, html_body)])
+        Ok(vec![(output_filename, self.render_html_body())])
     }
 
     fn finalize(
@@ -1428,6 +1431,7 @@ impl DocCodec for MdCodec {
         self.current_events = Vec::default();
         self.matched_sections.clear();
         self.seen_ids.clear();
+        let mut first_heading = true;
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
@@ -1560,14 +1564,13 @@ impl DocCodec for MdCodec {
                     let accum_title = current.accumulator.take().unwrap_or_default();
                     let current_title = current.title().unwrap_or_default();
                     // Heading 3 is an h1. heading 1 == network, heading 2 == document
-                    let is_document_heading =
-                        self.current_events.len() == 1 && current.heading == 3;
+                    let is_document_heading = first_heading && current.heading == 3;
                     if accum_title.is_empty() || current_title == accum_title || is_document_heading
                     {
                         // Don't count this as a new section --- glue it back onto the last proto for these cases:
                         // 1. the new title is empty,
                         // 2. it's the same as the last section title, or
-                        // 3. its an h1 at the start of the document with no prior content
+                        // 3. its an h1 at the start of the document with no prior headings
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
                             if is_document_heading && !accum_title.is_empty() {
@@ -1579,6 +1582,7 @@ impl DocCodec for MdCodec {
                     } else {
                         current.document.insert("title", value(accum_title));
                     }
+                    first_heading = false;
                 }
                 _ => {}
             }

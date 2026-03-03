@@ -2139,9 +2139,7 @@ impl BeliefSource for &BeliefBase {
                     .into_iter()
                     .filter_map(|(path, bid, order)| {
                         // Filter out network index files and subsections
-                        if path.is_empty()
-                            || !include_index && order.contains(&u16::MAX)
-                        {
+                        if path.is_empty() || !include_index && order.contains(&u16::MAX) {
                             None
                         } else {
                             Some((path, bid))

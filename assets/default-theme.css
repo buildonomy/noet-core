@@ -40,8 +40,8 @@ h6 {
     color: #27262b;
 }
 
-/* Document title - injected by HTML generator */
-h1.document-title {
+/* First h1 in an article is the document title — authored in Markdown body */
+article h1:first-child {
     margin-top: 0;
     margin-bottom: 1em;
     padding-bottom: 0.5em;
