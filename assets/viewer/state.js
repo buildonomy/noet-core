@@ -117,6 +117,14 @@ export const state = {
   currentDocPath: null,
 
   /**
+   * BID of the currently loaded document. Set alongside currentDocPath on
+   * successful loadDocument(); reset to null at the start of each load.
+   * Used by the nav tree to highlight the current document node distinctly
+   * from the selectedNodeBid (metadata panel focus).
+   */
+  currentDocBid: null,
+
+  /**
    * Asset/href node BID to highlight in content once the next document load
    * completes. Set by the metadata panel external link handler when the owner
    * document is not currently loaded. Consumed by loadDocument() after content

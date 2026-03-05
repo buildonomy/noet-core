@@ -43,6 +43,9 @@ export function showMetadataPanel(nodeBid) {
   }
 
   state.selectedNodeBid = nodeBid;
+  if (callbacks.updateNavTreeHighlight) {
+    callbacks.updateNavTreeHighlight();
+  }
 
   try {
     const context = state.beliefbase.get_context(nodeBid);
@@ -79,6 +82,9 @@ export function closeMetadataPanel() {
   applyPanelState();
   savePanelState();
   state.selectedNodeBid = null;
+  if (callbacks.updateNavTreeHighlight) {
+    callbacks.updateNavTreeHighlight();
+  }
 }
 
 /**

@@ -51,11 +51,21 @@ export function buildNavigation() {
     state.isFirstNavRender = false;
   }
 
-  // Expand ancestors of the active node
+  // Expand ancestors of the active node, current document, and selected metadata node
   const activeBid = getActiveBid();
   if (activeBid) {
     buildParentChain(activeBid);
     console.log(`[Noet] Active BID: ${activeBid}, expanded ${state.expandedNodes.size} ancestors`);
+  }
+  if (state.currentDocBid && state.currentDocBid !== activeBid) {
+    expandAncestors(state.currentDocBid);
+  }
+  if (
+    state.selectedNodeBid &&
+    state.selectedNodeBid !== activeBid &&
+    state.selectedNodeBid !== state.currentDocBid
+  ) {
+    expandAncestors(state.selectedNodeBid);
   }
 
   const treeHtml = renderNavTree();
@@ -71,33 +81,16 @@ export function buildNavigation() {
 }
 
 /**
- * Update CSS active classes on nav links without re-rendering the tree.
- * Called after a document load completes.
+ * Re-render the navigation tree to reflect the current active node,
+ * current document (is-current-doc), and selected metadata node (is-selected).
+ *
+ * Previously this did a partial DOM patch, but with three independent highlight
+ * axes a full rebuild is simpler and correct. Called after document loads and
+ * metadata panel changes.
  */
 export function updateNavTreeHighlight() {
-  if (!state.navContent) return;
-
-  const activeBid = getActiveBid();
-  if (!activeBid) return;
-
-  state.navContent.querySelectorAll(".noet-nav-link").forEach((link) => {
-    link.classList.remove("active");
-  });
-
-  const activeLink = state.navContent.querySelector(`.noet-nav-link[data-bid="${activeBid}"]`);
-  if (activeLink) {
-    activeLink.classList.add("active");
-
-    // Ensure ancestor nodes are tracked as expanded
-    let parent = activeLink.closest("li");
-    while (parent) {
-      const toggle = parent.querySelector(".noet-nav-toggle");
-      if (toggle && !state.expandedNodes.has(toggle.dataset.bid)) {
-        state.expandedNodes.add(toggle.dataset.bid);
-      }
-      parent = parent.parentElement?.closest("li");
-    }
-  }
+  if (!state.navTree) return;
+  buildNavigation();
 }
 
 /**
@@ -171,7 +164,16 @@ function buildParentChain(activeBid) {
   }
 
   // Walk parent chain upward
-  let currentBid = activeBid;
+  expandAncestors(activeBid);
+}
+
+/**
+ * Walk the parent chain of a BID upward, adding each ancestor to expandedNodes.
+ * Safe to call multiple times for different BIDs — additive, does not clear.
+ * @param {string} bid
+ */
+function expandAncestors(bid) {
+  let currentBid = bid;
   while (currentBid) {
     state.expandedNodes.add(currentBid);
     const node = state.navTree.nodes.get(currentBid);
@@ -243,11 +245,15 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
   const hasChildren = node.children && node.children.length > 0;
   const isExpanded = state.expandedNodes.has(bid);
   const isActive = bid === getActiveBid();
+  const isCurrentDoc = !!state.currentDocBid && bid === state.currentDocBid;
+  const isSelected = !!state.selectedNodeBid && bid === state.selectedNodeBid;
 
   let itemClass = "noet-nav-tree__item";
   if (hasChildren) itemClass += " has-children";
   if (isExpanded) itemClass += " is-expanded";
   if (isActive) itemClass += " active";
+  if (isCurrentDoc) itemClass += " is-current-doc";
+  if (isSelected) itemClass += " is-selected";
   if (node.is_network) itemClass += " is-network";
   else if (node.is_document) itemClass += " is-document";
   else itemClass += " is-anchor";

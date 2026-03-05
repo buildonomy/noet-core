@@ -196,6 +196,7 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
   }
 
   state.currentDocPath = null;
+  state.currentDocBid = null;
 
   try {
     // --- 1. Normalise path ---
@@ -283,6 +284,7 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     processLoadedContent(contentInner || state.contentElement);
 
     state.currentDocPath = docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath));
+    state.currentDocBid = documentBid;
     console.log(`[Noet] Document loaded: ${path}`);
 
     // --- 7. Nav highlight + metadata ---

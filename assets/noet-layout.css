@@ -276,12 +276,12 @@ body {
 
 .noet-metadata {
     grid-area: metadata;
-    background-color: var(--noet-bg-secondary);
     border-left: 1px solid var(--noet-border-primary);
     display: flex;
     flex-direction: column;
     padding: var(--size-4);
     font-weight: var(--noet-font-weight-ui, 350);
+    background-color: var(--noet-bg-primary);
 }
 
 /* Mobile/Tablet: Bottom drawer */
@@ -527,6 +527,7 @@ body {
         /*transform: translateX(50%);*/
         border-radius: var(--radius-2) 0 0 var(--radius-2);
         border-right: none;
+        box-shadow: var(--noet-collapse-shadow-metadata);
     }
 
     /* Metadata handle: left edge of .noet-metadata, protrudes leftward out of the drawer */
@@ -535,6 +536,7 @@ body {
         /*transform: translateX(-50%);*/
         border-radius: 0 var(--radius-2) var(--radius-2) 0;
         border-left: none;
+        box-shadow: var(--noet-collapse-shadow-nav);
     }
 
     /* Content handle: fixed at the bottom of the viewport, aligned to the right
@@ -545,6 +547,7 @@ body {
         left: calc(50vw + var(--noet-content-max-width, 45rem) / 2);
         border-radius: 0 var(--radius-2) var(--radius-2) 0;
         border-left: none;
+        box-shadow: var(--noet-collapse-shadow-nav);
     }
 }
 
@@ -679,6 +682,30 @@ html.is-resizing .noet-metadata__collapse {
 .noet-nav-tree__link.is-active {
     background-color: var(--noet-accent-primary);
     color: var(--noet-text-inverse);
+    font-weight: var(--font-weight-6);
+}
+
+/* Current document: accent colour on text to mark which doc is loaded in the content area. */
+.noet-nav-tree__item.is-current-doc > .noet-nav-tree__link,
+.noet-nav-tree__item.is-current-doc > .noet-nav-tree__label {
+    color: var(--noet-accent-primary);
+    font-weight: var(--font-weight-6);
+}
+
+/* Selected node (metadata panel focus): subtle background tint.
+   Distinct from is-current-doc so both can coexist on the same item. */
+.noet-nav-tree__item.is-selected > .noet-nav-tree__link {
+    background-color: var(--noet-bg-tertiary);
+    outline: 1px solid var(--noet-border-primary);
+    outline-offset: -1px;
+}
+
+/* When both is-current-doc and is-selected apply, combine accent text with selection background. */
+.noet-nav-tree__item.is-current-doc.is-selected > .noet-nav-tree__link {
+    color: var(--noet-accent-primary);
+    background-color: var(--noet-bg-tertiary);
+    outline: 1px solid var(--noet-border-primary);
+    outline-offset: -1px;
     font-weight: var(--font-weight-6);
 }
 
