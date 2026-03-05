@@ -74,12 +74,16 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn track_file_mtime(&mut self, path: &Path) -> Result<(), BuildonomyError> {
-        match fs::metadata(path) {
+        // Canonicalize to resolve Windows 8.3 short-name aliases and symlinks so that
+        // the same file is always stored under a single consistent key regardless of
+        // which alias the compiler or file-watcher happened to use at call time.
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        match fs::metadata(&canonical) {
             Ok(metadata) => match metadata.modified() {
                 Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {
                     Ok(duration) => {
                         let mtime = duration.as_secs() as i64;
-                        let path_str = os_path_to_string(path);
+                        let path_str = os_path_to_string(&canonical);
                         self.mtime_updates.insert(path_str.clone(), mtime);
                     }
                     Err(e) => {
@@ -100,8 +104,9 @@ impl<'a> Transaction<'a> {
             },
             Err(e) => {
                 tracing::warn!(
-                    "[Transaction]   ✗ Failed to get metadata for {:?}: {} (path may not exist or be inaccessible)",
+                    "[Transaction]   ✗ Failed to get metadata for {:?} (canonical: {:?}): {} (path may not exist or be inaccessible)",
                     path,
+                    canonical,
                     e
                 );
                 tracing::warn!("[Transaction]   errno/kind: {:?}", e.kind());
