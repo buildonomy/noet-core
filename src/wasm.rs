@@ -258,6 +258,10 @@ pub struct NavNode {
     pub parent: Option<String>,
     /// Child node BIDs (ordered by WEIGHT_SORT_KEY)
     pub children: Vec<String>,
+    /// True if this node has API or Network kind (is_network ⊆ is_document)
+    pub is_network: bool,
+    /// True if this node has a standalone document identity (API, Network, or Document kind)
+    pub is_document: bool,
 }
 
 /// WASM-compatible node context (no lifetimes, fully owned)
@@ -1180,6 +1184,10 @@ impl BeliefBaseWasm {
                 .map(|(_home_net, raw_path, _order)| Self::normalize_path_extension(&raw_path))
                 .unwrap_or_default();
             let network_bid_str = net_bid.to_string();
+            let net_kind = states
+                .get(net_bid)
+                .map(|node| node.kind.clone())
+                .unwrap_or_default();
             nodes_map.insert(
                 network_bid_str.clone(),
                 NavNode {
@@ -1188,6 +1196,8 @@ impl BeliefBaseWasm {
                     path: net_root_path,
                     parent: None,
                     children: Vec::new(),
+                    is_network: net_kind.is_network(),
+                    is_document: net_kind.is_document(),
                 },
             );
 
@@ -1230,10 +1240,10 @@ impl BeliefBaseWasm {
                 if path.ends_with(NETWORK_NAME) && nodes_map.contains_key(&bid_str) {
                     continue;
                 }
-                let node_title = states
+                let (node_title, node_kind) = states
                     .get(bid)
-                    .map(|node| node.title.clone())
-                    .unwrap_or_else(|| path.clone());
+                    .map(|node| (node.title.clone(), node.kind.clone()))
+                    .unwrap_or_else(|| (path.clone(), Default::default()));
 
                 // Normalize extension to .html
                 let html_path = Self::normalize_path_extension(path);
@@ -1253,6 +1263,8 @@ impl BeliefBaseWasm {
                     path: html_path,
                     parent: Some(parent_bid.clone()),
                     children: Vec::new(),
+                    is_network: node_kind.is_network(),
+                    is_document: node_kind.is_document(),
                 };
 
                 // Add node to map

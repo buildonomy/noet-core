@@ -84,9 +84,7 @@ export function updateNavTreeHighlight() {
     link.classList.remove("active");
   });
 
-  const activeLink = state.navContent.querySelector(
-    `.noet-nav-link[data-bid="${activeBid}"]`,
-  );
+  const activeLink = state.navContent.querySelector(`.noet-nav-link[data-bid="${activeBid}"]`);
   if (activeLink) {
     activeLink.classList.add("active");
 
@@ -163,9 +161,7 @@ export function getActiveBid() {
 function buildParentChain(activeBid) {
   // Preserve root expansions that were set on first render
   const roots = new Set(state.navTree.roots || []);
-  const preservedRoots = new Set(
-    [...state.expandedNodes].filter((bid) => roots.has(bid)),
-  );
+  const preservedRoots = new Set([...state.expandedNodes].filter((bid) => roots.has(bid)));
 
   state.expandedNodes.clear();
 
@@ -252,6 +248,9 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
   if (hasChildren) itemClass += " has-children";
   if (isExpanded) itemClass += " is-expanded";
   if (isActive) itemClass += " active";
+  if (node.is_network) itemClass += " is-network";
+  else if (node.is_document) itemClass += " is-document";
+  else itemClass += " is-anchor";
 
   let html = `<li class="${itemClass}" data-bid="${escapeHtml(bid)}">`;
 

@@ -11,6 +11,7 @@
  *   viewer/content.js    — processLoadedContent, image modal, link highlighting
  *   viewer/metadata.js   — Metadata panel: showMetadataPanel, renderNodeContext
  *   viewer/routing.js    — Hash routing, loadDocument, navigateToLink
+ *   viewer/resize.js     — Draggable resize handles for nav, metadata, and content panels
  *   viewer/wasm.js       — WASM init, getBidFromPath
  *
  * ⚠️  WASM Data Type Patterns
@@ -52,6 +53,7 @@ import {
   navigateToSection,
 } from "./viewer/routing.js";
 import { initializeWasm } from "./viewer/wasm.js";
+import { initResizeHandles } from "./viewer/resize.js";
 
 // =============================================================================
 // Bootstrap
@@ -75,9 +77,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 4. Attach DOM event listeners
   setupEventListeners();
 
-  // 5. Theme and panel state (work without WASM)
+  // 5. Theme, panel state, and resize handles (work without WASM)
   initializeTheme();
   initializePanelState();
+  initResizeHandles();
 
   // 6. Load WASM and BeliefBase (non-blocking — theme/basic features still work if this fails)
   try {

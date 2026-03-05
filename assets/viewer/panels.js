@@ -77,13 +77,13 @@ export function applyPanelState() {
   if (state.panelState.navCollapsed) {
     state.containerElement.classList.add("nav-collapsed");
     if (state.navCollapseBtn) {
-      state.navCollapseBtn.textContent = "▶";
+      state.navCollapseBtn.textContent = "]";
       state.navCollapseBtn.setAttribute("aria-label", "Expand navigation panel");
     }
   } else {
     state.containerElement.classList.remove("nav-collapsed");
     if (state.navCollapseBtn) {
-      state.navCollapseBtn.textContent = "◀";
+      state.navCollapseBtn.textContent = "[";
       state.navCollapseBtn.setAttribute("aria-label", "Collapse navigation panel");
     }
   }
@@ -92,13 +92,13 @@ export function applyPanelState() {
   if (state.panelState.metadataCollapsed) {
     state.containerElement.classList.add("metadata-collapsed");
     if (state.metadataCollapseBtn) {
-      state.metadataCollapseBtn.textContent = "◀";
+      state.metadataCollapseBtn.textContent = "[";
       state.metadataCollapseBtn.setAttribute("aria-label", "Show metadata panel");
     }
   } else {
     state.containerElement.classList.remove("metadata-collapsed");
     if (state.metadataCollapseBtn) {
-      state.metadataCollapseBtn.textContent = "▶";
+      state.metadataCollapseBtn.textContent = "]";
       state.metadataCollapseBtn.setAttribute("aria-label", "Hide metadata panel");
     }
   }

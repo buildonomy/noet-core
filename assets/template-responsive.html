@@ -19,6 +19,35 @@
         <!-- Noet Layout -->
         <link rel="stylesheet" href="/{{STYLESHEET_LAYOUT}}" />
 
+        <!-- Resize state: set CSS vars before first paint to avoid animated float on load -->
+        <script>
+            (function () {
+                var DEFAULTS = { navWidth: 280, metadataWidth: 320, contentMaxWidth: 720 };
+                var LIMITS = {
+                    navWidth: { min: 160, max: 520 },
+                    metadataWidth: { min: 200, max: 560 },
+                    contentMaxWidth: { min: 320, max: 1200 },
+                };
+                function clamp(v, l) {
+                    return Math.max(l.min, Math.min(l.max, v));
+                }
+                try {
+                    var raw = localStorage.getItem("noet-resize-state");
+                    var s = raw ? JSON.parse(raw) : {};
+                    var nw = clamp(s.navWidth ?? DEFAULTS.navWidth, LIMITS.navWidth);
+                    var mw = clamp(s.metadataWidth ?? DEFAULTS.metadataWidth, LIMITS.metadataWidth);
+                    var cw = clamp(
+                        s.contentMaxWidth ?? DEFAULTS.contentMaxWidth,
+                        LIMITS.contentMaxWidth,
+                    );
+                    var root = document.documentElement;
+                    root.style.setProperty("--noet-nav-width", nw + "px");
+                    root.style.setProperty("--noet-metadata-width", mw + "px");
+                    root.style.setProperty("--noet-content-max-width", cw + "px");
+                } catch (e) {}
+            })();
+        </script>
+
         <!-- Document BID (for viewer.js entry point) -->
         <script type="application/json" id="noet-entry-bid">
             "{{BID}}"
@@ -29,6 +58,12 @@
         <div class="noet-container">
             <!-- Left Navigation -->
             <nav class="noet-nav" id="nav-panel">
+                <button
+                    class="noet-resize-handle noet-resize-handle--nav"
+                    id="nav-resize"
+                    aria-label="Resize navigation panel"
+                    title="Drag to resize"
+                ></button>
                 <div class="noet-nav__content">
                     <div class="noet-nav-header">
                         <h2>Navigation</h2>
@@ -52,10 +87,22 @@
                 <div class="noet-content__inner">
                     <article>{{CONTENT}}</article>
                 </div>
+                <button
+                    class="noet-resize-handle noet-resize-handle--content"
+                    id="content-resize"
+                    aria-label="Resize content width"
+                    title="Drag to resize"
+                ></button>
             </main>
 
             <!-- Right Metadata Panel (collapsed by default) -->
             <div class="noet-metadata" id="metadata-panel">
+                <button
+                    class="noet-resize-handle noet-resize-handle--metadata"
+                    id="metadata-resize"
+                    aria-label="Resize metadata panel"
+                    title="Drag to resize"
+                ></button>
                 <div class="noet-metadata-header">
                     <h2>Metadata</h2>
                 </div>
@@ -111,7 +158,7 @@
                 aria-label="Collapse navigation panel"
                 data-target="nav-panel"
             >
-                ◀
+                [
             </button>
             <button
                 class="noet-metadata__collapse"
@@ -119,7 +166,7 @@
                 aria-label="Collapse metadata panel"
                 data-target="metadata-panel"
             >
-                ▶
+                ]
             </button>
         </div>
 

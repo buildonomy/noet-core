@@ -123,7 +123,7 @@ body {
         left: 0;
         top: 0;
         bottom: 0;
-        width: 280px;
+        width: var(--noet-nav-width, 280px);
         z-index: 40;
         overflow: hidden;
         transition: transform 0.3s var(--ease-2);
@@ -172,15 +172,18 @@ body {
         display: block;
         position: fixed;
         top: 50%;
-        left: 279px; /* Overlap panel border by 1px for seamless appearance */
+        left: calc(
+            var(--noet-nav-width, 280px) - 1px
+        ); /* Overlap panel border by 1px for seamless appearance */
         transform: translateY(-50%);
         background: var(--noet-collapse-bg);
         border: 1px solid var(--noet-border-primary);
         border-left: none;
         border-radius: 0 var(--radius-2) var(--radius-2) 0;
-        padding: var(--size-2) var(--size-3);
+        padding: var(--size-3) var(--size-1);
         cursor: pointer;
-        font-size: var(--font-size-2);
+        font-size: var(--font-size-3);
+        font-weight: bold;
         color: var(--noet-text-secondary);
         z-index: 100;
         transition:
@@ -231,7 +234,10 @@ body {
 /* Desktop: Add max-width and shadow for paper effect */
 @media (min-width: 1024px) {
     .noet-content__inner {
-        max-width: 45rem; /* ~720px at 16px base, optimal reading width */
+        max-width: var(
+            --noet-content-max-width,
+            45rem
+        ); /* ~720px at 16px base, optimal reading width */
         margin: 0 auto;
         box-shadow: var(--noet-shadow-medium);
     }
@@ -318,7 +324,7 @@ body {
         right: 0;
         top: 0;
         bottom: 0;
-        width: 320px;
+        width: var(--noet-metadata-width, 320px);
         z-index: 40;
         transition: transform 0.3s var(--ease-2);
     }
@@ -338,15 +344,18 @@ body {
         display: block;
         position: fixed;
         top: 50%;
-        right: 319px; /* Overlap panel border by 1px for seamless appearance */
+        right: calc(
+            var(--noet-metadata-width, 320px) - 1px
+        ); /* Overlap panel border by 1px for seamless appearance */
         transform: translateY(-50%);
         background: var(--noet-collapse-bg);
         border: 1px solid var(--noet-border-primary);
         border-right: none;
         border-radius: var(--radius-2) 0 0 var(--radius-2);
-        padding: var(--size-2) var(--size-3);
+        padding: var(--size-3) var(--size-1);
         cursor: pointer;
-        font-size: var(--font-size-2);
+        font-size: var(--font-size-3);
+        font-weight: bold;
         color: var(--noet-text-secondary);
         z-index: 100;
         transition:
@@ -425,6 +434,9 @@ body {
    Footer
    ========================================================================= */
 
+/* Footer height is ~48px (var(--size-3) top + bottom padding + line height).
+   The 70px clearance used in padding-bottom rules throughout this file accounts
+   for this. Resize handles use the same 70px offset to sit just above the footer. */
 .noet-footer {
     grid-area: footer;
     padding: var(--size-3) var(--size-4);
@@ -464,6 +476,85 @@ body {
         flex-direction: column;
         text-align: center;
     }
+}
+
+/* =========================================================================
+   Resize Handles
+   Desktop only. Each handle is a small draggable button flush with the bottom
+   of its panel, protruding inward toward panel content.
+
+   nav handle    — bottom of .noet-nav, arrow points left (into the drawer)
+   metadata handle — bottom of .noet-metadata, arrow points right (into the drawer)
+   content handle  — right edge of .noet-content__inner, arrow points right
+   ========================================================================= */
+
+.noet-resize-handle {
+    display: none; /* Hidden on mobile */
+}
+
+@media (min-width: 1024px) {
+    .noet-resize-handle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: absolute;
+        bottom: 65px; /* Flush with footer — shared by all three handles */
+        width: 8px;
+        height: 40px;
+        background: var(--noet-border-secondary);
+        /*border: 1px solid var(--noet-border-primary);*/
+        color: var(--noet-collapse-bg);
+        cursor: ew-resize;
+        font-size: var(--font-size-2);
+        line-height: 1;
+        z-index: 60;
+        transition:
+            background 0.15s var(--ease-2),
+            color 0.15s var(--ease-2);
+        user-select: none;
+        touch-action: none;
+    }
+
+    .noet-resize-handle:hover,
+    .noet-resize-handle.is-dragging {
+        background: var(--noet-border-primary);
+        color: var(--noet-collapse-bg-hover);
+    }
+
+    /* Nav handle: right edge of .noet-nav, protrudes rightward out of the drawer */
+    .noet-resize-handle--nav {
+        right: 0;
+        /*transform: translateX(50%);*/
+        border-radius: var(--radius-2) 0 0 var(--radius-2);
+        border-right: none;
+    }
+
+    /* Metadata handle: left edge of .noet-metadata, protrudes leftward out of the drawer */
+    .noet-resize-handle--metadata {
+        left: 0;
+        /*transform: translateX(-50%);*/
+        border-radius: 0 var(--radius-2) var(--radius-2) 0;
+        border-left: none;
+    }
+
+    /* Content handle: fixed at the bottom of the viewport, aligned to the right
+       edge of content__inner. content__inner is margin:0 auto with max-width
+       --noet-content-max-width, so its right edge is at: 50vw + (--noet-content-max-width / 2). */
+    .noet-resize-handle--content {
+        position: fixed;
+        left: calc(50vw + var(--noet-content-max-width, 45rem) / 2);
+        border-radius: 0 var(--radius-2) var(--radius-2) 0;
+        border-left: none;
+    }
+}
+
+/* During a resize drag, suppress position transitions on collapse tabs so they
+   track the panel edge without lag. JS adds/removes .is-resizing on <html>. */
+html.is-resizing .noet-nav__collapse,
+html.is-resizing .noet-metadata__collapse {
+    transition:
+        background 0.2s var(--ease-2),
+        box-shadow 0.2s var(--ease-2);
 }
 
 /* =========================================================================
@@ -589,6 +680,34 @@ body {
     background-color: var(--noet-accent-primary);
     color: var(--noet-text-inverse);
     font-weight: var(--font-weight-6);
+}
+
+/* Node-kind modifier classes on .noet-nav-tree__item
+   is-network  — node has API or Network kind (always also is-document)
+   is-document — node has standalone document identity (Document/Network/API kind)
+   is-anchor   — derived: !is_document; pure anchor/symbol with no standalone document identity
+*/
+.noet-nav-tree__item.is-network > .noet-nav-tree__link,
+.noet-nav-tree__item.is-network > .noet-nav-tree__label {
+    font-weight: var(--font-weight-6);
+}
+
+.noet-nav-tree__item.is-network > .noet-nav-tree__toggle {
+    color: var(--noet-accent-primary);
+}
+
+.noet-nav-tree__item.is-document > .noet-nav-tree__link {
+    font-style: italic;
+}
+
+.noet-nav-tree__item.is-anchor {
+    margin-bottom: 0;
+}
+
+.noet-nav-tree__item.is-anchor > .noet-nav-tree__link {
+    color: var(--noet-text-secondary);
+    padding-top: 0;
+    padding-bottom: 0;
 }
 
 /* Label for network nodes (no href) */
