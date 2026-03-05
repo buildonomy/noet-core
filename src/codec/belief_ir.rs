@@ -312,19 +312,21 @@ impl PartialEq for IRNode {
 
 impl IRNode {
     pub fn id(&self) -> Option<String> {
-        // Mirror BeliefNode::id(): prefer explicit document["id"], fall back to to_anchor(title) if
-        // that is set, otherwise return None.
-        self.document
-            .get("id")
-            .and_then(|id_val| id_val.as_str().map(|id_str| id_str.to_string()))
-            .or_else(|| {
+        // Mirror BeliefNode::id(): prefer explicit document["id"], fall back to to_anchor(title).
+        // An empty string id is a sentinel meaning "collision detected — suppress title fallback".
+        // We must check for the sentinel first to short-circuit before the title fallback runs.
+        match self.document.get("id").and_then(|v| v.as_str()) {
+            Some("") => None, // collision sentinel: suppress title fallback entirely
+            Some(explicit) => Some(explicit.to_string()),
+            None => {
                 let slug = to_anchor(self.title().as_deref().unwrap_or(""));
                 if slug.is_empty() {
                     None
                 } else {
                     Some(slug)
                 }
-            })
+            }
+        }
     }
 
     pub fn title(&self) -> Option<String> {

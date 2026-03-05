@@ -1234,7 +1234,7 @@ impl BeliefBaseWasm {
                 //
                 // Fix: if the order contains the gateway index, depth/nodetree need special
                 // processing.
-                if order_indices.len() > 0 && order_indices[depth - 1] == u16::MAX {
+                if !order_indices.is_empty() && order_indices[depth - 1] == u16::MAX {
                     continue;
                 } else if order_indices.len() > 1
                     && order_indices[order_indices.len() - 2] == u16::MAX

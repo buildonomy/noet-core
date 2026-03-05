@@ -1742,7 +1742,11 @@ impl DocCodec for MdCodec {
                                     ))
                                     .with_location(line, col),
                                 );
-                                current.document.remove("id");
+                                // Insert empty-string sentinel: IRNode::id() filters empty strings,
+                                // so this suppresses the title-derived fallback while preserving
+                                // the fact that a collision was detected. The section survives
+                                // with its title intact but without an addressable anchor.
+                                current.document.insert("id", value(""));
                             } else {
                                 self.seen_ids.insert(candidate);
                             }
@@ -2249,9 +2253,9 @@ schema = "Document"
 
     #[test]
     fn test_id_normalization_during_parse() {
-        // Test that parse() sets the title correctly and does NOT eagerly insert a title-derived id.
-        // IRNode::id() only reads document["id"] (explicit anchors only).
-        // Title→id derivation is lazy, handled by BeliefNode::id() in properties.rs.
+        // Test that parse() sets the title correctly and that IRNode::id() derives a slug from the
+        // title when no explicit {#anchor} is present. IRNode::id() mirrors BeliefNode::id():
+        // explicit document["id"] takes priority, then to_anchor(title), then None.
         use toml_edit::DocumentMut;
 
         let markdown = "## My-Section!";
@@ -2296,19 +2300,20 @@ schema = "Document"
             "Title should be set from heading text"
         );
 
-        // No explicit {#anchor} was present, so document["id"] must NOT be set.
-        // The title-to-id derivation happens lazily in BeliefNode::id(), not here.
+        // No explicit {#anchor} was present — IRNode::id() falls back to to_anchor(title).
+        // "My-Section!" → to_anchor → "my-section"
         assert_eq!(
-            proto.id(),
-            None,
-            "parse() must not eagerly insert a title-derived id; IRNode::id() only reads explicit anchors"
+            proto.id().as_deref(),
+            Some("my-section"),
+            "IRNode::id() should return title-derived slug when no explicit anchor is set"
         );
     }
 
     #[test]
     fn test_intra_document_heading_anchor_collision_title_derived() {
-        // Two headings with the same title: second must not be addressable (no id in document),
-        // but still survives as a section node with its title set.
+        // Two headings with the same title: the first claims the title-derived slug via id();
+        // the second collides and gets the empty-string sentinel, so id() returns None for it.
+        // Both survive as section nodes with their titles intact.
         use crate::codec::DocCodec;
         use toml_edit::DocumentMut;
 
@@ -2338,26 +2343,27 @@ schema = "Document"
         let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
         assert_eq!(sections.len(), 2, "Both section nodes must survive");
 
-        // First Introduction: title set, no explicit id (title-derived, not eagerly inserted)
+        // First Introduction: claims the title-derived slug "introduction"
         assert_eq!(sections[0].title().as_deref(), Some("Introduction"));
         assert_eq!(
-            sections[0].id(),
-            None,
-            "First section must have no explicit id — derivation is lazy"
+            sections[0].id().as_deref(),
+            Some("introduction"),
+            "First section gets the title-derived slug"
         );
 
-        // Second Introduction: title set, id must also be None (collision detected, not registered)
+        // Second Introduction: collision detected → empty-string sentinel → id() returns None
         assert_eq!(sections[1].title().as_deref(), Some("Introduction"));
         assert_eq!(
             sections[1].id(),
             None,
-            "Second section must have no explicit id — collision cleared it"
+            "Second section must have no id — collision suppressed the title-derived slug"
         );
     }
 
     #[test]
     fn test_intra_document_heading_anchor_collision_explicit_anchor() {
-        // Two headings with explicit {#same} anchor: second must have its id removed.
+        // Two headings with explicit {#same} anchor: first keeps the anchor; second gets the
+        // empty-string sentinel so id() returns None (not the title-derived slug "beta").
         use crate::codec::DocCodec;
         use toml_edit::DocumentMut;
 
@@ -2402,13 +2408,20 @@ schema = "Document"
             Some("shared"),
             "First explicit anchor must be kept"
         );
-        // Second claimant has id removed
-        assert_eq!(beta.id(), None, "Colliding explicit anchor must be removed");
+        // Second claimant: explicit anchor collided → sentinel inserted → id() is None,
+        // not the title-derived fallback "beta"
+        assert_eq!(
+            beta.id(),
+            None,
+            "Colliding explicit anchor must be suppressed; title fallback must not apply"
+        );
     }
 
     #[test]
     fn test_intra_document_heading_anchor_collision_explicit_vs_title() {
-        // An explicit anchor on one heading blocks a later title-derived slug from claiming it.
+        // An explicit anchor on the first heading blocks the later title-derived slug from
+        // claiming the same anchor. The second heading gets the empty-string sentinel so
+        // id() returns None, not the title-derived fallback "later".
         use crate::codec::DocCodec;
         use crate::paths::path::to_anchor;
         use toml_edit::DocumentMut;
@@ -2451,18 +2464,19 @@ schema = "Document"
 
         // Explicit anchor on "First" is kept
         assert_eq!(first.id().as_deref(), Some("later"));
-        // "Later" has no explicit anchor; title slug "later" is already taken → id stays None
+        // "Later" has no explicit anchor; title slug "later" is already taken by "First {#later}".
+        // Collision detected → empty-string sentinel inserted → id() returns None, not "later".
         assert_eq!(
             later.id(),
             None,
-            "Title-derived slug blocked by prior explicit anchor"
+            "Title-derived slug blocked by prior explicit anchor — sentinel suppresses fallback"
         );
         assert_eq!(to_anchor(&later.title().unwrap()), "later");
     }
 
     #[test]
     fn test_intra_document_heading_anchor_no_false_collision() {
-        // Distinct titles must not trigger a collision.
+        // Distinct titles must not trigger a collision; each gets its title-derived slug via id().
         use crate::codec::DocCodec;
         use toml_edit::DocumentMut;
 
@@ -2496,13 +2510,20 @@ schema = "Document"
             "All three distinct sections must be present"
         );
 
-        // No explicit anchors — all ids must be None (lazy derivation)
+        // No explicit anchors, no collisions — each section gets its title-derived slug
+        let expected: std::collections::HashMap<&str, &str> =
+            [("Alpha", "alpha"), ("Beta", "beta"), ("Gamma", "gamma")]
+                .into_iter()
+                .collect();
         for section in &sections {
+            let title = section.title().unwrap_or_default();
+            let expected_id = expected.get(title.as_str()).copied().unwrap_or("");
             assert_eq!(
-                section.id(),
-                None,
-                "No eager id insertion: section '{}' must have no explicit id",
-                section.title().unwrap_or_default()
+                section.id().as_deref(),
+                Some(expected_id),
+                "Section '{}' should have title-derived id '{}'",
+                title,
+                expected_id
             );
         }
     }
@@ -2687,9 +2708,8 @@ More content.
 
     #[test]
     fn test_inline_html_code_in_heading_generates_id() {
-        // Tests that titles are captured correctly for headings containing inline HTML and code.
-        // parse() does NOT eagerly insert ids from titles — IRNode::id() returns None for sections
-        // without explicit {#anchor} syntax. Title→id derivation is lazy via BeliefNode::id().
+        // Tests that titles are captured correctly for headings containing inline HTML and code,
+        // and that IRNode::id() returns the title-derived slug for sections without explicit anchors.
         use crate::codec::DocCodec;
         use crate::paths::path::to_anchor;
         use toml_edit::DocumentMut;
@@ -2752,18 +2772,17 @@ Mixed content.
             })
             .expect("Should find <Method Title> section");
 
-        // No explicit {#anchor} — IRNode::id() must be None
-        assert_eq!(
-            method_section.id(),
-            None,
-            "parse() must not insert title-derived id; no explicit anchor was present"
-        );
-        // Title is set; to_anchor(title) gives the expected slug (lazy derivation)
+        // No explicit {#anchor} — IRNode::id() falls back to to_anchor(title)
         let method_title = method_section.title().expect("Should have title");
         assert_eq!(
             to_anchor(&method_title),
             "method-title",
             "Title anchor slug should match expected value"
+        );
+        assert_eq!(
+            method_section.id().as_deref(),
+            Some("method-title"),
+            "IRNode::id() should return title-derived slug for <Method Title> section"
         );
 
         // Check that Code heading captured title correctly
@@ -2778,16 +2797,16 @@ Mixed content.
             })
             .expect("Should find code section");
 
-        assert_eq!(
-            code_section.id(),
-            None,
-            "parse() must not insert title-derived id"
-        );
         let code_title = code_section.title().expect("Should have title");
         assert_eq!(
             to_anchor(&code_title),
             "using--code--in-title",
             "Code title anchor slug should match expected value"
+        );
+        assert_eq!(
+            code_section.id().as_deref(),
+            Some("using--code--in-title"),
+            "IRNode::id() should return title-derived slug for code-in-heading section"
         );
 
         // Check mixed content
@@ -2802,16 +2821,16 @@ Mixed content.
             })
             .expect("Should find mixed section");
 
-        assert_eq!(
-            mixed_section.id(),
-            None,
-            "parse() must not insert title-derived id"
-        );
         let mixed_title = mixed_section.title().expect("Should have title");
         assert_eq!(
             to_anchor(&mixed_title),
             "mixed--html--and--code--content",
             "Mixed content title anchor slug should match expected value"
+        );
+        assert_eq!(
+            mixed_section.id().as_deref(),
+            Some("mixed--html--and--code--content"),
+            "IRNode::id() should return title-derived slug for mixed-content section"
         );
     }
 

@@ -444,7 +444,9 @@ mod tests {
             .proto(&index_path)
             .expect("proto should succeed")
             .expect("proto should return Some");
-        codec.parse(&content, proto, &mut vec![]).expect("parse should succeed");
+        codec
+            .parse(&content, proto, &mut vec![])
+            .expect("parse should succeed");
         codec
     }
 
