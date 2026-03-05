@@ -3,6 +3,7 @@ use crate::{
     codec::schema_registry::{migrate_schema, EdgeDirection, SCHEMAS},
     error::BuildonomyError,
     nodekey::NodeKey,
+    paths::to_anchor,
     properties::{BeliefKindSet, BeliefNode, Bref, Weight, WeightKind},
 };
 
@@ -311,9 +312,19 @@ impl PartialEq for IRNode {
 
 impl IRNode {
     pub fn id(&self) -> Option<String> {
+        // Mirror BeliefNode::id(): prefer explicit document["id"], fall back to to_anchor(title) if
+        // that is set, otherwise return None.
         self.document
             .get("id")
             .and_then(|id_val| id_val.as_str().map(|id_str| id_str.to_string()))
+            .or_else(|| {
+                let slug = to_anchor(self.title().as_deref().unwrap_or(""));
+                if slug.is_empty() {
+                    None
+                } else {
+                    Some(slug)
+                }
+            })
     }
 
     pub fn title(&self) -> Option<String> {
