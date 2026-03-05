@@ -846,6 +846,31 @@ impl<'a> AnchorPath<'a> {
             .map(|remainder| remainder.trim_start_matches('/'))
     }
 
+    /// Return a canonical root-relative path string: `"dir/file.ext#anchor"` with no leading slash
+    /// and no schema/hostname prefix and no url params.
+    ///
+    /// This is the form that `get_nav_tree()` stores in `NavNode.path` and that
+    /// `generate_terminal_path` produces for PathMap lookups. Use it whenever you neet to compare a
+    /// parsed URL against a NavNode path without ad-hoc string manipulation.
+    ///
+    /// # Examples
+    /// ```text
+    /// "/net/doc.html#intro"            -> "net/doc.html#intro"
+    /// "/index.html"                    -> "index.html"
+    /// "doc.html#section"               -> "doc.html#section
+    /// (external URLS have no meaningful root-relative form)
+    /// "https://example.com/some/path"  -> ""
+    /// ""                               -> ""
+    /// ```
+    pub fn canonicalize(&self) -> String {
+        // External URLs (has schema) have no meaningful root-relative form.
+        if self.has_schema() {
+            return String::new();
+        }
+        let filepath = self.filepath().trim_start_matches('/');
+        format!("{}{}", filepath, as_anchor(self.anchor()))
+    }
+
     pub fn replace_extension(&self, new_extension: &str) -> String {
         if self.ext().is_empty() {
             return self.path.to_string();
@@ -1397,6 +1422,30 @@ mod tests {
         let rel = AnchorPath::from("reference/design.md#section-2")
             .path_to("design.md#references", false);
         assert_eq!(rel, "#references");
+    }
+
+    #[test]
+    fn test_canonicalize() {
+        assert_eq!(
+            AnchorPath::from("/net/doc.html#intro").canonicalize(),
+            "net/doc.html#intro"
+        );
+        assert_eq!(AnchorPath::from("/index.html").canonicalize(), "index.html");
+        assert_eq!(
+            AnchorPath::from("net/doc.html").canonicalize(),
+            "net/doc.html"
+        );
+        assert_eq!(
+            AnchorPath::from("doc.html#section").canonicalize(),
+            "doc.html#section"
+        );
+        assert_eq!(AnchorPath::from("#section").canonicalize(), "#section");
+        assert_eq!(AnchorPath::from("doc.html").canonicalize(), "doc.html");
+        assert_eq!(AnchorPath::from("").canonicalize(), "");
+        assert_eq!(
+            AnchorPath::from("https://example.com/page#anchor").canonicalize(),
+            ""
+        );
     }
 
     #[test]

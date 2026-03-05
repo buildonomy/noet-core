@@ -681,11 +681,11 @@ pub fn normalize_path_extension_impl(path: &str) -> String {
     // otherwise intercept these paths and produce "mynetwork.html" instead
     // of "mynetwork/index.html".
     if anchor_path.ext().is_empty() {
-        // Empty path is the root network — always produces "/index.html".
+        // Empty path is the root network — always produces "index.html".
         // Non-empty directory paths use join so any anchor fragment is preserved,
         // e.g. "mynetwork#section" → "mynetwork/index.html#section".
         if path.is_empty() {
-            return "/index.html".to_string();
+            return "index.html".to_string();
         }
         return anchor_path.join("index.html").to_string();
     }
@@ -804,7 +804,7 @@ Test network for unit tests.
     #[test]
     fn test_normalize_network_empty_path() {
         // Empty path — directory entry, append /index.html
-        assert_eq!(normalize_path_extension_impl(""), "/index.html");
+        assert_eq!(normalize_path_extension_impl(""), "index.html");
     }
 
     #[test]

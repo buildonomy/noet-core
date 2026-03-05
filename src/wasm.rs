@@ -309,6 +309,9 @@ pub struct NodeContext {
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathParts {
+    /// Original (undecomposed) path string -- used by canonicalize() to delegate to
+    /// AnchorPath::canonicalize() without re-implementing the logic
+    original: String,
     path: String,
     filename: String,
     anchor: String,
@@ -347,6 +350,18 @@ impl PathParts {
     #[wasm_bindgen(getter)]
     pub fn schema(&self) -> String {
         self.schema.clone()
+    }
+
+    /// Reassemple a canonical root-relative path string with no leading slash.
+    #[wasm_bindgen]
+    pub fn canonicalize(&self) -> String {
+        AnchorPath::new(&self.original).canonicalize()
+    }
+
+    /// Use AnchorPath to return the filepath (no anchor, no params, no schema)
+    #[wasm_bindgen]
+    pub fn filepath(&self) -> String {
+        AnchorPath::new(&self.original).filepath().to_string()
     }
 }
 
@@ -431,6 +446,7 @@ impl BeliefBaseWasm {
     pub fn path_parts(path: &str) -> PathParts {
         let anchor_path = AnchorPath::new(path);
         PathParts {
+            original: path.to_string(),
             path: anchor_path.dir().to_string(),
             filename: anchor_path.filename().to_string(),
             anchor: anchor_path.anchor().to_string(),

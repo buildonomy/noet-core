@@ -1128,10 +1128,52 @@ impl MdCodec {
             }
         }
 
+        // FOr each proto node, rewrite its heading Start event to use to_anchor(title) as the HTML
+        // id. This decouples the HTML anchor from BeliefNode::id(), which may be a bref-collision
+        // key that doesn't match what generate_terminal_path puts in the PathMap (which falls back
+        // to to_anchor(title) when id == bref). Using the to_anchor(title) here ensures the NavTree
+        // path and the HTML heading id are always in sync.
         let events = self
             .current_events
             .iter()
-            .flat_map(|(_p, events)| events.iter().map(|(e, _)| e.clone()))
+            .flat_map(|(proto, events)| {
+                // Compute the title-derived anchor for this proto's heading (if it has a title),
+                // Section nodes (heading > 2) get the slug; document/network nodes keep whatever id
+                // inject_context set (they are navigated to by document path, not by anchor).
+                let html_anchor: Option<CowStr<'static>> = if proto.heading > 2 {
+                    proto
+                        .title()
+                        .as_deref()
+                        .map(to_anchor)
+                        .filter(|s| !s.is_empty())
+                        .map(CowStr::from)
+                } else {
+                    None
+                };
+
+                events.iter().map(move |(e, _)| {
+                    // Rewrite the heading id for section nodes only
+                    if let (
+                        Some(anchor),
+                        MdEvent::Start(MdTag::Heading {
+                            level,
+                            id: _,
+                            classes,
+                            attrs,
+                        }),
+                    ) = (&html_anchor, e)
+                    {
+                        MdEvent::Start(MdTag::Heading {
+                            level: *level,
+                            id: Some(anchor.clone()),
+                            classes: classes.clone(),
+                            attrs: attrs.clone(),
+                        })
+                    } else {
+                        e.clone()
+                    }
+                })
+            })
             .map(rewrite_md_links_to_html);
 
         let mut html_body = String::new();

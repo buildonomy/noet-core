@@ -492,10 +492,13 @@ export function navigateToLink(href, link, targetBid = null) {
     const hashPath = parsed.path.startsWith("/")
       ? `${parsed.path}#${parsed.anchor}`
       : `/${parsed.path}#${parsed.anchor}`;
-    window.location.hash = hashPath;
+    // Set pendingMetadataBid BEFORE updating location.hash -- hashchange fires asynchronously but
+    // setting hash may cause the handler to read the state before this function returns on some
+    // browsers.
     if (targetBid) {
       state.pendingMetadataBid = targetBid;
     }
+    window.location.hash = hashPath;
     return;
   }
 

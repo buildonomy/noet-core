@@ -109,11 +109,33 @@ export function getActiveBid() {
   const currentPath = window.location.pathname;
   const currentHash = window.location.hash;
 
-  // Strategy 2: match hash fragment against NavTree node paths
-  if (currentHash) {
+  // Strategy 2: match hash fragment against NavTree node paths. Use pathParts to canonicalize the
+  // hash content rather than ad-hoc string stripping. pathParts("/net/doc.html#section) gives:
+  //
+  //   path="net", filename="doc.html", anchor="section"
+  //
+  // which we reconstruct as "net/doc.html#section -- the same form that get_nav_tree() writes into
+  // NavNode.path (root-relative, no leading slash).
+  if (currentHash && state.wasmModule) {
+    const raw = currentHash.substring(1); //strip leading "#"
+    const parts = state.wasmModule.BeliefBaseWasm.pathParts(raw);
+    // Canonicalize() reassmbles the path without any leading slash
+    const canonicalFull = parts.canonicalize();
+    const canonicalDoc = parts.filepath();
+
     for (const [bid, node] of state.navTree.nodes) {
-      if (node.path && node.path.includes(currentHash.substring(1))) {
+      if (node.path && node.path === canonicalFull) {
         return bid;
+      }
+    }
+
+    // Fallback: match doc path only (no anchor) -- covers the case where the hash points at a
+    // document but hte active node is the document node itself
+    if (canonicalDoc) {
+      for (const [bid, node] of state.navTree.nodes) {
+        if (node.path && node.path === canonicalDoc) {
+          return bid;
+        }
       }
     }
   }
