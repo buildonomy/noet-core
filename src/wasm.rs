@@ -162,13 +162,34 @@ pub fn init_tracing() {
 #[cfg(feature = "wasm")]
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
+    codec::{normalize_path_extension_impl, NETWORK_NAME},
     nodekey::NodeKey,
+    paths::AnchorPath,
     properties::{
-        asset_namespace, buildonomy_namespace, href_namespace, BeliefKind, BeliefNode, Bid, Bref,
-        WeightKind, WEIGHT_SORT_KEY,
+        asset_namespace, buildonomy_namespace, content_namespaces, href_namespace, BeliefKind,
+        BeliefNode, Bid, Bref, WeightKind, WEIGHT_SORT_KEY,
     },
     query::{Expression, StatePred},
 };
+
+#[cfg(feature = "wasm")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "wasm")]
+use serde_json;
+
+#[cfg(feature = "wasm")]
+use enumset::EnumSet;
+
+#[cfg(feature = "wasm")]
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    str::FromStr,
+};
+
+#[cfg(feature = "wasm")]
+use js_sys::{Object, Reflect};
 
 /// Plain serialisable result returned as a JS object `{ bid, bref }`.
 ///
@@ -182,7 +203,7 @@ use crate::{
 /// console.log(result.bref);  // "0e90d9cb2fdb"
 /// ```
 #[cfg(feature = "wasm")]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct BidBrefResult {
     pub bid: String,
     pub bref: String,
@@ -201,21 +222,6 @@ impl BidBrefResult {
         serde_wasm_bindgen::to_value(self).unwrap_or(JsValue::NULL)
     }
 }
-
-#[cfg(feature = "wasm")]
-use serde::{Deserialize, Serialize};
-
-#[cfg(feature = "wasm")]
-use serde_json;
-
-#[cfg(feature = "wasm")]
-use enumset::EnumSet;
-
-#[cfg(feature = "wasm")]
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-#[cfg(feature = "wasm")]
-use js_sys::{Object, Reflect};
 
 /// Navigation tree structure for hierarchical document navigation
 ///
@@ -346,7 +352,7 @@ impl PathParts {
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 pub struct BeliefBaseWasm {
-    inner: std::cell::RefCell<BeliefBase>,
+    inner: RefCell<BeliefBase>,
     entry_point_bid: Bid,
 }
 
@@ -365,7 +371,7 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn set_log_level(level: &str) {
-        use std::str::FromStr;
+        use FromStr;
         let filter = tracing_subscriber::filter::LevelFilter::from_str(level)
             .unwrap_or(tracing_subscriber::filter::LevelFilter::WARN);
         if let Some(handle) = LOG_LEVEL_HANDLE.get() {
@@ -405,7 +411,7 @@ impl BeliefBaseWasm {
     /// The normalized path as a string
     #[wasm_bindgen(js_name = normalizePath)]
     pub fn normalize_path(path: &str) -> String {
-        crate::paths::AnchorPath::new(path).normalize().to_string()
+        AnchorPath::new(path).normalize().to_string()
     }
 
     /// Parse a path into its components: directory, filename, and anchor.
@@ -419,7 +425,7 @@ impl BeliefBaseWasm {
     /// PathParts object with path, filename, and anchor components
     #[wasm_bindgen(js_name = pathParts)]
     pub fn path_parts(path: &str) -> PathParts {
-        let anchor_path = crate::paths::AnchorPath::new(path);
+        let anchor_path = AnchorPath::new(path);
         PathParts {
             path: anchor_path.dir().to_string(),
             filename: anchor_path.filename().to_string(),
@@ -440,7 +446,7 @@ impl BeliefBaseWasm {
     /// The joined path as a string
     #[wasm_bindgen(js_name = pathJoin)]
     pub fn path_join(base: &str, end: &str, end_is_anchor: bool) -> String {
-        let base_path = crate::paths::AnchorPath::new(base);
+        let base_path = AnchorPath::new(base);
         if end_is_anchor {
             let end_with_hash = if end.starts_with('#') {
                 end.to_string()
@@ -462,7 +468,7 @@ impl BeliefBaseWasm {
     /// The extension (e.g., "html") or empty string if none
     #[wasm_bindgen(js_name = pathExtension)]
     pub fn path_extension(path: &str) -> String {
-        crate::paths::AnchorPath::new(path).ext().to_string()
+        AnchorPath::new(path).ext().to_string()
     }
 
     /// Get the parent path (directory or document path without anchor).
@@ -478,7 +484,7 @@ impl BeliefBaseWasm {
     /// The parent path as a string
     #[wasm_bindgen(js_name = pathParent)]
     pub fn path_parent(path: &str) -> String {
-        crate::paths::AnchorPath::new(path).parent().to_string()
+        AnchorPath::new(path).parent().to_string()
     }
 
     /// Get the filename without extension (stem).
@@ -490,7 +496,7 @@ impl BeliefBaseWasm {
     /// The filename without extension (e.g., "file")
     #[wasm_bindgen(js_name = pathFilestem)]
     pub fn path_filestem(path: &str) -> String {
-        crate::paths::AnchorPath::new(path).filestem().to_string()
+        AnchorPath::new(path).filestem().to_string()
     }
 
     /// Create a BeliefBase from JSON string (exported beliefbase.json) and entry point BID
@@ -536,7 +542,7 @@ impl BeliefBaseWasm {
         let inner = BeliefBase::from(graph);
 
         Ok(BeliefBaseWasm {
-            inner: std::cell::RefCell::new(inner),
+            inner: RefCell::new(inner),
             entry_point_bid,
         })
     }
@@ -867,7 +873,7 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: crate::codec::normalize_path_extension_impl(&ext_rel.root_path),
+                    root_path: normalize_path_extension_impl(&ext_rel.root_path),
                     link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
@@ -889,7 +895,7 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: crate::codec::normalize_path_extension_impl(&ext_rel.root_path),
+                    root_path: normalize_path_extension_impl(&ext_rel.root_path),
                     link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
@@ -923,7 +929,7 @@ impl BeliefBaseWasm {
 
             NodeContext {
                 node: ctx.node.clone(),
-                root_path: crate::codec::normalize_path_extension_impl(&ctx.root_path),
+                root_path: normalize_path_extension_impl(&ctx.root_path),
                 home_net: ctx.home_net,
                 related_nodes,
                 graph: sorted_graph,
@@ -988,7 +994,7 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn content_namespaces() -> JsValue {
-        let results: Vec<BidBrefResult> = crate::properties::content_namespaces()
+        let results: Vec<BidBrefResult> = content_namespaces()
             .iter()
             .map(|bid| BidBrefResult::from_bid(*bid))
             .collect();
@@ -1198,7 +1204,32 @@ impl BeliefBaseWasm {
                     continue;
                 }
 
-                // Get node title from BeliefNode
+                // Skip the "index.md" gateway alias for any network node already inserted.
+                //
+                // PathMap::new hardcodes two entries for every network node's own BID:
+                //   ("", net_bid, [])                     - the canonical doc-slot entry
+                //   ("index.md", net_bid, [u16::MAX])     - the gateway/section-plane alias
+                //
+                // When a subnet network is expanded inside a parent network's recursive_map, poth
+                // entries appear with paths joined uner the subnet's prefix e.g.:
+                //   ("subnet",  subnet_bid, [N])
+                //   ("subnet/index.md", subnet_bid, [N, 65535])
+                //
+                // The first entry correctly inserts subnet_bid into nodes_map and pushes it onto
+                // the stack. The second entry (the "index.md" alias) then arrives at depth+1.
+                // Because subnet_bid != net_bid, it is NOT skipped by the guard above, so
+                // nodes_map.insert overwrites the first entry with parent = subnet_bid itself
+                // (still on stack) and children = []. The subsequent parent_node.children.push then
+                // adds subnet_bid to its own children --- the self-reference.
+                //
+                // Fix: if the path ends with the NETWORK_NAME sentinel ("index.md") AND the bid is
+                // already in the nodes_map, this is the gateway alias for an already-registered
+                // node. Skip the ithem entirely; any of its heading children (order [N, u16::MAX,
+                // K]) will be added to the navtree, as they are the next elements in the vec
+                // returned by recursive map.
+                if path.ends_with(NETWORK_NAME) && nodes_map.contains_key(&bid_str) {
+                    continue;
+                }
                 let node_title = states
                     .get(bid)
                     .map(|node| node.title.clone())
@@ -1282,7 +1313,7 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn normalize_path_extension(path: &str) -> String {
-        crate::codec::normalize_path_extension_impl(path)
+        normalize_path_extension_impl(path)
     }
 }
 

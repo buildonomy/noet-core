@@ -322,7 +322,7 @@ impl PathMapMap {
                 pmm.nets.insert(node.bid);
             }
 
-            if node.kind.is_document() {
+            if node.kind.is_document() || node.kind.is_external() {
                 pmm.docs.insert(node.bid);
             }
         }
@@ -1199,12 +1199,19 @@ impl PathMap {
         let subnet_idxs = self
             .subnets()
             .iter()
-            .map(|net_bid| {
-                let idx_vec = self
-                    .bid_map
-                    .get(net_bid)
-                    .expect("All nets to be in bid_map by construction");
-                idx_vec[0]
+            .filter_map(|net_bid| match self.bid_map.get(net_bid) {
+                Some(idx_vec) => Some(idx_vec[0]),
+                None => {
+                    tracing::error!(
+                        "[recursive_map] Invariant violation: subnet {net_bid} is registered \
+                        in self.subnets for net {} but has no entry in self.bid_map. \
+                        Skipping this subnet. This indicates a bug in PathMap construction \
+                        or event processing -- a subnet was inserted into subnets before \
+                        its corresponding relation event was processed.",
+                        self.net
+                    );
+                    None
+                }
             })
             .collect::<Vec<usize>>();
 
@@ -1398,6 +1405,10 @@ impl PathMap {
                     bid_idx_vec.push(idx);
                     self.path_map.insert(path.clone(), idx);
                 }
+                // Keep subnets consistent with bid_map: a subnet whose path was just removed no
+                // longer has a bid_map entry and must be evicted from subnets to prevent
+                // recursive_map from looking it up and failing.
+                self.subnets.retain(|bid| self.bid_map.contains_key(bid));
             }
             return derivatives;
         };
@@ -1631,6 +1642,10 @@ impl PathMap {
             if nets.nets.contains(source) && self.net != *source {
                 self.subnets.insert(*source);
             }
+            // Keep subnets consistent with bid_map: a subnet whose path was just removed no longer
+            // has a bid_map entry and must be evicted from subnets to prevent recursive_map from
+            // looking it up and failing.
+            self.subnets.retain(|bid| self.bid_map.contains_key(bid));
 
             // Update our title and id maps
             if derivatives

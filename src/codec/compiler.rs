@@ -1984,8 +1984,8 @@ impl DocumentCompiler {
         // Get base directory for output (ctx.path for directories, parent for files)
         // ctx.path is home-network relative, so for network nodes it's just the network name
         // For document files, use the parent directory
-        let base_dir = if ctx.node.kind.is_network() {
-            // Network nodes: ctx.path is the network directory (may be subnet path)
+        let base_dir = if source_path.is_dir() {
+            // Network nodes may pass in directories as source_path
             repo_relative_path
         } else {
             // Document nodes: use parent directory of the source file

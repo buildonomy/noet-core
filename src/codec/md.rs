@@ -72,12 +72,30 @@ pub fn buildonomy_md_options() -> Options {
 ///
 /// If the link doesn't resolve in-page, returns a [NodeKey], and whether the link attributes
 /// contain a link-specific title, otherwise None.
+/// Strip a single layer of surrounding ASCII double-quotes from a URL string.
+///
+/// pulldown-cmark preserves literal quote characters in `dest_url` when the author writes a quoted
+/// inline URL, e.g `[text]("bref://abc" "title")`. The resulting CowStr is `"bref://abc"` (with the
+/// quote characters), which then fails to parse as a known NodeKey scheme and falls through to the
+/// Extrnal/href path, producing a spurious href node.
+///
+/// This helper removes exactly one leading and trailing `"` if boath are present, leaving the URL
+/// content intact for further processing.
+fn strip_url_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 fn link_to_relation(
     link_type: &LinkType,
-    dest_url: &CowStr<'_>,
+    dest_url_cowstr: &CowStr<'_>,
     title: &CowStr<'_>,
     id: &CowStr<'_>,
 ) -> Option<NodeKey> {
+    let dest_url = strip_url_quotes(dest_url_cowstr.as_ref());
     match link_type {
         // Autolink like `<http://foo.bar/baz>`
         // with NodeKey::Path(href_net, http://foo.bar/baz)
