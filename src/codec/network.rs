@@ -195,8 +195,13 @@ impl DocCodec for NetworkCodec {
         Ok(Some(proto))
     }
 
-    fn parse(&mut self, content: &str, current: IRNode) -> Result<(), BuildonomyError> {
-        self.0.parse(content, current)?;
+    fn parse(
+        &mut self,
+        content: &str,
+        current: IRNode,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<(), BuildonomyError> {
+        self.0.parse(content, current, diagnostics)?;
         let Some(first_tuple) = self.0.current_events.first_mut() else {
             return Err(BuildonomyError::Codec(
                 "Network file has no content".to_string(),
@@ -439,7 +444,7 @@ mod tests {
             .proto(&index_path)
             .expect("proto should succeed")
             .expect("proto should return Some");
-        codec.parse(&content, proto).expect("parse should succeed");
+        codec.parse(&content, proto, &mut vec![]).expect("parse should succeed");
         codec
     }
 

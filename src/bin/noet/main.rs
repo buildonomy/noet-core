@@ -337,8 +337,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for result in &parse_results {
                     for diagnostic in &result.diagnostics {
                         match diagnostic {
-                            ParseDiagnostic::Warning(msg) => {
-                                eprintln!("warning: {msg}");
+                            ParseDiagnostic::Warning {
+                                message: msg,
+                                location,
+                            } => {
+                                if let Some((line, col)) = location {
+                                    eprintln!("warning ({line}:{col}): {msg}");
+                                } else {
+                                    eprintln!("warning: {msg}");
+                                }
                                 warning_count += 1;
                             }
                             ParseDiagnostic::ReparseLimitExceeded => {
@@ -347,18 +354,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ParseDiagnostic::ParseError {
                                 message,
                                 attempt_count,
+                                location,
                             } => {
-                                eprintln!(
-                                    "error: {} (after {} attempt{})",
-                                    message,
-                                    attempt_count,
-                                    if *attempt_count == 1 { "" } else { "s" }
-                                );
+                                if let Some((line, col)) = location {
+                                    eprintln!(
+                                        "error ({line}:{col}): {} (after {} attempt{})",
+                                        message,
+                                        attempt_count,
+                                        if *attempt_count == 1 { "" } else { "s" }
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "error: {} (after {} attempt{})",
+                                        message,
+                                        attempt_count,
+                                        if *attempt_count == 1 { "" } else { "s" }
+                                    );
+                                }
                                 error_count += 1;
                             }
-                            ParseDiagnostic::Info(msg) => {
+                            ParseDiagnostic::Info {
+                                message: msg,
+                                location,
+                            } => {
                                 if verbose {
-                                    eprintln!("info: {msg}");
+                                    if let Some((line, col)) = location {
+                                        eprintln!("info ({line}:{col}): {msg}");
+                                    } else {
+                                        eprintln!("info: {msg}");
+                                    }
                                 }
                             }
                             // UnresolvedReference entries that survive to this point are

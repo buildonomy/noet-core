@@ -2304,7 +2304,7 @@ Test network for unit tests.
 
         assert_eq!(results[0].diagnostics.len(), 1);
         match &results[0].diagnostics[0] {
-            crate::codec::ParseDiagnostic::Warning(msg) => {
+            crate::codec::ParseDiagnostic::Warning { message: msg, .. } => {
                 assert!(msg.contains("unresolved link"), "message: {msg}");
                 assert!(msg.contains("10:3"), "expected line:col in message: {msg}");
                 assert!(
@@ -2356,7 +2356,7 @@ Test network for unit tests.
         assert!(
             matches!(
                 &results[0].diagnostics[0],
-                crate::codec::ParseDiagnostic::Warning(_)
+                crate::codec::ParseDiagnostic::Warning { .. }
             ),
             "Unresolved source should be promoted to Warning"
         );
@@ -2396,7 +2396,7 @@ Test network for unit tests.
         DocumentCompiler::promote_unresolved_to_warnings(&mut results);
 
         match &results[0].diagnostics[0] {
-            crate::codec::ParseDiagnostic::Warning(msg) => {
+            crate::codec::ParseDiagnostic::Warning { message: msg, .. } => {
                 assert!(msg.contains("unresolved link"), "message: {msg}");
                 // No line:col when location is absent
                 assert!(
@@ -2416,7 +2416,7 @@ Test network for unit tests.
             dependent_paths: vec![],
             diagnostics: vec![
                 crate::codec::ParseDiagnostic::warning("existing warning"),
-                crate::codec::ParseDiagnostic::Info("info message".to_string()),
+                crate::codec::ParseDiagnostic::info("info message"),
                 crate::codec::ParseDiagnostic::parse_error("parse failed", 1),
             ],
         }];
@@ -2427,11 +2427,11 @@ Test network for unit tests.
         assert_eq!(results[0].diagnostics.len(), 3);
         assert!(matches!(
             &results[0].diagnostics[0],
-            crate::codec::ParseDiagnostic::Warning(_)
+            crate::codec::ParseDiagnostic::Warning { .. }
         ));
         assert!(matches!(
             &results[0].diagnostics[1],
-            crate::codec::ParseDiagnostic::Info(_)
+            crate::codec::ParseDiagnostic::Info { .. }
         ));
         assert!(matches!(
             &results[0].diagnostics[2],
@@ -2470,7 +2470,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             .iter()
             .flat_map(|r| r.diagnostics.iter())
             .filter_map(|d| match d {
-                crate::codec::ParseDiagnostic::Warning(msg) => Some(msg.as_str()),
+                crate::codec::ParseDiagnostic::Warning { message: msg, .. } => Some(msg.as_str()),
                 _ => None,
             })
             .collect();

@@ -189,13 +189,23 @@ pub enum ParseDiagnostic {
         message: String,
         /// Number of times this file has been attempted
         attempt_count: usize,
+        /// Optional (line, column) position in the source file (1-based)
+        location: Option<(usize, usize)>,
     },
 
     /// A warning message about the parse (e.g., deprecated syntax, ambiguous reference)
-    Warning(String),
+    Warning {
+        message: String,
+        /// Optional (line, column) position in the source file (1-based)
+        location: Option<(usize, usize)>,
+    },
 
     /// An informational message about the parse
-    Info(String),
+    Info {
+        message: String,
+        /// Optional (line, column) position in the source file (1-based)
+        location: Option<(usize, usize)>,
+    },
 }
 
 impl ParseDiagnostic {
@@ -204,17 +214,60 @@ impl ParseDiagnostic {
         Self::ParseError {
             message: message.into(),
             attempt_count,
+            location: None,
         }
     }
 
     /// Create a warning diagnostic
     pub fn warning(message: impl Into<String>) -> Self {
-        Self::Warning(message.into())
+        Self::Warning {
+            message: message.into(),
+            location: None,
+        }
     }
 
     /// Create an info diagnostic
     pub fn info(message: impl Into<String>) -> Self {
-        Self::Info(message.into())
+        Self::Info {
+            message: message.into(),
+            location: None,
+        }
+    }
+
+    /// Attach a (line, column) source position to this diagnostic (builder-style).
+    /// Follows the same pattern as `UnresolvedReference::with_location`.
+    pub fn with_location(self, line: usize, column: usize) -> Self {
+        match self {
+            Self::Warning { message, .. } => Self::Warning {
+                message,
+                location: Some((line, column)),
+            },
+            Self::Info { message, .. } => Self::Info {
+                message,
+                location: Some((line, column)),
+            },
+            Self::ParseError {
+                message,
+                attempt_count,
+                ..
+            } => Self::ParseError {
+                message,
+                attempt_count,
+                location: Some((line, column)),
+            },
+            other => other,
+        }
+    }
+
+    /// Return the source position (line, column) if one is attached.
+    pub fn location(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Warning { location, .. }
+            | Self::Info { location, .. }
+            | Self::ParseError { location, .. } => *location,
+            Self::UnresolvedReference(u) => u.reference_location,
+            Self::ReparseLimitExceeded => None,
+        }
     }
 
     /// Check if this diagnostic represents a parse error
@@ -228,6 +281,7 @@ impl ParseDiagnostic {
             Self::ParseError {
                 message,
                 attempt_count,
+                ..
             } => Some((message.as_str(), *attempt_count)),
             _ => None,
         }
@@ -292,9 +346,31 @@ impl std::fmt::Display for ParseDiagnostic {
             Self::ParseError {
                 message,
                 attempt_count,
-            } => write!(f, "Parse error (attempt {attempt_count}): {message}"),
-            Self::Warning(msg) => write!(f, "Warning: {msg}"),
-            Self::Info(msg) => write!(f, "Info: {msg}"),
+                location,
+            } => {
+                if let Some((line, col)) = location {
+                    write!(
+                        f,
+                        "Parse error ({line}:{col}) (attempt {attempt_count}): {message}"
+                    )
+                } else {
+                    write!(f, "Parse error (attempt {attempt_count}): {message}")
+                }
+            }
+            Self::Warning { message, location } => {
+                if let Some((line, col)) = location {
+                    write!(f, "Warning ({line}:{col}): {message}")
+                } else {
+                    write!(f, "Warning: {message}")
+                }
+            }
+            Self::Info { message, location } => {
+                if let Some((line, col)) = location {
+                    write!(f, "Info ({line}:{col}): {message}")
+                } else {
+                    write!(f, "Info: {message}")
+                }
+            }
         }
     }
 }
@@ -401,8 +477,8 @@ mod tests {
         let info = ParseDiagnostic::info("Test info");
         let parse_error = ParseDiagnostic::parse_error("Syntax error", 2);
 
-        assert!(matches!(warning, ParseDiagnostic::Warning(_)));
-        assert!(matches!(info, ParseDiagnostic::Info(_)));
+        assert!(matches!(warning, ParseDiagnostic::Warning { .. }));
+        assert!(matches!(info, ParseDiagnostic::Info { .. }));
         assert!(parse_error.is_parse_error());
         assert_eq!(parse_error.as_parse_error().unwrap().1, 2);
     }

@@ -995,6 +995,8 @@ pub struct MdCodec {
     matched_sections: HashSet<NodeKey>,
     /// Track heading IDs within current document for collision detection
     seen_ids: HashSet<String>,
+    /// Byte offset of the most recently opened heading start tag, for position hints in diagnostics
+    heading_start_offset: Option<usize>,
 }
 
 impl MdCodec {
@@ -1004,6 +1006,7 @@ impl MdCodec {
             content: String::new(),
             matched_sections: HashSet::new(),
             seen_ids: HashSet::new(),
+            heading_start_offset: None,
         }
     }
 
@@ -1538,12 +1541,18 @@ impl DocCodec for MdCodec {
         Ok(modified_nodes)
     }
 
-    fn parse(&mut self, content: &str, mut current: IRNode) -> Result<(), BuildonomyError> {
+    fn parse(
+        &mut self,
+        content: &str,
+        mut current: IRNode,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<(), BuildonomyError> {
         // Initial parse and format to try and make pulldown_cmark <-> pulldown_cmark_to_cmark idempotent
         self.content = content.to_string();
         self.current_events = Vec::default();
         self.matched_sections.clear();
         self.seen_ids.clear();
+        self.heading_start_offset = None;
         let mut first_heading = true;
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
@@ -1634,6 +1643,7 @@ impl DocCodec for MdCodec {
                     classes: _,
                     attrs: _,
                 }) => {
+                    self.heading_start_offset = Some(offset.start);
                     let heading = match level {
                         // 0: UUID_NAMESPACE_BUILDONOMY
                         // 1: Network Node
@@ -1653,6 +1663,9 @@ impl DocCodec for MdCodec {
                         ..Default::default()
                     };
                     if let Some(normalized_id) = maybe_normalized_id {
+                        // Store explicit {#anchor} id into the document. seen_ids tracking
+                        // happens at End(Heading) where the title is also available, so we
+                        // can compute the full effective id the same way BeliefNode::id() would.
                         new_current.document.insert("id", value(normalized_id));
                     }
                     // Inherit the schema type from the prior parse. If the node has an explicit
@@ -1660,13 +1673,8 @@ impl DocCodec for MdCodec {
                     let mut proto_to_push = replace(&mut current, new_current);
                     proto_to_push.traverse_schema()?;
 
-                    if proto_to_push.id().is_none() {
-                        if let Some(title) = proto_to_push.title() {
-                            proto_to_push
-                                .document
-                                .insert("id", value(to_anchor(&title)));
-                        }
-                    }
+                    // Do NOT eagerly insert id from title here. Title→id derivation is handled
+                    // lazily by BeliefNode::id() (properties.rs) and builder.rs push().
                     let proto_to_push_events = std::mem::take(&mut proto_events);
                     self.current_events
                         .push((proto_to_push, proto_to_push_events));
@@ -1687,13 +1695,59 @@ impl DocCodec for MdCodec {
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
                             if is_document_heading && !accum_title.is_empty() {
-                                current.document.insert("title", value(accum_title));
+                                current
+                                    .document
+                                    .insert("title", value(accum_title.as_str()));
                             }
                             last_event_vec.append(&mut proto_events);
                             proto_events = last_event_vec;
                         }
                     } else {
-                        current.document.insert("title", value(accum_title));
+                        current.document.insert("title", value(accum_title.clone()));
+                    }
+                    // Check for intra-document anchor collision for all section nodes (heading > 2).
+                    // Done here at End(Heading) because this is the first point where both the
+                    // explicit id (set at Start) and the accumulated title are available, so we
+                    // can mirror the full BeliefNode::id() fallback: explicit id > to_anchor(title).
+                    if current.heading > 2 && !is_document_heading {
+                        let candidate_id = current
+                            .document
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                let slug = to_anchor(&accum_title);
+                                if slug.is_empty() {
+                                    None
+                                } else {
+                                    Some(slug)
+                                }
+                            });
+                        if let Some(candidate) = candidate_id {
+                            if self.seen_ids.contains(&candidate) {
+                                // Collision: a prior section already owns this anchor slug.
+                                // Remove any explicit id that was set — the section survives
+                                // without an addressable anchor. builder.rs handles network-level
+                                // uniqueness via BeliefNode::id()'s bref fallback.
+                                let (line, col) = self
+                                    .heading_start_offset
+                                    .map(|offset| byte_offset_to_location(&self.content, offset))
+                                    .unwrap_or((0, 0));
+                                diagnostics.push(
+                                    ParseDiagnostic::warning(format!(
+                                        "Intra-document heading anchor collision: '{}' appears \
+                                         more than once in this document. The second occurrence \
+                                         will not be addressable by this anchor.",
+                                        candidate
+                                    ))
+                                    .with_location(line, col),
+                                );
+                                current.document.remove("id");
+                            } else {
+                                self.seen_ids.insert(candidate);
+                            }
+                        }
+                        self.heading_start_offset = None;
                     }
                     first_heading = false;
                 }
@@ -1702,15 +1756,8 @@ impl DocCodec for MdCodec {
             proto_events.push_back((event.into_static(), Some(offset)));
         }
         current.traverse_schema()?;
-        if current.id().is_none() {
-            if let Some(title) = current
-                .document
-                .get("title")
-                .and_then(|title_val| title_val.as_str().map(|str| str.to_string()))
-            {
-                current.document.insert("id", value(to_anchor(&title)));
-            }
-        }
+        // Do NOT eagerly insert id from title for the final node either.
+        // Title→id derivation is handled lazily by BeliefNode::id() (properties.rs).
         self.current_events.push((current, proto_events));
         // tracing::debug!("Parsed a total of {} nodes", self.current_events.len());
 
@@ -2202,7 +2249,9 @@ schema = "Document"
 
     #[test]
     fn test_id_normalization_during_parse() {
-        // Test that IDs are normalized during parse (without explicit ID syntax)
+        // Test that parse() sets the title correctly and does NOT eagerly insert a title-derived id.
+        // IRNode::id() only reads document["id"] (explicit anchors only).
+        // Title→id derivation is lazy, handled by BeliefNode::id() in properties.rs.
         use toml_edit::DocumentMut;
 
         let markdown = "## My-Section!";
@@ -2225,9 +2274,8 @@ schema = "Document"
             heading: 2,
         };
 
-        codec.parse(markdown, proto).unwrap();
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
 
-        // Verify ID was normalized from title during parse
         let heading_node = codec.current_events.iter().find(|(p, _)| p.heading > 2);
         assert!(
             heading_node.is_some(),
@@ -2240,11 +2288,223 @@ schema = "Document"
                 .join("\n")
         );
         let (proto, _) = heading_node.unwrap();
+
+        // Title is set from the heading text
         assert_eq!(
-            proto.id().as_deref(),
-            Some("my-section"),
-            "ID should be normalized to lowercase without punctuation"
+            proto.title().as_deref(),
+            Some("My-Section!"),
+            "Title should be set from heading text"
         );
+
+        // No explicit {#anchor} was present, so document["id"] must NOT be set.
+        // The title-to-id derivation happens lazily in BeliefNode::id(), not here.
+        assert_eq!(
+            proto.id(),
+            None,
+            "parse() must not eagerly insert a title-derived id; IRNode::id() only reads explicit anchors"
+        );
+    }
+
+    #[test]
+    fn test_intra_document_heading_anchor_collision_title_derived() {
+        // Two headings with the same title: second must not be addressable (no id in document),
+        // but still survives as a section node with its title set.
+        use crate::codec::DocCodec;
+        use toml_edit::DocumentMut;
+
+        let markdown = "## Introduction\n\nFirst.\n\n## Introduction\n\nSecond.\n";
+
+        let mut codec = MdCodec::new();
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000001"));
+        doc.insert("schema", value("Document"));
+        doc.insert("title", value("Test Doc"));
+
+        let proto = IRNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+        };
+
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
+        let nodes = codec.nodes();
+
+        let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
+        assert_eq!(sections.len(), 2, "Both section nodes must survive");
+
+        // First Introduction: title set, no explicit id (title-derived, not eagerly inserted)
+        assert_eq!(sections[0].title().as_deref(), Some("Introduction"));
+        assert_eq!(
+            sections[0].id(),
+            None,
+            "First section must have no explicit id — derivation is lazy"
+        );
+
+        // Second Introduction: title set, id must also be None (collision detected, not registered)
+        assert_eq!(sections[1].title().as_deref(), Some("Introduction"));
+        assert_eq!(
+            sections[1].id(),
+            None,
+            "Second section must have no explicit id — collision cleared it"
+        );
+    }
+
+    #[test]
+    fn test_intra_document_heading_anchor_collision_explicit_anchor() {
+        // Two headings with explicit {#same} anchor: second must have its id removed.
+        use crate::codec::DocCodec;
+        use toml_edit::DocumentMut;
+
+        let markdown = "## Alpha {#shared}\n\nFirst.\n\n## Beta {#shared}\n\nSecond.\n";
+
+        let mut codec = MdCodec::new();
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000002"));
+        doc.insert("schema", value("Document"));
+        doc.insert("title", value("Test Doc"));
+
+        let proto = IRNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+        };
+
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
+        let nodes = codec.nodes();
+
+        let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
+        assert_eq!(sections.len(), 2, "Both section nodes must survive");
+
+        let alpha = sections
+            .iter()
+            .find(|s| s.title().as_deref() == Some("Alpha"))
+            .unwrap();
+        let beta = sections
+            .iter()
+            .find(|s| s.title().as_deref() == Some("Beta"))
+            .unwrap();
+
+        // First claimant keeps the anchor
+        assert_eq!(
+            alpha.id().as_deref(),
+            Some("shared"),
+            "First explicit anchor must be kept"
+        );
+        // Second claimant has id removed
+        assert_eq!(beta.id(), None, "Colliding explicit anchor must be removed");
+    }
+
+    #[test]
+    fn test_intra_document_heading_anchor_collision_explicit_vs_title() {
+        // An explicit anchor on one heading blocks a later title-derived slug from claiming it.
+        use crate::codec::DocCodec;
+        use crate::paths::path::to_anchor;
+        use toml_edit::DocumentMut;
+
+        // "## Later" has title "Later" → to_anchor = "later", same as {#later} on first heading.
+        let markdown = "## First {#later}\n\nFirst.\n\n## Later\n\nSecond.\n";
+
+        let mut codec = MdCodec::new();
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000003"));
+        doc.insert("schema", value("Document"));
+        doc.insert("title", value("Test Doc"));
+
+        let proto = IRNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+        };
+
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
+        let nodes = codec.nodes();
+
+        let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
+        assert_eq!(sections.len(), 2);
+
+        let first = sections
+            .iter()
+            .find(|s| s.title().as_deref() == Some("First"))
+            .unwrap();
+        let later = sections
+            .iter()
+            .find(|s| s.title().as_deref() == Some("Later"))
+            .unwrap();
+
+        // Explicit anchor on "First" is kept
+        assert_eq!(first.id().as_deref(), Some("later"));
+        // "Later" has no explicit anchor; title slug "later" is already taken → id stays None
+        assert_eq!(
+            later.id(),
+            None,
+            "Title-derived slug blocked by prior explicit anchor"
+        );
+        assert_eq!(to_anchor(&later.title().unwrap()), "later");
+    }
+
+    #[test]
+    fn test_intra_document_heading_anchor_no_false_collision() {
+        // Distinct titles must not trigger a collision.
+        use crate::codec::DocCodec;
+        use toml_edit::DocumentMut;
+
+        let markdown = "## Alpha\n\nFirst.\n\n## Beta\n\nSecond.\n\n## Gamma\n\nThird.\n";
+
+        let mut codec = MdCodec::new();
+        let mut doc = DocumentMut::new();
+        doc.insert("bid", value("10000000-0000-0000-0000-000000000004"));
+        doc.insert("schema", value("Document"));
+        doc.insert("title", value("Test Doc"));
+
+        let proto = IRNode {
+            accumulator: None,
+            content: String::new(),
+            document: doc,
+            upstream: Vec::new(),
+            downstream: Vec::new(),
+            path: "test.md".to_string(),
+            kind: crate::properties::BeliefKindSet::default(),
+            errors: Vec::new(),
+            heading: 2,
+        };
+
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
+        let nodes = codec.nodes();
+
+        let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
+        assert_eq!(
+            sections.len(),
+            3,
+            "All three distinct sections must be present"
+        );
+
+        // No explicit anchors — all ids must be None (lazy derivation)
+        for section in &sections {
+            assert_eq!(
+                section.id(),
+                None,
+                "No eager id insertion: section '{}' must have no explicit id",
+                section.title().unwrap_or_default()
+            );
+        }
     }
 
     // ========================================================================
@@ -2427,7 +2687,11 @@ More content.
 
     #[test]
     fn test_inline_html_code_in_heading_generates_id() {
+        // Tests that titles are captured correctly for headings containing inline HTML and code.
+        // parse() does NOT eagerly insert ids from titles — IRNode::id() returns None for sections
+        // without explicit {#anchor} syntax. Title→id derivation is lazy via BeliefNode::id().
         use crate::codec::DocCodec;
+        use crate::paths::path::to_anchor;
         use toml_edit::DocumentMut;
 
         let markdown = r#"### <Method Title>
@@ -2461,7 +2725,7 @@ Mixed content.
             heading: 2,
         };
 
-        codec.parse(markdown, proto).unwrap();
+        codec.parse(markdown, proto, &mut vec![]).unwrap();
         let nodes = codec.nodes();
 
         // Should have 4 nodes: document + 3 sections
@@ -2476,7 +2740,7 @@ Mixed content.
         let sections: Vec<_> = nodes.iter().filter(|n| n.heading > 2).collect();
         assert_eq!(sections.len(), 3, "Expected 3 section nodes");
 
-        // Check that InlineHtml heading generated proper ID
+        // Check that InlineHtml heading captured title and has no explicit id
         let method_section = sections
             .iter()
             .find(|s| {
@@ -2488,13 +2752,21 @@ Mixed content.
             })
             .expect("Should find <Method Title> section");
 
-        let method_id = method_section.id().expect("Should have ID");
+        // No explicit {#anchor} — IRNode::id() must be None
         assert_eq!(
-            method_id, "method-title",
-            "InlineHtml should contribute to ID"
+            method_section.id(),
+            None,
+            "parse() must not insert title-derived id; no explicit anchor was present"
+        );
+        // Title is set; to_anchor(title) gives the expected slug (lazy derivation)
+        let method_title = method_section.title().expect("Should have title");
+        assert_eq!(
+            to_anchor(&method_title),
+            "method-title",
+            "Title anchor slug should match expected value"
         );
 
-        // Check that Code heading generated proper ID
+        // Check that Code heading captured title correctly
         let code_section = sections
             .iter()
             .find(|s| {
@@ -2506,10 +2778,16 @@ Mixed content.
             })
             .expect("Should find code section");
 
-        let code_id = code_section.id().expect("Should have ID");
         assert_eq!(
-            code_id, "using--code--in-title",
-            "Code should contribute to ID (backticks become spaces)"
+            code_section.id(),
+            None,
+            "parse() must not insert title-derived id"
+        );
+        let code_title = code_section.title().expect("Should have title");
+        assert_eq!(
+            to_anchor(&code_title),
+            "using--code--in-title",
+            "Code title anchor slug should match expected value"
         );
 
         // Check mixed content
@@ -2524,10 +2802,16 @@ Mixed content.
             })
             .expect("Should find mixed section");
 
-        let mixed_id = mixed_section.id().expect("Should have ID");
         assert_eq!(
-            mixed_id, "mixed--html--and--code--content",
-            "Mixed InlineHtml and Code should contribute to ID (backticks become spaces)"
+            mixed_section.id(),
+            None,
+            "parse() must not insert title-derived id"
+        );
+        let mixed_title = mixed_section.title().expect("Should have title");
+        assert_eq!(
+            to_anchor(&mixed_title),
+            "mixed--html--and--code--content",
+            "Mixed content title anchor slug should match expected value"
         );
     }
 
@@ -2616,7 +2900,9 @@ Install the software.
             .insert("bid", value("01234567-89ab-cdef-0123-456789abcdef"));
         proto.document.insert("title", value("Test Document"));
 
-        codec.parse(markdown, proto).expect("Parse failed");
+        codec
+            .parse(markdown, proto, &mut vec![])
+            .expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
@@ -2670,7 +2956,9 @@ This section has no explicit BID.
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
         proto.document.insert("title", value("Minimal Doc"));
 
-        codec.parse(markdown, proto).expect("Parse failed");
+        codec
+            .parse(markdown, proto, &mut vec![])
+            .expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
@@ -2711,7 +2999,9 @@ Already HTML [html link](./page.html "bref://doc789").
             .insert("bid", value("12345678-1234-5678-1234-567812345678"));
         proto.document.insert("title", value("Link Test"));
 
-        codec.parse(markdown, proto).expect("Parse failed");
+        codec
+            .parse(markdown, proto, &mut vec![])
+            .expect("Parse failed");
 
         let fragments = codec.generate_html().expect("HTML generation failed");
         assert_eq!(fragments.len(), 1, "Should generate one fragment");

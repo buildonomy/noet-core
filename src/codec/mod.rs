@@ -74,6 +74,8 @@
 //!         content: &str,
 //!         // Contains the builder root-path relative information to seed the parse with
 //!         current: IRNode,
+//!         // Any author-visible warnings discovered during parsing
+//!         diagnostics: &mut Vec<ParseDiagnostic>,
 //!     ) -> Result<(), BuildonomyError> {
 //!         todo!();
 //!     }
@@ -248,6 +250,9 @@ pub trait DocCodec: Sync {
         content: &str,
         // Contains the builder root-path relative information to seed the parse with
         current: IRNode,
+        // Any author-visible warnings or errors discovered during parsing (e.g. duplicate
+        // heading anchors) should be pushed here rather than emitted via tracing.
+        diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<(), BuildonomyError>;
 
     fn nodes(&self) -> Vec<IRNode>;
@@ -668,29 +673,26 @@ impl CodecMap {
 /// unit-tested with the native test runner. The `#[wasm_bindgen]` method in
 /// `wasm.rs` delegates to this function.
 pub fn normalize_path_extension_impl(path: &str) -> String {
-    use crate::paths::AnchorPath;
-
     let anchor_path = AnchorPath::new(path);
-    let filepath = anchor_path.filepath();
-    let ext = anchor_path.ext();
 
     // Case 1: empty extension — network/directory entry.
     // Must be checked before CODECS.get() because the non-WASM codec map
     // registers the NetworkCodec with an empty stem+ext match and would
     // otherwise intercept these paths and produce "mynetwork.html" instead
     // of "mynetwork/index.html".
-    if ext.is_empty() {
-        return format!("{}/index.html", filepath);
+    if anchor_path.ext().is_empty() {
+        // Empty path is the root network — always produces "/index.html".
+        // Non-empty directory paths use join so any anchor fragment is preserved,
+        // e.g. "mynetwork#section" → "mynetwork/index.html#section".
+        if path.is_empty() {
+            return "/index.html".to_string();
+        }
+        return anchor_path.join("index.html").to_string();
     }
 
     // Case 2: already .html — leave unchanged (re-attach anchor below)
-    if filepath.ends_with(".html") {
-        let mut result = filepath.to_string();
-        if !anchor_path.anchor().is_empty() {
-            result.push('#');
-            result.push_str(anchor_path.anchor());
-        }
-        return result;
+    if anchor_path.ext() == "html" {
+        return anchor_path.to_string();
     }
 
     // Case 3: known codec extension — replace_extension already preserves the anchor
@@ -698,13 +700,7 @@ pub fn normalize_path_extension_impl(path: &str) -> String {
         return anchor_path.replace_extension("html");
     }
 
-    // Case 4: non-codec, non-html extension (.pdf, .png, …) — asset, leave unchanged
-    let mut result = filepath.to_string();
-    if !anchor_path.anchor().is_empty() {
-        result.push('#');
-        result.push_str(anchor_path.anchor());
-    }
-    result
+    anchor_path.to_string()
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

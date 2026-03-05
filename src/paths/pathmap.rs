@@ -125,7 +125,21 @@ fn generate_terminal_path(
         explicit_path
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
-            .or_else(|| nets.ids.get(source).cloned())
+            .or_else(|| {
+                // Use the stored id only if it is not a bref-fallback (collision-corrected).
+                // When id == bref, the author never set a meaningful id; prefer the title-anchor
+                // for a human-readable path instead.
+                nets.ids
+                    .get(source)
+                    .filter(|id| id.as_str() != source.bref().to_string().as_str())
+                    .cloned()
+            })
+            .or_else(|| {
+                nets.titles
+                    .get(source)
+                    .map(|t| to_anchor(t))
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| index.to_string())
     }
 }

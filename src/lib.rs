@@ -88,7 +88,7 @@
 //!             ParseDiagnostic::UnresolvedReference(unresolved) => {
 //!                 println!("Forward ref: {:?}", unresolved);
 //!             }
-//!             ParseDiagnostic::Warning(msg) => {
+//!             ParseDiagnostic::Warning { message: msg, .. } => {
 //!                 println!("Warning: {}", msg);
 //!             }
 //!             _ => {}
@@ -194,10 +194,10 @@
 //! ParseDiagnostic::UnresolvedReference(UnresolvedReference::default())  // Forward ref (will resolve later)
 //! # ;
 //! # let _diagnostic =
-//! ParseDiagnostic::Warning(String::from("example"))
+//! ParseDiagnostic::warning("example")
 //! # ;
 //! # let _diagnostic =
-//! ParseDiagnostic::Info(String::from("example"))
+//! ParseDiagnostic::info("example")
 //! # ;
 //! # }
 //! ```

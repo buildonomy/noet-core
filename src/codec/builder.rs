@@ -300,7 +300,7 @@ impl GraphBuilder {
         if let Some(codec_factory) = CODECS.get(&doc_ap) {
             // Create fresh codec instance from factory
             let mut codec = codec_factory();
-            codec.parse(&content, initial)?;
+            codec.parse(&content, initial, &mut diagnostics)?;
 
             let mut inject_context = false;
             parsed_bids = Vec::with_capacity(codec.nodes().len());

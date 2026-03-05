@@ -162,7 +162,7 @@ pub fn init_tracing() {
 #[cfg(feature = "wasm")]
 use crate::{
     beliefbase::{BeliefBase, BeliefGraph},
-    codec::{normalize_path_extension_impl, NETWORK_NAME},
+    codec::normalize_path_extension_impl,
     nodekey::NodeKey,
     paths::AnchorPath,
     properties::{
@@ -1206,7 +1206,7 @@ impl BeliefBaseWasm {
             stack.push((network_bid_str.clone(), 0)); // Network is at depth 0
 
             for (path, bid, order_indices) in pm.recursive_map(&paths, &mut visited).iter() {
-                let depth = order_indices.len();
+                let mut depth = order_indices.len();
                 let bid_str = bid.to_string();
 
                 // Skip the network node itself (prevents self-reference)
@@ -1232,13 +1232,16 @@ impl BeliefBaseWasm {
                 // (still on stack) and children = []. The subsequent parent_node.children.push then
                 // adds subnet_bid to its own children --- the self-reference.
                 //
-                // Fix: if the path ends with the NETWORK_NAME sentinel ("index.md") AND the bid is
-                // already in the nodes_map, this is the gateway alias for an already-registered
-                // node. Skip the ithem entirely; any of its heading children (order [N, u16::MAX,
-                // K]) will be added to the navtree, as they are the next elements in the vec
-                // returned by recursive map.
-                if path.ends_with(NETWORK_NAME) && nodes_map.contains_key(&bid_str) {
+                // Fix: if the order contains the gateway index, depth/nodetree need special
+                // processing.
+                if order_indices.len() > 0 && order_indices[depth - 1] == u16::MAX {
                     continue;
+                } else if order_indices.len() > 1
+                    && order_indices[order_indices.len() - 2] == u16::MAX
+                {
+                    // Glue network anchor sections to the back of the section list. Because the map
+                    // is sorted, these will appear after the network's document list.
+                    depth -= 1;
                 }
                 let (node_title, node_kind) = states
                     .get(bid)

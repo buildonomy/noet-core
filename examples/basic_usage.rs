@@ -119,10 +119,10 @@ async fn main() -> Result<(), BuildonomyError> {
                 ParseDiagnostic::ParseError { .. } => {
                     parse_error.push(idx);
                 }
-                ParseDiagnostic::Warning(..) => {
+                ParseDiagnostic::Warning { .. } => {
                     warning.push(idx);
                 }
-                ParseDiagnostic::Info(..) => {
+                ParseDiagnostic::Info { .. } => {
                     info.push(idx);
                 }
             }
