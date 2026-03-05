@@ -498,15 +498,37 @@ body {
 
 .noet-nav-tree__item {
     margin-bottom: var(--size-1);
+    list-style: nonet;
 }
 
-/* Items with toggle buttons - use grid to position button, label, and children */
-.noet-nav-tree__item.has-children {
+.noet-nav-tree__item::marker {
+    content: none;
+}
+
+/* All items use the same two-column grid: icon column + link column.
+   This ensures ::before icons and toggle buttons share the same column width
+   so links are always left-aligned regardless of has-children or not. */
+.noet-nav-tree__item {
     display: grid;
     grid-template-columns: auto 1fr;
     grid-template-rows: auto auto;
     gap: 0 var(--size-1);
     align-items: center;
+}
+
+/*
+ * Leaf items (no toggle): ::before sits in column 1 as a non-interactive icon matching the toggle
+ * button's size so all links align in column 2.
+ */
+.noet-nav-tree__item:not(.has-children)::before {
+    content: "-";
+    grid-column: 1;
+    grid-row: 1;
+    padding: var(--size-1);
+    font-size: var(--font-size-2);
+    line-height: 1;
+    color: var(--noet-text-secondary);
+    text-align: center;
 }
 
 /* Toggle button in first column */
@@ -515,16 +537,16 @@ body {
     grid-row: 1;
 }
 
-/* Link/label in second column, same row as toggle */
-.noet-nav-tree__item.has-children > .noet-nav-tree__link,
-.noet-nav-tree__item.has-children > .noet-nav-tree__label {
+/* Link/label in second column for all items */
+.noet-nav-tree__item > .noet-nav-tree__link,
+.noet-nav-tree__item > .noet-nav-tree__label {
     grid-column: 2;
     grid-row: 1;
 }
 
 /* Children list spans both columns on second row */
 .noet-nav-tree__item.has-children > .noet-nav-tree__children {
-    grid-column: 1 / -1;
+    grid-column: 2 / -1;
     grid-row: 2;
 }
 
@@ -585,7 +607,8 @@ body {
 /* Nested navigation children */
 .noet-nav-tree__children {
     display: none;
-    padding-left: var(--size-5);
+    list-style: none;
+    padding-left: 0;
     margin-top: var(--size-1);
 }
 
@@ -594,7 +617,7 @@ body {
 }
 
 .noet-nav-tree__children .noet-nav-tree {
-    margin-left: var(--size-2);
+    margin-left: 0;
 }
 
 /* Metadata content area with scroll */
