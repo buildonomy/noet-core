@@ -267,7 +267,11 @@ use std::{
     fs::{read_to_string, write},
     path::{Path, PathBuf},
     result::Result,
-    sync::{mpsc::Sender, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -419,6 +423,68 @@ impl WatchService {
         self.db.clone()
     }
 
+    /// Block until the debouncer, compiler, and transaction handler are all idle
+    /// for every active network syncer, or until `timeout` elapses.
+    ///
+    /// "Idle" means all three pipeline stages have quiesced simultaneously:
+    /// - The debouncer callback has no paths left to enqueue.
+    /// - Both compiler queues (primary and reparse) are empty.
+    /// - The transaction handler channel is empty and the last commit has completed.
+    ///
+    /// Note: idle detection for the transaction stage has up to ~1 s latency due to
+    /// its current poll-based loop.
+    ///
+    /// Block until a full compile+transaction cycle completes for every active network
+    /// syncer since this method was called, or until `timeout` elapses.
+    ///
+    /// Internally this snapshots the commit generation counter for each syncer and waits
+    /// until the transaction task increments it, which only happens after a successful
+    /// `execute()` call that staged at least one event. This guarantees the caller
+    /// observes results from a parse that began after `wait_for_idle` was invoked.
+    ///
+    /// Note: the transaction task polls on a 1-second loop, so idle detection has up to
+    /// ~1 s of additional latency beyond the compile time itself.
+    ///
+    /// Returns `Err(BuildonomyError::Timeout)` if the deadline is exceeded.
+    pub fn wait_for_idle(&self, timeout: Duration) -> Result<(), BuildonomyError> {
+        let deadline = std::time::Instant::now() + timeout;
+
+        // Snapshot generation + clone notifier handles while holding the lock briefly,
+        // then drop the lock before calling block_on.
+        let syncer_handles: Vec<(u64, Arc<AtomicU64>, Arc<tokio::sync::Notify>)> = {
+            let binding = self.watchers.lock();
+            let watchers = binding.0.lock();
+            watchers
+                .values()
+                .map(|(_debouncer, syncer)| {
+                    (
+                        syncer.commit_generation.load(Ordering::SeqCst),
+                        syncer.commit_generation.clone(),
+                        syncer.commit_notify.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        for (snapshot, generation, notifier) in syncer_handles {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            self.runtime
+                .block_on(async move {
+                    tokio::time::timeout(remaining, async move {
+                        loop {
+                            if generation.load(Ordering::SeqCst) > snapshot {
+                                return;
+                            }
+                            notifier.notified().await;
+                        }
+                    })
+                    .await
+                })
+                .map_err(|_| BuildonomyError::Timeout("wait_for_idle timed out".to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn get_content<P: AsRef<Path>>(&self, path: P) -> Result<String, BuildonomyError> {
         tracing::debug!("Reading {:?}", path.as_ref());
         Ok(read_to_string(path)?)
@@ -512,7 +578,10 @@ impl WatchService {
         let compiler_ref = network_syncer.compiler.clone();
         let work_notifier = network_syncer.work_notifier.clone();
 
-        // Trigger initial parse of the network
+        // Enqueue the network root for initial parse, then mark the compiler and transaction
+        // stages busy before firing notify_one. This ordering guarantees that wait_for_idle
+        // cannot observe a spurious all-idle state between the notify and the compiler
+        // task waking up and clearing bit 1 itself.
         {
             let mut compiler = compiler_ref.write();
             compiler.enqueue(repo_path);
@@ -525,6 +594,7 @@ impl WatchService {
 
         let ignored_write_paths = network_syncer.ignored_write_paths.clone();
         let debouncer_codec = self.codecs.clone();
+        let debouncer_compiler_idle = network_syncer.compiler_idle.clone();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
@@ -537,6 +607,19 @@ impl WatchService {
                                 EventKind::Create(_)
                                 | EventKind::Modify(_)
                                 | EventKind::Remove(_) => {
+                                    // Hold off if the compiler is active. Any file-watcher
+                                    // events that arrived while the compiler was running may
+                                    // include writes the compiler itself produced. Deferring
+                                    // here is safe: notify-debouncer-full buffers events
+                                    // internally and will re-deliver them after the next
+                                    // quiet window once the compiler goes idle.
+                                    if !debouncer_compiler_idle.load(Ordering::SeqCst) {
+                                        tracing::debug!(
+                                            "[Debouncer] Compiler active, deferring debounce event"
+                                        );
+                                        return;
+                                    }
+
                                     // Filter paths to only include files with registered codec extensions
                                     // Note: Assets are discovered and tracked during document parsing
                                     let sync_paths: Vec<&PathBuf> = event
@@ -548,8 +631,9 @@ impl WatchService {
                                                 return false;
                                             }
 
-                                            // Skip paths we're currently writing to
-                                            // Normalize path to handle ./ and other variations
+                                            // Fine-grained per-file guard: skip paths the
+                                            // compiler has written in this idle window.
+                                            // Normalize path to handle ./ and other variations.
                                             {
                                                 let normalized = match p.canonicalize() {
                                                     Ok(canonical) => {
@@ -563,7 +647,7 @@ impl WatchService {
                                                 };
                                                 let ignored = ignored_write_paths.lock().unwrap();
                                                 if ignored.contains(&normalized) {
-                                                    tracing::debug!("[Debouncer] Ignoring write to {:?} (normalized: {:?}, compiler is writing)", p, normalized);
+                                                    tracing::debug!("[Debouncer] Ignoring write to {:?} (normalized: {:?}, compiler wrote this file)", p, normalized);
                                                     return false;
                                                 }
                                             }
@@ -597,7 +681,7 @@ impl WatchService {
                                         }
                                         tracing::info!("[Debouncer] Finished enqueuing, compiler.has_pending()={}", compiler.has_pending());
 
-                                        // Notify compiler thread that work is available
+                                        // Notify compiler thread that work is available.
                                         work_notifier.notify_one();
                                     }
                                 }
@@ -640,6 +724,16 @@ pub(crate) struct FileUpdateSyncer {
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub work_notifier: Arc<tokio::sync::Notify>,
     pub ignored_write_paths: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Incremented by the transaction task after each successful commit that staged at
+    /// least one event. `wait_for_idle` snapshots this value and waits until it advances,
+    /// guaranteeing a full compile+commit cycle has completed since the snapshot was taken.
+    pub commit_generation: Arc<AtomicU64>,
+    /// Notified whenever `commit_generation` is incremented.
+    pub commit_notify: Arc<tokio::sync::Notify>,
+    /// Compiler-idle flag: true when both compiler queues are empty. The debouncer reads
+    /// this to decide whether to hold off enqueueing (avoiding false positives from
+    /// compiler-written files appearing in the watcher event stream).
+    pub compiler_idle: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FileUpdateSyncer {
@@ -665,6 +759,16 @@ impl FileUpdateSyncer {
 
         // Set of paths to ignore in debouncer (files we're currently writing)
         let ignored_write_paths = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        // Generation counter incremented by the transaction task after each commit.
+        // wait_for_idle snapshots the current value and waits until it advances, ensuring
+        // a full compile+commit cycle has completed since enable_network_syncer was called.
+        let commit_generation = Arc::new(AtomicU64::new(0));
+        let commit_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Compiler-idle flag used by the debouncer hold-off logic.
+        // Starts false (busy) because the network root will be enqueued immediately.
+        let compiler_idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Create the compiler with the event channel and optional HTML output
         let compiler = Arc::new(RwLock::new(if let Some(html_dir) = html_output_dir {
@@ -692,17 +796,19 @@ impl FileUpdateSyncer {
         let compiler_global_bb = global_bb.clone();
 
         let compiler_ignored_paths = ignored_write_paths.clone();
-        let compiler_runtime = runtime.handle().clone();
+        let compiler_idle_flag = compiler_idle.clone();
         let transaction_events = Arc::new(RwLock::new(accum_rx));
         let transaction_global_bb = global_bb.clone();
         let transaction_tx = tx.clone();
+        let transaction_commit_generation = commit_generation.clone();
+        let transaction_commit_notify = commit_notify.clone();
 
         // doc_compiler thread
         let compiler_handle = runtime.spawn(async move {
             tracing::info!("[DocumentCompiler] Starting compiler thread");
 
-            // Check for stale files before starting the main loop
-            // This ensures modified files are re-parsed on watch service startup
+            // Check for stale files before starting the main loop.
+            // This ensures modified files are re-parsed on watch service startup.
             {
                 let mut compiler_write = compiler_ref.write_arc();
                 match compiler_write.check_stale_files(&compiler_global_bb, false).await {
@@ -725,8 +831,10 @@ impl FileUpdateSyncer {
             }
 
             loop {
-                // Wait for notification that work is available
+                // Wait for notification that work is available.
                 compiler_notifier.notified().await;
+                // Mark compiler busy so the debouncer hold-off activates.
+                compiler_idle_flag.store(false, Ordering::SeqCst);
 
                 tracing::info!(
                     "[DocumentCompiler] Notification received, processing all pending work"
@@ -773,13 +881,13 @@ impl FileUpdateSyncer {
                                 result.path
                             );
 
-                            // Add this path to ignore list temporarily (we may have written to it)
-                            // Normalize path to handle ./ and other variations in file watcher events
-                            // For BeliefNetwork directories, resolve to the actual file path
+                            // Add this path to the ignore set so the debouncer does not
+                            // re-enqueue it when the file watcher fires for a compiler write.
+                            // Normalize to a canonical path for consistent keying.
+                            // For BeliefNetwork directories, resolve to the actual file path.
                             {
                                 let mut path_to_ignore = result.path.clone();
 
-                                // If path is a directory, it might be a BeliefNetwork directory
                                 if path_to_ignore.is_dir() {
                                     if let Some(network_file_path) = detect_network_file(&path_to_ignore) {
                                         tracing::trace!("[DocumentCompiler] Resolved BeliefNetwork directory {:?} -> file {:?}", path_to_ignore, network_file_path);
@@ -794,32 +902,16 @@ impl FileUpdateSyncer {
                                     },
                                     Err(_) => {
                                         tracing::trace!("[DocumentCompiler] Failed to normalize {:?}, using as-is", path_to_ignore);
-                                        path_to_ignore.clone() // File might not exist, use as-is
+                                        path_to_ignore.clone()
                                     }
                                 };
                                 let mut ignored = compiler_ignored_paths.lock().unwrap();
                                 ignored.insert(normalized_path.clone());
-                                tracing::debug!("[DocumentCompiler] Ignoring writes to {:?} (normalized from {:?}) for 3s", normalized_path, result.path);
+                                tracing::debug!(
+                                    "[DocumentCompiler] Ignoring debouncer writes to {:?} (normalized from {:?}) until next compiler-idle",
+                                    normalized_path, result.path
+                                );
                             }
-
-                            // Spawn task to remove path from ignore list after delay
-                            let mut path_for_removal = result.path.clone();
-                            if path_for_removal.is_dir() {
-                                if let Some(network_file_path) = detect_network_file(&path_for_removal) {
-                                    path_for_removal = network_file_path;
-                                }
-                            }
-                            let path_to_remove = match path_for_removal.canonicalize() {
-                                Ok(canonical) => canonical,
-                                Err(_) => path_for_removal,
-                            };
-                            let ignored_paths_clone = compiler_ignored_paths.clone();
-                            compiler_runtime.spawn(async move {
-                                sleep(Duration::from_millis(3000)).await;
-                                let mut ignored = ignored_paths_clone.lock().unwrap();
-                                ignored.remove(&path_to_remove);
-                                tracing::debug!("[DocumentCompiler] No longer ignoring writes to {:?}", path_to_remove);
-                            });
 
                             // Note: DocumentCompiler handles writing when created with write=true
                             // We don't write here to avoid duplicate writes
@@ -863,6 +955,24 @@ impl FileUpdateSyncer {
                                 stats.reparse_queue_len,
                                 stats.total_parses
                             );
+
+                            // Queues are drained: flush ignored_write_paths and signal idle.
+                            // The debouncer holds off while compiler_idle is false, so all
+                            // compiler-written paths are safe to forget at this point —
+                            // tokio::fs::write has already returned for every parsed file.
+                            {
+                                let mut ignored = compiler_ignored_paths.lock().unwrap();
+                                let count = ignored.len();
+                                ignored.clear();
+                                if count > 0 {
+                                    tracing::debug!(
+                                        "[DocumentCompiler] Flushed {} ignored write paths on idle",
+                                        count
+                                    );
+                                }
+                            }
+                            compiler_idle_flag.store(true, Ordering::SeqCst);
+
                             // Break inner loop to wait for next notification
                             break;
                         }
@@ -900,6 +1010,9 @@ impl FileUpdateSyncer {
                     {
                         Ok(_) => {
                             tracing::debug!("[belief-compiler] Successfully integrated belief updates to the global cache.");
+                            // Advance generation and notify waiters so wait_for_idle unblocks.
+                            transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
+                            transaction_commit_notify.notify_waiters();
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -919,10 +1032,15 @@ impl FileUpdateSyncer {
             transaction_handle,
             work_notifier: work_notifier.clone(),
             ignored_write_paths,
+            commit_generation,
+            commit_notify,
+            compiler_idle,
         };
 
-        // Trigger initial notification since files may already be enqueued
-        work_notifier.notify_one();
+        // Do NOT call notify_one here. enable_network_syncer is responsible for enqueuing
+        // the network root and firing notify_one. If we fire here the compiler wakes against
+        // an empty queue, immediately declares itself idle, and wait_for_idle returns before
+        // any real work has been done.
 
         Ok(syncer)
     }

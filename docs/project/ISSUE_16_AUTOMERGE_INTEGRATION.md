@@ -670,6 +670,12 @@ Focus {
   - `procedure_engine.md` - Procedure matching and redline learning
   - `action_inference_engine.md` - Action detection events
   - `redline_system.md` - Correction feedback loop
+  - [`docs/design/federated_belief_network.md`](../design/federated_belief_network.md) -
+    Distributed compiler-DB coordination. Defines the **Layer 2** belief graph replication
+    protocol that sits below the **Layer 3** activity event log specified here. The two layers
+    use different consistency models (single-owner pull replication vs. Automerge CRDT) for
+    different reasons. The `commit_generation` counter introduced in Issue 51 is the seed of
+    the Layer 2 sequence number described there.
 - **External**:
   - [Automerge](https://automerge.org/) - CRDT library
   - [Keyhive](https://github.com/inkandswitch/keyhive) - Distributed authorization (pre-release)

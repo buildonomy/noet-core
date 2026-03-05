@@ -58,6 +58,8 @@ pub enum BuildonomyError {
     Serialization(String),
     #[error("Service API error: {0}")]
     Service(String),
+    #[error("Operation timed out: {0}")]
+    Timeout(String),
     #[error("Unresolved network reference '{network_ref}' in {key_type}://{network_ref}/{value}. Use resolve_network() to resolve via BeliefSource.")]
     UnresolvedNetwork {
         network_ref: String,
@@ -80,6 +82,7 @@ impl BuildonomyError {
             BuildonomyError::PermissionDenied => StatusCode::FORBIDDEN,
             BuildonomyError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             BuildonomyError::Service(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            BuildonomyError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
             BuildonomyError::UnresolvedNetwork { .. } => StatusCode::BAD_REQUEST,
         }
     }

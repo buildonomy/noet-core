@@ -39,7 +39,9 @@ fn test_mtime_tracking() {
     service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse and transaction processing
-    std::thread::sleep(Duration::from_secs(3));
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout");
 
     // Check that mtime was tracked in database
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -90,7 +92,9 @@ fn test_stale_file_detection_and_reparse() {
     service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    std::thread::sleep(Duration::from_secs(3));
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout after initial parse");
 
     // Get initial mtime
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -111,22 +115,26 @@ fn test_stale_file_detection_and_reparse() {
     // Drain initial events
     while rx.try_recv().is_ok() {}
 
-    // Wait to ensure mtime will be different
-    // Windows NTFS has 2-second resolution for write times (per Microsoft docs)
+    // Sleep to ensure the new mtime will be strictly greater than the cached one.
+    // This is logically required: filesystem mtime resolution may be coarse (1–2 s on
+    // some platforms), so without a pause the re-written file could carry the same mtime
+    // as the original and not be detected as stale. This is NOT a synchronization hack.
     std::thread::sleep(Duration::from_secs(3));
 
     // Modify the file
     std::fs::write(&doc_path, "# Modified Content\n\nThis is new!").unwrap();
 
-    // Explicitly set mtime to current time + 60 seconds to ensure it's different
-    // Use FileTime::now() instead of unix timestamp arithmetic to avoid NTFS rounding issues
-    // The file watcher has a 2-second debounce, so this happens before the reparse
+    // Explicitly advance the mtime by 60 seconds to guarantee it differs from the cached
+    // value regardless of filesystem mtime resolution (e.g. NTFS 2-second granularity).
     let current_time = FileTime::now();
     let future_mtime = FileTime::from_unix_time(current_time.unix_seconds() + 60, 0);
     set_file_mtime(&doc_path, future_mtime).unwrap();
 
-    // Wait for file watcher to detect change, debounce, and reparse
-    std::thread::sleep(Duration::from_secs(7));
+    // Wait for the file watcher to fire, the debounce window to elapse, and the full
+    // compile + transaction cycle to complete.
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout after file modification");
 
     // Verify we received events (indicating reparse happened)
     let mut event_count = 0;
@@ -187,7 +195,9 @@ fn test_multiple_files_mtime_tracking() {
     service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    std::thread::sleep(Duration::from_secs(4));
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout");
 
     // Check that all files have mtimes tracked
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -238,7 +248,9 @@ fn test_deleted_file_handling() {
     service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    std::thread::sleep(Duration::from_secs(3));
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout after initial parse");
 
     // Verify file was tracked
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -258,11 +270,15 @@ fn test_deleted_file_handling() {
     // Delete the file
     std::fs::remove_file(&doc_path).unwrap();
 
-    // Wait for file watcher to detect deletion and process
+    // Deletion emits no FileParsed event and therefore no transaction commit, so
+    // wait_for_idle would wait forever. A bounded sleep is correct here: the test
+    // only verifies the service handles deletion without panicking, not that any
+    // specific DB state results. The debounce window (2 s) plus processing headroom
+    // is sufficient.
     std::thread::sleep(Duration::from_secs(7));
 
-    // Service should handle this gracefully without panicking
-    // The test passes if we get here without crashes
+    // Service should handle this gracefully without panicking.
+    // The test passes if we reach here without crashes.
 
     // Cleanup
     service.disable_network_syncer(&network_path).ok();
@@ -289,7 +305,9 @@ fn test_unchanged_files_keep_same_mtime() {
     service.enable_network_syncer(&network_path).unwrap();
 
     // Wait for initial parse
-    std::thread::sleep(Duration::from_secs(3));
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout after initial parse");
 
     // Get initial mtime
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -309,13 +327,14 @@ fn test_unchanged_files_keep_same_mtime() {
 
     // Disable and re-enable syncer to simulate a restart
     service.disable_network_syncer(&network_path).ok();
-    std::thread::sleep(Duration::from_millis(500));
     service.enable_network_syncer(&network_path).unwrap();
 
-    // Wait for second parse
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for second parse cycle to complete
+    service
+        .wait_for_idle(Duration::from_secs(30))
+        .expect("Pipeline should become idle within timeout after restart");
 
-    // Check that mtime is unchanged (file wasn't modified)
+    // Check that mtime is unchanged (file wasn't modified, so no re-parse should occur)
     let new_mtime = rt.block_on(async {
         let db_path = root_dir.join("belief_cache.db");
         let pool = db_init(db_path).await.unwrap();
