@@ -150,6 +150,11 @@ impl GraphBuilder {
         };
         // network index file is now network dir
         repo_root.pop();
+        // Normalize repo_root through os_path_to_string + string_to_os_path to strip any Windows
+        // \\?\ extended-path prefix that canonicalize() adds. Without this, repo_root would be e.g.
+        // \\?\C:\tmp\xxx while parent_path (reconstructed from os_path_to_string) is C:\tmp\xxx ---
+        // causing strip_prefix to always fail on Windows.
+        let repo_root = string_to_os_path(&os_path_to_string(&repo_root));
 
         let tx = match maybe_tx.take() {
             Some(tx) => tx,
