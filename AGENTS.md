@@ -216,6 +216,14 @@ When symptoms appear in one subsystem but root cause may be elsewhere:
 4. Identify which system *owns* the problem vs. which *displays* it
 5. If stuck, say so — "I need more information about X" or "This requires human judgment"
 
+**BID ephemerality**: BIDs for nodes that have never been written to disk are
+time-based (they embed a timestamp). Running the compiler without `--write` (or
+without a parse result `rewritten_content` being flushed to disk) means those
+BIDs will differ across runs. Never compare raw BID values across separate test
+runs unless the BIDs were previously persisted in source files. When debugging
+BID mismatches, compare *counts* and *structural position* (parent bref suffix,
+sort order) rather than absolute BID values.
+
 ## File Conventions
 
 | Type | Location | Notes |

@@ -51,8 +51,11 @@ export function buildNavigation() {
     state.isFirstNavRender = false;
   }
 
-  // Expand ancestors of the active node, current document, and selected metadata node
+  // Cache getActiveBid for this render pass — it reads window.location and iterates
+  // all navTree nodes, so calling it once per node (inside renderNavNode) would be O(n²).
   const activeBid = getActiveBid();
+
+  // Expand ancestors of the active node, current document, and selected metadata node
   if (activeBid) {
     buildParentChain(activeBid);
     console.log(`[Noet] Active BID: ${activeBid}, expanded ${state.expandedNodes.size} ancestors`);
@@ -68,7 +71,7 @@ export function buildNavigation() {
     expandAncestors(state.selectedNodeBid);
   }
 
-  const treeHtml = renderNavTree();
+  const treeHtml = renderNavTree(activeBid);
   state.navContent.innerHTML = treeHtml;
 
   attachNavToggleListeners();
@@ -110,18 +113,27 @@ export function getActiveBid() {
   const currentHash = window.location.hash;
 
   // Strategy 2: match hash fragment against NavTree node paths. Use pathParts to canonicalize the
-  // hash content rather than ad-hoc string stripping. pathParts("/net/doc.html#section) gives:
+  // hash content rather than ad-hoc string stripping. pathParts("/net/doc.html#section") gives:
   //
   //   path="net", filename="doc.html", anchor="section"
   //
-  // which we reconstruct as "net/doc.html#section -- the same form that get_nav_tree() writes into
+  // which we reconstruct as "net/doc.html#section" — the same form that get_nav_tree() writes into
   // NavNode.path (root-relative, no leading slash).
   if (currentHash && state.wasmModule) {
-    const raw = currentHash.substring(1); //strip leading "#"
+    const raw = currentHash.substring(1); // strip leading "#"
     const parts = state.wasmModule.BeliefBaseWasm.pathParts(raw);
-    // Canonicalize() reassmbles the path without any leading slash
+    // canonicalize() reassembles the path without any leading slash
     const canonicalFull = parts.canonicalize();
-    const canonicalDoc = parts.filepath();
+    // filepath() may return a leading slash — strip it to match NavNode.path format
+    const canonicalDocRaw = parts.filepath();
+    const canonicalDoc =
+      canonicalDocRaw && canonicalDocRaw.startsWith("/")
+        ? canonicalDocRaw.substring(1)
+        : canonicalDocRaw;
+
+    console.log(
+      `[Noet] getActiveBid strategy2: hash=${JSON.stringify(currentHash)} canonicalFull=${JSON.stringify(canonicalFull)} canonicalDoc=${JSON.stringify(canonicalDoc)}`,
+    );
 
     for (const [bid, node] of state.navTree.nodes) {
       if (node.path && node.path === canonicalFull) {
@@ -129,8 +141,8 @@ export function getActiveBid() {
       }
     }
 
-    // Fallback: match doc path only (no anchor) -- covers the case where the hash points at a
-    // document but hte active node is the document node itself
+    // Fallback: match doc path only (no anchor) — covers the case where the hash points at a
+    // document but the active node is the document node itself.
     if (canonicalDoc) {
       for (const [bid, node] of state.navTree.nodes) {
         if (node.path && node.path === canonicalDoc) {
@@ -138,6 +150,8 @@ export function getActiveBid() {
         }
       }
     }
+
+    console.log(`[Noet] getActiveBid strategy2: no match found`);
   }
 
   // Strategy 3: match pathname against NavTree node paths
@@ -243,9 +257,10 @@ function toggleNode(bid) {
 
 /**
  * Render the full navigation tree as an HTML string.
+ * @param {string|null} activeBid - Pre-computed active BID (avoids O(n²) recomputation)
  * @returns {string}
  */
-function renderNavTree() {
+function renderNavTree(activeBid = null) {
   if (!state.navTree.roots || state.navTree.roots.length === 0) {
     console.error("[Noet] No roots to render");
     return '<p class="noet-placeholder">No networks found</p>';
@@ -253,7 +268,7 @@ function renderNavTree() {
 
   let html = '<ul class="noet-nav-tree">';
   for (const rootBid of state.navTree.roots) {
-    html += renderNavNode(rootBid);
+    html += renderNavNode(rootBid, 0, new Set(), activeBid);
   }
   html += "</ul>";
   return html;
@@ -264,9 +279,10 @@ function renderNavTree() {
  * @param {string} bid
  * @param {number} depth - Current recursion depth (cycle/depth guard)
  * @param {Set<string>} visited - BIDs already rendered in this chain
+ * @param {string|null} activeBid - Pre-computed active BID from buildNavigation()
  * @returns {string}
  */
-function renderNavNode(bid, depth = 0, visited = new Set()) {
+function renderNavNode(bid, depth = 0, visited = new Set(), activeBid = null) {
   if (visited.has(bid)) {
     console.error(`[Noet] Cycle detected: node ${bid} already visited in this chain`);
     return `<li class="noet-nav-tree__item noet-error">⚠ Cycle detected: ${escapeHtml(bid)}</li>`;
@@ -285,7 +301,7 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
 
   const hasChildren = node.children && node.children.length > 0;
   const isExpanded = state.expandedNodes.has(bid);
-  const isActive = bid === getActiveBid();
+  const isActive = bid === activeBid;
   const isCurrentDoc = !!state.currentDocBid && bid === state.currentDocBid;
   const isSelected = !!state.selectedNodeBid && bid === state.selectedNodeBid;
 
@@ -342,7 +358,7 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
         html += `<li class="noet-nav-tree__item noet-error">⚠ Self-reference detected</li>`;
         continue;
       }
-      html += renderNavNode(childBid, depth + 1, newVisited);
+      html += renderNavNode(childBid, depth + 1, newVisited, activeBid);
     }
     html += "</ul>";
   }

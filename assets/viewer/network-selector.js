@@ -123,13 +123,15 @@ export function initNetworkSelector() {
     }
   });
 
-  // Re-render whenever a shard is loaded or unloaded.
-  state.shardManager.addListener(() => {
-    _renderTabSummary();
-    if (_isOpen) {
-      _renderBody(body);
-    }
-  });
+  // Re-render whenever a shard is loaded or unloaded (sharded mode only).
+  if (state.shardManager) {
+    state.shardManager.addListener(() => {
+      _renderTabSummary();
+      if (_isOpen) {
+        _renderBody(body);
+      }
+    });
+  }
 }
 
 // =============================================================================
