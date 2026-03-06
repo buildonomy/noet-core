@@ -1120,6 +1120,7 @@ impl GraphBuilder {
         weight
             .set(crate::properties::WEIGHT_OWNED_BY, weight_owner)
             .ok();
+
         let _derivative_events = self.doc_bb.process_event(&BeliefEvent::RelationChange(
             bid,
             parent_bid,
@@ -1127,13 +1128,25 @@ impl GraphBuilder {
             Some(weight.clone()),
             EventOrigin::Remote,
         ))?;
-        // For sections, use the full path with anchor from the generated keys
-        // For documents/networks, use the document path
+        // For sections, build an absolute stack path by joining the network-relative anchor path
+        // from speculative_path_key onto the absolute net_path.  The Path key stores a
+        // network-relative form (e.g. "doc.md#heading-id") — correct for PathMap lookups — but
+        // get_parent_from_stack compares stack_ap.filepath() against the absolute proto.path, so
+        // the stack entry must also be absolute.  Re-joining against net_path restores the
+        // absolute prefix that strip_prefix removed inside speculative_path_key.
+        let net_path = self
+            .stack
+            .iter()
+            .rev()
+            .find(|(_bid, _path, heading)| *heading == 1)
+            .map(|(_bid, path, _heading)| path.clone())
+            .unwrap_or_default();
         let stack_path = if proto.heading > 2 {
-            // Section: extract path from Path key
             keys.iter()
                 .find_map(|k| match k {
-                    NodeKey::Path { path, .. } => Some(path.clone()),
+                    NodeKey::Path { path, .. } => {
+                        Some(AnchorPath::new(&net_path).join(path).into_string())
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| proto.path.clone())
@@ -2069,6 +2082,97 @@ Test network for unit tests.
         assert!(
             builder.stack.len() < initial_stack_len,
             "Should have popped sibling sections from stack"
+        );
+    }
+
+    /// Regression test: when a section heading has an explicit anchor that collides with a
+    /// prior heading's title-derived slug (e.g. `## Section Headings {#explicit-brefs}` after
+    /// `## Explicit Brefs`), the collision strips the explicit id and forces a bref-based id.
+    /// On every reparse that bref-based id is fresh, leaving a stale orphan edge in the graph.
+    /// Before the doc_order fix, `max+1` edge assignment caused the collision section and its
+    /// following sibling to both receive sort key 3, making their navtree order non-deterministic.
+    ///
+    /// After the fix, `push()` uses the document-position index as the sort key, so order is
+    /// always stable across multiple parses regardless of stale orphan edges.
+    #[tokio::test]
+    async fn test_anchor_collision_section_keeps_document_order() {
+        use crate::beliefbase::BeliefBase;
+        use crate::codec::compiler::DocumentCompiler;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Minimal network index
+        std::fs::write(
+            temp_dir.path().join("index.md"),
+            "---\nid = \"test-net\"\ntitle = \"Test Net\"\n---\n\n# Test Net\n",
+        )
+        .unwrap();
+
+        // Document that mirrors link_manipulation_test.md's collision pattern:
+        //   ## Alpha        → slug "alpha"       (sort position 0)
+        //   ## Beta {#alpha} → explicit id collides with "alpha", gets bref id (sort position 1)
+        //   ## Gamma        → slug "gamma"        (sort position 2)
+        std::fs::write(
+            temp_dir.path().join("doc.md"),
+            "---\ntitle = \"Doc\"\n---\n\n# Doc\n\n\
+             ## Alpha\n\nContent.\n\n\
+             ## Beta {#alpha}\n\nCollision section.\n\n\
+             ## Gamma\n\nAfter collision.\n",
+        )
+        .unwrap();
+
+        let global_bb = BeliefBase::default();
+
+        // Parse twice to expose the stale-orphan / sort-key-collision bug.
+        let mut compiler = DocumentCompiler::new(temp_dir.path(), None, Some(5), false).unwrap();
+        let _first = compiler.parse_all(global_bb.clone(), true).await.unwrap();
+        let _second = compiler.parse_all(global_bb.clone(), true).await.unwrap();
+
+        // Extract the path order for doc.md from the PathMap.
+        let paths = compiler.cache().paths();
+        let all = paths.all_paths();
+
+        // Find the network PathMap (the one that contains "doc.md")
+        let doc_entries: Vec<(String, Vec<u16>)> = all
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .filter(|(path, _bid, _order)| path.starts_with("doc.md#"))
+            .map(|(path, _bid, order)| (path, order))
+            .collect();
+
+        assert!(
+            !doc_entries.is_empty(),
+            "Expected section entries for doc.md; got none. All paths: {paths}"
+        );
+
+        // Find each section by its anchor suffix.
+        let order_for = |anchor: &str| -> Vec<u16> {
+            doc_entries
+                .iter()
+                .find(|(path, _)| path.ends_with(anchor))
+                .map(|(_, order)| order.clone())
+                .unwrap_or_default()
+        };
+
+        let alpha_order = order_for("#alpha");
+        let gamma_order = order_for("#gamma");
+
+        // Beta has no stable anchor after collision; find it as the remaining entry.
+        let beta_order = doc_entries
+            .iter()
+            .find(|(path, _)| !path.ends_with("#alpha") && !path.ends_with("#gamma"))
+            .map(|(_, order)| order.clone())
+            .expect("Expected a beta/collision entry");
+
+        assert!(
+            alpha_order < beta_order,
+            "alpha (doc order 0) must sort before beta/collision (doc order 1); \
+             alpha={alpha_order:?} beta={beta_order:?}"
+        );
+        assert!(
+            beta_order < gamma_order,
+            "beta/collision (doc order 1) must sort before gamma (doc order 2); \
+             beta={beta_order:?} gamma={gamma_order:?}"
         );
     }
 }

@@ -1768,27 +1768,68 @@ impl DocCodec for MdCodec {
                         if let Some(candidate) = candidate_id {
                             if self.seen_ids.contains(&candidate) {
                                 // Collision: a prior section already owns this anchor slug.
-                                // Remove any explicit id that was set — the section survives
-                                // without an addressable anchor. builder.rs handles network-level
-                                // uniqueness via BeliefNode::id()'s bref fallback.
                                 let (line, col) = self
                                     .heading_start_offset
                                     .map(|offset| byte_offset_to_location(&self.content, offset))
                                     .unwrap_or((0, 0));
-                                diagnostics.push(
-                                    ParseDiagnostic::warning(format!(
-                                        "Intra-document heading anchor collision: '{}' appears \
-                                         more than once in this document. The second occurrence \
-                                         will not be addressable by this anchor.",
-                                        candidate
-                                    ))
-                                    .with_location(line, col),
-                                );
-                                // Insert empty-string sentinel: IRNode::id() filters empty strings,
-                                // so this suppresses the title-derived fallback while preserving
-                                // the fact that a collision was detected. The section survives
-                                // with its title intact but without an addressable anchor.
-                                current.document.insert("id", value(""));
+
+                                // Distinguish two cases:
+                                //
+                                // A) The explicit {#anchor} collides but the title-derived slug
+                                //    is free. Drop only the explicit id; let the title fallback
+                                //    give the node a stable, addressable anchor. The warning
+                                //    tells the author their explicit tag was ignored.
+                                //
+                                // B) The title-derived slug itself collides (no explicit id, or
+                                //    both collide). The node truly cannot have an addressable
+                                //    anchor — insert the empty-string sentinel so IRNode::id()
+                                //    suppresses the title fallback and builder.rs falls back to
+                                //    a bref-based id.
+                                let has_explicit_id = current
+                                    .document
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false);
+                                let title_slug = to_anchor(accum_title.as_str());
+                                let title_slug_free =
+                                    !title_slug.is_empty() && !self.seen_ids.contains(&title_slug);
+
+                                if has_explicit_id && title_slug_free {
+                                    // Case A: explicit anchor collides, title is fine.
+                                    // Remove the explicit id so IRNode::id() falls through to
+                                    // the title slug, giving the node a stable identity.
+                                    current.document.remove("id");
+                                    // Register the title slug as claimed so later headings
+                                    // with the same title still collide correctly.
+                                    self.seen_ids.insert(title_slug);
+                                    diagnostics.push(
+                                        ParseDiagnostic::info(format!(
+                                            "Intra-document anchor collision: explicit anchor \
+                                             '{}' is already used in this document. The \
+                                             explicit anchor has been removed; the heading will \
+                                             use its title-derived anchor instead.",
+                                            candidate
+                                        ))
+                                        .with_location(line, col),
+                                    );
+                                } else {
+                                    // Case B: title slug also collides (or there is no title
+                                    // slug). Insert empty-string sentinel so IRNode::id()
+                                    // suppresses the title fallback entirely; builder.rs
+                                    // assigns a bref-based id.
+                                    current.document.insert("id", value(""));
+                                    diagnostics.push(
+                                        ParseDiagnostic::warning(format!(
+                                            "Intra-document heading anchor collision: '{}' \
+                                             appears more than once in this document. The \
+                                             second occurrence will not be addressable by \
+                                             this anchor.",
+                                            candidate
+                                        ))
+                                        .with_location(line, col),
+                                    );
+                                }
                             } else {
                                 self.seen_ids.insert(candidate);
                             }
@@ -2404,8 +2445,9 @@ schema = "Document"
 
     #[test]
     fn test_intra_document_heading_anchor_collision_explicit_anchor() {
-        // Two headings with explicit {#same} anchor: first keeps the anchor; second gets the
-        // empty-string sentinel so id() returns None (not the title-derived slug "beta").
+        // Two headings with explicit {#shared} anchor: first keeps the anchor; second's explicit
+        // anchor is stripped but its title slug "beta" is free, so id() returns Some("beta").
+        // This is Case A: explicit collision but title fallback is available and stable.
         use crate::codec::DocCodec;
         use toml_edit::DocumentMut;
 
@@ -2450,12 +2492,12 @@ schema = "Document"
             Some("shared"),
             "First explicit anchor must be kept"
         );
-        // Second claimant: explicit anchor collided → sentinel inserted → id() is None,
-        // not the title-derived fallback "beta"
+        // Second claimant: explicit anchor collided but title slug "beta" is free →
+        // Case A: explicit id removed, title fallback gives a stable anchor.
         assert_eq!(
-            beta.id(),
-            None,
-            "Colliding explicit anchor must be suppressed; title fallback must not apply"
+            beta.id().as_deref(),
+            Some("beta"),
+            "When explicit anchor collides but title slug is free, title fallback must apply"
         );
     }
 
