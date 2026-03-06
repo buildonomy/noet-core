@@ -276,7 +276,10 @@ use std::{
 };
 use tokio::{
     runtime::Runtime,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver},
+    sync::{
+        broadcast,
+        mpsc::{unbounded_channel, UnboundedReceiver},
+    },
     task::JoinHandle,
     time::sleep,
 };
@@ -724,9 +727,10 @@ pub(crate) struct FileUpdateSyncer {
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub work_notifier: Arc<tokio::sync::Notify>,
     pub ignored_write_paths: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
-    /// Incremented by the transaction task after each successful commit that staged at
-    /// least one event. `wait_for_idle` snapshots this value and waits until it advances,
-    /// guaranteeing a full compile+commit cycle has completed since the snapshot was taken.
+    /// Incremented by the transaction task after each successful commit at true pipeline
+    /// idle (channel empty AND compiler_idle == true). `wait_for_idle` snapshots this
+    /// value and waits until it advances, guaranteeing a full compile+commit cycle has
+    /// completed since the snapshot was taken.
     pub commit_generation: Arc<AtomicU64>,
     /// Notified whenever `commit_generation` is incremented.
     pub commit_notify: Arc<tokio::sync::Notify>,
@@ -734,6 +738,24 @@ pub(crate) struct FileUpdateSyncer {
     /// this to decide whether to hold off enqueueing (avoiding false positives from
     /// compiler-written files appearing in the watcher event stream).
     pub compiler_idle: Arc<std::sync::atomic::AtomicBool>,
+    /// Fired by the compiler task immediately after setting compiler_idle = true.
+    /// The transaction task selects on this to know when to drain the remainder of the
+    /// channel and signal wait_for_idle, without needing to inspect the channel itself.
+    ///
+    /// Forward-looking API: will be consumed by the LSP server (Issue 11) and peer
+    /// replication layer (federated_belief_network.md) once those are implemented.
+    #[allow(dead_code)]
+    pub compiler_idle_notify: Arc<tokio::sync::Notify>,
+    /// Broadcast sender for best-effort fan-out to LSP and future peer subscribers.
+    /// The transaction task sends each BeliefEvent here alongside the DB write.
+    /// Receivers that fall behind receive a Lagged error and should re-query the DB.
+    ///
+    /// Forward-looking API: will be consumed by the LSP server (Issue 11) and peer
+    /// replication layer (federated_belief_network.md) once those are implemented.
+    /// Clone this sender to create a new subscriber receiver:
+    ///   `let rx = syncer.belief_broadcast.subscribe();`
+    #[allow(dead_code)]
+    pub belief_broadcast: broadcast::Sender<BeliefEvent>,
 }
 
 impl FileUpdateSyncer {
@@ -760,15 +782,24 @@ impl FileUpdateSyncer {
         // Set of paths to ignore in debouncer (files we're currently writing)
         let ignored_write_paths = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-        // Generation counter incremented by the transaction task after each commit.
-        // wait_for_idle snapshots the current value and waits until it advances, ensuring
-        // a full compile+commit cycle has completed since enable_network_syncer was called.
+        // Generation counter incremented by the transaction task only at true pipeline idle:
+        // channel empty AND compiler_idle == true. wait_for_idle snapshots this and waits
+        // until it advances, guaranteeing a full compile+commit cycle has completed.
         let commit_generation = Arc::new(AtomicU64::new(0));
         let commit_notify = Arc::new(tokio::sync::Notify::new());
 
         // Compiler-idle flag used by the debouncer hold-off logic.
         // Starts false (busy) because the network root will be enqueued immediately.
         let compiler_idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Fired by the compiler task immediately after setting compiler_idle = true.
+        // The transaction task selects on this instead of polling or inspecting the channel.
+        let compiler_idle_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Broadcast channel for best-effort fan-out to LSP and future peer subscribers.
+        // Capacity 256: enough headroom for a large parse burst without unbounded memory.
+        // Receivers that fall behind receive Lagged and should re-query the DB.
+        let (belief_broadcast, _) = broadcast::channel::<BeliefEvent>(256);
 
         // Create the compiler with the event channel and optional HTML output
         let compiler = Arc::new(RwLock::new(if let Some(html_dir) = html_output_dir {
@@ -797,11 +828,16 @@ impl FileUpdateSyncer {
 
         let compiler_ignored_paths = ignored_write_paths.clone();
         let compiler_idle_flag = compiler_idle.clone();
-        let transaction_events = Arc::new(RwLock::new(accum_rx));
+        let compiler_idle_notify_flag = compiler_idle_notify.clone();
+
+        // transaction task owns accum_rx exclusively — no RwLock wrapper needed.
         let transaction_global_bb = global_bb.clone();
         let transaction_tx = tx.clone();
         let transaction_commit_generation = commit_generation.clone();
         let transaction_commit_notify = commit_notify.clone();
+        let transaction_compiler_idle = compiler_idle.clone();
+        let transaction_compiler_idle_notify = compiler_idle_notify.clone();
+        let transaction_belief_broadcast = belief_broadcast.clone();
 
         // doc_compiler thread
         let compiler_handle = runtime.spawn(async move {
@@ -972,6 +1008,11 @@ impl FileUpdateSyncer {
                                 }
                             }
                             compiler_idle_flag.store(true, Ordering::SeqCst);
+                            // Notify the transaction task that the compiler has gone idle.
+                            // The transaction task will drain any remaining channel events,
+                            // commit them, and then signal wait_for_idle. The compiler does
+                            // not inspect the transaction channel directly.
+                            compiler_idle_notify_flag.notify_one();
 
                             // Break inner loop to wait for next notification
                             break;
@@ -987,41 +1028,124 @@ impl FileUpdateSyncer {
         });
 
         // transaction builder/executor thread
+        //
+        // Owns accum_rx exclusively. Uses tokio::select! to react to either:
+        //   (a) new BeliefEvents arriving from the compiler, or
+        //   (b) the compiler declaring itself idle via compiler_idle_notify.
+        //
+        // commit_generation is incremented and commit_notify fired only when both the
+        // channel is empty AND compiler_idle == true, ensuring wait_for_idle cannot
+        // unblock on a partial batch mid-compile.
+        //
+        // Each processed event is also forwarded to belief_broadcast for best-effort
+        // delivery to LSP and future peer subscribers. Lagged receivers must re-query
+        // the DB; the DB path is always reliable.
         let transaction_handle = runtime.spawn(async move {
+            let mut accum_rx: UnboundedReceiver<BeliefEvent> = accum_rx;
             loop {
-                let is_empty = {
-                    while transaction_events.is_locked_exclusive() {
-                        tracing::info!(
-                            "[transaction handler] Waiting for read \n                             access to transaction event queue"
+                tokio::select! {
+                    // Branch A: a new event arrived from the compiler.
+                    maybe_event = accum_rx.recv() => {
+                        match maybe_event {
+                            None => {
+                                // Sender dropped — service is shutting down.
+                                tracing::info!("[transaction handler] Event channel closed, exiting.");
+                                return Ok(());
+                            }
+                            Some(first_event) => {
+                                // Drain the channel into a single transaction batch.
+                                let mut transaction = Transaction::new();
+                                let mut events = vec![first_event];
+                                // Non-blocking drain of any additional events already queued.
+                                while let Ok(ev) = accum_rx.try_recv() {
+                                    events.push(ev);
+                                }
+                                for event in events {
+                                    transaction.add_event(&event)?;
+                                    // Best-effort broadcast; ignored if no receivers.
+                                    let _ = transaction_belief_broadcast.send(event.clone());
+                                    if notify {
+                                        transaction_tx.send(Event::Belief(event))?;
+                                    }
+                                }
+                                if transaction.staged > 0 {
+                                    match transaction.execute(&transaction_global_bb.0).await {
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                "[transaction handler] Committed {} staged events.",
+                                                transaction.staged
+                                            );
+                                            match transaction_global_bb.is_db_balanced().await {
+                                                Ok(_) => tracing::debug!("Global DB Cache is balanced"),
+                                                Err(e) => tracing::warn!("Global DB Cache is Not Balanced. Errors: {}", e),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "[transaction handler] Error executing transaction: {:?}", e
+                                            );
+                                        }
+                                    }
+                                }
+                                // Signal idle only if the compiler has also gone idle and
+                                // the channel is now empty (no more events in flight).
+                                if transaction_compiler_idle.load(Ordering::SeqCst)
+                                    && accum_rx.is_empty()
+                                {
+                                    transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
+                                    transaction_commit_notify.notify_waiters();
+                                    tracing::debug!(
+                                        "[transaction handler] Channel empty + compiler idle \
+                                         after batch: signalled wait_for_idle (generation={})",
+                                        transaction_commit_generation.load(Ordering::SeqCst)
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Branch B: the compiler just declared itself idle.
+                    _ = transaction_compiler_idle_notify.notified() => {
+                        // Drain any events the compiler produced in its final parse
+                        // iteration that arrived after our last recv() returned.
+                        let mut transaction = Transaction::new();
+                        while let Ok(ev) = accum_rx.try_recv() {
+                            transaction.add_event(&ev)?;
+                            let _ = transaction_belief_broadcast.send(ev.clone());
+                            if notify {
+                                transaction_tx.send(Event::Belief(ev))?;
+                            }
+                        }
+                        if transaction.staged > 0 {
+                            match transaction.execute(&transaction_global_bb.0).await {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        "[transaction handler] Committed {} staged events on \
+                                         compiler-idle notification.",
+                                        transaction.staged
+                                    );
+                                    match transaction_global_bb.is_db_balanced().await {
+                                        Ok(_) => tracing::debug!("Global DB Cache is balanced"),
+                                        Err(e) => tracing::warn!("Global DB Cache is Not Balanced. Errors: {}", e),
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[transaction handler] Error executing transaction on \
+                                         compiler-idle: {:?}", e
+                                    );
+                                }
+                            }
+                        }
+                        // Channel is now empty and compiler is idle: full cycle complete.
+                        transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
+                        transaction_commit_notify.notify_waiters();
+                        tracing::debug!(
+                            "[transaction handler] Compiler-idle notification processed: \
+                             signalled wait_for_idle (generation={})",
+                            transaction_commit_generation.load(Ordering::SeqCst)
                         );
-                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    let rx_read = transaction_events.read_arc();
-                    rx_read.is_empty()
-                };
-                if !is_empty {
-                    match perform_transaction(
-                        transaction_events.clone(),
-                        transaction_global_bb.clone(),
-                        transaction_tx.clone(),
-                        notify,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            tracing::debug!("[belief-compiler] Successfully integrated belief updates to the global cache.");
-                            // Advance generation and notify waiters so wait_for_idle unblocks.
-                            transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
-                            transaction_commit_notify.notify_waiters();
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[belief-compiler] Error performing belief update transaction. Error: {:?}", e
-                            );
-                        }
-                    }
-                } else {
-                    sleep(Duration::from_secs(1)).await;
                 }
             }
         });
@@ -1035,6 +1159,8 @@ impl FileUpdateSyncer {
             commit_generation,
             commit_notify,
             compiler_idle,
+            compiler_idle_notify,
+            belief_broadcast,
         };
 
         // Do NOT call notify_one here. enable_network_syncer is responsible for enqueuing
@@ -1044,57 +1170,6 @@ impl FileUpdateSyncer {
 
         Ok(syncer)
     }
-}
-
-async fn perform_transaction(
-    rx_lock: Arc<RwLock<UnboundedReceiver<BeliefEvent>>>,
-    global_bb: DbConnection,
-    tx: Sender<Event>,
-    notify: bool,
-) -> Result<(), BuildonomyError> {
-    let mut transaction = Transaction::new();
-    let mut poll_result = {
-        while rx_lock.is_locked() {
-            tracing::info!(
-                "[perform_transaction] Waiting for write access to belief event receiver"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-        let mut rx = rx_lock.write_arc();
-        rx.try_recv()
-    };
-
-    while let Ok(event) = poll_result {
-        transaction.add_event(&event)?;
-        if notify {
-            tx.send(Event::Belief(event))?;
-        }
-
-        poll_result = {
-            while rx_lock.is_locked() {
-                tracing::info!(
-                    "[perform_transaction] Waiting for write access to belief event receiver"
-                );
-                sleep(Duration::from_millis(100)).await;
-            }
-            let mut rx = rx_lock.write_arc();
-            rx.try_recv()
-        };
-
-        if poll_result.is_err() {
-            // Add a little delay to ensure we process the entire transaction blast before
-            // executing the collated transaction.
-            sleep(Duration::from_millis(100)).await;
-        }
-    }
-    if transaction.staged > 0 {
-        transaction.execute(&global_bb.0).await?;
-        match global_bb.is_db_balanced().await {
-            Ok(_) => tracing::debug!("Global DB Cache is balanced"),
-            Err(e) => tracing::warn!("Global DB Cache is Not Balanced. Errors: {}", e),
-        };
-    }
-    Ok(())
 }
 
 #[derive(Default, Clone, Deserialize)]
