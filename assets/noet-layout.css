@@ -644,7 +644,7 @@ html.is-resizing .noet-metadata__collapse {
     grid-row: 2;
 }
 
-/* Toggle button for collapsible sections */
+/* Toggle button for collapsible sections — icon is driven by CSS ::before content */
 .noet-nav-tree__toggle {
     background: none;
     border: none;
@@ -654,6 +654,14 @@ html.is-resizing .noet-metadata__collapse {
     font-size: var(--font-size-1);
     line-height: 1;
     flex-shrink: 0;
+}
+
+.noet-nav-tree__toggle::before {
+    content: "▶";
+}
+
+.noet-nav-tree__item.is-expanded > .noet-nav-tree__toggle::before {
+    content: "▼";
 }
 
 .noet-nav-tree__toggle:hover {
@@ -750,7 +758,7 @@ html.is-resizing .noet-metadata__collapse {
     white-space: nowrap;
 }
 
-/* Nested navigation children */
+/* Nested navigation children — always in DOM, shown/hidden by is-expanded on parent */
 .noet-nav-tree__children {
     display: none;
     list-style: none;

@@ -205,17 +205,36 @@ function expandAncestors(bid) {
 }
 
 /**
- * Toggle expand/collapse for a node and re-render.
+ * Toggle expand/collapse for a node in-place without a full re-render.
+ * Flips the is-expanded class on the <li> and updates aria-expanded on the button.
+ * State is kept in sync so that a subsequent buildNavigation() call is consistent.
  * @param {string} bid
  */
 function toggleNode(bid) {
-  console.log(`[Noet] Toggling node: ${bid}, currently expanded: ${state.expandedNodes.has(bid)}`);
-  if (state.expandedNodes.has(bid)) {
+  const isExpanded = state.expandedNodes.has(bid);
+  console.log(`[Noet] Toggling node: ${bid}, currently expanded: ${isExpanded}`);
+
+  if (isExpanded) {
     state.expandedNodes.delete(bid);
   } else {
     state.expandedNodes.add(bid);
   }
-  buildNavigation();
+
+  // Patch the DOM directly — no full re-render needed.
+  const li = state.navContent.querySelector(`li[data-bid="${CSS.escape(bid)}"]`);
+  if (li) {
+    if (isExpanded) {
+      li.classList.remove("is-expanded");
+    } else {
+      li.classList.add("is-expanded");
+    }
+    const btn = li.querySelector(
+      `:scope > button.noet-nav-tree__toggle[data-bid="${CSS.escape(bid)}"]`,
+    );
+    if (btn) {
+      btn.setAttribute("aria-expanded", String(!isExpanded));
+    }
+  }
 }
 
 // =============================================================================
@@ -282,15 +301,13 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
 
   let html = `<li class="${itemClass}" data-bid="${escapeHtml(bid)}">`;
 
-  // Toggle button for nodes with children
+  // Toggle button for nodes with children — icon is driven by CSS so no re-render needed on toggle
   if (hasChildren) {
-    const toggleIcon = isExpanded ? "▼" : "▶";
     html += `
       <button class="noet-nav-tree__toggle"
               data-bid="${escapeHtml(bid)}"
               aria-label="Toggle ${escapeHtml(node.title)}"
               aria-expanded="${isExpanded}">
-        ${toggleIcon}
       </button>
     `;
   }
@@ -313,8 +330,8 @@ function renderNavNode(bid, depth = 0, visited = new Set()) {
     `;
   }
 
-  // Recursively render children when expanded
-  if (hasChildren && isExpanded) {
+  // Always render children into the DOM — CSS shows/hides via is-expanded on the parent <li>.
+  if (hasChildren) {
     const newVisited = new Set(visited);
     newVisited.add(bid);
 
