@@ -1359,20 +1359,18 @@ impl GraphBuilder {
             NodeSource::Merged => {
                 panic!("We should only produced NodeSource::Merged from GraphBuilder::push!")
             }
-            NodeSource::GlobalCache => {
-                // The missing_structure from cache_fetch has all the other node structure we
-                // need. We will merge that into self.doc_bb within parse_content before processing the
-                // event queue.
-            }
-            NodeSource::SourceFile | NodeSource::Generated => {
-                // We've accumulated all the structure we need already, the event queue can be
-                // processed without issue.
-            }
-
-            NodeSource::StackCache => {
-                // There is no missing structure with respect to the stack cache, but we do need to
-                // get missing structure from the stack cache to apply to self.doc_bb in order to
-                // maintain a balanced BeliefBase.
+            NodeSource::GlobalCache | NodeSource::StackCache => {
+                // The node state itself comes from cache_fetch (via missing_structure), but that
+                // only carries the node's TOML -- no relations. On a re-parse the node already
+                // exists in session_bb with its full neighborhood (e.g. a href node's
+                // RelationChange to href_namespace that populates its PathMap entry). Pull that
+                // neighborhood from session_bb here, whenever the node comes from "outside"
+                // (StackCache or GlobalCache), so that doc_bb has a complete picture for
+                // inject_context.
+                //
+                // Without this, content namespace nodes (href, asset) fetched from GlobalCache on
+                // re-parses have no PathMap entry in doc_bb, causing ExtendedRelation::new to
+                // return an empty root_path and erasing their URLs during link rewriting.
                 let query = Query {
                     seed: Expression::from(&NodeKey::Bid {
                         bid: other_node.bid,
@@ -1380,12 +1378,16 @@ impl GraphBuilder {
                     traverse: None,
                 };
                 let stack_result = self.session_bb.eval_query(&query, true).await?;
-                // tracing::debug!(
-                //     "Returned session_bb missing structure for query bid {}:\n{}",
-                //     other_node.bid,
-                //     stack_result.display_contents()
-                // );
-                missing_structure.union_mut(&stack_result);
+
+                // Use union_mut_with_trace so that Trace-kind nodes (e.g. href nodes, which are
+                // always External|Trace) are included. Plain union_mut filters out Trace nodes,
+                // which would silently drop the href_hamespace section edges and leave the href
+                // PathMap incomplete during inject_context.
+                missing_structure.union_mut_with_trace(&stack_result);
+            }
+            NodeSource::SourceFile | NodeSource::Generated => {
+                // We've accumulated all the structure we need already, the event queue can be
+                // processed without issue.
             }
         };
 
