@@ -448,7 +448,7 @@ async fn serve_html(output_dir: PathBuf, port: u16) {
 - **Depends On**: 
   - [`ISSUE_06_HTML_GENERATION.md`](./ISSUE_06_HTML_GENERATION.md) - HTML generation basics
   - [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - CLI and daemon infrastructure
-- **Roadmap**: [`ROADMAP_HTML_RENDERING.md`](./ROADMAP_HTML_RENDERING.md) - overall HTML strategy
+- **Roadmap**: [`ROADMAP.md`](./ROADMAP.md) - project history and vision
 - **Integration**: Bridges Issues 1-4 (clean markdown) with Issue 6 (HTML generation)
 - **Static Site Generators** (inspiration):
   - mdBook: https://github.com/rust-lang/mdBook

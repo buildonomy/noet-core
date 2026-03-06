@@ -1,6 +1,6 @@
 # Issue 46: Full-Text Search with Tantivy
 
-**STATUS**: SUPERSEDED - Split into ISSUE_48 (MVP) and ISSUE_49 (Production)
+**STATUS**: SUPERSEDED - Split into Issue 50 (Sharding) and Issue 54 (Built-In Search MVP)
 
 **Priority**: HIGH
 **Estimated Effort**: 16-24 days (SPLIT: 5-7 days MVP + 8-12 days Production)
@@ -11,29 +11,27 @@
 
 ## Superseded Notice
 
-This issue has been split into two focused issues:
+This issue has been split into two focused issues, implemented in this order:
 
-1. **ISSUE_48: Full-Text Search MVP - Embedded WASM** (5-7 days)
-   - Per-network indexing architecture
-   - Embedded Tantivy in WASM for static HTML output
-   - Keyword + fuzzy search
-   - Memory budget management (50/50 BeliefBase + search)
-   - Works with `noet parse` and `noet watch`
+1. **Issue 50: BeliefBase Sharding — Per-Network Export and Loading** (4-6 days)
+   - Per-network BeliefBase JSON sharding
+   - On-demand shard loading in WASM with ShardManager
+   - Network selector UI and memory budget display
+   - Establishes export infrastructure that search layers onto
 
-2. **ISSUE_49: Full-Text Search Production - Scalable Service** (8-12 days)
-   - Event stream integration for incremental updates
-   - Daemon mode integration
-   - HTTP API with Docker container
-   - GB-scale performance benchmarking
-   - Production deployment guide
+2. **Issue 54: Full-Text Search MVP — Built-In BeliefBase Search** (3-4 days)
+   - Built-in inverted index directly in `BeliefBase` (no Tantivy)
+   - TF-IDF ranking with title boost, fuzzy matching, snippet generation
+   - Extends existing `BeliefBaseWasm.search()` with full-text capability
+   - Zero additional WASM binary size, zero WASM compilation risk
 
-**Rationale for split**: 
-- MVP establishes per-network indexing architecture (critical foundation)
-- Production adds scaling, daemon integration, and deployment
-- Allows earlier delivery of basic search functionality
-- Cleaner separation of concerns (embedded vs. service)
+A design review determined that every field needed for search (`title`, `payload["text"]`, `kind`, `schema`, `id`) is already present in `BeliefNode` and loaded into WASM memory. Tantivy would duplicate this data, add 2-4MB to the WASM binary, and carry significant WASM compilation risk. The built-in approach eliminates all three concerns.
 
-See `.scratchpad/search_architecture_review.md` for architectural deep dive.
+**Issue 49** (originally "Full-Text Search Production") has been converted to a backlog brainstorm of post-MVP enhancements (stemming, boolean queries, phrase search, ranking boosts). Its event-driven indexing is automatic under the built-in model, and its HTTP search server is superseded by the federated `BeliefSource` architecture (see `federated_belief_network.md` §3.6).
+
+**Architecture**: See `docs/design/search_and_sharding.md` for the unified design.
+
+**Implementation sequence**: Issue 50 → Issue 47 (perf profiling for scale fixtures) → Issue 54. BeliefBase sharding first establishes the shared infrastructure (export hooks, viewer UI, memory budget), performance profiling creates scale-sized test fixtures, then built-in search layers on top.
 
 ---
 
@@ -43,7 +41,7 @@ See `.scratchpad/search_architecture_review.md` for architectural deep dive.
 
 Implement full-text search capability using Tantivy to support both local daemon (editor workflow) and CI/CD deployment (GitHub Pages + search container) use cases. The system must scale to GB-level document collections with incremental indexing, stemming, and rich query features.
 
-**Note**: This has been refined and split into ISSUE_48 (MVP) and ISSUE_49 (Production) based on architectural review.
+**Note**: This has been refined and split into Issue 54 (MVP), Issue 49 (Production), and Issue 50 (BeliefBase Sharding) based on architectural review.
 
 ## Goals
 

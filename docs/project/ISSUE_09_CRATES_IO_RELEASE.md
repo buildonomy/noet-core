@@ -3,7 +3,7 @@
 **Priority**: MEDIUM - Final step before v0.1.0 public release  
 **Estimated Effort**: 2-3 days  
 **Dependencies**: Issues 5-8 complete (docs, quality, tests, repo ready)  
-**Context**: Part of [`ROADMAP_OPEN_SOURCE_NOET-CORE.md`](./ROADMAP_OPEN_SOURCE_NOET-CORE.md) - publishes crate to crates.io and announces
+**Context**: Release gate — publishes crate to crates.io and announces. See [`ROADMAP.md`](./ROADMAP.md).
 
 ## Summary
 
@@ -336,7 +336,7 @@ Thanks to everyone who provided feedback during development!
 
 ## What's Next?
 
-See our [roadmap](https://github.com/alyjak/noet-core/blob/main/docs/project/ROADMAP_HTML_RENDERING.md) for upcoming features.
+See our [roadmap](https://github.com/buildonomy/noet-core/blob/main/docs/project/ROADMAP.md) for upcoming features.
 ```
 
 ### This Week in Rust Submission Template

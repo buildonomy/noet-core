@@ -1,520 +1,179 @@
-# noet-core Development Backlog
-
-**Purpose**: This document tracks all planned work for noet-core, organized by version milestone. It establishes the versioning strategy and explains how issues map to releases.
-
-## Versioning Strategy
-
-### Release Philosophy
-
-**Pre-v0.1.0 - Soft Open Source**
-- Repository made public on GitLab
-- No announcement or marketing
-- May have breaking changes without notice
-- Used for early feedback from trusted users
-- Not yet on crates.io
-
-**v0.1.0 - Announcement Release**
-- First public announcement (This Week in Rust, social media, etc.)
-- Published to crates.io
-- "Feature complete" for core library functionality
-- Production-ready API (semantic versioning starts here)
-- Comprehensive documentation
-- Working examples
-
-**v0.2+.0+ - Enhancement Releases**
-- No breaking changes to public API (semver)
-- New features (LSP, advanced tooling, etc.)
-- Performance improvements
-- Additional documentation
-
-**v1.0.0 - Stability Commitment**
-- Full API stability guarantee
-- Long-term support (LTS)
-- Battle-tested in production
-- Complete feature set for intended use cases
-
-## Current Status
-
-**Active Development**: Pre-v0.1.0 (soft open source phase)
-**Current Status**: Pre-soft-open-source
-
-**Next Milestone**: Soft open source (make repo public, no announcement)
-
-**Timeline Estimate**: 
-- 1 week to soft open source (Issue 5 only)
-- 3-4 weeks post-soft-open-source to v0.1.0 announcement
-
-## Version Milestones
-
-### v0.1.0 - Announcement Release (CURRENT TARGET)
-
-**Roadmap**: [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md)
-
-**Status**: In Progress (Phases 1-5)
-
-**Goal**: Feature-complete core library ready for public announcement and crates.io publication.
-
-**Blocking Issues** (must complete before announcement):
-
-#### Phase 1: Minimal Documentation for Soft Open Source ✅ COMPLETE (2025-01-18)
-- **[Issue 5: Core Library Documentation](./ISSUE_05_DOCUMENTATION.md)** ✅ COMPLETE
-  - Migrated `beliefbase_architecture.md` (removed product references)
-  - Created basic architecture docs
-  - Updated READMEs for standalone repository
-  - Fixed Cargo.toml dependencies (removed product crate references)
-  - **Stage 2 complete**: Issue 10 examples integrated (WatchService tutorial, 2025-01-24)
-
-**SOFT OPEN SOURCE POINT** ✅ ACHIEVED (2025-01-18)
-- Repository made public: https://gitlab.com/buildonomy/noet-core
-- No announcement yet, no crates.io publication
-- Early feedback from trusted users
-- Breaking changes acceptable
-
-#### Phase 1b: CLI and Daemon ✅ COMPLETE (2025-01-24)
-- **[Issue 10: Daemon Testing & Library Pattern Extraction](./ISSUE_10_DAEMON_TESTING.md)** ✅ COMPLETE
-  - Migrated `compiler.rs` → `watch.rs` (renamed `LatticeService` → `WatchService`)
-  - Created CLI tool (`noet parse`, `noet watch`)
-  - Integration tests (7 passing, 1 ignored - see Issue 19)
-  - Comprehensive tutorial docs with 4 doctests (240+ lines)
-  - Full orchestration example: `examples/watch_service.rs` (432 lines)
-  - Threading model documented
-
-#### Phase 2: HTML Rendering ✅ COMPLETE (2025-01-28)
-- **[Issue 1: Schema Registry](./completed/ISSUE_01_SCHEMA_REGISTRY.md)** ✅ COMPLETE
-  - Refactored to singleton pattern
-  - Enabled downstream schema registration
-
-- **[Issue 2: Multi-Node TOML Parsing](./completed/ISSUE_02_MULTINODE_TOML_PARSING.md)** ✅ COMPLETE
-  - Parse frontmatter with `sections` map
-  - Apply schema-typed payloads to headings
-
-- **[Issue 3: Heading Anchors](./completed/ISSUE_03_HEADING_ANCHORS.md)** ✅ COMPLETE
-  - Parse title-based anchors: `{#introduction}`
-  - Track BID-to-anchor mappings internally
-
-- **[Issue 4: Link Manipulation](./completed/ISSUE_04_LINK_MANIPULATION.md)** ✅ COMPLETE
-  - Parse NodeKey link attributes
-  - Auto-update paths when targets move
-
-- **[Issue 21: JSON/TOML Dual-Format Support](./completed/ISSUE_21_JSON_FALLBACK_PARSING.md)** ✅ COMPLETE
-  - JSON as default format (cross-platform compatibility)
-  - Support both BeliefNetwork.json and BeliefNetwork.toml
-  - Network configuration schema for repo-wide format preferences
-  - Bidirectional JSON/TOML conversion for uniform handling
-
-- **[Issue 6: HTML Generation](./ISSUE_06_HTML_GENERATION.md)** (8-10 days, HIGH) - **IN PROGRESS**
-  - Extend `DocCodec` trait with `generate_html()` method
-  - Implement HTML generation for `MdCodec`
-  - Create JavaScript viewer script for interactive features
-  - Create CSS stylesheet for noet documents
-  - NodeKey anchor resolution in browser
-
-- **[Issue 13: HTML CLI Integration](./ISSUE_13_HTML_CLI_INTEGRATION.md)** (2-3 days)
-  - Add `--html <output_dir>` to `noet parse` and `noet watch`
-  - Integrate HTML generation into FileUpdateSyncer
-  - Live reload server (optional)
-  - Static site generation workflow
-  - Requires Issue 6
-
-#### Phase 3: Code Quality & Testing (1 week)
-- **[Issue 7: Comprehensive Testing](./ISSUE_07_COMPREHENSIVE_TESTING.md)** (5-7 days)
-  - Comprehensive unit test suite
-  - Integration tests for all major workflows
-  - Property-based testing for builder
-  - Fuzzing for codec implementations
-  - Performance benchmarks established
-  - Memory leak detection tests
-  
-**Recent Testing Improvements** ✅:
-- **[Issue 22: Duplicate Node Deduplication](./completed/ISSUE_22_DUPLICATE_NODE_DEDUPLICATION.md)** ✅ COMPLETE
-- **[Issue 23: Integration Test Convergence](./completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md)** ✅ COMPLETE
-
-#### Phase 4: Repository & Infrastructure ✅ MOSTLY COMPLETE (2025-01-20)
-- **[Issue 8: Repository Setup](./ISSUE_08_REPOSITORY_SETUP.md)** ✅ COMPLETE
-  - Extracted repository from monorepo
-  - Set up basic CI/CD (security scanning)
-  - License headers added (MIT/Apache-2.0)
-  - Contributing guidelines created
-  
-**Remaining**:
-- [ ] Complete comprehensive CI/CD (Linux, macOS, Windows, multiple Rust versions)
-- [ ] Configure crates.io publishing workflow
-
-#### Phase 5: Publication & Announcement (2-3 days) - **BLOCKED ON ISSUE 6**
-- **[Issue 9: Crates.io Release](./ISSUE_09_CRATES_IO_RELEASE.md)** (2-3 days)
-  - Publish v0.1.0 to crates.io
-  - Write announcement blog post
-  - Submit to This Week in Rust
-  - Social media announcements
-  - Monitor initial feedback
-  - Requires Issues 6, 7, 8 complete
-
-**Soft Open Source Criteria** ✅ COMPLETE (2025-01-20):
-- [x] Issue 5 complete (basic documentation)
-- [x] Cargo.toml dependencies cleaned (no product crate references)
-- [x] README explains library purpose
-- [x] No product-specific code in noet-core
-- [x] Basic examples compile
-
-**v0.1.0 Success Metrics** (Before announcement):
-- [x] All tests passing (Issues 22, 23 complete)
-- [x] Documentation complete (Issue 5 + Issue 10 examples)
-- [x] HTML rendering parsing complete (Issues 1-4, 21)
-- [ ] HTML generation complete (Issue 6) - **BLOCKING v0.1.0**
-- [ ] HTML CLI integration (Issue 13)
-- [x] CLI tool working (`noet parse`, `noet watch`)
-- [ ] CI/CD comprehensive (basic security scanning complete)
-- [ ] Published to crates.io (Issue 9)
-- [ ] Announcement ready
-
-**Current Blocker**: Issue 6 (HTML Generation) must complete before v0.1.0 announcement
-
----
-
-### v0.2.0 - IDE Integration (POST-ANNOUNCEMENT)
-
-**Status**: Planning
-
-**Goal**: Language Server Protocol (LSP) support for IDE integration.
-
-**Target Timeline**: 1-2 months after v0.1.0 announcement
-
-**Issues**:
-
-#### Core LSP Implementation
-- **[Issue 11: Basic LSP](./ISSUE_11_BASIC_LSP.md)** (3-5 days, HIGH PRIORITY)
-  - Add position/range tracking to builder
-  - Implement LSP server with `tower-lsp`
-  - Document synchronization (didOpen, didChange, didSave, didClose)
-  - Real-time diagnostics
-  - Hover provider (show node metadata)
-  - VSCode/Zed/Neovim configuration
-
-**Deliverables**:
-- `noet lsp` command working
-- Diagnostics appear in IDEs
-- Hover shows BIDs and metadata
-- Tested in VSCode, Zed, Neovim
-- LSP documentation complete
-
-**Success Metrics**:
-- Users can edit noet documents in IDE with real-time feedback
-- LSP works in at least 2 different editors
-- Documentation enables easy setup
-
----
-
-### v0.3.0 - Advanced LSP Features (ENHANCEMENT)
-
-**Status**: Backlog
-
-**Goal**: Full-featured IDE experience with navigation, completion, refactoring, and real-time collaboration.
-
-**Target Timeline**: 2-3 months after v0.2.0
-
-**Issues**:
-
-#### Advanced LSP Features
-- **[Issue 12: Advanced LSP](./ISSUE_12_ADVANCED_LSP.md)** (5-7 days, MEDIUM PRIORITY)
-  - **Navigation**: Go to definition, find references, document outline, symbol search
-  - **Editing**: Autocomplete, formatting, code actions, rename
-  - **Performance**: Incremental sync, lazy parsing, debounced diagnostics
-  - **Quality of Life**: Semantic tokens, inlay hints
-
-#### Real-Time Collaboration
-- **[Issue 15: Filtered Event Streaming](./ISSUE_15_FILTERED_EVENT_STREAMING.md)** (5-7 days, MEDIUM PRIORITY)
-  - Query-based event subscriptions (reimagined "focus")
-  - Bidirectional event streaming (client ↔ server)
-  - LSP custom notifications for filtered updates
-  - Multiple concurrent subscriptions with different filters
-  - Efficient real-time updates for IDE extensions and dashboards
-
-**Deliverables**:
-- Click on `[[links]]` to jump to definition
-- Autocomplete available references
-- Format document (inject BIDs, normalize links)
-- Rename symbols with automatic reference updates
-- Document outline in sidebar
-- Workspace-wide symbol search
-- Query-based event subscriptions via LSP
-- Real-time filtered updates to IDE extensions
-- Bidirectional event flow (client can send updates)
-
-**Success Metrics**:
-- IDE experience comparable to programming languages
-- Navigation works across documents
-- Autocomplete response time < 50ms
-- Rename works on 100+ document workspaces
-- Filtered event routing latency < 10ms
-- Multiple concurrent subscriptions work correctly
-
----
-
-### v0.4.0 - Multi-Device Sync & Collaboration (BACKLOG)
-
-**Status**: Planning
-
-**Goal**: Distributed state synchronization and collaborative features using Automerge CRDT.
-
-**Target Timeline**: 3-4 months after v0.3.0
-
-**Issues**:
-
-#### Automerge Integration
-- **[Issue 16: Automerge Integration for Activity Logs and Distributed State](./ISSUE_16_AUTOMERGE_INTEGRATION.md)** (2-3 weeks, MEDIUM PRIORITY)
-  - Activity log sync (user motivations, focus history)
-  - Subscription state sync across devices
-  - Peer-to-peer sync (mDNS, QR pairing)
-  - Collaborative presence indicators
-  - Offline-first workflow
-  - Optional relay server for internet sync
-  - Future: Keyhive authorization integration (v0.5.0+)
-
-**Deliverables**:
-- Activity logs synced across user's devices
-- Subscription state synced (ISSUE_15 filters)
-- Peer discovery on local network (mDNS)
-- Automatic conflict resolution (CRDT)
-- Collaborative presence (who's viewing/editing what)
-- UI state sync (preferences, window layout)
-- Offline-first sync on reconnect
-
-**Success Metrics**:
-- Sync latency < 100ms on local network
-- Activity logs preserved across devices
-- Conflicts resolved automatically (no user intervention)
-- Works offline → syncs on reconnect
-
-**Architecture**:
-- Hybrid model: Files remain canonical (git-versioned), Automerge for ephemeral state
-- Feature flag: `automerge` (optional dependency)
-- Integration with ISSUE_15 (filtered event streaming)
-
----
-
-### v0.5.0+ - Future Enhancements (BACKLOG)
-
-**Status**: Ideas / Not Planned Yet
-
-**Potential Features**:
-
-#### Authorization & Security
-- Keyhive distributed authorization (when stable)
-- Capability-based access control
-- Multi-user permissions
-
-#### Language Features
-
-- Syntax extensions (custom block types, attributes)
-- Template system for document generation
-- Macro system for reusable content
-- Query language for complex graph queries
-
-#### Procedural Extensions
-- **[Issue 17: Extract noet-procedures Crate](./ISSUE_17_NOET_PROCEDURES_EXTRACTION.md)** (2-3 weeks, MEDIUM PRIORITY)
-  - Extract procedural execution functionality to separate crate
-  - Implement "as-run" tracking (template + context + execution record)
-  - Provide core redline system (deviation recording, not prediction)
-  - Depends on Issue 1 (Schema Registry)
-  - Note: `procedures.md` will be removed from noet-core - procedures become a runtime-registered schema
-
-- **[Issue 18: Extended Procedure Schemas](./ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md)** (1.5-2 weeks, MEDIUM PRIORITY)
-  - Observable action schema (`inference_hint` for passive detection)
-  - Prompt schema (interactive participant input)
-  - Extension points for observation producers and prompt renderers
-  - Depends on Issue 1 (Schema Registry) and Issue 17 (noet-procedures)
-
-#### Code Quality
-- **[Issue 14: Naming Improvements](./ISSUE_14_NAMING_IMPROVEMENTS.md)** (2-3 days, OPTIONAL)
-  - Rename types to match compiler architecture analogy
-  - Fix confusing field names (`set` vs `stack_cache`)
-  - Improve pedagogical clarity
-  - Recommended before v1.0.0, optional for v0.1.0
-
-#### Tooling
-- `noet fmt` - standalone formatter
-- `noet check` - validation without modification
-- `noet migrate` - schema migration tool
-- `noet serve` - local documentation server
-- `noet export` - export to HTML/PDF
-
-#### Performance
-- Parallel parsing for large workspaces
-- Incremental compilation cache
-- Memory-mapped file support
-- Lazy evaluation for queries
-
-#### LSP Advanced
-- Refactoring: Extract document, merge documents, split at cursor
-- Call hierarchy (document dependencies)
-- Type hierarchy (schema relationships)
-- Collaborative editing support
-
-#### Integrations
-- Git integration (track BID changes)
-- Database backends (PostgreSQL, SQLite alternatives)
-- Web API / REST server mode
-- Plugin system for custom codecs
-
-#### AI/ML Features
-- Suggest related documents
-- Auto-generate summaries
-- Semantic search
-- Auto-tagging
-
----
-
-### Issue Organization
-
-Issues are numbered sequentially and tracked in `docs/project/ISSUE_XX_*.md`:
-
-- **Issue 5**: Documentation - ✅ COMPLETE (Stage 1: 2025-01-18, Stage 2: 2025-01-24)
-- **Issue 10**: Daemon Testing - ✅ COMPLETE (2025-01-24)
-- **Issue 19**: File Watcher Timing Bug Investigation (HIGH PRIORITY) - Created 2025-01-24
-- **Issue 20**: CLI Write-Back Support - ✅ COMPLETE (2025-01-26)
-- **Issues 1-4**: HTML Rendering (Phase 2 of v0.1.0)
-- **Issue 6**: HTML Generation basics
-- **Issue 13**: HTML CLI Integration (integrates Issues 6 + 10)
-- **Issue 11**: Basic LSP (v0.2.0)
-- **Issue 12**: Advanced LSP (v0.3.0)
-- **Issue 14**: Naming Improvements (pedagogical clarity) - Optional for v0.1.0, recommended before v1.0.0
-- **Issue 15**: Filtered Event Streaming (v0.3.0)
-- **Issue 16**: Automerge Integration (v0.4.0)
-- **Issue 17**: Extract noet-procedures Crate (v0.5.0+, depends on Issue 1)
-- **Issue 18**: Extended Procedure Schemas (v0.5.0+, depends on Issue 1 and Issue 17)
-
-### Issue States
-
-- **Planning**: Issue written, not started
-- **In Progress**: Actively being worked on
-- **Blocked**: Waiting on dependency
-- **Complete**: Merged to main branch
-- **Deferred**: Moved to future version
-
-### Issue Dependencies
+# noet-core Roadmap
+
+A living document recording where noet-core has been, where it is now, and where it's headed.
+
+**Last Updated**: 2026-03-02
+
+## What noet-core Is
+
+noet-core transforms document networks (Markdown, TOML) into a queryable hypergraph called a BeliefBase. It maintains bidirectional synchronization between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes. The output is an interactive HTML viewer that lets users navigate, inspect, and (soon) search their document graph in the browser.
+
+## Project History
+
+### Foundation (2024 — early 2025)
+
+The core compilation model: multi-pass parsing, BID injection, BeliefBase graph operations, event streaming, and the codec system. Originally developed as part of a larger workspace, then extracted as a standalone library.
+
+- **Compilation model**: Multi-pass diagnostic-driven resolution of forward references
+- **Identity system**: BID (Belief ID) injection for stable cross-document linking
+- **Graph operations**: BeliefBase with typed edges (Subsection, Epistemic, Pragmatic)
+- **Event architecture**: Async event streaming for incremental cache updates
+- **Codec system**: Extensible parser framework (Markdown, TOML)
+
+### Soft Open Source (January 2025)
+
+Repository made public. Core documentation written. CLI tool (`noet parse`, `noet watch`) and daemon created.
+
+**Completed issues**: 1 (Schema Registry), 2 (Multi-Node TOML), 3 (Heading Anchors), 4 (Link Manipulation), 5 (Documentation), 10 (Daemon/CLI), 14 (Naming Improvements), 20 (CLI Write-Back), 21 (JSON/TOML Dual-Format), 22 (Duplicate Node Dedup), 23 (Integration Test Convergence)
+
+**Key decisions**:
+- Title-based anchors in markdown, BIDs only in HTML data attributes — universal renderer compatibility
+- JSON as default metadata format (TOML fallback) — cross-platform consistency
+- Event loop synchronization (Option G pattern) — correct BeliefBase export timing
+
+### HTML Rendering (January — March 2025)
+
+The migration from YAML block BID injection to clean frontmatter + title anchors, followed by full HTML generation with an interactive single-page application viewer.
+
+**Completed issues**: 6 (HTML Generation), 24 (API Node Architecture), 29 (Static Asset Tracking), 33 (Weight Doc Paths), 34 (Cache Instability), 35 (Cache Invalidation), 37 (Heading Anchor Bugs), 38 (Interactive SPA Foundation), 39 (Advanced Interactive Features), 40 (Network Index DocCodec), 43 (Codec HTML Refactor), 44 (UI Cleanup), 45 (WASM Threading Fix), 48 (Path Manipulation Consolidation), 51 (Author Diagnostics), 52 (Network Index Content Merge), 53 (Cache Invalidation Test Sync)
+
+**Key decisions**:
+- Single-page application with client-side document fetching — no server required
+- WASM-compiled BeliefBase for in-browser graph queries — `BeliefBaseWasm`
+- Two-click navigation pattern — preview metadata, then navigate
+- PathMapMap-based navigation tree — stack-based construction matching document hierarchy
+- Deferred HTML generation — cross-document content (backlinks, related nodes) generated after all documents parsed
+
+### Current State (March 2025)
+
+The interactive HTML viewer is functional: SPA navigation, metadata panel, navigation tree, theme switching, link detection, image modals, header anchors. The compiler produces complete static HTML output via `noet parse` and live-reloading output via `noet watch`.
+
+**What works well**: Compilation model, BID stability, interactive viewer, daemon with file watching, event-driven cache updates, cross-network references.
+
+**What's missing for internal MVP**: Full-text search, BeliefBase sharding for large repositories, performance characterization at scale.
+
+## Current Focus: Internal MVP
+
+The immediate goal is an internal MVP for use at Buildonomy. This means the viewer needs to handle real-world documentation repositories — which means search and scaling.
+
+### Active Work
+
+**Issue 50: BeliefBase Sharding** — Per-network JSON export and on-demand loading in the viewer. Establishes the `ShardManager`, network selector UI, and memory budget infrastructure that search layers onto.
+
+### Planned Sequence
 
 ```
-Soft Open Source:
-  Issue 5 (Documentation + Cargo.toml cleanup) → MAKE REPO PUBLIC
-
-v0.1.0 Dependencies:
-  Issue 5 (Documentation - basic)
-  Issue 10 (Daemon + CLI)
-  Issue 1 (Schema) → Issue 2 (TOML) → Issue 3 (Anchors)
-  Issue 3 (Anchors) + Issue 2 (TOML) → Issue 4 (Links)
-  Issue 6 (HTML Generation) + Issue 10 (CLI) → Issue 13 (HTML CLI Integration)
-  All Phase 1-2 → Phase 3 (Testing) → Phase 4 (Infra) → Phase 5 (Publication)
-
-v0.2.0 Dependencies:
-  Issue 10 (Daemon) → Issue 11 (Basic LSP)
-
-v0.3.0 Dependencies:
-  Issue 11 (Basic LSP) → Issue 12 (Advanced LSP)
-
-v0.5.0+ Dependencies:
-  Issue 1 (Schema Registry) → Issue 17 (noet-procedures extraction)
-  Issue 17 (noet-procedures) → Issue 18 (extended schemas: observables + prompts)
-
-Bugfixes (no version dependency):
-  Issue 19 (File Watcher Bug) - HIGH PRIORITY, may block soft open source if CLI broken
+Issue 50: BeliefBase Sharding (4–6 days)
+    Establishes: finalize_html export hooks, ShardManager,
+    network selector UI, memory budget display,
+    search/*.idx.json generation (always, both modes)
+    ▼
+Issue 47: Performance Profiling (3–4 days)
+    Establishes: realistic corpus generator, scale-sized
+    test fixtures (10KB → 100MB+), macro-benchmarks
+    ▼
+Issue 54: Full-Text Search MVP (4–5 days)
+    Adds: compile-time per-network search indices (.idx.json),
+    TF-IDF ranking, fuzzy matching, viewer search UI
+    No external dependencies — zero WASM binary increase
+    Search covers entire corpus at init (including unloaded shards)
 ```
 
-## Backlog Management
+**Design document**: `docs/design/search_and_sharding.md` — unified architecture for sharding and search.
 
-### Adding New Issues
+### Release Gating
 
-When creating a new issue:
-1. Assign to version milestone (v0.1.0, v0.2.0, etc.)
-2. Identify dependencies
-3. Estimate effort (days)
-4. Add to this BACKLOG.md
-5. Create issue file: `docs/project/ISSUE_XX_NAME.md`
+After the internal MVP is validated, the path to public release (v0.1.0):
 
-### Prioritization Criteria
+- **Issue 7**: Comprehensive testing — full test suite, CI matrix, browser compatibility
+- **Issue 8**: Repository setup — CI/CD pipelines, issue templates, documentation hosting
+- **Issue 9**: Crates.io release — dependency audit, package validation, publication, announcements
 
-**CRITICAL**: Blocks v0.1.0 announcement
-- Must complete before crates.io publication
-- Required for core functionality
-- Affects API stability
+These are deliberately deferred until the product is proven internally. Quality pass happens once, not iteratively.
 
-**HIGH**: Important for version milestone
-- Significant user-facing feature
-- Impacts documentation or examples
-- Enables key use case
+## Vision: Where We're Headed
 
-**MEDIUM**: Enhancement or optimization
-- Nice to have, not blocking
-- Performance improvement
-- Quality of life feature
+The following are aspirational directions, roughly ordered by how likely they are to happen. No timelines — they'll be planned when the time comes.
 
-**LOW**: Future work
-- Experimental feature
-- Research needed
-- Can be deferred indefinitely
+### IDE Integration
 
-### Version Planning
+Language Server Protocol support for real-time diagnostics, navigation, and editing in IDEs.
 
-**Soft Open Source**: Minimal viable documentation
-- Basic README explaining library purpose
-- Clean Cargo.toml (no product dependencies)
-- Repository made public
-- No announcement yet
+- **Issue 11**: Basic LSP — diagnostics, hover, document sync
+- **Issue 12**: Advanced LSP — go-to-definition, find references, autocomplete, rename
+- **Issue 15**: Filtered event streaming — query-based subscriptions for real-time UI updates
 
-**v0.1.0**: Feature-complete with announcement
-- No breaking changes after announcement
-- Complete documentation (including CLI/daemon examples)
-- Production-ready examples
-- HTML rendering working
-- Tested on multiple platforms
+### Graph Visualization and Querying
 
-**v0.2.0+**: Add features without breaking API
-- LSP integration (v0.2.0)
-- Advanced LSP (v0.3.0)
-- Tooling enhancements (v0.4.0+)
-- Maintain semantic versioning
+Interactive graph views embedded in the HTML viewer. Query builder UI for exploring the BeliefBase.
 
-## Current Sprint
+- **Issue 42**: Graph visualization
+- **Issue 41**: Query builder UI
+- **Issue 41 (Stream)**: Stream events to SPA for live updates
 
-**Active Phase**: Post-soft-open-source (ready for Phase 2 or v0.1.0 announcement)
+### Multi-Device Sync and Collaboration
 
-**Recently Completed**: 
-- Issue 5 - Core Library Documentation ✅ COMPLETE (Stage 1: 2025-01-18, Stage 2: 2025-01-24)
-- Issue 10 - Daemon Testing ✅ COMPLETE (2025-01-24)
+Distributed state synchronization using Automerge CRDTs. Peer-to-peer sync, collaborative presence, offline-first workflow.
 
-**Current Priority**: 
-- Issue 19 - File Watcher Bug (HIGH PRIORITY - manual CLI testing needed)
+- **Issue 16**: Automerge integration for activity logs and distributed state
 
-**Next Up**: 
-- Option A: Resolve Issue 19 (verify `noet watch` works)
-- Option B: Proceed to Phase 2 (HTML Rendering - Issues 1-4, 6, 13)
-- Option C: Announce v0.1.0 (if Issue 19 not blocking)
+### Per-Network Theming and Git-Aware Networks
 
-**Blocked**: Potentially blocked by Issue 19 if `noet watch` CLI is broken
+Custom themes per network. Git integration for tracking changes and displaying version history.
 
-**Estimated Completion**: 
-- Soft open source: ✅ COMPLETE (2025-01-18)
-- Issue 19 resolution: 1-2 days
-- Phase 2 (HTML): 2 weeks
-- v0.1.0 announcement: 2-4 weeks depending on path
+- **Issue 25**: Per-network theming
+- **Issue 26**: Git-aware networks
+
+### Procedural Extensions
+
+Extract procedure execution to a separate crate. "As-run" tracking, redline system, observable actions, interactive prompts.
+
+- **Issue 17**: Extract noet-procedures crate
+- **Issue 18**: Extended procedure schemas (observables, prompts)
+
+### Further Out
+
+These are ideas, not plans:
+
+- **Authorization**: Keyhive distributed authorization, capability-based access control
+- **Language features**: Syntax extensions, template system, macro system
+- **Tooling**: `noet fmt`, `noet check`, `noet migrate`, `noet serve`
+- **Performance**: Parallel parsing, incremental compilation cache, memory-mapped files
+- **Integrations**: Database backends (PostgreSQL), plugin system for custom codecs
+- **AI/ML**: Semantic search, related document suggestions, auto-tagging
+
+## Active Issues
+
+| Issue | Title | Priority | Status |
+|-------|-------|----------|--------|
+| 50 | BeliefBase Sharding | HIGH | Planned (next) |
+| 47 | Performance Profiling | MEDIUM | Planned |
+| 54 | Full-Text Search MVP | HIGH | Planned |
+| 49 | Full-Text Search Production | MEDIUM | Planned |
+| 7 | Comprehensive Testing | MEDIUM | Planned (release gate) |
+| 8 | Repository Setup | MEDIUM | Planned (release gate) |
+| 9 | Crates.io Release | MEDIUM | Planned (release gate) |
+| 11 | Basic LSP | MEDIUM | Planned (post-release) |
+| 13 | HTML CLI Integration | MEDIUM | Partially complete |
+| 25 | Per-Network Theming | LOW | Backlog |
+| 26 | Git-Aware Networks | LOW | Backlog |
+| 27 | Rustdoc Integration | LOW | Backlog |
+| 28 | Code Quality | LOW | Backlog |
+| 30 | External URL Tracking | LOW | Backlog |
+| 31 | Watch Service Asset Integration | LOW | Backlog |
+| 32 | Schema Registry Production | LOW | Backlog |
+| 36 | Section BID Migration | LOW | Backlog |
+| 41 | Query Builder / Stream Events | LOW | Backlog |
+| 42 | Graph Visualization | LOW | Backlog |
+| 46 | Full-Text Search (superseded) | — | Superseded by 50/54/49 |
+
+See `BACKLOG.md` for optional enhancements extracted from completed issues.
 
 ## References
 
-- **Main Roadmap**: [`ROADMAP_OPEN_SOURCE_NOET-CORE.md`](./ROADMAP_OPEN_SOURCE_NOET-CORE.md)
-- **Agent Guidelines**: [`../../../AGENTS.md`](../../../AGENTS.md)
-- **Issues Directory**: `docs/project/ISSUE_*.md`
-
-## Change Log
-
-- **2024-XX-XX**: Created BACKLOG.md with versioning strategy
-- **2024-XX-XX**: Added Issue 10 (Daemon Testing)
-- **2024-XX-XX**: Added Issue 11 (Basic LSP) for v0.2.0
-- **2024-XX-XX**: Added Issue 12 (Advanced LSP) for v0.3.0
-- **2024-XX-XX**: Added Issue 13 (HTML CLI Integration)
-- **2024-XX-XX**: Clarified soft open source strategy - Issue 5 only, then public repo
-- **2024-XX-XX**: Decoupled Issue 5 from Issue 10 - can open source sooner
-- **2025-01-18**: Soft open source achieved - repository made public
-- **2025-01-24**: Completed Issue 5 Stage 2 (WatchService tutorial from Issue 10)
-- **2025-01-24**: Completed Issue 10 (tutorial docs, integration tests, example created)
-- **2025-01-24**: Created Issue 19 (File Watcher Timing Bug - HIGH PRIORITY)
-- **2025-01-24**: Created Issue 20 (CLI Write-Back Support - extends Issue 10 CLI functionality)
-- **2025-01-26**: Completed Issue 20 (CLI Write-Back Support)
+- `docs/design/beliefbase_architecture.md` — Core data model and compilation architecture
+- `docs/design/interactive_viewer.md` — HTML viewer design
+- `docs/design/search_and_sharding.md` — Search and sharding architecture
+- `docs/project/README.md` — Issue resolution workflow
+- `docs/project/BACKLOG.md` — Optional enhancements
+- `AGENTS.md` — Collaboration guidelines

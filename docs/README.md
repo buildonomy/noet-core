@@ -14,9 +14,7 @@ This directory contains all documentation for the noet-core library.
 ### For Contributors
 
 **Project Planning**:
-- [Roadmap](project/ROADMAP.md) - Version milestones and feature backlog
-- [v0.1.0 Roadmap](project/ROADMAP_NOET-CORE_v0.1.md) - Detailed plan for first release
-- [Issue 5: Documentation](project/ISSUE_05_DOCUMENTATION.md) - Current documentation work (Stage 1 ✅ complete)
+- [Roadmap](project/ROADMAP.md) - Project history, current focus, and vision
 
 **Development Guidelines**:
 - [Documentation Strategy](project/DOCUMENTATION_STRATEGY.md) - How documentation is organized
@@ -82,11 +80,9 @@ Complete technical specification for understanding internals and contributing.
 
 **Purpose**: Project planning, issue tracking, and development guidelines
 
-### Roadmaps
+### Roadmap
 
-- **[ROADMAP.md](project/ROADMAP.md)** - Main roadmap with version milestones (v0.1.0, v0.2.0, v0.3.0+)
-- **[ROADMAP_NOET-CORE_v0.1.md](project/ROADMAP_NOET-CORE_v0.1.md)** - Detailed v0.1.0 plan (soft open source → announcement)
-- **[ROADMAP_HTML_RENDERING.md](project/ROADMAP_HTML_RENDERING.md)** - HTML rendering feature plan
+- **[ROADMAP.md](project/ROADMAP.md)** - Project history, current focus, and vision
 
 ### Issues
 

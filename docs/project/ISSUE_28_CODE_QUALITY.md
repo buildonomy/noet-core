@@ -3,7 +3,7 @@
 **Priority**: HIGH - Required for v0.1.0  
 **Estimated Effort**: 3-4 days  
 **Dependencies**: Issues 1-4 complete (stable API surface)  
-**Context**: Part of [`ROADMAP_OPEN_SOURCE_NOET-CORE.md`](./ROADMAP_OPEN_SOURCE_NOET-CORE.md) - ensures code quality before open source release
+**Context**: Release gate — ensures code quality before public release. See [`ROADMAP.md`](./ROADMAP.md).
 
 ## Summary
 

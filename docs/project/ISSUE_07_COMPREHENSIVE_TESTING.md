@@ -3,7 +3,7 @@
 **Priority**: HIGH - Required for v0.1.0  
 **Estimated Effort**: 4-6 days (includes viewer testing from ISSUE_39)
 **Dependencies**: Issues 1-6 complete (stable implementation), ISSUE_39 Phase 1 complete  
-**Context**: Part of [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md) - ensures reliability before open source release
+**Context**: Release gate — ensures reliability before public release. See [`ROADMAP.md`](./ROADMAP.md).
 
 **Note**: Includes testing tasks from ISSUE_39 Phase 2 (viewer accessibility, browser compatibility, performance)
 
