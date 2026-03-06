@@ -36,16 +36,34 @@ use noet_core::codec::{compiler::DocumentCompiler, diagnostic::ParseDiagnostic};
 use noet_core::event::Event;
 #[cfg(feature = "service")]
 use noet_core::watch::WatchService;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 #[cfg(feature = "service")]
 use std::sync::mpsc::channel;
 #[cfg(feature = "service")]
 use std::time::Duration;
 
+#[derive(clap::ValueEnum, Clone, Default)]
+enum ColorChoice {
+    /// Emit color codes if stderr is a TTY, suppress them otherwise
+    #[default]
+    Auto,
+    /// Always emit color codes (useful when piping through `less -R`)
+    Always,
+    /// Never emit color codes
+    Never,
+}
+
 #[derive(Parser)]
 #[command(name = "noet")]
 #[command(author, version, about = "A tool for parsing and watching markdown documents", long_about = None)]
 struct Cli {
+    /// Control color output: auto (default), always, never.
+    /// `always` is useful when piping through a pager that supports ANSI escapes (e.g. `less -R`).
+    /// Color is also suppressed when the NO_COLOR environment variable is set.
+    #[arg(long, default_value = "auto", global = true)]
+    color: ColorChoice,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -154,6 +172,44 @@ enum Commands {
     },
 }
 
+/// ANSI color codes for diagnostic output.
+///
+/// Respects `--color`, `is_terminal()`, and the `NO_COLOR` environment variable
+/// (see <https://no-color.org>).
+struct DiagColors {
+    warning: &'static str,
+    error: &'static str,
+    info: &'static str,
+    reset: &'static str,
+}
+
+impl DiagColors {
+    fn new(choice: &ColorChoice) -> Self {
+        let use_color = match choice {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+            }
+        };
+        if use_color {
+            Self {
+                warning: "\x1b[33m", // yellow
+                error: "\x1b[31m",   // red
+                info: "\x1b[36m",    // cyan
+                reset: "\x1b[0m",
+            }
+        } else {
+            Self {
+                warning: "",
+                error: "",
+                info: "",
+                reset: "",
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -164,6 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let color_choice = cli.color.clone();
 
     match cli.command {
         Commands::Init {
@@ -332,40 +389,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Collect and report diagnostics
+                let colors = DiagColors::new(&color_choice);
                 let mut warning_count = 0usize;
                 let mut error_count = 0usize;
                 for result in &parse_results {
+                    let path = result.path.display();
                     for diagnostic in &result.diagnostics {
                         match diagnostic {
                             ParseDiagnostic::Warning {
                                 message: msg,
                                 location,
                             } => {
+                                let label = format!("{}warning{}", colors.warning, colors.reset);
                                 if let Some((line, col)) = location {
-                                    eprintln!("warning ({line}:{col}): {msg}");
+                                    eprintln!("{path}:{line}:{col}: {label}: {msg}");
                                 } else {
-                                    eprintln!("warning: {msg}");
+                                    eprintln!("{path}: {label}: {msg}");
                                 }
                                 warning_count += 1;
                             }
                             ParseDiagnostic::ReparseLimitExceeded => {
-                                eprintln!("\"{:?}\": Reparse limit exceeded", result.path);
+                                let label = format!("{}error{}", colors.error, colors.reset);
+                                eprintln!("{path}: {label}: reparse limit exceeded");
+                                error_count += 1;
                             }
                             ParseDiagnostic::ParseError {
                                 message,
                                 attempt_count,
                                 location,
                             } => {
+                                let label = format!("{}error{}", colors.error, colors.reset);
                                 if let Some((line, col)) = location {
                                     eprintln!(
-                                        "error ({line}:{col}): {} (after {} attempt{})",
+                                        "{path}:{line}:{col}: {label}: {} (after {} attempt{})",
                                         message,
                                         attempt_count,
                                         if *attempt_count == 1 { "" } else { "s" }
                                     );
                                 } else {
                                     eprintln!(
-                                        "error: {} (after {} attempt{})",
+                                        "{path}: {label}: {} (after {} attempt{})",
                                         message,
                                         attempt_count,
                                         if *attempt_count == 1 { "" } else { "s" }
@@ -378,15 +441,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 location,
                             } => {
                                 if verbose {
+                                    let label = format!("{}info{}", colors.info, colors.reset);
                                     if let Some((line, col)) = location {
-                                        eprintln!("info ({line}:{col}): {msg}");
+                                        eprintln!("{path}:{line}:{col}: {label}: {msg}");
                                     } else {
-                                        eprintln!("info: {msg}");
+                                        eprintln!("{path}: {label}: {msg}");
                                     }
                                 }
                             }
-                            // UnresolvedReference entries that survive to this point are
-                            // compiler-internal sink dependencies; not shown to the author.
+                            // UnresolvedReference diagnostics are compiler-internal signals
+                            // and must not survive past parse_all; nothing to display.
                             ParseDiagnostic::UnresolvedReference(_) => {}
                         }
                     }

@@ -18,7 +18,6 @@ use crate::{
     query::{BeliefSource, Expression, NeighborsExpression, Query},
 };
 
-use petgraph::Direction;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -734,153 +733,66 @@ impl DocumentCompiler {
             }
         }
 
-        let mut results = Vec::new();
+        // Each path maps to its latest real ParseResult. Reparse runs replace earlier attempts,
+        // so callers always see exactly one result per path with no staleness bookkeeping.
+        //
+        // Exception: ReparseLimitExceeded is a compiler-internal sentinel emitted *instead of*
+        // a real parse. When it arrives we merge it into the existing entry's diagnostics so
+        // that the last real parse's UnresolvedReferences are preserved for promotion.
+        let mut latest: HashMap<PathBuf, ParseResult> = HashMap::new();
 
         while let Some(result) = self.parse_next(global_bb.clone()).await? {
-            results.push(result);
+            let is_sentinel = result
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
+
+            if is_sentinel {
+                // Merge the sentinel into the existing entry without overwriting its diagnostics.
+                latest
+                    .entry(result.path.clone())
+                    .or_insert(result)
+                    .diagnostics
+                    .push(ParseDiagnostic::ReparseLimitExceeded);
+            } else {
+                latest.insert(result.path.clone(), result);
+            }
         }
 
-        // All passes complete. Any UnresolvedReference entries that originated from
-        // link-resolution failures (not cross-document sink dependencies) are now permanent
-        // author errors. Promote them to Warning so callers see clean, actionable output.
-        //
-        // However, a file may have been parsed multiple times (reparse queue). Only promote
-        // UnresolvedReference diagnostics from a given parse attempt if that file has no
-        // later parse result that is free of unresolved refs. In other words: if a later
-        // reparse succeeded (produced zero UnresolvedReference diagnostics for that path),
-        // the earlier attempt's unresolved refs are stale and must be suppressed.
+        // All passes complete. Exactly one result per path exists in `latest`.
+        // Any remaining UnresolvedReference is a permanent author error — promote to Warning.
+        let mut results: Vec<ParseResult> = latest.into_values().collect();
         Self::promote_unresolved_to_warnings(&mut results);
 
         Ok(results)
     }
 
-    /// Promote lingering link-resolution `UnresolvedReference` diagnostics to `Warning`.
+    /// Promote lingering `UnresolvedReference` diagnostics to `Warning`.
     ///
-    /// After all parse passes are complete, any `UnresolvedReference` that came from a link in
-    /// a document that never resolved is a permanent author error. Sink dependencies
-    /// (`is_unresolved_source() == true`, `Direction::Incoming`) are compiler-internal ordering
-    /// signals and are left unchanged; they will have resolved or been dropped by this point.
+    /// Called by `parse_all` after the parse loop. At that point `results` contains exactly
+    /// one entry per path (the latest real parse attempt), so no staleness tracking is needed.
+    /// Every surviving `UnresolvedReference` is a permanent author error.
+    /// `ReparseLimitExceeded` sentinels are stripped — they are compiler-internal signals
+    /// that callers should not see.
     ///
-    /// This keeps `UnresolvedReference` as the compiler's internal multi-pass signal while
-    /// ensuring the `Vec<ParseResult>` handed to the CLI and LSP layer contains only
-    /// author-facing variants (`Warning`, `ParseError`, `Info`).
+    /// Location and direction information is preserved in the `Warning`'s `location` field
+    /// for callers (CLI, LSP) to format as they see fit.
     fn promote_unresolved_to_warnings(results: &mut [ParseResult]) {
-        // For each path, find the index of the last parse result that contains at least one
-        // non-sink-dependency UnresolvedReference. If a later result for the same path exists
-        // with zero such diagnostics, the earlier attempt's unresolved refs were resolved on
-        // reparse and must not be promoted to warnings.
-        //
-        // Build a set of (path, result-index) pairs whose UnresolvedReference entries are
-        // stale — i.e., the same path has a subsequent result with no unresolved refs.
-        let mut last_unresolved_idx: HashMap<PathBuf, usize> = HashMap::new();
-        let mut last_clean_idx: HashMap<PathBuf, usize> = HashMap::new();
-
-        for (idx, result) in results.iter().enumerate() {
-            // A result is only "clean" (meaning its links resolved) if it has:
-            // - no unresolved refs of any direction (both outgoing link failures and incoming
-            //   unresolved-source signals indicate still-pending work), AND
-            // - no ParseError (which is a max-reparse sentinel meaning we gave up, not that
-            //   links resolved — treating sentinels as clean would suppress warnings from
-            //   the last real parse attempt).
-            let has_unresolved = result
-                .diagnostics
-                .iter()
-                .any(|d| matches!(d, ParseDiagnostic::UnresolvedReference(_)));
-            let has_parse_error = result
-                .diagnostics
-                .iter()
-                .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
-            if has_unresolved {
-                last_unresolved_idx.insert(result.path.clone(), idx);
-            } else if !has_parse_error {
-                last_clean_idx.insert(result.path.clone(), idx);
-            }
-        }
-
-        // A result's unresolved refs are stale if either:
-        // 1. A later clean result exists for the same path (the links resolved on reparse), OR
-        // 2. A later result with outgoing unresolved refs exists for the same path (emit only
-        //    from the final failing attempt, not every intermediate attempt).
-        //
-        // `last_unresolved_idx` holds the index of the LAST result with outgoing unresolved
-        // refs per path. Any earlier result with outgoing unresolved refs for that path is
-        // therefore stale — it was superseded by a later attempt (whether that later attempt
-        // resolved them or failed again).
-
-        // Collect the set of ALL indices that have outgoing unresolved refs per path, keyed by
-        // path, so we can mark all but the last one as stale.
-        let mut all_unresolved_indices: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-        for (idx, result) in results.iter().enumerate() {
-            let has_unresolved = result
-                .diagnostics
-                .iter()
-                .any(|d| matches!(d, ParseDiagnostic::UnresolvedReference(_)));
-            if has_unresolved {
-                all_unresolved_indices
-                    .entry(result.path.clone())
-                    .or_default()
-                    .push(idx);
-            }
-        }
-
-        let stale: HashSet<usize> = last_unresolved_idx
-            .iter()
-            .flat_map(|(path, &last_unresolved_idx_for_path)| {
-                // Earlier unresolved attempts for this path (all but the last).
-                let earlier: Vec<usize> = all_unresolved_indices
-                    .get(path)
-                    .map(|v| {
-                        v.iter()
-                            .copied()
-                            .filter(|&i| i < last_unresolved_idx_for_path)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // If a later clean result exists, the last unresolved attempt is also stale.
-                let last_also_stale: Option<usize> = last_clean_idx
-                    .get(path)
-                    .filter(|&&clean_idx| clean_idx > last_unresolved_idx_for_path)
-                    .map(|_| last_unresolved_idx_for_path);
-
-                earlier
-                    .into_iter()
-                    .chain(last_also_stale)
-                    .collect::<Vec<usize>>()
-            })
-            .collect();
-
-        for (idx, result) in results.iter_mut().enumerate() {
-            let path_str = result.path.display().to_string();
+        for result in results.iter_mut() {
             let mut promoted = Vec::with_capacity(result.diagnostics.len());
             for diagnostic in result.diagnostics.drain(..) {
                 match diagnostic {
                     ParseDiagnostic::UnresolvedReference(ref u) => {
-                        if stale.contains(&idx) {
-                            // This attempt's unresolved ref was resolved on a later reparse;
-                            // drop it silently.
-                            continue;
-                        }
-                        let (line, col) = u.reference_location.unwrap_or((0, 0));
                         let keys_str = u
                             .other_keys
                             .iter()
                             .map(|k| format!("{k:?}"))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let msg = if line > 0 {
-                            let dir = match u.direction {
-                                Direction::Incoming => "+",
-                                Direction::Outgoing => "-",
-                            };
-                            format!(
-                                "{}:{}:{}: unresolved link [{}] — tried [{}]",
-                                path_str, line, col, dir, keys_str
-                            )
-                        } else {
-                            format!("{}: unresolved link — tried [{}]", path_str, keys_str)
-                        };
-                        promoted.push(ParseDiagnostic::warning(msg));
+                        promoted.push(ParseDiagnostic::Warning {
+                            message: format!("unresolved link — tried [{}]", keys_str),
+                            location: u.reference_location,
+                        });
                     }
                     ParseDiagnostic::ReparseLimitExceeded => {}
                     other => promoted.push(other),
@@ -2223,6 +2135,20 @@ Test network for unit tests.
         .unwrap();
     }
 
+    /// Helper: run promotion on a single-entry result slice and return the diagnostics.
+    fn promote_single(
+        diagnostics: Vec<crate::codec::ParseDiagnostic>,
+    ) -> Vec<crate::codec::ParseDiagnostic> {
+        let mut results = vec![ParseResult {
+            path: std::path::PathBuf::from("docs/page.md"),
+            rewritten_content: None,
+            dependent_paths: vec![],
+            diagnostics,
+        }];
+        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
+        results.remove(0).diagnostics
+    }
+
     #[test]
     fn test_compiler_creation() {
         // This is a basic structure test - actual functional tests would require
@@ -2291,25 +2217,24 @@ Test network for unit tests.
             reference_location: Some((10, 3)),
         };
 
-        let mut results = vec![ParseResult {
-            path: std::path::PathBuf::from("docs/page.md"),
-            rewritten_content: None,
-            dependent_paths: vec![],
-            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
-                unresolved,
-            )],
-        }];
+        let diagnostics = promote_single(vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+            unresolved,
+        )]);
 
-        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
-
-        assert_eq!(results[0].diagnostics.len(), 1);
-        match &results[0].diagnostics[0] {
-            crate::codec::ParseDiagnostic::Warning { message: msg, .. } => {
+        assert_eq!(diagnostics.len(), 1);
+        match &diagnostics[0] {
+            crate::codec::ParseDiagnostic::Warning {
+                message: msg,
+                location,
+            } => {
                 assert!(msg.contains("unresolved link"), "message: {msg}");
-                assert!(msg.contains("10:3"), "expected line:col in message: {msg}");
-                assert!(
-                    msg.contains("docs/page.md"),
-                    "expected path in message: {msg}"
+                // Path is not embedded in the message — callers (CLI, LSP) are responsible
+                // for prefixing path and location when rendering diagnostics.
+                // Location is a structured field; callers (CLI, LSP) format it as needed.
+                assert_eq!(
+                    *location,
+                    Some((10, 3)),
+                    "location field must carry line:col"
                 );
             }
             other => panic!("Expected Warning, got {other:?}"),
@@ -2324,8 +2249,8 @@ Test network for unit tests.
         use petgraph::Direction;
 
         let net_bref = Bid::default().bref();
-        // Unresolved source: Direction::Incoming — the source node of a relation could not be
-        // found. These are now promoted to warnings just like outgoing unresolved refs.
+        // Direction::Incoming — the source node of a relation could not be found.
+        // These are promoted to warnings just like outgoing unresolved refs.
         let unresolved_source = UnresolvedReference {
             direction: Direction::Incoming,
             self_bid: Bid::nil(),
@@ -2340,22 +2265,14 @@ Test network for unit tests.
             reference_location: None,
         };
 
-        let mut results = vec![ParseResult {
-            path: std::path::PathBuf::from("docs/page.md"),
-            rewritten_content: None,
-            dependent_paths: vec![],
-            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
-                unresolved_source,
-            )],
-        }];
+        let diagnostics = promote_single(vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+            unresolved_source,
+        )]);
 
-        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
-
-        // Unresolved source must be promoted to a Warning, not left as UnresolvedReference
-        assert_eq!(results[0].diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 1);
         assert!(
             matches!(
-                &results[0].diagnostics[0],
+                &diagnostics[0],
                 crate::codec::ParseDiagnostic::Warning { .. }
             ),
             "Unresolved source should be promoted to Warning"
@@ -2381,27 +2298,23 @@ Test network for unit tests.
             }],
             weight_kind: WeightKind::Epistemic,
             weight_data: None,
-            reference_location: None, // no location available
+            reference_location: None,
         };
 
-        let mut results = vec![ParseResult {
-            path: std::path::PathBuf::from("docs/page.md"),
-            rewritten_content: None,
-            dependent_paths: vec![],
-            diagnostics: vec![crate::codec::ParseDiagnostic::UnresolvedReference(
-                unresolved,
-            )],
-        }];
+        let diagnostics = promote_single(vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+            unresolved,
+        )]);
 
-        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
-
-        match &results[0].diagnostics[0] {
-            crate::codec::ParseDiagnostic::Warning { message: msg, .. } => {
+        assert_eq!(diagnostics.len(), 1);
+        match &diagnostics[0] {
+            crate::codec::ParseDiagnostic::Warning {
+                message: msg,
+                location,
+            } => {
                 assert!(msg.contains("unresolved link"), "message: {msg}");
-                // No line:col when location is absent
-                assert!(
-                    !msg.contains(":0:0"),
-                    "should not contain :0:0 in message: {msg}"
+                assert_eq!(
+                    *location, None,
+                    "no location when reference_location is absent"
                 );
             }
             other => panic!("Expected Warning, got {other:?}"),
@@ -2410,33 +2323,94 @@ Test network for unit tests.
 
     #[test]
     fn test_promote_preserves_non_unresolved_diagnostics() {
-        let mut results = vec![ParseResult {
-            path: std::path::PathBuf::from("docs/page.md"),
-            rewritten_content: None,
-            dependent_paths: vec![],
-            diagnostics: vec![
-                crate::codec::ParseDiagnostic::warning("existing warning"),
-                crate::codec::ParseDiagnostic::info("info message"),
-                crate::codec::ParseDiagnostic::parse_error("parse failed", 1),
-            ],
-        }];
+        let diagnostics = promote_single(vec![
+            crate::codec::ParseDiagnostic::warning("existing warning"),
+            crate::codec::ParseDiagnostic::info("info message"),
+            crate::codec::ParseDiagnostic::parse_error("parse failed", 1),
+        ]);
 
-        DocumentCompiler::promote_unresolved_to_warnings(&mut results);
-
-        // All three non-UnresolvedReference diagnostics must pass through unchanged
-        assert_eq!(results[0].diagnostics.len(), 3);
+        // All three non-UnresolvedReference diagnostics must pass through unchanged.
+        assert_eq!(diagnostics.len(), 3);
         assert!(matches!(
-            &results[0].diagnostics[0],
+            &diagnostics[0],
             crate::codec::ParseDiagnostic::Warning { .. }
         ));
         assert!(matches!(
-            &results[0].diagnostics[1],
+            &diagnostics[1],
             crate::codec::ParseDiagnostic::Info { .. }
         ));
         assert!(matches!(
-            &results[0].diagnostics[2],
+            &diagnostics[2],
             crate::codec::ParseDiagnostic::ParseError { .. }
         ));
+    }
+
+    #[test]
+    fn test_promote_reparse_limit_exceeded_stripped() {
+        // ReparseLimitExceeded is a compiler-internal sentinel that must not survive promotion.
+        // Other diagnostics in the same result must be preserved.
+        let diagnostics = promote_single(vec![
+            crate::codec::ParseDiagnostic::ReparseLimitExceeded,
+            crate::codec::ParseDiagnostic::warning("real warning"),
+        ]);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "ReparseLimitExceeded must be stripped"
+        );
+        assert!(matches!(
+            &diagnostics[0],
+            crate::codec::ParseDiagnostic::Warning { .. }
+        ));
+    }
+
+    /// When parse_all's HashMap replaces earlier results with later ones, a resolved reparse
+    /// produces no warning. An unresolved reparse still does.
+    #[test]
+    fn test_promote_reparse_resolved_produces_no_warning() {
+        use crate::codec::diagnostic::UnresolvedReference;
+        use crate::nodekey::NodeKey;
+        use crate::properties::{Bid, WeightKind};
+        use petgraph::Direction;
+
+        let net_bref = Bid::default().bref();
+        let unresolved = UnresolvedReference {
+            direction: Direction::Outgoing,
+            self_bid: Bid::nil(),
+            self_net: Bid::nil(),
+            self_path: "docs/page.md".to_string(),
+            other_keys: vec![NodeKey::Path {
+                net: net_bref,
+                path: "docs/other.md".to_string(),
+            }],
+            weight_kind: WeightKind::Epistemic,
+            weight_data: None,
+            reference_location: Some((5, 1)),
+        };
+
+        // A clean reparse replaced the failing attempt in the HashMap — no warning expected.
+        let resolved = promote_single(vec![crate::codec::ParseDiagnostic::info("all good")]);
+        assert!(
+            resolved
+                .iter()
+                .all(|d| !matches!(d, crate::codec::ParseDiagnostic::Warning { .. })),
+            "A resolved reparse must not produce a warning; diagnostics: {resolved:?}"
+        );
+
+        // A still-failing reparse is the sole entry in the HashMap — warning expected.
+        let unresolved_diags =
+            promote_single(vec![crate::codec::ParseDiagnostic::UnresolvedReference(
+                unresolved,
+            )]);
+        assert_eq!(unresolved_diags.len(), 1);
+        assert!(
+            matches!(
+                &unresolved_diags[0],
+                crate::codec::ParseDiagnostic::Warning { .. }
+            ),
+            "A still-unresolved result must produce a warning; diagnostics: {unresolved_diags:?}"
+        );
     }
 
     #[tokio::test]
@@ -2446,7 +2420,7 @@ Test network for unit tests.
         let temp_dir = tempfile::tempdir().unwrap();
         create_test_network(temp_dir.path());
 
-        // Write a document with a link that references a node that does not exist
+        // Write a document with a link that references a node that does not exist.
         std::fs::write(
             temp_dir.path().join("page.md"),
             r#"---
@@ -2464,41 +2438,26 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let mut compiler = DocumentCompiler::new(temp_dir.path(), None, Some(2), false).unwrap();
         let results = compiler.parse_all(global_bb, false).await.unwrap();
 
-        // After all passes, there must be at least one Warning diagnostic mentioning
-        // "unresolved link" somewhere across the results (the broken bref link).
-        let warning_msgs: Vec<&str> = results
-            .iter()
-            .flat_map(|r| r.diagnostics.iter())
-            .filter_map(|d| match d {
-                crate::codec::ParseDiagnostic::Warning { message: msg, .. } => Some(msg.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        // No raw UnresolvedReference should survive after promotion
+        // No raw UnresolvedReference should survive after promotion.
         let leftover_unresolved = results
             .iter()
             .flat_map(|r| r.diagnostics.iter())
-            .filter(|d| {
-                matches!(
-                    d,
-                    crate::codec::ParseDiagnostic::UnresolvedReference(u)
-                        if !u.is_unresolved_source()
-                )
-            })
+            .filter(|d| matches!(d, crate::codec::ParseDiagnostic::UnresolvedReference(_)))
             .count();
         assert_eq!(
             leftover_unresolved, 0,
-            "No outgoing UnresolvedReference should remain after parse_all"
+            "No UnresolvedReference should remain after parse_all; diagnostics: {results:#?}"
         );
 
+        // The broken bref link must surface as a Warning.
+        let has_unresolved_warning = results
+            .iter()
+            .flat_map(|r| r.diagnostics.iter())
+            .any(|d| matches!(d, crate::codec::ParseDiagnostic::Warning { message, .. } if message.contains("unresolved link")));
+
         assert!(
-            !warning_msgs.is_empty(),
-            "Expected at least one unresolved link warning; diagnostics: {results:#?}"
-        );
-        assert!(
-            warning_msgs.iter().any(|m| m.contains("unresolved link")),
-            "Warning should mention 'unresolved link'; warnings: {warning_msgs:?}"
+            has_unresolved_warning,
+            "Expected an 'unresolved link' warning; diagnostics: {results:#?}"
         );
     }
 }
