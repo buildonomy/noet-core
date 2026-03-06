@@ -125,7 +125,7 @@ body {
         bottom: 0;
         width: var(--noet-nav-width, 280px);
         z-index: 40;
-        overflow: hidden;
+        overflow: clip; /* was: overflow: hidden -- clip avoids creating a scroll container which caused Chrome to swallow click events on child buttons */
         transition: transform 0.3s var(--ease-2);
     }
 

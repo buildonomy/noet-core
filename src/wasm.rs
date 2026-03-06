@@ -1449,9 +1449,10 @@ impl BeliefBaseWasm {
         let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
         let mut root_nodes: Vec<String> = Vec::new();
 
-        // First pass: Build map of subnet BIDs to their parent path prefixes
-        // This is needed because subnet documents have paths relative to the subnet,
-        // but NavTree needs full paths including the subnet directory prefix
+        // First pass: Build map of all subnet BIDs reachable from any network, transitively. We use
+        // recursive_map here so that nested subnets (subnets of subnets) are discovered, not just
+        // direct children. Any BID found this way that is not the root of the traversal is a subnet
+        // and must be excluded from the outer loop's root list.
         let mut subnet_prefixes: BTreeMap<Bid, String> = BTreeMap::new();
         let mut visited = BTreeSet::default();
 
@@ -1467,8 +1468,11 @@ impl BeliefBaseWasm {
 
             let pm = pm_lock.read();
 
-            // Find subnet entries in this PathMap and record their prefixes
-            for (path, bid, _order_indices) in pm.map().iter() {
+            // Use recursive_map to discover transitively reachable nodes, then collect any that are themselves network roots (subnets at any depth).
+            let mut recursive_visited = BTreeSet::default();
+            for (path, bid, _order_indices) in
+                pm.recursive_map(&paths, &mut recursive_visited).iter()
+            {
                 // Check if this bid is a network (subnet)
                 if paths.nets().contains(bid) && *bid != *net_bid_for_prefix {
                     subnet_prefixes.insert(*bid, path.clone());
@@ -1597,6 +1601,13 @@ impl BeliefBaseWasm {
                     is_document: node_kind.is_document(),
                 };
 
+                // Skip BIDs already inserted -- a node can appear multiple times in a recursive map
+                // output if it has multiple path entries in the PathMap. Each appearance would
+                // otherwise overwrite the node and push it into another parent's children lis,
+                // producing duplicate entries in the tree.
+                if nodes_map.contains_key(&bid_str) {
+                    continue;
+                }
                 // Add node to map
                 nodes_map.insert(bid_str.clone(), new_node);
 

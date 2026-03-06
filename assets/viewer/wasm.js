@@ -159,7 +159,11 @@ export async function initializeWasm() {
 
   const entryPointNode = state.beliefbase.get_by_bid(entryPoint.bid);
   if (!entryPointNode) {
-    throw new Error(`Entry point node ${entryPoint.bid} not found in beliefbase`);
+    throw new Error(
+      `Entry point node ${entryPoint.bid} not found in beliefbase. ` +
+        `This usually means the HTML pages and beliefbase.json were generated at different times. ` +
+        `Try a clean rebuild with --write to realign them.`,
+    );
   }
   console.log("[Noet] ✓ Entry point node exists:", entryPointNode.title);
 
