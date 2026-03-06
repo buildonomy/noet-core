@@ -12,7 +12,9 @@
  *   viewer/metadata.js   — Metadata panel: showMetadataPanel, renderNodeContext
  *   viewer/routing.js    — Hash routing, loadDocument, navigateToLink
  *   viewer/resize.js     — Draggable resize handles for nav, metadata, and content panels
- *   viewer/wasm.js       — WASM init, getBidFromPath
+ *   viewer/wasm.js             — WASM init, getBidFromPath (detects sharded vs monolithic)
+ *   viewer/shard-manager.js    — ShardManager: memory-budgeted shard load/unload, search index loading
+ *   viewer/network-selector.js — Network selector panel UI (sharded mode only)
  *
  * ⚠️  WASM Data Type Patterns
  * ===========================
@@ -53,6 +55,7 @@ import {
   navigateToSection,
 } from "./viewer/routing.js";
 import { initializeWasm } from "./viewer/wasm.js";
+import { initNetworkSelector } from "./viewer/network-selector.js";
 import { initResizeHandles } from "./viewer/resize.js";
 
 // =============================================================================
@@ -89,6 +92,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Usage: noet.set_log_level('debug')
     //        noet.href_namespace()
     window.noet = state.wasmModule.BeliefBaseWasm;
+    // Initialize network selector panel (sharded mode only; no-op in monolithic mode).
+    initNetworkSelector();
   } catch (error) {
     console.error(
       "[Noet] WASM initialization failed (theme and basic features still work):",

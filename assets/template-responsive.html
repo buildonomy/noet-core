@@ -133,6 +133,20 @@
 
             <!-- Footer -->
             <footer class="noet-footer">
+                <!-- Shard drawer tab: always visible after WASM init -->
+                <div id="shard-drawer-tab" class="noet-footer__shard-tab">
+                    <button
+                        class="noet-shard-tab__btn"
+                        id="shard-drawer-toggle"
+                        aria-expanded="false"
+                        aria-controls="shard-drawer-body"
+                        title="Manage loaded networks and memory budget"
+                    >
+                        <span class="noet-shard-tab__icon" aria-hidden="true">▲</span>
+                        <span class="noet-shard-tab__label">Networks</span>
+                        <span class="noet-shard-tab__summary" id="shard-tab-summary"></span>
+                    </button>
+                </div>
                 <div class="noet-footer__theme">
                     <label for="theme-select">Theme:</label>
                     <select id="theme-select" class="noet-theme-select">
@@ -172,6 +186,18 @@
 
         <!-- Backdrop overlay for mobile panels -->
         <div id="backdrop" class="noet-backdrop"></div>
+
+        <!-- Shard drawer body (sharded mode only; hidden until toggled open) -->
+        <!-- Positioned fixed above the footer; populated by network-selector.js -->
+        <div
+            id="shard-drawer-body"
+            class="noet-shard-drawer__body"
+            role="region"
+            aria-label="Network memory management"
+            hidden
+        >
+            <!-- Populated by network-selector.js after WASM init -->
+        </div>
 
         <!-- Viewer Script -->
         <script type="module" src="/assets/viewer.js"></script>

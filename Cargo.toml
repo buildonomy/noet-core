@@ -59,6 +59,7 @@ wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", features = ["console"], optional = true }
+rust-stemmers = { version = "1.2", optional = true }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
@@ -97,9 +98,14 @@ trybuild = "1.0"
 
 [features]
 default = []
-bin = ["clap", "dep:tracing-subscriber", "wasm"]
+bin = ["clap", "dep:tracing-subscriber", "wasm", "stemming"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber"]
+# Compile-time English stemming for search index building. Native only — the
+# WASM query side must replicate the same stemming logic via the Issue 54
+# implementation (same Snowball English algorithm, applied to query terms).
+# Enabled by default for 'bin' builds. Can be disabled for minimal builds.
+stemming = ["dep:rust-stemmers"]
 
 # Feature Notes:
 # - 'wasm' is for browser WASM target (no filesystem, no native I/O)

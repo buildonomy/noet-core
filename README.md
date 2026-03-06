@@ -19,6 +19,7 @@ A Rust library for parsing interconnected documents into a queryable hypergraph 
 - **Hypergraph relationships**: Rich semantic relationships with typed edges and custom payloads
 - **Nested networks**: Hierarchical network dependencies similar to git submodules
 - **Event streaming**: Incremental cache updates via event-driven architecture
+- **BeliefBase sharding**: Large repositories automatically split into per-network JSON shards for on-demand browser loading; always generates compile-time search indices
 
 ## Quick Start
 

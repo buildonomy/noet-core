@@ -3,17 +3,29 @@
  *
  * Responsible for:
  *   - Loading the noet_core.js WASM module
- *   - Fetching and parsing beliefbase.json
+ *   - Detecting sharded vs monolithic BeliefBase export format
+ *   - Fetching and parsing beliefbase data (sharded or monolithic)
+ *   - Loading search indices (always, from search/)
  *   - Constructing the BeliefBaseWasm instance
  *   - Validating the entry point
  *   - Populating state.navTree and triggering buildNavigation()
  *
- * After initializeWasm() resolves, the following state fields are populated:
- *   state.wasmModule   — the imported JS/WASM module
- *   state.beliefbase   — the BeliefBaseWasm instance
- *   state.navTree      — NavTree { nodes: Map, roots: Array }
+ * ## Format Detection
  *
- * Log level control (Rust tracing → browser console):
+ * initializeWasm() probes for `beliefbase/manifest.json` first:
+ *   - 200 OK  → sharded mode: BeliefBaseWasm.from_manifest + ShardManager.init()
+ *   - 404     → monolithic mode: BeliefBaseWasm.from_json (existing path, unchanged)
+ *
+ * ## After initializeWasm() resolves
+ *
+ *   state.wasmModule    — the imported JS/WASM module
+ *   state.beliefbase    — BeliefBaseWasm instance
+ *   state.navTree       — NavTree { nodes: Map, roots: Array }
+ *   state.shardManager  — ShardManager instance (sharded mode only, else null)
+ *   state.searchIndex   — Map<bref, index> (both modes — always populated)
+ *
+ * ## Log level control (Rust tracing → browser console)
+ *
  *   setLogLevel("debug")  // verbose; default in debug WASM builds
  *   setLogLevel("info")
  *   setLogLevel("warn")   // default in release WASM builds
@@ -36,6 +48,7 @@
 
 import { state } from "./state.js";
 import { buildNavigation } from "./navigation.js";
+import { ShardManager, loadMonolithicSearchIndices } from "./shard-manager.js";
 
 // =============================================================================
 // Log level control
@@ -65,10 +78,14 @@ export function setLogLevel(level) {
 /**
  * Load and initialize the WASM module, BeliefBase, and navigation tree.
  *
- * Mutates: state.wasmModule, state.beliefbase, state.navTree
+ * Detects sharded vs monolithic format automatically by probing for
+ * `beliefbase/manifest.json`. Loads search indices in both modes.
+ *
+ * Mutates: state.wasmModule, state.beliefbase, state.navTree,
+ *          state.shardManager, state.searchIndex
  * Side-effect: calls buildNavigation() on success.
  *
- * @throws {Error} if the WASM module, beliefbase.json, or entry point are unavailable
+ * @throws {Error} if the WASM module, BeliefBase data, or entry point are unavailable
  */
 export async function initializeWasm() {
   console.log("[Noet] Loading WASM module...");
@@ -77,15 +94,6 @@ export async function initializeWasm() {
   state.wasmModule = await import("/assets/noet_core.js");
   await state.wasmModule.default();
   console.log("[Noet] WASM module loaded successfully");
-
-  // Fetch the serialized belief base
-  console.log("[Noet] Loading beliefbase.json...");
-  const response = await fetch("/beliefbase.json");
-  if (!response.ok) {
-    throw new Error(`Failed to fetch beliefbase.json: ${response.status}`);
-  }
-  const beliefbaseJson = await response.text();
-  console.log("[Noet] BeliefBase JSON loaded successfully");
 
   // Read entry point BID from the <script id="noet-entry-bid"> tag injected by
   // the site generator into every SPA shell page.
@@ -96,11 +104,55 @@ export async function initializeWasm() {
   const entryBidString = JSON.parse(entryBidScript.textContent);
   console.log("[Noet] Entry point BID from script tag:", entryBidString);
 
-  // Construct the BeliefBaseWasm instance
-  state.beliefbase = new state.wasmModule.BeliefBaseWasm(beliefbaseJson, entryBidString);
-  console.log("[Noet] BeliefBaseWasm initialized");
+  // --- Format detection: probe for shard manifest ---
+  const shardManifestResp = await fetch("/beliefbase/manifest.json");
+  const isSharded = shardManifestResp.ok;
 
-  // --- Validation ---
+  if (isSharded) {
+    // =========================================================================
+    // Sharded path
+    // =========================================================================
+    console.log("[Noet] Sharded BeliefBase detected. Initializing via ShardManager...");
+    const manifestJson = await shardManifestResp.text();
+    const manifest = JSON.parse(manifestJson);
+
+    // Construct empty BeliefBaseWasm from the manifest.
+    state.beliefbase = state.wasmModule.BeliefBaseWasm.from_manifest(manifestJson, entryBidString);
+    console.log("[Noet] BeliefBaseWasm (sharded) initialized");
+
+    // ShardManager loads search indices + global shard + entry network.
+    state.shardManager = new ShardManager(state.beliefbase, manifest);
+    await state.shardManager.init();
+
+    // Expose the search index from the shard manager on state for Issue 54.
+    state.searchIndex = state.shardManager.searchIndex;
+
+    console.log(`[Noet] Sharded init complete. Loaded shards: ${state.beliefbase.loaded_shards()}`);
+  } else {
+    // =========================================================================
+    // Monolithic path (existing behaviour — unchanged)
+    // =========================================================================
+    console.log("[Noet] No shard manifest found — loading monolithic beliefbase.json...");
+
+    const response = await fetch("/beliefbase.json");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch beliefbase.json: ${response.status}`);
+    }
+    const beliefbaseJson = await response.text();
+    console.log("[Noet] BeliefBase JSON loaded successfully");
+
+    state.beliefbase = new state.wasmModule.BeliefBaseWasm(beliefbaseJson, entryBidString);
+    console.log("[Noet] BeliefBaseWasm (monolithic) initialized");
+
+    state.shardManager = null;
+
+    // Load search indices for full-corpus search (monolithic mode).
+    state.searchIndex = await loadMonolithicSearchIndices();
+  }
+
+  // =========================================================================
+  // Shared validation (both paths)
+  // =========================================================================
 
   const entryPoint = state.beliefbase.entryPoint();
   console.log("[Noet] Entry point BID:", entryPoint.bid, "bref:", entryPoint.bref);

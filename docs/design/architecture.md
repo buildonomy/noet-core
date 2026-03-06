@@ -376,6 +376,12 @@ CODECS.insert("org".to_string(), || Box::new(OrgModeCodec::new()));
 
 **[`paths`](../src/paths.rs)**: Relative path resolution across nested networks
 
+**[`shard`](../src/shard/)**: Per-network BeliefBase export and compile-time search indices
+- `export_beliefbase`: Chooses monolithic or sharded export based on graph size
+- `build_search_indices`: Always generates `search/{bref}.idx.json` per network
+- `ShardManifest`: Shard metadata written to `beliefbase/manifest.json`
+- `SearchIndex`: Inverted index with English stemming and stop-word filtering
+
 ### Data Flow
 
 ```
@@ -455,6 +461,45 @@ pub enum ParseDiagnostic {
 4. **Three-source reconciliation**: Parsed docs + local cache + global DB
 5. **Continuous error-tolerant compilation**: Parsing never fails catastrophically
 6. **Dynamic source blocks**: BID injection, auto-title references, path updates
+
+## BeliefBase Sharding and Search Indices
+
+For large repositories, `finalize_html` automatically splits the exported BeliefBase into per-network JSON shards, enabling the browser viewer to load only the networks a user needs. Compile-time search indices are always generated regardless of export mode.
+
+### How Sharding Works
+
+`finalize_html` performs two steps unconditionally, then a third conditionally:
+
+1. **Always**: builds `search/manifest.json` + `search/{bref}.idx.json` per network — full-corpus search is available from the moment the viewer loads, before any data shard is fetched.
+2. **Measures** the serialized `BeliefGraph` size. Below the threshold (default 10 MB): writes `beliefbase.json` as before (backward-compatible). At or above: writes the `beliefbase/` directory.
+
+```text
+html_output_dir/
+├── beliefbase.json          # small repos only (< 10 MB)
+├── search/
+│   ├── manifest.json        # always generated
+│   └── {bref}.idx.json      # one per network, always generated
+└── beliefbase/              # large repos only (≥ 10 MB)
+    ├── manifest.json        # shard metadata + memory budget
+    ├── global.json          # API node + cross-network relations
+    └── networks/
+        └── {bref}.json      # one per network
+```
+
+### Viewer Behavior
+
+The viewer probes for `beliefbase/manifest.json` on init:
+
+- **404 → monolithic**: loads `beliefbase.json` via the existing `BeliefBaseWasm.from_json` path.
+- **200 → sharded**: constructs `BeliefBaseWasm` from the manifest, then uses `ShardManager` to load the global shard and the entry-network shard. Additional networks are loaded or unloaded on demand via the **Network Selector** panel in the left nav.
+
+In both modes, search indices are fetched from `search/` and are available immediately — the viewer search code path is identical regardless of data format.
+
+### Memory Budget
+
+A 200 MB browser budget governs loaded data shards. The Network Selector panel shows a usage bar (yellow ≥ 80%, red ≥ 90%) and refuses loads that would exceed the budget. Search indices (~200 KB total for a typical repo) are loaded eagerly and do not count against the data budget.
+
+See `docs/design/search_and_sharding.md` for the full architecture specification including manifest schemas, shard format, and WASM integration details.
 
 ## Features
 

@@ -1261,3 +1261,424 @@ h6:hover .noet-header-anchor {
         overflow: visible;
     }
 }
+
+/* =========================================================================
+   Network Selector Panel (sharded mode only)
+   ========================================================================= */
+
+.noet-network-selector-container {
+    border-top: 1px solid var(--noet-border-primary);
+    flex-shrink: 0;
+}
+
+/* Collapsible section wrapper */
+.noet-network-selector {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Toggle button — full-width, looks like a section header */
+.noet-network-selector__toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--size-2, 0.5rem);
+    width: 100%;
+    padding: var(--size-2, 0.5rem) var(--size-3, 0.75rem);
+    background: var(--noet-bg-secondary);
+    border: none;
+    border-bottom: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-secondary);
+    font-size: 0.8rem;
+    font-weight: var(--noet-font-weight-medium, 500);
+    text-align: left;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    user-select: none;
+}
+
+.noet-network-selector__toggle:hover {
+    background: var(--noet-bg-tertiary);
+    color: var(--noet-text-primary);
+}
+
+.noet-network-selector__toggle-icon {
+    font-size: 0.65rem;
+    color: var(--noet-text-tertiary);
+    transition: transform 0.15s ease;
+}
+
+/* Body: list + memory bar */
+.noet-network-selector__body {
+    padding: var(--size-2, 0.5rem) 0;
+}
+
+.noet-network-selector__body[hidden] {
+    display: none;
+}
+
+/* Network list */
+.noet-network-selector__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.noet-network-selector__item {
+    padding: 0;
+}
+
+.noet-network-selector__label {
+    display: flex;
+    align-items: baseline;
+    gap: var(--size-2, 0.5rem);
+    padding: var(--size-1, 0.25rem) var(--size-3, 0.75rem);
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.noet-network-selector__label:hover {
+    background: var(--noet-bg-secondary);
+}
+
+.noet-network-selector__item--loaded .noet-network-selector__label {
+    color: var(--noet-text-primary);
+}
+
+.noet-network-selector__checkbox {
+    flex-shrink: 0;
+    margin-top: 0.1em; /* optical alignment with text baseline */
+    accent-color: var(--noet-link);
+    cursor: pointer;
+}
+
+.noet-network-selector__checkbox:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.noet-network-selector__name {
+    flex: 1;
+    font-size: 0.85rem;
+    color: var(--noet-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+
+.noet-network-selector__meta {
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    color: var(--noet-text-tertiary);
+    white-space: nowrap;
+}
+
+/* Error message */
+.noet-network-selector__error {
+    margin: var(--size-2, 0.5rem) var(--size-3, 0.75rem);
+    padding: var(--size-1, 0.25rem) var(--size-2, 0.5rem);
+    background: var(--red-1, #ffe0e0);
+    border: 1px solid var(--red-3, #ffaaaa);
+    border-radius: var(--radius-2, 4px);
+    color: var(--red-8, #8b0000);
+    font-size: 0.78rem;
+    line-height: 1.4;
+}
+
+/* =========================================================================
+   Memory Usage Bar
+   ========================================================================= */
+
+.noet-memory-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--size-2, 0.5rem);
+    padding: var(--size-2, 0.5rem) var(--size-3, 0.75rem);
+    margin-top: var(--size-1, 0.25rem);
+}
+
+.noet-memory-bar__track {
+    flex: 1;
+    height: 6px;
+    background: var(--noet-bg-tertiary);
+    border-radius: var(--radius-round, 9999px);
+    overflow: hidden;
+    border: 1px solid var(--noet-border-primary);
+}
+
+.noet-memory-bar__fill {
+    height: 100%;
+    background: var(--noet-link, var(--blue-6));
+    border-radius: inherit;
+    transition:
+        width 0.3s ease,
+        background-color 0.3s ease;
+}
+
+.noet-memory-bar__fill--warn {
+    background: var(--yellow-6, #ca8a04);
+}
+
+.noet-memory-bar__fill--critical {
+    background: var(--red-6, #dc2626);
+}
+
+.noet-memory-bar__label {
+    flex-shrink: 0;
+    font-size: 0.72rem;
+    color: var(--noet-text-tertiary);
+    white-space: nowrap;
+}
+
+/* =========================================================================
+   Shard Drawer — Footer Tab + Sliding Body Panel
+   =========================================================================
+   The drawer has two parts:
+     1. .noet-footer__shard-tab  — lives inside .noet-footer as a flex child;
+        always visible in sharded mode, hidden otherwise.
+     2. .noet-shard-drawer__body — position: fixed, full width, sits above the
+        footer; hidden until the tab is toggled open.
+   ========================================================================= */
+
+/* --- Footer tab container ------------------------------------------------ */
+
+.noet-footer__shard-tab {
+    /* Sits as the leftmost item in the footer flex row */
+    order: -1;
+    display: flex;
+    align-items: center;
+    /* Vertical separator between tab and the rest of the footer */
+    padding-right: var(--size-3, 0.75rem);
+    margin-right: var(--size-2, 0.5rem);
+    border-right: 1px solid var(--noet-border-primary);
+}
+
+/* Hide when the [hidden] attribute is present */
+.noet-footer__shard-tab[hidden] {
+    display: none;
+}
+
+/* --- Tab toggle button --------------------------------------------------- */
+
+.noet-shard-tab__btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--size-2, 0.5rem);
+    padding: var(--size-1, 0.25rem) var(--size-2, 0.5rem);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-2, 4px);
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-1, 0.75rem);
+    font-weight: var(--noet-font-weight-medium, 500);
+    font-family: inherit;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    transition:
+        color 0.15s ease,
+        background-color 0.15s ease,
+        border-color 0.15s ease;
+}
+
+.noet-shard-tab__btn:hover {
+    background: var(--noet-bg-tertiary);
+    border-color: var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+
+.noet-shard-tab__btn:focus-visible {
+    outline: 2px solid var(--noet-border-focus);
+    outline-offset: 2px;
+}
+
+/* Chevron rotates when drawer is open */
+.noet-shard-tab__icon {
+    font-size: 0.6rem;
+    color: var(--noet-text-tertiary);
+    transition: transform 0.2s ease;
+    display: inline-block;
+}
+
+.noet-shard-tab__btn[aria-expanded="true"] .noet-shard-tab__icon {
+    transform: rotate(180deg);
+}
+
+.noet-shard-tab__label {
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-size: 0.7rem;
+}
+
+/* Compact memory/load summary: "3 loaded · 42 / 200 MB" */
+.noet-shard-tab__summary {
+    font-size: 0.7rem;
+    color: var(--noet-text-tertiary);
+    font-weight: var(--noet-font-weight-ui, 350);
+}
+
+/* Tint the summary amber when memory is >80% */
+.noet-shard-tab__btn[data-memory-warning="warn"] .noet-shard-tab__summary {
+    color: var(--yellow-6, #ca8a04);
+}
+
+.noet-shard-tab__btn[data-memory-warning="critical"] .noet-shard-tab__summary {
+    color: var(--red-6, #dc2626);
+    font-weight: var(--noet-font-weight-medium, 500);
+}
+
+/* --- Drawer body ---------------------------------------------------------- */
+
+.noet-shard-drawer__body {
+    position: fixed;
+    /* Sit just above the footer; ~48px is a safe footer-height estimate.
+       If the footer height ever changes, update --noet-footer-height here too. */
+    bottom: calc(var(--noet-footer-height, 48px));
+    left: 0;
+    right: 0;
+    z-index: 190; /* below modals (typically 300+), above content */
+
+    background: var(--noet-bg-primary);
+    border-top: 1px solid var(--noet-border-primary);
+    border-bottom: 1px solid var(--noet-border-primary);
+    box-shadow:
+        0 -4px 16px rgba(0, 0, 0, 0.12),
+        0 -1px 4px rgba(0, 0, 0, 0.06);
+
+    /* Slide-up animation: translate down (hidden) → translate 0 (visible) */
+    transform: translateY(8px);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+        transform 0.2s ease,
+        opacity 0.15s ease;
+
+    /* Internal layout */
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+}
+
+/* Open state — JS removes [hidden] then adds this class one rAF later so
+   the CSS transition fires correctly (start state → end state).
+   Sequence on open:  remove [hidden] → rAF → add --open  → transition plays
+   Sequence on close: remove --open  → transition plays   → set [hidden]    */
+.noet-shard-drawer__body--open {
+    transform: translateY(0);
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* [hidden] keeps the element out of the render tree when fully closed. */
+.noet-shard-drawer__body[hidden] {
+    display: none;
+}
+
+/* Drawer header bar — "Networks" title + close affordance hint */
+.noet-shard-drawer__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--size-2, 0.5rem) var(--size-4, 1rem);
+    border-bottom: 1px solid var(--noet-border-primary);
+    background: var(--noet-bg-secondary);
+    flex-shrink: 0;
+}
+
+.noet-shard-drawer__title {
+    font-size: 0.78rem;
+    font-weight: var(--noet-font-weight-medium, 500);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--noet-text-secondary);
+    margin: 0;
+}
+
+.noet-shard-drawer__header-hint {
+    font-size: 0.72rem;
+    color: var(--noet-text-tertiary);
+    font-weight: var(--noet-font-weight-ui, 350);
+}
+
+/* Scrollable network list area */
+.noet-shard-drawer__content {
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+    padding: var(--size-2, 0.5rem) 0;
+}
+
+/* Memory bar inside the drawer — sits at bottom, doesn't scroll */
+.noet-shard-drawer__footer {
+    flex-shrink: 0;
+    border-top: 1px solid var(--noet-border-secondary);
+    padding: var(--size-1, 0.25rem) var(--size-4, 1rem);
+    background: var(--noet-bg-secondary);
+}
+
+/* Monolithic mode informational note */
+.noet-shard-drawer__monolithic-note {
+    margin: var(--size-4, 1rem) var(--size-4, 1rem);
+    font-size: 0.82rem;
+    color: var(--noet-text-secondary);
+    line-height: 1.5;
+}
+
+/* Error message inside drawer */
+.noet-shard-drawer__error {
+    margin: var(--size-2, 0.5rem) var(--size-4, 1rem);
+    padding: var(--size-1, 0.25rem) var(--size-2, 0.5rem);
+    background: var(--red-1, #ffe0e0);
+    border: 1px solid var(--red-3, #ffaaaa);
+    border-radius: var(--radius-2, 4px);
+    color: var(--red-8, #8b0000);
+    font-size: 0.78rem;
+    line-height: 1.4;
+}
+
+/* =========================================================================
+   Network list inside drawer — override/extend .noet-network-selector__*
+   so the list items lay out horizontally when there's enough space.
+   ========================================================================= */
+
+/* In the drawer, the list can use a multi-column layout on wide screens */
+@media (min-width: 768px) {
+    .noet-shard-drawer__content .noet-network-selector__list {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        max-height: none; /* height is controlled by .noet-shard-drawer__content */
+        padding: 0 var(--size-2, 0.5rem);
+        gap: 0;
+    }
+
+    .noet-shard-drawer__content .noet-network-selector__label {
+        padding: var(--size-1, 0.25rem) var(--size-3, 0.75rem);
+    }
+}
+
+/* Mobile: single column, same as before */
+@media (max-width: 767px) {
+    .noet-shard-drawer__content .noet-network-selector__list {
+        max-height: none;
+    }
+}
+
+/* Memory bar inside drawer footer gets a bit more breathing room */
+.noet-shard-drawer__footer .noet-memory-bar {
+    padding: var(--size-1, 0.25rem) 0;
+    margin-top: 0;
+}
+
+/* =========================================================================
+   Print: hide drawer entirely
+   ========================================================================= */
+
+@media print {
+    .noet-footer__shard-tab,
+    .noet-shard-drawer__body {
+        display: none !important;
+    }
+}

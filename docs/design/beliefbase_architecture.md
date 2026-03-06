@@ -1315,10 +1315,100 @@ This creates the **Structural Hierarchy** of Subsection relationships, enabling 
 - **Network Files**: `BeliefNetwork.toml` per repository root
 - **Query Cache**: In-memory pagination cache with automatic invalidation
 
+### 3.8. Shard Export and Compile-Time Search Indices
+
+`finalize_html` (called after `parse_all`) writes two categories of output to the HTML directory: compile-time search indices (always) and BeliefBase data (monolithic or sharded depending on size). The implementation lives in `src/shard/`.
+
+#### ShardConfig
+
+```rust
+pub struct ShardConfig {
+    /// Byte threshold above which the export is split into per-network shards.
+    /// Default: 10 MB.
+    pub shard_threshold: usize,
+    /// Browser memory budget for loaded data shards (MB). Default: 200 MB.
+    pub memory_budget_mb: f64,
+}
+```
+
+`ShardConfig::should_shard(serialized_bytes) -> bool` is the single decision point. It is called once after the full `BeliefGraph` is serialized to measure its size.
+
+#### Search Index Format
+
+`build_search_indices` runs unconditionally before the sharding decision. It writes:
+
+- `search/manifest.json` — `SearchManifest { version, networks: Vec<NetworkSearchMeta> }`
+- `search/{bref}.idx.json` — one `SearchIndex` per network
+
+```rust
+pub struct SearchIndex {
+    pub network_bref: String,
+    pub doc_count: usize,
+    /// Whether terms are stemmed: "English" | "None"
+    pub stemmed: StemMode,
+    /// Document metadata list (title, path, term_count)
+    pub docs: Vec<IndexedDoc>,
+    /// Inverted index: term → Vec<(doc_index, tf_idf_score)> sorted descending
+    pub index: BTreeMap<String, Vec<(usize, f32)>>,
+}
+```
+
+Tokenization pipeline (in `src/shard/search.rs::tokenize`):
+1. Lowercase and split on whitespace/punctuation
+2. Drop tokens shorter than 3 chars or purely numeric
+3. Remove English stop words (~150-word `ENGLISH_STOP_WORDS` set)
+4. Apply Snowball English stemming via `rust-stemmers` (feature-gated; no-op shim when disabled)
+
+The `stemmed` field records the mode used at index-build time so the WASM query side (Issue 54) applies the same transformation to query terms before index lookup.
+
+#### Shard Wire Formats
+
+In sharded mode, `export_sharded` writes:
+
+```rust
+// beliefbase/global.json
+pub struct GlobalShard {
+    pub states: BTreeMap<String, BeliefNode>,   // API node + namespace nodes + unowned nodes
+    pub relations: SerializableBidGraph,         // Cross-network edges
+}
+
+// beliefbase/networks/{bref}.json
+pub struct NetworkShard {
+    pub network_bref: String,
+    pub network_bid: String,
+    pub states: BTreeMap<String, BeliefNode>,   // Nodes owned by this network
+    pub relations: SerializableBidGraph,         // Intra-network edges only
+}
+```
+
+`SerializableBidGraph` uses BID strings as node identifiers instead of petgraph internal indices, which are not stable across independent deserialization.
+
+The `ShardManifest` written to `beliefbase/manifest.json` lists per-network metadata (bref, bid, title, node count, estimated size, shard path) and global shard metadata. It is the first file the viewer fetches in sharded mode.
+
+#### BeliefBaseWasm Shard-Aware API
+
+`BeliefBaseWasm` (in `src/wasm.rs`) was extended in Issue 50 with:
+
+| Method | Description |
+|--------|-------------|
+| `from_manifest(manifest_json, entry_bid)` | Creates an empty `BeliefBase`; caller must then call `load_shard` |
+| `load_shard(bref_key, shard_json)` | Deserializes a `NetworkShard` or `GlobalShard`, calls `BeliefBase::merge` |
+| `unload_shard(bref_key)` | Removes tracked BIDs via `process_event(NodesRemoved, Remote)` |
+| `loaded_shards()` | Returns JSON array of currently-loaded bref keys |
+| `has_bid(bid_str)` | Returns `true` if a BID is present in the loaded graph |
+| `memory_usage_mb()` | Heuristic node-count estimate for UI display |
+
+Internally, `BeliefBaseWasm` maintains a `loaded_shards: RefCell<HashMap<String, BTreeSet<Bid>>>` that tracks which BIDs belong to which shard. `unload_shard` filters out BIDs still referenced by other loaded shards before removing them, preventing incorrect removal of nodes shared between the global shard and a network shard.
+
+The `"global"` key is reserved for the global shard. Network shards use their 5-hex-char bref as the key.
+
+See `docs/design/search_and_sharding.md` for the complete specification including manifest JSON schemas, memory budget model (§6), and WASM integration (§8).
+
 ### 4.5. UI Layer
 - Query interfaces for filtered graph views
 - Content access for file editing
 - Event subscription for reactive rendering
+- **Network Selector panel** (sharded mode): collapsible panel in the left nav showing per-network checkboxes, node counts, estimated shard sizes, and a memory usage bar (yellow ≥ 80%, red ≥ 90% of the 200 MB budget). Implemented in `assets/viewer/network-selector.js` and driven by `assets/viewer/shard-manager.js`. Hidden in monolithic mode.
 
 ## 5. Examples
 

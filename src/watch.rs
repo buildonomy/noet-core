@@ -974,7 +974,27 @@ impl FileUpdateSyncer {
                                 match compiler_read
                                     .finalize_html(compiler_global_bb.clone())
                                     .await {
-                                        Ok(_) => compiler_read.stats(),
+                                        Ok(diagnostics) => {
+                                            // Surface export-phase warnings (e.g. oversized
+                                            // networks) through tracing so they appear in
+                                            // the watch server's log output.
+                                            for d in &diagnostics {
+                                                match d {
+                                                    crate::codec::ParseDiagnostic::Warning { message, .. } => {
+                                                        tracing::warn!(
+                                                            "[finalize_html] {}", message
+                                                        );
+                                                    }
+                                                    crate::codec::ParseDiagnostic::Info { message, .. } => {
+                                                        tracing::info!(
+                                                            "[finalize_html] {}", message
+                                                        );
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            compiler_read.stats()
+                                        }
                                         Err(err) => {
                                             tracing::warn!(
                                                 "[DocumentCompiler] Finalize html failed with \

@@ -94,6 +94,21 @@ export const state = {
   /** BeliefBaseWasm instance */
   beliefbase: null,
 
+  /**
+   * ShardManager instance — populated in sharded mode, null in monolithic mode.
+   * Use this to load/unload network shards and check memory usage.
+   * @type {import('./shard-manager.js').ShardManager|null}
+   */
+  shardManager: null,
+
+  /**
+   * Per-network search indices, keyed by bref string.
+   * Populated eagerly during initializeWasm() in both sharded and monolithic modes.
+   * Used by Issue 54 (Full-Text Search MVP) to query the compiled indices.
+   * @type {Map<string, object>}
+   */
+  searchIndex: new Map(),
+
   /** Navigation tree data — NavTree { nodes: Map, roots: Array } from get_nav_tree() */
   navTree: null,
 

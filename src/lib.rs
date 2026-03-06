@@ -249,6 +249,7 @@ pub mod nodekey;
 pub mod paths;
 pub mod properties;
 pub mod query;
+pub mod shard;
 #[cfg(test)]
 mod tests;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]

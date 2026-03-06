@@ -373,6 +373,10 @@ impl PathParts {
 pub struct BeliefBaseWasm {
     inner: RefCell<BeliefBase>,
     entry_point_bid: Bid,
+    /// Tracks which BIDs were loaded from which shard (keyed by bref string).
+    /// Used by `unload_shard` to know which nodes to remove.
+    /// The special key `"global"` is used for the global shard.
+    loaded_shards: RefCell<HashMap<String, BTreeSet<Bid>>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -564,7 +568,310 @@ impl BeliefBaseWasm {
         Ok(BeliefBaseWasm {
             inner: RefCell::new(inner),
             entry_point_bid,
+            loaded_shards: RefCell::new(HashMap::new()),
         })
+    }
+
+    // =========================================================================
+    // Shard-aware constructor and shard management
+    // =========================================================================
+
+    /// Construct a `BeliefBaseWasm` from a shard manifest JSON (sharded export mode).
+    ///
+    /// This creates an **empty** `BeliefBase` with the given entry point. The
+    /// caller must subsequently call `load_shard` with `"global"` (the global
+    /// shard JSON) and then with the entry-network bref (the per-network shard
+    /// JSON) to populate the belief base with usable data.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest_json` — Contents of `beliefbase/manifest.json`
+    /// * `entry_bid_str` — Full BID string of the entry-point network node
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const manifestResp = await fetch("/beliefbase/manifest.json");
+    /// const manifestJson = await manifestResp.text();
+    /// const bb = BeliefBaseWasm.from_manifest(manifestJson, entryBidStr);
+    /// // Now load the global shard and entry network shard:
+    /// const globalResp = await fetch("/beliefbase/global.json");
+    /// await bb.load_shard("global", await globalResp.text());
+    /// const entryResp = await fetch(`/beliefbase/networks/${entryBref}.json`);
+    /// await bb.load_shard(entryBref, await entryResp.text());
+    /// ```
+    #[wasm_bindgen]
+    pub fn from_manifest(
+        manifest_json: String,
+        entry_bid_str: String,
+    ) -> Result<BeliefBaseWasm, JsValue> {
+        // Validate manifest JSON is well-formed (the JS ShardManager handles
+        // full manifest parsing; we only need to confirm it's valid JSON here).
+        let _manifest: serde_json::Value = serde_json::from_str(&manifest_json).map_err(|e| {
+            let msg = format!("❌ Failed to parse shard manifest: {}", e);
+            console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
+
+        let entry_point_bid = Bid::try_from(entry_bid_str.as_str()).map_err(|e| {
+            let msg = format!("❌ Failed to parse entry point BID: {}", e);
+            console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
+
+        console::log_1(
+            &format!(
+                "✅ Shard manifest parsed. Entry point: {}. Call load_shard() to populate.",
+                entry_point_bid
+            )
+            .into(),
+        );
+
+        Ok(BeliefBaseWasm {
+            inner: RefCell::new(BeliefBase::default()),
+            entry_point_bid,
+            loaded_shards: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Load a shard into the belief base, merging its nodes and relations.
+    ///
+    /// The shard JSON may be either:
+    /// - A **global shard** (`beliefbase/global.json`) — use `bref = "global"`
+    /// - A **per-network shard** (`beliefbase/networks/{bref}.json`) — use the
+    ///   5-hex-char bref of that network as the key.
+    ///
+    /// Loading the same bref twice is a no-op (idempotent): the shard is
+    /// unloaded first, then re-loaded from the new JSON.
+    ///
+    /// # Arguments
+    ///
+    /// * `bref_key` — `"global"` or a 5-hex-char network bref
+    /// * `shard_json` — Raw JSON string for the shard
+    ///
+    /// # Returns
+    ///
+    /// The number of nodes now present in the belief base after loading.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const count = await bb.load_shard("global", globalJson);
+    /// console.log(`BeliefBase now has ${count} nodes`);
+    /// ```
+    #[wasm_bindgen]
+    pub fn load_shard(&self, bref_key: String, shard_json: String) -> Result<usize, JsValue> {
+        // If already loaded, unload first (idempotent reload).
+        {
+            let loaded = self.loaded_shards.borrow();
+            if loaded.contains_key(&bref_key) {
+                drop(loaded);
+                self.unload_shard(bref_key.clone())?;
+            }
+        }
+
+        // Deserialize: global shard and network shards have different schemas.
+        #[allow(clippy::type_complexity)]
+        let (states, edges): (
+            BTreeMap<String, BeliefNode>,
+            Vec<(Bid, Bid, crate::properties::WeightSet)>,
+        ) = if bref_key == "global" {
+            let shard: crate::shard::GlobalShard =
+                serde_json::from_str(&shard_json).map_err(|e| {
+                    let msg = format!("❌ Failed to parse global shard: {}", e);
+                    console::error_1(&msg.clone().into());
+                    JsValue::from_str(&msg)
+                })?;
+            let edges = shard
+                .relations
+                .edges
+                .into_iter()
+                .filter_map(|e| {
+                    let src = Bid::try_from(e.source.as_str()).ok()?;
+                    let snk = Bid::try_from(e.sink.as_str()).ok()?;
+                    Some((src, snk, e.weights))
+                })
+                .collect();
+            (shard.states, edges)
+        } else {
+            let shard: crate::shard::NetworkShard =
+                serde_json::from_str(&shard_json).map_err(|e| {
+                    let msg = format!("❌ Failed to parse network shard '{}': {}", bref_key, e);
+                    console::error_1(&msg.clone().into());
+                    JsValue::from_str(&msg)
+                })?;
+            let edges = shard
+                .relations
+                .edges
+                .into_iter()
+                .filter_map(|e| {
+                    let src = Bid::try_from(e.source.as_str()).ok()?;
+                    let snk = Bid::try_from(e.sink.as_str()).ok()?;
+                    Some((src, snk, e.weights))
+                })
+                .collect();
+            (shard.states, edges)
+        };
+
+        // Collect the BIDs being added so we can track them for unloading.
+        let shard_bids: BTreeSet<Bid> = states
+            .keys()
+            .filter_map(|s| Bid::try_from(s.as_str()).ok())
+            .collect();
+
+        // Build a BeliefGraph from the shard data and merge it into the inner BeliefBase.
+        let graph = {
+            use crate::beliefbase::BidGraph;
+            let relations = BidGraph::from_edges(edges);
+            BeliefGraph {
+                states: states
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((Bid::try_from(k.as_str()).ok()?, v)))
+                    .collect(),
+                relations,
+            }
+        };
+
+        let added_count = graph.states.len();
+        let edge_count = graph.relations.as_graph().edge_count();
+
+        self.inner.borrow_mut().merge(&graph);
+
+        // Record the BIDs for this shard key.
+        self.loaded_shards
+            .borrow_mut()
+            .insert(bref_key.clone(), shard_bids);
+
+        let total = self.inner.borrow().states().len();
+        console::log_1(
+            &format!(
+                "✅ Loaded shard '{}': +{} nodes, {} edges → {} total nodes",
+                bref_key, added_count, edge_count, total
+            )
+            .into(),
+        );
+        Ok(total)
+    }
+
+    /// Unload a previously-loaded shard, removing its nodes from the belief base.
+    ///
+    /// Nodes that appear in multiple loaded shards (e.g. cross-references
+    /// duplicated in the global shard) are **not** removed if they are still
+    /// tracked by another loaded shard.
+    ///
+    /// # Arguments
+    ///
+    /// * `bref_key` — `"global"` or the 5-hex-char network bref used in `load_shard`
+    ///
+    /// # Returns
+    ///
+    /// The number of nodes remaining in the belief base after unloading.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const remaining = bb.unload_shard("abc12");
+    /// console.log(`BeliefBase now has ${remaining} nodes`);
+    /// ```
+    #[wasm_bindgen]
+    pub fn unload_shard(&self, bref_key: String) -> Result<usize, JsValue> {
+        let shard_bids = {
+            let mut loaded = self.loaded_shards.borrow_mut();
+            match loaded.remove(&bref_key) {
+                Some(bids) => bids,
+                None => {
+                    console::warn_1(
+                        &format!("⚠️ unload_shard: '{}' was not loaded", bref_key).into(),
+                    );
+                    return Ok(self.inner.borrow().states().len());
+                }
+            }
+        };
+
+        // Do not remove BIDs that are still referenced by another loaded shard.
+        let still_needed: BTreeSet<Bid> = self
+            .loaded_shards
+            .borrow()
+            .values()
+            .flat_map(|bids| bids.iter().copied())
+            .collect();
+
+        let to_remove: BTreeSet<Bid> = shard_bids
+            .into_iter()
+            .filter(|bid| !still_needed.contains(bid))
+            .collect();
+
+        let remove_count = to_remove.len();
+        if !to_remove.is_empty() {
+            let event = crate::event::BeliefEvent::NodesRemoved(
+                to_remove.into_iter().collect(),
+                crate::event::EventOrigin::Remote,
+            );
+            if let Err(e) = self.inner.borrow_mut().process_event(&event) {
+                let msg = format!("❌ unload_shard '{}': remove failed: {}", bref_key, e);
+                console::error_1(&msg.clone().into());
+                return Err(JsValue::from_str(&msg));
+            }
+        }
+
+        let total = self.inner.borrow().states().len();
+        console::log_1(
+            &format!(
+                "✅ Unloaded shard '{}': -{} nodes → {} total nodes",
+                bref_key, remove_count, total
+            )
+            .into(),
+        );
+        Ok(total)
+    }
+
+    /// Return the list of currently-loaded shard keys.
+    ///
+    /// Returns a JSON array of bref key strings (e.g. `["global", "abc12"]`).
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const shards = JSON.parse(bb.loaded_shards());
+    /// console.log(shards); // ["global", "abc12"]
+    /// ```
+    #[wasm_bindgen]
+    pub fn loaded_shards(&self) -> String {
+        let loaded = self.loaded_shards.borrow();
+        let keys: Vec<&str> = loaded.keys().map(|s| s.as_str()).collect();
+        serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Return whether a BID is currently present in the loaded belief base.
+    ///
+    /// Useful for checking if a node is available before navigating to it,
+    /// or for prompting the user to load a network shard.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// if (!bb.has_bid(targetBid)) {
+    ///   showLoadNetworkPrompt(targetBref);
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub fn has_bid(&self, bid_str: String) -> bool {
+        match Bid::try_from(bid_str.as_str()) {
+            Ok(bid) => self.inner.borrow().states().contains_key(&bid),
+            Err(_) => false,
+        }
+    }
+
+    /// Return the estimated total memory used by loaded data shards (MB).
+    ///
+    /// Approximated as: `node_count * AVG_NODE_BYTES_MB`. This is a rough
+    /// heuristic for UI display — not used for correctness-critical decisions.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const usedMb = bb.memory_usage_mb();
+    /// ```
+    #[wasm_bindgen]
+    pub fn memory_usage_mb(&self) -> f64 {
+        // Approximate: 2KB per node (title, payload, BID strings, graph overhead).
+        const AVG_NODE_BYTES: f64 = 2048.0;
+        let node_count = self.inner.borrow().states().len() as f64;
+        (node_count * AVG_NODE_BYTES) / (1024.0 * 1024.0)
     }
 
     /// Query nodes using Expression syntax

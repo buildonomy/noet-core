@@ -384,14 +384,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Finalize HTML generation with synchronized BeliefBase
                 // Note: finalize() was already called during parse_all (with empty global_bb)
                 // Now call finalize_html with synchronized final_bb for remaining tasks
-                if html_output.is_some() {
-                    compiler.finalize_html(&final_bb).await?;
-                }
+                let finalize_diagnostics = if html_output.is_some() {
+                    compiler.finalize_html(&final_bb).await?
+                } else {
+                    Vec::new()
+                };
 
                 // Collect and report diagnostics
                 let colors = DiagColors::new(&color_choice);
                 let mut warning_count = 0usize;
                 let mut error_count = 0usize;
+
+                // Report export-phase diagnostics (e.g. oversized networks) before
+                // per-file diagnostics so authors see them prominently.
+                for diagnostic in &finalize_diagnostics {
+                    match diagnostic {
+                        ParseDiagnostic::Warning { message: msg, .. } => {
+                            let label = format!("{}warning{}", colors.warning, colors.reset);
+                            eprintln!("{label}: {msg}");
+                            warning_count += 1;
+                        }
+                        ParseDiagnostic::Info { message: msg, .. } => {
+                            if verbose {
+                                let label = format!("{}info{}", colors.info, colors.reset);
+                                eprintln!("{label}: {msg}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 for result in &parse_results {
                     let path = result.path.display();
                     for diagnostic in &result.diagnostics {

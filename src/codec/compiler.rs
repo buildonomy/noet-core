@@ -1028,10 +1028,11 @@ impl DocumentCompiler {
     pub async fn finalize_html<B: BeliefSource + Clone>(
         &self,
         global_bb: B,
-    ) -> Result<(), BuildonomyError> {
-        if self.html_output_dir().is_none() {
-            return Ok(()); // No HTML output configured
-        }
+    ) -> Result<Vec<crate::codec::ParseDiagnostic>, BuildonomyError> {
+        let html_dir = match &self.html_output_dir {
+            Some(dir) => dir.clone(),
+            None => return Ok(Vec::new()), // No HTML output configured
+        };
 
         // Generate deferred HTML with synchronized context
         self.generate_deferred_html(global_bb.clone()).await?;
@@ -1049,11 +1050,94 @@ impl DocumentCompiler {
 
         self.create_asset_hardlinks(&asset_manifest).await?;
 
-        // Export BeliefGraph to JSON for client-side use
+        // Export BeliefGraph to JSON for client-side use.
+        // Step 1: Obtain graph and pathmap from the synchronized global_bb.
         let graph = global_bb.export_beliefgraph().await?;
-        self.export_beliefbase_json(graph).await?;
 
-        Ok(())
+        // Collects warnings generated during export (e.g. oversized networks).
+        // Returned to the caller so they can surface them alongside parse diagnostics.
+        let mut finalize_diagnostics: Vec<crate::codec::ParseDiagnostic> = Vec::new();
+
+        // Reconstruct a temporary BeliefBase so we can access its PathMapMap.
+        // BeliefBase::from(BeliefGraph) re-derives paths from the node/relation data,
+        // giving us a PathMapMap that reflects the complete synchronized state.
+        // We keep `temp_bb` alive for the duration of the export pipeline so the
+        // read-guard returned by `paths()` remains valid.
+        let temp_bb = crate::beliefbase::BeliefBase::from(graph.clone());
+
+        // Step 2: Build compile-time search indices (always, before sharding decision).
+        let search_manifest = {
+            let pathmap = temp_bb.paths();
+            crate::shard::search::build_search_indices(&graph.states, &pathmap, &html_dir).await
+        };
+
+        let search_manifest = match search_manifest {
+            Ok((manifest, warnings)) => {
+                finalize_diagnostics.extend(warnings);
+                manifest
+            }
+            Err(e) => {
+                tracing::warn!("[finalize_html] Search index generation failed: {e}. Continuing without search indices.");
+                crate::shard::manifest::SearchManifest::new()
+            }
+        };
+
+        // Step 3: Export BeliefBase (monolithic or sharded based on size).
+        // Obtain a fresh pathmap guard for the export step.
+        //
+        // NOET_SHARD_THRESHOLD overrides the default 10MB threshold for development
+        // testing (e.g. `NOET_SHARD_THRESHOLD=1 noet build` forces sharded output).
+        let shard_config = match std::env::var("NOET_SHARD_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(threshold) => {
+                tracing::info!(
+                    "[finalize_html] NOET_SHARD_THRESHOLD={threshold} — overriding default shard threshold"
+                );
+                crate::shard::manifest::ShardConfig {
+                    shard_threshold: threshold,
+                    ..crate::shard::manifest::ShardConfig::default()
+                }
+            }
+            None => crate::shard::manifest::ShardConfig::default(),
+        };
+        let export_result = {
+            let pathmap = temp_bb.paths();
+            crate::shard::export::export_beliefbase(
+                graph,
+                &pathmap,
+                &html_dir,
+                &shard_config,
+                &search_manifest,
+            )
+            .await
+        };
+        match export_result {
+            Ok(crate::shard::ExportMode::Monolithic { size_mb }) => {
+                tracing::debug!(
+                    "[finalize_html] Exported monolithic beliefbase.json ({:.2} MB)",
+                    size_mb
+                );
+            }
+            Ok(crate::shard::ExportMode::Sharded { manifest }) => {
+                tracing::info!(
+                    "[finalize_html] Exported {} network shards to beliefbase/",
+                    manifest.networks.len()
+                );
+            }
+            Err(e) => {
+                // Log and fall back to the legacy exporter so a build failure here
+                // doesn't break the rest of the output.
+                tracing::warn!(
+                    "[finalize_html] Shard export failed ({e}). Falling back to legacy export."
+                );
+                let graph_fallback = global_bb.export_beliefgraph().await?;
+                self.export_beliefbase_json(graph_fallback).await?;
+            }
+        }
+
+        Ok(finalize_diagnostics)
     }
 
     async fn process_asset(
@@ -2458,6 +2542,289 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         assert!(
             has_unresolved_warning,
             "Expected an 'unresolved link' warning; diagnostics: {results:#?}"
+        );
+    }
+
+    /// Helper: compile a network directory to html_dir using the full event-loop pattern
+    /// required by finalize_html (mirrors the parse command in main.rs).
+    async fn compile_to_html(
+        network_dir: &std::path::Path,
+        html_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{beliefbase::BeliefBase, event::BeliefEvent};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+
+        // Background task: receive and process all events into global_bb.
+        let mut event_bb = BeliefBase::empty();
+        let processor = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let _ = event_bb.process_event(&event);
+            }
+            event_bb
+        });
+
+        let mut compiler = DocumentCompiler::with_html_output(
+            network_dir,
+            Some(tx),
+            Some(5),
+            false,
+            Some(html_dir.to_path_buf()),
+            None,
+            false,
+            None,
+        )?;
+
+        let cache = compiler.builder().doc_bb().clone();
+        compiler.parse_all(cache, false).await?;
+
+        // Close the tx channel so the processor task finishes.
+        compiler.builder_mut().close_tx();
+        let final_bb = processor.await?;
+
+        compiler.finalize_html(&final_bb).await?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: search index generation
+    // ------------------------------------------------------------------
+
+    /// Verify that `search/manifest.json` and at least one `.idx.json` are
+    /// always written by `finalize_html`, regardless of whether sharding fires.
+    #[tokio::test]
+    async fn test_finalize_html_always_writes_search_indices() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Write minimal network.
+        create_test_network(src_dir.path());
+        std::fs::write(
+            src_dir.path().join("doc.md"),
+            "---\ntitle = \"Doc\"\n---\n\n# Doc\n\nHello world.\n",
+        )
+        .unwrap();
+
+        // Compile into the html_dir (full event-loop pattern).
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        let search_dir = html_dir.path().join("search");
+        assert!(
+            search_dir.exists(),
+            "search/ directory should always be created"
+        );
+
+        let manifest_path = search_dir.join("manifest.json");
+        assert!(
+            manifest_path.exists(),
+            "search/manifest.json should always be written"
+        );
+
+        // Parse the manifest and check it has at least one network entry.
+        let manifest_json = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: crate::shard::SearchManifest = serde_json::from_str(&manifest_json).unwrap();
+        assert!(
+            !manifest.networks.is_empty(),
+            "search manifest should list at least one network"
+        );
+
+        // Verify each listed .idx.json actually exists on disk.
+        for entry in &manifest.networks {
+            let idx_path = search_dir.join(&entry.path);
+            assert!(
+                idx_path.exists(),
+                "search index file '{}' listed in manifest should exist on disk",
+                entry.path
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: monolithic export
+    // ------------------------------------------------------------------
+
+    /// Small repos (below threshold) must write `beliefbase.json` and must NOT
+    /// write `beliefbase/manifest.json`.
+    #[tokio::test]
+    async fn test_finalize_html_monolithic_below_threshold() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        create_test_network(src_dir.path());
+
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        // Monolithic: beliefbase.json must exist.
+        assert!(
+            html_dir.path().join("beliefbase.json").exists(),
+            "monolithic export should write beliefbase.json"
+        );
+
+        // Monolithic: no beliefbase/manifest.json.
+        assert!(
+            !html_dir
+                .path()
+                .join("beliefbase")
+                .join("manifest.json")
+                .exists(),
+            "monolithic export should NOT write beliefbase/manifest.json"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: sharded export
+    // ------------------------------------------------------------------
+
+    /// Verify sharded output structure when the shard threshold is forced to 1 byte
+    /// by temporarily overriding ShardConfig in a helper. We test the shard module
+    /// directly here (calling export_beliefbase with a tiny threshold) rather than
+    /// wiring the threshold override all the way through finalize_html, which would
+    /// require a test-only config parameter.
+    #[tokio::test]
+    async fn test_sharded_export_writes_correct_structure() {
+        use crate::{
+            beliefbase::BeliefBase,
+            shard::{
+                export::export_beliefbase,
+                manifest::{SearchManifest, ShardConfig},
+            },
+        };
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        create_test_network(src_dir.path());
+        std::fs::write(
+            src_dir.path().join("doc.md"),
+            "---\ntitle = \"Shard Doc\"\n---\n\n# Shard Doc\n\nContent here.\n",
+        )
+        .unwrap();
+
+        // Compile to build a synchronized BeliefBase for graph extraction.
+        // We use the event-loop pattern so the final_bb is fully populated.
+        let final_bb = {
+            use crate::event::BeliefEvent;
+            use tokio::sync::mpsc::unbounded_channel;
+
+            let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+            let mut event_bb = BeliefBase::empty();
+            let processor = tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    let _ = event_bb.process_event(&event);
+                }
+                event_bb
+            });
+
+            let mut compiler = DocumentCompiler::with_html_output(
+                src_dir.path(),
+                Some(tx),
+                Some(5),
+                false,
+                Some(html_dir.path().to_path_buf()),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            let cache = compiler.builder().doc_bb().clone();
+            compiler.parse_all(cache, false).await.unwrap();
+            compiler.builder_mut().close_tx();
+            processor.await.unwrap()
+        };
+
+        let graph = final_bb.export_beliefgraph().await.unwrap();
+        let pathmap = final_bb.paths();
+
+        // Force sharded mode: threshold = 1 byte so any non-empty graph shards.
+        let config = ShardConfig {
+            shard_threshold: 1,
+            memory_budget_mb: 200.0,
+        };
+        let empty_search_manifest = SearchManifest::new();
+
+        let result = export_beliefbase(
+            graph,
+            &pathmap,
+            html_dir.path(),
+            &config,
+            &empty_search_manifest,
+        )
+        .await
+        .unwrap();
+
+        // Must report as sharded.
+        assert!(
+            matches!(result, crate::shard::ExportMode::Sharded { .. }),
+            "export should be sharded when threshold is 1 byte"
+        );
+
+        let bb_dir = html_dir.path().join("beliefbase");
+        assert!(bb_dir.exists(), "beliefbase/ directory should be created");
+        assert!(
+            bb_dir.join("manifest.json").exists(),
+            "beliefbase/manifest.json should be written"
+        );
+        assert!(
+            bb_dir.join("global.json").exists(),
+            "beliefbase/global.json should be written"
+        );
+        assert!(
+            bb_dir.join("networks").exists(),
+            "beliefbase/networks/ directory should be created"
+        );
+
+        // Manifest must be valid JSON with correct structure.
+        let manifest_json = std::fs::read_to_string(bb_dir.join("manifest.json")).unwrap();
+        let manifest: crate::shard::ShardManifest = serde_json::from_str(&manifest_json).unwrap();
+        assert!(manifest.sharded, "manifest.sharded should be true");
+        assert_eq!(manifest.memory_budget_mb, 200.0);
+
+        // Every network listed in the manifest must have its shard file on disk.
+        for net in &manifest.networks {
+            let shard_path = bb_dir.join(&net.path);
+            assert!(
+                shard_path.exists(),
+                "shard file '{}' listed in manifest should exist",
+                net.path
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: backward compat — old beliefbase.json still loads
+    // ------------------------------------------------------------------
+
+    /// Verify that the monolithic `beliefbase.json` is valid JSON that can be
+    /// deserialized as a `BeliefGraph` (backward compat with old viewer code).
+    #[tokio::test]
+    async fn test_monolithic_beliefbase_json_is_valid_belief_graph() {
+        use crate::beliefbase::BeliefGraph;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        create_test_network(src_dir.path());
+
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        let json_path = html_dir.path().join("beliefbase.json");
+        assert!(json_path.exists(), "beliefbase.json must exist");
+
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let graph: BeliefGraph =
+            serde_json::from_str(&json).expect("beliefbase.json must deserialize as BeliefGraph");
+
+        // Sanity: the graph should have at least one node (the API node).
+        assert!(
+            !graph.states.is_empty(),
+            "deserialized BeliefGraph should have at least one node"
         );
     }
 }

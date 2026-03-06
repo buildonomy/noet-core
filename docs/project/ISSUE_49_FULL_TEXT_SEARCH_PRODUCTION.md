@@ -1,6 +1,6 @@
 # Issue 49: Search Feature Backlog — Future Enhancements
 
-**Status**: BACKLOG — brainstorm of post-MVP search enhancements
+**Status**: BACKLOG — brainstorm of post-MVP search enhancements (Stemming and Stop Words pulled into Issue 50)
 **Priority**: LOW
 **Dependencies**: Issue 54 (Full-Text Search MVP) complete
 
@@ -20,14 +20,14 @@ See `.scratchpad/unified_search_analysis.md` (if present) for the full analysis.
 
 These are incremental improvements to `BeliefBase::full_text_search()` that can be added after Issue 54's MVP ships. None require architectural changes.
 
-### Stemming Support
+### Stemming Support ✅ Pulled into Issue 50
 
-Add English stemming via `rust-stemmers` (~50KB crate) so that "running" matches "run", "documents" matches "document", etc.
+English stemming via `rust-stemmers` was added during Issue 50 implementation (compile-time index building in `src/shard/search.rs`).
 
-- Add `rust-stemmers` as an optional dependency
-- Insert stemming step into the tokenizer pipeline (after lowercase, before index insertion)
-- Stem both index terms and query terms for consistent matching
-- Estimated effort: 0.5 days
+- `rust-stemmers` added as an optional dependency under the `stemming` feature flag (enabled by default for `bin` builds)
+- Snowball English algorithm applied in `tokenize()` after lowercase and stop word removal
+- Index terms are stems; the `SearchIndex::stemmed` field records the mode (`StemMode::English` or `StemMode::None`) so the WASM query side (Issue 54) can apply the same transformation to query terms
+- The `stemming` feature can be disabled for minimal builds — the no-op `Stemmer` shim has zero cost
 
 ### Boolean Query Operators
 
@@ -68,14 +68,13 @@ Improve result ranking with additional signals beyond TF-IDF.
 - These signals are all derivable from existing `BeliefBase` data — no new fields needed
 - Estimated effort: 0.5 days
 
-### Stop Word Removal
+### Stop Word Removal ✅ Pulled into Issue 50
 
-Filter common English words ("the", "a", "is", "and") from the index to reduce noise and index size.
+English stop word filtering was added during Issue 50 implementation alongside stemming.
 
-- Standard English stop word list (~150 words)
-- Applied during tokenization, before index insertion
-- Query terms are also filtered so stop words in queries don't produce empty results
-- Estimated effort: 0.25 days
+- ~150-word `ENGLISH_STOP_WORDS` set defined as a `OnceLock<BTreeSet>` in `src/shard/search.rs`
+- Applied in `tokenize()` after length/numeric filtering and **before** stemming (no point stemming "the")
+- The WASM query side (Issue 54) must apply the same filter to query terms before index lookup
 
 ## Backlog: Performance and Scale
 
