@@ -1528,7 +1528,8 @@ impl BeliefBaseWasm {
             let mut stack: Vec<(String, usize)> = Vec::new();
             stack.push((network_bid_str.clone(), 0)); // Network is at depth 0
 
-            for (path, bid, order_indices) in pm.recursive_map(&paths, &mut visited).iter() {
+            for (path_str, bid, order_indices) in pm.recursive_map(&paths, &mut visited).iter() {
+                let path = path_str.to_string();
                 let mut depth = order_indices.len();
                 let bid_str = bid.to_string();
 
@@ -1564,6 +1565,9 @@ impl BeliefBaseWasm {
                 {
                     // Glue network anchor sections to the back of the section list. Because the map
                     // is sorted, these will appear after the network's document list.
+                    // Paths are stored as "index.md#slug" (or "subnet1/index.md#slug" after
+                    // recursive_map joining) by pathmap.rs, so normalize_path_extension converts
+                    // them correctly to "index.html#slug" without any special handling here.
                     depth -= 1;
                 }
                 let (node_title, node_kind) = states
@@ -1572,7 +1576,7 @@ impl BeliefBaseWasm {
                     .unwrap_or_else(|| (path.clone(), Default::default()));
 
                 // Normalize extension to .html
-                let html_path = Self::normalize_path_extension(path);
+                let html_path = Self::normalize_path_extension(&path);
 
                 // Pop stack until we reach the parent level
                 while stack.len() > 1 && stack.last().unwrap().1 >= depth {

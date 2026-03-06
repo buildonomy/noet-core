@@ -782,8 +782,28 @@ impl PathMap {
                     // The anchor's own sort key becomes the second element, placing it at
                     // [NETWORK_SECTION_SORT_KEY, anchor_idx] — fully non-colliding with
                     // document children at [doc_idx] (i.e. [0..NETWORK_SECTION_SORT_KEY-1]).
+                    //
+                    // Paths for these anchors are stored as "index.md#slug" rather than
+                    // the bare "#slug" produced by anchorize(). The bare form causes two
+                    // downstream failures:
+                    //   1. AnchorPath::join("#slug") treats the empty path as a no-op and
+                    //      returns the base unchanged, dropping the anchor entirely when
+                    //      recursive_map joins subnet paths.
+                    //   2. get_nav_tree cannot distinguish a bare slug from a path segment,
+                    //      making correct href reconstruction impossible.
+                    // Storing "index.md#slug" means normalize_path_extension converts it to
+                    // "index.html#slug" and recursive_map's join produces correct full paths
+                    // (e.g. "subnet1/index.html#slug") automatically.
                     let sub_path_info = if sink == net && nets.is_anchor(&source) {
-                        (vec![NETWORK_SECTION_SORT_KEY, *weight], all_paths)
+                        let prefixed_paths = all_paths
+                            .iter()
+                            .map(|p| {
+                                // p is "#slug" from anchorize(); prepend NETWORK_NAME so the
+                                // path is self-contained: "index.md#slug".
+                                format!("{NETWORK_NAME}{p}")
+                            })
+                            .collect::<Vec<_>>();
+                        (vec![NETWORK_SECTION_SORT_KEY, *weight], prefixed_paths)
                     } else {
                         (vec![*weight], all_paths)
                     };

@@ -897,15 +897,6 @@ impl GraphBuilder {
             .find(|(_bid, _path, heading)| *heading == 1)
             .map(|(bid, path, _heading)| (*bid, path.clone()))
             .unwrap_or((self.repo(), String::default()));
-        let pmm = self.doc_bb.paths();
-        let net_pm = pmm.get_map(&net.bref()).ok_or_else(|| {
-            BuildonomyError::Codec(format!(
-                "No PathMap found for network {} while computing path for '{:?} - {:?}'",
-                net,
-                proto.path,
-                proto.id()
-            ))
-        })?;
         let net_anchored_child = AnchorPath::new(&proto.path)
             .strip_prefix(&net_path)
             .unwrap_or(&proto.path);
@@ -915,11 +906,22 @@ impl GraphBuilder {
                 tracing::debug!("Cannot generate speculative key for a section node without an ID");
                 return Ok(None);
             };
-            if net_pm.get_from_id(&section_id, &pmm).is_some() {
-                tracing::debug!("Cannot generate speculative key, there already exists a node with ID '{section_id}' in this network.");
-                return Ok(None);
+            // No get_from_id guard here: section path keys are always unique per document
+            // ("doc.md#slug"), so two sections in different documents with the same slug
+            // produce distinct path keys and never collide. The old guard fired on re-parse
+            // (second parse of the same document after the id_map was populated by the first
+            // parse), causing push() to create a fresh bref-based node instead of finding the
+            // existing one, breaking re-parse idempotency.
+            //
+            // When net_anchored_child is empty, the heading lives in the network's own
+            // index.md. PathMap stores these as "index.md#slug" (NETWORK_NAME prefix), so
+            // we must use the same form here to get a cache hit on re-parse.
+            let base = if child_ap.to_string().is_empty() {
+                AnchorPath::new(NETWORK_NAME)
+            } else {
+                child_ap
             };
-            child_ap.join(as_anchor(&section_id)).into_string()
+            base.join(as_anchor(&section_id)).into_string()
         } else {
             child_ap.to_string()
         };
