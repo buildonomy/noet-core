@@ -2827,4 +2827,113 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             "deserialized BeliefGraph should have at least one node"
         );
     }
+
+    /// Verify that `finalize_html` replaces the network-children sentinel in index.html
+    /// with an actual child listing `<ul>` when child documents exist.
+    ///
+    /// Regression test for: sentinel left unreplaced in phase-2 (generate_deferred_html).
+    #[tokio::test]
+    async fn test_finalize_html_replaces_sentinel_in_index() {
+        use crate::codec::network::NETWORK_CHILDREN_SENTINEL;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Root network with explicit network-children marker
+        std::fs::write(
+            src_dir.path().join("index.md"),
+            "---\nid: \"root-network\"\ntitle: \"Root Network\"\n---\n\n# Root\n\n<!-- network-children -->\n",
+        )
+        .unwrap();
+
+        // A child document that should appear in the listing
+        std::fs::write(
+            src_dir.path().join("child.md"),
+            "---\nid: \"child-doc\"\ntitle: \"Child Doc\"\n---\n\n# Child\n\nSome content.\n",
+        )
+        .unwrap();
+
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        let index_path = html_dir.path().join("pages").join("index.html");
+        assert!(
+            index_path.exists(),
+            "pages/index.html must be written by phase 1"
+        );
+
+        let content = std::fs::read_to_string(&index_path).unwrap();
+
+        assert!(
+            !content.contains(NETWORK_CHILDREN_SENTINEL),
+            "sentinel must be replaced by finalize_html; raw sentinel found in:\n{}",
+            &content[..content.len().min(1000)]
+        );
+        assert!(
+            content.contains("<ul>"),
+            "replaced sentinel must contain a <ul> child listing; got:\n{}",
+            &content[..content.len().min(1000)]
+        );
+        assert!(
+            content.contains("child.html"),
+            "child listing must link to child.html; got:\n{}",
+            &content[..content.len().min(1000)]
+        );
+    }
+
+    /// Verify sentinel replacement also works for subnet index.html files.
+    #[tokio::test]
+    async fn test_finalize_html_replaces_sentinel_in_subnet_index() {
+        use crate::codec::network::NETWORK_CHILDREN_SENTINEL;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Root network (no marker — sentinel appended automatically)
+        std::fs::write(
+            src_dir.path().join("index.md"),
+            "---\nid: \"root-net\"\ntitle: \"Root\"\n---\n\n# Root\n",
+        )
+        .unwrap();
+
+        // Subnet directory
+        let subnet_dir = src_dir.path().join("sub");
+        std::fs::create_dir_all(&subnet_dir).unwrap();
+        std::fs::write(
+            subnet_dir.join("index.md"),
+            "---\nid: \"sub-net\"\ntitle: \"Subnet\"\n---\n\n# Subnet\n\n<!-- network-children -->\n",
+        )
+        .unwrap();
+        std::fs::write(
+            subnet_dir.join("page.md"),
+            "---\nid: \"subnet-page\"\ntitle: \"Subnet Page\"\n---\n\n# Page\n\nContent.\n",
+        )
+        .unwrap();
+
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        let subnet_index = html_dir.path().join("pages").join("sub").join("index.html");
+        assert!(subnet_index.exists(), "pages/sub/index.html must exist");
+
+        let content = std::fs::read_to_string(&subnet_index).unwrap();
+
+        assert!(
+            !content.contains(NETWORK_CHILDREN_SENTINEL),
+            "sentinel must be replaced in subnet index.html; raw sentinel found in:\n{}",
+            &content[..content.len().min(1000)]
+        );
+        assert!(
+            content.contains("<ul>"),
+            "subnet listing must contain a <ul>; got:\n{}",
+            &content[..content.len().min(1000)]
+        );
+        assert!(
+            content.contains("page.html"),
+            "subnet listing must link to page.html; got:\n{}",
+            &content[..content.len().min(1000)]
+        );
+    }
 }

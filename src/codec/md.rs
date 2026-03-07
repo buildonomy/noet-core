@@ -1128,24 +1128,36 @@ impl MdCodec {
             }
         }
 
-        // FOr each proto node, rewrite its heading Start event to use to_anchor(title) as the HTML
-        // id. This decouples the HTML anchor from BeliefNode::id(), which may be a bref-collision
-        // key that doesn't match what generate_terminal_path puts in the PathMap (which falls back
-        // to to_anchor(title) when id == bref). Using the to_anchor(title) here ensures the NavTree
-        // path and the HTML heading id are always in sync.
+        // For each proto node, rewrite its heading Start event to use the correct HTML id.
+        //
+        // Priority mirrors generate_terminal_path so the NavTree path and the HTML anchor
+        // are always in sync:
+        //   1. Explicit {#id} from source (proto.id() when it differs from the bref fallback)
+        //   2. to_anchor(title) slug
+        //
+        // The old approach always used to_anchor(title), which broke NavTree links whenever
+        // an author supplied an explicit {#id} override — generate_terminal_path would put
+        // the explicit id in the PathMap, but the HTML rendered a different anchor.
         let events = self
             .current_events
             .iter()
             .flat_map(|(proto, events)| {
-                // Compute the title-derived anchor for this proto's heading (if it has a title),
-                // Section nodes (heading > 2) get the slug; document/network nodes keep whatever id
-                // inject_context set (they are navigated to by document path, not by anchor).
+                // Compute the anchor for this proto's heading (if it has one).
+                // Section nodes (heading > 2) get an anchor; document/network nodes are
+                // navigated to by document path, not by in-page anchor.
                 let html_anchor: Option<CowStr<'static>> = if proto.heading > 2 {
+                    // Use the explicit id when present (matches generate_terminal_path priority).
+                    // Fall back to the title slug, matching the generate_terminal_path fallback.
                     proto
-                        .title()
-                        .as_deref()
-                        .map(to_anchor)
+                        .id()
                         .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            proto
+                                .title()
+                                .as_deref()
+                                .map(to_anchor)
+                                .filter(|s| !s.is_empty())
+                        })
                         .map(CowStr::from)
                 } else {
                     None

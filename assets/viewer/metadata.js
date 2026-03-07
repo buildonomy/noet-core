@@ -114,7 +114,8 @@ function renderNodeContext(context) {
   // ---- Node Information ----
   html += "<h3>Node Information</h3>";
   html += '<dl class="noet-metadata-list">';
-  html += `<dt>Title</dt><dd>${escapeHtml(node.title)}</dd>`;
+  const displayTitle = node.title && node.title.length > 0 ? node.title : formatBid(node.bid);
+  html += `<dt>Title</dt><dd>${escapeHtml(displayTitle)}</dd>`;
   html += `<dt>BID</dt><dd><code>${formatBid(node.bid)}</code></dd>`;
 
   if (node.kind && node.kind.length > 0) {
@@ -131,7 +132,10 @@ function renderNodeContext(context) {
   }
 
   html += `<dt>Path</dt><dd><code>${escapeHtml(root_path)}</code></dd>`;
-  html += `<dt>Network</dt><dd><code>${formatBid(home_net)}</code></dd>`;
+  const netNode = state.beliefbase ? state.beliefbase.get_by_bid(home_net) : null;
+  const netTitle =
+    netNode && netNode.title && netNode.title.length > 0 ? netNode.title : formatBid(home_net);
+  html += `<dt>Network</dt><dd>${escapeHtml(netTitle)}</dd>`;
   html += "</dl>";
   html += "</div>";
 
