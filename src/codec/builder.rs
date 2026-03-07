@@ -490,10 +490,23 @@ impl GraphBuilder {
             let mut is_changed = false;
             if inject_context {
                 for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
-                    let ctx = self
-                        .doc_bb
-                        .get_context(&self.repo(), bid)
-                        .expect("Set should be balanced here");
+                    let Some(ctx) = self.doc_bb.get_context(&self.repo(), bid) else {
+                        // This should not happen: every parsed node is pushed into doc_bb in
+                        // Phase 1 and the repo network ancestor is established in
+                        // initialize_stack.  If we reach here it most likely means a path
+                        // normalization mismatch prevented the ancestor walk from populating
+                        // doc_bb (e.g. Windows 8.3 short-name vs. long-name mismatch).
+                        tracing::error!(
+                            "[parse_content] Phase 4: get_context returned None for bid {} \
+                             (repo={}).  Skipping context injection for this node.  \
+                             doc_bb states: {}, repo_root: {:?}",
+                            bid,
+                            self.repo(),
+                            self.doc_bb.states().len(),
+                            self.repo_root,
+                        );
+                        continue;
+                    };
                     let old_node = ctx.node.toml();
                     // Inject proto text into our self set here, because inject context is where the
                     // markdown parser generates section-specific text fields regardless of whether
@@ -826,6 +839,13 @@ impl GraphBuilder {
     }
 
     fn get_parent_from_stack(&mut self, proto: &IRNode) -> (Bid, String, String) {
+        // proto.path may contain a Windows drive-letter prefix (e.g. "C:/tmp/foo.md") because
+        // os_path_to_string preserves it.  stack entries are also stored with the drive-letter
+        // prefix.  AnchorPath::filepath() strips the drive letter on both sides, giving a
+        // consistent comparison.  We normalise proto.path here rather than at construction time
+        // so that PathBuf-based operations in initialize_stack (which need the drive letter for
+        // strip_prefix against repo_root) continue to work.
+        let proto_filepath = AnchorPath::new(&proto.path).filepath().to_string();
         let mut parent_info = None;
         let mut first_run = true;
         while !self.stack.is_empty() && parent_info.is_none() {
@@ -840,17 +860,21 @@ impl GraphBuilder {
                 .filter(|(_stack_bid, stack_path, stack_heading)| {
                     // Extract document path from stack_path (which may contain anchors for sections)
                     let stack_ap = AnchorPath::from(stack_path);
-                    (proto.path.starts_with(stack_ap.filepath())
-                        && proto.path != stack_ap.filepath()
+                    let stack_filepath = stack_ap.filepath();
+                    (proto_filepath.starts_with(stack_filepath)
+                        && proto_filepath != stack_filepath
                         && !proto
                             .kind
                             .intersection(BeliefKind::Network | BeliefKind::Document)
                             .is_empty())
-                        || (proto.path == stack_ap.filepath() && *stack_heading < proto.heading)
+                        || (proto_filepath == stack_filepath && *stack_heading < proto.heading)
                 })
                 .map(|(stack_bid, stack_path, _stack_heading)| {
-                    let proto_ap = AnchorPath::new(&proto.path);
-                    let path_info = proto_ap
+                    // Use proto_filepath (drive-letter-stripped) so that strip_prefix can
+                    // match against stack_path regardless of Windows drive-letter form.
+                    // strip_prefix applies filepath() to the prefix argument, so both sides
+                    // must be in the same normalised form.
+                    let path_info = AnchorPath::new(&proto_filepath)
                         .strip_prefix(stack_path)
                         .map(|s| s.to_string())
                         .unwrap_or_default();
@@ -897,7 +921,13 @@ impl GraphBuilder {
             .find(|(_bid, _path, heading)| *heading == 1)
             .map(|(bid, path, _heading)| (*bid, path.clone()))
             .unwrap_or((self.repo(), String::default()));
-        let net_anchored_child = AnchorPath::new(&proto.path)
+        // proto.path may contain a Windows drive-letter prefix.  Normalise via filepath() here
+        // so that strip_prefix (which applies filepath() to the prefix argument) works
+        // correctly on both sides.  We do this at the comparison site rather than at
+        // construction time so that PathBuf-based operations in initialize_stack continue to
+        // see the original drive-letter form.
+        let proto_filepath_str = AnchorPath::new(&proto.path).filepath().to_string();
+        let net_anchored_child = AnchorPath::new(&proto_filepath_str)
             .strip_prefix(&net_path)
             .unwrap_or(&proto.path);
         let child_ap = AnchorPath::new(net_anchored_child);

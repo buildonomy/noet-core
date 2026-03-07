@@ -189,7 +189,7 @@ impl DocumentCompiler {
         if let Some(ref html_dir) = html_output_dir {
             Self::copy_static_assets(html_dir, use_cdn)?;
         }
-        let entry_path = entry_point.as_ref().canonicalize()?;
+        let entry_path = Self::normalize_queue_path(entry_point.as_ref().canonicalize()?);
 
         let builder = GraphBuilder::new(&entry_path, tx)?;
         let mut primary_queue = VecDeque::new();
@@ -224,7 +224,7 @@ impl DocumentCompiler {
     /// # Arguments
     /// * `entry_point` - The file or directory to start parsing from
     pub fn simple(entry_point: impl AsRef<Path>) -> Result<Self, BuildonomyError> {
-        let entry_path = entry_point.as_ref().canonicalize()?;
+        let entry_path = Self::normalize_queue_path(entry_point.as_ref().canonicalize()?);
 
         let builder = GraphBuilder::new(&entry_path, None)?;
         let mut primary_queue = VecDeque::new();
@@ -491,7 +491,9 @@ impl DocumentCompiler {
 
             match codec.generate_html() {
                 Ok(fragments) => {
-                    // Convert absolute path to repo-relative path
+                    // Convert absolute path to repo-relative path.
+                    // file_path derives from path (queue entry), which is normalised by
+                    // normalize_queue_path, so strip_prefix against repo_root is safe.
                     let repo_relative_path = file_path
                         .strip_prefix(self.builder.repo_root())
                         .unwrap_or(file_path.as_path());
@@ -883,13 +885,36 @@ impl DocumentCompiler {
     //     self.reparse_queue.remove(best_idx)
     // }
 
+    /// Normalise an absolute path for queue storage.
+    ///
+    /// On Windows, `Path::canonicalize()` returns paths with the `\\?\` extended-path
+    /// prefix (e.g. `\\?\C:\tmp\foo`).  `GraphBuilder::new` already strips this prefix
+    /// from `repo_root` via `os_path_to_string` + `string_to_os_path`.  Every path
+    /// stored in the compiler's queues must go through the same normalisation so that
+    /// `path.strip_prefix(repo_root)` works consistently at every consumption site.
+    ///
+    /// On Linux/macOS `os_path_to_string` is a no-op for absolute paths, so this
+    /// function is zero-cost on those platforms.
+    ///
+    /// On Windows, `TempDir` (and some other path sources) may return 8.3 short-name
+    /// paths (e.g. `RUNNER~1`) while `GraphBuilder::new` canonicalizes `repo_root` to
+    /// long names.  Without canonicalization here, `strip_prefix` in `initialize_stack`
+    /// silently fails for every file whose path came from such a source, preventing
+    /// ancestor network nodes from being pushed into `doc_bb` and causing a panic in
+    /// Phase 4 context injection.  Canonicalize first to resolve short-name aliases,
+    /// falling back to the original path if the file does not (yet) exist.
+    fn normalize_queue_path(path: PathBuf) -> PathBuf {
+        let resolved = path.canonicalize().unwrap_or(path);
+        string_to_os_path(&os_path_to_string(&resolved))
+    }
+
     /// Add a path to the queue (e.g., from file watcher)
     ///
     /// This method checks if the path is already in either queue to avoid duplicates.
     /// New paths are added to the primary queue.
     /// Enqueue a path for parsing if not already queued
     pub fn enqueue(&mut self, path: impl AsRef<Path>) {
-        let path = path.as_ref().to_path_buf();
+        let path = Self::normalize_queue_path(path.as_ref().to_path_buf());
         if !self.primary_queue.contains(&path) && !self.reparse_queue.contains(&path) {
             // tracing::debug!("[Compiler] Enqueuing path: {:?}", path);
             self.primary_queue.push_back(path);
@@ -898,7 +923,7 @@ impl DocumentCompiler {
 
     /// Enqueue a path at the front of the primary queue (for prioritized parsing like file modifications)
     pub fn enqueue_front(&mut self, path: impl AsRef<Path>) {
-        let path = path.as_ref().to_path_buf();
+        let path = Self::normalize_queue_path(path.as_ref().to_path_buf());
         // Remove from reparse queue if present (fresh content takes precedence)
         self.reparse_queue.retain(|p| p != &path);
 
@@ -976,10 +1001,11 @@ impl DocumentCompiler {
                 continue;
             }
 
-            let asset_absolute_path = self
-                .builder
-                .repo_root()
-                .join(string_to_os_path(repo_relative_path));
+            let asset_absolute_path = Self::normalize_queue_path(
+                self.builder
+                    .repo_root()
+                    .join(string_to_os_path(repo_relative_path)),
+            );
 
             if !self.processed.contains_key(&asset_absolute_path) {
                 tracing::debug!(
@@ -1384,7 +1410,7 @@ impl DocumentCompiler {
                 .join(asset_relative_path);
             let repo_relative_asset: &str = asset_relative_path;
 
-            let absolute_path = string_to_os_path(&asset_absolute_path);
+            let absolute_path = Self::normalize_queue_path(string_to_os_path(&asset_absolute_path));
             // Always enqueue asset files to check for content changes
             // even if already tracked in session_bb
             if !self.processed.contains_key(&absolute_path)
@@ -1471,9 +1497,9 @@ impl DocumentCompiler {
             return;
         };
 
-        // Canonicalize if it exists
+        // Canonicalize if it exists, then normalise to strip any \\?\ prefix (Windows).
         let canonical_dep_path = match full_dep_path.canonicalize() {
-            Ok(p) => p,
+            Ok(p) => Self::normalize_queue_path(p),
             Err(_) => {
                 tracing::debug!(
                     "[Compiler] Cannot canonicalize {:?}, treating as external",
@@ -1925,8 +1951,8 @@ impl DocumentCompiler {
             BuildonomyError::Codec(msg)
         })?;
         // Query for the node using repo-relative path. source_path is an absolute filesystem
-        // path (stored in self.deferred_html), but PathMapMap only stores repo-relative paths.
-        // Strip the repo root prefix before constructing the NodeKey.
+        // path (stored in self.deferred_html), which was normalised by normalize_queue_path
+        // before insertion, so strip_prefix against repo_root is safe.
         let repo_relative_str = source_path
             .strip_prefix(self.builder.repo_root())
             .map(os_path_to_string)
@@ -1972,7 +1998,9 @@ impl DocumentCompiler {
         // Get title for write_fragment fallback path
         let title = ctx.node.display_title().to_string();
 
-        // Convert absolute path to repo-relative path
+        // Convert absolute path to repo-relative path.
+        // source_path is normalised (via normalize_queue_path at insertion), so
+        // strip_prefix against repo_root is safe on all platforms.
         let repo_relative_path = source_path
             .strip_prefix(self.builder.repo_root())
             .unwrap_or(source_path);
