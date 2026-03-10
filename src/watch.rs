@@ -1088,7 +1088,7 @@ impl FileUpdateSyncer {
                                         transaction_tx.send(Event::Belief(event))?;
                                     }
                                 }
-                                if transaction.staged > 0 {
+                                if transaction.has_pending() {
                                     match transaction.execute(&transaction_global_bb.0).await {
                                         Ok(_) => {
                                             tracing::debug!(
@@ -1136,7 +1136,7 @@ impl FileUpdateSyncer {
                                 transaction_tx.send(Event::Belief(ev))?;
                             }
                         }
-                        if transaction.staged > 0 {
+                        if transaction.has_pending() {
                             match transaction.execute(&transaction_global_bb.0).await {
                                 Ok(_) => {
                                     tracing::debug!(

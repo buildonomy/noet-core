@@ -37,6 +37,16 @@ pub struct Transaction<'a> {
     mtime_updates: BTreeMap<String, i64>,
 }
 
+impl<'a> Transaction<'a> {
+    /// Returns true if there is anything to commit — either staged belief-graph events
+    /// or pending mtime updates. Use this instead of checking `staged > 0` directly so
+    /// that `FileParsed`-only batches (zero staged events, non-empty mtime_updates) are
+    /// not silently dropped.
+    pub fn has_pending(&self) -> bool {
+        self.staged > 0 || !self.mtime_updates.is_empty()
+    }
+}
+
 impl<'a> Default for Transaction<'a> {
     fn default() -> Self {
         Self::new()
