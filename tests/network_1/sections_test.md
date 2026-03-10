@@ -1,6 +1,7 @@
 ---
 bid = "10000000-0000-0000-0000-000000000002"
 schema = "Document"
+title = "Sections Test Document"
 
 
 

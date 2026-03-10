@@ -2,7 +2,7 @@ use petgraph::{visit::EdgeRef, Direction};
 use serde::{Deserialize, Serialize};
 /// Utilities for parsing various document types into BeliefBases
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
     path::{Path, PathBuf},
     result::Result,
@@ -111,6 +111,23 @@ pub struct GraphBuilder {
     stack: Vec<(Bid, String, usize)>,
     session_bb: BeliefBase,
     tx: UnboundedSender<BeliefEvent>,
+    /// One-time cache of `NetworkCodec::proto` results keyed by directory path.
+    ///
+    /// `NetworkCodec::proto` calls `iter_net_docs` internally, which does a
+    /// full `WalkDir` scan of the directory. Without this cache, every call to
+    /// `initialize_stack` re-scans each ancestor directory — O(depth × files)
+    /// work per parsed document. On a corpus like MDN (~14 k files, depth ~5)
+    /// that amounts to tens of thousands of redundant directory scans.
+    ///
+    /// `None` in the map means the directory was probed and found to contain no
+    /// network file (so we can skip it on future calls without re-scanning).
+    /// `Some(proto)` is the cached result.
+    ///
+    /// The cache is intentionally not invalidated within a single compiler
+    /// session: network index files are not expected to change while the
+    /// compiler is running. The watch-service creates a fresh `GraphBuilder`
+    /// for each watch cycle, so stale entries cannot accumulate across reloads.
+    network_proto_cache: HashMap<PathBuf, Option<IRNode>>,
 }
 
 /// GraphBuilder collects source material, parses it into a BeliefBase representation, maps
@@ -188,6 +205,7 @@ impl GraphBuilder {
             stack: Vec::default(),
             session_bb: BeliefBase::empty(),
             tx,
+            network_proto_cache: HashMap::new(),
         };
 
         tracing::debug!(
@@ -308,6 +326,7 @@ impl GraphBuilder {
             codec.parse(&content, initial, &mut diagnostics)?;
 
             let mut inject_context = false;
+            let mut has_new_bids = false;
             parsed_bids = Vec::with_capacity(codec.nodes().len());
             let mut check_sinks = BTreeMap::<Bid, BTreeSet<NodeKey>>::default();
             let mut relation_event_queue = Vec::<BeliefEvent>::default();
@@ -327,17 +346,24 @@ impl GraphBuilder {
                         "Phase 1 {}: merging missing structure onto self.session_bb:",
                         bid,
                     );
-                    // Don't merge missing_structure into self.doc_bb here -- we want to preserve the
-                    // relations we're building up from the parse
                     self.session_bb.merge(&missing_structure);
                     // We did a bunch of cache_fetch operations, so the stack cache should be
                     // rebalanced as well.
                     self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
+                    // Also merge the structural halo (ancestor chains, external network nodes)
+                    // into doc_bb so that PathMapMap has the network context needed for
+                    // regularize() in Phase 2. This does not clobber the doc's own freshly-parsed
+                    // relations because missing_structure only contains nodes fetched from
+                    // global_bb (external structure), never the current document's owned edges.
+                    self.doc_bb.merge(&missing_structure);
                     missing_structure = BeliefGraph::default();
                 }
 
                 if !source.is_from_cache() {
                     inject_context = true;
+                    if matches!(source, NodeSource::Generated) {
+                        has_new_bids = true;
+                    }
                 } else if !unique_oldkeys.is_empty() {
                     for old_bid in unique_oldkeys.iter().filter_map(|key| {
                         if let NodeKey::Bid { bid: old_bid } = key {
@@ -493,56 +519,22 @@ impl GraphBuilder {
                 inject_context
             );
             let mut is_changed = false;
-            if inject_context {
-                for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
-                    let Some(ctx) = self.doc_bb.get_context(&self.repo(), bid) else {
-                        // This should not happen: every parsed node is pushed into doc_bb in
-                        // Phase 1 and the repo network ancestor is established in
-                        // initialize_stack.  If we reach here it most likely means a path
-                        // normalization mismatch prevented the ancestor walk from populating
-                        // doc_bb (e.g. Windows 8.3 short-name vs. long-name mismatch).
-                        tracing::error!(
-                            "[parse_content] Phase 4: get_context returned None for bid {} \
-                             (repo={}).  Skipping context injection for this node.  \
-                             doc_bb states: {}, repo_root: {:?}",
-                            bid,
-                            self.repo(),
-                            self.doc_bb.states().len(),
-                            self.repo_root,
-                        );
-                        continue;
-                    };
-                    let old_node = ctx.node.toml();
-                    // Inject proto text into our self set here, because inject context is where the
-                    // markdown parser generates section-specific text fields regardless of whether
-                    // it changes the markdown itself due to the injected context.
-                    if let Some(updated_node) =
-                        codec.inject_context(proto, &ctx, &mut diagnostics)?
-                    {
-                        if old_node != updated_node.toml() {
-                            is_changed = true;
-                            let _derivatives =
-                                self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
-                                    vec![NodeKey::Bid {
-                                        bid: updated_node.bid,
-                                    }],
-                                    updated_node.toml(),
-                                    EventOrigin::Remote,
-                                ))?;
-                        }
-                    }
-                }
-
-                // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
-                tracing::debug!("Phase 4b: codec finalization");
-                let finalized_nodes = codec.finalize(&mut diagnostics)?;
-                for (_proto, updated_node) in finalized_nodes {
-                    let old_toml = self
-                        .doc_bb
-                        .states()
-                        .get(&updated_node.bid)
-                        .map(|node| node.toml());
-                    if Some(updated_node.toml()) != old_toml {
+            // Always run inject_context for every parsed node. The inject_context boolean was
+            // previously used as a gate to skip Phase 4 as an optimisation, but that optimisation
+            // is incorrect: section nodes resolved from StackCache may carry BIDs that have never
+            // been persisted to disk. Those BIDs must be injected into the proto documents so that
+            // finalize() can write them into the sections table and trigger a content rewrite.
+            for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
+                let ctx = self
+                    .doc_bb
+                    .get_context(&self.repo(), bid)
+                    .expect("Set should be balanced here");
+                let old_node = ctx.node.toml();
+                // Inject proto text into our self set here, because inject context is where the
+                // markdown parser generates section-specific text fields regardless of whether
+                // it changes the markdown itself due to the injected context.
+                if let Some(updated_node) = codec.inject_context(proto, &ctx, &mut diagnostics)? {
+                    if old_node != updated_node.toml() {
                         is_changed = true;
                         let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
@@ -555,11 +547,35 @@ impl GraphBuilder {
                 }
             }
 
-            if is_changed {
+            // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
+            tracing::debug!("Phase 4b: codec finalization");
+            let finalized_nodes = codec.finalize(&mut diagnostics)?;
+            for (_proto, updated_node) in finalized_nodes {
+                let old_toml = self
+                    .doc_bb
+                    .states()
+                    .get(&updated_node.bid)
+                    .map(|node| node.toml());
+                if Some(updated_node.toml()) != old_toml {
+                    is_changed = true;
+                    let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
+                        vec![NodeKey::Bid {
+                            bid: updated_node.bid,
+                        }],
+                        updated_node.toml(),
+                        EventOrigin::Remote,
+                    ))?;
+                }
+            }
+
+            if is_changed || has_new_bids {
                 tracing::debug!("Generating source");
                 let maybe_new_content = codec.generate_source();
                 if let Some(new_content) = maybe_new_content.as_ref() {
-                    if new_content != &content {
+                    // Always rewrite when new BIDs were assigned, even if markdown text is
+                    // unchanged — the BIDs must be persisted to disk so they don't become
+                    // ephemeral entries in global_bb without a corresponding on-disk record.
+                    if new_content != &content || has_new_bids {
                         maybe_content = maybe_new_content;
                     }
                 }
@@ -680,10 +696,30 @@ impl GraphBuilder {
         let mut maybe_content_parent_proto = None;
         let mut missing_structure = BeliefGraph::default();
         let mut events = Vec::<BeliefEvent>::default();
-        let net_codec = NetworkCodec::default();
         while let Some(path) = parent_path_stack.pop() {
-            let Some(state_accum) = net_codec.proto(path.as_ref())? else {
-                continue;
+            // Use the per-session cache to avoid redundant WalkDir scans.
+            // Each unique ancestor directory is scanned at most once per
+            // compiler session regardless of how many files share that ancestor.
+            let state_accum = match self.network_proto_cache.entry(path.clone()) {
+                Entry::Occupied(e) => {
+                    match e.get() {
+                        Some(proto) => proto.clone(),
+                        None => continue, // previously found to have no network file
+                    }
+                }
+                Entry::Vacant(e) => {
+                    let net_codec = NetworkCodec::default();
+                    match net_codec.proto(path.as_ref())? {
+                        Some(proto) => {
+                            e.insert(Some(proto.clone()));
+                            proto
+                        }
+                        None => {
+                            e.insert(None);
+                            continue;
+                        }
+                    }
+                }
             };
 
             let (ancestor, (_source, _, _)) = self
@@ -1477,12 +1513,6 @@ impl GraphBuilder {
             // use eval_query in order to receive a balanced_set if/when we get a query hit on
             // one of our caches
             let stack_result = BeliefBase::from(self.session_bb.eval_query(&query, true).await?);
-
-            // tracing::debug!(
-            //     "stack_result has {} nodes. session_bb.is_balanced = {}",
-            //     stack_result.states().len(),
-            //     self.session_bb.is_balanced(),
-            // );
 
             match stack_result.get(key) {
                 Some(existing_state) => {

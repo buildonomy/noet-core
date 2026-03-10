@@ -1749,11 +1749,6 @@ impl DocCodec for MdCodec {
                         // 3. its an h1 at the start of the document with no prior headings
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
-                            if is_document_heading && !accum_title.is_empty() {
-                                current
-                                    .document
-                                    .insert("title", value(accum_title.as_str()));
-                            }
                             last_event_vec.append(&mut proto_events);
                             proto_events = last_event_vec;
                         }

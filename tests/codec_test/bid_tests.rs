@@ -79,7 +79,6 @@ async fn test_belief_set_builder_bid_generation_and_caching(
 
         while let Ok(event) = accum_rx.try_recv() {
             global_bb.process_event(&event)?;
-            // tracing::debug!("global cache event: {:?}", event);
         }
     }
     tracing::debug!(

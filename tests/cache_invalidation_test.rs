@@ -81,7 +81,11 @@ fn test_stale_file_detection_and_reparse() {
 
     // Create a test document
     let doc_path = network_path.join("test.md");
-    std::fs::write(&doc_path, "# Original Content\n").unwrap();
+    std::fs::write(
+        &doc_path,
+        "+++\ntitle = \"Original Content\"\n+++\n\nSome body text.\n",
+    )
+    .unwrap();
 
     let (tx, rx) = channel::<Event>();
 
@@ -121,8 +125,12 @@ fn test_stale_file_detection_and_reparse() {
     // as the original and not be detected as stale. This is NOT a synchronization hack.
     std::thread::sleep(Duration::from_secs(3));
 
-    // Modify the file
-    std::fs::write(&doc_path, "# Modified Content\n\nThis is new!").unwrap();
+    // Modify the file — frontmatter title change guarantees a distinct parsed doc node
+    std::fs::write(
+        &doc_path,
+        "+++\ntitle = \"Modified Content\"\n+++\n\nThis is new!\n",
+    )
+    .unwrap();
 
     // Explicitly advance the mtime by 60 seconds to guarantee it differs from the cached
     // value regardless of filesystem mtime resolution (e.g. NTFS 2-second granularity).
