@@ -928,7 +928,9 @@ impl GraphBuilder {
     /// Generate a speculative Nodekey::Path for for a node push.
     /// Uses PathMap's speculative_path to compute what the path would be with collision detection.
     /// Returns Result<NodeKey, BuildonomyError>.
-    fn speculative_path_key(&self, proto: &IRNode) -> Result<Option<NodeKey>, BuildonomyError> {
+    fn speculative_path_key(&self, proto: &IRNode) -> Result<Vec<NodeKey>, BuildonomyError> {
+        // Note: returns empty Vec when no key can be generated (e.g. section without ID),
+        // preserving the original Ok(None) semantics that push() relies on for collision handling.
         // Find the network by walking up the stack (network nodes have heading=1)
         if let Some(bid) = proto
             .document
@@ -937,7 +939,7 @@ impl GraphBuilder {
             .and_then(|bid_str| Bid::try_from(bid_str).ok())
             .filter(|bid| bid.initialized())
         {
-            return Ok(Some(NodeKey::Bid { bid }));
+            return Ok(vec![NodeKey::Bid { bid }]);
         }
 
         if proto.kind.is_network() {
@@ -950,11 +952,34 @@ impl GraphBuilder {
                         .to_string(),
                 ));
             };
-            return Ok(Some(NodeKey::Id {
+            let id_key = NodeKey::Id {
                 net: Bref::default(),
                 id: network_id,
-            }));
+            };
+            // Network|Document dual-kind nodes (e.g. MDN constructor pages where the filename
+            // matches the parent directory name, like `duration/duration/index.md`) must also
+            // register a Path key so that their child sections can anchor under them in the
+            // PathMap. Without the Path key, sections get no PathMap entry and push_relation
+            // panics when trying to regularize relative links from those sections.
+            if proto.kind.is_document() {
+                if let Some(path_key) = self.build_path_key(proto) {
+                    return Ok(vec![id_key, path_key]);
+                }
+            }
+            return Ok(vec![id_key]);
         }
+        Ok(self.build_path_key(proto).into_iter().collect())
+    }
+
+    /// Build a `NodeKey::Path` for `proto` based on the current network stack.
+    ///
+    /// Returns `None` when no path key can be generated (section node without an ID), which
+    /// preserves the original `Ok(None)` semantics from `speculative_path_key` that `push()`
+    /// relies on: an empty `keys` vec triggers the ID-collision guard at the `Unresolved` branch.
+    ///
+    /// Extracted from `speculative_path_key` so it can be reused for `Network|Document`
+    /// dual-kind nodes that need both an ID key and a path key.
+    fn build_path_key(&self, proto: &IRNode) -> Option<NodeKey> {
         let (net, net_path) = self
             .stack
             .iter()
@@ -973,9 +998,16 @@ impl GraphBuilder {
             .unwrap_or(&proto.path);
         let child_ap = AnchorPath::new(net_anchored_child);
         let path = if proto.heading > 2 {
-            let Some(section_id) = proto.id() else {
-                tracing::debug!("Cannot generate speculative key for a section node without an ID");
-                return Ok(None);
+            let section_id = match proto.id() {
+                Some(id) => id,
+                None => {
+                    tracing::debug!(
+                        "Cannot generate speculative path key for a section node without an ID"
+                    );
+                    // Return None so push() sees an empty keys vec and the Unresolved branch
+                    // fires the ID-collision guard (same behaviour as the original Ok(None)).
+                    return None;
+                }
             };
             // No get_from_id guard here: section path keys are always unique per document
             // ("doc.md#slug"), so two sections in different documents with the same slug
@@ -996,10 +1028,10 @@ impl GraphBuilder {
         } else {
             child_ap.to_string()
         };
-        Ok(Some(NodeKey::Path {
+        Some(NodeKey::Path {
             net: net.bref(),
             path,
-        }))
+        })
     }
 
     /// Update the parent stack, and update the stack cache with the node and its relations from the
@@ -1032,10 +1064,7 @@ impl GraphBuilder {
         let mut parsed_node = BeliefNode::try_from(proto)?;
 
         // Generate keys based on node type
-        let mut keys = self
-            .speculative_path_key(proto)?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut keys = self.speculative_path_key(proto)?;
         // On top of providing us with the old state of the node (if such a state exists), this will
         // also update our session_bb to include all the old relationships tied to this node. We
         // will use this info later in terminate_stack to determine what our "affected_sink" set is,
@@ -1294,17 +1323,32 @@ impl GraphBuilder {
         let maybe_weight = &relation.weight;
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
-        let other_key_regularized = other_key
-            .regularize(
-                &self.doc_bb,
-                *owner_bid,
-                self.repo(),
-                &os_path_to_string(&self.repo_root),
-            )
-            .expect(
-                "parse_content Phase 1 parsing ensures that we have a valid subsection \
-                structure to get paths from for all our parsed nodes",
-            );
+        let other_key_regularized = match other_key.regularize(
+            &self.doc_bb,
+            *owner_bid,
+            self.repo(),
+            &os_path_to_string(&self.repo_root),
+        ) {
+            Ok(key) => key,
+            Err(e) => {
+                // This can happen for Network|Document dual-kind nodes (e.g. MDN constructor
+                // pages where filename == parent directory name) whose sections don't get a
+                // PathMap entry because speculative_path_key routes them through the ID branch
+                // rather than the Path branch. Until that is fixed, emit an UnresolvedReference
+                // diagnostic and skip this relation rather than panicking the whole corpus run.
+                tracing::warn!(
+                    "[push_relation] cannot regularize relation from owner {}: {}. \
+                     Skipping relation {:?} and emitting UnresolvedReference.",
+                    owner_bid,
+                    e,
+                    other_key
+                );
+                return Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
+                    other_keys: vec![other_key.clone()].into(),
+                    ..Default::default()
+                }));
+            }
+        };
 
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
