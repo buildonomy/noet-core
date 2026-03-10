@@ -315,7 +315,17 @@ impl GraphBuilder {
         let mut diagnostics = Vec::<ParseDiagnostic>::new();
 
         let doc_path = initial.path.clone();
-        let doc_ap = AnchorPath::from(&doc_path);
+        // Use new_dir when the proto node is a Network: NetworkCodec::proto() sets
+        // initial.path to the directory (e.g. ".../symbol.iterator"), not the index.md
+        // file. AnchorPath::new / ::from would misparse "symbol.iterator" as stem="symbol"
+        // ext="iterator" and the codec lookup would fail. new_dir forces directory
+        // semantics so path_parts() returns ("", "") and the (None, None) NetworkCodec
+        // wildcard matches correctly.
+        let doc_ap = if initial.kind.contains(BeliefKind::Network) {
+            AnchorPath::new_dir(&doc_path)
+        } else {
+            AnchorPath::from(&doc_path)
+        };
 
         let mut parsed_bids;
         let owned_codec: Box<dyn DocCodec + Send>;

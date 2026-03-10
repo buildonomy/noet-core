@@ -230,6 +230,41 @@ impl<'a> AnchorPath<'a> {
         }
     }
 
+    /// Construct an `AnchorPath` that treats the input as a **directory** path even when the
+    /// last path component contains a dot. `AnchorPath::new` classifies dotted last components
+    /// (e.g. `symbol.iterator`, `v1.2`) as files with an extension. This constructor undoes
+    /// that classification so that:
+    ///
+    /// - `is_dir()` → `true`
+    /// - `ext()` → `""`
+    /// - `filestem()` → `""`
+    /// - `filename()` → `""`
+    /// - `dir()` → the full path (the dotted component becomes part of the directory)
+    /// - `filepath()` → the full path (same as `dir()`)
+    ///
+    /// Use this whenever you have a filesystem path that is known to be a directory, so that
+    /// a dotted directory name (e.g. `array/symbol.iterator`) is not misclassified as a file
+    /// with extension `"iterator"` during codec lookup or path manipulation.
+    ///
+    /// Paths that `new` already treats as directories (no `ext_sep`) are returned unchanged.
+    /// Trailing-slash paths and empty strings are also returned unchanged.
+    pub fn new_dir(path: &'a str) -> AnchorPath<'a> {
+        let mut ap = Self::new(path);
+        if ap.ext_sep.is_some() {
+            let path_end = ap.param_sep.or(ap.anc_sep).unwrap_or(path.len());
+            // Only override when the path doesn't already end with '/' (bare root "/" is fine).
+            if path_end > 0 && path.as_bytes().get(path_end - 1).copied() != Some(b'/') {
+                // Clear ext_sep → is_dir() returns true, ext() and filestem() return "".
+                ap.ext_sep = None;
+                // Apply the "top is a dir" dir_sep promotion that new() skipped because it
+                // saw an extension. This makes dir() return the full dotted-component path
+                // and filename()/filepath() behave consistently with a bare directory.
+                ap.dir_sep = ap.param_sep.or(ap.anc_sep);
+            }
+        }
+        ap
+    }
+
     /// Construct an `AnchorPath` that treats the input as a **file** path even when the
     /// filename has no extension. `AnchorPath::new` classifies extensionless paths as
     /// directories (`ext_sep = None`, `is_dir() == true`, `filestem() == ""`). This
@@ -579,15 +614,25 @@ impl<'a> AnchorPath<'a> {
         &self.path[start_idx..stop_idx]
     }
 
-    pub fn parent(&self) -> &'a str {
+    /// Return the logical parent of this path as an [`AnchorPath<'a>`] (zero-allocation).
+    ///
+    /// - **File with no anchor** (`ext_sep.is_some()`, `anc_sep.is_none()`): returns the
+    ///   containing directory via [`AnchorPath::new_dir`] so that a dotted directory name
+    ///   (e.g. `array/symbol.iterator`) is correctly classified as a directory rather than
+    ///   re-parsed as a file with extension `"iterator"`.
+    /// - **Path with anchor** (`anc_sep.is_some()`): returns the filepath (anchor stripped)
+    ///   via [`AnchorPath::new`] — the filepath may itself be a file.
+    /// - **Directory** (`ext_sep.is_none()`, `anc_sep.is_none()`): walks up one level via
+    ///   [`AnchorPath::new`] (already a directory, no dotted last component to misclassify).
+    pub fn parent(&self) -> AnchorPath<'a> {
         if self.anc_sep.is_some() {
-            self.filepath()
+            AnchorPath::new(self.filepath())
         } else if self.ext_sep.is_some() {
-            self.dir()
+            AnchorPath::new_dir(self.dir())
         } else {
             let dir_sep = self.dir_sep.unwrap_or(self.path.len());
             let next_sep = self.path[0..dir_sep].rfind('/');
-            &self.path[0..next_sep.unwrap_or(0)]
+            AnchorPath::new(&self.path[0..next_sep.unwrap_or(0)])
         }
     }
 
@@ -946,6 +991,42 @@ impl<'a, T: AsRef<str> + ?Sized> From<&'a T> for AnchorPath<'a> {
     }
 }
 
+impl<'a> PartialEq<str> for AnchorPath<'a> {
+    fn eq(&self, other: &str) -> bool {
+        self.path == other
+    }
+}
+
+impl<'a> PartialEq<&str> for AnchorPath<'a> {
+    fn eq(&self, other: &&str) -> bool {
+        self.path == *other
+    }
+}
+
+impl<'a> PartialEq<String> for AnchorPath<'a> {
+    fn eq(&self, other: &String) -> bool {
+        self.path == other.as_str()
+    }
+}
+
+impl<'a> PartialEq<AnchorPath<'a>> for str {
+    fn eq(&self, other: &AnchorPath<'a>) -> bool {
+        self == other.path
+    }
+}
+
+impl<'a> PartialEq<AnchorPath<'a>> for &str {
+    fn eq(&self, other: &AnchorPath<'a>) -> bool {
+        *self == other.path
+    }
+}
+
+impl<'a> PartialEq<AnchorPath<'a>> for String {
+    fn eq(&self, other: &AnchorPath<'a>) -> bool {
+        self.as_str() == other.path
+    }
+}
+
 impl<'a> AsRef<str> for AnchorPath<'a> {
     fn as_ref(&self) -> &str {
         self.path
@@ -1220,8 +1301,75 @@ mod tests {
         assert_eq!(net_hidden_dir_ap.filename(), "");
         assert_eq!(net_hidden_dir_ap.filepath(), "network/.hidden_dir");
         assert_eq!(net_hidden_dir_ap.parent(), "network");
+        // parent() on a file in a dotted directory returns an AnchorPath<'_> with is_dir() = true
+        let symbol_file = AnchorPath::new("/repo/array/symbol.iterator/index.md");
+        let symbol_parent = symbol_file.parent();
+        assert_eq!(symbol_parent, "/repo/array/symbol.iterator");
+        assert!(symbol_parent.is_dir());
+        assert_eq!(symbol_parent.ext(), "");
+        assert_eq!(symbol_parent.path_parts(), ("", ""));
         assert_eq!(AnchorPath::new(".hidden_file.pdf").ext(), "pdf");
         assert_eq!(AnchorPath::new("noextension#anchor").ext(), "");
+    }
+
+    #[test]
+    fn test_new_dir() {
+        // new() misclassifies dotted directory names as files with extensions
+        assert_eq!(AnchorPath::new("array/symbol.iterator").ext(), "iterator");
+        assert_eq!(AnchorPath::new("array/symbol.iterator").is_dir(), false);
+
+        // new_dir() corrects this: dotted last component is treated as a directory
+        let ap = AnchorPath::new_dir("array/symbol.iterator");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.filestem(), "");
+        assert_eq!(ap.filename(), "");
+        assert_eq!(ap.is_dir(), true);
+        assert_eq!(ap.dir(), "array/symbol.iterator");
+        assert_eq!(ap.filepath(), "array/symbol.iterator");
+        assert_eq!(ap.path_parts(), ("", ""));
+
+        // Absolute path variant
+        let ap = AnchorPath::new_dir("/repo/array/symbol.species");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+        assert_eq!(ap.dir(), "/repo/array/symbol.species");
+        assert_eq!(ap.filepath(), "/repo/array/symbol.species");
+
+        // Paths that new() already treats as directories are unchanged
+        let ap = AnchorPath::new_dir("plain_dir");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+
+        let ap = AnchorPath::new_dir("nested/plain_dir");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+        assert_eq!(ap.dir(), "nested/plain_dir");
+
+        // Trailing slash: unchanged (already a directory)
+        let ap = AnchorPath::new_dir("array/symbol.iterator/");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+
+        // Real files are also correctly handled (though callers should use new() for files)
+        let ap = AnchorPath::new_dir("dir/index.md");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+        assert_eq!(ap.dir(), "dir/index.md");
+
+        // Hidden dotted components (already treated as dir by new()) are unchanged
+        let ap = AnchorPath::new_dir("network/.hidden_dir");
+        assert_eq!(ap.ext(), "");
+        assert_eq!(ap.is_dir(), true);
+
+        // path_parts returns ("", "") — correct for codec (None, None) wildcard lookup
+        assert_eq!(
+            AnchorPath::new_dir("array/symbol.iterator").path_parts(),
+            ("", "")
+        );
+        assert_eq!(
+            AnchorPath::new_dir("array/symbol.asyncdispose").path_parts(),
+            ("", "")
+        );
     }
 
     #[test]
@@ -1232,6 +1380,7 @@ mod tests {
         assert_eq!(ap.filestem(), "guide");
         assert_eq!(ap.filepath(), "docs/guide.md");
         assert_eq!(ap.parent(), "docs");
+        assert!(ap.parent().is_dir());
         assert_eq!(&ap.join("api.md"), "docs/api.md");
         assert_eq!(
             AnchorPath::new("docs/guide.md").join("ref/types.md"),
