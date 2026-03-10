@@ -748,15 +748,15 @@ impl GraphBuilder {
                     &mut missing_structure,
                 )
                 .await?;
-            if path.as_os_str().is_empty() && self.repo == Bid::nil() {
-                self.repo = ancestor;
-            }
             // Merge missing_structure after each push so it's available for the next iteration.
             if !missing_structure.is_empty() {
                 // Keep self.doc_bb isolated from the structure, that way we can ensure our comparison
                 // between the source material and the cache stays consistent.
                 self.session_bb.merge(&missing_structure);
-                missing_structure = BeliefGraph::default(); // reset for next interation
+                missing_structure = BeliefGraph::default(); // reset for next iteration
+            }
+            if path.as_os_str().is_empty() && self.repo == Bid::nil() {
+                self.repo = ancestor;
             }
             maybe_content_parent_proto = Some((ancestor, state_accum));
         }
@@ -1448,11 +1448,46 @@ impl GraphBuilder {
                         .location
                         .map(|offset| crate::codec::byte_offset_to_location(source, offset));
                     let pmm_guard = self.doc_bb.paths();
-                    let (owner_home_net, owner_home_path) =
-                    pmm_guard.api_map().home_path(owner_bid, &pmm_guard).expect(
-                        "parse_content Phase 1 parsing ensures that we have a valid subsection \
-                        structure to get paths from for all our parsed nodes",
-                    );
+                    let Some((owner_home_net, owner_home_path)) =
+                        pmm_guard.api_map().home_path(owner_bid, &pmm_guard)
+                    else {
+                        // owner_bid has no home path in doc_bb. This happens when a
+                        // Network|Document dual-kind node (e.g. duration/duration) is parsed
+                        // *after* its siblings in filesystem order. push_relation is called
+                        // with the owner being that not-yet-registered dual-kind node, so
+                        // doc_bb has no PathMap entry for it yet.
+                        //
+                        // Correct recovery: emit an Incoming UnresolvedReference whose
+                        // other_keys point to the owner node itself (by BID). The compiler
+                        // will enqueue the owner for parsing and re-parse the current file
+                        // once the owner is registered — preserving link correctness.
+                        //
+                        // We look up the owner's keys from session_bb (it was added there as
+                        // a Trace node when its sibling network was loaded in initialize_stack).
+                        let owner_keys = self
+                            .session_bb
+                            .get(&NodeKey::Bid { bid: *owner_bid })
+                            .map(|owner_node| {
+                                owner_node.keys(Some(self.repo), None, &self.session_bb)
+                            })
+                            .unwrap_or_else(|| vec![NodeKey::Bid { bid: *owner_bid }]);
+                        tracing::debug!(
+                            "Unresolved relation at index {}: owner {:?} has no home path in \
+                            doc_bb (parse order issue — dual-kind node not yet registered). \
+                            Re-queuing owner via Incoming UnresolvedReference with keys: {:?}",
+                            index,
+                            owner_bid,
+                            owner_keys,
+                        );
+                        let mut requeue = unresolved_initial.clone();
+                        requeue.direction = Direction::Incoming;
+                        requeue.self_bid = *owner_bid;
+                        requeue.other_keys = owner_keys;
+                        requeue.reference_location = relation
+                            .location
+                            .map(|offset| crate::codec::byte_offset_to_location(source, offset));
+                        return Ok(GetOrCreateResult::Unresolved(requeue));
+                    };
                     unresolved.self_net = owner_home_net;
                     unresolved.self_path = owner_home_path;
                     tracing::debug!(
