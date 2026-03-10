@@ -1459,26 +1459,43 @@ impl DocumentCompiler {
     }
 
     fn process_unresolved_reference(&mut self, path: &Path, net_dep_path_str: &str, net_ref: Bref) {
+        // Use session_bb rather than doc_bb here. doc_bb is cleared and rebuilt for each
+        // document in initialize_stack, so for plain .md files it only contains that file's
+        // local nodes — the root network node (and its pathmap entry) is absent.
+        //
+        // session_bb is the right source because:
+        //   1. process_unresolved_reference is only reachable after parse_content returns Ok,
+        //      which means terminate_stack has already synced doc_bb into session_bb.
+        //   2. Child documents are enqueued by processing the root network's own unresolved
+        //      child-file references, so the root network is always parsed (and present in
+        //      session_bb) before any child document's process_unresolved_reference runs.
+        //   3. compute_diff only removes nodes reachable from parsed_content via section edges;
+        //      the root network is never in a child document's parsed_content, so it is never
+        //      evicted from session_bb by a subsequent parse.
         let repo_pathmap = self
             .builder()
-            .doc_bb()
+            .session_bb()
             .paths()
             .get_map(&self.builder().repo().bref())
-            .expect("builder.repo to be instantiated after parse_content was successfully called.");
+            .expect(
+                "session_bb must contain the root network pathmap entry: the root network is \
+                 always parsed before any child document (it enqueues them), and terminate_stack \
+                 syncs doc_bb into session_bb before parse_content returns.",
+            );
         let Some(net) = self
             .builder()
-            .doc_bb()
+            .session_bb()
             .paths()
             .nets()
             .iter()
             .find(|net| net.bref() == net_ref)
             .copied()
         else {
-            tracing::warn!("self.bulder().doc_bb() does not have a network node with bref {} initialized in its pathmapmap", net_ref);
+            tracing::warn!("self.builder().session_bb() does not have a network node with bref {} initialized in its pathmapmap", net_ref);
             return;
         };
         let full_dep_path = if let Some((_home_net, net_path, _order)) =
-            repo_pathmap.path(&net, &self.builder().doc_bb().paths())
+            repo_pathmap.path(&net, &self.builder().session_bb().paths())
         {
             debug_assert!(_home_net == net);
             // Convert relative path to absolute
