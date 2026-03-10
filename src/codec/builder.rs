@@ -645,34 +645,42 @@ impl GraphBuilder {
             self.tx.send(api_node_event)?;
         }
 
-        // Fetch const_namespaces from global_bb to populate session_bb with known assets
-        // This enables asset content change detection by populating PathMap with existing paths
-        for const_bid in &content_namespaces() {
-            let key = NodeKey::Bid { bid: *const_bid };
-            if let Some(const_ns_node) = global_bb.get_async(&key).await? {
-                // Process asset namespace node into session_bb
-                let const_ns_event = BeliefEvent::NodeUpdate(
-                    vec![key.clone()],
-                    const_ns_node.toml(),
-                    EventOrigin::Remote,
-                );
-                self.session_bb.process_event(&const_ns_event)?;
+        // Fetch const_namespaces from global_bb to populate session_bb with known assets.
+        // This enables asset content change detection by populating PathMap with existing paths.
+        // Guard: only run once per session — these are static global namespaces (href + asset)
+        // that never change between files. Repeating this on every initialize_stack call was the
+        // primary driver of session_bb O(N²) growth across a corpus run.
+        let content_ns_loaded = content_namespaces()
+            .iter()
+            .any(|bid| self.session_bb.get(&NodeKey::Bid { bid: *bid }).is_some());
+        if !content_ns_loaded {
+            for const_bid in &content_namespaces() {
+                let key = NodeKey::Bid { bid: *const_bid };
+                if let Some(const_ns_node) = global_bb.get_async(&key).await? {
+                    // Process asset namespace node into session_bb
+                    let const_ns_event = BeliefEvent::NodeUpdate(
+                        vec![key.clone()],
+                        const_ns_node.toml(),
+                        EventOrigin::Remote,
+                    );
+                    self.session_bb.process_event(&const_ns_event)?;
 
-                // Fetch all assets connected to this namespace
-                // Use eval to get the namespace and its relations
-                let const_expr = Expression::from(&key);
-                let const_graph = global_bb.eval(&const_expr).await?;
+                    // Fetch all assets connected to this namespace
+                    // Use eval to get the namespace and its relations
+                    let const_expr = Expression::from(&key);
+                    let const_graph = global_bb.eval(&const_expr).await?;
 
-                // Merge the fetched asset graph into session_bb
-                self.session_bb.merge(&const_graph);
+                    // Merge the fetched asset graph into session_bb
+                    self.session_bb.merge(&const_graph);
 
-                tracing::debug!(
-                    "[initialize_stack] Loaded {} assets from global cache for namespace {}",
-                    const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
-                    const_bid
-                );
+                    tracing::debug!(
+                        "[initialize_stack] Loaded {} assets from global cache for namespace {}",
+                        const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
+                        const_bid
+                    );
+                }
             }
-        }
+        } // end content_ns_loaded guard
 
         let initial_factory = CODECS
             .path_get(abs_path.as_ref())
