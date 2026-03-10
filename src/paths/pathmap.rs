@@ -325,9 +325,7 @@ impl PathMapMap {
         };
         for node in states.values() {
             pmm.titles.insert(node.bid, node.title.clone());
-            if let Some(id) = node.id.as_ref() {
-                pmm.ids.insert(node.bid, id.clone());
-            }
+            pmm.ids.insert(node.bid, node.id());
             if node.kind.contains(BeliefKind::API) {
                 pmm.apis.insert(node.bid);
             }
