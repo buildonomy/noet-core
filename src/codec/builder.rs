@@ -957,15 +957,15 @@ impl GraphBuilder {
                 id: network_id,
             };
             // Network|Document dual-kind nodes (e.g. MDN constructor pages where the filename
-            // matches the parent directory name, like `duration/duration/index.md`) must also
-            // register a Path key so that their child sections can anchor under them in the
-            // PathMap. Without the Path key, sections get no PathMap entry and push_relation
-            // panics when trying to regularize relative links from those sections.
-            if proto.kind.is_document() {
-                if let Some(path_key) = self.build_path_key(proto) {
-                    return Ok(vec![id_key, path_key]);
-                }
-            }
+            // matches the parent directory name, like `duration/duration/index.md`) must NOT
+            // register an additional Path key here. The path that `build_path_key` would
+            // produce is the parent network's child-address for this node (e.g. "duration"
+            // relative to `temporal/duration/`), which collides with the parent's own
+            // child-listing relation and creates a self-referential Section edge. The sections
+            // of the constructor page are addressed as "index.md#slug" in their own PathMap
+            // via the normal `build_path_key` path — and `push_relation` derives the owner
+            // path from the stack directly rather than the PathMap, so no Path key is needed
+            // here.
             return Ok(vec![id_key]);
         }
         Ok(self.build_path_key(proto).into_iter().collect())
@@ -1323,32 +1323,39 @@ impl GraphBuilder {
         let maybe_weight = &relation.weight;
         // When is_source_owned=false (sink-owned/upstream_relations): owner is sink, other is source
         // When is_source_owned=true (source-owned/downstream_relations): owner is source, other is sink
-        let other_key_regularized = match other_key.regularize(
-            &self.doc_bb,
-            *owner_bid,
-            self.repo(),
-            &os_path_to_string(&self.repo_root),
-        ) {
-            Ok(key) => key,
-            Err(e) => {
-                // This can happen for Network|Document dual-kind nodes (e.g. MDN constructor
-                // pages where filename == parent directory name) whose sections don't get a
-                // PathMap entry because speculative_path_key routes them through the ID branch
-                // rather than the Path branch. Until that is fixed, emit an UnresolvedReference
-                // diagnostic and skip this relation rather than panicking the whole corpus run.
-                tracing::warn!(
-                    "[push_relation] cannot regularize relation from owner {}: {}. \
-                     Skipping relation {:?} and emitting UnresolvedReference.",
-                    owner_bid,
-                    e,
-                    other_key
-                );
-                return Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
-                    other_keys: vec![other_key.clone()].into(),
-                    ..Default::default()
-                }));
-            }
-        };
+        //
+        // Derive the owner's repo-relative path from the stack rather than from PathMap.
+        //
+        // `regularize` (the previous approach) looks up the owner's path in PathMap, which fails
+        // for Phase 2 relations whose owner is a freshly-parsed node: at Phase 2 start the PathMap
+        // has been rebuilt after Phase 1, but sections of a Network|Document dual-kind node (e.g.
+        // `duration/duration/index.md`) have no PathMap entry yet because the Section edges
+        // connecting them to their home network haven't been emitted yet — those edges are exactly
+        // what Phase 2 is in the process of building.
+        //
+        // The stack is the authoritative source for Phase 1 and Phase 2: every node pushed in
+        // Phase 1 (and every ancestor pushed by initialize_stack) has an entry in self.stack.
+        // Stack paths are absolute; strip_prefix(repo_root) yields the repo-relative form that
+        // `regularize_unchecked` expects as `owner_path`.
+        //
+        // base_net remains self.repo() — `regularize_unchecked` assigns self.repo().bref() to
+        // any default-net Path key, which is correct: all document paths are registered in the
+        // repo-root PathMap regardless of which subnet they belong to.
+        let repo_root_str = os_path_to_string(&self.repo_root);
+        let owner_rel_path = self
+            .stack
+            .iter()
+            .rev()
+            .find(|(bid, _path, _heading)| bid == owner_bid)
+            .map(|(_bid, abs_owner_path, _heading)| {
+                AnchorPath::new(abs_owner_path)
+                    .strip_prefix(&repo_root_str)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| abs_owner_path.clone())
+            })
+            .unwrap_or_default();
+        let other_key_regularized =
+            other_key.regularize_unchecked(self.repo(), &owner_rel_path, &repo_root_str);
 
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
@@ -1519,6 +1526,32 @@ impl GraphBuilder {
                 (other_node.bid, *owner_bid)
             }
         };
+
+        // Guard against self-referential edges. This arises with Network|Document dual-kind
+        // nodes (e.g. MDN constructor pages where filename == parent directory name, like
+        // `duration/duration/index.md`). The parent network's child-list includes "duration"
+        // as a child path, and after the speculative_path_key fix that same node holds a
+        // Path key "duration" — so cache_fetch resolves the child relation back to the node
+        // itself. Without this guard the self-loop enters session_bb and is re-encountered
+        // on every subsequent initialize_stack, firing add_relations_seeded's self-connection
+        // warn hundreds of times and causing 30s stalls late in the corpus.
+        //
+        // The right long-term fix is in iter_net_docs / NetworkCodec::proto: exclude any
+        // child path that resolves to the same BID as the network node itself (i.e. detect
+        // the constructor-page pattern at filesystem scan time and skip the self-child).
+        // This guard is the minimal safe fix that prevents the symptom from accumulating.
+        if source_bid == sink_bid {
+            tracing::debug!(
+                "[push_relation] skipping self-referential {:?} edge on node {} \
+                 (owner={}, other={}). This is expected for Network|Document dual-kind \
+                 nodes where the child path resolves back to the network node itself.",
+                kind,
+                source_bid,
+                owner_bid,
+                other_node.bid,
+            );
+            return Ok(GetOrCreateResult::Resolved(other_node, other_node_source));
+        }
 
         update_queue.push(BeliefEvent::RelationChange(
             source_bid,
