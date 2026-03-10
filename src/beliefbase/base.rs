@@ -1175,14 +1175,6 @@ impl BeliefBase {
 
         // Append path events to derivatives for DbConnection and other subscribers
         derivative_events.append(&mut path_events);
-        // tracing::debug!(
-        //     "[process_event]: {event:?}\nderivatives:\n- {}",
-        //     derivative_events
-        //         .iter()
-        //         .map(|e| format!("{e:?}"))
-        //         .collect::<Vec<_>>()
-        //         .join("\n- ")
-        // );
         Ok(derivative_events)
     }
 
@@ -1720,6 +1712,7 @@ impl BeliefBase {
     /// `seed_bids`: when `Some`, restricts the relation DFS to those seeds (fixing the O(N²)
     /// BN-1 bottleneck). When `None`, seeds from `self.states ∩ rhs.states` (original behaviour).
     fn merge_graph_mut(&mut self, rhs: &BeliefGraph, seed_bids: Option<&BTreeSet<Bid>>) {
+<<<<<<< HEAD
         // Mutate states in-place using lhs-wins semantics: or_insert_with preserves any node
         // already present in self. This is intentionally different from union_mut (rhs-wins)
         // because BeliefBase::merge is used by doc_bb, which is the authority for the current
@@ -1730,6 +1723,11 @@ impl BeliefBase {
             if entry.kind.contains(BeliefKind::Trace) && !node.kind.contains(BeliefKind::Trace) {
                 entry.kind.remove(BeliefKind::Trace);
             }
+=======
+        // Mutate states in-place (same logic as union_mut / union_mut_from). rhs wins on conflict.
+        for node in rhs.states.values().filter(|n| n.kind.is_complete()) {
+            self.states.insert(node.bid, node.clone());
+>>>>>>> c9d7776 (perf(graph): add seeded DFS merge to fix O(N²) BN-1 bottleneck on large corpora)
         }
         // Keep brefs index consistent with states.
         self.brefs = BTreeMap::from_iter(self.states.keys().map(|bid| (bid.bref(), *bid)));

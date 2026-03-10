@@ -378,6 +378,20 @@ impl BeliefGraph {
     }
 
     fn add_relations(&mut self, rhs: &BeliefGraph) {
+        self.add_relations_seeded(rhs, None);
+    }
+
+    /// Like `add_relations`, but restricts the DFS seed set to `seed_bids` rather than
+    /// seeding from all of `self.states`. Use this when the caller already knows which rhs
+    /// nodes are relevant, avoiding an O(session_bb_size × rhs_edges) scan.
+    ///
+    /// `seed_bids` are looked up in `rhs.relations` — only seeds that exist in the rhs graph
+    /// are used. If `seed_bids` is `None`, behaviour is identical to `add_relations`.
+    pub(super) fn add_relations_seeded(
+        &mut self,
+        rhs: &BeliefGraph,
+        seed_bids: Option<&BTreeSet<Bid>>,
+    ) {
         let mut bid_to_index: BTreeMap<_, _> = self
             .relations
             .as_graph()
@@ -392,7 +406,13 @@ impl BeliefGraph {
             .node_indices()
             .filter_map(|idx| {
                 let bid = rhs_relations[idx];
-                if self.states.contains_key(&bid) {
+                let in_seed = match seed_bids {
+                    // Restricted mode: seed only from the caller-supplied set.
+                    Some(seeds) => seeds.contains(&bid),
+                    // Unrestricted mode (original behaviour): seed from anything already in self.
+                    None => self.states.contains_key(&bid),
+                };
+                if in_seed {
                     Some((bid, idx))
                 } else {
                     None
@@ -511,11 +531,30 @@ impl BeliefGraph {
         self.add_relations(rhs);
     }
 
+    /// Like `union_mut`, but restricts the DFS seed set in the relation merge to `seed_bids`.
+    ///
+    /// Use this when merging a large accumulated `rhs` graph (e.g. `missing_structure` after
+    /// processing all relations in a file) into a large `self` (e.g. `session_bb`). Without a
+    /// restricted seed the DFS visits O(session_bb_size) nodes per call, making the total cost
+    /// across a corpus O(N² × K). By supplying only the BIDs relevant to the current file the
+    /// DFS is bounded by O(rhs_size) regardless of how large `self` has grown.
+    ///
+    /// Correctness contract: `seed_bids` must be a subset of BIDs present in `rhs`. Any rhs
+    /// node reachable (forward or backward) from a seed will still be pulled into `self`; only
+    /// the starting points of the DFS are narrowed.
+    pub fn union_mut_from(&mut self, rhs: &BeliefGraph, seed_bids: &BTreeSet<Bid>) {
+        // State merge is identical to union_mut — rhs wins on conflict. Seeds only affect the
+        // relation DFS below.
+        for node in rhs.states.values().filter(|node| node.kind.is_complete()) {
+            self.states.insert(node.bid, node.clone());
+        }
+        self.add_relations_seeded(rhs, Some(seed_bids));
+    }
+
     /// Union with trace nodes included. Used during traversal where we want to accumulate
     /// nodes even if they're marked as Trace (incomplete relations). rhs wins on conflict,
     /// except that a Trace rhs node never downgrades a complete lhs node.
     pub fn union_mut_with_trace(&mut self, rhs: &BeliefGraph) {
-        // Accept all nodes from rhs, including Trace nodes
         for node in rhs.states.values() {
             match self.states.entry(node.bid) {
                 BTreeEntry::Vacant(e) => {

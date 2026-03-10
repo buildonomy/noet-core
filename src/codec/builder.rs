@@ -438,7 +438,12 @@ impl GraphBuilder {
             // balanced set.
             if !missing_structure.is_empty() {
                 tracing::debug!("Phase 2: merging missing structure onto session_bb and set");
-                self.session_bb.merge(&missing_structure);
+                // Use merge_from with the current file's parsed_bids as the DFS seed set.
+                // This bounds the DFS to O(rhs_size) rather than O(session_bb_size × rhs_edges),
+                // fixing the O(N²) BN-1 bottleneck on large corpora (Issue 47).
+                let parsed_bid_set: BTreeSet<Bid> = parsed_bids.iter().copied().collect();
+                self.session_bb
+                    .merge_from(&missing_structure, &parsed_bid_set);
                 self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
                 // we need to merge this phase 2 missing structure into self.doc_bb as well to ensure
                 // we have full structural paths to all the external nodes we connect to within the
