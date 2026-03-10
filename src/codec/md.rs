@@ -454,10 +454,11 @@ fn check_for_link_and_push(
             // We need to find root_abs_path = the absolute prefix that, when concatenated
             // with ctx_filepath, gives doc_abs_path (modulo extension differences).
             //
-            // Strategy: normalise both to an extensionless stem using plain string ops so
-            // that Windows absolute paths (C://...) are not misinterpreted as URLs by
-            // AnchorPath. Forward slashes are always used here (os_path_to_string guarantees
-            // that by the time paths reach the codec layer).
+            // Strategy: normalise both to an extensionless stem using plain string ops.
+            // AnchorPath is now drive-letter-aware (C:/... is treated as a plain absolute
+            // path, not a URL schema), so filepath() correctly preserves the drive prefix.
+            // Forward slashes are always used here (os_path_to_string guarantees that by
+            // the time paths reach the codec layer).
             let ctx_filepath = AnchorPath::new(&ctx.root_path).filepath();
 
             /// Strip the file extension from a forward-slash path string.

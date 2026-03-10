@@ -12,30 +12,58 @@ pub fn os_path_to_string<P: AsRef<Path>>(os_path_ref: P) -> String {
     #[cfg(windows)]
     use std::path::Prefix;
 
+    // On Windows, a drive-letter path (e.g. `C:\Users\foo`) decomposes into:
+    //   Prefix(Disk('C'))  →  "C:"
+    //   RootDir            →  ""   ← if we emit this, join("/") gives "C://Users"
+    //   Normal("Users")    →  "Users"
+    //
+    // The double slash would make AnchorPath treat "C:" as a URL schema — now moot
+    // since AnchorPath is drive-letter-aware, but the single-slash form is still
+    // the correct canonical representation and avoids any future ambiguity.
+    //
+    // Fix: track whether we just emitted a drive-letter Prefix and, if so, skip the
+    // immediately following RootDir component (the backslash is implied by "C:").
+    //
+    // On Linux there is never a Prefix, so RootDir still emits "" and the join
+    // produces the correct leading "/" for absolute paths.
+    #[cfg(windows)]
+    let mut skip_next_root_dir = false;
+
     let res = os_path_ref
         .as_ref()
         .components()
-        .filter_map(|c| match c {
-            Component::RootDir => Some(Cow::from("".to_string())),
-            #[cfg(windows)]
-            Component::Prefix(prefix) => {
-                // Extract drive letter from prefix, skip \\?\ verbatim prefix
-                match prefix.kind() {
-                    Prefix::VerbatimDisk(letter) | Prefix::Disk(letter) => {
-                        // Convert drive letter (e.g., b'C') to "C:"
-                        Some(Cow::from(format!("{}:", letter as char)))
+        .filter_map(|c| {
+            match c {
+                Component::RootDir => {
+                    #[cfg(windows)]
+                    if skip_next_root_dir {
+                        skip_next_root_dir = false;
+                        return None;
                     }
-                    _ => {
-                        // For other prefix types (UNC, VerbatimUNC, etc.), include as-is
-                        Some(prefix.as_os_str().to_string_lossy())
+                    Some(Cow::from("".to_string()))
+                }
+                #[cfg(windows)]
+                Component::Prefix(prefix) => {
+                    // Extract drive letter from prefix, skip \\?\ verbatim prefix
+                    match prefix.kind() {
+                        Prefix::VerbatimDisk(letter) | Prefix::Disk(letter) => {
+                            // Convert drive letter (e.g., b'C') to "C:"
+                            // Signal that the following RootDir is redundant.
+                            skip_next_root_dir = true;
+                            Some(Cow::from(format!("{}:", letter as char)))
+                        }
+                        _ => {
+                            // For other prefix types (UNC, VerbatimUNC, etc.), include as-is
+                            Some(prefix.as_os_str().to_string_lossy())
+                        }
                     }
                 }
+                #[cfg(not(windows))]
+                Component::Prefix(_) => None,
+                Component::Normal(s) => Some(s.to_string_lossy()),
+                Component::CurDir => Some(Cow::from(".")),
+                Component::ParentDir => Some(Cow::from("..")),
             }
-            #[cfg(not(windows))]
-            Component::Prefix(_) => None,
-            Component::Normal(s) => Some(s.to_string_lossy()),
-            Component::CurDir => Some(Cow::from(".")),
-            Component::ParentDir => Some(Cow::from("..")),
         })
         .collect::<Vec<_>>()
         .join("/");
@@ -113,7 +141,14 @@ impl<'a> AnchorPath<'a> {
                 .filter_map(|&x| x)
                 .min();
 
-            if first_separator.is_none() || colon_idx < first_separator.unwrap() {
+            // A single ASCII letter followed by ':' is a Windows drive letter (e.g. "C:"),
+            // not a URL schema. Treat it as a plain absolute path so that filepath(), dir(),
+            // join(), normalize(), etc. preserve the drive prefix rather than stripping it.
+            let is_drive_letter = colon_idx == 1 && path.as_bytes()[0].is_ascii_alphabetic();
+
+            if is_drive_letter {
+                None
+            } else if first_separator.is_none() || colon_idx < first_separator.unwrap() {
                 Some(colon_idx)
             } else {
                 None
@@ -131,9 +166,10 @@ impl<'a> AnchorPath<'a> {
         if let Some(sch_idx) = sch_sep {
             let after_schema = sch_idx + 1;
             // Check if we have // after the schema (indicates hierarchical URL with authority).
-            // A single-character schema is a Windows drive letter (e.g. "C://path") — the "//"
-            // is an absolute path, not a hostname authority. Zero-length ("://path") and
-            // multi-character schemas (http, ftp, file, …) do have a real hostname authority.
+            // Windows drive letters (e.g. "C:/...") are excluded before this block — they
+            // produce sch_sep = None so we never reach here for them.
+            // Zero-length schemas ("://path") and multi-character schemas (http, ftp, file, …)
+            // have a real hostname authority; single-char non-alpha colons (edge case) do not.
             let schema_is_url = sch_idx != 1;
             if schema_is_url
                 && after_schema + 1 < path.len()
@@ -236,7 +272,16 @@ impl<'a> AnchorPath<'a> {
     }
 
     pub fn is_absolute(&self) -> bool {
-        self.dir().starts_with('/')
+        // Standard Unix-style absolute path starts with '/'.
+        // Windows absolute paths start with a drive letter followed by ':/' (e.g. "C:/").
+        // Because drive letters are no longer parsed as URL schemas, filepath()/dir() now
+        // include the "C:" prefix, so we must check both forms here.
+        let d = self.dir();
+        d.starts_with('/')
+            || (d.len() >= 3
+                && d.as_bytes()[0].is_ascii_alphabetic()
+                && d.as_bytes()[1] == b':'
+                && d.as_bytes()[2] == b'/')
     }
 
     pub fn is_anchor(&self) -> bool {
@@ -867,8 +912,18 @@ impl<'a> AnchorPath<'a> {
         if self.has_schema() {
             return String::new();
         }
-        let filepath = self.filepath().trim_start_matches('/');
-        format!("{}{}", filepath, as_anchor(self.anchor()))
+        // Strip leading '/' for Unix absolute paths, or "X:/" for Windows absolute paths.
+        let filepath = self.filepath();
+        let stripped = if filepath.len() >= 3
+            && filepath.as_bytes()[0].is_ascii_alphabetic()
+            && filepath.as_bytes()[1] == b':'
+            && filepath.as_bytes()[2] == b'/'
+        {
+            &filepath[3..]
+        } else {
+            filepath.trim_start_matches('/')
+        };
+        format!("{}{}", stripped, as_anchor(self.anchor()))
     }
 
     pub fn replace_extension(&self, new_extension: &str) -> String {
@@ -1657,14 +1712,17 @@ mod tests {
         assert!(ap.has_schema());
         assert_eq!(ap.schema(), "custom-protocol");
 
-        // Single letter token before colon is a Windows drive letter.
-        // It is detected as a schema (for backward compat with single-slash form "C:/..."),
-        // but the "//" form "C://..." must NOT trigger hostname parsing.
+        // Single letter followed by colon is a Windows drive letter — NOT a URL schema.
+        // AnchorPath now treats it as a plain absolute path, preserving the drive prefix.
         let ap = AnchorPath::new("c:/Windows/file.txt");
-        assert!(ap.has_schema());
-        assert_eq!(ap.schema(), "c");
-        assert_eq!(ap.filepath(), "/Windows/file.txt");
-        assert_eq!(ap.dir(), "/Windows");
+        assert!(
+            !ap.has_schema(),
+            "drive letter must not be detected as schema"
+        );
+        assert_eq!(ap.schema(), "");
+        assert_eq!(ap.filepath(), "c:/Windows/file.txt");
+        assert_eq!(ap.dir(), "c:/Windows");
+        assert!(ap.is_absolute());
 
         // Empty schema with //
         let ap = AnchorPath::new("://path");
@@ -1744,58 +1802,88 @@ mod tests {
 
     #[test]
     fn test_windows_absolute_paths() {
-        // Windows absolute paths produced by os_path_to_string use forward slashes and
-        // may have double-slash after the drive letter: "C://Users/...".
-        // The drive letter "C" must NOT be treated as a URL schema with "Users" as hostname.
+        // AnchorPath now treats single-char alpha + ':' as a Windows drive letter,
+        // NOT a URL schema.  filepath() and dir() include the full "C:/" prefix,
+        // is_absolute() returns true, has_schema() returns false.
 
-        // Double-slash form (what os_path_to_string produces on Windows)
-        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/test.md");
-        assert!(ap.has_schema(), "drive letter still detected as schema");
-        assert!(!ap.has_hostname(), "C:// must not produce a hostname");
-        assert_eq!(ap.schema(), "C");
+        // Basic file path
+        let ap = AnchorPath::new("C:/Users/RUNNER/AppData/Local/Temp/test.md");
+        assert!(
+            !ap.has_schema(),
+            "drive letter must not be detected as schema"
+        );
+        assert!(!ap.has_hostname(), "C:/ must not produce a hostname");
+        assert_eq!(ap.schema(), "");
         assert_eq!(ap.hostname(), "");
-        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp");
+        assert_eq!(ap.dir(), "C:/Users/RUNNER/AppData/Local/Temp");
         assert_eq!(ap.filename(), "test.md");
         assert_eq!(ap.filestem(), "test");
         assert_eq!(ap.ext(), "md");
-        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/test.md");
+        assert_eq!(ap.filepath(), "C:/Users/RUNNER/AppData/Local/Temp/test.md");
+        assert!(ap.is_absolute());
 
-        // Directory path (no extension) — double-slash drive form
-        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/subnet1");
-        assert!(ap.has_schema());
+        // Directory path (no extension)
+        let ap = AnchorPath::new("C:/Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert!(!ap.has_schema());
         assert!(!ap.has_hostname());
-        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert_eq!(ap.dir(), "C:/Users/RUNNER/AppData/Local/Temp/subnet1");
         assert_eq!(ap.filename(), "");
         assert_eq!(ap.filestem(), "");
-        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert_eq!(ap.filepath(), "C:/Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert!(ap.is_absolute());
 
         // Network index path
-        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/subnet1/index.md");
-        assert!(ap.has_schema());
+        let ap = AnchorPath::new("C:/Users/RUNNER/AppData/Local/Temp/subnet1/index.md");
+        assert!(!ap.has_schema());
         assert!(!ap.has_hostname());
-        assert_eq!(ap.dir(), "//Users/RUNNER/AppData/Local/Temp/subnet1");
+        assert_eq!(ap.dir(), "C:/Users/RUNNER/AppData/Local/Temp/subnet1");
         assert_eq!(ap.filename(), "index.md");
         assert_eq!(ap.filestem(), "index");
         assert_eq!(ap.ext(), "md");
         assert_eq!(
             ap.filepath(),
-            "//Users/RUNNER/AppData/Local/Temp/subnet1/index.md"
+            "C:/Users/RUNNER/AppData/Local/Temp/subnet1/index.md"
         );
 
         // With anchor fragment
-        let ap = AnchorPath::new("C://Users/RUNNER/AppData/Local/Temp/test.md#section");
-        assert!(ap.has_schema());
+        let ap = AnchorPath::new("C:/Users/RUNNER/AppData/Local/Temp/test.md#section");
+        assert!(!ap.has_schema());
         assert!(!ap.has_hostname());
-        assert_eq!(ap.filepath(), "//Users/RUNNER/AppData/Local/Temp/test.md");
+        assert_eq!(ap.filepath(), "C:/Users/RUNNER/AppData/Local/Temp/test.md");
         assert_eq!(ap.anchor(), "section");
+        assert!(ap.is_absolute());
 
         // Lowercase drive letter
-        let ap = AnchorPath::new("c://tmp/project/docs/guide.md");
-        assert!(ap.has_schema());
+        let ap = AnchorPath::new("c:/tmp/project/docs/guide.md");
+        assert!(!ap.has_schema());
         assert!(!ap.has_hostname());
-        assert_eq!(ap.dir(), "//tmp/project/docs");
+        assert_eq!(ap.dir(), "c:/tmp/project/docs");
         assert_eq!(ap.filestem(), "guide");
         assert_eq!(ap.ext(), "md");
+        assert!(ap.is_absolute());
+
+        // normalize() must preserve the drive-letter prefix
+        let ap = AnchorPath::new("C:/Users/foo/../bar/./baz.md");
+        assert_eq!(
+            ap.normalize().as_anchor_path().filepath(),
+            "C:/Users/bar/baz.md"
+        );
+
+        // join() with a relative path must preserve the drive-letter base
+        let base = AnchorPath::new("C:/Users/foo/doc.md");
+        let joined = base.join("../assets/img.png");
+        assert_eq!(
+            joined.as_anchor_path().filepath(),
+            "C:/Users/assets/img.png"
+        );
+
+        // starts_with check (mirrors regularize_unchecked guard)
+        let base_abs = "C:/Users/RUNNER/repo";
+        let link_abs = "C:/Users/RUNNER/repo/assets/img.png";
+        assert!(
+            AnchorPath::new(link_abs).path.starts_with(base_abs),
+            "drive-letter path must start_with its base"
+        );
 
         // Real URL schemas (>=2 chars) must still parse hostname correctly
         let ap = AnchorPath::new("https://example.com/path/file.html");
