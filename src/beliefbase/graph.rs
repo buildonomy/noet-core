@@ -502,30 +502,32 @@ impl BeliefGraph {
     }
 
     pub fn union_mut(&mut self, rhs: &BeliefGraph) {
-        // First, union the states with the non-trace elements of rhs.
+        // Union the states with the non-trace elements of rhs. rhs wins on conflict so that
+        // callers can rely on passing the fresher/more-authoritative graph as rhs to overwrite
+        // stale lhs content. This is consistent with edge semantics (update_edge also overwrites).
         for node in rhs.states.values().filter(|node| node.kind.is_complete()) {
-            let self_node_entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
-            if self_node_entry.kind.contains(BeliefKind::Trace)
-                && !node.kind.contains(BeliefKind::Trace)
-            {
-                // rhs asserts it contains all relations for this node, so remove the Trace kind.
-                self_node_entry.kind.remove(BeliefKind::Trace);
-            }
+            self.states.insert(node.bid, node.clone());
         }
         self.add_relations(rhs);
     }
 
     /// Union with trace nodes included. Used during traversal where we want to accumulate
-    /// nodes even if they're marked as Trace (incomplete relations).
+    /// nodes even if they're marked as Trace (incomplete relations). rhs wins on conflict,
+    /// except that a Trace rhs node never downgrades a complete lhs node.
     pub fn union_mut_with_trace(&mut self, rhs: &BeliefGraph) {
         // Accept all nodes from rhs, including Trace nodes
         for node in rhs.states.values() {
-            let self_node_entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
-            if self_node_entry.kind.contains(BeliefKind::Trace)
-                && !node.kind.contains(BeliefKind::Trace)
-            {
-                // rhs asserts it contains all relations for this node, so remove the Trace kind.
-                self_node_entry.kind.remove(BeliefKind::Trace);
+            match self.states.entry(node.bid) {
+                BTreeEntry::Vacant(e) => {
+                    e.insert(node.clone());
+                }
+                BTreeEntry::Occupied(mut e) => {
+                    let existing = e.get();
+                    // rhs wins unless rhs is Trace and lhs is already complete.
+                    if !(node.kind.contains(BeliefKind::Trace) && existing.kind.is_complete()) {
+                        *e.get_mut() = node.clone();
+                    }
+                }
             }
         }
         self.add_relations(rhs);
@@ -770,5 +772,364 @@ impl From<&BeliefBase> for BeliefGraph {
 impl fmt::Display for BeliefGraph {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.display_contents())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::properties::{
+        BeliefKind, BeliefKindSet, BeliefNode, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
+    };
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    fn make_node(bid: Bid, title: &str, kind: BeliefKind) -> BeliefNode {
+        BeliefNode {
+            bid,
+            title: title.to_string(),
+            kind: BeliefKindSet(kind.into()),
+            ..Default::default()
+        }
+    }
+
+    fn make_weights(sort_key: u16) -> WeightSet {
+        let mut w = Weight::default();
+        w.set(WEIGHT_SORT_KEY, sort_key).ok();
+        let mut ws = WeightSet::empty();
+        ws.set(WeightKind::Section, w);
+        ws
+    }
+
+    /// Build a BeliefGraph from a node list and an edge list (source, sink, sort_key).
+    fn make_graph(nodes: Vec<BeliefNode>, edges: Vec<(Bid, Bid, u16)>) -> BeliefGraph {
+        let states: BTreeMap<Bid, BeliefNode> = nodes.iter().map(|n| (n.bid, n.clone())).collect();
+        let relations = BidGraph::from_edges(
+            edges
+                .into_iter()
+                .map(|(src, snk, sk)| (src, snk, make_weights(sk))),
+        );
+        BeliefGraph { states, relations }
+    }
+
+    /// Extract the sort_key for the single edge (source→sink) in `g`, panicking if absent.
+    fn edge_sort_key(g: &BeliefGraph, source: Bid, sink: Bid) -> Option<u16> {
+        g.relations.as_graph().raw_edges().iter().find_map(|e| {
+            let s = g.relations.as_graph()[e.source()];
+            let t = g.relations.as_graph()[e.target()];
+            if s == source && t == sink {
+                e.weight.get(&WeightKind::Section)?.get(WEIGHT_SORT_KEY)
+            } else {
+                None
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // T1: Idempotency — union_mut(A, A) == A
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_idempotent() {
+        let net = Bid::new(Bid::nil());
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+
+        let a = make_graph(
+            vec![
+                make_node(net, "Net", BeliefKind::Network),
+                make_node(x, "X", BeliefKind::Document),
+                make_node(y, "Y", BeliefKind::Document),
+            ],
+            vec![(x, net, 0), (y, net, 1)],
+        );
+
+        let mut result = a.clone();
+        result.union_mut(&a);
+
+        assert_eq!(result.states.len(), a.states.len(), "state count unchanged");
+        assert_eq!(
+            result.relations.as_graph().edge_count(),
+            a.relations.as_graph().edge_count(),
+            "edge count unchanged"
+        );
+        assert_eq!(edge_sort_key(&result, x, net), Some(0));
+        assert_eq!(edge_sort_key(&result, y, net), Some(1));
+    }
+
+    // -------------------------------------------------------------------------
+    // T2: Disjoint state sets are commutative (first-writer-wins is moot when
+    //     there is no conflict — documents the ownership invariant happy path).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_disjoint_states_commutative() {
+        let net = Bid::new(Bid::nil());
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+
+        let a = make_graph(vec![make_node(x, "X", BeliefKind::Document)], vec![]);
+        let b = make_graph(vec![make_node(y, "Y", BeliefKind::Document)], vec![]);
+
+        let mut r1 = BeliefGraph::default();
+        r1.union_mut(&a);
+        r1.union_mut(&b);
+
+        let mut r2 = BeliefGraph::default();
+        r2.union_mut(&b);
+        r2.union_mut(&a);
+
+        assert_eq!(r1.states.len(), r2.states.len());
+        assert_eq!(
+            r1.states.keys().collect::<Vec<_>>(),
+            r2.states.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // T3: Conflicting state for the same BID is non-commutative (rhs-wins).
+    //     If two tasks produce a node with the same BID but different content,
+    //     the merge result depends on insertion order — the last graph passed
+    //     as rhs overwrites. Consistent with edge semantics (update_edge).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_state_conflict_rhs_wins() {
+        let net = Bid::new(Bid::nil());
+        let shared = Bid::new(net);
+
+        let a = make_graph(
+            vec![make_node(shared, "Version A", BeliefKind::Document)],
+            vec![],
+        );
+        let b = make_graph(
+            vec![make_node(shared, "Version B", BeliefKind::Document)],
+            vec![],
+        );
+
+        let mut r1 = BeliefGraph::default();
+        r1.union_mut(&a);
+        r1.union_mut(&b); // B applied last as rhs → wins
+
+        let mut r2 = BeliefGraph::default();
+        r2.union_mut(&b);
+        r2.union_mut(&a); // A applied last as rhs → wins
+
+        // rhs wins in both cases: last-applied graph's content takes effect.
+        assert_eq!(r1.states[&shared].title, "Version B");
+        assert_eq!(r2.states[&shared].title, "Version A");
+        // Non-commutative: order still matters, but now consistently rhs-wins rather than lhs-wins.
+        assert_ne!(r1.states[&shared].title, r2.states[&shared].title);
+    }
+
+    // -------------------------------------------------------------------------
+    // T4: Conflicting edge for the same (source, sink) pair is non-commutative
+    //     (last-writer-wins via update_edge). Documents WEIGHT_SORT_KEY
+    //     sensitivity: the final sort key depends on merge order.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_edge_conflict_is_non_commutative() {
+        let net = Bid::new(Bid::nil());
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+
+        // Both graphs own the same edge x→y but with different sort keys.
+        let a = make_graph(
+            vec![
+                make_node(x, "X", BeliefKind::Document),
+                make_node(y, "Y", BeliefKind::Document),
+            ],
+            vec![(x, y, 0)],
+        );
+        let b = make_graph(
+            vec![
+                make_node(x, "X", BeliefKind::Document),
+                make_node(y, "Y", BeliefKind::Document),
+            ],
+            vec![(x, y, 99)],
+        );
+
+        let mut r1 = BeliefGraph::default();
+        r1.union_mut(&a);
+        r1.union_mut(&b); // b applied last → sort_key=99 wins
+
+        let mut r2 = BeliefGraph::default();
+        r2.union_mut(&b);
+        r2.union_mut(&a); // a applied last → sort_key=0 wins
+
+        assert_eq!(
+            edge_sort_key(&r1, x, y),
+            Some(99),
+            "b wins when applied last"
+        );
+        assert_eq!(
+            edge_sort_key(&r2, x, y),
+            Some(0),
+            "a wins when applied last"
+        );
+        assert_ne!(
+            edge_sort_key(&r1, x, y),
+            edge_sort_key(&r2, x, y),
+            "edge merge is order-dependent under conflict"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // T5: Fully disjoint tasks are commutative — the ownership invariant
+    //     happy path. This is the critical gate test for Issue 57: if tasks
+    //     own disjoint BID sets and disjoint edge sets, parallel merging is
+    //     safe regardless of order.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_disjoint_tasks_commutative() {
+        let net = Bid::new(Bid::nil());
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+        let p = Bid::new(net);
+        let q = Bid::new(net);
+
+        // Task A: owns nodes X, Y and edge X→Y
+        let a = make_graph(
+            vec![
+                make_node(x, "X", BeliefKind::Document),
+                make_node(y, "Y", BeliefKind::Document),
+            ],
+            vec![(x, y, 1)],
+        );
+        // Task B: owns nodes P, Q and edge P→Q — completely disjoint from A
+        let b = make_graph(
+            vec![
+                make_node(p, "P", BeliefKind::Document),
+                make_node(q, "Q", BeliefKind::Document),
+            ],
+            vec![(p, q, 2)],
+        );
+
+        let mut r1 = BeliefGraph::default();
+        r1.union_mut(&a);
+        r1.union_mut(&b);
+
+        let mut r2 = BeliefGraph::default();
+        r2.union_mut(&b);
+        r2.union_mut(&a);
+
+        // State sets must be identical.
+        assert_eq!(
+            r1.states.keys().collect::<Vec<_>>(),
+            r2.states.keys().collect::<Vec<_>>(),
+            "state sets equal under disjoint merge"
+        );
+        // Edge counts must match.
+        assert_eq!(
+            r1.relations.as_graph().edge_count(),
+            r2.relations.as_graph().edge_count(),
+            "edge counts equal under disjoint merge"
+        );
+        // Individual edge weights must match.
+        assert_eq!(edge_sort_key(&r1, x, y), edge_sort_key(&r2, x, y));
+        assert_eq!(edge_sort_key(&r1, p, q), edge_sort_key(&r2, p, q));
+    }
+
+    // -------------------------------------------------------------------------
+    // T6: Shared namespace / API node appears exactly once regardless of merge
+    //     order. Because the API node is identical in both graphs (same BID,
+    //     same content), first-writer-wins is idempotent and both orderings
+    //     produce the same result.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_shared_api_node_commutative() {
+        let net = Bid::new(Bid::nil());
+        let api = Bid::new(net);
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+
+        let api_node = make_node(api, "API", BeliefKind::Network);
+
+        // Both tasks share the identical API node.
+        let a = make_graph(
+            vec![api_node.clone(), make_node(x, "X", BeliefKind::Document)],
+            vec![(x, api, 0)],
+        );
+        let b = make_graph(
+            vec![api_node.clone(), make_node(y, "Y", BeliefKind::Document)],
+            vec![(y, api, 1)],
+        );
+
+        let mut r1 = BeliefGraph::default();
+        r1.union_mut(&a);
+        r1.union_mut(&b);
+
+        let mut r2 = BeliefGraph::default();
+        r2.union_mut(&b);
+        r2.union_mut(&a);
+
+        // API node appears exactly once in both results.
+        assert_eq!(r1.states.len(), 3, "api + x + y, no duplicates (r1)");
+        assert_eq!(r2.states.len(), 3, "api + x + y, no duplicates (r2)");
+
+        // API node content is identical in both orderings.
+        assert_eq!(r1.states[&api].title, r2.states[&api].title);
+
+        // Both edges are present in both results.
+        assert!(edge_sort_key(&r1, x, api).is_some());
+        assert!(edge_sort_key(&r1, y, api).is_some());
+        assert!(edge_sort_key(&r2, x, api).is_some());
+        assert!(edge_sort_key(&r2, y, api).is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // T7: Three-way merge associativity under disjoint ownership.
+    //     merge(merge(base, A), B) == merge(merge(base, B), A)
+    //     This is the compiler's post-epoch pattern extended to three tasks.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_union_mut_three_way_merge_associative_under_disjoint_ownership() {
+        let net = Bid::new(Bid::nil());
+        let base_node = Bid::new(net);
+        let x = Bid::new(net);
+        let y = Bid::new(net);
+        let p = Bid::new(net);
+        let q = Bid::new(net);
+
+        let base = make_graph(
+            vec![make_node(base_node, "Base", BeliefKind::Network)],
+            vec![],
+        );
+        let a = make_graph(
+            vec![
+                make_node(x, "X", BeliefKind::Document),
+                make_node(y, "Y", BeliefKind::Document),
+            ],
+            vec![(x, y, 10)],
+        );
+        let b = make_graph(
+            vec![
+                make_node(p, "P", BeliefKind::Document),
+                make_node(q, "Q", BeliefKind::Document),
+            ],
+            vec![(p, q, 20)],
+        );
+
+        // merge(merge(base, A), B)
+        let mut r1 = base.clone();
+        r1.union_mut(&a);
+        r1.union_mut(&b);
+
+        // merge(merge(base, B), A)
+        let mut r2 = base.clone();
+        r2.union_mut(&b);
+        r2.union_mut(&a);
+
+        assert_eq!(
+            r1.states.keys().collect::<Vec<_>>(),
+            r2.states.keys().collect::<Vec<_>>(),
+            "three-way merge produces identical state sets under disjoint ownership"
+        );
+        assert_eq!(
+            r1.relations.as_graph().edge_count(),
+            r2.relations.as_graph().edge_count(),
+            "three-way merge produces identical edge counts under disjoint ownership"
+        );
+        assert_eq!(edge_sort_key(&r1, x, y), edge_sort_key(&r2, x, y));
+        assert_eq!(edge_sort_key(&r1, p, q), edge_sort_key(&r2, p, q));
     }
 }
