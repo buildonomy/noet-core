@@ -2,80 +2,111 @@
 
 This directory contains Criterion-based performance benchmarks for noet-core.
 
-## Purpose
+## Benchmark Tiers
 
-These benchmarks measure regression in key operations:
-- Document parsing and compilation
-- BID generation and caching
-- Multi-pass reference resolution
-- Graph queries (PathMap lookups, edge traversal)
+### Micro-benchmarks (`document_processing.rs`)
 
-**Note**: These are micro-benchmarks using the small `tests/network_1` corpus (~10KB). For GB-scale performance characterization, see **ISSUE_47**.
+Function-level benchmarks using the small `tests/network_1` corpus (~10 KB).
+Purpose: regression detection on specific operations.
 
-## Running Benchmarks
+- **`parse_all_documents`** — full document parsing with multi-pass compilation
+- **`bid_generation_and_caching`** — BID generation with event accumulation
+- **`multi_pass_reference_resolution`** — cold-cache vs warm-cache parse
+- **`graph_queries`** — PathMap lookups and edge traversal on a compiled graph
 
-```bash
-# Run all benchmarks
+### Macro-benchmarks (`macro_benchmarks.rs`)
+
+Corpus-scale benchmarks using the [MDN content](https://github.com/mdn/content)
+repository (~14 000 `index.md` files, ~55 MB of markdown). Large enough to
+trigger noet's sharding strategy and reveal scaling behaviour invisible in the
+micro-benchmark corpus.
+
+- **`parse_throughput/mdn_en_us`** — single-pass parse + HTML generation across
+  the full `files/en-us/` tree; measures end-to-end throughput (bytes/sec)
+- **`cache_warmup/mdn_en_us`** — two consecutive passes (cold then warm);
+  comparing against `parse_throughput` isolates the BID cache benefit
+- **`graph_queries/traverse_all_edges`** — traverses every edge in the compiled
+  graph; corpus is pre-compiled outside the timed loop
+
+## Quick Start
+
+```sh
+# 1. Fetch the MDN corpus (sparse checkout, only *.md — ~30 s first time)
+bash benches/fetch_corpora.sh
+
+# 2. Run micro-benchmarks (fast, no corpus needed)
 cargo bench --features service
 
-# Run specific benchmark
-cargo bench --features service -- parse_all_documents
+# 3. Run macro-benchmarks (slow, corpus required)
+cargo bench --bench macro_benchmarks --features bin,service
 
-# Save baseline for comparison
-cargo bench --features service -- --save-baseline main
-
-# Compare against baseline
-cargo bench --features service -- --baseline main
+# 4. Browse HTML output
+xdg-open target/bench-output/mdn/index.html   # Linux
+open target/bench-output/mdn/index.html        # macOS
 ```
 
-## Viewing Results
+## Baseline Workflow
 
-Criterion generates HTML reports in `target/criterion/`:
+```sh
+# Save a named baseline on main
+cargo bench --bench macro_benchmarks --features bin,service -- --save-baseline main
 
-```bash
-# Open in browser (macOS)
-open target/criterion/report/index.html
+# Compare a branch against the saved baseline
+cargo bench --bench macro_benchmarks --features bin,service -- --baseline main
+```
 
-# Open in browser (Linux)
+Criterion generates HTML reports under `target/criterion/`:
+
+```sh
 xdg-open target/criterion/report/index.html
 ```
 
-## Benchmark Details
+## Corpus Details
 
-### `parse_all_documents`
-- **What**: Full document parsing with multi-pass compilation
-- **Mirrors**: `examples/basic_usage.rs`
-- **Measures**: End-to-end parse time for entire corpus
+| Property | Value |
+|----------|-------|
+| Source | `mdn/content` @ `6c53947` |
+| Root | `.bench_corpora/mdn-content/files/en-us/` |
+| Files | ~14 000 `index.md` files |
+| Size | ~55 MB markdown |
+| Structure | Every directory has an `index.md` — no staging needed |
 
-### `bid_generation_and_caching`
-- **What**: BID generation with event accumulation
-- **Mirrors**: `tests/codec_test/bid_tests.rs::test_belief_set_builder_bid_generation_and_caching`
-- **Measures**: Parse time with BeliefBase event tracking
+The MDN layout matches what `NetworkCodec` expects: each directory is a subnet
+identified by the presence of `index.md`. No copying or pre-processing is
+performed; the benchmark reads directly from `.bench_corpora/`.
 
-### `multi_pass_reference_resolution`
-- **What**: Two consecutive parses (cold cache, then warm cache)
-- **Measures**: Cache warming effects on parse performance
-
-### `graph_queries`
-- **What**: Document node queries and edge traversal
-- **Measures**: Query performance on compiled graph (no I/O)
+To advance the corpus baseline, update `MDN_SHA` in `fetch_corpora.sh` to a
+newer commit on `mdn/content:main` and re-run `fetch_corpora.sh --force`.
 
 ## Configuration
 
-- **Sample size**: 50 iterations (reduced from default 100 due to file I/O)
-- **Measurement time**: 10 seconds per benchmark
-- **Corpus**: `tests/network_1` (~10KB, 9 markdown files, 31 cross-references)
+| Setting | Micro | Macro |
+|---------|-------|-------|
+| Sample size | 50 | 10 |
+| Measurement time | 10 s | 120 s |
+| Corpus | `tests/network_1` (~10 KB) | `mdn/content` (~55 MB) |
+| Features | `service` | `bin,service` |
+
+Sample counts are intentionally low for macro-benchmarks: each iteration
+involves real file I/O across thousands of files. At 10 samples the relative
+comparisons (e.g. "warm cache is 2× faster") are still statistically sound
+even if absolute numbers vary between machines.
 
 ## CI Integration
 
-Benchmarks run automatically in GitHub Actions on push to `main`:
-- See `.github/workflows/test.yml` → `benchmark` job
-- Results stored as artifacts (not compared automatically)
-- For local regression detection, use `--baseline` flag
+Micro-benchmarks run automatically in GitHub Actions on push to `main`
+(see `.github/workflows/test.yml` → `benchmark` job). Results are stored as
+artifacts but not automatically compared — use `--baseline` locally for
+regression detection.
 
-## Future Work
+Macro-benchmarks are **not** run in CI: the MDN corpus fetch would add ~30 s
+and the measurement time is too long for shared runners. Run them locally
+before performance-sensitive merges.
 
-See **ISSUE_47** for:
-- Macro-benchmarks with realistic corpora (10KB → 100MB+)
-- Memory profiling infrastructure
-- GB-scale performance characterization
+## Relationship to ISSUE_47
+
+- **ISSUE_07** established the micro-benchmarks for regression detection.
+- **ISSUE_47** added the macro-benchmarks and memory profiling infrastructure.
+  The MDN corpus replaces the earlier rust-book / rust-reference corpora, which
+  were too small to trigger sharding and contained non-CommonMark syntax
+  (`r[rule.id]` anchor labels in rust-reference) that `MdCodec` does not parse.

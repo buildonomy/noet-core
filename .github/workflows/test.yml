@@ -459,9 +459,24 @@ jobs:
         with:
           shared-key: bench
 
-      - name: Run benchmarks
+      - name: Cache benchmark corpora
+        uses: actions/cache@v4
+        id: cache-corpora
+        with:
+          path: .bench_corpora
+          key: bench-corpora-05d114287b7d-c49e89cc8c7c
+
+      - name: Fetch benchmark corpora
+        if: steps.cache-corpora.outputs.cache-hit != 'true'
+        run: bash benches/fetch_corpora.sh
+
+      - name: Run micro-benchmarks
         run: |
-          cargo bench --all-features --no-fail-fast
+          cargo bench --bench document_processing --features service --no-fail-fast
+
+      - name: Run macro-benchmarks
+        run: |
+          cargo bench --bench macro_benchmarks --features bin,service --no-fail-fast
 
       - name: Upload benchmark results
         if: success()
@@ -471,6 +486,137 @@ jobs:
           path: |
             target/criterion/
           retention-days: 30
+
+  # Corpus pages: compile real-world corpora to HTML and publish to GitHub Pages.
+  # Serves two purposes:
+  #   1. Manual browser-based performance validation of the SPA on real content.
+  #   2. Criterion HTML reports hosted alongside the rendered output.
+  corpus-pages:
+    name: Corpus Pages
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Pages deployment requires write permission to pages and id-token for OIDC.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v4
+        id: cache-wasm-bindgen
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-0.2.108-${{ runner.os }}
+
+      - name: Install wasm-bindgen-cli
+        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: corpus-pages
+
+      - name: Cache benchmark corpora
+        uses: actions/cache@v4
+        id: cache-corpora
+        with:
+          path: .bench_corpora
+          key: bench-corpora-05d114287b7d-c49e89cc8c7c
+
+      - name: Fetch benchmark corpora
+        if: steps.cache-corpora.outputs.cache-hit != 'true'
+        run: bash benches/fetch_corpora.sh
+
+      - name: Run micro-benchmarks (for Criterion HTML reports)
+        run: |
+          cargo bench --bench document_processing --features service --no-fail-fast
+
+      - name: Run macro-benchmarks — Rust Book (HTML + Criterion reports)
+        env:
+          NOET_BASE_URL: https://buildonomy.github.io/noet-core/corpus/rust-book
+        run: |
+          cargo bench --bench macro_benchmarks --features bin,service --no-fail-fast \
+            -- full_corpus/Rust\ Book
+
+      - name: Run macro-benchmarks — Rust Reference (HTML + Criterion reports)
+        env:
+          NOET_BASE_URL: https://buildonomy.github.io/noet-core/corpus/rust-reference
+        run: |
+          cargo bench --bench macro_benchmarks --features bin,service --no-fail-fast \
+            -- full_corpus/Rust\ Reference
+
+      - name: Run remaining macro-benchmarks (combined, cache_warmup, graph_queries)
+        run: |
+          cargo bench --bench macro_benchmarks --features bin,service --no-fail-fast \
+            -- combined_corpus cache_warmup graph_queries
+
+      - name: Copy corpus HTML into site
+        run: |
+          mkdir -p site/corpus/rust-book site/corpus/rust-reference
+          cp -r target/bench-output/rust-book/. site/corpus/rust-book/
+          cp -r target/bench-output/rust-reference/. site/corpus/rust-reference/
+
+      - name: Copy Criterion reports into site
+        run: |
+          mkdir -p site/benchmarks
+          cp -r target/criterion/. site/benchmarks/
+
+      - name: Write Pages index
+        run: |
+          cat > site/index.html << 'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <title>noet-core Performance Pages</title>
+            <style>
+              body { font-family: sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+              h1 { font-size: 1.5rem; }
+              ul { line-height: 2; }
+            </style>
+          </head>
+          <body>
+            <h1>noet-core — Performance &amp; Corpus Pages</h1>
+            <h2>Corpus Outputs (manual browser validation)</h2>
+            <ul>
+              <li><a href="corpus/rust-book/">Rust Book</a></li>
+              <li><a href="corpus/rust-reference/">Rust Reference</a></li>
+            </ul>
+            <h2>Benchmark Reports (Criterion)</h2>
+            <ul>
+              <li><a href="benchmarks/report/index.html">All benchmarks</a></li>
+              <li><a href="benchmarks/parse_throughput/report/index.html">parse_throughput</a></li>
+              <li><a href="benchmarks/combined_corpus/report/index.html">combined_corpus</a></li>
+              <li><a href="benchmarks/cache_warmup/report/index.html">cache_warmup</a></li>
+              <li><a href="benchmarks/graph_queries/report/index.html">graph_queries (macro)</a></li>
+              <li><a href="benchmarks/parse_all_documents/report/index.html">parse_all_documents (micro)</a></li>
+            </ul>
+          </body>
+          </html>
+          EOF
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
 
   # Standalone crate test (Issue 7 requirement)
   standalone:

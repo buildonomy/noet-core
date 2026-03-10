@@ -50,6 +50,9 @@ tarpaulin-report.html
 # Benchmark results
 criterion/
 
+# Benchmark corpora (fetched on demand by benches/fetch_corpora.sh)
+.bench_corpora/
+
 # Python (for tooling/scripts)
 __pycache__/
 *.py[cod]

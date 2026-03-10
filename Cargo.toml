@@ -134,3 +134,8 @@ required-features = ["bin"]
 name = "document_processing"
 harness = false
 required-features = ["service"]
+
+[[bench]]
+name = "macro_benchmarks"
+harness = false
+required-features = ["service"]
