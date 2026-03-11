@@ -111,6 +111,18 @@ optimization after BN-1 is addressed.
 
 ### Three-Tier Benchmark Strategy
 
+**Tier 0: Log analysis tools** (implemented, `benches/log_analysis/`)
+- `parse_log.py`: analyses `RUST_LOG=debug` output from real corpus runs
+- Extracts per-file, per-phase timing from timestamped log lines
+- Modes: `--phase-summary` (slowest files, outlier flagging), `--stalls`
+  (silent gaps between log lines), `--warnings` (WARN/ERROR classification
+  and histogram), `--phase-detail` (per-phase breakdown for a named file)
+- Warning classifier maps known patterns (self-connection flood, Issue-34
+  violations, sort-key sentinel resets) to human-readable labels
+- No dependencies beyond Python 3.10 stdlib
+- Purpose: diagnose *which phase* and *which files* are slow in a real run,
+  before and after a candidate fix
+
 **Tier 1: Micro-benchmarks** (existing, via Criterion)
 - Function-level: parsing, BID injection, graph queries
 - Purpose: Regression detection on specific operations
@@ -171,6 +183,19 @@ Generate markdown that resembles real documentation:
 
 ## Implementation Steps
 
+### 0. **Log Analysis Tools** (complete)
+   - [x] Create `benches/log_analysis/parse_log.py`
+   - [x] Parse timestamped `RUST_LOG=debug` lines; extract per-file `FileRecord`
+         with phase timestamps, diff-event counts
+   - [x] `--phase-summary`: ranked Phase 0 table with mean/σ outlier flagging
+         and Phase 5 post-processing gap table
+   - [x] `--stalls SECONDS`: silent-gap detector with ±3-line context
+   - [x] `--warnings`: WARN/ERROR classifier (BN-2 floods, Issue-34 violations,
+         sentinel resets, …) with per-minute histogram
+   - [x] `--phase-detail FRAGMENT`: per-phase breakdown for named files
+   - [x] `benches/log_analysis/README.md` with quick-start, example output,
+         and diagnostic decision tree
+
 ### 1. **Corpus Generator** (1 day)
    - [ ] Create `benches/corpus_generator.rs`
    - [ ] Implement realistic markdown structure generation:
@@ -214,6 +239,9 @@ Generate markdown that resembles real documentation:
 ### 5. **Bottleneck Analysis** (1 day)
    - [x] O(N²) bottleneck in `add_relations` DFS confirmed on MDN `web/javascript`
          (see **Confirmed Bottlenecks** above)
+   - [x] `parse_log.py --phase-summary` and `--stalls` used to isolate BN-1 and
+         BN-3 symptoms; `--warnings` used to quantify BN-2 self-connection flood
+         and Issue-34 violations across the full 1 300-file run
    - [ ] Profile `add_relations` with `perf` or `flamegraph` to measure DFS share
          vs. edge-insertion share of wall time
    - [ ] Implement and benchmark candidate fix: `add_relations_from(rhs, seed_bids)`
@@ -287,8 +315,19 @@ Generate markdown that resembles real documentation:
 
 **Relationship to ISSUE_07**:
 - ISSUE_07 established Criterion micro-benchmarks for regression detection
-- ISSUE_47 adds macro-benchmarks and memory profiling for scaling analysis
+- ISSUE_47 adds macro-benchmarks, memory profiling, and log-analysis tools for
+  scaling analysis
 - Both are needed: ISSUE_07 prevents regressions, ISSUE_47 prevents surprises at scale
+
+**`benches/log_analysis/` workflow**:
+The typical use of the log-analysis tools is:
+1. Capture a run: `RUST_LOG=debug cargo run … parse <corpus> 2>&1 | tee run.log`
+2. `parse_log.py run.log --all` to locate slow files and dominant warning types
+3. `parse_log.py run.log --phase-detail <slow-file>` to pinpoint the bottleneck phase
+4. Apply fix, re-run step 1, compare Phase 0 distributions to confirm improvement
+These tools complement (not replace) the Criterion benchmarks: Criterion measures
+throughput under controlled synthetic conditions; `parse_log.py` diagnoses real
+corpus behaviour where the bottleneck may be structural (e.g. `session_bb` growth).
 
 **Future work** (not in this issue):
 - Performance optimization based on profiling results
