@@ -5,6 +5,7 @@ use std::{
     ops::Deref,
     path::{Component, Path, PathBuf, MAIN_SEPARATOR_STR},
 };
+use unicode_normalization::UnicodeNormalization;
 
 /// Utility function to replace separators and convert to unicode (via to_string_lossy) on os path.
 /// On Windows, strips the `\\?\` UNC prefix but preserves drive letters for canonical path representation.
@@ -74,15 +75,54 @@ pub fn string_to_os_path(path_string: &str) -> PathBuf {
     PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR))
 }
 
-/// Turn a title string into a regularized anchor string
+/// Turn a title string into a regularized anchor string.
+///
+/// Rules:
+/// - NFKC normalization: resolves Unicode compatibility variants (`ﬁ`→`fi`,
+///   `²`→`2`, `ℕ`→`N`, full-width chars→ASCII equivalents) without stripping
+///   accents or destroying non-Latin scripts. This ensures that precomposed
+///   and decomposed forms of the same character (e.g. `é` U+00E9 vs `e` +
+///   combining accent) compare equal, while keeping genuinely distinct titles
+///   like `Résumé` and `Resume` as distinct anchors.
+/// - Lowercase
+/// - ASCII whitespace → `-`
+/// - Keep: alphanumeric (all Unicode scripts), `-`, `.`, `_`, `(`, `)`,
+///   `[`, `]`, `@`. These are all valid in HTML5 `id=` attributes
+///   (no-whitespace-only rule) and are legal in RFC 3986 URL fragments
+///   (unreserved + sub-delims). Preserving them makes JS API titles like
+///   `Temporal.Duration()`, `Array.prototype.map()`, `Symbol.iterator`,
+///   and `for...in` produce distinct, human-readable anchors.
+///   Non-ASCII alphanumeric chars (accented letters, CJK, Arabic, …) are
+///   kept as-is — they are valid in HTML5 `id=` and modern browsers handle
+///   non-ASCII URL fragments correctly.
+/// - Strip everything else (e.g. `&`, `!`, `:`, `#`, `%`, `+`, `=`, …)
+/// - Collapse runs of `-` to a single `-` and strip leading/trailing `-`
 pub fn to_anchor(title: &str) -> String {
-    title
-        .trim()
-        .to_lowercase()
-        .replace(char::is_whitespace, "-")
+    // NFKC first: resolves compatibility variants without stripping accents
+    let s: String = title.trim().nfkc().collect::<String>().to_lowercase();
+    let s: String = s
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect()
+        .map(|c| if c.is_ascii_whitespace() { '-' } else { c })
+        .filter(|c| {
+            c.is_alphanumeric() || matches!(c, '-' | '.' | '_' | '(' | ')' | '[' | ']' | '@')
+        })
+        .collect();
+    // Collapse consecutive hyphens and strip leading/trailing hyphens
+    let mut result = String::with_capacity(s.len());
+    let mut prev_hyphen = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+    // Strip leading/trailing hyphens
+    result.trim_matches('-').to_string()
 }
 
 pub fn as_anchor(anchor: &str) -> String {
@@ -1679,15 +1719,66 @@ mod tests {
 
     #[test]
     fn test_to_anchor_consistency() {
-        // Verify to_anchor() behavior for collision detection
+        // Basic lowercasing and whitespace handling
         assert_eq!(to_anchor("Details"), "details");
         assert_eq!(to_anchor("Section One"), "section-one");
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
         assert_eq!(to_anchor("My-Section!"), "my-section");
+
+        // & is stripped; surrounding spaces each become a hyphen which then collapse
+        assert_eq!(to_anchor("API & Reference"), "api-reference");
+
+        // Semantically meaningful JS API punctuation is preserved
+        assert_eq!(to_anchor("Temporal.Duration"), "temporal.duration");
+        assert_eq!(to_anchor("Temporal.Duration()"), "temporal.duration()");
+        assert_eq!(to_anchor("Array.prototype.map()"), "array.prototype.map()");
+        assert_eq!(to_anchor("Symbol.iterator"), "symbol.iterator");
+        assert_eq!(
+            to_anchor("Object.__defineGetter__()"),
+            "object.__definegetter__()"
+        );
+        assert_eq!(to_anchor("for...in"), "for...in");
+        assert_eq!(to_anchor("try...catch"), "try...catch");
+        assert_eq!(to_anchor("Array[@@iterator]()"), "array[@@iterator]()");
+
+        // Critical: constructor page no longer collides with its parent class
+        assert_ne!(
+            to_anchor("Temporal.Duration"),
+            to_anchor("Temporal.Duration()")
+        );
+        assert_ne!(
+            to_anchor("Array.prototype.map"),
+            to_anchor("Array.prototype.map()")
+        );
 
         // Case insensitivity
         assert_eq!(to_anchor("Details"), to_anchor("DETAILS"));
         assert_eq!(to_anchor("Section"), to_anchor("section"));
+
+        // Hyphen collapsing
+        assert_eq!(to_anchor("a  b"), "a-b");
+        assert_eq!(to_anchor("--leading"), "leading");
+        assert_eq!(to_anchor("trailing--"), "trailing");
+
+        // NFKC: compatibility variants resolved without stripping accents
+        assert_eq!(to_anchor("ﬁle"), "file"); // ligature fi → fi
+        assert_eq!(to_anchor("²nd"), "2nd"); // superscript 2 → 2
+        assert_eq!(to_anchor("ℕatural"), "natural"); // double-struck N → N
+
+        // Non-ASCII alphanumeric preserved (accents, CJK, etc.)
+        assert_eq!(to_anchor("Résumé"), "résumé");
+        assert_eq!(to_anchor("für"), "für");
+        assert_eq!(to_anchor("日本語"), "日本語");
+
+        // Accented and unaccented titles stay distinct — no silent collision
+        assert_ne!(to_anchor("Résumé"), to_anchor("Resume"));
+        assert_ne!(to_anchor("für"), to_anchor("fur"));
+        assert_ne!(to_anchor("café"), to_anchor("cafe"));
+
+        // NFC/NFD precomposed vs decomposed → same anchor via NFKC
+        // é as precomposed U+00E9 vs e + combining acute U+0301
+        let precomposed = "\u{00E9}"; // é (single codepoint)
+        let decomposed = "e\u{0301}"; // e + combining acute
+        assert_eq!(to_anchor(precomposed), to_anchor(decomposed));
     }
 
     #[test]

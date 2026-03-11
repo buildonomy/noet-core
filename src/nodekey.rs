@@ -687,12 +687,24 @@ mod tests {
         assert_eq!(to_anchor("trailing spaces  "), "trailing-spaces");
         assert_eq!(to_anchor("CAPITALS"), "capitals");
 
-        // Test punctuation removal for HTML/URL compatibility
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
-        assert_eq!(to_anchor("Section 2.1: Overview"), "section-21-overview");
+        // Semantically meaningful punctuation is preserved; junk is stripped
+        // '&' stripped, surrounding spaces collapse → single hyphen
+        assert_eq!(to_anchor("API & Reference"), "api-reference");
+        // ':' stripped, surrounding spaces collapse → single hyphen; '.' kept
+        assert_eq!(to_anchor("Section 2.1: Overview"), "section-2.1-overview");
+        // ':' stripped, surrounding spaces collapse → single hyphen
         assert_eq!(to_anchor("Step 1: Install"), "step-1-install");
+        // '\'' and '?' stripped
         assert_eq!(to_anchor("What's this?"), "whats-this");
+        // ',' and '!' stripped
         assert_eq!(to_anchor("Hello, World!"), "hello-world");
+        // JS API punctuation preserved — constructors and methods don't collide with classes
+        assert_eq!(to_anchor("Temporal.Duration"), "temporal.duration");
+        assert_eq!(to_anchor("Temporal.Duration()"), "temporal.duration()");
+        assert_ne!(
+            to_anchor("Temporal.Duration"),
+            to_anchor("Temporal.Duration()")
+        );
     }
 
     #[test]

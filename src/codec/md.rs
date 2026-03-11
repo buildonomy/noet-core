@@ -2038,13 +2038,14 @@ schema = "Document"
 
     #[test]
     fn test_to_anchor_usage() {
-        // Using existing to_anchor from nodekey module
-        // Note: to_anchor trims / and #, lowercases, replaces whitespace with -,
-        // and removes punctuation for HTML/URL compatibility
+        // to_anchor lowercases, maps whitespace to hyphens, collapses hyphens,
+        // and preserves semantically meaningful punctuation (.  _  ()  []  @).
         assert_eq!(to_anchor("Introduction"), "introduction");
         assert_eq!(to_anchor("My Section Title"), "my-section-title");
-        assert_eq!(to_anchor("Section 2.1: Overview"), "section-21-overview");
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
+        // ':' is stripped; surrounding spaces collapse to a single hyphen
+        assert_eq!(to_anchor("Section 2.1: Overview"), "section-2.1-overview");
+        // '&' is stripped; surrounding spaces collapse to a single hyphen
+        assert_eq!(to_anchor("API & Reference"), "api-reference");
     }
 
     #[test]
@@ -2892,12 +2893,12 @@ Mixed content.
         let code_title = code_section.title().expect("Should have title");
         assert_eq!(
             to_anchor(&code_title),
-            "using--code--in-title",
+            "using-code-in-title",
             "Code title anchor slug should match expected value"
         );
         assert_eq!(
             code_section.id().as_deref(),
-            Some("using--code--in-title"),
+            Some("using-code-in-title"),
             "IRNode::id() should return title-derived slug for code-in-heading section"
         );
 
@@ -2916,12 +2917,12 @@ Mixed content.
         let mixed_title = mixed_section.title().expect("Should have title");
         assert_eq!(
             to_anchor(&mixed_title),
-            "mixed--html--and--code--content",
+            "mixed-html-and-code-content",
             "Mixed content title anchor slug should match expected value"
         );
         assert_eq!(
             mixed_section.id().as_deref(),
-            Some("mixed--html--and--code--content"),
+            Some("mixed-html-and-code-content"),
             "IRNode::id() should return title-derived slug for mixed-content section"
         );
     }

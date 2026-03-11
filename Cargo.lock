@@ -1689,6 +1689,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-wasm",
  "trybuild",
+ "unicode-normalization",
  "uniffi",
  "url",
  "uuid",

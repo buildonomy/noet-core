@@ -2045,7 +2045,7 @@ Test network for unit tests.
 
         assert_eq!(to_anchor("Details"), "details");
         assert_eq!(to_anchor("Section One!"), "section-one");
-        assert_eq!(to_anchor("API & Reference"), "api--reference");
+        assert_eq!(to_anchor("API & Reference"), "api-reference");
 
         // Same title always produces same anchor
         let title = "My Section";
