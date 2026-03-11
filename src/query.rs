@@ -526,7 +526,6 @@ pub trait BeliefSource: Sync {
     ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send;
 
     /// Get all document paths (including documents in subnets) for a network as (path, bid) pairs.
-    /// Unlike get_network_paths which returns only network nodes, this returns all documents.
     /// Useful for sitemap generation and comprehensive document enumeration.
     /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
     fn get_all_paths(

@@ -713,12 +713,25 @@ pub struct PathMap {
     map: Vec<(String, Bid, Vec<u16>)>,
     bid_map: BTreeMap<Bid, Vec<usize>>,
     path_map: BTreeMap<String, usize>,
+    /// Index from order-vec (serialised as "sk1.sk2.sk3") to map index. Allows O(log N)
+    /// ancestor lookup by order prefix during stack reconstruction.
+    order_map: BTreeMap<String, usize>,
     id_map: IdMap,
     title_map: IdMap,
     kind: WeightKind,
     net: Bid,
     subnets: BTreeSet<Bid>,
     pub loops: BTreeSet<(Bid, Bid)>,
+}
+
+/// Serialise an order vec to a dot-joined string key suitable for `PathMap::order_map`.
+#[inline]
+fn order_key(order: &[u16]) -> String {
+    order
+        .iter()
+        .map(|sk| sk.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 impl PathMap {
@@ -930,10 +943,12 @@ impl PathMap {
         });
         let mut bid_map = BTreeMap::new();
         let mut path_map = BTreeMap::new();
-        for (idx, (path, bid, _order)) in map.iter().enumerate() {
+        let mut order_map = BTreeMap::new();
+        for (idx, (path, bid, order)) in map.iter().enumerate() {
             let bid_idx_vec = bid_map.entry(*bid).or_insert(Vec::<usize>::default());
             bid_idx_vec.push(idx);
             path_map.insert(path.clone(), idx);
+            order_map.insert(order_key(order), idx);
         }
 
         let mut id_map = IdMap::default();
@@ -958,6 +973,7 @@ impl PathMap {
             map,
             bid_map,
             path_map,
+            order_map,
             id_map,
             title_map,
             kind,
@@ -981,6 +997,37 @@ impl PathMap {
 
     pub fn map(&self) -> &Vec<(String, Bid, Vec<u16>)> {
         &self.map
+    }
+
+    /// Look up the PathMap entry whose order vec equals `order`.
+    /// Returns `(bid, path)` in O(log N) via the `order_map` index.
+    /// Returns `None` if no entry has that exact order (e.g. the order is empty,
+    /// which corresponds to the repo-root network itself and is not stored in any
+    /// child PathMap entry).
+    pub fn order_for(&self, order: &[u16]) -> Option<(Bid, &str)> {
+        if order.is_empty() {
+            return None;
+        }
+        self.order_map.get(&order_key(order)).map(|&idx| {
+            let (path, bid, _) = &self.map[idx];
+            (*bid, path.as_str())
+        })
+    }
+
+    /// Look up the PathMap entry for `bid` and return its `(order, path)`.
+    /// Uses `bid_map` for O(log N) index lookup, then reads the order vec from
+    /// `self.map`. Returns the first entry when a BID maps to multiple paths
+    /// (e.g. a subnet network that appears at more than one mount point).
+    pub fn order_for_bid(&self, bid: &Bid) -> Option<(&Vec<u16>, &str)> {
+        let &idx = self.bid_map.get(bid)?.first()?;
+        let (path, _, order) = &self.map[idx];
+        Some((order, path.as_str()))
+    }
+
+    /// Returns true if `bid` has any entry in this PathMap's `bid_map` index.
+    /// Ownership-free alternative to `order_for_bid` for use in diagnostic checks.
+    pub fn bid_has_path(&self, bid: &Bid) -> bool {
+        self.bid_map.contains_key(bid)
     }
 
     pub fn subnets(&self) -> &BTreeSet<Bid> {
@@ -1333,6 +1380,9 @@ impl PathMap {
                     }
                 }
                 if let Some(map_indices) = self.bid_map.remove(from) {
+                    // order_map values are indices into self.map; the BidReplace event only
+                    // changes the Bid stored at those indices, not the order vecs, so
+                    // order_map keys/values remain valid — no rebuild needed here.
                     self.bid_map.insert(*to, map_indices);
                 }
                 if let Some(id) = self.id_map.remove(from) {
@@ -1373,10 +1423,31 @@ impl PathMap {
         // FIXME: This isn't checking for loops at all
         let mut derivatives = Vec::default();
         let mut sink_sub_indices = self.source_sub_indices(sink, false);
+        tracing::trace!(
+            "[process_relation_update] net={} source={} sink={} weightset_kinds={:?} \
+            sink_in_bid_map={} sink_in_nets={} sink_sub_indices_len={} self.net==sink={}",
+            self.net,
+            source,
+            sink,
+            weightset.weights.keys().collect::<Vec<_>>(),
+            self.bid_map.contains_key(sink),
+            nets.nets.contains(sink),
+            sink_sub_indices.len(),
+            self.net == *sink,
+        );
         if sink_sub_indices.is_empty() {
+            tracing::trace!(
+                "[process_relation_update] EARLY RETURN: sink_sub_indices empty for sink={} in net={}",
+                sink, self.net
+            );
             return derivatives;
         }
         if nets.nets.contains(sink) && self.net != *sink {
+            tracing::trace!(
+                "[process_relation_update] EARLY RETURN: sink={} is a net and self.net={} != sink",
+                sink,
+                self.net
+            );
             return derivatives;
         }
 
@@ -1432,10 +1503,12 @@ impl PathMap {
                 ));
                 self.bid_map.clear();
                 self.path_map.clear();
-                for (idx, (path, bid, _order)) in self.map.iter().enumerate() {
+                self.order_map.clear();
+                for (idx, (path, bid, order)) in self.map.iter().enumerate() {
                     let bid_idx_vec = self.bid_map.entry(*bid).or_default();
                     bid_idx_vec.push(idx);
                     self.path_map.insert(path.clone(), idx);
+                    self.order_map.insert(order_key(order), idx);
                 }
                 // Keep subnets consistent with bid_map: a subnet whose path was just removed no
                 // longer has a bid_map entry and must be evicted from subnets to prevent
@@ -1665,10 +1738,12 @@ impl PathMap {
             // Regenerate our support indices
             self.bid_map.clear();
             self.path_map.clear();
-            for (idx, (path, bid, _order)) in self.map.iter().enumerate() {
+            self.order_map.clear();
+            for (idx, (path, bid, order)) in self.map.iter().enumerate() {
                 let bid_idx_vec = self.bid_map.entry(*bid).or_default();
                 bid_idx_vec.push(idx);
                 self.path_map.insert(path.clone(), idx);
+                self.order_map.insert(order_key(order), idx);
             }
 
             if nets.nets.contains(source) && self.net != *source {

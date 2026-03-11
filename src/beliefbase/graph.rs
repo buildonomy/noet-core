@@ -1171,4 +1171,129 @@ mod tests {
         assert_eq!(edge_sort_key(&r1, x, y), edge_sort_key(&r2, x, y));
         assert_eq!(edge_sort_key(&r1, p, q), edge_sort_key(&r2, p, q));
     }
+
+    // -------------------------------------------------------------------------
+    // T8: balance() with a subnet doc where eval_unbalanced returns the full
+    // neighbor set including both S→R and S→API.
+    //
+    // Scenario: document D inside subnet S inside repo R, all under API.
+    // eval_unbalanced(D) is modelled as returning ALL edges where D or its
+    // immediate neighbors appear (RelationPred::NodeIn semantics), so the
+    // initial set already contains:
+    //   D→S, S→R, S→API, R→API
+    // and states {D(Trace), S(Trace), R(Trace), API(Trace)}.
+    //
+    // R is already in the initial set. balance() must terminate cleanly
+    // (API is the only sink, eval_trace(API) adds nothing, loop breaks on
+    // same-expr) and R must remain in the final set.
+    //
+    // This test confirms that the "S→API shortcut omits R" concern does NOT
+    // apply when eval_unbalanced uses RelationPred::NodeIn, because S's full
+    // neighborhood (including S→R) is included in the initial set.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_balance_subnet_full_neighbor_set() {
+        use crate::{
+            error::BuildonomyError,
+            properties::{
+                BeliefKind, BeliefNode, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
+            },
+            query::{BeliefSource, Expression, StatePred},
+        };
+        use std::collections::BTreeMap;
+
+        let api_bid = BeliefNode::api_state().bid;
+        let r_bid = Bid::new(api_bid);
+        let s_bid = Bid::new(r_bid);
+        let d_bid = Bid::new(s_bid);
+
+        let make_section_ws = |sk: u16| -> WeightSet {
+            let mut w = Weight::default();
+            w.set(WEIGHT_SORT_KEY, sk).ok();
+            let mut ws = WeightSet::empty();
+            ws.set(WeightKind::Section, w);
+            ws
+        };
+
+        // Minimal mock: eval_trace(API) → {API} with no edges (API is a true
+        // sink). All other queries return empty — nothing new to fetch since
+        // the full chain is already in the initial set.
+        struct MockSource {
+            api: Bid,
+        }
+        impl BeliefSource for MockSource {
+            async fn eval_unbalanced(
+                &self,
+                _expr: &Expression,
+            ) -> Result<BeliefGraph, BuildonomyError> {
+                Ok(BeliefGraph::default())
+            }
+            async fn eval_trace(
+                &self,
+                expr: &Expression,
+                _filter: WeightSet,
+            ) -> Result<BeliefGraph, BuildonomyError> {
+                // Only API queries come in; return API state with no edges.
+                let Expression::StateIn(StatePred::Bid(bids)) = expr else {
+                    return Ok(BeliefGraph::default());
+                };
+                let mut states = BTreeMap::new();
+                for bid in bids {
+                    if *bid == self.api {
+                        states.insert(self.api, BeliefNode::api_state());
+                    }
+                }
+                Ok(BeliefGraph {
+                    states,
+                    relations: BidGraph::default(),
+                })
+            }
+        }
+
+        let source = MockSource { api: api_bid };
+
+        // Initial set: full neighbor expansion of D, as eval_unbalanced with
+        // RelationPred::NodeIn would produce. Includes S→R and S→API.
+        let mut set = {
+            let mut n_d = make_node(d_bid, "doc", BeliefKind::Document);
+            let mut n_s = make_node(s_bid, "subnet", BeliefKind::Network);
+            let mut n_r = make_node(r_bid, "repo", BeliefKind::Network);
+            let mut n_api = BeliefNode::api_state();
+            n_d.kind.0.insert(BeliefKind::Trace);
+            n_s.kind.0.insert(BeliefKind::Trace);
+            n_r.kind.0.insert(BeliefKind::Trace);
+            n_api.kind.0.insert(BeliefKind::Trace);
+            let states =
+                BTreeMap::from([(d_bid, n_d), (s_bid, n_s), (r_bid, n_r), (api_bid, n_api)]);
+            let relations = BidGraph::from_edges([
+                (d_bid, s_bid, make_section_ws(0)),
+                (s_bid, r_bid, make_section_ws(0)),
+                (s_bid, api_bid, make_section_ws(1)),
+                (r_bid, api_bid, make_section_ws(0)),
+            ]);
+            BeliefGraph { states, relations }
+        };
+
+        source
+            .balance(&mut set)
+            .await
+            .expect("balance should not error");
+
+        // R was in the initial set and must still be present after balance.
+        assert!(
+            set.states.contains_key(&r_bid),
+            "repo root R must be present in set after balance()"
+        );
+        // S→R edge must be present.
+        assert!(
+            set.relations.as_graph().raw_edges().iter().any(|e| {
+                set.relations.as_graph()[e.source()] == s_bid
+                    && set.relations.as_graph()[e.target()] == r_bid
+            }),
+            "S→R Section edge must be present in set after balance()"
+        );
+        // balance() must have terminated (not hit BALANCE_CUTOFF) — verified
+        // implicitly by the mock only returning API with no edges, causing the
+        // same-expr break after one iteration.
+    }
 }

@@ -1,6 +1,6 @@
 # Issue 47: Performance Profiling Infrastructure
 
-**Priority**: HIGH - O(N²) bottleneck confirmed on realistic corpus
+**Priority**: MEDIUM - FM1b O(siblings) bottleneck fixed; remaining work is benchmarking and one pre-existing test failure
 **Estimated Effort**: 3-4 days
 **Dependencies**: ISSUE_07 (basic benchmarks established)
 **Context**: Preparation for processing GB-scale documentation corpora
@@ -9,7 +9,11 @@
 
 Establish performance profiling infrastructure to characterize noet-core's behavior at scale. Currently we have micro-benchmarks (Criterion) for regression detection, but need macro-benchmarks with realistic workloads, memory profiling, and performance characterization for GB-scale document processing. This issue creates the foundation for identifying bottlenecks before they become critical.
 
-**Update**: An O(N²) bottleneck has been confirmed empirically on the MDN `web/javascript` sub-corpus (~1 300 files). The bottleneck is in `BeliefGraph::add_relations` (called from `session_bb.merge` at `builder.rs:459-474`). Root cause and candidate fixes are documented in the new **Confirmed Bottlenecks** section below. Profiling infrastructure is now needed primarily to measure the fix, not just find the problem.
+**Update 2 (FM1b fixed)**: The dominant O(siblings) bottleneck in `initialize_stack` has been eliminated. The `push_relation` sibling fan-out loop is gone; `initialize_stack` now returns `(IRNode, Option<u16>)` carrying the entry doc's sort key directly. The fast path queries the parent network (not the entry doc), hitting `StackCache` on the first parse of every child. Run 3 on the MDN corpus is needed to confirm Phase 0 mean drops to <0.5 s and Phase 5 stalls disappear.
+
+One pre-existing test failure remains: `bid_tests::test_belief_set_builder_with_db_cache` — a section anchor (`heading=4`) ends up `in_states=true, in_pathmap=false` on reparse when `global_bb` is a `DbConnection`. Root cause is that `doc_bb` receives a pre-seeded `Section(section, doc, {sk:N})` edge before Phase 1 `push(section)` fires, causing `generate_edge_update` to see no change and skip the PathMap update. Tracked below.
+
+**Earlier update**: An O(N²) bottleneck was confirmed empirically on the MDN `web/javascript` sub-corpus (~1 300 files). The bottleneck was in `initialize_stack`'s `push_relation` sibling fan-out (FM1b), not `BeliefGraph::add_relations` as originally suspected. Profiling infrastructure is now needed primarily to measure the fix, not just find the problem.
 
 ## Goals
 
@@ -22,72 +26,97 @@ Establish performance profiling infrastructure to characterize noet-core's behav
 
 ## Confirmed Bottlenecks
 
-### BN-1: O(N²) Phase 2 merge in `parse_content` — **confirmed**
+### ✅ FM1b: O(siblings) fan-out in `initialize_stack` — **FIXED**
 
-**Location**: `src/codec/builder.rs:459-474`, specifically the call to
-`self.session_bb.merge(&missing_structure)`.
+**Location**: `src/codec/builder.rs`, `initialize_stack` slow path.
 
-**Observed symptom**: When parsing the MDN `web/javascript` sub-corpus
-(~1 300 files), each file in the latter half of the lexicographic parse order
-stalls for >10 seconds at the log line:
+**Observed symptom**: Every file in a large flat network spent ~4 ms per
+sibling during `initialize_stack` re-processing the parent network's sibling
+list. The 645 s stall for `trailing_commas` (1 193 RelationUpdates) and 618 s
+stall for `working_with_objects` (1 156 RelationUpdates) in Run 2 confirmed
+`session_bb` was O(all-prior-files) in size.
 
+**Root cause**: The slow-path `push_relation` loop over
+`maybe_content_parent_proto.upstream` (all sibling docs) was pre-seeding
+`session_bb` and `doc_bb` with sibling edges on every file parse, causing
+O(siblings) work per file → O(N × siblings) total.
+
+**Fix** (landed):
+- Removed `push_relation` sibling fan-out entirely from `initialize_stack`.
+- `initialize_stack` now returns `(IRNode, Option<u16>)` — the second element
+  is the entry doc's sort key read from `upstream` index (slow path) or from
+  the session PathMap (fast path).
+- `parse_content` passes this as `explicit_sort_key` into the first Phase 1
+  `push()` call via a new parameter, replacing the former StackCache-only
+  sort-key workaround in `push`.
+- Fast path (`try_initialize_stack_from_session_cache`) redesigned to query
+  the **parent network** in `session_bb` instead of the entry doc. This hits
+  `StackCache` on the first parse of every child (not just reparsed ones),
+  because the compiler always parses the parent network before its children.
+- `doc_sort_key = None` on a child's first parse is correct: the child was
+  unresolved when the parent was parsed, so no `Section(child, parent)` edge
+  exists in `session_bb` yet. `push` auto-assigns the sort key safely because
+  `doc_bb` starts clean.
+- `doc_sort_key = Some(N)` on reparse: the confirmed sort key from the prior
+  `terminate_stack` is used directly, preventing sk=0 collisions.
+- `PathMap::order_map` index added for O(log N) ancestor prefix lookup during
+  stack reconstruction.
+
+**Test result**: 6/7 codec tests pass. The single failure (`with_db_cache`) is
+a pre-existing bug unrelated to FM1b (see BN-DB below).
+
+**Run 3 needed**: corpus benchmark to confirm Phase 0 mean drops from 4.74 s
+toward <0.5 s and Phase 5 stalls disappear.
+
+---
+
+### ❌ BN-DB: `with_db_cache` section anchor not in PathMap — **PRE-EXISTING, OPEN**
+
+**Location**: `src/codec/builder.rs`, Phase 1 `push(section)` during reparse
+with `DbConnection` as `global_bb`.
+
+**Symptom**: `test_belief_set_builder_with_db_cache` panics:
 ```
-Phase 2: merging missing structure onto session_bb and set
+Set should be balanced here: bid=X in_states=true in_pathmap=false
+proto.heading=4 proto.path=".../asset_tracking_test.md"
 ```
+A section anchor (`heading=4`) is in `doc_bb.states` but not `doc_bb.paths()`
+after Phase 1.
 
-**Root cause**: `BeliefBase::merge` → `BeliefGraph::union_mut` →
-`add_relations`. The `add_relations` function seeds a DFS from all nodes in
-`self.states` that also appear in the rhs graph. `session_bb` grows
-monotonically across the entire parse session — every file permanently adds
-its nodes. By file 1 000 of 1 300, `session_bb` holds thousands of nodes,
-making every `add_relations` call proportionally more expensive:
+**Root cause** (partially confirmed): On reparse, `doc_bb` already contains a
+`Section(section, doc, {sk:N})` edge before Phase 1 `push(section)` fires its
+`RelationChange`. `generate_edge_update` compares incoming weight (no
+`sort_key`) against present weight (`sort_key: N`) — sees no meaningful change
+— returns `None` — PathMap update skipped — section not in PathMap. The
+seeding path that puts the edge in `doc_bb` has not been fully traced; the
+`downstream_query` in `try_initialize_stack_from_session_cache` and
+`RelationPred::NodeIn` semantics in `cache_fetch` are candidates.
 
-```
-cost(file N) ≈ O(session_bb_size(N) × missing_structure_edges)
-             ≈ O(N × K)   where K = avg edges per GlobalCache hit
-total cost   ≈ O(N² × K)
-```
+**Candidate fix**: In `generate_edge_update`, when the incoming weight has no
+`sort_key` but the present weight does, treat the existing `sort_key` as
+authoritative and still mark `changed = true` so the PathMap entry is
+(re)created. This preserves idempotency without requiring a fresh auto-assign.
 
-**Secondary contributor**: `missing_structure` is accumulated across all
-`push_relation` calls within a single file (each `GlobalCache` hit appends a
-subgraph via `union_mut`). For densely-linked files (e.g. MDN `String`
-reference with 40+ method links), `missing_structure` can reach hundreds of
-nodes before the Phase 2 merge runs.
+**Blocked by**: needs one targeted trace log to confirm exactly which code path
+seeds the section→doc edge into `doc_bb` before `push(section)` fires.
 
-**Why it gets worse late in the parse**: the corpus parses roughly
-lexicographically. The `global_objects/string/` subtree — where the stalls are
-observed — is parsed after `array/`, `boolean/`, `error/`, etc., so
-`session_bb` is already large when those files are reached.
+---
 
-**Candidate fixes** (in order of invasiveness):
+### BN-1: O(N²) Phase 2 merge in `parse_content` — **superseded by FM1b**
 
-1. **Restrict the DFS seed set** (`add_relations`): instead of seeding from
-   all nodes in `self.states` that appear in rhs, accept an optional
-   `seed_bids: &BTreeSet<Bid>` parameter and only seed from those. For the
-   Phase 2 merge, the caller already knows the relevant seeds are the current
-   file's `parsed_bids`. This reduces the DFS scope from O(session_bb_size) to
-   O(file_nodes). New signature: `add_relations_from(rhs, seed_bids)`.
+Originally suspected as the dominant cost driver. Run 2 confirmed FM1b
+(O(siblings) fan-out) was the actual dominant term. BN-1 (`add_relations` DFS
+in `session_bb.merge`) is a secondary cost; address after Run 3 confirms
+whether it remains significant post-FM1b fix.
 
-2. **Skip DFS for the Phase 2 case entirely**: `missing_structure` is produced
-   by `cache_fetch` which already knows exactly which nodes are needed. The DFS
-   is redundant for this call site — all required nodes are already in the
-   graph.
+**Candidate fixes** (deferred):
 
-3. **Lazy `session_bb` population**: accumulate a per-file index of
-   BID → graph fragment during `push_relation` and merge into `session_bb`
-   only in `terminate_stack`, paying the cost once per file instead of once
-   per relation.
-
-**Interaction with Issue 57 (parallel epochs)**: parallelism does not fix
-this. The post-epoch merge (merging N task `session_bb`s into the compiler's
-`session_bb`) still calls `add_relations` sequentially per task, and the
-merged seed for epoch 1 would be as large as the current sequential case. Fix
-BN-1 first; then Issue 57 compounds the win.
-
-**Note on `BalanceCheck`**: the two `process_event(&BeliefEvent::BalanceCheck)`
-calls in the Phase 2 block add constant overhead per file but are not the
-quadratic term. They can be deferred to `terminate_stack` as a secondary
-optimization after BN-1 is addressed.
+1. **Restrict the DFS seed set** (`add_relations`): accept optional
+   `seed_bids: &BTreeSet<Bid>` and only seed from those.
+2. **Skip DFS for Phase 2**: `missing_structure` from `cache_fetch` already
+   contains exactly the needed nodes; the DFS is redundant.
+3. **Lazy `session_bb` population**: merge into `session_bb` only in
+   `terminate_stack`.
 
 ---
 
@@ -237,22 +266,20 @@ Generate markdown that resembles real documentation:
      - Example: "Peak memory < 2× corpus size"
 
 ### 5. **Bottleneck Analysis** (1 day)
-   - [x] O(N²) bottleneck in `add_relations` DFS confirmed on MDN `web/javascript`
-         (see **Confirmed Bottlenecks** above)
-   - [x] `parse_log.py --phase-summary` and `--stalls` used to isolate BN-1 and
-         BN-3 symptoms; `--warnings` used to quantify BN-2 self-connection flood
-         and Issue-34 violations across the full 1 300-file run
-   - [ ] Profile `add_relations` with `perf` or `flamegraph` to measure DFS share
-         vs. edge-insertion share of wall time
-   - [ ] Implement and benchmark candidate fix: `add_relations_from(rhs, seed_bids)`
-         — seed DFS only from current file's `parsed_bids` in Phase 2
-   - [ ] Measure fix: run MDN `web/javascript` parse before and after; target <1 s/file
-         on latter half of corpus (currently >10 s/file)
-   - [ ] Check remaining bottlenecks after BN-1 fix:
+   - [x] FM1b O(siblings) fan-out in `initialize_stack` confirmed as dominant cost driver (Run 2)
+   - [x] `parse_log.py --phase-summary` and `--stalls` used to isolate FM1b and
+         FM1a symptoms; `--warnings` used to quantify BN-2 self-connection flood
+         and Issue-34 violations across the full run
+   - [x] FM1b fix landed: `push_relation` fan-out removed, `doc_sort_key` sentinel,
+         parent-network fast path — 6/7 codec tests pass
+   - [ ] Run 3: MDN corpus benchmark post-FM1b; target Phase 0 mean <0.5 s,
+         Phase 5 stalls eliminated
+   - [ ] Fix `with_db_cache` pre-existing failure (BN-DB above); target 7/7 green
+   - [ ] Check remaining bottlenecks after Run 3:
+     - BN-1 (`add_relations` DFS) still significant?
      - PathMap collision detection?
      - `BalanceCheck` frequency?
-     - Global cache query latency?
-   - [ ] Document confirmed findings; update this issue or create ISSUE_48 for fix work
+   - [ ] Document confirmed findings; update this issue or create ISSUE_48 for remaining fix work
 
 ## Testing Requirements
 
@@ -261,6 +288,9 @@ Generate markdown that resembles real documentation:
 - [ ] Benchmarks run successfully in CI (optional: store as artifacts)
 - [ ] Memory profiling identifies no obvious leaks
 - [ ] Baseline metrics documented and reviewable
+- [x] FM1b fix: `initialize_stack` sibling fan-out eliminated (6/7 codec tests pass)
+- [ ] `with_db_cache` test failure fixed (7/7 green CI checkpoint)
+- [ ] Run 3 corpus benchmark confirms Phase 0 mean <0.5 s
 
 ## Success Criteria
 
@@ -268,9 +298,11 @@ Generate markdown that resembles real documentation:
 - [ ] Macro-benchmarks characterize 10KB → 100MB+ scaling
 - [ ] Memory profiling infrastructure operational
 - [ ] Baseline performance metrics documented
-- [x] At least 1 confirmed O(N²) bottleneck identified (BN-1, `add_relations` DFS)
-- [ ] BN-1 candidate fix implemented and benchmarked against MDN `web/javascript`
-- [ ] At least 2 additional bottlenecks characterized after BN-1 fix
+- [x] At least 1 confirmed O(N²) bottleneck identified and fixed (FM1b, `initialize_stack` fan-out)
+- [ ] Run 3 confirms FM1b fix effective on MDN corpus
+- [ ] BN-DB (`with_db_cache`) fixed; 7/7 green CI
+- [ ] BN-1 (`add_relations` DFS) assessed post-Run 3; fix if still dominant
+- [ ] At least 2 additional bottlenecks characterized after FM1b fix
 - [ ] Performance characteristics documented in design docs
 - [ ] Clear answer to: "Can we process GB-scale corpora with current architecture?"
 
