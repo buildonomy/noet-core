@@ -73,7 +73,7 @@ silent stalls will remain and become the new dominant term.
 
 ---
 
-### ❌ BN-GW: Gateway-tier reclassification causes silent link drop — **CONFIRMED CORRECTNESS GAP**
+### ❌ Section/Document ID Collision: Gateway-tier reclassification causes silent link drop — **CONFIRMED CORRECTNESS GAP**
 
 **Location**: `src/paths/pathmap.rs` (`process_relation_update`),
 `src/codec/md.rs` (`check_for_link_and_push`, `inject_context`).

@@ -1,4 +1,3 @@
-use petgraph::Direction;
 use pulldown_cmark::{
     BrokenLink, CowStr, Event as MdEvent, HeadingLevel, LinkType, MetadataBlockKind, Options,
     Parser as MdParser, Tag as MdTag, TagEnd as MdTagEnd,
@@ -26,7 +25,7 @@ use crate::{
     codec::{
         belief_ir::{IRNode, IntermediateRelation},
         byte_offset_to_location,
-        diagnostic::{ParseDiagnostic, UnresolvedReference},
+        diagnostic::ParseDiagnostic,
         DocCodec, CODECS,
     },
     error::BuildonomyError,
@@ -351,7 +350,7 @@ fn check_for_link_and_push(
     events_in: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     ctx: &BeliefContext<'_>,
     doc_abs_path: &str,
-    source: &str,
+    _source: &str,
     events_out: &mut VecDeque<(MdEvent<'static>, Option<Range<usize>>)>,
     stop_event: Option<&MdEvent<'_>>,
     diagnostics: &mut Vec<ParseDiagnostic>,
@@ -452,41 +451,60 @@ fn check_for_link_and_push(
             //   3. Extensionless key: doc="/tmp/.../test.md"   ctx="test"
             //
             // We need to find root_abs_path = the absolute prefix that, when concatenated
-            // with ctx_filepath, gives doc_abs_path (modulo extension differences).
+            // with ctx_stem, gives doc_stem (i.e. doc_stem.ends_with(ctx_stem)).
             //
-            // Strategy: normalise both to an extensionless stem using plain string ops.
-            // AnchorPath is now drive-letter-aware (C:/... is treated as a plain absolute
-            // path, not a URL schema), so filepath() correctly preserves the drive prefix.
-            // Forward slashes are always used here (os_path_to_string guarantees that by
-            // the time paths reach the codec layer).
-            let ctx_filepath = AnchorPath::new(&ctx.root_path).filepath();
+            // Strategy: reduce both paths to their containing directory using AnchorPath.
+            //
+            // ctx_filepath comes from ctx.root_path, which may be:
+            //   - a real file path:     "array/symbol.iterator/index.md"
+            //   - a dotted dir name:    "array/symbol.iterator"   (document node, no index.md)
+            //   - a plain dir name:     "array"
+            //
+            // AnchorPath::new() mis-classifies "array/symbol.iterator" as a file with
+            // extension "iterator", so dir() returns only "array" — losing the last component.
+            // Use new_dir() + drop_index_file() for the same treatment as doc_stem below.
+            //
+            // doc_abs_path is the absolute filesystem path of the document being parsed.
+            // It may be a real file (".../array/index.md") or a dotted directory name
+            // (".../array/symbol.iterator") that AnchorPath::new() would mis-classify as
+            // a file with extension "iterator". Using new_dir() unconditionally forces
+            // directory semantics, giving dir() = the full path. Then drop_index_file()
+            // strips a trailing "/index.md" (or bare "index.anything") to normalise the
+            // file-path case back to the parent directory, matching what ctx_stem produces.
+            //
+            //   ".../array/index.md"       → new_dir → dir = ".../array/index.md"
+            //                              → drop_index_file → ".../array"            ✓
+            //   ".../array/symbol.iterator"→ new_dir → dir = ".../array/symbol.iterator"
+            //                              → drop_index_file → ".../array/symbol.iterator" ✓
+            //   ".../array"                → new_dir → dir = ".../array"
+            //                              → drop_index_file → ".../array"            ✓
+            //
+            // AnchorPath is drive-letter-aware (C:/... is a plain absolute path, not a
+            // URL schema), so dir() preserves the drive prefix correctly.
+            // Forward slashes are always used here (os_path_to_string guarantees that).
 
-            /// Strip the file extension from a forward-slash path string.
-            /// "subnet1/index.md" → "subnet1/index"
-            /// "test.md"          → "test"
-            /// "subnet1"          → "subnet1"   (no extension — unchanged)
-            fn strip_ext(p: &str) -> &str {
-                // Only consider the portion after the last '/'
+            /// Strip a trailing "index" file segment (with any extension, e.g. "index.md",
+            /// "index.html") from an absolute path, returning the parent directory.
+            /// A bare "index" (no extension) is also stripped.
+            /// Non-index last components are returned unchanged.
+            ///
+            /// "…/array/index.md"  → "…/array"
+            /// "…/array"           → "…/array"   (unchanged)
+            /// "index.md"          → ""           (repo root)
+            fn drop_index_file(p: &str) -> &str {
                 let last_slash = p.rfind('/').map(|i| i + 1).unwrap_or(0);
-                if let Some(dot) = p[last_slash..].rfind('.') {
-                    &p[..last_slash + dot]
+                let last_component = &p[last_slash..];
+                if last_component == "index" || last_component.starts_with("index.") {
+                    // Strip the last component and the preceding slash (if any).
+                    &p[..last_slash.saturating_sub(1)]
                 } else {
                     p
                 }
             }
 
-            /// Further reduce a stem: if it ends in "/index" or equals "index" (top-level
-            /// network root whose ctx.root_path is "index.md"), drop that segment so that
-            /// "subnet1/index", "subnet1", "/abs/path/to/dir", and "index" all compare equal
-            /// against their counterpart.
-            fn drop_index_suffix(p: &str) -> &str {
-                p.strip_suffix("/index")
-                    .or_else(|| if p == "index" { Some("") } else { None })
-                    .unwrap_or(p)
-            }
-
-            let ctx_stem = drop_index_suffix(strip_ext(ctx_filepath));
-            let doc_stem = drop_index_suffix(strip_ext(doc_abs_path));
+            let ctx_filepath = AnchorPath::new(&ctx.root_path).filepath();
+            let ctx_stem = drop_index_file(AnchorPath::new_dir(ctx_filepath).dir());
+            let doc_stem = drop_index_file(AnchorPath::new_dir(doc_abs_path).dir());
 
             if !doc_stem.ends_with(ctx_stem) {
                 // Mismatch means we cannot safely compute root_abs_path.
@@ -654,21 +672,6 @@ fn check_for_link_and_push(
                 };
                 events_out.push_back((start_event, None));
             } else {
-                // No matching relation found - leave link unchanged and emit a diagnostic
-                let location = link_data
-                    .range
-                    .as_ref()
-                    .map(|r| byte_offset_to_location(source, r.start));
-                let unresolved = UnresolvedReference {
-                    direction: Direction::Incoming,
-                    self_path: doc_abs_path.to_string(),
-                    other_keys: keys.clone(),
-                    reference_location: location,
-                    ..UnresolvedReference::default()
-                };
-
-                // diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
-
                 let start_event = if link_data.is_image {
                     MdEvent::Start(MdTag::Image {
                         link_type: link_data.link_type,

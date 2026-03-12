@@ -353,6 +353,7 @@ impl GraphBuilder {
                         false,
                         &mut missing_structure,
                         entry_sort_key,
+                        &mut diagnostics,
                     )
                     .await?;
                 if !missing_structure.is_empty() {
@@ -508,6 +509,7 @@ impl GraphBuilder {
                 // to bound the DFS to the current file's nodes — not all of doc_bb's ancestor chain.
                 // The unbounded merge was the BN-1 bottleneck: on reparse, doc_bb's ancestor chain
                 // includes the root network node, causing a full-graph DFS on every reparse pass.
+
                 self.doc_bb.merge_from(&missing_structure, &parsed_bid_set);
             }
             for edge_update in relation_event_queue.drain(..) {
@@ -558,6 +560,7 @@ impl GraphBuilder {
             // is incorrect: section nodes resolved from StackCache may carry BIDs that have never
             // been persisted to disk. Those BIDs must be injected into the proto documents so that
             // finalize() can write them into the sections table and trigger a content rewrite.
+
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                 let in_states = self.doc_bb.states().contains_key(bid);
                 let in_pathmap = self
@@ -796,7 +799,8 @@ impl GraphBuilder {
                     global_bb.clone(),
                     true,
                     &mut missing_structure,
-                    None, // ancestor network nodes; sort key is not relevant here
+                    None,            // ancestor network nodes; sort key is not relevant here
+                    &mut Vec::new(), // ancestor pushes are trace-only; diagnostics discarded
                 )
                 .await?;
             // Merge missing_structure after each push so it's available for the next iteration.
@@ -1109,6 +1113,7 @@ impl GraphBuilder {
         as_trace: bool,
         missing_structure: &mut BeliefGraph,
         explicit_sort_key: Option<u16>,
+        diagnostics: &mut Vec<ParseDiagnostic>,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
         let (parent_bid, path_info, _parent_full_path) = self.get_parent_from_stack(proto);
 
@@ -1210,16 +1215,49 @@ impl GraphBuilder {
                 // Only check collision if node was actually found (not generated)
                 // Collision if existing node has different BID
                 if existing_source.is_from_cache() && existing_node.bid != bid {
-                    // First-one-wins: Clear the ID so inject_context uses Bref for id
-                    node.id = Some(node_bref);
-                    // Regenerate keys since we updated our ID
-                    for key in keys.iter_mut() {
-                        if let NodeKey::Id { .. } = key {
-                            *key = NodeKey::Id {
-                                net: net.bref(),
-                                id: node.id(),
+                    let incoming_is_document = node.kind.0.contains(BeliefKind::Document);
+                    let existing_is_anchor = existing_node.kind.is_anchor();
+
+                    if incoming_is_document && existing_is_anchor {
+                        // Document wins over section with the same network id.
+                        // Clobber the section's id to its bref in both doc_bb and session_bb
+                        // so that inject_context can correctly resolve this document's path.
+                        let mut clobbered = existing_node.clone();
+                        let section_bref = clobbered.bid.bref().to_string();
+                        clobbered.id = Some(section_bref);
+                        let clobber_keys = vec![NodeKey::Id {
+                            net: net.bref(),
+                            id: node_id.clone(),
+                        }];
+                        let _ = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
+                            clobber_keys.clone(),
+                            clobbered.toml(),
+                            EventOrigin::Remote,
+                        ));
+                        let _ = self.session_bb.process_event(&BeliefEvent::NodeUpdate(
+                            clobber_keys,
+                            clobbered.toml(),
+                            EventOrigin::Remote,
+                        ));
+                        diagnostics.push(ParseDiagnostic::warning(format!(
+                            "ID collision: section '{}' (BID {}) shares network id '{}' with \
+                                 this document. The section's id has been reset to its bref. \
+                                 Rename the heading or add an explicit anchor id in its source \
+                                 file to resolve.",
+                            existing_node.title, existing_node.bid, node_id,
+                        )));
+                    } else {
+                        // First-one-wins: incoming loses, clear id so inject_context uses bref
+                        node.id = Some(node_bref);
+                        // Regenerate keys since we updated our ID
+                        for key in keys.iter_mut() {
+                            if let NodeKey::Id { .. } = key {
+                                *key = NodeKey::Id {
+                                    net: net.bref(),
+                                    id: node.id(),
+                                };
                             };
-                        };
+                        }
                     }
                 }
             }
@@ -1719,34 +1757,37 @@ impl GraphBuilder {
         //
         // The parent network directory is the immediate ancestor directory that contains a
         // network file.  For a plain doc `net/doc.md`, the parent dir is `net/`.
-        // For a subnet index `net/subnet/index.md`, the entry doc IS a network — fall
-        // through to slow path (no separate parent to query).
+        // For a subnet index `net/subnet/index.md`, the entry doc IS itself a network but
+        // its parent is the grandparent network `net/` — still queryable on the fast path.
+        // Only the repo root `index.md` has no parent and must use the slow path.
         //
         // We replicate the slow-path's parent_path_stack logic:
-        //   1. Start from initial.path (the doc's own path string).
-        //   2. Pop NETWORK_NAME suffix if present (subnet case) — but that means it's a
-        //      network itself, so fall through.
-        //   3. Pop one directory component — that's the parent network directory.
-        //   4. Strip repo_root → parent_net_rel_path for the NodeKey.
+        //   1. Start from abs_path.
+        //   2. Pop NETWORK_NAME filename → now at the subnet directory itself.
+        //   3. Pop the subnet directory component → now at the grandparent network dir.
+        //   4. For a plain doc, just pop the filename → now at the parent network dir.
+        //   5. If after popping we are outside the repo, this is the repo root → slow path.
+        //   6. Strip repo_root → parent_net_rel_path for the NodeKey.
         let entry_rel_path = match abs_path.strip_prefix(self.repo_root()) {
             Ok(p) => os_path_to_string(p),
             Err(_) => return Ok(None),
         };
 
         // Determine the parent network directory (absolute).
-        // If abs_path ends with NETWORK_NAME, the entry doc IS a network — no separate
-        // parent to query on the fast path; fall through to slow path.
         let abs_path_str = os_path_to_string(abs_path);
         let abs_ap = AnchorPath::new(&abs_path_str);
+        let mut parent_abs = abs_path.to_path_buf();
         if abs_ap.filename() == NETWORK_NAME {
-            return Ok(None);
+            // Subnet index.md: pop filename, then pop the subnet dir itself to reach
+            // the grandparent network directory.
+            parent_abs.pop(); // removes "index.md"
+            parent_abs.pop(); // removes subnet dir (e.g. "array")
+        } else {
+            // Plain doc: pop just the filename.
+            parent_abs.pop();
         }
 
-        // Pop the filename component to get the containing directory.
-        let mut parent_abs = abs_path.to_path_buf();
-        parent_abs.pop();
-
-        // The parent directory must still be inside the repo.
+        // If we've popped above the repo root, this is the repo root index.md — slow path.
         if parent_abs.strip_prefix(self.repo_root()).is_err() {
             return Ok(None);
         }
@@ -1765,17 +1806,17 @@ impl GraphBuilder {
         };
 
         // Query the parent network in session_bb.
-        // On a StackCache hit, fast_missing contains the parent network node, its ancestor
-        // chain (Section edges up to the API root via balance()), and — because the parent
-        // is a network — its downstream Section edges to each child document with their sort
-        // keys in the edge weights.
-        let mut fast_missing = BeliefGraph::default();
+        // We use cache_fetch only to confirm a StackCache hit and extract parent_bid.
+        // cache_fetch deliberately does NOT populate missing_structure on a StackCache hit
+        // (to avoid corrupting doc_bb in Phase 2 callers). So fast_missing is populated
+        // separately via a direct session_bb.eval_query after the hit is confirmed.
+        let mut _unused_missing = BeliefGraph::default();
         let fast_result = self
             .cache_fetch(
                 std::slice::from_ref(&parent_key),
                 global_bb.clone(),
                 false,
-                &mut fast_missing,
+                &mut _unused_missing,
             )
             .await?;
 
@@ -1784,12 +1825,22 @@ impl GraphBuilder {
             _ => return Ok(None),
         };
 
+        // Populate fast_missing directly from session_bb now that we have confirmed the
+        // StackCache hit. eval_query with traverse:None calls balance(), which for a network
+        // node walks Section edges one level downstream — giving us the parent's full ancestor
+        // chain AND its child Section edges (with sort keys) in one call.
+        let parent_query = Query {
+            seed: Expression::from(&parent_key),
+            traverse: None,
+        };
+        let fast_missing: BeliefGraph = self.session_bb.eval_query(&parent_query, true).await?;
+
         // Extract doc_sort_key from the parent's Section edge to the entry doc.
         //
-        // fast_missing (from cache_fetch on the parent) contains the balanced ancestor graph
-        // plus all downstream Section edges from the parent to its children (because
-        // eval_query with traverse:None calls balance(), which walks Section edges downward
-        // one level for network nodes in order to populate the PathMap with child sort keys).
+        // fast_missing now contains the balanced ancestor graph plus all downstream Section
+        // edges from the parent to its children (because eval_query with traverse:None calls
+        // balance(), which walks Section edges downward one level for network nodes in order
+        // to populate the PathMap with child sort keys).
         //
         // The entry doc's repo-relative path is `entry_rel_path`.  Find the Section edge
         // whose doc_paths weight contains that path and read its sort_key.

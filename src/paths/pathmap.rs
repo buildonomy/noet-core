@@ -775,6 +775,12 @@ impl PathMap {
                     let (weight, paths) = tree_graph.edge_weight(sink, source).expect(
                         "Edge weight should exist since we received a DfsEvent for this relation",
                     );
+                    if nets.titles().get(&source).is_none() {
+                        tracing::error!(
+                            "[PathMap::new] ISSUE 34: source {} has no title entry in nets (sink={}, paths={:?})",
+                            source, sink, paths
+                        );
+                    }
 
                     // Handle multiple paths per relation
                     // Store ALL paths for this source in the sink's sub_paths
@@ -883,7 +889,13 @@ impl PathMap {
                                 // For each base path, join with each sub path
                                 let mut joined_paths = Vec::new();
                                 for base_path in source_base_paths.iter() {
-                                    let base_ap = AnchorPath::from(base_path);
+                                    // Use new_dir() so that dotted directory names (e.g.
+                                    // "symbol.iterator") are treated as directory components
+                                    // in join(), not as files with extension "iterator".
+                                    // Without this, AnchorPath::from("symbol.iterator") sets
+                                    // ext_sep and dir() returns "", silently dropping the
+                                    // directory component when joining sub-paths.
+                                    let base_ap = AnchorPath::new_dir(base_path);
                                     for sub_path in sub_paths.iter() {
                                         joined_paths.push(base_ap.join(sub_path).into_string());
                                     }
@@ -1166,7 +1178,13 @@ impl PathMap {
                         .and_then(|idx_vec| idx_vec.first().copied())
                         .expect("pathmap subnets to be synchronized with pathmap.bid_map");
                     let (subnet_path, _subnet_bid, net_order) = &self.map[first_idx];
-                    let subnet_ap = AnchorPath::from(subnet_path);
+                    // Use new_dir() so that dotted directory names (e.g. "symbol.iterator")
+                    // are treated as directory components in join(), not as files with
+                    // extension "iterator". Without new_dir(), AnchorPath::from("symbol.iterator")
+                    // sets ext_sep and dir() returns "", causing the directory component to be
+                    // silently dropped when joining sub-paths like "index.md#syntax" — producing
+                    // "index.md#syntax" instead of the correct "symbol.iterator/index.md#syntax".
+                    let subnet_ap = AnchorPath::new_dir(subnet_path);
                     nets.get_map(&net_bid.bref())
                         .and_then(|subnet_path_map| subnet_path_map.path(bid, nets))
                         .map(|(home_net_bid, home_path, home_order)| {
@@ -1251,7 +1269,9 @@ impl PathMap {
                     .get_map(&a_bid.bref())
                     .map(|pm| pm.all_paths(nets, visited))
                 {
-                    let a_ap = AnchorPath::from(a_path);
+                    // Use new_dir() so that dotted directory names (e.g. "symbol.iterator")
+                    // are treated as directory components in join(), not as files.
+                    let a_ap = AnchorPath::new_dir(a_path);
                     for subnet_path in sub_paths.iter() {
                         paths.push(a_ap.join(subnet_path).into_string());
                     }
@@ -1300,7 +1320,9 @@ impl PathMap {
                     .get_map(&elem_bid.bref())
                     .map(|pm| pm.recursive_map(nets, visited))
                     .expect("all identified subnets to be registered with the pathmapmap");
-                let sub_ap = AnchorPath::new(elem_path);
+                // Use new_dir() so that dotted directory names (e.g. "symbol.iterator")
+                // are treated as directory components in join(), not as files.
+                let sub_ap = AnchorPath::new_dir(elem_path);
                 for tuple in subs.iter_mut() {
                     tuple.0 = sub_ap.join(&tuple.0).into_string();
                     let mut new_order = elem_order.clone();
