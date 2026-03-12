@@ -567,7 +567,7 @@ fn check_for_link_and_push(
             let root_abs_path = &doc_stem[0..(doc_stem.len() - ctx_stem.len())];
             let regularized =
                 normalized_abs.regularize_unchecked(ctx.root_net, &ctx.root_path, root_abs_path);
-            let keys = vec![regularized];
+            let keys = [regularized];
 
             // Check sources (upstream) for the link target. Assets and document links are sources
             // (upstream)

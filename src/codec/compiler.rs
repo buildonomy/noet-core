@@ -1062,11 +1062,11 @@ impl DocumentCompiler {
             if self.html_output_dir().is_some() {
                 self.generate_spa_shell().await?;
             }
-            tracing::debug!(
-                "State of session_bb at finalize:\n{}\n{}",
-                self.builder().session_bb().clone().consume(),
-                self.builder().session_bb().paths()
-            );
+            // tracing::debug!(
+            //     "State of session_bb at finalize:\n{}\n{}",
+            //     self.builder().session_bb().clone().consume(),
+            //     self.builder().session_bb().paths()
+            // );
         }
 
         Ok(())

@@ -238,16 +238,23 @@ impl NodeKey {
                         .path
                         .starts_with(base_abs_path)
                 {
-                    tracing::warn!(
-                        "[Nodekey::regularize] NodeKey::Path supplied with an \
-                        absolute path {}, but without an anchoring network. The meaning of \
-                        the path is unclear. Assuming this is rooted at the root dir of \
-                        the supplied network {}",
+                    // The path is absolute but outside the repo boundary — this is a
+                    // corpus-relative absolute reference (e.g. MDN's `/en-US/docs/...`
+                    // slugs, which are absolute relative to the MDN content root but
+                    // outside the parsed repo subtree). Treating it as an in-repo key
+                    // produces a corrupt filesystem path that `canonicalize` will fail on.
+                    //
+                    // Classify as an href_namespace external instead: the path is
+                    // unresolvable within this repo, and `push_relation` already handles
+                    // href_namespace keys correctly (generates an External node).
+                    tracing::debug!(
+                        "[Nodekey::regularize] Absolute path {:?} is outside repo boundary {:?}; \
+                        treating as href_namespace external",
                         normalized_link_buf,
-                        base_net
+                        base_abs_path,
                     );
                     return NodeKey::Path {
-                        net: base_net.bref(),
+                        net: href_namespace().bref(),
                         path: normalized_link_buf.into(),
                     };
                 }

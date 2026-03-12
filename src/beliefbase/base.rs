@@ -1143,8 +1143,11 @@ impl BeliefBase {
                 // Metadata only, handled by Transaction for mtime tracking
             }
             BeliefEvent::BalanceCheck => {
-                // Just run a quick check for balanceCheck operations, not a full built_in_test check
-                self.index_sync(false);
+                // No-op: bid_to_index is rebuilt lazily on next access via the index_dirty flag.
+                // Calling index_sync(false) here was O(session_bb) per file — the dominant
+                // bottleneck in run 11 (+4.4 ms/file slope). The lazy rebuild in read_bid_index()
+                // is sufficient; BalanceCheck's only remaining role is as a synchronization
+                // signal for subscribers (e.g. db.rs).
             }
             BeliefEvent::BuiltInTest => {
                 // Run a full built_in_test check
@@ -1717,57 +1720,24 @@ impl BeliefBase {
 
     /// Core implementation for `merge` and `merge_from`.
     ///
-    /// Directly mutates `self`'s states and relations through the write lock rather than
-    /// going through `consume()` + `BeliefBase::from()`. This avoids the full
-    /// `PathMapMap::new()` rebuild inside `new_unbalanced` — the PathMap is left dirty and
-    /// will be reconstructed on the next `BalanceCheck` or path read.
+    /// Merges `rhs` into `self` by converting it to an event stream and applying each
+    /// event via `process_event`. This keeps `PathMapMap` fully correct — node metadata
+    /// AND PathMap path entries — at O(rhs_size) cost with no clone of session_bb relations
+    /// and no `PathMapMap::new` rebuild.
     ///
-    /// `seed_bids`: when `Some`, restricts the relation DFS to those seeds (fixing the O(N²)
-    /// BN-1 bottleneck). When `None`, seeds from `self.states ∩ rhs.states` (original behaviour).
+    /// `seed_bids`: when `Some`, scopes the relation events to the halo around those seeds
+    /// (seeds + neighbours + balanced Section ancestors). When `None`, all rhs relations
+    /// are emitted.
     fn merge_graph_mut(&mut self, rhs: &BeliefGraph, seed_bids: Option<&BTreeSet<Bid>>) {
-        // Mutate states in-place using lhs-wins semantics: or_insert_with preserves any node
-        // already present in self. This is intentionally different from union_mut (rhs-wins)
-        // because BeliefBase::merge is used by doc_bb, which is the authority for the current
-        // parse. Freshly-pushed nodes must not be overwritten by stale versions arriving via
-        // missing_structure. The Trace-kind downgrade (complete beats Trace) is still applied.
-        for node in rhs.states.values().filter(|n| n.kind.is_complete()) {
-            let entry = self.states.entry(node.bid).or_insert_with(|| node.clone());
-            if entry.kind.contains(BeliefKind::Trace) && !node.kind.contains(BeliefKind::Trace) {
-                entry.kind.remove(BeliefKind::Trace);
+        let events = rhs.to_event_stream(self, seed_bids);
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            if let Err(e) = self.process_event(&event) {
+                tracing::warn!("[merge_graph_mut] process_event failed for {event}: {e}");
             }
         }
-        // Keep brefs index consistent with states.
-        self.brefs = BTreeMap::from_iter(self.states.keys().map(|bid| (bid.bref(), *bid)));
-
-        // Mutate the relation graph directly through the write lock.
-        {
-            let mut relations = self.write_relations();
-            // Build a temporary BeliefGraph wrapping our current relation graph so we can
-            // call add_relations_seeded, then put the result back.
-            //
-            // We need a BeliefGraph whose `states` reflects the *already-merged* state map
-            // (computed above) so that `add_relations_seeded` can gate edge insertion on
-            // `self.states.contains_key`.  We clone states here; the clone is O(session_bb_size)
-            // but avoids the far more expensive PathMapMap reconstruction.
-            let mut lhs_graph = BeliefGraph {
-                states: self.states.clone(),
-                relations: BidGraph(std::mem::replace(
-                    relations.as_graph_mut(),
-                    petgraph::Graph::new(),
-                )),
-            };
-            match seed_bids {
-                Some(seeds) => lhs_graph.add_relations_seeded(rhs, Some(seeds)),
-                None => lhs_graph.add_relations_seeded(rhs, None),
-            }
-            // Put the mutated relation graph back.
-            *relations.as_graph_mut() = lhs_graph.relations.0;
-            // States were already updated above; drop the temporary clone.
-        }
-
-        // Mark indices dirty — bid_to_index and PathMapMap will be rebuilt on next access
-        // (BalanceCheck calls index_sync, path reads call paths()).
-        self.index_dirty.store(true, Ordering::SeqCst);
     }
 
     pub fn set_merge(&mut self, rhs_set: &mut BeliefBase) {

@@ -378,6 +378,7 @@ impl PathMapMap {
         }
 
         pmm.map.clear();
+
         for net in pmm.nets.iter() {
             if !pmm.map.contains_key(&net.bref()) {
                 let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
@@ -590,15 +591,68 @@ impl PathMapMap {
     ) -> Vec<BeliefEvent> {
         let mut path_events = Vec::new();
 
+        // Pass 1: populate titles, docs, nets, and ids from all NodeUpdate/NodeRemoved events
+        // before rebuilding any PathMaps. This ensures that when a network NodeUpdate triggers
+        // PathMap::new in pass 2, every node referenced in the relations graph (including
+        // freshly-generated href nodes) already has a title entry — preventing the Issue 34
+        // "source has no title entry in nets" error caused by processing NodeUpdate(href_namespace)
+        // before NodeUpdate(href_node) when both arrive in the same event queue.
         for event in events {
             match event {
                 BeliefEvent::NodeUpdate(_, toml_str, _) => {
                     if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
-                        self.process_node_update(&node, relations);
+                        self.titles.insert(node.bid, node.title.clone());
+                        self.ids.insert(node.bid, node.id());
+                        if node.kind.contains(BeliefKind::API) {
+                            self.apis.insert(node.bid);
+                        }
+                        if node.kind.is_network() {
+                            self.nets.insert(node.bid);
+                        }
+                        if node.kind.is_document() || node.kind.is_external() {
+                            self.docs.insert(node.bid);
+                        }
                     }
                 }
                 BeliefEvent::NodesRemoved(bids, _) => {
                     self.process_nodes_removed(bids);
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 2: rebuild network PathMaps and apply relation updates, now that titles is complete.
+        // Nodes from prior merge_graph_mut calls (e.g. href_node added when an earlier file was
+        // parsed) are already in self.titles because merge_graph_mut now fires NodeUpdate events
+        // through the PathMapMap for every newly-added state. No backfill needed here.
+        for event in events {
+            match event {
+                BeliefEvent::NodeUpdate(_, toml_str, _) => {
+                    if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
+                        // Rebuild the PathMap for newly registered network nodes. All source nodes
+                        // referenced in relations are already in self.titles (from pass 1 for nodes
+                        // in this batch, from merge_graph_mut's NodeUpdate events for prior batches).
+                        //
+                        // Guard against Trace network nodes only when a PathMap already exists:
+                        // a Trace node is balance scaffolding emitted by to_event_stream to satisfy
+                        // process_relation_update's sink-must-exist requirement. If a PathMap already
+                        // exists for this network (built from a prior complete NodeUpdate), skip the
+                        // rebuild — the existing PathMap is correct and the O(session_bb) DFS would
+                        // only produce a stale result. If no PathMap exists yet, build one even for
+                        // a Trace node so that child RelationUpdate events can find the sink.
+                        let pm_already_exists = self.map.contains_key(&node.bid.bref());
+                        if node.kind.is_network()
+                            && !(node.kind.contains(BeliefKind::Trace) && pm_already_exists)
+                        {
+                            let pm = PathMap::new(
+                                WeightKind::Section,
+                                node.bid,
+                                self,
+                                relations.clone(),
+                            );
+                            self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
+                        }
+                    }
                 }
                 BeliefEvent::NodeRenamed(from, to, _) => {
                     self.process_node_renamed(from, to);
@@ -623,26 +677,29 @@ impl PathMapMap {
                 _ => {}
             }
         }
+        // Sort all PathMaps that may have received out-of-order siblings. RelationUpdate events
+        // are not guaranteed to arrive in WEIGHT_SORT_KEY order, but process_relation_update
+        // inserts new entries at the end of existing children without consulting the sort key.
+        // One O(M log M) pass per network here — rather than per-event — restores correct order.
+        for pm_lock in self.map.values() {
+            let mut pm = pm_lock.write();
+            pm.sort();
+            pm.bid_map.clear();
+            pm.path_map.clear();
+            pm.order_map.clear();
+            let entries: Vec<(String, Bid, Vec<u16>)> = pm
+                .map
+                .iter()
+                .map(|(path, bid, order)| (path.clone(), *bid, order.clone()))
+                .collect();
+            for (idx, (path, bid, order)) in entries.iter().enumerate() {
+                pm.bid_map.entry(*bid).or_default().push(idx);
+                pm.path_map.insert(path.clone(), idx);
+                pm.order_map.insert(order_key(order), idx);
+            }
+        }
+
         path_events
-    }
-
-    /// Process a NodeUpdate event to synchronize nets, docs, and titles
-    pub fn process_node_update(&mut self, node: &BeliefNode, relations: &Arc<RwLock<BidGraph>>) {
-        self.titles.insert(node.bid, node.title.clone());
-        self.ids.insert(node.bid, node.id());
-
-        if node.kind.contains(BeliefKind::API) {
-            self.apis.insert(node.bid);
-        }
-
-        if node.kind.is_network() {
-            self.nets.insert(node.bid);
-            let pm = PathMap::new(WeightKind::Section, node.bid, self, relations.clone());
-            self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
-        }
-        if node.kind.is_document() || node.kind.is_external() {
-            self.docs.insert(node.bid);
-        }
     }
 
     /// Process a NodesRemoved event to clean up nets, docs, and titles

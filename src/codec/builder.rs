@@ -826,20 +826,7 @@ impl GraphBuilder {
         // directory tree to handle files in non-network subdirectories that iter_net_docs
         // flattens into the ancestor network's child list.
         let doc_sort_key: Option<u16> = proto_index.sort_key_for(abs_path.as_ref());
-        tracing::debug!(
-            "[initialize_stack slow-path] doc_sort_key={:?} for path={:?}",
-            doc_sort_key,
-            abs_path.as_ref()
-        );
-        tracing::debug!(
-            "[initialize_stack slow-path stack]:\n{}",
-            self.stack
-                .iter()
-                .enumerate()
-                .map(|(idx, (_bid, path, heading))| format!("{idx}: {heading}. {path}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+
         Ok((initial, doc_sort_key))
     }
 
@@ -898,12 +885,29 @@ impl GraphBuilder {
                     BeliefEvent::NodesRemoved(nids, _) => node_removed_count += nids.len(),
                     BeliefEvent::NodeRenamed(_, _, _) => node_renamed_count += 1,
                     BeliefEvent::RelationChange(_, _, _, _, _) => relation_insert_count += 1,
-                    BeliefEvent::RelationRemoved(_, _, _) => relation_removed_count += 1,
+                    BeliefEvent::RelationRemoved(source, sink, _) => {
+                        relation_removed_count += 1;
+                        // Removed relations indicate instability: a previously-known edge is
+                        // being retracted. Log at WARN so parse_log.py can surface them without
+                        // requiring RUST_LOG=debug.
+                        tracing::warn!("[terminate_stack] RelationRemoved: {} → {}", source, sink,);
+                    }
                     BeliefEvent::RelationUpdate(_, _, _, _) => relation_update_count += 1,
                     BeliefEvent::PathAdded(..) | BeliefEvent::PathUpdate(..) => {
                         path_update_count += 1
                     }
-                    BeliefEvent::PathsRemoved(_, paths, _) => path_removed_count += paths.len(),
+                    BeliefEvent::PathsRemoved(net, paths, _) => {
+                        path_removed_count += paths.len();
+                        // Removed paths also indicate instability (a node moved or was
+                        // reclassified). Log each removed path at WARN for parse_log.py.
+                        for path in paths {
+                            tracing::warn!(
+                                "[terminate_stack] PathsRemoved: net={} path={:?}",
+                                net,
+                                path,
+                            );
+                        }
+                    }
                     BeliefEvent::FileParsed(_) => {} // Metadata only, handled by Transaction
                     BeliefEvent::BalanceCheck => {}
                     BeliefEvent::BuiltInTest => {}
@@ -2007,21 +2011,6 @@ impl GraphBuilder {
 
         self.stack = stack_entries;
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
-
-        tracing::debug!(
-            "[initialize_stack fast-path] doc_sort_key={:?} for path={:?}",
-            doc_sort_key,
-            abs_path
-        );
-        tracing::debug!(
-            "[initialize_stack fast-path stack]:\n{}",
-            self.stack
-                .iter()
-                .enumerate()
-                .map(|(idx, (_bid, path, heading))| format!("{idx}: {heading}. {path}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
 
         // proto() is still needed — initialize_stack must return the entry IRNode for Phase 1.
         let initial_factory = CODECS

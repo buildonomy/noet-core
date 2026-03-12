@@ -289,6 +289,68 @@ All three bail-out paths call this helper, then `continue` the loop.
 
 **Status**: Low risk, purely mechanical refactor. No behaviour change intended.
 
+## Site-Root-Relative Slug Resolution via Slug Namespace
+
+**Priority**: MEDIUM - Improves cross-reference fidelity for common corpus types
+
+**Context**: Many static site generators (MDN, Jekyll, Hugo, Docusaurus, Sphinx) use
+absolute-path cross-references relative to a site root rather than the filesystem root
+(e.g. MDN's `/en-US/docs/Web/JavaScript/Reference/Global_Objects/Iterator`). These are
+distinguishable from external `http://` hrefs by the signature `is_absolute() &&
+!has_schema()` on `AnchorPath`. Currently `regularize_unchecked` correctly classifies
+these as `href_namespace` externals (fix landed in Issue 34 session), but they could be
+resolved to real in-graph nodes if the document registers its slug in a dedicated
+`slug_namespace` PathMap.
+
+### Design
+
+**Slug registration**: When a document's frontmatter contains a `slug:` field (or
+equivalent site-root-relative path declaration), the codec emits an additional
+`RelationUpdate` placing the document's BID into the `slug_namespace` PathMap under the
+slug string. Same BID as the file-derived node — the slug is just an alternate path alias.
+
+**Slug lookup**: In `regularize_unchecked`, paths matching `is_absolute() &&
+!has_schema()` are returned as `NodeKey::Path { net: slug_namespace().bref(), path }` (as
+they are today for `href_namespace`, but using `slug_namespace` instead). `cache_fetch`
+checks the `slug_namespace` PathMap after the normal filesystem PathMap miss. On a hit,
+returns `GetOrCreateResult::Resolved` with the real node — full graph edge established, no
+`External` node created. On a miss, falls back to `href_namespace` external as today.
+
+**Parse ordering**: If document B's slug is not yet registered when document A references
+it, `cache_fetch` misses and returns `UnresolvedReference` as normal. B is parsed later,
+registers its slug. A is re-queued via the standard reparse loop and resolves on the
+second pass. No special handling needed — the existing multi-pass convergence loop covers
+this.
+
+**Corpus scoping**: If the referenced slug is outside the parsed corpus subtree (e.g.
+running against `javascript/` when the slug points to `web/css/`), the slug PathMap will
+never contain it and the reference correctly degrades to `href_namespace` external. No
+prefix-stripping or site-root configuration required — the slug PathMap either has the
+entry or it doesn't.
+
+### Implementation Sketch
+
+1. Add `slug_namespace()` Bid in `properties.rs` (parallel to `href_namespace()`).
+2. In `regularize_unchecked`: `is_absolute() && !has_schema()` → return
+   `NodeKey::Path { net: slug_namespace().bref(), path }` instead of `href_namespace`.
+3. In `cache_fetch`: after filesystem PathMap miss, check slug PathMap; on hit return
+   resolved node.
+4. In `md.rs` (or a generic frontmatter hook): when `slug:` key present in frontmatter,
+   emit `RelationUpdate` adding the slug path to `slug_namespace` PathMap for this node's
+   BID.
+5. `push_relation` fallback: if slug lookup misses, re-classify as `href_namespace`
+   external (existing behaviour).
+
+### Notes
+- No "site root URL prefix" configuration needed — the PathMap match is purely by slug
+  string against registered slugs.
+- Works across any corpus that registers slugs, not just MDN.
+- Running against a full corpus root (e.g. `files/en-us/`) vs a subtree
+  (`files/en-us/web/javascript/`) naturally determines how many slugs resolve vs degrade
+  to externals — no code change required for either mode.
+
+**Status**: Design complete. Blocked on nothing. Low implementation risk.
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

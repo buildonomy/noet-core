@@ -1,6 +1,6 @@
 # Issue 47: Performance Profiling Infrastructure
 
-**Priority**: MEDIUM - FM1b + ProtoIndex fix committed; Run 3 queued; BN-1 is next bottleneck
+**Priority**: MEDIUM - Issue 34 + fast-path fixes committed; HTML WASM latency + Issue 57 are next bottlenecks
 **Estimated Effort**: 3-4 days
 **Dependencies**: ISSUE_07 (basic benchmarks established)
 **Context**: Preparation for processing GB-scale documentation corpora
@@ -9,7 +9,9 @@
 
 Establish performance profiling infrastructure to characterize noet-core's behavior at scale. Currently we have micro-benchmarks (Criterion) for regression detection, but need macro-benchmarks with realistic workloads, memory profiling, and performance characterization for GB-scale document processing. This issue creates the foundation for identifying bottlenecks before they become critical.
 
-**Update 3 (Run 2 analysed; ProtoIndex landed)**: Run 2 on the MDN `web/javascript` corpus (1,329 files) ran for ~19.7 hours and confirmed FM1b as the dominant bottleneck: Phase 0 mean was 10.38 s (target <0.5 s), 106 outlier files exceeded 34 s, and 47 Phase 5 stalls totalling ~6.3 h of wall time were driven by RelationUpdate fan-out on `trailing_commas`, `working_with_objects`, and `functions/set`. The FM1b fix (ProtoIndex + three correctness bugs) is now committed and all 7 codec tests pass. Run 3 will measure the improvement. A secondary bottleneck — BN-1 (`add_relations` DFS in `session_bb.merge`) — was visible from ~05:33 onward in Run 2 as silent 0-RelUpdate stalls; this will become the dominant term once FM1b is gone.
+**Update 4 (Run 11 analysed; Issue 34 + fast-path fully resolved)**: Run 11 on the MDN `web/javascript` corpus (665 files parsed in ~29 min wall time) confirms all major algorithmic bottlenecks resolved. Mean parse time 1.19 s, max 7.10 s, 30 outliers above 3.27 s. 1,316 fast-path hits, 2 slow-path (repo root only). Zero Issue 34 errors. Zero WARN/ERROR outside of `Skipping update_relation` (1,277 Epistemic edges whose sinks arrive late — pre-existing, Issue 57 territory). Dominant remaining bottleneck is `index_sync` O(N) on `session_bb`: `BalanceCheck` at the end of the fast path triggers `index_sync(false)`, which rebuilds `bid_to_index` by walking every node in `session_bb.relations` — O(session_bb size) per file. Complexity fit shows +4.4 ms/file O(N) slope, consistent with this. The stalls appear as gaps inside `try_initialize_stack_from_session_cache` (between `ancestors_only` query and fast-path completion), not in HTML generation. Issue 57 (parallel epochs + bounded session_bb) eliminates this by construction.
+
+**Update 3 (Run 2 analysed; ProtoIndex landed)**: Run 2 on the MDN `web/javascript` corpus (1,329 files) ran for ~19.7 hours and confirmed FM1b as the dominant bottleneck: Phase 0 mean was 10.38 s (target <0.5 s), 106 outlier files exceeded 34 s, and 47 Phase 5 stalls totalling ~6.3 h of wall time were driven by RelationUpdate fan-out on `trailing_commas`, `working_with_objects`, and `functions/set`. The FM1b fix (ProtoIndex + three correctness bugs) is now committed and all 7 codec tests pass. A secondary bottleneck — BN-1 (`add_relations` DFS in `session_bb.merge`) — was visible from ~05:33 onward in Run 2 as silent 0-RelUpdate stalls; superseded by the Issue 34 / fast-path fixes.
 
 **Update 2 (FM1b fixed)**: The dominant O(siblings) bottleneck in `initialize_stack` has been eliminated. The `push_relation` sibling fan-out loop is gone; `initialize_stack` now returns `(IRNode, Option<u16>)` carrying the entry doc's sort key directly. The fast path queries the parent network (not the entry doc), hitting `StackCache` on the first parse of every child.
 
@@ -224,9 +226,28 @@ whether it remains significant post-FM1b fix.
 - Run on push to main branch (informational only)
 - Focus: Function-level performance regression detection
 
-**MDN corpus runs** (ad-hoc, `.bench_corpora/mdn-content/files/en-us/web/javascript`, 1,329 files):
-- **Run 2** (pre-FM1b fix): ~19.7 h, Phase 0 mean 10.38 s, 106 outliers, 47 Phase 5 stalls
-- **Run 3** (post-ProtoIndex): in progress — expected to confirm Phase 0 collapse and reveal BN-1 as next bottleneck
+**MDN corpus runs** (ad-hoc, `.bench_corpora/mdn-content/files/en-us/web/javascript`):
+
+| Run | Files | Wall time | Mean | Max | Outliers | Notes |
+|-----|-------|-----------|------|-----|----------|-------|
+| 2 | 1,329 | ~19.7 h | 10.38 s | 56 s | 106 | Pre-FM1b baseline |
+| 6 | 1,590 | ~4.1 h | 5.31 s | 130 s | 92 | Post-ProtoIndex; 0 fast-path hits (bug) |
+| 9 | — | — | ~0.2 s early | — | — | Post-fast-path fix; BN-GW clean |
+| 11 | 665 | ~29 min | 1.19 s | 7.10 s | 30 | Post-Issue-34 + fast-path; HTML WASM dominant |
+
+**Run 11 summary** (`beliefbase-merge-fix.log`, `RUST_LOG=debug`):
+- 665 files, 1,316 fast-path / 2 slow-path (repo root only) ✅
+- Zero Issue 34 errors ✅
+- Zero BN-GW path mismatch warnings ✅
+- 1,277 `Skipping update_relation` (Epistemic, sink missing) — pre-existing, Epistemic edges
+  whose sink nodes arrive late in the parse order; not a new regression
+- All 30 outliers are large `global_objects` networks; cost is HTML WASM render (~1–2.5 s/file)
+- Complexity fit: O(N) slope +4.4 ms/file — `index_sync` on `session_bb` growing with corpus size
+- Stalls appear inside `try_initialize_stack_from_session_cache` (between `ancestors_only` query
+  and fast-path completion), not in HTML generation — confirmed by stall report log alignment
+- `index_sync(false)` rebuilds `bid_to_index` by walking all `session_bb.relations` nodes — O(session_bb)
+  per file; triggered by `BalanceCheck` at end of fast path after `ancestors_only` merge sets `index_dirty`
+- **Dominant bottleneck: `index_sync` O(N) on session_bb** — Issue 57 eliminates by construction
 
 **Gap**: No macro-benchmarks for realistic workloads or memory profiling. Corpus runs are ad-hoc; we have no automated way to measure fixes or detect regressions at this scale.
 
@@ -399,10 +420,13 @@ Generate markdown that resembles real documentation:
 - [ ] Baseline performance metrics documented
 - [x] At least 1 confirmed O(N²) bottleneck identified and fixed (FM1b, `initialize_stack` fan-out)
 - [x] Run 2 baseline: Phase 0 mean 10.38 s, 106 outliers, 47 stalls (6.3 h), BN-1 visible
-- [ ] Run 3 confirms FM1b fix effective on MDN corpus (target Phase 0 mean <0.5 s)
-- [ ] BN-1 (`add_relations` DFS) quantified post-Run 3; fix if dominant
-- [ ] BN-DB (`with_db_cache`) investigated; fix or track in separate issue
-- [ ] At least 2 additional bottlenecks characterized after FM1b fix
+- [x] FM1b fix effective: fast-path confirmed firing (1,316/1,318 hits in run 11)
+- [x] BN-1 (`add_relations` DFS) resolved: superseded by Issue 34 `to_event_stream` refactor (O(rhs_size))
+- [x] Issue 34 (PathMap path entries missing for merged edges) resolved: zero errors in run 11
+- [x] BN-GW (path mismatch / dotted dir names) resolved: zero warnings in run 11
+- [x] At least 2 additional bottlenecks characterized and fixed (fast-path bugs, BN-GW, Issue 34)
+- [ ] BN-DB (`with_db_cache` section anchor not in PathMap) investigated; fix or track in separate issue
+- [ ] `index_sync` O(N) on session_bb addressed (Issue 57: parallel epochs bound session_bb size)
 - [ ] Performance characteristics documented in design docs
 - [ ] Clear answer to: "Can we process GB-scale corpora with current architecture?"
 
@@ -434,14 +458,17 @@ Generate markdown that resembles real documentation:
 - What's the target performance for 1GB corpus? (Need product requirements)
 - Should we benchmark streaming/incremental processing? (If we add that capability)
 - Do we need distributed processing for multi-GB corpora? (Out of scope for v0.1)
-- Should BN-1 fix work be tracked in this issue or a new ISSUE_48? Given the fix
-  touches `add_relations` (a core merge primitive), it may warrant its own issue
-  with its own correctness gate and rollback plan.
+- BN-1 fix is no longer needed as a separate work item — `to_event_stream` (Issue 34) already
+  makes `merge_graph_mut` O(rhs_size). Close that open question.
+- `Skipping update_relation` (1,277 Epistemic edges in run 11, sink missing): these are
+  Epistemic cross-references whose target nodes haven't been parsed yet when the edge fires.
+  Is this a correctness gap (missing edges in the final graph) or expected multi-pass
+  behaviour (they resolve on reparse)? Needs one targeted investigation before Issue 57.
 - Once wall-clock time is in the "minutes" range (post-Issue 57), add `rari`
   (`github.com/mdn/rari`, the Rust-based MDN build tool) as a cross-project
   benchmark target on the same MDN corpus. Rari does not build a belief graph
   (flat macro resolution only), so the comparison won't be apples-to-apples, but
-  it would establish a meaningful lower bound for single-pass Rust corpus rendering
+  it would establish a meaningful lower bound for single-pass Rust rendering
   and contextualize noet-core's multi-pass belief graph overhead.
 
 ## Notes
