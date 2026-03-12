@@ -1356,14 +1356,14 @@ mod tests {
     fn test_new_dir() {
         // new() misclassifies dotted directory names as files with extensions
         assert_eq!(AnchorPath::new("array/symbol.iterator").ext(), "iterator");
-        assert_eq!(AnchorPath::new("array/symbol.iterator").is_dir(), false);
+        assert!(!AnchorPath::new("array/symbol.iterator").is_dir());
 
         // new_dir() corrects this: dotted last component is treated as a directory
         let ap = AnchorPath::new_dir("array/symbol.iterator");
         assert_eq!(ap.ext(), "");
         assert_eq!(ap.filestem(), "");
         assert_eq!(ap.filename(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
         assert_eq!(ap.dir(), "array/symbol.iterator");
         assert_eq!(ap.filepath(), "array/symbol.iterator");
         assert_eq!(ap.path_parts(), ("", ""));
@@ -1371,35 +1371,35 @@ mod tests {
         // Absolute path variant
         let ap = AnchorPath::new_dir("/repo/array/symbol.species");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
         assert_eq!(ap.dir(), "/repo/array/symbol.species");
         assert_eq!(ap.filepath(), "/repo/array/symbol.species");
 
         // Paths that new() already treats as directories are unchanged
         let ap = AnchorPath::new_dir("plain_dir");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
 
         let ap = AnchorPath::new_dir("nested/plain_dir");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
         assert_eq!(ap.dir(), "nested/plain_dir");
 
         // Trailing slash: unchanged (already a directory)
         let ap = AnchorPath::new_dir("array/symbol.iterator/");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
 
         // Real files are also correctly handled (though callers should use new() for files)
         let ap = AnchorPath::new_dir("dir/index.md");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
         assert_eq!(ap.dir(), "dir/index.md");
 
         // Hidden dotted components (already treated as dir by new()) are unchanged
         let ap = AnchorPath::new_dir("network/.hidden_dir");
         assert_eq!(ap.ext(), "");
-        assert_eq!(ap.is_dir(), true);
+        assert!(ap.is_dir());
 
         // path_parts returns ("", "") — correct for codec (None, None) wildcard lookup
         assert_eq!(

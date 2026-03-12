@@ -2,7 +2,7 @@ use petgraph::{visit::EdgeRef, Direction};
 use serde::{Deserialize, Serialize};
 /// Utilities for parsing various document types into BeliefBases
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     path::{Path, PathBuf},
     result::Result,
@@ -18,7 +18,8 @@ use crate::{
         belief_ir::IRNode,
         diagnostic::ParseDiagnostic,
         network::{detect_network_file, NETWORK_NAME},
-        DocCodec, NetworkCodec, CODECS,
+        proto_index::ProtoIndex,
+        DocCodec, CODECS,
     },
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
@@ -111,23 +112,6 @@ pub struct GraphBuilder {
     stack: Vec<(Bid, String, usize)>,
     session_bb: BeliefBase,
     tx: UnboundedSender<BeliefEvent>,
-    /// One-time cache of `NetworkCodec::proto` results keyed by directory path.
-    ///
-    /// `NetworkCodec::proto` calls `iter_net_docs` internally, which does a
-    /// full `WalkDir` scan of the directory. Without this cache, every call to
-    /// `initialize_stack` re-scans each ancestor directory — O(depth × files)
-    /// work per parsed document. On a corpus like MDN (~14 k files, depth ~5)
-    /// that amounts to tens of thousands of redundant directory scans.
-    ///
-    /// `None` in the map means the directory was probed and found to contain no
-    /// network file (so we can skip it on future calls without re-scanning).
-    /// `Some(proto)` is the cached result.
-    ///
-    /// The cache is intentionally not invalidated within a single compiler
-    /// session: network index files are not expected to change while the
-    /// compiler is running. The watch-service creates a fresh `GraphBuilder`
-    /// for each watch cycle, so stale entries cannot accumulate across reloads.
-    network_proto_cache: HashMap<PathBuf, Option<IRNode>>,
 }
 
 /// GraphBuilder collects source material, parses it into a BeliefBase representation, maps
@@ -205,7 +189,6 @@ impl GraphBuilder {
             stack: Vec::default(),
             session_bb: BeliefBase::empty(),
             tx,
-            network_proto_cache: HashMap::new(),
         };
 
         tracing::debug!(
@@ -296,11 +279,12 @@ impl GraphBuilder {
         input_path: P,
         content: String,
         global_bb: B,
+        proto_index: ProtoIndex,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
         tracing::debug!("Phase 0: initialize stack");
         let full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let (initial, doc_sort_key) = self
-            .initialize_stack(input_path.as_ref(), global_bb.clone())
+            .initialize_stack(input_path.as_ref(), global_bb.clone(), &proto_index)
             .await?;
 
         let mut maybe_content: Option<String> = None;
@@ -517,8 +501,11 @@ impl GraphBuilder {
                 self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
                 // we need to merge this phase 2 missing structure into self.doc_bb as well to ensure
                 // we have full structural paths to all the external nodes we connect to within the
-                // relation_event_queue
-                self.doc_bb.merge(&missing_structure);
+                // relation_event_queue. Use merge_from with parsed_bid_set (already computed above)
+                // to bound the DFS to the current file's nodes — not all of doc_bb's ancestor chain.
+                // The unbounded merge was the BN-1 bottleneck: on reparse, doc_bb's ancestor chain
+                // includes the root network node, causing a full-graph DFS on every reparse pass.
+                self.doc_bb.merge_from(&missing_structure, &parsed_bid_set);
             }
             for edge_update in relation_event_queue.drain(..) {
                 let _deriv = self.doc_bb.process_event(&edge_update)?;
@@ -680,6 +667,7 @@ impl GraphBuilder {
         &mut self,
         abs_path: P,
         global_bb: B,
+        proto_index: &ProtoIndex,
     ) -> Result<(IRNode, Option<u16>), BuildonomyError> {
         // self.parsed_content.clear();
         // self.parsed_structure.clear();
@@ -747,7 +735,11 @@ impl GraphBuilder {
         // fan-out entirely. See try_initialize_stack_from_session_cache for details.
         if self.repo != Bid::nil() {
             if let Some((initial, doc_sort_key)) = self
-                .try_initialize_stack_from_session_cache(abs_path.as_ref(), global_bb.clone())
+                .try_initialize_stack_from_session_cache(
+                    abs_path.as_ref(),
+                    global_bb.clone(),
+                    proto_index,
+                )
                 .await?
             {
                 return Ok((initial, doc_sort_key));
@@ -765,7 +757,7 @@ impl GraphBuilder {
             .ok_or(BuildonomyError::Codec(format!(
                 "Codec could not resolve path '{abs_path:?}' into a proto node"
             )))?;
-        let mut doc_sort_key: Option<u16> = None;
+
         let mut parent_path = string_to_os_path(&initial.path);
         let mut parent_path_stack: Vec<PathBuf> = Vec::default();
         // If path is a sub-network node, dont count self path as a parent path
@@ -784,32 +776,12 @@ impl GraphBuilder {
                 break;
             }
         }
-        let mut maybe_content_parent_proto = None;
         let mut missing_structure = BeliefGraph::default();
         while let Some(path) = parent_path_stack.pop() {
-            // Use the per-session cache to avoid redundant WalkDir scans.
-            // Each unique ancestor directory is scanned at most once per
-            // compiler session regardless of how many files share that ancestor.
-            let state_accum = match self.network_proto_cache.entry(path.clone()) {
-                Entry::Occupied(e) => {
-                    match e.get() {
-                        Some(proto) => proto.clone(),
-                        None => continue, // previously found to have no network file
-                    }
-                }
-                Entry::Vacant(e) => {
-                    let net_codec = NetworkCodec::default();
-                    match net_codec.proto(path.as_ref())? {
-                        Some(proto) => {
-                            e.insert(Some(proto.clone()));
-                            proto
-                        }
-                        None => {
-                            e.insert(None);
-                            continue;
-                        }
-                    }
-                }
+            // Use the ProtoIndex (built once at compiler startup via a single WalkDir pass)
+            // to look up the ancestor network proto without redundant filesystem scans.
+            let Some(state_accum) = proto_index.proto_for(&path)? else {
+                continue;
             };
 
             let (ancestor, (_source, _, _)) = self
@@ -831,52 +803,20 @@ impl GraphBuilder {
             if path.as_os_str().is_empty() && self.repo == Bid::nil() {
                 self.repo = ancestor;
             }
-            maybe_content_parent_proto = Some((ancestor, state_accum));
         }
 
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
-        // We can safely expect the BeliefBase to be balanced after after stack initialization
-        // tracing::debug!(
-        //     "processing {} events and adding to our self.doc_bb",
-        //     events.len()
-        // );
-
-        // Determine the entry document's sort key — its position among siblings in the
-        // parent network.  This is the index of the entry doc's path in
-        // `maybe_content_parent_proto.upstream`, which is produced by `iter_net_docs` in
-        // alphabetical (component) order and is the authoritative sort order written as
-        // WEIGHT_SORT_KEY by `push_relation`.
-        //
-        // We read the key here without calling `push_relation` for the sibling list:
-        // sibling nodes are seeded into `session_bb` naturally by each file's
-        // `terminate_stack` as it completes, so no pre-emptive fan-out is needed.
-        // Removing the fan-out is the FM1b fix — it eliminates the O(siblings) work
-        // that previously ran on every slow-path `initialize_stack` call.
-        //
-        // `iter_net_docs` strips paths relative to `network_dir` (the parent network
-        // directory).  `parent_proto.path` equals `os_path_to_string(network_dir)`, so
-        // stripping `abs_path` against that directory yields the same relative form as
-        // the upstream key paths.
-        if let Some((_parent_bid, parent_proto)) = &maybe_content_parent_proto {
-            let parent_net_dir = string_to_os_path(&parent_proto.path);
-            if let Ok(rel) = abs_path.as_ref().strip_prefix(&parent_net_dir) {
-                let rel_str = os_path_to_string(rel);
-                for (index, relation) in parent_proto.upstream.iter().enumerate() {
-                    if let NodeKey::Path { path: rel_key, .. } = &relation.key {
-                        if rel_str == *rel_key {
-                            doc_sort_key = Some(index as u16);
-                            break;
-                        }
-                    }
-                }
-            }
-            tracing::debug!(
-                "[initialize_stack slow-path] doc_sort_key={:?} for path={:?}",
-                doc_sort_key,
-                abs_path.as_ref()
-            );
-        }
+        // Determine the entry document's sort key using the ProtoIndex — single canonical
+        // source of truth shared by both fast and slow paths.  sort_key_for walks up the
+        // directory tree to handle files in non-network subdirectories that iter_net_docs
+        // flattens into the ancestor network's child list.
+        let doc_sort_key: Option<u16> = proto_index.sort_key_for(abs_path.as_ref());
+        tracing::debug!(
+            "[initialize_stack slow-path] doc_sort_key={:?} for path={:?}",
+            doc_sort_key,
+            abs_path.as_ref()
+        );
         tracing::debug!(
             "[initialize_stack slow-path stack]:\n{}",
             self.stack
@@ -1764,6 +1704,7 @@ impl GraphBuilder {
         &mut self,
         abs_path: &Path,
         global_bb: B,
+        proto_index: &ProtoIndex,
     ) -> Result<Option<(IRNode, Option<u16>)>, BuildonomyError> {
         // Compute the parent network's repo-relative path.
         //
@@ -1843,40 +1784,11 @@ impl GraphBuilder {
         //
         // The entry doc's repo-relative path is `entry_rel_path`.  Find the Section edge
         // whose doc_paths weight contains that path and read its sort_key.
-        let doc_sort_key: Option<u16> = {
-            let g = fast_missing.relations.as_graph();
-            g.raw_edges().iter().find_map(|e| {
-                let edge_source = g[e.source()];
-                let edge_sink = g[e.target()];
-                // We want edges where sink == parent_bid (child → parent Section edge).
-                if edge_sink != parent_bid {
-                    return None;
-                }
-                let w = e.weight.get(&WeightKind::Section)?;
-                // Check that the doc_paths weight matches the entry doc's rel path.
-                let doc_paths = w.get::<Vec<String>>(crate::properties::WEIGHT_DOC_PATHS)?;
-                let matches = doc_paths.iter().any(|p| {
-                    // doc_paths entries may be relative to the parent network dir or
-                    // repo-relative; try both forms.
-                    let full = if parent_rel_path.is_empty() {
-                        p.clone()
-                    } else {
-                        format!("{}/{}", parent_rel_path, p)
-                    };
-                    full == entry_rel_path || *p == entry_rel_path
-                });
-                if matches {
-                    // Edge source is the child doc BID — also remember it.
-                    let sk = w.get::<u16>(crate::properties::WEIGHT_SORT_KEY)?;
-                    let _ = edge_source; // entry_doc_bid resolved below via session_bb
-                    Some(sk)
-                } else {
-                    None
-                }
-            })
-        };
+        // Determine doc_sort_key using the ProtoIndex — the single canonical source of
+        // truth for sibling position, shared by both fast and slow paths.
+        let doc_sort_key: Option<u16> = proto_index.sort_key_for(abs_path);
         tracing::debug!(
-            "[try_initialize_stack_from_session_cache] doc_sort_key from parent edge={:?} for path={:?}",
+            "[try_initialize_stack_from_session_cache] doc_sort_key from proto_index={:?} for path={:?}",
             doc_sort_key,
             abs_path
         );
@@ -1926,9 +1838,11 @@ impl GraphBuilder {
             ancestors_only.relations.as_graph().edge_count(),
         );
 
-        let mut doc_graph = self.doc_bb.consume();
-        doc_graph.union_mut_with_trace(&ancestors_only);
-        self.doc_bb = BeliefBase::from(doc_graph);
+        // Build doc_bb directly from ancestors_only — do NOT consume() the previous
+        // doc_bb and union into it.  The previous doc_bb may contain stale content from
+        // the prior parse of this file (asset nodes, section edges, etc.); carrying that
+        // forward leaks state and causes PathMap corruption (in_states=true, in_pathmap=false).
+        self.doc_bb = BeliefBase::from(ancestors_only);
         self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // Merge the full parent graph (including child edges) into session_bb so subsequent
@@ -2081,17 +1995,20 @@ impl GraphBuilder {
 
             // use eval_query in order to receive a balanced_set if/when we get a query hit on
             // one of our caches
-            let mut stack_result =
-                BeliefBase::from(self.session_bb.eval_query(&query, true).await?);
+            let stack_result = BeliefBase::from(self.session_bb.eval_query(&query, true).await?);
 
             match stack_result.get(key) {
                 Some(existing_state) => {
                     found_state = Some(existing_state);
-                    // Propagate the balanced graph (ancestor chain + Section edges) into
-                    // missing_structure, symmetric with what the GlobalCache branch does.
-                    // This allows callers (e.g. try_initialize_stack_from_session_cache) to
-                    // reconstruct self.stack from missing_structure without re-running push().
-                    missing_structure.union_mut(&stack_result.consume());
+                    // StackCache hit: the node is already in session_bb with a balanced
+                    // ancestor chain. We do NOT populate missing_structure here — doing so
+                    // caused Phase 2's unconditional doc_bb.merge(&missing_structure) to
+                    // overwrite the section→doc Section edges that Phase 1 just established,
+                    // corrupting the PathMap and triggering the Phase 4 get_context panic.
+                    //
+                    // try_initialize_stack_from_session_cache passes its own local
+                    // `fast_missing` as the missing_structure argument and reads it directly
+                    // after this call — it does not need the population to happen here.
                     source = NodeSource::StackCache;
                     break;
                 }

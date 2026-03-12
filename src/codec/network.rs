@@ -48,7 +48,7 @@ pub const NETWORK_NAME: &str = "index.md";
 /// Iterates through a directory subtree, filtering to return a sorted list of network directories
 /// (directories containing an index.md file), as well as file paths
 /// matching known codec extensions.
-fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
+pub(crate) fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
     fn is_hidden(entry: &DirEntry) -> bool {
         entry
             .file_name()

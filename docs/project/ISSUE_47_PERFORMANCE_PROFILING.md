@@ -1,6 +1,6 @@
 # Issue 47: Performance Profiling Infrastructure
 
-**Priority**: MEDIUM - FM1b O(siblings) bottleneck fixed; remaining work is benchmarking and one pre-existing test failure
+**Priority**: MEDIUM - FM1b + ProtoIndex fix committed; Run 3 queued; BN-1 is next bottleneck
 **Estimated Effort**: 3-4 days
 **Dependencies**: ISSUE_07 (basic benchmarks established)
 **Context**: Preparation for processing GB-scale documentation corpora
@@ -9,9 +9,9 @@
 
 Establish performance profiling infrastructure to characterize noet-core's behavior at scale. Currently we have micro-benchmarks (Criterion) for regression detection, but need macro-benchmarks with realistic workloads, memory profiling, and performance characterization for GB-scale document processing. This issue creates the foundation for identifying bottlenecks before they become critical.
 
-**Update 2 (FM1b fixed)**: The dominant O(siblings) bottleneck in `initialize_stack` has been eliminated. The `push_relation` sibling fan-out loop is gone; `initialize_stack` now returns `(IRNode, Option<u16>)` carrying the entry doc's sort key directly. The fast path queries the parent network (not the entry doc), hitting `StackCache` on the first parse of every child. Run 3 on the MDN corpus is needed to confirm Phase 0 mean drops to <0.5 s and Phase 5 stalls disappear.
+**Update 3 (Run 2 analysed; ProtoIndex landed)**: Run 2 on the MDN `web/javascript` corpus (1,329 files) ran for ~19.7 hours and confirmed FM1b as the dominant bottleneck: Phase 0 mean was 10.38 s (target <0.5 s), 106 outlier files exceeded 34 s, and 47 Phase 5 stalls totalling ~6.3 h of wall time were driven by RelationUpdate fan-out on `trailing_commas`, `working_with_objects`, and `functions/set`. The FM1b fix (ProtoIndex + three correctness bugs) is now committed and all 7 codec tests pass. Run 3 will measure the improvement. A secondary bottleneck — BN-1 (`add_relations` DFS in `session_bb.merge`) — was visible from ~05:33 onward in Run 2 as silent 0-RelUpdate stalls; this will become the dominant term once FM1b is gone.
 
-One pre-existing test failure remains: `bid_tests::test_belief_set_builder_with_db_cache` — a section anchor (`heading=4`) ends up `in_states=true, in_pathmap=false` on reparse when `global_bb` is a `DbConnection`. Root cause is that `doc_bb` receives a pre-seeded `Section(section, doc, {sk:N})` edge before Phase 1 `push(section)` fires, causing `generate_edge_update` to see no change and skip the PathMap update. Tracked below.
+**Update 2 (FM1b fixed)**: The dominant O(siblings) bottleneck in `initialize_stack` has been eliminated. The `push_relation` sibling fan-out loop is gone; `initialize_stack` now returns `(IRNode, Option<u16>)` carrying the entry doc's sort key directly. The fast path queries the parent network (not the entry doc), hitting `StackCache` on the first parse of every child.
 
 **Earlier update**: An O(N²) bottleneck was confirmed empirically on the MDN `web/javascript` sub-corpus (~1 300 files). The bottleneck was in `initialize_stack`'s `push_relation` sibling fan-out (FM1b), not `BeliefGraph::add_relations` as originally suspected. Profiling infrastructure is now needed primarily to measure the fix, not just find the problem.
 
@@ -41,32 +41,35 @@ stall for `working_with_objects` (1 156 RelationUpdates) in Run 2 confirmed
 `session_bb` and `doc_bb` with sibling edges on every file parse, causing
 O(siblings) work per file → O(N × siblings) total.
 
-**Fix** (landed):
+**Fix** (landed — ProtoIndex commit):
+- Replaced per-session `network_proto_cache` on `GraphBuilder` with
+  `ProtoIndex` — a pre-built filesystem index (one WalkDir pass at compiler
+  startup, shared via `Arc<RwLock<...>>` clone).
 - Removed `push_relation` sibling fan-out entirely from `initialize_stack`.
-- `initialize_stack` now returns `(IRNode, Option<u16>)` — the second element
-  is the entry doc's sort key read from `upstream` index (slow path) or from
-  the session PathMap (fast path).
-- `parse_content` passes this as `explicit_sort_key` into the first Phase 1
-  `push()` call via a new parameter, replacing the former StackCache-only
-  sort-key workaround in `push`.
+- `initialize_stack` now returns `(IRNode, Option<u16>)` — sort key from
+  `proto_index.sort_key_for()`, single source of truth for both fast and slow paths.
 - Fast path (`try_initialize_stack_from_session_cache`) redesigned to query
-  the **parent network** in `session_bb` instead of the entry doc. This hits
-  `StackCache` on the first parse of every child (not just reparsed ones),
-  because the compiler always parses the parent network before its children.
-- `doc_sort_key = None` on a child's first parse is correct: the child was
-  unresolved when the parent was parsed, so no `Section(child, parent)` edge
-  exists in `session_bb` yet. `push` auto-assigns the sort key safely because
-  `doc_bb` starts clean.
-- `doc_sort_key = Some(N)` on reparse: the confirmed sort key from the prior
-  `terminate_stack` is used directly, preventing sk=0 collisions.
-- `PathMap::order_map` index added for O(log N) ancestor prefix lookup during
-  stack reconstruction.
+  the **parent network** in `session_bb` instead of the entry doc.
+- Three correctness bugs introduced by the FM1b draft were also fixed:
+  sort_key_for index.md handling; StackCache branch polluting missing_structure;
+  stale doc_bb carried forward via consume()+union_mut.
+- `PathMap::order_map` index added for O(log N) ancestor prefix lookup.
 
-**Test result**: 6/7 codec tests pass. The single failure (`with_db_cache`) is
-a pre-existing bug unrelated to FM1b (see BN-DB below).
+**Test result**: 7/7 codec tests pass (all three bugs fixed).
 
-**Run 3 needed**: corpus benchmark to confirm Phase 0 mean drops from 4.74 s
-toward <0.5 s and Phase 5 stalls disappear.
+**Run 2 corpus baseline** (pre-fix, mdn-javascript.log, ~19.7 h wall time):
+
+| Metric | Value |
+|--------|-------|
+| Phase 0 mean | **10.38 s** |
+| Phase 0 max | 56 s |
+| Outlier files (>34 s) | 106 |
+| Phase 5 stalls >30s | 47 (6.3 h total) |
+| Worst stall | 705 s (`trailing_commas`, 624 RelUpdates) |
+| Parse attempts: 1st/2nd/3rd | 1,552 / 1,155 / 195 |
+
+**Run 3 target**: Phase 0 mean <0.5 s; FM1b Phase 5 stalls gone; BN-1
+silent stalls will remain and become the new dominant term.
 
 ---
 
@@ -134,7 +137,11 @@ whether it remains significant post-FM1b fix.
 - Run on push to main branch (informational only)
 - Focus: Function-level performance regression detection
 
-**Gap**: No macro-benchmarks for realistic workloads or memory profiling. The MDN corpus run described above was ad-hoc (`noet parse` against `.bench_corpora/mdn-content/files/en-us/web/javascript`); we have no automated way to measure the fix or detect regressions at this scale.
+**MDN corpus runs** (ad-hoc, `.bench_corpora/mdn-content/files/en-us/web/javascript`, 1,329 files):
+- **Run 2** (pre-FM1b fix): ~19.7 h, Phase 0 mean 10.38 s, 106 outliers, 47 Phase 5 stalls
+- **Run 3** (post-ProtoIndex): in progress — expected to confirm Phase 0 collapse and reveal BN-1 as next bottleneck
+
+**Gap**: No macro-benchmarks for realistic workloads or memory profiling. Corpus runs are ad-hoc; we have no automated way to measure fixes or detect regressions at this scale.
 
 ## Architecture
 
@@ -271,10 +278,13 @@ Generate markdown that resembles real documentation:
          FM1a symptoms; `--warnings` used to quantify BN-2 self-connection flood
          and Issue-34 violations across the full run
    - [x] FM1b fix landed: `push_relation` fan-out removed, `doc_sort_key` sentinel,
-         parent-network fast path — 6/7 codec tests pass
-   - [ ] Run 3: MDN corpus benchmark post-FM1b; target Phase 0 mean <0.5 s,
-         Phase 5 stalls eliminated
-   - [ ] Fix `with_db_cache` pre-existing failure (BN-DB above); target 7/7 green
+         parent-network fast path
+   - [x] ProtoIndex landed: replaces `network_proto_cache`; three correctness bugs fixed;
+         all 7/7 codec tests pass; Windows normalization applied
+   - [x] Run 2 analysed: Phase 0 mean 10.38 s, 106 outliers, 47 Phase 5 stalls (~6.3 h),
+         BN-1 silent stalls confirmed as next bottleneck from ~05:33 onward
+   - [ ] Run 3: MDN corpus benchmark post-ProtoIndex; target Phase 0 mean <0.5 s,
+         FM1b Phase 5 stalls gone; characterise residual BN-1 stalls
    - [ ] Check remaining bottlenecks after Run 3:
      - BN-1 (`add_relations` DFS) still significant?
      - PathMap collision detection?
@@ -288,9 +298,11 @@ Generate markdown that resembles real documentation:
 - [ ] Benchmarks run successfully in CI (optional: store as artifacts)
 - [ ] Memory profiling identifies no obvious leaks
 - [ ] Baseline metrics documented and reviewable
-- [x] FM1b fix: `initialize_stack` sibling fan-out eliminated (6/7 codec tests pass)
-- [ ] `with_db_cache` test failure fixed (7/7 green CI checkpoint)
-- [ ] Run 3 corpus benchmark confirms Phase 0 mean <0.5 s
+- [x] FM1b fix: `initialize_stack` sibling fan-out eliminated
+- [x] ProtoIndex: replaces network_proto_cache; 7/7 codec tests pass; Windows normalization applied
+- [x] Run 2 baseline documented: Phase 0 mean 10.38 s, 47 Phase 5 stalls, BN-1 confirmed secondary
+- [ ] Run 3 corpus benchmark confirms Phase 0 mean <0.5 s and FM1b stalls gone
+- [ ] BN-1 (`add_relations` DFS) quantified post-Run 3; fix if dominant
 
 ## Success Criteria
 
@@ -299,9 +311,10 @@ Generate markdown that resembles real documentation:
 - [ ] Memory profiling infrastructure operational
 - [ ] Baseline performance metrics documented
 - [x] At least 1 confirmed O(N²) bottleneck identified and fixed (FM1b, `initialize_stack` fan-out)
-- [ ] Run 3 confirms FM1b fix effective on MDN corpus
-- [ ] BN-DB (`with_db_cache`) fixed; 7/7 green CI
-- [ ] BN-1 (`add_relations` DFS) assessed post-Run 3; fix if still dominant
+- [x] Run 2 baseline: Phase 0 mean 10.38 s, 106 outliers, 47 stalls (6.3 h), BN-1 visible
+- [ ] Run 3 confirms FM1b fix effective on MDN corpus (target Phase 0 mean <0.5 s)
+- [ ] BN-1 (`add_relations` DFS) quantified post-Run 3; fix if dominant
+- [ ] BN-DB (`with_db_cache`) investigated; fix or track in separate issue
 - [ ] At least 2 additional bottlenecks characterized after FM1b fix
 - [ ] Performance characteristics documented in design docs
 - [ ] Clear answer to: "Can we process GB-scale corpora with current architecture?"

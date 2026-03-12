@@ -5,6 +5,7 @@ use crate::{
         belief_ir::IRNode,
         builder::GraphBuilder,
         network::{detect_network_file, NetworkCodec, NETWORK_NAME},
+        proto_index::ProtoIndex,
         DocCodec, ParseDiagnostic, UnresolvedReference, CODECS,
     },
     error::BuildonomyError,
@@ -125,6 +126,17 @@ pub struct DocumentCompiler {
     /// Base URL for sitemap and canonical URLs (e.g., <https://username.github.io/repo>)
     base_url: Option<String>,
     builder: GraphBuilder,
+    /// Pre-built filesystem index of network directories and their ordered children.
+    ///
+    /// Built once at compiler construction via a single WalkDir pass from `repo_root`.
+    /// Passed as a cheap `Arc`-clone to each `parse_content` call so that both the fast
+    /// and slow paths of `initialize_stack` share a single canonical source of truth for
+    /// `sort_key_for(abs_path)` — eliminating the BN-DB dual-source sort-key instability.
+    ///
+    /// For Issue 57 parallel tasks, each task receives `proto_index.clone()` (zero-copy
+    /// `Arc` handle) so all tasks share one pre-built read-only map with no WalkDir calls
+    /// during parsing.
+    proto_index: ProtoIndex,
     primary_queue: VecDeque<PathBuf>,
     reparse_queue: VecDeque<PathBuf>,
     pending_dependencies: HashMap<PathBuf, Vec<PathBuf>>,
@@ -192,6 +204,18 @@ impl DocumentCompiler {
         let entry_path = Self::normalize_queue_path(entry_point.as_ref().canonicalize()?);
 
         let builder = GraphBuilder::new(&entry_path, tx)?;
+
+        // Build the ProtoIndex with a single WalkDir pass from repo_root.
+        // Falls back to an empty index on error (e.g. entry_path is not yet a full repo)
+        // so construction never fails due to a missing network file at startup.
+        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_else(|e| {
+            tracing::warn!(
+                "[DocumentCompiler] ProtoIndex::build failed for {:?}: {e} — using empty index",
+                builder.repo_root()
+            );
+            ProtoIndex::new()
+        });
+
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
@@ -202,6 +226,7 @@ impl DocumentCompiler {
             use_cdn,
             base_url,
             builder,
+            proto_index,
             primary_queue,
             reparse_queue: VecDeque::new(),
             pending_dependencies: HashMap::new(),
@@ -227,6 +252,13 @@ impl DocumentCompiler {
         let entry_path = Self::normalize_queue_path(entry_point.as_ref().canonicalize()?);
 
         let builder = GraphBuilder::new(&entry_path, None)?;
+        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_else(|e| {
+            tracing::warn!(
+                "[DocumentCompiler::simple] ProtoIndex::build failed for {:?}: {e} — using empty index",
+                builder.repo_root()
+            );
+            ProtoIndex::new()
+        });
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
@@ -237,6 +269,7 @@ impl DocumentCompiler {
             use_cdn: false,
             base_url: None,
             builder,
+            proto_index,
             primary_queue,
             reparse_queue: VecDeque::new(),
             pending_dependencies: HashMap::new(),
@@ -419,7 +452,12 @@ impl DocumentCompiler {
         // parse_content's codec lookup succeeds. For non-directory paths they are identical.
         let (mut parse_result, codec) = match self
             .builder
-            .parse_content(&file_path, content, global_bb.clone())
+            .parse_content(
+                &file_path,
+                content,
+                global_bb.clone(),
+                self.proto_index.clone(),
+            )
             .await
         {
             Ok(with_codec) => (with_codec.result, with_codec.codec),

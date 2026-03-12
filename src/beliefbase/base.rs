@@ -1299,16 +1299,18 @@ impl BeliefBase {
             return None;
         };
 
-        let present_weight = if let (Some(source_idx), Some(sink_idx)) =
-            (self.bid_to_index(source), self.bid_to_index(sink))
-        {
+        let source_idx = self.bid_to_index(source);
+        let sink_idx = self.bid_to_index(sink);
+
+        let present_weight = if let (Some(src_idx), Some(snk_idx)) = (source_idx, sink_idx) {
             self.relations()
                 .as_graph()
-                .find_edge(source_idx, sink_idx)
+                .find_edge(src_idx, snk_idx)
                 .map(|edge_idx| self.relations().as_graph()[edge_idx].clone())
         } else {
             None
         };
+
         let mut new_weights = present_weight.clone().unwrap_or(WeightSet::default());
         let mut changed = false;
         if let Some(weight) = maybe_weight {

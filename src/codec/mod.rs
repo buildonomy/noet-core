@@ -185,6 +185,8 @@ pub mod md;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod proto_index;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schema_registry;
 
 // Re-export for backward compatibility
@@ -196,6 +198,8 @@ pub use builder::GraphBuilder;
 pub use compiler::DocumentCompiler;
 #[cfg(not(target_arch = "wasm32"))]
 pub use diagnostic::{byte_offset_to_location, ParseDiagnostic, UnresolvedReference};
+#[cfg(not(target_arch = "wasm32"))]
+pub use proto_index::ProtoIndex;
 #[cfg(not(target_arch = "wasm32"))]
 pub use schema_registry::SCHEMAS;
 
@@ -940,6 +944,7 @@ Test network for unit tests.
     #[tokio::test]
     async fn test_parse_content_returns_owned_codec() {
         use crate::codec::builder::GraphBuilder;
+        use crate::codec::proto_index::ProtoIndex;
         use tempfile::TempDir;
 
         // Create temporary directory with a test markdown file
@@ -954,8 +959,9 @@ Test network for unit tests.
 
         // Parse with factory method - should return owned codec
         let session_bb = builder.session_bb().clone();
+        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_default();
         let result = builder
-            .parse_content(&test_file, content.to_string(), session_bb)
+            .parse_content(&test_file, content.to_string(), session_bb, proto_index)
             .await;
 
         assert!(
@@ -984,6 +990,7 @@ Test network for unit tests.
     async fn test_dual_phase_html_generation() {
         init_logging();
         use crate::codec::builder::GraphBuilder;
+        use crate::codec::proto_index::ProtoIndex;
         use tempfile::TempDir;
 
         // Create temporary directory with a test markdown file
@@ -998,8 +1005,9 @@ Test network for unit tests.
 
         // Parse with factory method - should return owned codec
         let session_bb = builder.session_bb().clone();
+        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_default();
         let result = builder
-            .parse_content(&test_file, content.to_string(), session_bb)
+            .parse_content(&test_file, content.to_string(), session_bb, proto_index)
             .await;
 
         assert!(result.is_ok(), "parse_content should succeed");
