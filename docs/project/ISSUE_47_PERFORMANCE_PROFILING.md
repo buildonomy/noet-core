@@ -73,6 +73,93 @@ silent stalls will remain and become the new dominant term.
 
 ---
 
+### ❌ BN-GW: Gateway-tier reclassification causes silent link drop — **CONFIRMED CORRECTNESS GAP**
+
+**Location**: `src/paths/pathmap.rs` (`process_relation_update`),
+`src/codec/md.rs` (`check_for_link_and_push`, `inject_context`).
+
+**Two warning types — same root cause** (Run 5, pass 1 only, both present
+since profiling began):
+
+1. 30 WARN from `noet_core::paths::pathmap` — 15 distinct nodes in the JS
+   corpus root network (`1f11dfa0-a80b`) transition from `[u16::MAX, N]` →
+   `[M]` sort key:
+   ```
+   WARN [1f11dfa0-a80b-…] Path order depth changed for source 1f11dfa0-a817-…:
+        old=[65535, 2], new=[1]. This may require re-parsing dependent documents.
+   ```
+
+2. 136+ WARN from `noet_core::codec::md` — all `symbol.*` pages
+   (`symbol.iterator`, `symbol.species`, `regexp/symbol.matchall`, etc.),
+   links to them silently left unchanged:
+   ```
+   WARN [check_for_link_and_push] Path mismatch: proto abs path
+        ".../arguments/symbol.iterator" does not align with ctx repo-relative
+        path "reference/functions/arguments/index.md". Leaving link unchanged.
+   ```
+
+**Root cause** (confirmed by code trace): The trigger is a `NodeKey::Id`
+collision in `push()` between a section node and a same-named document node.
+
+Concrete example: `arguments/index.md` contains `## [Symbol.iterator]()`.
+During `parse_content` for `arguments/index.md`, the section gets
+`NodeKey::Id { net: arguments_net, id: "symbol.iterator" }` registered in the
+network's id-map. Later, when `symbol.iterator/index.md` is parsed as a real
+document, `push()` does the Issue-37 ID-collision guard lookup with the same
+`NodeKey::Id` — finds the existing section BID — and fires **first-one-wins**:
+the document node's id is clobbered to its bref, and it is now registered under
+a different BID than the section expected.
+
+This BID mismatch then propagates into `pathmap.rs`: the document node is
+inserted with a flat `[M]` sort key, while the section BID still holds a
+`[u16::MAX, N]` gateway-plane entry — triggering the depth-change warning.
+`inject_context` then fails because `codec.nodes()` returns a proto with
+`proto.path = /abs/.../symbol.iterator`, but the clobbered BID's context in
+`doc_bb` has `ctx.root_path = "parent/index.md"`. The
+`doc_stem.ends_with(ctx_stem)` check in `check_for_link_and_push` fails →
+link left unchanged → **the relationship to `symbol.*` pages is silently
+dropped from the graph**.
+
+The core design gap: `NodeKey::Id` is scoped to the network but not to the
+node kind. Section ids and document ids occupy the same id-map namespace, so a
+section titled `## Introduction` will always collide with a sibling document
+`introduction/`. First-one-wins resolves the collision by clobbering the
+document, which is the wrong winner — the document node should own the
+`NodeKey::Id` and the section should be forced to a bref-based id.
+
+No reparse is triggered at any point. The affected documents are processed with
+the wrong BID context and will not be re-queued.
+
+**Confirmed impact**: All MDN `@@`-symbol method pages
+(`Array.prototype[Symbol.iterator]`, `RegExp[Symbol.matchAll]`, etc.) are
+missing their cross-links in the output graph. 25 distinct `symbol.*` files
+affected in the JS corpus. The same bug will fire on any corpus where a section
+title in `index.md` matches a sibling subdirectory name — it is not MDN-specific.
+
+**Candidate fix**: The collision guard in `push()` must prefer the `Document`
+kind node over the section node when both produce the same `NodeKey::Id`.
+Two viable approaches:
+
+1. **Kind-aware first-one-wins** (targeted): In the ID-collision guard, check
+   `existing_node.kind.contains(BeliefKind::Document)` vs
+   `parsed_node.kind.contains(BeliefKind::Document)`. If the incoming node is
+   a Document and the existing node is a section (no Document kind), invert
+   the win: clobber the *section's* id to its bref instead of the document's.
+   Requires the existing section node to be updated in `doc_bb`/`session_bb`
+   before proceeding.
+
+2. **Path-scoped id keys for sections** (structural): Section id-collision
+   checks use `NodeKey::Path` (which already encodes `"index.md#slug"`) rather
+   than `NodeKey::Id`. Document nodes continue using `NodeKey::Id`. This
+   eliminates the shared namespace entirely. More invasive but removes the
+   ambiguity at the source.
+
+**Blocked by**: design decision on which approach to take. Option 1 is more
+surgical but leaves the shared id namespace in place; Option 2 is cleaner but
+touches more of the key-generation path.
+
+---
+
 ### ❌ BN-DB: `with_db_cache` section anchor not in PathMap — **PRE-EXISTING, OPEN**
 
 **Location**: `src/codec/builder.rs`, Phase 1 `push(section)` during reparse
@@ -350,6 +437,12 @@ Generate markdown that resembles real documentation:
 - Should BN-1 fix work be tracked in this issue or a new ISSUE_48? Given the fix
   touches `add_relations` (a core merge primitive), it may warrant its own issue
   with its own correctness gate and rollback plan.
+- Once wall-clock time is in the "minutes" range (post-Issue 57), add `rari`
+  (`github.com/mdn/rari`, the Rust-based MDN build tool) as a cross-project
+  benchmark target on the same MDN corpus. Rari does not build a belief graph
+  (flat macro resolution only), so the comparison won't be apples-to-apples, but
+  it would establish a meaningful lower bound for single-pass Rust corpus rendering
+  and contextualize noet-core's multi-pass belief graph overhead.
 
 ## Notes
 
@@ -373,6 +466,18 @@ The typical use of the log-analysis tools is:
 These tools complement (not replace) the Criterion benchmarks: Criterion measures
 throughput under controlled synthetic conditions; `parse_log.py` diagnoses real
 corpus behaviour where the bottleneck may be structural (e.g. `session_bb` growth).
+
+**Rari cross-project comparison** (deferred until post-Issue 57):
+`github.com/mdn/rari` is a Rust-based MDN build tool (replaced Yari's Node.js
+pipeline in 2024). It processes the same MDN corpus we use for benchmarking.
+Rari uses flat macro resolution — no belief graph, no multi-pass convergence —
+so it represents a lower bound on what a single-pass Rust renderer can achieve.
+Once noet-core's wall-clock time is in the "minutes" range, add Rari as a
+`benches/` target: clone it, run it against `.bench_corpora/mdn-content`, record
+wall time and peak memory, and document the delta. This contextualizes the cost
+of noet-core's belief graph model vs. a simpler rendering pipeline on identical
+input data. Defer until Issue 57 parallel epochs land — comparing now would just
+confirm we're slower without providing actionable signal.
 
 **Future work** (not in this issue):
 - Performance optimization based on profiling results

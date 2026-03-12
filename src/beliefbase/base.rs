@@ -1690,7 +1690,18 @@ impl BeliefBase {
         maybe_node
     }
 
-    pub fn merge(&mut self, rhs: &BeliefGraph) {
+    /// Merge `rhs` into `self` using an unbounded DFS seed (`self.states ∩ rhs.states`).
+    ///
+    /// # Warning
+    ///
+    /// This is intentionally `pub(crate)` — callers outside `beliefbase` must use
+    /// [`merge_from`] with an explicit seed set to avoid O(session_bb_size × rhs_edges)
+    /// fan-out as `session_bb` grows across a corpus run (Issue 47 BN-1).
+    ///
+    /// Legitimate internal uses: shard loading onto a fresh/empty base, and tests where
+    /// the lhs is small enough that the unbounded seed is harmless.
+    #[allow(dead_code)] // used by shard/export.rs and wasm.rs under feature flags
+    pub(crate) fn merge(&mut self, rhs: &BeliefGraph) {
         self.merge_graph_mut(rhs, None);
     }
 

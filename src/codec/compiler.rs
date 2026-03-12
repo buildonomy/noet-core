@@ -380,12 +380,8 @@ impl DocumentCompiler {
         // 2b. Increment parse count
         *self.processed.entry(path.clone()).or_insert(0) += 1;
         tracing::debug!(
-            "\n \
-            Parsing file {}\n \
-            ============={}\n \
-            (attempt {}/{}",
+            "[Compiler] Parsing file {} (attempt {}/{})\n\n",
             path.to_string_lossy(),
-            "=".repeat(path.to_string_lossy().len()),
             parse_count + 1,
             self.max_reparse_count
         );

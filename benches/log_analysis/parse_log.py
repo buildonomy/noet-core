@@ -13,6 +13,7 @@ Usage
     python3 benches/log_analysis/parse_log.py run.log --phase-summary
     python3 benches/log_analysis/parse_log.py run.log --stalls 2.0
     python3 benches/log_analysis/parse_log.py run.log --warnings
+    python3 benches/log_analysis/parse_log.py run.log --file-times
     python3 benches/log_analysis/parse_log.py run.log --all
 
 Output modes
@@ -34,6 +35,14 @@ Output modes
 --phase-detail FILE_FRAGMENT
     Show per-phase timing breakdown for all files whose path contains
     FILE_FRAGMENT.
+
+--file-times
+    Total parse time per file (from "Parsing file" compiler message to
+    Phase 5 completion), ranked slowest-first with mean/stddev/outlier
+    flagging.  Captures all phases including Phase 5 fan-out, unlike
+    --phase-summary which only measures Phase 0.  Also shows per-attempt
+    breakdown for files parsed more than once.  Includes a linear trend
+    fit (OLS over parse order) to detect O(N) parse-time growth.
 
 --all
     Run all analyses.
@@ -129,6 +138,7 @@ _PHASE_LABELS = {
 _QUEUEING_RE = re.compile(r'Queueing for deferred HTML generation: "(.+)"')
 _WRITE_RE = re.compile(r'Write disabled, skipping file write for "(.+)"')
 _DIFF_RE = re.compile(r"Diff events \((\d+)\).*RelationUpdate\((\d+)\)")
+_PARSING_FILE_RE = re.compile(r"\[Compiler\] Parsing file (.+?) \(attempt (\d+)/")
 
 
 @dataclass
@@ -137,6 +147,10 @@ class FileRecord:
     phases: dict[str, datetime] = field(default_factory=dict)
     diff_total: int = 0
     diff_relation_updates: int = 0
+    parse_start: Optional[datetime] = (
+        None  # timestamp of "Parsing file" compiler message
+    )
+    attempt: int = 1  # which parse attempt this record represents
 
     def phase0_duration(self) -> Optional[float]:
         p0 = self.phases.get("phase0_start")
@@ -158,18 +172,49 @@ class FileRecord:
             return (tb - ta).total_seconds()
         return None
 
+    def total_duration(self) -> Optional[float]:
+        """Total parse time: 'Parsing file' message → Phase 5 start.
+        Falls back to phase0_start if the compiler message wasn't captured."""
+        start = self.parse_start or self.phases.get("phase0_start")
+        end = self.phases.get("phase5")
+        if start and end:
+            return (end - start).total_seconds()
+        return None
+
 
 def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
     """
     Walk the log and group phase markers + file-path lines into FileRecord
-    objects, one per parsed file.
+    objects, one per parsed file (attempt).
+
+    The "Parsing file" compiler message is the authoritative parse-start
+    timestamp and path source.  Phase markers are matched to the most-recently-
+    seen "Parsing file" record.  Queueing/Write messages are kept as fallback
+    path sources for records where the compiler message wasn't captured.
     """
     records: list[FileRecord] = []
     current: Optional[FileRecord] = None
     last_file_path = ""
+    attempt_counts: dict[str, int] = {}  # path -> number of attempts seen so far
 
     for ll in lines:
-        # Track most-recently-seen file path from compiler messages
+        # "[Compiler] Parsing file <path> (attempt N/M)" — primary parse-start
+        # marker emitted by compiler.rs on a single timestamped line.
+        pm = _PARSING_FILE_RE.search(ll.body)
+        if pm:
+            file_path = pm.group(1).strip()
+            attempt = int(pm.group(2))
+            last_file_path = file_path
+            attempt_counts[file_path] = attempt
+            current = FileRecord(
+                path=file_path,
+                parse_start=ll.ts,
+                attempt=attempt,
+            )
+            records.append(current)
+            continue
+
+        # Fallback path sources (used when "Parsing file" wasn't captured)
         qm = _QUEUEING_RE.search(ll.body)
         wm = _WRITE_RE.search(ll.body)
         if qm:
@@ -180,8 +225,8 @@ def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
         # Match phase markers
         for snippet, key in _PHASE_LABELS.items():
             if snippet in ll.body:
-                if key == "phase0_start":
-                    # Start of a new file record
+                if key == "phase0_start" and current is None:
+                    # Fallback: start a record from phase0 if no "Parsing file" seen
                     current = FileRecord(path=last_file_path)
                     records.append(current)
                 if current is not None:
@@ -210,6 +255,183 @@ def _short_path(full: str) -> str:
         if idx != -1:
             return full[idx + len(marker) :]
     return Path(full).name or full
+
+
+# ---------------------------------------------------------------------------
+# Analysis: total parse time per file
+# ---------------------------------------------------------------------------
+
+
+def _ols(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    """Ordinary least-squares: returns (slope, intercept)."""
+    n = len(xs)
+    sx = sum(xs)
+    sy = sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return 0.0, sy / n
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    return slope, intercept
+
+
+def _rss(xs: list[float], ys: list[float], slope: float, intercept: float) -> float:
+    """Residual sum of squares for a fitted line."""
+    return sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+
+
+def _fit_models(
+    xs: list[float], ys: list[float]
+) -> list[tuple[str, float, float, float]]:
+    """Fit O(N), O(N²), O(log N), O(N log N) models to (xs, ys).
+
+    Returns list of (label, slope, intercept, rss) sorted by rss ascending
+    (best fit first).  xs must be 0-based parse order indices.
+    """
+    models = []
+
+    # O(N): feature = x
+    xs_linear = xs
+    s, i = _ols(xs_linear, ys)
+    models.append(("O(N)      ", s, i, _rss(xs_linear, ys, s, i)))
+
+    # O(N²): feature = x²
+    xs_sq = [x * x for x in xs]
+    s, i = _ols(xs_sq, ys)
+    models.append(("O(N²)     ", s, i, _rss(xs_sq, ys, s, i)))
+
+    # O(log N): feature = log(x+1)  (+1 avoids log(0))
+    xs_log = [math.log(x + 1) for x in xs]
+    s, i = _ols(xs_log, ys)
+    models.append(("O(log N)  ", s, i, _rss(xs_log, ys, s, i)))
+
+    # O(N log N): feature = x * log(x+1)
+    xs_nlogn = [x * math.log(x + 1) for x in xs]
+    s, i = _ols(xs_nlogn, ys)
+    models.append(("O(N log N)", s, i, _rss(xs_nlogn, ys, s, i)))
+
+    models.sort(key=lambda m: m[3])
+    return models
+
+
+def _trend_bar(slope_ms: float) -> str:
+    """ASCII indicator: flat / mild / strong growth or decay."""
+    abs_s = abs(slope_ms)
+    if abs_s < 0.05:
+        return "── flat"
+    direction = "↑" if slope_ms > 0 else "↓"
+    if abs_s < 0.5:
+        return f"{direction}  mild ({slope_ms:+.3f} ms/file)"
+    if abs_s < 2.0:
+        return f"{direction}{direction} moderate ({slope_ms:+.3f} ms/file)"
+    return f"{direction}{direction}{direction} STRONG ({slope_ms:+.3f} ms/file)"
+
+
+def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
+    """Total parse time per file (parse_start → phase5), ranked slowest-first."""
+    timed = [(r.total_duration(), r) for r in records if r.total_duration() is not None]
+    if not timed:
+        print("No total parse timing data found.")
+        return
+
+    vals = [d for d, _ in timed]
+    mean = sum(vals) / len(vals)
+    variance = sum((v - mean) ** 2 for v in vals) / len(vals)
+    sigma = math.sqrt(variance)
+    threshold = mean + 2 * sigma
+
+    # Split records into attempt-1 (fresh parse) and attempt-2+ (reparse) epochs,
+    # each sorted chronologically so x=0 is the first file in that epoch.
+    def _epoch_ordered(attempt_pred):
+        return sorted(
+            [
+                (r.total_duration(), r)
+                for r in records
+                if r.total_duration() is not None
+                and r.parse_start is not None
+                and attempt_pred(r.attempt)
+            ],
+            key=lambda t: t[1].parse_start,  # type: ignore[arg-type]
+        )
+
+    epochs = [
+        ("attempt 1  (fresh parse)", _epoch_ordered(lambda a: a == 1)),
+        ("attempt 2+ (reparse)    ", _epoch_ordered(lambda a: a > 1)),
+    ]
+
+    def _print_fit(epoch_label: str, ordered: list) -> None:
+        if len(ordered) < 2:
+            if ordered:
+                print(
+                    f"\n  Complexity fit — {epoch_label}: only {len(ordered)} record(s), skipping fit."
+                )
+            return
+        xs = [float(i) for i in range(len(ordered))]
+        ys = [d for d, _ in ordered]
+        models = _fit_models(xs, ys)
+        lin = next(m for m in models if m[0].startswith("O(N)"))
+        slope_ms = lin[1] * 1000.0
+        intercept_ms = lin[2] * 1000.0
+        pred_last = intercept_ms + slope_ms * (len(ordered) - 1)
+        best_label = models[0][0].strip()
+        print(f"\n  Complexity fit — {epoch_label} ({len(ordered)} records):")
+        print(f"    Best fit   : {best_label}  (lowest residual)")
+        print(f"    {'Model':<12}  {'Slope':>12}  {'Intercept':>10}  {'RSS':>14}")
+        print(f"    {'-' * 12}  {'-' * 12}  {'-' * 10}  {'-' * 14}")
+        for rank, (label, slope, intercept, rss) in enumerate(models):
+            marker = "← best" if rank == 0 else ""
+            print(
+                f"    {label}  {slope * 1000:>+10.4f}ms  {intercept * 1000:>8.1f}ms  {rss:>14.4f}  {marker}"
+            )
+        print(f"\n    O(N) detail:")
+        print(f"      Slope      : {slope_ms:+.3f} ms/file  {_trend_bar(slope_ms)}")
+        print(f"      Intercept  : {intercept_ms:.1f} ms  (predicted cost of file #0)")
+        print(
+            f"      Predicted  : {intercept_ms:.0f} ms → {pred_last:.0f} ms  (first → last file)"
+        )
+
+    timed.sort(key=lambda t: t[0], reverse=True)
+
+    print(f"\n{'=' * 70}")
+    print(f"  Total parse time (Parsing file → Phase 5) — top {top_n} slowest")
+    print(f"{'=' * 70}")
+    print(f"  Records analysed : {len(vals)}")
+    print(f"  Mean             : {mean:.2f}s")
+    print(f"  Std-dev          : {sigma:.2f}s")
+    print(f"  Min              : {min(vals):.2f}s")
+    print(f"  Max              : {max(vals):.2f}s")
+    print(f"  Outlier cutoff   : {threshold:.2f}s  (mean + 2σ)")
+    total_wall = sum(vals)
+    print(f"  Sum (sequential) : {total_wall:.0f}s  ({total_wall / 3600:.2f}h)")
+    for epoch_label, ordered in epochs:
+        _print_fit(epoch_label, ordered)
+    print()
+
+    # Per-attempt breakdown for multi-attempt files
+    multi = {}
+    for d, r in timed:
+        if r.attempt > 1:
+            multi.setdefault(r.path, []).append((r.attempt, d))
+
+    print(f"  {'Duration':>9}  {'Att':>3}  {'Flag':<5}  File")
+    print(f"  {'-' * 9}  {'-' * 3}  {'-' * 5}  {'-' * 50}")
+    for dur, rec in timed[:top_n]:
+        flag = ">>>" if dur > threshold else "   "
+        short = _short_path(rec.path)
+        print(f"  {dur:>8.2f}s  {rec.attempt:>3}  {flag}    {short}")
+
+    outliers = sum(1 for v in vals if v > threshold)
+    if outliers:
+        print(f"\n  {outliers} outlier(s) above {threshold:.2f}s")
+
+    # Attempts summary
+    attempt_dist: Counter = Counter(r.attempt for _, r in timed)
+    if max(attempt_dist.keys()) > 1:
+        print(f"\n  Parse attempt distribution:")
+        for att in sorted(attempt_dist):
+            print(f"    attempt {att}: {attempt_dist[att]} records")
 
 
 def report_phase_summary(records: list[FileRecord], top_n: int = 30) -> None:
@@ -320,7 +542,10 @@ _WARN_CLASSIFIER = [
     ("ISSUE 34 VIOLATION", "Issue-34 nodes-in-relations-not-in-states"),
     ("Unresolved relation", "Unresolved relation (sibling not yet parsed)"),
     ("Setting 2 paths", "Duplicate path for single relation"),
-    ("Path order depth changed", "Sort-key sentinel 65535 re-settled"),
+    (
+        "Path order depth changed",
+        "Gateway-tier depth change [u16::MAX→flat] (node reclassified from index.md plane to doc address space; dependents NOT re-queued)",
+    ),
     ("Failed to parse", "File skipped (codec error)"),
     ("cache_fetch FAILED", "cache_fetch returned results but key miss"),
     ("No Codec for extension", "Unknown file extension in codec map"),
@@ -464,9 +689,14 @@ def main() -> None:
         help="Per-phase breakdown for files whose path contains FILE_FRAGMENT",
     )
     ap.add_argument(
+        "--file-times",
+        action="store_true",
+        help="Total parse time per file (Parsing file → Phase 5), ranked slowest-first",
+    )
+    ap.add_argument(
         "--all",
         action="store_true",
-        help="Run all analyses (phase-summary + stalls + warnings)",
+        help="Run all analyses (phase-summary + stalls + warnings + file-times)",
     )
     ap.add_argument(
         "--top",
@@ -493,11 +723,15 @@ def main() -> None:
         or args.stalls is not None
         or args.warnings
         or args.phase_detail
+        or args.file_times
         or args.all
     )
 
     if not any_mode or args.phase_summary or args.all:
         report_phase_summary(records, top_n=args.top)
+
+    if args.file_times or args.all:
+        report_file_times(records, top_n=args.top)
 
     if args.stalls is not None or args.all:
         threshold = args.stalls if args.stalls is not None else 1.0

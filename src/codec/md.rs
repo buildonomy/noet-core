@@ -666,8 +666,7 @@ fn check_for_link_and_push(
                     reference_location: location,
                     ..UnresolvedReference::default()
                 };
-                tracing::debug!("{unresolved:?}");
-                tracing::debug!("sources: {sources:?}",);
+
                 // diagnostics.push(ParseDiagnostic::UnresolvedReference(unresolved));
 
                 let start_event = if link_data.is_image {

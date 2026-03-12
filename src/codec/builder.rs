@@ -360,7 +360,10 @@ impl GraphBuilder {
                         "Phase 1 {}: merging missing structure onto self.session_bb:",
                         bid,
                     );
-                    self.session_bb.merge(&missing_structure);
+                    // Seed from the single node just pushed — bounds the DFS to what's
+                    // reachable from this node in missing_structure, not all of session_bb.
+                    let node_seed: BTreeSet<Bid> = BTreeSet::from([bid]);
+                    self.session_bb.merge_from(&missing_structure, &node_seed);
                     // We did a bunch of cache_fetch operations, so the stack cache should be
                     // rebalanced as well.
                     self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
@@ -382,7 +385,7 @@ impl GraphBuilder {
                     // structure (ancestor chains, href namespace nodes) that doc_bb genuinely
                     // needs — merge as before.
                     if !source.is_from_cache() {
-                        self.doc_bb.merge(&missing_structure);
+                        self.doc_bb.merge_from(&missing_structure, &node_seed);
                     }
                     missing_structure = BeliefGraph::default();
                 }
@@ -717,8 +720,11 @@ impl GraphBuilder {
                     let const_expr = Expression::from(&key);
                     let const_graph = global_bb.eval(&const_expr).await?;
 
-                    // Merge the fetched asset graph into session_bb
-                    self.session_bb.merge(&const_graph);
+                    // Merge the fetched asset graph into session_bb.
+                    // Seed from the namespace node itself — bounds DFS to assets reachable
+                    // from this namespace, not all of session_bb.
+                    let ns_seed: BTreeSet<Bid> = BTreeSet::from([*const_bid]);
+                    self.session_bb.merge_from(&const_graph, &ns_seed);
 
                     tracing::debug!(
                         "[initialize_stack] Loaded {} assets from global cache for namespace {}",
@@ -797,7 +803,11 @@ impl GraphBuilder {
             if !missing_structure.is_empty() {
                 // Keep self.doc_bb isolated from the structure, that way we can ensure our comparison
                 // between the source material and the cache stays consistent.
-                self.session_bb.merge(&missing_structure);
+                // Seed from the ancestor network node just pushed — bounds DFS to structure
+                // reachable from this ancestor, not all of session_bb.
+                let ancestor_seed: BTreeSet<Bid> = BTreeSet::from([ancestor]);
+                self.session_bb
+                    .merge_from(&missing_structure, &ancestor_seed);
                 missing_structure = BeliefGraph::default(); // reset for next iteration
             }
             if path.as_os_str().is_empty() && self.repo == Bid::nil() {
@@ -911,7 +921,6 @@ impl GraphBuilder {
 
         let events_is_empty = tx_events.is_empty();
         for event in tx_events.into_iter() {
-            tracing::debug!("{event:?}");
             self.tx.send(event)?;
         }
         if !events_is_empty {
@@ -1847,7 +1856,10 @@ impl GraphBuilder {
 
         // Merge the full parent graph (including child edges) into session_bb so subsequent
         // sibling parses also find the parent on a StackCache hit.
-        self.session_bb.merge(&fast_missing);
+        // Seed from parent_bid — bounds DFS to structure reachable from the parent network,
+        // not all of session_bb.
+        let parent_seed: BTreeSet<Bid> = BTreeSet::from([parent_bid]);
+        self.session_bb.merge_from(&fast_missing, &parent_seed);
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // If the entry doc was already parsed in this session (reparse case), also fetch its
@@ -1868,7 +1880,12 @@ impl GraphBuilder {
             };
             let downstream_graph = self.session_bb.eval_query(&downstream_query, true).await?;
             if !downstream_graph.states.is_empty() {
-                self.session_bb.merge(&downstream_graph);
+                // Seed from the entry doc's BID — bounds DFS to section children reachable
+                // from this doc in downstream_graph, not all of session_bb.
+                if let Some(entry_node) = self.session_bb.get(&entry_key) {
+                    let entry_seed: BTreeSet<Bid> = BTreeSet::from([entry_node.bid]);
+                    self.session_bb.merge_from(&downstream_graph, &entry_seed);
+                }
             }
         }
 
