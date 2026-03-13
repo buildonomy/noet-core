@@ -233,7 +233,7 @@ impl<B: BeliefSource> CachedBeliefSource<B> {
                     affected.insert(*source);
                     affected.insert(*sink);
                 }
-                // NodeRenamed, PathAdded/Update/Removed, FileParsed, BalanceCheck,
+                // NodeRenamed, PathAdded/Update/Removed, FileParsed, BatchEnd,
                 // BuiltInTest: no direct cache effect on query results.
                 _ => {}
             }

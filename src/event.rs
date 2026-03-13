@@ -40,8 +40,14 @@ pub enum BeliefEvent {
     RelationRemoved(Bid, Bid, EventOrigin),
     /// File successfully parsed - track mtime for cache invalidation
     FileParsed(PathBuf),
-    /// A signal that the BeliefBase should be balanced at this point.
-    BalanceCheck,
+    /// Signals the start of a coherent batch of events (one network level / reparse round).
+    /// The BeliefAccumulator enters deferred-commit mode: events are collected but not yet
+    /// applied to the backing store or visible to queries.
+    BatchStart,
+    /// Signals the end of a coherent batch. The BeliefAccumulator sorts the collected events
+    /// (node events first, then relations/paths), applies them to the backing store as a
+    /// single unit, and invalidates the query cache so subsequent queries see fresh state.
+    BatchEnd,
     /// A signal to run a full built in test.
     BuiltInTest,
 }
@@ -84,7 +90,7 @@ impl PartialEq for BeliefEvent {
 impl Eq for BeliefEvent {}
 
 impl BeliefEvent {
-    /// Returns the EventOrigin of this event, or None for BalanceCheck
+    /// Returns the EventOrigin of this event, or None for BatchStart/BatchEnd/BuiltInTest/FileParsed.
     pub fn origin(&self) -> Option<EventOrigin> {
         match self {
             BeliefEvent::NodeUpdate(_, _, origin) => Some(*origin),
@@ -97,7 +103,8 @@ impl BeliefEvent {
             BeliefEvent::RelationChange(_, _, _, _, origin) => Some(*origin),
             BeliefEvent::RelationRemoved(_, _, origin) => Some(*origin),
             BeliefEvent::FileParsed(_) => None,
-            BeliefEvent::BalanceCheck => None,
+            BeliefEvent::BatchStart => None,
+            BeliefEvent::BatchEnd => None,
             BeliefEvent::BuiltInTest => None,
         }
     }
@@ -121,7 +128,8 @@ impl BeliefEvent {
             }
             BeliefEvent::RelationRemoved(s, k, _) => BeliefEvent::RelationRemoved(s, k, new_origin),
             BeliefEvent::FileParsed(p) => BeliefEvent::FileParsed(p),
-            BeliefEvent::BalanceCheck => BeliefEvent::BalanceCheck,
+            BeliefEvent::BatchStart => BeliefEvent::BatchStart,
+            BeliefEvent::BatchEnd => BeliefEvent::BatchEnd,
             BeliefEvent::BuiltInTest => BeliefEvent::BuiltInTest,
         }
     }
@@ -140,7 +148,8 @@ impl Display for BeliefEvent {
             BeliefEvent::RelationChange(_, _, _, _, _) => write!(f, "RelationChange"),
             BeliefEvent::RelationRemoved(_, _, _) => write!(f, "RelationRemoved"),
             BeliefEvent::FileParsed(_) => write!(f, "FileParsed"),
-            BeliefEvent::BalanceCheck => write!(f, "BalanceCheck"),
+            BeliefEvent::BatchStart => write!(f, "BatchStart"),
+            BeliefEvent::BatchEnd => write!(f, "BatchEnd"),
             BeliefEvent::BuiltInTest => write!(f, "BuiltInTest"),
         }
     }

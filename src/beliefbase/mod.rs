@@ -22,6 +22,8 @@ mod base;
 mod cached;
 mod context;
 mod graph;
+#[cfg(not(target_arch = "wasm32"))]
+mod sink;
 
 #[cfg(test)]
 mod tests;
@@ -32,3 +34,5 @@ pub use base::BeliefBase;
 pub use cached::CachedBeliefSource;
 pub use context::{BeliefContext, ExtendedRelation};
 pub use graph::{BeliefGraph, BidGraph, BidRefGraph, BidSubGraph};
+#[cfg(not(target_arch = "wasm32"))]
+pub use sink::BeliefSink;

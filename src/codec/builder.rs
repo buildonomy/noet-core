@@ -380,9 +380,6 @@ impl GraphBuilder {
                     // reachable from this node in missing_structure, not all of session_bb.
                     let node_seed: BTreeSet<Bid> = BTreeSet::from([bid]);
                     self.session_bb.merge_from(&missing_structure, &node_seed);
-                    // We did a bunch of cache_fetch operations, so the stack cache should be
-                    // rebalanced as well.
-                    self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
                     // Merge the structural halo (ancestor chains, external network nodes) into
                     // doc_bb so that PathMapMap has the network context needed for regularize()
                     // in Phase 2.
@@ -429,8 +426,6 @@ impl GraphBuilder {
                 }
                 parsed_bids.push(bid);
             }
-
-            self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
             tracing::debug!("Phase 2: Balance and process relations");
             let mut generated_href_nodes = Vec::new();
@@ -517,7 +512,6 @@ impl GraphBuilder {
                 let parsed_bid_set: BTreeSet<Bid> = parsed_bids.iter().copied().collect();
                 self.session_bb
                     .merge_from(&missing_structure, &parsed_bid_set);
-                self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
                 // we need to merge this phase 2 missing structure into self.doc_bb as well to ensure
                 // we have full structural paths to all the external nodes we connect to within the
                 // relation_event_queue. Use merge_from with parsed_bid_set (already computed above)
@@ -530,7 +524,6 @@ impl GraphBuilder {
             for edge_update in relation_event_queue.drain(..) {
                 let _deriv = self.doc_bb.process_event(&edge_update)?;
             }
-            self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
             tracing::debug!(
                 "Phase 3: inform external sinks about nodekey changes from this document"
@@ -849,8 +842,6 @@ impl GraphBuilder {
             }
         }
 
-        self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
-
         // Determine the entry document's sort key using the ProtoIndex — single canonical
         // source of truth shared by both fast and slow paths.  sort_key_for walks up the
         // directory tree to handle files in non-network subdirectories that iter_net_docs
@@ -867,9 +858,6 @@ impl GraphBuilder {
     ) -> Result<(), BuildonomyError> {
         // ensure the stack is empty
         self.stack.clear();
-        // Ensure we operate on a balanced set
-        let balance_check = BeliefEvent::BalanceCheck;
-        self.doc_bb.process_event(&balance_check)?;
         // First, apply node renames in order to have a solid basis for our next operations
         let mut tx_events = Vec::new();
         for (from_bid, to_bid) in renamed_nodes.iter() {
@@ -896,7 +884,6 @@ impl GraphBuilder {
                 }
             }
         }
-        self.session_bb.process_event(&balance_check)?;
         diff_events.append(&mut path_events);
         tx_events.append(&mut diff_events);
         if !tx_events.is_empty() {
@@ -974,7 +961,7 @@ impl GraphBuilder {
                         }
                     }
                     BeliefEvent::FileParsed(_) => {} // Metadata only, handled by Transaction
-                    BeliefEvent::BalanceCheck => {}
+                    BeliefEvent::BatchStart | BeliefEvent::BatchEnd => {}
                     BeliefEvent::BuiltInTest => {}
                 }
             }
@@ -992,13 +979,8 @@ impl GraphBuilder {
             );
         }
 
-        let events_is_empty = tx_events.is_empty();
         for event in tx_events.into_iter() {
             self.tx.send(event)?;
-        }
-        if !events_is_empty {
-            // tracing::debug!("Ensuring our global_bb is balanced");
-            self.tx.send(balance_check)?;
         }
 
         Ok(())
@@ -1979,7 +1961,6 @@ impl GraphBuilder {
         // the prior parse of this file (asset nodes, section edges, etc.); carrying that
         // forward leaks state and causes PathMap corruption (in_states=true, in_pathmap=false).
         self.doc_bb = BeliefBase::from(ancestors_only);
-        self.doc_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // Merge the full parent graph (including child edges) into session_bb so subsequent
         // sibling parses also find the parent on a StackCache hit.
@@ -1987,7 +1968,6 @@ impl GraphBuilder {
         // not all of session_bb.
         let parent_seed: BTreeSet<Bid> = BTreeSet::from([parent_bid]);
         self.session_bb.merge_from(&fast_missing, &parent_seed);
-        self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // Pre-populate session_bb with the entry doc and its section children so that Phase 1
         // push() finds them via StackCache and reuses persisted BIDs rather than generating
@@ -2049,7 +2029,6 @@ impl GraphBuilder {
             {
                 let entry_seed: BTreeSet<Bid> = BTreeSet::from([entry_bid]);
                 self.session_bb.merge_from(&children_graph, &entry_seed);
-                self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
             }
         }
 
@@ -2119,7 +2098,6 @@ impl GraphBuilder {
             .unwrap_or_else(|| vec![(self.repo, repo_root_str.clone(), heading_for(&self.repo))]);
 
         self.stack = stack_entries;
-        self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
         // proto() is still needed — initialize_stack must return the entry IRNode for Phase 1.
         let initial_factory = CODECS

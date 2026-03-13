@@ -531,7 +531,7 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
     let mut balanced_result = BeliefBase::from(query_result);
 
     // This should succeed - the balance should pull in the Network->API relation
-    let balance_result = balanced_result.process_event(&BeliefEvent::BalanceCheck);
+    let balance_result = balanced_result.process_event(&BeliefEvent::BatchEnd);
 
     // THIS IS WHERE THE BUG MANIFESTS:
     // If this assertion fails, it means the balance didn't include Network->API

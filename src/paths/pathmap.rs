@@ -673,7 +673,7 @@ impl PathMapMap {
                 // redundant processing.
                 // BeliefEvent::RelationChange(source, sink, kind, weight, _) => {}
                 // PathsAdded/PathsRemoved are derivative events - we don't process them
-                // NodeRenamed, RelationRemoved, BalanceCheck - handled elsewhere or ignored
+                // NodeRenamed, RelationRemoved, BatchEnd - handled elsewhere or ignored
                 _ => {}
             }
         }

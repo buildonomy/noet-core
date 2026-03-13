@@ -171,10 +171,11 @@ impl<'a> Transaction<'a> {
             BeliefEvent::FileParsed(path) => {
                 self.track_file_mtime(path)?;
             }
-            BeliefEvent::BalanceCheck => {
-                // tracing::debug!(
-                //     "BalanceCheck: DB *should* be balanced now but we're not checking."
-                // );
+            BeliefEvent::BatchStart | BeliefEvent::BatchEnd => {
+                // No-op at the backing-store level. All batch semantics (event collection,
+                // node-first reordering, Transaction::execute) are owned by
+                // BeliefAccumulator. add_event only sees the reordered event slice
+                // after BatchEnd has been processed by the accumulator.
             }
             BeliefEvent::BuiltInTest => {
                 tracing::debug!(

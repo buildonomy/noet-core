@@ -367,8 +367,11 @@ fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
         BeliefEvent::RelationRemoved(source, sink, origin) => {
             println!("  [RelationRemoved] {source} -> {sink}, origin: {origin:?}");
         }
-        BeliefEvent::BalanceCheck => {
-            println!("  [BalanceCheck]");
+        BeliefEvent::BatchStart => {
+            println!("  [BatchStart]");
+        }
+        BeliefEvent::BatchEnd => {
+            println!("  [BatchEnd]");
         }
         BeliefEvent::FileParsed(path) => {
             println!("  [FileParse] {:?}", path);

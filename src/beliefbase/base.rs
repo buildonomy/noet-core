@@ -1149,12 +1149,11 @@ impl BeliefBase {
             BeliefEvent::FileParsed(_) => {
                 // Metadata only, handled by Transaction for mtime tracking
             }
-            BeliefEvent::BalanceCheck => {
-                // No-op: bid_to_index is rebuilt lazily on next access via the index_dirty flag.
-                // Calling index_sync(false) here was O(session_bb) per file — the dominant
-                // bottleneck in run 11 (+4.4 ms/file slope). The lazy rebuild in read_bid_index()
-                // is sufficient; BalanceCheck's only remaining role is as a synchronization
-                // signal for subscribers (e.g. db.rs).
+            BeliefEvent::BatchStart | BeliefEvent::BatchEnd => {
+                // No-op at the backing-store level. All batch semantics (event collection,
+                // node-first reordering, cache invalidation, index_sync) are owned by
+                // BeliefAccumulator. process_event only sees the reordered event slice
+                // after BatchEnd has been processed by the accumulator.
             }
             BeliefEvent::BuiltInTest => {
                 // Run a full built_in_test check
