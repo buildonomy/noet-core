@@ -128,6 +128,11 @@ enum Commands {
         /// Can also be set via NOET_BASE_URL environment variable
         #[arg(long)]
         base_url: Option<String>,
+
+        /// Number of parallel jobs for epoch dispatch (default: available CPUs).
+        /// Use 1 for sequential execution. Can also be set via NOET_JOBS env var.
+        #[arg(short = 'j', long)]
+        jobs: Option<usize>,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -315,6 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             html_output,
             cdn,
             base_url,
+            jobs,
         } => {
             // Read base_url from environment if not provided via CLI
             let base_url = base_url.or_else(|| std::env::var("NOET_BASE_URL").ok());
@@ -361,9 +367,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None, // No live reload script for parse command
                         cdn,
                         base_url,
+                        jobs,
                     )?
                 } else {
-                    DocumentCompiler::new(&path, Some(tx), None, write)?
+                    let mut c = DocumentCompiler::new(&path, Some(tx), None, write)?;
+                    if let Some(j) = jobs {
+                        c.set_jobs(j);
+                    }
+                    c
                 };
 
                 // Parse all documents (events sent to processor)

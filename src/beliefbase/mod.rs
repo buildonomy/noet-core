@@ -18,6 +18,8 @@
 //! ```
 
 mod base;
+#[cfg(not(target_arch = "wasm32"))]
+mod cached;
 mod context;
 mod graph;
 
@@ -26,5 +28,7 @@ mod tests;
 
 // Re-export public types to maintain existing API
 pub use base::BeliefBase;
+#[cfg(not(target_arch = "wasm32"))]
+pub use cached::CachedBeliefSource;
 pub use context::{BeliefContext, ExtendedRelation};
 pub use graph::{BeliefGraph, BidGraph, BidRefGraph, BidSubGraph};

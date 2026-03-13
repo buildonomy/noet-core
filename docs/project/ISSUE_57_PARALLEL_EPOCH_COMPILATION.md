@@ -1,291 +1,344 @@
 # Issue 57: Parallel Epoch Compilation
 
 **Priority**: MEDIUM
-**Estimated Effort**: 3 days (RELATIVE COMPARISON ONLY)
-**Dependencies**: None hard. Issue 56 protocol model informs the merge-safety argument but does not block implementation.
+**Estimated Effort**: 5 days (RELATIVE COMPARISON ONLY)
+**Dependencies**: None hard. Issue 56 protocol model informs the merge-safety
+argument but does not block implementation.
 **Related**: Issue 56 (PathMap protocol observability)
 
 ## Summary
 
-`DocumentCompiler::parse_all` processes files sequentially today. Files parsed
-in the same epoch (same parse-count round) are mutually independent — no
-cross-file state exists at the start of each epoch. Giving each file its own
-`GraphBuilder` with a private `session_bb` and running epoch tasks concurrently
-via a bounded thread pool should yield near-linear wall-clock speedup on the
-I/O and codec-parse phases. On a corpus like MDN (~14 000 files), epoch 0 alone
-represents ~14 000 independent tasks that currently run one at a time.
-
-Epoch 0 gets an additional simplification: because no PathMap state exists yet,
-the collision-avoidance logic in `generate_path_name_with_collision_check` is
-both unnecessary and a source of non-determinism under parallel execution. The
-fix is to skip it entirely during epoch-0 tasks and instead rebuild the
-`PathMapMap` from scratch via `index_sync(true)` after the epoch-0 merge.
-`PathMap::new` produces a fully deterministic result from the relation graph
-alone — no event ordering dependency, no collision-check state, BID-ordered
-tiebreaking built in.
+`DocumentCompiler::parse_all` processes files sequentially today. This issue
+delivers true intra-epoch parallelism by (1) introducing a `BeliefAccumulator`
+— a live, drainable in-memory `BeliefSource` that unifies the `parse` and
+`watch` event-processing architectures — and (2) restructuring epoch 0 as a
+network-ordered sequence of parallel leaf batches, each separated by an
+explicit flush. The result is a `parse` pipeline structurally identical to
+`watch`, where `global_bb` is always live and queryable between sub-epoch
+boundaries.
 
 ## Goals
 
-1. Define the epoch invariant formally and encode it as a doc-comment on `parse_all`.
-2. Refactor `GraphBuilder` to accept a pre-seeded `session_bb` at construction time.
-3. Implement parallel epoch dispatch in `parse_all` using a bounded thread pool (`--jobs N` / `NOET_JOBS`).
-4. Merge per-task `session_bb` results back into the compiler's `session_bb` after each epoch.
-5. After the epoch-0 merge, rebuild `PathMapMap` from scratch via `index_sync(true)` to produce a deterministic canonical PathMap without any event-ordering dependency.
-6. Validate the post-merge event stream with the ownership invariant (see Architecture).
-7. Preserve the existing sequential code path behind `--jobs 1` for debugging.
+1. ✅ Extend `try_initialize_stack_from_session_cache` to accept a `GlobalCache`
+   hit as equivalent to a `StackCache` hit.
+2. ✅ Add `--jobs N` / `NOET_JOBS` flag and sequential fallback at `jobs=1`.
+3. Introduce `BeliefAccumulator`: a live in-memory `BeliefSource` backed by an
+   `UnboundedReceiver<BeliefEvent>` that unifies `parse` and `watch` event
+   handling.
+4. Repurpose `BalanceCheck` → `Flush`: remove all vestigial emit/consume sites,
+   assign new sub-epoch-boundary semantics consumed by `BeliefAccumulator`.
+5. Restructure epoch 0 in `parse_all` as a network-ordered sequence of parallel
+   leaf batches gated by `Flush`.
+6. Implement true OS-thread parallelism for leaf batches via
+   `tokio::task::spawn` + bounded semaphore.
+7. Preserve `--jobs 1` sequential path as byte-identical fallback.
 
 ## Architecture
 
-### The Epoch Invariant
+### The Epoch Invariant (unchanged)
 
 An **epoch** is the set of files sharing the same parse count at the point they
-are dequeued. Files in epoch 0 have never been parsed; their nodes do not yet
-exist in any `session_bb`. Files in epoch N ≥ 1 have been parsed N times; their
-nodes exist in the compiler's `session_bb` from prior epochs.
+are dequeued. Files in epoch 0 have never been parsed. Files in epoch N ≥ 1
+have been parsed N times; their nodes exist in `global_bb` from prior epochs.
 
-**Within a single epoch, no file's parse output is an input to any other file's
-parse in that same epoch.** Cross-file dependencies only flow across epoch
-boundaries (a file reparsed in epoch N reads nodes written in epochs 0..N-1).
-This is the invariant that makes intra-epoch parallelism safe.
+**Within a single epoch, no file's parse output is an input to any other
+file's parse in that same epoch.** Cross-file dependencies only flow across
+epoch boundaries. This is the invariant that makes intra-epoch parallelism safe.
 
-### Per-Task Isolation
+### BeliefAccumulator
 
-Each concurrent task receives:
+`BeliefAccumulator` is the in-memory analog of `DbConnection`. It owns:
 
-- An **owned `GraphBuilder`** constructed with its own fresh (epoch 0) or cloned
-  (epoch N ≥ 1) `session_bb`.
-- A **shared read reference to `global_bb`** — already `BeliefSource + Clone`,
-  no changes needed.
-- Exclusive ownership of its input file path — the 1:1 file-per-task invariant
-  means no two tasks touch the same path, so `rewritten_content` write-back
-  inside `terminate_stack` is safe without additional coordination.
+- An internal `BeliefBase` (the accumulated state)
+- An `UnboundedReceiver<BeliefEvent>` (the read side of the compiler's `tx`)
 
-`terminate_stack` is unchanged. It computes `compute_diff(session_bb, doc_bb,
-parsed_nodes)` and sends diff events over `self.tx` to the global `BeliefBase`
-channel. That channel is already the integration point; parallel tasks just
-produce events concurrently rather than sequentially.
+It implements `BeliefSource` by querying the internal `BeliefBase` directly.
+Before each query it lazily drains any pending events from the receiver into the
+internal `BeliefBase` — cheap when the channel is already empty, free when
+nothing has changed.
 
-### Epoch Seed Strategy
+It exposes one additional method:
 
-| Epoch | Per-task `session_bb` seed |
-|-------|---------------------------|
-| 0     | Empty (same as today's `initialize_stack` starting state) |
-| N ≥ 1 | Clone of compiler's `session_bb` post-merge from epoch N-1 |
+```rust
+fn drain(&mut self)
+```
 
-After all tasks in an epoch complete, the compiler merges each task's
-`session_bb` into its own via `BeliefBase::merge`. This produces the seed for
-the next epoch.
+`drain()` performs a complete synchronous drain of all pending channel events
+into the internal `BeliefBase` and then calls `invalidate()` on any wrapped
+`CachedBeliefSource`. This is the explicit flush point called by `parse_all` at
+sub-epoch boundaries.
 
-### Merge Commutativity and the Ownership Invariant
+`BeliefAccumulator` lives in `src/beliefbase/accumulator.rs`, gated to
+`#[cfg(not(target_arch = "wasm32"))]` (same as `CachedBeliefSource`).
 
-`WEIGHT_SORT_KEY` in each `RelationChange` event is the document-position index
-of the relation within a single file's parse (`index as u16` in
-`push_relation`). It is locally unique and stable per file regardless of which
-task processes it.
+### parse / watch Unification
 
-`compute_diff` already enforces ownership before emitting any `Relation*` event:
-it only includes an edge in the diff when `parsed_content.contains(owner)`,
-where `owner` is the endpoint indicated by `WEIGHT_OWNED_BY` on that edge. This
-means each task's diff events are, by construction, restricted to edges owned by
-nodes that task actually parsed.
+Today `parse` and `watch` differ in how `global_bb` is wired:
 
-**The ownership invariant** (to be validated on the unified post-merge event
-stream): every `RelationChange` / `RelationUpdate` event emitted by a task must
-have its `WEIGHT_OWNED_BY` endpoint be a BID that was in that task's
-`parsed_content` set. This is the predicate that `compute_diff`'s filter
-enforces locally, and the same predicate that the Issue 56 `push_relation` guard
-protects at the `session_bb` boundary. Verifying it on the merged stream closes
-the gap between "each task is individually correct" and "the merged result is
-collectively correct."
+| | `parse` (today) | `watch` | target |
+|---|---|---|---|
+| `global_bb` type | frozen `BeliefBase` clone | live `DbConnection` | live `BeliefAccumulator` |
+| event consumer | background processor task | transaction task | `BeliefAccumulator::drain()` |
+| drain trigger | `close_tx` + `processor.await` | compiler-idle notify | explicit `drain()` at sub-epoch boundaries |
 
-### Epoch-0 PathMap Rebuild (Determinism Without Event Ordering)
+After this issue, `parse` uses `BeliefAccumulator` as `global_bb`. The
+background processor task in `main.rs` is eliminated. `parse_all` owns the
+drain loop. `finalize_html` receives the same `BeliefAccumulator` (fully
+drained) that was used during parsing — no separate `final_bb` needed.
 
-During epoch 0, no PathMap state exists yet. The event-driven
-`process_relation_update` path calls `generate_path_name_with_collision_check`,
-which reads `self.map` at insertion time to decide between the title-anchor path
-and the bref fallback. Under parallel execution this read is
-arrival-order-dependent: whichever task's diff events are applied first
-determines which sibling gets the clean path name and which gets the bref
-fallback. This is a genuine non-determinism source, not a positional stability
-risk.
+`watch` is unchanged: it continues to use `DbConnection` as `global_bb`. The
+compiler task in `FileUpdateSyncer` continues to call `parse_next` against the
+`DbConnection` exactly as today.
 
-**The fix**: epoch-0 tasks skip collision-avoidance entirely (they only record
-the relation graph). After the epoch-0 merge, call `index_sync(true)` (or an
-equivalent `BeliefBase::rebuild_paths`) to throw away the event-driven PathMap
-and rebuild `PathMapMap` from scratch using `PathMap::new`. `PathMap::new`
-already handles this correctly:
+### Epoch 0: Network-Ordered Parallel Dispatch
 
-- It calls `generate_terminal_path` directly, with no collision-check read of
-  `self.map`.
-- It sorts the final `map` by `(pathmap_order, bid)` — the BID tiebreaker is
-  unique and stable, so the result is fully deterministic regardless of which
-  tasks completed in which order.
-- Collisions between same-titled siblings are resolved by BID ordering, not by
-  arrival order.
+`ProtoIndex::discover_network_dirs()` returns all network directories sorted
+by depth (shallowest first — already implemented). This ordering defines the
+sub-epoch sequence for epoch 0:
 
-This is not a new code path: `index_sync(true)` already builds a `PathMapMap`
-via `PathMapMap::new` and compares it against the event-driven one as a
-correctness check. The change is to *use* the constructor-built PathMap as the
-authoritative result after epoch 0, rather than just asserting they match.
+```
+For each network_dir in discover_network_dirs() (depth order):
+  1. Parse network_dir/index.md  (single task, slow-path push())
+  2. accumulator.drain()         (flush: index.md's events enter global_bb)
+  3. Dispatch all leaf children of network_dir in parallel
+     (each fires GlobalCache fast-path against now-populated global_bb)
+  4. accumulator.drain()         (flush: leaf events enter global_bb;
+                                   CachedBeliefSource invalidated)
+```
 
-**Epoch 1+**: tasks start from the canonical PathMap produced by the epoch-0
-rebuild. `generate_path_name_with_collision_check` reads stable, deterministic
-`self.map` contents for all tasks in the same epoch (they all receive the same
-cloned `session_bb` seed). Collision outcomes are therefore order-independent
-for all subsequent epochs without any additional sorting or rebuilding.
+**Why the parent must precede its leaves**: `try_initialize_stack_from_session_cache`
+needs the parent network node in `global_bb` to fire the `GlobalCache` fast
+path. The parent node enters `global_bb` only after its `terminate_stack` events
+are drained. Once drained, all leaves are fully independent — `sort_key_for` is
+served by `ProtoIndex` (static, no `global_bb` query needed) and leaf content
+is mutually non-referential within epoch 0.
 
-### Shared Read-Only Filesystem Access
+**Sub-networks**: `discover_network_dirs()` returns them in depth order. A
+sub-network (`array/`) appears after its parent (`reference/global_objects/`)
+in the sequence, so by the time `array/index.md` is dispatched, its parent
+network is already in `global_bb`. The leaf batch for `array/` fires after
+`array/index.md` is drained. Correct by construction.
 
-`initialize_stack` calls `NetworkCodec::proto` on each ancestor directory,
-which calls `iter_net_docs` — a `WalkDir` scan. Two concurrent tasks parsing
-sibling files in the same network will both scan that directory. This is
-read-only and safe; the redundancy is acceptable and can be addressed later
-with a per-epoch directory-scan cache if profiling shows it matters.
+**`CachedBeliefSource` scope**: one `CachedBeliefSource` wraps `global_bb` for
+the entire `parse_all` invocation. After each `drain()`, `invalidate()` is
+called so stale parent-network query results are evicted. Within a leaf batch
+(between two drains), the cache is stable — all siblings query the same parent
+key and share the memoised result.
 
-### Thread Pool and Concurrency Bound
+### Epoch N ≥ 1: Standard Parallel Dispatch
 
-Parallelism is bounded by a pool sized to `--jobs N` (default: `num_cpus::get()`),
-exposed as `NOET_JOBS` environment variable for CI control. Blindly opening one
-task per file for 14 000 files would exhaust file descriptors and tokio thread
-pool capacity.
+At the start of epoch N ≥ 1, `global_bb` (the `BeliefAccumulator`) is fully
+drained from epoch N-1. All parent networks and all previously-parsed leaf
+nodes are present. Wrap in a fresh `CachedBeliefSource`.
 
-Preferred primitive: `tokio::task::spawn_blocking` for the file-read + codec
-parse work (CPU-bound, benefits from OS thread parallelism), feeding results
-back to an async collection loop via a `FuturesUnordered` or a bounded channel.
-Alternatively, `rayon` for the CPU-bound codec work with async I/O kept on the
-tokio runtime. The choice between these is an implementation decision; the pool
-bound is the non-negotiable constraint.
+Every file queued for reparse can resolve cross-document links via `GlobalCache`
+hits against this complete snapshot. Files within epoch N are still mutually
+independent (same epoch invariant). Dispatch all epoch-N files in parallel,
+then `drain()` before epoch N+1.
 
-`--jobs 1` (or `NOET_JOBS=1`) must produce byte-identical output to the current
-sequential path and serves as the debugging escape hatch.
+The sequential `parse_next` reparse state machine (max_reparse_count,
+reparse_stable, pending_dependencies) is preserved unchanged — the parallel
+dispatch just replaces the inner `parse_next` call, not the outer retry logic.
+
+### Flush Event (`BalanceCheck` → `Flush`)
+
+`BalanceCheck` is currently vestigial at every consumption site:
+
+- `BeliefBase::process_event` — explicit no-op (comment explains it was
+  de-fanged in run 11)
+- `db.rs Transaction::add_event` — commented-out no-op
+- `terminate_stack` match arm — `BeliefEvent::BalanceCheck => {}`
+- All emit sites in `builder.rs` and
+  `try_initialize_stack_from_session_cache` — fire-and-forget calls that
+  accomplish nothing
+
+**Plan**: rename `BalanceCheck` → `Flush` and simultaneously:
+
+1. Remove all vestigial emit sites in `builder.rs` and
+   `try_initialize_stack_from_session_cache`.
+2. Remove the no-op match arms in `BeliefBase::process_event`, `db.rs`, and
+   `terminate_stack`.
+3. Assign new semantics: `Flush` is emitted by `parse_all` onto the `tx`
+   channel at sub-epoch boundaries as a sentinel. `BeliefAccumulator::drain()`
+   drains until it sees `Flush` (or the channel empties), then invalidates
+   `CachedBeliefSource`.
+
+`Flush` is not emitted by `terminate_stack` or any per-file code — it is
+exclusively a `parse_all`-level signal. Per-file `BalanceCheck` emissions are
+simply deleted.
+
+### True OS-Thread Parallelism
+
+Steps 1 and 2 of this issue already added `Send` bounds to `B` in
+`parse_next`, `parse_all`, and `parse_epoch_parallel`. `BeliefBase` on native
+is `Send + Sync` (uses `Arc<RwLock<T>>`). `GraphBuilder` (which contains
+`BeliefBase`) is therefore `Send` on native.
+
+Leaf batch tasks can be dispatched via `tokio::task::spawn` with a
+`Arc<Semaphore>` pool bounded to `--jobs N`. Each task:
+
+1. Constructs a fresh `GraphBuilder` (fresh `session_bb`, shared `tx` clone)
+2. Calls `parse_content` + `terminate_stack`
+3. Returns `ParseContentWithCodec`
+
+No post-task merge step. Events flow directly to `BeliefAccumulator` via `tx`.
+The semaphore ensures at most N tasks run concurrently regardless of batch size.
 
 ## Implementation Steps
 
-### 1. `GraphBuilder` seeded construction (0.5 days)
-   - [ ] Add `GraphBuilder::with_session_bb(session_bb: BeliefBase, ...) -> Self`
-         constructor (or extend `new` with an `Option<BeliefBase>` parameter).
-   - [ ] Ensure `initialize_stack` does not unconditionally clear `session_bb`
-         when it is pre-seeded. Today it clears `doc_bb` only; `session_bb` is
-         preserved across calls on the same builder. Verify this invariant holds
-         when the builder is constructed with a cloned seed.
+### Step 1: GlobalCache fast-path ✅ (complete)
 
-### 2. Thread pool and job control (0.5 days)
-   - [ ] Add `--jobs N` CLI flag and `NOET_JOBS` env var to `DocumentCompiler`.
-   - [ ] Default to `num_cpus::get()`. `--jobs 1` falls back to the existing
-         sequential `parse_next` loop without any other code changes.
-   - [ ] Implement the bounded pool (tokio `spawn_blocking` + semaphore, or
-         rayon); validate that file descriptor usage stays bounded on a 14k-file
-         corpus.
+`try_initialize_stack_from_session_cache` accepts both `NodeSource::StackCache`
+and `NodeSource::GlobalCache`. `fast_missing` sourced from `global_bb` on
+`GlobalCache` hit.
 
-### 3. Parallel epoch dispatch in `parse_all` (1 day)
-   - [ ] Partition the current-epoch queue into a batch: all paths with
-         `self.processed.get(path) == epoch_number` (or 0 for the primary queue).
-   - [ ] Dispatch each path to the pool, each task constructing its own
-         `GraphBuilder` and calling `parse_content` + `terminate_stack`.
-   - [ ] Collect `(ParseResult, session_bb)` from each completed task.
-   - [ ] Merge all task `session_bb`s into the compiler's `session_bb` in
-         alphabetical-by-path order to keep the merge itself deterministic.
-   - [ ] After the epoch-0 merge, call `BeliefBase::rebuild_paths()` (wrapping
-         `index_sync(true)`) to replace the event-driven `PathMapMap` with the
-         constructor-built one. This is the canonical determinism fix for epoch 0
-         (see Architecture).
-   - [ ] Apply the reparse-stability check (`reparse_stable`, `last_round_updates`)
-         across the full batch result rather than per-file.
+### Step 2: `--jobs` / `NOET_JOBS` ✅ (complete)
 
-### 4. Ownership invariant validation (0.5 days)
-   - [ ] After collecting all diff events from an epoch, assert (in debug builds)
-         that every `RelationChange` / `RelationUpdate` event has its
-         `WEIGHT_OWNED_BY` endpoint in the `parsed_content` set of the task that
-         emitted it.
-   - [ ] This is the same predicate `compute_diff` enforces locally; verifying it
-         on the unified stream confirms the per-task isolation is preserved through
-         the merge.
-   - [ ] If any violation is found, it indicates a task's `session_bb` contained
-         a stale cross-document edge — the Issue 56 class of bug — and the
-         `push_relation` home-network guard failed to catch it.
+`jobs: usize` field on `DocumentCompiler`. `-j N` CLI flag. `NOET_JOBS` env
+var. Sequential fallback at `jobs=1`.
 
-### 5. Expose `rebuild_paths` on `BeliefBase` (0.25 days)
-   - [ ] Add `pub fn rebuild_paths(&self)` to `BeliefBase` that calls
-         `self.index_dirty.store(true, Ordering::SeqCst)` then `index_sync(true)`.
-   - [ ] Add a test that verifies `rebuild_paths()` after a parallel-simulated
-         out-of-order merge produces the same `PathMapMap` as a sequential build
-         of the same corpus.
+### Step 3: `BeliefAccumulator` (1 day)
 
-### 6. HTML generation (0.5 days)
-   - [ ] `write_fragment` is already pure file I/O after codec state is
-         captured. Confirm it can run inside the task (it currently does) and
-         that concurrent writes to distinct output paths are safe (they are,
-         by the 1:1 file-per-task invariant).
-   - [ ] If `deferred_html` (network index generation) is touched by parallel
-         tasks, ensure the `HashSet` insert is done post-merge in the compiler,
-         not inside the task.
+- [ ] `src/beliefbase/accumulator.rs`: `BeliefAccumulator` struct with internal
+      `BeliefBase` + `UnboundedReceiver<BeliefEvent>`.
+- [ ] `impl BeliefSource for BeliefAccumulator`: drain lazily before each
+      query (cheap `try_recv` loop), then delegate to internal `BeliefBase`.
+- [ ] `fn drain(&mut self)`: synchronous full drain + `CachedBeliefSource`
+      invalidation. Takes a `&mut CachedBeliefSource<Self>` or invalidates via
+      a shared `Arc<Inner>` reference.
+- [ ] `pub fn new(rx: UnboundedReceiver<BeliefEvent>) -> Self`
+- [ ] `src/beliefbase/mod.rs`: `mod accumulator; pub use accumulator::BeliefAccumulator`
+      gated to `#[cfg(not(target_arch = "wasm32"))]`.
+- [ ] `src/bin/noet/main.rs`: replace background processor task with
+      `BeliefAccumulator::new(rx)`. Pass accumulator as `global_bb` to
+      `parse_all`. After `parse_all` returns, call `close_tx()` then
+      `accumulator.drain()` for the final flush before `finalize_html`.
+- [ ] Tests: construct `BeliefAccumulator` from a channel, send events, confirm
+      `BeliefSource` queries reflect them after drain.
 
-### 7. PathMap determinism validation (0.5 days)
-   - [ ] Run parallel and sequential builds against `NOET_BENCH_CORPUS=web/javascript`.
-   - [ ] Diff PathMap output (via a test that compares `get_nav_tree()` node sets
-         and their ordering between the two runs).
-   - [ ] The epoch-0 `rebuild_paths()` call should make this a non-issue; confirm
-         empirically and document the result in this issue and in the `parse_all`
-         doc-comment.
-   - [ ] Verify epoch 1+ produces stable output without any additional sorting
-         (expected, given the deterministic epoch-0 PathMap seed).
+### Step 4: `BalanceCheck` → `Flush` (0.5 days)
+
+- [ ] `src/event.rs`: rename `BalanceCheck` → `Flush`. Update doc comment.
+- [ ] Remove all vestigial emit sites in `builder.rs` (all
+      `process_event(&BeliefEvent::BalanceCheck)` calls on `session_bb`,
+      `doc_bb`) and in `try_initialize_stack_from_session_cache`.
+- [ ] Remove no-op match arms for `BalanceCheck` in `BeliefBase::process_event`,
+      `db.rs Transaction::add_event`, `terminate_stack`.
+- [ ] `BeliefAccumulator::drain()`: emit `Flush` from `parse_all` onto `tx`
+      as the drain sentinel; `drain()` reads until `Flush` or channel empty.
+- [ ] Update `Display`, `origin()`, `with_origin()` impls in `event.rs`.
+- [ ] `s/BalanceCheck/Flush/g` across all remaining match arms (compile-driven).
+
+### Step 5: Network-ordered epoch 0 dispatch (1.5 days)
+
+- [ ] `parse_all`: replace the flat `primary_queue` batch with a loop over
+      `proto_index.discover_network_dirs()` in depth order.
+- [ ] For each `network_dir`:
+  - Parse `network_dir/index.md` as a single task (reuse `parse_epoch_parallel`
+    with a one-element slice, or inline).
+  - Call `cached_global_bb.invalidate()` + `accumulator.drain()`.
+  - Collect `children_of(network_dir)` that are leaves (not themselves network
+    dirs). Dispatch as a parallel batch via `parse_epoch_parallel`.
+  - Call `cached_global_bb.invalidate()` + `accumulator.drain()`.
+- [ ] Handle the case where a child of `network_dir` is itself a network dir
+      (sub-network): it will appear later in `discover_network_dirs()` and be
+      handled in its own iteration — skip it in the leaf batch.
+- [ ] Verify: after epoch 0 completes, every file in `primary_queue` has been
+      dispatched exactly once.
+- [ ] `--jobs 1` path: same loop structure, but each leaf batch runs
+      sequentially (reuse existing `parse_epoch_parallel` sequential loop or
+      `parse_next`).
+
+### Step 6: True OS-thread parallelism (1 day)
+
+- [ ] `parse_epoch_parallel`: replace sequential `for path in paths` loop with
+      `tokio::task::spawn` per path, gated by `Arc<Semaphore>` of size `jobs`.
+- [ ] Each spawned task gets: owned `GraphBuilder`, `tx.clone()`,
+      `global_bb.clone()` (cheap — `CachedBeliefSource` is `Arc`-wrapped).
+- [ ] Collect results via `JoinSet` or `FuturesUnordered`; preserve path order
+      for deterministic result ordering.
+- [ ] `--jobs 1`: semaphore of size 1 is equivalent to sequential — no special
+      case needed.
+
+### Step 7: Epoch N ≥ 1 parallel dispatch (0.5 days)
+
+- [ ] After epoch 0 completes, the reparse queue contains files with unresolved
+      cross-document links. Group by epoch number (existing `processed` map).
+- [ ] For each reparse epoch N: wrap `accumulator` in a fresh
+      `CachedBeliefSource`, dispatch all epoch-N files via
+      `parse_epoch_parallel`, drain.
+- [ ] The existing reparse state machine (max_reparse_count, reparse_stable,
+      pending_dependencies, last_round_updates) is preserved; only the inner
+      dispatch changes from sequential `parse_next` to parallel batch.
 
 ## Testing Requirements
 
-- [ ] Existing test suite passes with parallel dispatch enabled (no regressions).
-- [ ] `--jobs 1` produces byte-identical output to the current implementation
-      on `tests/network_1`.
-- [ ] Parallel build of `NOET_BENCH_CORPUS=web/javascript` completes without
-      panic or data corruption.
-- [ ] Ownership invariant `debug_assert` fires zero times on the MDN corpus.
-- [ ] PathMap output is byte-identical between sequential and parallel builds
-      (enforced by `rebuild_paths()` after epoch 0, not by event ordering).
-- [ ] File descriptor usage stays bounded (no EMFILE errors at 14k files).
-- [ ] `bench_parse_throughput` shows measurable improvement over the baseline
-      saved before this issue.
+- [ ] `cargo test --features service` passes with no regressions.
+- [ ] `--jobs 1` produces byte-identical output to the current sequential
+      implementation on `tests/network_1`.
+- [ ] Parallel build of `global_objects/` corpus completes without panic or
+      data corruption.
+- [ ] `BeliefAccumulator` unit tests: drain reflects events, lazy query drain
+      works, `Flush` sentinel triggers invalidation.
+- [ ] No `BalanceCheck` references remain after Step 4.
 
 ## Success Criteria
 
-- [ ] `parse_all` dispatches epoch-0 tasks concurrently via a bounded pool.
-- [ ] Epoch N ≥ 1 tasks use a cloned `session_bb` seed from the post-merge
-      compiler state.
-- [ ] Per-task `session_bb`s are merged back into the compiler's `session_bb`
-      after each epoch in deterministic (alphabetical-by-path) order.
-- [ ] `BeliefBase::rebuild_paths()` called after epoch-0 merge; PathMap is
-      constructor-built and fully deterministic.
-- [ ] Ownership invariant validated on unified event stream post-merge.
-- [ ] `--jobs 1` / `NOET_JOBS=1` sequential fallback exists and is correct.
-- [ ] PathMap determinism confirmed empirically for both epoch 0 and epoch 1+.
-- [ ] Wall-clock improvement on MDN `web/javascript` corpus is measurable
-      (target: > 2× speedup on epoch 0 on a 4-core machine).
+- [ ] `BeliefAccumulator` replaces the background processor task in `main.rs`.
+- [ ] `parse` and `watch` share the same event-processing pattern: compiler
+      emits to `tx`; a live `BeliefSource` (accumulator or DB) drains and
+      answers queries.
+- [ ] Epoch 0 dispatches leaf files in parallel, gated by network-parent
+      availability in `global_bb`.
+- [ ] `BalanceCheck` is gone; `Flush` is emitted only at sub-epoch boundaries
+      by `parse_all`.
+- [ ] Wall-clock improvement on `global_objects/` corpus is measurable with
+      `--jobs 4` vs `--jobs 1`.
+- [ ] `--jobs 1` sequential fallback is correct and byte-identical.
 
 ## Risks
 
-- **PathMap ordering instability**: parallel task completion order could produce
-  non-deterministic `recursive_map` output. → **Mitigation**: `rebuild_paths()`
-  after epoch-0 merge replaces event-driven PathMap with the fully deterministic
-  constructor-built one. Epoch 1+ is order-independent by construction (stable
-  `session_bb` seed). Empirical gate (step 7) confirms both.
+- **`BeliefAccumulator` lazy drain cost**: if `try_recv` before every
+  `eval_query` adds measurable latency even when the channel is empty, switch
+  to an explicit pre-batch drain only.
+  → **Mitigation**: `try_recv` on an empty `mpsc` channel is a single atomic
+  check — negligible. Profile if it shows up.
 
-- **`session_bb` merge amplifies Issue 56 class of bugs**: if a task's
-  `session_bb` contains a stale cross-document edge, merging it propagates
-  the corruption to all subsequent epochs. → **Mitigation**: the Issue 47 fix
-  (`push_relation` home-network guard) is already in place. The ownership
-  invariant `debug_assert` (step 4) catches violations at the merge boundary
-  without requiring Issue 56's full protocol model to be complete first.
+- **Network-dir ordering edge cases**: a file that lives in a directory without
+  an `index.md` is flattened into its ancestor network by `iter_net_docs`. Its
+  sort key is computed by `sort_key_for` walking upward. If
+  `discover_network_dirs` doesn't cover this directory, the file appears in the
+  ancestor network's leaf batch — correct, since the ancestor network was
+  already parsed in its own iteration.
+  → **Mitigation**: `ProtoIndex::sort_key_for` already handles this case
+  (walk-up loop). No changes needed to `ProtoIndex`.
 
-- **`iter_net_docs` redundant scans**: N concurrent tasks parsing siblings in
-  the same network directory each call `WalkDir` on that directory during
-  `initialize_stack`. Read-only and safe; redundant work only.
-  → **Mitigation**: acceptable for now; a per-epoch directory-scan cache can
-  be added if profiling shows it matters.
+- **`Flush` sentinel race**: if `parse_all` sends `Flush` onto `tx` while a
+  parallel batch task is still sending its own events, the drain could stop at
+  `Flush` before all task events have arrived.
+  → **Mitigation**: `parse_all` sends `Flush` only after `JoinSet` / all task
+  handles have been awaited — all task `tx` sends are complete before `Flush`
+  is enqueued. MPSC ordering guarantees `Flush` arrives after all preceding
+  sends from any task that has already completed.
 
-- **File descriptor exhaustion**: bounded pool prevents EMFILE at scale.
-  → **Mitigation**: pool size capped at `--jobs N` (default `num_cpus::get()`);
-  validate on MDN corpus as part of step 6.
+- **`CachedBeliefSource` invalidation granularity**: invalidating the full
+  cache on every drain evicts entries that are still valid (e.g. the repo-root
+  ancestor chain never changes). `invalidate_for_events` would be more precise
+  but requires threading the event list through `drain()`.
+  → **Mitigation**: full invalidation is correct and cheap (cache is small —
+  tens of entries per epoch). Selective invalidation is a follow-on optimisation
+  if profiling shows it matters.
+
+- **Reparse epoch correctness under parallelism**: two files in the same reparse
+  epoch that have a latent cross-document dependency (file A's epoch-1 output
+  is needed by file B's epoch-1 parse) would produce a wrong result if
+  dispatched in parallel.
+  → **Mitigation**: the epoch invariant forbids this by definition. Epoch-N
+  files depend only on epoch 0..N-1 output, never on each other. If a violation
+  is found empirically, it indicates a bug in the dependency-promotion logic
+  (which promotes unresolved references to the *next* epoch), not in the
+  parallel dispatch.
 
 ## Open Questions
 
-- Should `NOET_JOBS` default to `num_cpus::get()` or to a fixed value for CI
-  reproducibility? Recommendation: default to `num_cpus::get()` at runtime;
-  CI can pin via `NOET_JOBS=1` if byte-identical output is required.
+- None. Architecture is settled; implementation is sequenced above.

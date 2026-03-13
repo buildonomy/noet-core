@@ -13,6 +13,46 @@ use crate::{
     },
     query::{Expression, RelationPred, ResultsPage, StatePred, DEFAULT_LIMIT},
 };
+
+// ---------------------------------------------------------------------------
+// MergeOp — typed output of to_event_stream
+// ---------------------------------------------------------------------------
+
+/// A single operation produced by [`BeliefGraph::to_event_stream`] for consumption
+/// by [`super::BeliefBase::merge_graph_mut`].
+///
+/// Using a typed enum instead of [`BeliefEvent`] lets `merge_graph_mut` apply node
+/// upserts directly via `self.states.insert` — **no TOML round-trip, no per-node
+/// `index_sync`**.  The index is marked dirty exactly once after all node ops are
+/// applied, and relation ops are then driven through `update_relation` (which uses
+/// the by-then-rebuilt index) and `process_event_queue` (which only needs
+/// `BeliefEvent` refs for the PathMapMap).
+#[derive(Debug, Clone)]
+pub enum MergeOp {
+    /// Insert or replace a node directly into `states` (lhs-wins / Trace-downgrade
+    /// semantics already applied by `to_event_stream`).
+    NodeUpsert(BeliefNode),
+    /// Add or update an edge in the relations graph.
+    RelationUpdate(Bid, Bid, WeightSet),
+}
+
+impl MergeOp {
+    /// Convert to the equivalent [`BeliefEvent`] for callers that need one (e.g.
+    /// `process_event_queue`).  Only `NodeUpsert` and `RelationUpdate` variants are
+    /// produced, so only those two conversions are needed.
+    pub fn to_belief_event(&self) -> BeliefEvent {
+        match self {
+            MergeOp::NodeUpsert(node) => BeliefEvent::NodeUpdate(
+                vec![NodeKey::Bid { bid: node.bid }],
+                node.toml(),
+                EventOrigin::Remote,
+            ),
+            MergeOp::RelationUpdate(source, sink, weight_set) => {
+                BeliefEvent::RelationUpdate(*source, *sink, weight_set.clone(), EventOrigin::Remote)
+            }
+        }
+    }
+}
 use petgraph::{
     graphmap::GraphMap,
     visit::{depth_first_search, Control, DfsEvent},
@@ -829,12 +869,26 @@ impl BeliefGraph {
     ///
     /// Sibling ordering within the event stream is not required to be correct —
     /// `process_event_queue` sorts all PathMaps at end of pass 2.
+    /// Build the ordered list of [`MergeOp`]s needed to merge `self` (rhs) into `lhs`.
+    ///
+    /// The returned ops are suitable for direct application by
+    /// [`super::BeliefBase::merge_graph_mut`]:
+    ///
+    /// * [`MergeOp::NodeUpsert`] — node already filtered by lhs-wins / Trace-downgrade;
+    ///   apply with `self.states.insert` directly, no TOML round-trip.
+    /// * [`MergeOp::RelationUpdate`] — apply via `update_relation` after all node ops
+    ///   and a single `index_dirty` flush.
+    ///
+    /// Replaces the old `to_event_stream → Vec<BeliefEvent>` signature.  The
+    /// per-node `index_sync` that the old path triggered (via `process_event →
+    /// insert_state → evaluate_expression`) is eliminated; the index is marked dirty
+    /// once after the node pass and rebuilt once before the relation pass.
     pub fn to_event_stream(
         &self,
         lhs: &BeliefBase,
         seed_bids: Option<&BTreeSet<Bid>>,
-    ) -> Vec<BeliefEvent> {
-        let mut events = Vec::new();
+    ) -> Vec<MergeOp> {
+        let mut ops = Vec::new();
 
         // ----------------------------------------------------------------
         // Compute scoped_bids first — gates both passes to prevent orphaned nodes.
@@ -934,11 +988,7 @@ impl BeliefGraph {
                 _ => true,
             };
             if should_emit {
-                events.push(BeliefEvent::NodeUpdate(
-                    vec![NodeKey::Bid { bid: node.bid }],
-                    node.toml(),
-                    EventOrigin::Remote,
-                ));
+                ops.push(MergeOp::NodeUpsert(node.clone()));
             }
         }
 
@@ -995,12 +1045,7 @@ impl BeliefGraph {
                 });
                 if let Some(weight) = full_weight {
                     section_emitted.insert((source, sink));
-                    events.push(BeliefEvent::RelationUpdate(
-                        source,
-                        sink,
-                        weight,
-                        EventOrigin::Remote,
-                    ));
+                    ops.push(MergeOp::RelationUpdate(source, sink, weight));
                 }
             }
             Control::<()>::Continue
@@ -1031,15 +1076,10 @@ impl BeliefGraph {
             if already_present {
                 continue;
             }
-            events.push(BeliefEvent::RelationUpdate(
-                source,
-                sink,
-                edge.weight.clone(),
-                EventOrigin::Remote,
-            ));
+            ops.push(MergeOp::RelationUpdate(source, sink, edge.weight.clone()));
         }
 
-        events
+        ops
     }
 }
 

@@ -29,7 +29,7 @@ use crate::{
         buildonomy_namespace, content_namespaces, href_namespace, BeliefKind, BeliefKindSet,
         BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
     },
-    query::{BeliefSource, Expression, NeighborsExpression, Query},
+    query::{BeliefSource, Expression, Query},
 };
 
 use super::{belief_ir::IntermediateRelation, UnresolvedReference};
@@ -77,6 +77,13 @@ pub struct ParseContentWithCodec {
     pub result: ParseContentResult,
     /// Owned codec instance with parsed state
     pub codec: Box<dyn DocCodec + Send>,
+    /// The repository root BID discovered during this parse (Bid::nil() if not yet resolved).
+    /// Used by the compiler to seed `self.builder.repo` after a parallel epoch-0 batch.
+    pub repo_bid: Bid,
+    /// The repository root node itself, if discovered during this parse.
+    /// Used by the compiler to seed `self.builder.session_bb` after a parallel epoch-0 batch
+    /// so that `generate_spa_shell` / `finalize_html` can find the repo node.
+    pub repo_node: Option<BeliefNode>,
 }
 
 impl ParseContentResult {
@@ -204,6 +211,14 @@ impl GraphBuilder {
 
     pub fn repo(&self) -> Bid {
         self.repo
+    }
+
+    /// Set the repository root BID. Used by the compiler after a parallel epoch-0 batch
+    /// to seed the compiler's own builder with the repo BID discovered by task-builders.
+    pub(crate) fn set_repo(&mut self, bid: Bid) {
+        if self.repo == Bid::nil() {
+            self.repo = bid;
+        }
     }
 
     pub fn doc_bb(&self) -> &BeliefBase {
@@ -586,6 +601,13 @@ impl GraphBuilder {
                 // it changes the markdown itself due to the injected context.
                 if let Some(updated_node) = codec.inject_context(proto, &ctx, &mut diagnostics)? {
                     if old_node != updated_node.toml() {
+                        tracing::trace!(
+                            "[inject_context] node changed: bid={} path={:?}\n  old={:?}\n  new={:?}",
+                            updated_node.bid,
+                            proto.path,
+                            old_node,
+                            updated_node.toml(),
+                        );
                         is_changed = true;
                         let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
@@ -648,12 +670,20 @@ impl GraphBuilder {
         )
         .await?;
 
+        let repo_node = if self.repo != Bid::nil() {
+            self.session_bb.states().get(&self.repo).cloned()
+        } else {
+            None
+        };
+
         Ok(ParseContentWithCodec {
             result: ParseContentResult {
                 rewritten_content: maybe_content,
                 diagnostics,
             },
             codec: owned_codec,
+            repo_bid: self.repo,
+            repo_node,
         })
     }
 
@@ -881,10 +911,27 @@ impl GraphBuilder {
 
             for event in &tx_events {
                 match event {
-                    BeliefEvent::NodeUpdate(_, _, _) => node_update_count += 1,
-                    BeliefEvent::NodesRemoved(nids, _) => node_removed_count += nids.len(),
-                    BeliefEvent::NodeRenamed(_, _, _) => node_renamed_count += 1,
-                    BeliefEvent::RelationChange(_, _, _, _, _) => relation_insert_count += 1,
+                    BeliefEvent::NodeUpdate(keys, _, _) => {
+                        node_update_count += 1;
+                        tracing::trace!("[terminate_stack] NodeUpdate: {:?}", keys);
+                    }
+                    BeliefEvent::NodesRemoved(nids, _) => {
+                        node_removed_count += nids.len();
+                        tracing::trace!("[terminate_stack] NodesRemoved: {:?}", nids);
+                    }
+                    BeliefEvent::NodeRenamed(from, to, _) => {
+                        node_renamed_count += 1;
+                        tracing::trace!("[terminate_stack] NodeRenamed: {} → {}", from, to);
+                    }
+                    BeliefEvent::RelationChange(source, sink, kind, _, _) => {
+                        relation_insert_count += 1;
+                        tracing::trace!(
+                            "[terminate_stack] RelationChange: {} -[{:?}]-> {}",
+                            source,
+                            kind,
+                            sink
+                        );
+                    }
                     BeliefEvent::RelationRemoved(source, sink, _) => {
                         relation_removed_count += 1;
                         // Removed relations indicate instability: a previously-known edge is
@@ -892,9 +939,27 @@ impl GraphBuilder {
                         // requiring RUST_LOG=debug.
                         tracing::warn!("[terminate_stack] RelationRemoved: {} → {}", source, sink,);
                     }
-                    BeliefEvent::RelationUpdate(_, _, _, _) => relation_update_count += 1,
-                    BeliefEvent::PathAdded(..) | BeliefEvent::PathUpdate(..) => {
-                        path_update_count += 1
+                    BeliefEvent::RelationUpdate(source, sink, _, _) => {
+                        relation_update_count += 1;
+                        tracing::trace!("[terminate_stack] RelationUpdate: {} → {}", source, sink);
+                    }
+                    BeliefEvent::PathAdded(net, path, bid, _, _) => {
+                        path_update_count += 1;
+                        tracing::trace!(
+                            "[terminate_stack] PathAdded: net={} path={:?} bid={}",
+                            net,
+                            path,
+                            bid
+                        );
+                    }
+                    BeliefEvent::PathUpdate(net, path, bid, _, _) => {
+                        path_update_count += 1;
+                        tracing::trace!(
+                            "[terminate_stack] PathUpdate: net={} path={:?} bid={}",
+                            net,
+                            path,
+                            bid
+                        );
                     }
                     BeliefEvent::PathsRemoved(net, paths, _) => {
                         path_removed_count += paths.len();
@@ -1809,11 +1874,12 @@ impl GraphBuilder {
             path: parent_rel_path.clone(),
         };
 
-        // Query the parent network in session_bb.
-        // We use cache_fetch only to confirm a StackCache hit and extract parent_bid.
+        // Query the parent network. Accept either a StackCache hit (session_bb already has
+        // the parent from a prior sibling parse in this task) or a GlobalCache hit (parallel
+        // execution: session_bb is fresh but global_bb has the parent from a prior epoch).
         // cache_fetch deliberately does NOT populate missing_structure on a StackCache hit
         // (to avoid corrupting doc_bb in Phase 2 callers). So fast_missing is populated
-        // separately via a direct session_bb.eval_query after the hit is confirmed.
+        // separately after the hit is confirmed.
         let mut _unused_missing = BeliefGraph::default();
         let fast_result = self
             .cache_fetch(
@@ -1824,20 +1890,26 @@ impl GraphBuilder {
             )
             .await?;
 
-        let parent_bid = match fast_result {
-            GetOrCreateResult::Resolved(ref node, NodeSource::StackCache) => node.bid,
+        let (parent_bid, use_global_bb) = match fast_result {
+            GetOrCreateResult::Resolved(ref node, NodeSource::StackCache) => (node.bid, false),
+            GetOrCreateResult::Resolved(ref node, NodeSource::GlobalCache) => (node.bid, true),
             _ => return Ok(None),
         };
 
-        // Populate fast_missing directly from session_bb now that we have confirmed the
-        // StackCache hit. eval_query with traverse:None calls balance(), which for a network
-        // node walks Section edges one level downstream — giving us the parent's full ancestor
-        // chain AND its child Section edges (with sort keys) in one call.
+        // Populate fast_missing from the appropriate source:
+        // - StackCache: session_bb already holds the balanced parent subgraph.
+        // - GlobalCache: session_bb is fresh (parallel task); query global_bb instead.
+        // eval_query with traverse:None calls balance(), walking Section edges one level
+        // downstream — giving the parent's full ancestor chain AND child Section edges.
         let parent_query = Query {
             seed: Expression::from(&parent_key),
             traverse: None,
         };
-        let fast_missing: BeliefGraph = self.session_bb.eval_query(&parent_query, true).await?;
+        let fast_missing: BeliefGraph = if use_global_bb {
+            global_bb.eval_query(&parent_query, true).await?
+        } else {
+            self.session_bb.eval_query(&parent_query, true).await?
+        };
 
         // Extract doc_sort_key from the parent's Section edge to the entry doc.
         //
@@ -1917,30 +1989,67 @@ impl GraphBuilder {
         self.session_bb.merge_from(&fast_missing, &parent_seed);
         self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
 
-        // If the entry doc was already parsed in this session (reparse case), also fetch its
-        // downstream section children into session_bb so Phase 1 reuses existing section BIDs
-        // rather than generating fresh timestamp-based ones.
+        // Pre-populate session_bb with the entry doc and its section children so that Phase 1
+        // push() finds them via StackCache and reuses persisted BIDs rather than generating
+        // fresh timestamp-based ones.
+        //
+        // Strategy:
+        //   1. fast_missing (from the parent-network eval_query above) already contains the
+        //      entry doc as a Trace node — its BID comes from the DB/session_bb neighbor fetch
+        //      of the parent's Section edges.  Merge it into session_bb first.
+        //   2. Then query global_bb for the entry doc's full neighborhood by BID (not by
+        //      NodeKey::Path, which fails for DB because paths are stored net-relative under
+        //      the sub-network's bref, not repo-relative under repo.bref).
+        //   3. session_bb.get(&entry_key) is the fast path for same-compiler reparses where
+        //      terminate_stack already wrote the full neighborhood in.
+
         let entry_key = NodeKey::Path {
             net: self.repo.bref(),
             path: entry_rel_path.clone(),
         };
-        if self.session_bb.get(&entry_key).is_some() {
-            let downstream_query = Query {
+
+        // Step 1: find the entry doc's BID from fast_missing (it's a Trace node — the parent
+        // network's balanced neighborhood includes its Section-edge sources as Trace nodes).
+        // Also covers same-compiler reparses where session_bb already has it fully resolved.
+        let entry_bid_from_fast: Option<Bid> = {
+            let fast_bb = BeliefBase::from(fast_missing.clone());
+            fast_bb
+                .get(&entry_key)
+                .map(|n| n.bid)
+                .or_else(|| self.session_bb.get(&entry_key).map(|n| n.bid))
+        };
+
+        let children_graph = if self.session_bb.get(&entry_key).is_some() {
+            // Same-compiler reparse: session_bb already has the full neighborhood from
+            // a prior terminate_stack.  Query session_bb directly — no round-trip needed.
+            let q = Query {
                 seed: Expression::from(&entry_key),
-                traverse: Some(NeighborsExpression {
-                    filter: Some(WeightKind::Section.into()),
-                    upstream: 0,
-                    downstream: 1,
-                }),
+                traverse: None,
             };
-            let downstream_graph = self.session_bb.eval_query(&downstream_query, true).await?;
-            if !downstream_graph.states.is_empty() {
-                // Seed from the entry doc's BID — bounds DFS to section children reachable
-                // from this doc in downstream_graph, not all of session_bb.
-                if let Some(entry_node) = self.session_bb.get(&entry_key) {
-                    let entry_seed: BTreeSet<Bid> = BTreeSet::from([entry_node.bid]);
-                    self.session_bb.merge_from(&downstream_graph, &entry_seed);
-                }
+            self.session_bb.eval_query(&q, true).await?
+        } else if let Some(entry_bid) = entry_bid_from_fast {
+            // First parse of this doc in the current session (or fresh session_bb from a
+            // parallel task / DB-backed second compiler).  We have the BID from fast_missing.
+            // Query global_bb by BID — works for both BeliefBase and DbConnection because
+            // BID lookups are direct regardless of path encoding.
+            let bid_query = Query {
+                seed: Expression::StateIn(crate::query::StatePred::Bid(vec![entry_bid])),
+                traverse: None,
+            };
+            global_bb.eval_query(&bid_query, true).await?
+        } else {
+            BeliefGraph::default()
+        };
+
+        if !children_graph.states.is_empty() {
+            // Seed from the entry doc's BID — bounds DFS to the entry's immediate neighborhood,
+            // not all of session_bb.
+            if let Some(entry_bid) =
+                entry_bid_from_fast.or_else(|| self.session_bb.get(&entry_key).map(|n| n.bid))
+            {
+                let entry_seed: BTreeSet<Bid> = BTreeSet::from([entry_bid]);
+                self.session_bb.merge_from(&children_graph, &entry_seed);
+                self.session_bb.process_event(&BeliefEvent::BalanceCheck)?;
             }
         }
 

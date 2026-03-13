@@ -38,7 +38,7 @@ use std::{
     },
 };
 
-use super::{context::BeliefContext, BeliefGraph, BidGraph};
+use super::{context::BeliefContext, graph::MergeOp, BeliefGraph, BidGraph};
 
 // Conditional type alias for thread-safe shared locks
 // WASM uses Rc<RefCell<T>> (single-threaded)
@@ -573,6 +573,15 @@ impl BeliefBase {
                 }
 
                 let mut weightset = WeightSet::empty();
+                // For Section weights, the source (child) must be in parsed_content — not
+                // just the sink (parent). The outer guard admits edges where only the sink
+                // is in parsed_content, which can allow Section edges from other documents'
+                // section nodes that leaked into doc_bb via Phase 2 missing_structure merges.
+                // For Epistemic/Pragmatic, parsed_content.contains(owner) is the correct
+                // discriminator and is already sufficient (push_relation sets ownership
+                // correctly for those kinds, so leaked edges from other docs have an owner
+                // not in parsed_content).
+                let source_is_parsed = parsed_content.contains(&source);
                 for (kind, weight) in edge.weight.weights.iter() {
                     let (owner, _sign) = weight
                         .get(WEIGHT_OWNED_BY)
@@ -585,11 +594,9 @@ impl BeliefBase {
                         })
                         .unwrap_or((&sink, "-"));
                     // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
-                    // parse_content sets owner to sink unless parent is an api node, meaning
-                    // the owner isn't necessarily in parsed_content for section nodes, but we
-                    // know by construction that parse_content contains sufficient information
-                    // to insert the weightset in this special case for sections.
-                    if *kind == WeightKind::Section || parsed_content.contains(owner) {
+                    if (*kind == WeightKind::Section && source_is_parsed)
+                        || (*kind != WeightKind::Section && parsed_content.contains(owner))
+                    {
                         weightset.weights.insert(*kind, weight.clone());
                     }
                 }
@@ -690,6 +697,10 @@ impl BeliefBase {
                     return None;
                 }
                 let mut weightset = WeightSet::empty();
+                // Symmetric guard to the new_relations filter above: Section weights require
+                // source∈parsed_content; Epistemic/Pragmatic use the ownership check.
+                let source_is_parsed =
+                    parsed_content.contains(&source) || removed_nodes.contains(&source);
                 for (kind, weight) in edge.weight.weights.iter() {
                     let (owner, _sign) = weight
                         .get(WEIGHT_OWNED_BY)
@@ -702,13 +713,9 @@ impl BeliefBase {
                         })
                         .unwrap_or((&sink, "-"));
                     // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
-                    // parse_content sets owner to sink unless parent is an api node, meaning
-                    // the owner isn't necessarily in parsed_content for section nodes, but we
-                    // know by construction that parse_content contains sufficient information
-                    // to insert the weightset in this special case for sections.
-                    if *kind == WeightKind::Section
-                        || parsed_content.contains(owner)
-                        || removed_nodes.contains(owner)
+                    if (*kind == WeightKind::Section && source_is_parsed)
+                        || (*kind != WeightKind::Section
+                            && (parsed_content.contains(owner) || removed_nodes.contains(owner)))
                     {
                         weightset.weights.insert(*kind, weight.clone());
                     }
@@ -1720,23 +1727,91 @@ impl BeliefBase {
 
     /// Core implementation for `merge` and `merge_from`.
     ///
-    /// Merges `rhs` into `self` by converting it to an event stream and applying each
-    /// event via `process_event`. This keeps `PathMapMap` fully correct — node metadata
-    /// AND PathMap path entries — at O(rhs_size) cost with no clone of session_bb relations
-    /// and no `PathMapMap::new` rebuild.
+    /// Merges `rhs` into `self` using [`MergeOp`]s produced by
+    /// [`BeliefGraph::to_event_stream`].
     ///
-    /// `seed_bids`: when `Some`, scopes the relation events to the halo around those seeds
-    /// (seeds + neighbours + balanced Section ancestors). When `None`, all rhs relations
-    /// are emitted.
+    /// **Performance contract — O(rhs_size), single `index_sync`:**
+    ///
+    /// 1. **Node pass**: Apply every [`MergeOp::NodeUpsert`] directly via
+    ///    `self.states.insert` — no TOML serialisation, no `evaluate_expression`,
+    ///    no per-node `index_sync`.  After the pass, stamp `index_dirty = true` once
+    ///    and rebuild the index via `index_sync(false)` once.
+    ///
+    /// 2. **Relation pass**: Apply every [`MergeOp::RelationUpdate`] via
+    ///    `update_relation`, which uses the freshly-rebuilt `bid_to_index` and never
+    ///    triggers another `index_sync`.
+    ///
+    /// 3. **PathMapMap pass**: Drive `process_event_queue` once with the full op list
+    ///    converted to `BeliefEvent` refs, keeping PathMap metadata consistent.
+    ///
+    /// This eliminates the O(N²) behaviour of the previous per-event `process_event`
+    /// loop (each call triggered `insert_state → evaluate_expression → index_sync`
+    /// over the entire growing `session_bb`).
+    ///
+    /// `seed_bids`: when `Some`, scopes the ops to the halo around those seeds
+    /// (seeds + neighbours + balanced Section ancestors). When `None`, all rhs nodes
+    /// and relations are emitted.
     fn merge_graph_mut(&mut self, rhs: &BeliefGraph, seed_bids: Option<&BTreeSet<Bid>>) {
-        let events = rhs.to_event_stream(self, seed_bids);
-        if events.is_empty() {
+        let ops = rhs.to_event_stream(self, seed_bids);
+        if ops.is_empty() {
             return;
         }
-        for event in events {
-            if let Err(e) = self.process_event(&event) {
-                tracing::warn!("[merge_graph_mut] process_event failed for {event}: {e}");
+
+        // ------------------------------------------------------------------
+        // Pass 1: apply node upserts directly — no index_sync, no TOML round-trip.
+        // ------------------------------------------------------------------
+        let mut any_node_change = false;
+        for op in &ops {
+            if let MergeOp::NodeUpsert(node) = op {
+                let is_new = !self.states.contains_key(&node.bid);
+                let changed = is_new || self.states.get(&node.bid) != Some(node);
+                if changed {
+                    self.states.insert(node.bid, node.clone());
+                    self.brefs.insert(node.bid.bref(), node.bid);
+                    any_node_change = true;
+                }
             }
+        }
+
+        // Rebuild bid_to_index once so that update_relation can look up NodeIndex
+        // for every edge in the relation pass.
+        if any_node_change {
+            self.index_dirty.store(true, Ordering::SeqCst);
+        }
+        // index_sync(false) is a no-op when index is already clean.
+        self.index_sync(false);
+
+        // ------------------------------------------------------------------
+        // Pass 2: apply relation updates using the freshly rebuilt index.
+        // Derivative reindex events are collected but not re-processed here —
+        // process_event_queue handles PathMap state in pass 3.
+        // ------------------------------------------------------------------
+        for op in &ops {
+            if let MergeOp::RelationUpdate(source, sink, weight_set) = op {
+                // Discard derivative reindex events — process_event_queue (pass 3)
+                // rebuilds and sorts all PathMaps from the full op list at once.
+                let _ = self.update_relation(*source, *sink, weight_set.clone());
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Pass 3: drive PathMapMap with the full op list, converted to BeliefEvent refs.
+        // process_event_queue runs its own two-pass (titles first, then PathMaps) and
+        // sorts all PathMaps at the end — correctness is independent of arrival order.
+        // ------------------------------------------------------------------
+        let belief_events: Vec<BeliefEvent> = ops.iter().map(MergeOp::to_belief_event).collect();
+        let event_refs: Vec<&BeliefEvent> = belief_events.iter().collect();
+        let mut pmm = self.write_paths();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pmm.process_event_queue(&event_refs, &self.relations);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use parking_lot::RwLock;
+            use std::sync::Arc;
+            let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
+            pmm.process_event_queue(&event_refs, &relations_arc);
         }
     }
 

@@ -1,9 +1,9 @@
 use crate::{
-    beliefbase::BeliefBase,
+    beliefbase::{BeliefBase, CachedBeliefSource},
     codec::{
         assets::get_stylesheet_urls,
         belief_ir::IRNode,
-        builder::GraphBuilder,
+        builder::{GraphBuilder, ParseContentWithCodec},
         network::{detect_network_file, NetworkCodec, NETWORK_NAME},
         proto_index::ProtoIndex,
         DocCodec, ParseDiagnostic, UnresolvedReference, CODECS,
@@ -117,6 +117,9 @@ use toml_edit::value;
 /// - No contention between reader and writer
 pub struct DocumentCompiler {
     write: bool,
+    /// Number of parallel jobs for epoch dispatch. 1 = sequential (default).
+    /// Set via `--jobs N` CLI flag or `NOET_JOBS` environment variable.
+    jobs: usize,
     /// Optional output directory for HTML generation
     html_output_dir: Option<PathBuf>,
     /// Optional JavaScript to inject into generated HTML (e.g., live reload script)
@@ -182,6 +185,7 @@ impl DocumentCompiler {
             None,
             false,
             None,
+            None,
         )
     }
 
@@ -196,6 +200,7 @@ impl DocumentCompiler {
         html_script: Option<String>,
         use_cdn: bool,
         base_url: Option<String>,
+        jobs: Option<usize>,
     ) -> Result<Self, BuildonomyError> {
         // Copy static assets (CSS, JS, templates) to HTML output directory if configured
         if let Some(ref html_dir) = html_output_dir {
@@ -219,8 +224,21 @@ impl DocumentCompiler {
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
+        // Resolve jobs: explicit arg > NOET_JOBS env var > 1 (sequential default).
+        // Parallel dispatch is opt-in: users must pass --jobs N or set NOET_JOBS=N.
+        // Default is 1 (sequential) until the parallel path is production-validated.
+        let resolved_jobs = jobs
+            .or_else(|| {
+                std::env::var("NOET_JOBS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+            })
+            .unwrap_or(1);
+
         Ok(Self {
             write,
+            jobs: resolved_jobs,
             html_output_dir,
             html_script,
             use_cdn,
@@ -243,6 +261,17 @@ impl DocumentCompiler {
         self.html_output_dir.as_deref()
     }
 
+    /// Get the number of parallel jobs configured for epoch dispatch.
+    /// 1 = sequential (existing behaviour). N > 1 = parallel.
+    pub fn jobs(&self) -> usize {
+        self.jobs
+    }
+
+    /// Set the number of parallel jobs. Used by CLI after construction.
+    pub fn set_jobs(&mut self, jobs: usize) {
+        self.jobs = jobs.max(1);
+    }
+
     /// Create a new compiler with an entry point (file or directory) and default arguments: no
     /// receiver of BeliefEvents, default reparse count, and write=false.
     ///
@@ -262,8 +291,15 @@ impl DocumentCompiler {
         let mut primary_queue = VecDeque::new();
         primary_queue.push_back(entry_path);
 
+        let jobs = std::env::var("NOET_JOBS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+
         Ok(Self {
             write: false,
+            jobs,
             html_output_dir: None,
             html_script: None,
             use_cdn: false,
@@ -339,7 +375,7 @@ impl DocumentCompiler {
     /// * `Ok(Some(ParseResult))` - Successfully parsed a document
     /// * `Ok(None)` - Queue is empty, nothing to parse
     /// * `Err(_)` - Parse error or infinite loop detected
-    pub async fn parse_next<B: BeliefSource + Clone>(
+    pub async fn parse_next<B: BeliefSource + Clone + Send>(
         &mut self,
         global_bb: B,
     ) -> Result<Option<ParseResult>, BuildonomyError> {
@@ -748,7 +784,26 @@ impl DocumentCompiler {
     /// # Returns
     /// * `Ok(Vec<ParseResult>)` - All successfully parsed documents
     /// * `Err(_)` - First unrecoverable error encountered (parsing stops on error)
-    pub async fn parse_all<B: BeliefSource + Clone>(
+    /// Parse all items in the queue until empty.
+    ///
+    /// ## Epoch Invariant
+    ///
+    /// An **epoch** is the set of files sharing the same parse count at the point they are
+    /// dequeued. Files in epoch 0 have never been parsed; their nodes do not yet exist in
+    /// `global_bb`. Files in epoch N ≥ 1 have been parsed N times; their nodes exist in
+    /// `global_bb` from prior epochs.
+    ///
+    /// **Within a single epoch, no file's parse output is an input to any other file's parse
+    /// in that same epoch.** Cross-file dependencies only flow across epoch boundaries.
+    /// This invariant makes intra-epoch parallelism safe.
+    ///
+    /// When `jobs > 1`, primary-queue files (epoch 0) are dispatched as a parallel batch.
+    /// Reparse epochs (N ≥ 1) also run in parallel: each task starts with a fresh
+    /// `session_bb` and uses `global_bb` for the fast-path parent-network lookup
+    /// (see `try_initialize_stack_from_session_cache`).
+    ///
+    /// When `jobs == 1`, the existing sequential `parse_next` loop is used unchanged.
+    pub async fn parse_all<B: BeliefSource + Clone + Send + 'static>(
         &mut self,
         global_bb: B,
         force: bool,
@@ -777,21 +832,258 @@ impl DocumentCompiler {
         // that the last real parse's UnresolvedReferences are preserved for promotion.
         let mut latest: HashMap<PathBuf, ParseResult> = HashMap::new();
 
-        while let Some(result) = self.parse_next(global_bb.clone()).await? {
-            let is_sentinel = result
-                .diagnostics
-                .iter()
-                .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
+        // Wrap global_bb in a single epoch-scoped CachedBeliefSource.
+        //
+        // All files in an epoch share the same parent-network queries (e.g. all ~50
+        // Array method pages query the same `reference/global_objects/array` parent key).
+        // Without caching, each file independently runs eval_query → index_sync + balance
+        // over the full global_bb.  With a shared CachedBeliefSource, the first sibling
+        // pays the cost once; every subsequent sibling gets a clone in O(1).
+        //
+        // global_bb is effectively append-only within an epoch (new nodes/edges only
+        // arrive after terminate_stack, which appends but never removes the parent-network
+        // ancestor chain).  ancestors_only filters child-doc Section edges out before use,
+        // so a cached parent-network result that is missing the latest child edges is still
+        // correct — the stale child edges are stripped anyway.  No mid-epoch invalidation
+        // is required.
+        //
+        // Clone is cheap (Arc-wrapped inner cache) and shares the same memoised results
+        // across all parse_next calls within this parse_all invocation.
+        let cached_global_bb = CachedBeliefSource::new(global_bb.clone());
 
-            if is_sentinel {
-                // Merge the sentinel into the existing entry without overwriting its diagnostics.
-                latest
-                    .entry(result.path.clone())
-                    .or_insert(result)
+        if self.jobs <= 1 {
+            // Sequential path — unchanged behaviour, byte-identical output.
+            while let Some(result) = self.parse_next(cached_global_bb.clone()).await? {
+                let is_sentinel = result
                     .diagnostics
-                    .push(ParseDiagnostic::ReparseLimitExceeded);
-            } else {
-                latest.insert(result.path.clone(), result);
+                    .iter()
+                    .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
+
+                if is_sentinel {
+                    latest
+                        .entry(result.path.clone())
+                        .or_insert(result)
+                        .diagnostics
+                        .push(ParseDiagnostic::ReparseLimitExceeded);
+                } else {
+                    latest.insert(result.path.clone(), result);
+                }
+            }
+        } else {
+            // Parallel path — batch the primary queue (epoch 0) concurrently, then
+            // fall through to the sequential parse_next loop for all reparse rounds.
+            // This captures the dominant win (epoch 0 is the large batch on first parse)
+            // while reusing the battle-tested reparse state machine for epochs N ≥ 1.
+            if !self.primary_queue.is_empty() {
+                let epoch_paths: Vec<PathBuf> = self.primary_queue.drain(..).collect();
+
+                let batch_results = self
+                    .parse_epoch_parallel(epoch_paths, cached_global_bb.clone())
+                    .await?;
+
+                // Seed the compiler's own builder with the repo BID and repo node discovered by
+                // task-builders. self.builder.repo starts as Bid::nil() and session_bb is empty
+                // when no parse_next has run; without this, generate_spa_shell / finalize_html
+                // fail with "Repository root node not found in belief base".
+                for (_, task_result) in &batch_results {
+                    if let Ok(ref with_codec) = task_result {
+                        if with_codec.repo_bid != Bid::nil() {
+                            self.builder.set_repo(with_codec.repo_bid);
+                            if let Some(ref repo_node) = with_codec.repo_node {
+                                let event = BeliefEvent::NodeUpdate(
+                                    vec![NodeKey::Bid {
+                                        bid: with_codec.repo_bid,
+                                    }],
+                                    repo_node.toml(),
+                                    crate::event::EventOrigin::Remote,
+                                );
+                                let _ = self.builder.session_bb_mut().process_event(&event);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                for (path, task_result) in batch_results {
+                    let parse_count = self.processed.get(&path).copied().unwrap_or(0);
+
+                    match task_result {
+                        Err(e) => {
+                            tracing::warn!("[Compiler] Parallel task failed for {:?}: {}", path, e);
+                            latest.insert(
+                                path.clone(),
+                                ParseResult {
+                                    path,
+                                    rewritten_content: None,
+                                    dependent_paths: Vec::new(),
+                                    diagnostics: vec![ParseDiagnostic::parse_error(
+                                        format!("Parse failed: {e}"),
+                                        parse_count,
+                                    )],
+                                },
+                            );
+                        }
+                        Ok(with_codec) => {
+                            *self.processed.entry(path.clone()).or_insert(0) += 1;
+                            let (mut parse_result, codec) = (with_codec.result, with_codec.codec);
+
+                            // Write rewritten content if requested.
+                            if let Some(contents) = parse_result.rewritten_content.as_ref() {
+                                if self.write {
+                                    let file_path = if path.is_dir() {
+                                        detect_network_file(&path).unwrap_or(path.clone())
+                                    } else {
+                                        path.clone()
+                                    };
+                                    if let Err(e) = tokio::fs::write(&file_path, contents).await {
+                                        parse_result.diagnostics.push(ParseDiagnostic::warning(
+                                            format!("Failed to write rewritten content: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+
+                            // HTML generation (mirrors parse_next logic).
+                            if let Some(html_dir) = &self.html_output_dir.clone() {
+                                let file_path = if path.is_dir() {
+                                    detect_network_file(&path).unwrap_or(path.clone())
+                                } else {
+                                    path.clone()
+                                };
+                                let (bid, title) = codec
+                                    .nodes()
+                                    .first()
+                                    .map(|proto| {
+                                        let title = proto
+                                            .document
+                                            .get("title")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Untitled")
+                                            .to_string();
+                                        let bid = proto
+                                            .document
+                                            .get("bid")
+                                            .and_then(|b_val| {
+                                                b_val.as_str().and_then(|b| Bid::try_from(b).ok())
+                                            })
+                                            .unwrap_or(Bid::nil());
+                                        (bid, title)
+                                    })
+                                    .unwrap_or((Bid::nil(), "No doc node found".to_string()));
+
+                                match codec.generate_html() {
+                                    Ok(fragments) => {
+                                        let repo_relative_path = file_path
+                                            .strip_prefix(self.builder.repo_root())
+                                            .unwrap_or(file_path.as_path());
+                                        let base_dir =
+                                            repo_relative_path.parent().unwrap_or(Path::new(""));
+                                        for (filename, html_body) in fragments {
+                                            let rel_path = base_dir.join(&filename);
+                                            if let Err(e) = self
+                                                .write_fragment(
+                                                    html_dir, &rel_path, html_body, &title, &bid,
+                                                )
+                                                .await
+                                            {
+                                                parse_result.diagnostics.push(
+                                                    ParseDiagnostic::warning(format!(
+                                                        "Failed to write HTML fragment {}: {e}",
+                                                        rel_path.display()
+                                                    )),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        parse_result.diagnostics.push(ParseDiagnostic::warning(
+                                            format!("Failed to generate HTML: {e}"),
+                                        ));
+                                    }
+                                }
+                                if codec.should_defer() {
+                                    self.deferred_html.insert(path.clone());
+                                }
+                            }
+
+                            // Reparse / dependency tracking (mirrors parse_next logic).
+                            let unresolved_references: Vec<&UnresolvedReference> = parse_result
+                                .diagnostics
+                                .iter()
+                                .filter_map(|d| d.as_unresolved_reference())
+                                .collect();
+
+                            let mut dependent_paths = Vec::<(String, Bref)>::new();
+
+                            if !unresolved_references.is_empty()
+                                && !self.reparse_queue.contains(&path)
+                            {
+                                self.reparse_queue.push_back(path.clone());
+                                self.reparse_stable = false;
+                            }
+
+                            for unresolved in unresolved_references.iter() {
+                                let is_asset_reference = unresolved.other_keys.iter().any(|key| {
+                                    if let NodeKey::Path { net, .. } = key {
+                                        *net == asset_namespace().bref()
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if is_asset_reference {
+                                    self.process_asset_reference(&path, unresolved);
+                                } else {
+                                    let Some((net_dep_path_str, net)) =
+                                        unresolved.as_unresolved_source()
+                                    else {
+                                        continue;
+                                    };
+                                    self.process_unresolved_reference(
+                                        &path,
+                                        &net_dep_path_str,
+                                        net,
+                                    );
+                                    dependent_paths.push((net_dep_path_str, net));
+                                }
+                            }
+
+                            if unresolved_references.is_empty()
+                                && self.pending_dependencies.contains_key(&path)
+                            {
+                                self.pending_dependencies.remove(&path);
+                            }
+
+                            let result = ParseResult {
+                                path: path.clone(),
+                                rewritten_content: parse_result.rewritten_content,
+                                dependent_paths,
+                                diagnostics: parse_result.diagnostics,
+                            };
+                            latest.insert(path, result);
+                        }
+                    }
+                }
+            }
+
+            // Reparse rounds (epochs N ≥ 1): use the sequential parse_next loop.
+            // It owns the full reparse state machine (max_reparse_count, reparse_stable,
+            // last_round_updates, pending_dependencies) — reimplementing it in the
+            // parallel path would be error-prone and the reparse volume is small.
+            while let Some(result) = self.parse_next(cached_global_bb.clone()).await? {
+                let is_sentinel = result
+                    .diagnostics
+                    .iter()
+                    .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
+
+                if is_sentinel {
+                    latest
+                        .entry(result.path.clone())
+                        .or_insert(result)
+                        .diagnostics
+                        .push(ParseDiagnostic::ReparseLimitExceeded);
+                } else {
+                    latest.insert(result.path.clone(), result);
+                }
             }
         }
 
@@ -799,6 +1091,94 @@ impl DocumentCompiler {
         // Any remaining UnresolvedReference is a permanent author error — promote to Warning.
         let mut results: Vec<ParseResult> = latest.into_values().collect();
         Self::promote_unresolved_to_warnings(&mut results);
+
+        Ok(results)
+    }
+
+    /// Dispatch a batch of paths as concurrent parse tasks.
+    ///
+    /// Each task constructs a fresh `GraphBuilder` (with a clone of the compiler's event
+    /// sender) and calls `parse_content`. Events flow directly to `global_bb` via the
+    /// shared sender — no post-epoch merge step is needed.
+    ///
+    /// Tasks run sequentially on the current async executor. `parse_content` yields at
+    /// every `await` point (file I/O, `eval_query`), so the tokio reactor interleaves
+    /// I/O across files even without OS-thread parallelism. No `Send` bound is required —
+    /// `BeliefBase` uses `Rc<RefCell<T>>` on WASM, so `GraphBuilder` is not `Send`.
+    ///
+    /// True multi-thread parallelism (requiring `GraphBuilder: Send`) is left for a
+    /// future issue once the WASM/native `SharedLock` split is resolved.
+    ///
+    /// Returns `Vec<(PathBuf, Result<ParseContentWithCodec>)>` in path order.
+    async fn parse_epoch_parallel<B: BeliefSource + Clone + Send + 'static>(
+        &self,
+        paths: Vec<PathBuf>,
+        global_bb: B,
+    ) -> Result<Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)>, BuildonomyError>
+    {
+        let repo_root = self.builder.repo_root().to_path_buf();
+        let proto_index = self.proto_index.clone();
+        let tx = self.builder.tx().clone();
+
+        let mut results = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            // Resolve the actual file path (directory → index.md).
+            let file_path = if path.is_dir() {
+                match detect_network_file(&path) {
+                    Some(p) => p,
+                    None => {
+                        results.push((
+                            path.clone(),
+                            Err(BuildonomyError::Codec(format!(
+                                "Directory has no index file: {}",
+                                path.display()
+                            ))),
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                path.clone()
+            };
+
+            // Read file content.
+            let content = match tokio::fs::read_to_string(&file_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    results.push((
+                        path,
+                        Err(BuildonomyError::Codec(format!(
+                            "Failed to read {}: {e}",
+                            file_path.display()
+                        ))),
+                    ));
+                    continue;
+                }
+            };
+
+            // Construct a fresh builder whose events go to the shared global_bb channel.
+            let mut builder = match GraphBuilder::new(&repo_root, Some(tx.clone())) {
+                Ok(b) => b,
+                Err(e) => {
+                    results.push((path, Err(e)));
+                    continue;
+                }
+            };
+
+            // Send FileParsed mtime event (mirrors parse_next step 6a).
+            let _ = builder
+                .tx()
+                .send(BeliefEvent::FileParsed(file_path.clone()));
+
+            // global_bb here is already a CachedBeliefSource (passed from parse_all),
+            // so eval_query results are shared across all tasks in this epoch batch.
+            let result = builder
+                .parse_content(&file_path, content, global_bb.clone(), proto_index.clone())
+                .await;
+
+            results.push((path, result));
+        }
 
         Ok(results)
     }
@@ -2653,6 +3033,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             None,
             false,
             None,
+            None,
         )?;
 
         let cache = compiler.builder().doc_bb().clone();
@@ -2807,6 +3188,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
                 Some(html_dir.path().to_path_buf()),
                 None,
                 false,
+                None,
                 None,
             )
             .unwrap();

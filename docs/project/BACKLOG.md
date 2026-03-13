@@ -351,6 +351,52 @@ entry or it doesn't.
 
 **Status**: Design complete. Blocked on nothing. Low implementation risk.
 
+## Flattened Subnet Cache for `resolve_net_path` (from Issue 57)
+
+**Priority**: LOW
+**Context**: `DbConnection::resolve_net_path` currently resolves cross-network paths by
+recursing one SQL hop per path segment (e.g. `"subnet/file.md"` → look up `"subnet"` under
+`net`, then look up `"file.md"` under the returned sub-net BID). This is correct and
+consistent by construction, but does O(depth) queries.
+
+### Proposed Optimization
+
+Maintain a flattened `subnets` table:
+
+```sql
+CREATE TABLE subnets (net TEXT, subnet_path TEXT, subnet_bid TEXT)
+```
+
+- `net`: the root network BID this row belongs to
+- `subnet_path`: the full path from `net` to the sub-network (e.g. `"a/b"` for a net
+  nested two levels deep)
+- `subnet_bid`: the BID of the sub-network node at that path
+
+**Read path**: `resolve_net_path(net, path)` does a single
+`SELECT * FROM subnets WHERE net = ?`, processes all rows in Rust, finds the
+longest `subnet_path` that is a prefix of `path`, then resolves the remainder
+against `subnet_bid`. One SQL query regardless of nesting depth.
+
+**Write path**: On a `NodeUpdate` event, if `node.kind.is_network()`, insert
+flattened ancestry rows. For a new net `N` at path `p` under parent `P`:
+  1. Insert `(net=P, subnet_path=p, subnet_bid=N)`.
+  2. Find all existing rows where `subnet_bid = P` (i.e. `P` is itself a sub-net of
+     some ancestor `A` at path `q`), and insert `(net=A, subnet_path=q/p, subnet_bid=N)`.
+  This is a SELECT + batch INSERT, not recursive SQL.
+
+On `NodeRemoved`, delete all rows where `subnet_bid = N` and all rows where
+`subnet_path` starts with the removed path prefix (cascading descendants).
+
+**Consistency**: updates should be in the same DB transaction as the path event
+write, so there is no consistency window.
+
+### When to Implement
+
+Profile first. Typical repo subnet depth is 2-4 levels; the current recursive
+approach does 2-4 queries and is unlikely to be a bottleneck. Implement this
+only if `resolve_net_path` shows up in profiling for large repos with deep or
+wide subnet hierarchies.
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

@@ -812,6 +812,7 @@ impl FileUpdateSyncer {
                 html_script,
                 use_cdn,
                 base_url,
+                None,
             )?
         } else {
             DocumentCompiler::new(

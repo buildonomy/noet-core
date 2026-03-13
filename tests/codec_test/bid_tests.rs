@@ -167,6 +167,10 @@ async fn test_belief_set_builder_bid_generation_and_caching(
     Ok(())
 }
 
+// Verifies cache stability with DbConnection as global_bb across two sequential parses.
+// The second parse must produce identical BIDs (no rewritten_content) and zero
+// graph-modifying events.  Requires DbConnection::resolve_net_path (landed Session 8)
+// to correctly handle repo-relative NetPath queries like "subnet/file.md".
 #[test(tokio::test)]
 async fn test_belief_set_builder_with_db_cache() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Testing cache stability with DbConnection (Issue 34)");
