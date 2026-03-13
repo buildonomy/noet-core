@@ -339,21 +339,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                use noet_core::beliefbase::BeliefBase;
+                use noet_core::beliefbase::{BeliefAccumulator, BeliefBase};
                 use noet_core::event::BeliefEvent;
                 use tokio::sync::mpsc::unbounded_channel;
 
-                // Create event channel for belief events
-                let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
+                // Create event channel for belief events.
+                let (tx, rx) = unbounded_channel::<BeliefEvent>();
 
-                // Start event processor in background task
-                let mut global_bb = BeliefBase::empty();
-                let processor = tokio::spawn(async move {
-                    while let Some(event) = rx.recv().await {
-                        let _ = global_bb.process_event(&event);
-                    }
-                    global_bb // Return processed BeliefBase when channel closes
-                });
+                // `BeliefAccumulator` replaces the old `tokio::spawn` background processor.
+                // It owns the channel receiver and the in-memory belief store, drains events
+                // lazily before each query, and caches `eval_query` results between `BatchEnd`
+                // boundaries (previously `CachedBeliefSource`).
+                let accumulator = BeliefAccumulator::new(BeliefBase::empty(), rx);
+
+                // `query_handle()` is a cheap, clonable view backed by the same
+                // `Arc<Mutex<AccInner>>` and `Arc<AccCache>`.  Pass this to `parse_all`
+                // so parallel tasks can call `eval_query` without exclusive channel access.
+                let global_bb = accumulator.query_handle();
 
                 // Create compiler with event transmitter
                 let mut compiler = if let Some(ref html_dir) = html_output {
@@ -377,24 +379,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     c
                 };
 
-                // Parse all documents (events sent to processor)
-                let cache = compiler.builder().doc_bb().clone();
-                let parse_results = compiler.parse_all(cache, force).await?;
+                // Parse all documents.  Events travel over `tx` into the accumulator.
+                // `global_bb` is a `QueryHandle` that shares the accumulator's
+                // `Arc<Mutex<AccInner>>`; each `BeliefSource` call on the handle locks
+                // `AccInner` and consults `inner` through the shared cache.
+                let parse_results = compiler.parse_all(global_bb, force).await?;
 
                 // Get stats
                 let stats = compiler.stats();
 
-                // Close tx to signal event processor
+                // Close tx so the accumulator's channel is disconnected.
+                // All epoch boundaries are signalled via BatchStart/BatchEnd on the
+                // channel; closing tx is sufficient — no out-of-band drain needed.
                 compiler.builder_mut().close_tx();
 
-                // Wait for event processor to finish (drains all events)
-                let final_bb = processor.await.map_err(|e| {
-                    noet_core::BuildonomyError::Custom(format!("Event processor failed: {}", e))
+                // Extract the fully-populated BeliefBase for post-parse operations.
+                let final_bb = accumulator.into_inner().await.map_err(|e| {
+                    noet_core::BuildonomyError::Custom(format!(
+                        "BeliefAccumulator::into_inner failed: {}",
+                        e
+                    ))
                 })?;
 
-                // Finalize HTML generation with synchronized BeliefBase
-                // Note: finalize() was already called during parse_all (with empty global_bb)
-                // Now call finalize_html with synchronized final_bb for remaining tasks
+                // Finalize HTML generation with the synchronized BeliefBase.
                 let finalize_diagnostics = if html_output.is_some() {
                     compiler.finalize_html(&final_bb).await?
                 } else {

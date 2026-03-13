@@ -203,6 +203,20 @@ impl ProtoIndex {
         dirs
     }
 
+    /// Returns all known network directories, sorted shallowest-first (by component count,
+    /// then lexicographically).
+    ///
+    /// This is the same order as [`discover_network_dirs`](Self::discover_network_dirs) but
+    /// reads from the already-built index rather than performing a new filesystem scan.
+    ///
+    /// Use this in `parse_all` to iterate epoch-0 batches in the correct network order
+    /// without redundant `WalkDir` calls.
+    pub fn network_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.inner.read().keys().cloned().collect();
+        dirs.sort_by(|a, b| a.components().cmp(b.components()));
+        dirs
+    }
+
     /// Returns the lexically-ordered direct children of `dir`, or `None` if `dir` is not a
     /// known network directory.
     ///

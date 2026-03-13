@@ -70,8 +70,10 @@ impl BeliefSink for BeliefBase {
 // impl DbConnection
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 use crate::db::{DbConnection, Transaction};
 
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 impl BeliefSink for DbConnection {
     /// Collect all events into a single [`Transaction`] and execute it atomically.
     ///

@@ -1819,7 +1819,7 @@ impl GraphBuilder {
         //   4. For a plain doc, just pop the filename → now at the parent network dir.
         //   5. If after popping we are outside the repo, this is the repo root → slow path.
         //   6. Strip repo_root → parent_net_rel_path for the NodeKey.
-        let entry_rel_path = match abs_path.strip_prefix(self.repo_root()) {
+        let _entry_rel_path = match abs_path.strip_prefix(self.repo_root()) {
             Ok(p) => os_path_to_string(p),
             Err(_) => return Ok(None),
         };
@@ -1960,79 +1960,34 @@ impl GraphBuilder {
         // doc_bb and union into it.  The previous doc_bb may contain stale content from
         // the prior parse of this file (asset nodes, section edges, etc.); carrying that
         // forward leaks state and causes PathMap corruption (in_states=true, in_pathmap=false).
-        self.doc_bb = BeliefBase::from(ancestors_only);
+        self.doc_bb = BeliefBase::from(ancestors_only.clone());
 
-        // Merge the full parent graph (including child edges) into session_bb so subsequent
-        // sibling parses also find the parent on a StackCache hit.
-        // Seed from parent_bid — bounds DFS to structure reachable from the parent network,
-        // not all of session_bb.
-        let parent_seed: BTreeSet<Bid> = BTreeSet::from([parent_bid]);
-        self.session_bb.merge_from(&fast_missing, &parent_seed);
-
-        // Pre-populate session_bb with the entry doc and its section children so that Phase 1
-        // push() finds them via StackCache and reuses persisted BIDs rather than generating
-        // fresh timestamp-based ones.
+        // Merge ancestor networks only into session_bb so subsequent sibling parses find
+        // the parent on a StackCache hit.
         //
-        // Strategy:
-        //   1. fast_missing (from the parent-network eval_query above) already contains the
-        //      entry doc as a Trace node — its BID comes from the DB/session_bb neighbor fetch
-        //      of the parent's Section edges.  Merge it into session_bb first.
-        //   2. Then query global_bb for the entry doc's full neighborhood by BID (not by
-        //      NodeKey::Path, which fails for DB because paths are stored net-relative under
-        //      the sub-network's bref, not repo-relative under repo.bref).
-        //   3. session_bb.get(&entry_key) is the fast path for same-compiler reparses where
-        //      terminate_stack already wrote the full neighborhood in.
-
-        let entry_key = NodeKey::Path {
-            net: self.repo.bref(),
-            path: entry_rel_path.clone(),
-        };
-
-        // Step 1: find the entry doc's BID from fast_missing (it's a Trace node — the parent
-        // network's balanced neighborhood includes its Section-edge sources as Trace nodes).
-        // Also covers same-compiler reparses where session_bb already has it fully resolved.
-        let entry_bid_from_fast: Option<Bid> = {
-            let fast_bb = BeliefBase::from(fast_missing.clone());
-            fast_bb
-                .get(&entry_key)
-                .map(|n| n.bid)
-                .or_else(|| self.session_bb.get(&entry_key).map(|n| n.bid))
-        };
-
-        let children_graph = if self.session_bb.get(&entry_key).is_some() {
-            // Same-compiler reparse: session_bb already has the full neighborhood from
-            // a prior terminate_stack.  Query session_bb directly — no round-trip needed.
-            let q = Query {
-                seed: Expression::from(&entry_key),
-                traverse: None,
-            };
-            self.session_bb.eval_query(&q, true).await?
-        } else if let Some(entry_bid) = entry_bid_from_fast {
-            // First parse of this doc in the current session (or fresh session_bb from a
-            // parallel task / DB-backed second compiler).  We have the BID from fast_missing.
-            // Query global_bb by BID — works for both BeliefBase and DbConnection because
-            // BID lookups are direct regardless of path encoding.
-            let bid_query = Query {
-                seed: Expression::StateIn(crate::query::StatePred::Bid(vec![entry_bid])),
-                traverse: None,
-            };
-            global_bb.eval_query(&bid_query, true).await?
-        } else {
-            BeliefGraph::default()
-        };
-
-        if !children_graph.states.is_empty() {
-            // Seed from the entry doc's BID — bounds DFS to the entry's immediate neighborhood,
-            // not all of session_bb.
-            if let Some(entry_bid) =
-                entry_bid_from_fast.or_else(|| self.session_bb.get(&entry_key).map(|n| n.bid))
-            {
-                let entry_seed: BTreeSet<Bid> = BTreeSet::from([entry_bid]);
-                self.session_bb.merge_from(&children_graph, &entry_seed);
-            }
-        }
+        // Previously this merged the full fast_missing (parent + all child Trace nodes +
+        // their own Section edges) into session_bb. On attempt 2, global_bb.eval_query
+        // returns the balanced parent graph which includes every child doc's full Section
+        // subgraph as Trace nodes — thousands of edges whose source nodes don't exist in
+        // session_bb yet. merge_from then calls update_relation for each, producing a
+        // flood of "Skipping update_relation / source is missing" warnings and a 69-second
+        // stall inside the merge (confirmed in beliefbase-merge-fix.log: 4,674 warnings,
+        // Phase 2 stall 16:16:53→16:18:02 for global_objects attempt 2).
+        //
+        // The fix: use ancestors_only (network-kinded nodes only, already computed above
+        // for doc_bb). Siblings still find the parent via StackCache. The entry doc's
+        // Trace node and children_graph are added separately below via Steps 1-2.
+        let parent_seed: BTreeSet<Bid> = BTreeSet::from([parent_bid]);
+        self.session_bb.merge_from(&ancestors_only, &parent_seed);
 
         // Reconstruct self.stack from the parent network's PathMap position in doc_bb.
+        // Section nodes for the entry doc are already in session_bb from the prior
+        // terminate_stack (attempt 2+) or will be fetched individually by Phase 1 push()
+        // via cache_fetch → session_bb.eval_query / global_bb.eval_query (first parse).
+        // Pre-populating via a bulk eval_query+merge_from here is redundant on reparse and
+        // harmful on first parse: balance() fans out to the full subtree and to_event_stream's
+        // halo expansion pulls in Epistemic edges to not-yet-parsed sinks, causing
+        // "Skipping update_relation" floods and multi-second stalls per child doc.
         //
         // The parent network is in doc_bb (ancestors_only above).  Its order vec in the
         // repo PathMap is the prefix used to find its own ancestors.  We push the parent

@@ -17,9 +17,10 @@
 //! use noet_core::beliefbase::{BeliefBase, BeliefGraph, BidGraph};
 //! ```
 
-mod base;
 #[cfg(not(target_arch = "wasm32"))]
-mod cached;
+pub(crate) mod accumulator;
+mod base;
+
 mod context;
 mod graph;
 #[cfg(not(target_arch = "wasm32"))]
@@ -29,9 +30,10 @@ mod sink;
 mod tests;
 
 // Re-export public types to maintain existing API
-pub use base::BeliefBase;
 #[cfg(not(target_arch = "wasm32"))]
-pub use cached::CachedBeliefSource;
+pub use accumulator::{BeliefAccumulator, QueryHandle};
+pub use base::BeliefBase;
+
 pub use context::{BeliefContext, ExtendedRelation};
 pub use graph::{BeliefGraph, BidGraph, BidRefGraph, BidSubGraph};
 #[cfg(not(target_arch = "wasm32"))]
