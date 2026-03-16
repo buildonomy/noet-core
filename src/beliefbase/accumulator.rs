@@ -34,7 +34,7 @@
 //! then the query cache is cleared so subsequent queries see fresh state.
 //!
 //! All drain activity is driven exclusively by `BatchStart`/`BatchEnd` sentinels on the
-//! channel.  There is no public `drain` method — epoch boundaries are signalled by the
+//! channel.  There is no public drain method — epoch boundaries are signalled by the
 //! compiler via the event channel, not by out-of-band API calls.
 //!
 //! [`BeliefSource`] queries on the accumulator delegate to `inner` with the memoised
@@ -74,7 +74,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     beliefbase::BeliefGraph,
-    event::BeliefEvent,
+    event::{BeliefEvent, EventOrigin},
     properties::{Bid, WeightSet},
     query::{BeliefSource, Expression, Query},
     BuildonomyError,
@@ -188,14 +188,51 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
     /// | Any other, outside batch | `apply_batch` immediately (no ordering needed) |
     ///
     /// Returns `Ok(())` when the channel is empty or closed.
-    async fn drain(&mut self, cache: &AccCache) -> Result<(), BuildonomyError> {
+    /// Drain all events currently available in `rx` without blocking.
+    /// Logs a per-event-type census on completion so we can see exactly what's
+    /// left in the channel at shutdown and how many events land outside a batch.
+    async fn drain_with_census(
+        &mut self,
+        cache: &AccCache,
+        label: &str,
+    ) -> Result<(), BuildonomyError> {
+        let pending_before = self.pending.len();
+        let in_batch_before = self.in_batch;
+        let mut outside_batch: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut inside_batch: usize = 0;
+        let mut batch_starts: usize = 0;
+        let mut batch_ends: usize = 0;
+
         loop {
             match self.rx.try_recv() {
-                Ok(event) => self.handle_event(event, cache).await?,
+                Ok(event) => {
+                    // Classify before consuming
+                    let was_in_batch = self.in_batch;
+                    match &event {
+                        BeliefEvent::BatchStart => batch_starts += 1,
+                        BeliefEvent::BatchEnd => batch_ends += 1,
+                        _ if was_in_batch => inside_batch += 1,
+                        _ => *outside_batch.entry(event.as_str()).or_insert(0) += 1,
+                    }
+                    self.handle_event(event, cache).await?;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
+
+        let outside_total: usize = outside_batch.values().sum();
+        tracing::info!(
+            label,
+            pending_before,
+            in_batch_before,
+            batch_starts,
+            batch_ends,
+            inside_batch,
+            outside_total,
+            outside_census = ?outside_batch,
+            "accumulator drain complete",
+        );
         Ok(())
     }
 
@@ -204,6 +241,7 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
         event: BeliefEvent,
         cache: &AccCache,
     ) -> Result<(), BuildonomyError> {
+        let event_kind_string = format!("{event}");
         match event {
             BeliefEvent::BatchStart => {
                 // In a well-formed stream from `parse_all`, `pending` is always empty
@@ -239,7 +277,15 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
                 if self.in_batch {
                     self.pending.push(other);
                 } else {
-                    // Outside a batch: apply immediately so no events are silently dropped.
+                    // Events arriving outside a BatchStart/BatchEnd window should not
+                    // happen in the parallel parse path — all compiler events are supposed
+                    // to be bracketed by BatchStart/BatchEnd pairs.  Log at ERROR so we
+                    // can identify the source; apply immediately so no events are lost.
+                    tracing::error!(
+                        event_kind = event_kind_string,
+                        "accumulator: event arrived outside any BatchStart/BatchEnd window — \
+                         this is a compiler bug (event will be applied without batch ordering)"
+                    );
                     self.inner.apply_batch(std::slice::from_ref(&other)).await?;
                 }
             }
@@ -261,8 +307,6 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
 ///    - `NodeUpdate` / `NodeRenamed` next (their internal removes are now no-ops)
 ///    - Everything else last (relation/path events find nodes already indexed)
 fn prepare_batch(events: &mut Vec<BeliefEvent>) {
-    use crate::event::EventOrigin;
-
     // Consolidate all NodesRemoved into one event.
     let mut removed_bids: Vec<Bid> = Vec::new();
     let mut removed_origin = EventOrigin::Remote;
@@ -337,8 +381,8 @@ where
     ///
     /// Drains any remaining events from the channel before unwrapping.  The
     /// caller should close `tx` before calling `into_inner` so the channel is
-    /// disconnected; the `Disconnected` arm in `AccInner::drain` then ensures
-    /// no events are silently lost.
+    /// disconnected; the `Disconnected` arm in `AccInner::drain_with_census` then
+    /// ensures no events are silently lost.
     ///
     /// # Errors
     ///
@@ -351,7 +395,7 @@ where
         // signals on the channel itself.
         {
             let mut guard = self.acc.lock().await;
-            guard.drain(&self.cache).await?;
+            guard.drain_with_census(&self.cache, "into_inner").await?;
         }
         let arc = self.acc;
         match Arc::try_unwrap(arc) {
@@ -372,7 +416,7 @@ where
     ///
     /// `QueryHandle` does **not** drain the channel — it only reads from `inner`
     /// through the shared cache.  Draining is driven exclusively by `BatchEnd`
-    /// signals on the channel, processed inside `into_inner`.
+    /// signals on the channel, processed inside `into_inner` via `drain_with_census`.
     pub fn query_handle(&self) -> QueryHandle<S> {
         QueryHandle {
             acc: Arc::clone(&self.acc),
@@ -407,7 +451,7 @@ where
 
         async move {
             // No lazy drain here. Draining is driven exclusively by parse_all at
-            // BatchEnd boundaries via BeliefAccumulator::drain(). Within an epoch,
+            // BatchEnd boundaries via BeliefAccumulator::drain_with_census(). Within an epoch,
             // inner is stable and queries go straight to the cache / inner.
             let cache_key = (query_owned.clone(), all_or_none);
             if let Some(cached) = cache.get(&cache_key) {
@@ -498,15 +542,65 @@ where
 /// cloned and passed to parallel parse tasks without exclusive access to the
 /// event channel.
 ///
-/// `QueryHandle` reads from `inner` through the shared cache.  It does NOT drain
-/// the channel — draining is exclusively the responsibility of `BeliefAccumulator::drain`,
-/// called by `parse_all` at epoch boundaries.  Within a stable epoch (after a drain),
-/// `inner` is immutable from the tasks' perspective and all queries are purely
-/// read-bound, sharing cache entries across all handles.
+/// `QueryHandle` reads from `inner` through the shared cache.  Between epochs the
+/// compiler calls [`EpochDrain::drain_epoch`] on the handle to commit the completed
+/// batch and invalidate the cache so the next epoch sees fresh state.  Within a
+/// stable epoch (after a drain), `inner` is immutable from the tasks' perspective
+/// and all queries are purely read-bound, sharing cache entries across all handles.
+///
+/// Individual parse tasks must **not** call `drain_epoch` — they hold clones of the
+/// handle and must not advance the epoch boundary mid-batch.  Only the compiler's
+/// main task (which owns the canonical `QueryHandle` returned by
+/// [`BeliefAccumulator::query_handle`]) calls `drain_epoch`, always after all tasks
+/// in the batch have been joined and `BatchEnd` has been sent to `tx`.
 #[derive(Clone)]
 pub struct QueryHandle<S: BeliefSource + BeliefSink> {
     acc: Arc<tokio::sync::Mutex<AccInner<S>>>,
     cache: Arc<AccCache>,
+}
+
+// ---------------------------------------------------------------------------
+// EpochDrain — inter-epoch commit trigger
+// ---------------------------------------------------------------------------
+
+/// Drain and commit the current batch after a `BatchEnd` sentinel has been sent.
+///
+/// Implemented only by [`QueryHandle`].  The compiler calls this once per epoch
+/// boundary (after `BatchEnd` is sent to `tx` and before the next `BatchStart`)
+/// so that `global_bb` reflects all events from the completed epoch before the
+/// next epoch's tasks begin querying it.
+///
+/// This is deliberately a separate trait from [`BeliefSource`] so that generic
+/// parse tasks (which receive a cloned `QueryHandle` and must not drain mid-batch)
+/// cannot accidentally call it.  Only the compiler's main task, which owns the
+/// canonical handle, holds this bound.
+pub trait EpochDrain {
+    fn drain_epoch(&self) -> impl std::future::Future<Output = Result<(), BuildonomyError>> + Send;
+}
+
+impl<S> EpochDrain for QueryHandle<S>
+where
+    S: BeliefSource + BeliefSink + Clone + Send + 'static,
+{
+    /// Drain all pending channel events (including the `BatchEnd` that was just
+    /// sent) and clear the query cache.
+    ///
+    /// After this returns, `inner` is consistent with all events from the
+    /// completed epoch and the cache is empty, so the first query of the next
+    /// epoch hits `inner` directly (warm-starting the cache for that epoch).
+    fn drain_epoch(&self) -> impl std::future::Future<Output = Result<(), BuildonomyError>> + Send {
+        let acc = Arc::clone(&self.acc);
+        let cache = Arc::clone(&self.cache);
+        async move {
+            let mut guard = acc.lock().await;
+            guard.drain_with_census(&cache, "drain_epoch").await?;
+            // drain_with_census clears the cache on every BatchEnd it processes.
+            // If (pathologically) no BatchEnd arrived, clear explicitly so callers
+            // never see stale cached results across an epoch boundary.
+            cache.clear();
+            Ok(())
+        }
+    }
 }
 
 impl<S> BeliefSource for QueryHandle<S>
@@ -524,7 +618,7 @@ where
 
         async move {
             // No drain — QueryHandle operates within a stable epoch (inner was last
-            // drained by BeliefAccumulator::drain at the preceding BatchEnd boundary).
+            // drained by BeliefAccumulator::into_inner at the preceding BatchEnd boundary).
             let cache_key = (query_owned.clone(), all_or_none);
             if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);

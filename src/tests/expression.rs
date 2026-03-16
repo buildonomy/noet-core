@@ -541,9 +541,9 @@ async fn test_evaluate_expression_subsection_chain_balancing() {
              This indicates that querying for a document didn't properly include \
              the upstream network's connection to API during balancing. Api nodes: {}",
         balanced_result
-            .errors()
+            .diagnostics()
             .iter()
-            .map(|err_msg| err_msg.replace("\n", "\n\t"))
+            .map(|d| d.to_string().replace("\n", "\n\t"))
             .collect::<Vec<String>>()
             .join(",\n\t- "),
         balanced_result

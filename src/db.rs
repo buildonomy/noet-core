@@ -1,5 +1,5 @@
 use crate::{
-    beliefbase::{BeliefBase, BeliefGraph, BidGraph},
+    beliefbase::{BeliefBase, BeliefGraph, BidGraph, EpochDrain},
     error::BuildonomyError,
     event::BeliefEvent,
     paths::{
@@ -320,6 +320,19 @@ type NestedNetFuture =
 
 #[derive(Debug, Clone)]
 pub struct DbConnection(pub Pool<Sqlite>);
+
+// ---------------------------------------------------------------------------
+// EpochDrain — no-op impl for DbConnection (sequential / test path)
+// ---------------------------------------------------------------------------
+
+/// `DbConnection` is used directly in the sequential parse path and in tests
+/// (e.g. `bid_tests.rs`).  It has no event channel to drain, so `drain_epoch`
+/// is a no-op — the same reasoning as the `BeliefBase` impl.
+impl EpochDrain for DbConnection {
+    fn drain_epoch(&self) -> impl std::future::Future<Output = Result<(), BuildonomyError>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
 
 /// TODO: ensure push_values iter counts never exceed this huge value
 ///

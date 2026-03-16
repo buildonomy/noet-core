@@ -1,9 +1,9 @@
 ---
 title = "BeliefBase Architecture: The Compiler IR for Document Graphs"
 authors = "Andrew Lyjak, Claude Code"
-last_updated = "2025-01-17"
+last_updated = "2025-03-16"
 status = "Draft"
-version = "0.2"
+version = "0.3"
 ---
 
 # BeliefBase Architecture
@@ -857,26 +857,25 @@ pub async fn parse_content(...) -> Result<ParseContentResult, BuildonomyError>
 
 **Resolution Algorithm:**
 
-1. **First Pass - Virgin Repository**: Parse files with no prior context
-   - Target not yet parsed → `cache_fetch()` returns `GetOrCreateResult::Unresolved(...)`
-   - Collect `UnresolvedReference` diagnostic (no relation created yet)
-   - Compiler tracks unresolved refs for later resolution checking
-   - Continue parsing all files
+1. **Initial Pass**: `DocumentCompiler` iterates `ProtoIndex::ordered_paths()` — a
+   depth-first, lexicographic traversal of the repo tree that guarantees every
+   network's `index.md` is committed to `global_bb` before its sibling files are
+   dispatched. For each path:
+   - Parse via `GraphBuilder::parse_content`
+   - Unresolvable cross-file refs produce `UnresolvedReference` diagnostics
+   - Resolved deps that need a source rewrite (BID injection, title update) are
+     pushed to `remainder_queue`
 
-2. **Propagation**: Compiler-driven resolution checking
-   - After parsing each file, check if it resolves any tracked unresolved refs
-   - If resolved: create relation via `RelationChange` event
-   - If NodeKey type requires rewrite (Path, Title): enqueue source file for reparse
-   - Queue managed by `DocumentCompiler` with priority ordering
+2. **Remainder Loop**: While `remainder_queue` is non-empty:
+   - Pop the next path (ordered by `processed` count ascending — assets at count=0
+     sort before doc rereparses at count=1+)
+   - Reparse; new unresolved refs or rewrite triggers extend `remainder_queue`
+   - Stop when a full drain produces no new entries, or `max_reparse_count` is reached
 
-3. **Subsequent Passes**: Reparse files after dependencies resolve
-   - Previously missing targets now exist in cache
-   - Links resolve to concrete BIDs
-   - Inject BIDs into source files (rewritten content)
+3. **Convergence**: Internal refs resolve after full tree parse; external refs or
+   typos remain as `UnresolvedReference` diagnostics in the final result.
 
-4. **Convergence**: Iterate until all resolvable refs are resolved
-   - Internal refs resolve after full tree parse
-   - External refs or typos remain in unresolved list
+`DocumentCompiler` exposes two public drivers built on this model — see §3.3.
 
 **Example - Initial Parse with Auto-Title (WikiLinks):**
 ```
@@ -1099,6 +1098,73 @@ We cannot assume all relations are immediately accessible during parsing. Unreso
 - **Reparse queue**: Files with unresolved dependencies
 
 This handles multi-pass resolution efficiently without polluting the cache with incomplete nodes.
+
+### 3.3. DocumentCompiler: Orchestration and Work Queue
+
+`DocumentCompiler` is the build-system driver. It owns the `ProtoIndex`, the work
+queue, per-path parse counts, and the `GraphBuilder`. It exposes two public parse
+drivers:
+
+| Method | Description |
+|--------|-------------|
+| `parse_sequential` | Single-threaded. Iterates `ProtoIndex::ordered_paths()` directly, then drains `remainder_queue`. No epoch/batch machinery. Used as the baseline for sequential tests. |
+| `parse_all` | Parallel. Drives epoch batches via `BeliefAccumulator`; epoch-0 uses network-first ProtoIndex ordering; subsequent epochs drain `remainder_queue`. |
+
+**State:**
+
+```rust
+pub struct DocumentCompiler {
+    /// Ordered work queue for remainder (reparse) passes.
+    /// Entries are sorted by `processed[path]` ascending: assets (count=0)
+    /// sort before doc rereparses (count=1+), which sort before repeated rereparses.
+    remainder_queue: VecDeque<PathBuf>,
+
+    /// Number of times each path has been parsed. Used for reparse-limit enforcement
+    /// and remainder_queue ordering.
+    processed: HashMap<PathBuf, usize>,
+
+    /// Maximum number of times any path may be reparsed before emitting
+    /// ReparseLimitExceeded and dropping the path.
+    max_reparse_count: usize,
+
+    /// Pre-built filesystem index: network dirs → ordered child lists.
+    /// Built once at startup via a single O(files) WalkDir pass.
+    proto_index: ProtoIndex,
+
+    // ... HTML output config, tx channel, etc.
+}
+```
+
+**`ProtoIndex::ordered_paths()` — canonical iteration order:**
+
+Returns a flat depth-first list of all repo paths. Within each network directory,
+entries are sorted lexicographically (subnet directories interleave alphabetically
+with plain files at their natural sort position). This guarantees:
+
+```
+repo/index.md               ← network root always first in its group
+repo/a.md
+repo/b_dir/                 ← subnet dir, at its lex position (b < c)
+repo/b_dir/index.md         ← subnet's own root first within b_dir
+repo/b_dir/a_sub.md
+repo/b_dir/x.md
+repo/b_dir/y_repo/          ← nested subnet
+repo/b_dir/y_repo/index.md
+repo/b_dir/y_repo/abc.md
+repo/c.md
+repo/d_dir/a.md             ← plain dir (no index.md) — files included flat
+repo/z.md
+```
+
+Every network `index.md` is committed to `global_bb` before its children are
+dispatched, eliminating the slow-path fallback in
+`try_initialize_stack_from_session_cache` for all files in the initial pass.
+
+**Watch service integration** (planned): `on_file_modified(path)` resets
+`processed[path] = 0` and pushes to the front of `remainder_queue`.
+`on_file_deleted(path)` removes from `remainder_queue` and `processed`. The watch
+service then calls `parse_all` (or a future incremental `parse_modified`) with no
+other coordination needed.
 
 ### 3.4. BeliefBase vs BeliefGraph: Full API vs Transport Layer
 
@@ -1707,31 +1773,70 @@ Optimization is better suited for the **DbConnection** persistent cache (db.rs) 
 
 ### 6.5. Concurrent Parsing
 
-**Current State**: Intra-epoch parallelism is implemented (Issue 57). Files
-within the same epoch are dispatched as parallel batches via `parse_epoch`.
-True OS-thread parallelism (Step 6 of Issue 57) is not yet complete — tasks
-currently run cooperatively on the async executor.
+**Current State**: Intra-epoch parallelism is architecturally complete (Issue 57).
+The `BeliefAccumulator` + `QueryHandle<T>` + `EpochDrain` machinery is in place.
+True OS-thread parallelism (spawning one `tokio::task` per path within an epoch,
+gated by `Arc<Semaphore>`) is the remaining step.
 
-**Epoch invariant**: within a single epoch no file's parse output is an input
-to any other file's parse in that epoch. Cross-file dependencies only flow
-across epoch boundaries. This is what makes intra-epoch parallelism safe without
-locking `GraphBuilder`.
+**Epoch invariant**: within a single epoch no file's parse output is an input to
+any other file's parse in that epoch. Cross-file dependencies only flow across epoch
+boundaries. This is what makes intra-epoch parallelism safe without locking
+`GraphBuilder`.
 
-**Epoch 0 ordering**: `parse_all` uses a `VecDeque` work-queue that guarantees
-every network's `index.md` is parsed in its own single-file epoch
-(BatchStart → parse → BatchEnd → `drain_epoch`) before its children are
-dispatched. Children of the same network then form a parallel leaf batch. Subnet
-sub-directories are re-enqueued for their own round. This ensures every child
-document's `GlobalCache` fast-path lookup for the parent network finds a
-committed BID in `global_bb`.
+**`parse_all` epoch structure:**
+
+```
+Epoch 0 (ProtoIndex-ordered):
+  for each network dir in ProtoIndex::network_dirs() [shallowest-first]:
+    BatchStart → parse index.md alone → BatchEnd → drain_epoch()
+    BatchStart → parse_epoch(leaf children of this net) → BatchEnd → drain_epoch()
+
+Remainder epochs (epoch ≥ 1):
+  while remainder_queue is non-empty:
+    batch = remainder_queue.drain(), sorted by processed[path] ascending
+    BatchStart → parse_epoch(batch) → BatchEnd → drain_epoch()
+```
+
+The epoch-0 per-network split guarantees every `index.md` is committed to
+`global_bb` before its children are dispatched, so
+`try_initialize_stack_from_session_cache` always finds the parent network on the
+`GlobalCache` fast path.
+
+**`parse_sequential` (no epochs):**
+
+```
+Initial pass:
+  for path in proto_index.ordered_paths():
+    result = parse_one_codec_path(path)
+    unresolved non-proto_index deps → remainder_queue
+
+Remainder loop:
+  while remainder_queue is non-empty:
+    path = remainder_queue.pop_front()
+    result = parse_one_codec_path(path)
+    new unresolved deps → remainder_queue
+```
+
+No `BatchStart`/`BatchEnd`, no `drain_epoch`. Used as the sequential baseline
+and for contexts where no inter-epoch accumulator is needed.
 
 **`BeliefAccumulator`**: the `BatchStart`/`BatchEnd` sentinel pair drives
 accumulator commit and cache invalidation. `drain_epoch()` must not be a no-op
-for the inter-epoch cache invariant to hold — `BeliefBase`'s no-op
-`EpochDrain` implementation is correct only in contexts where no inter-epoch
-state sharing is expected (e.g. single-epoch unit tests).
+for the inter-epoch cache invariant to hold — `BeliefBase`'s no-op `EpochDrain`
+implementation is correct only in contexts where no inter-epoch state sharing is
+expected (e.g. single-epoch unit tests).
 
-**Remaining work** (Issue 57 Step 6):
+**`node_to_nets` reverse index**: `PathMapMap` maintains
+`node_to_nets: BTreeMap<Bid, BTreeSet<Bref>>` to route `RelationUpdate` events
+only to the PathMaps that contain the source or sink node (O(1) vs prior
+O(N_networks) broadcast). Maintained by `rebuild_node_to_nets_for` after each
+PathMap construction, and incrementally from `PathAdded` derivatives in the sort
+pass of `process_event_queue`. **Critical invariant**: the `node_to_nets`
+incremental update must run regardless of whether the PathMap required a sort —
+skipping it when `already_sorted=true` causes section nodes at depth ≥ 2 to be
+silently dropped from the PathMap.
+
+**Remaining work** (Issue 57):
 - Replace the sequential `for path in paths` loop in `parse_epoch` with
   `tokio::task::spawn` per path, gated by `Arc<Semaphore>` of size `jobs`.
 - Each spawned task gets an owned `GraphBuilder`, `tx.clone()`, and a

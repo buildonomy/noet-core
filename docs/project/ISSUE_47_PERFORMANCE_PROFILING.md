@@ -19,7 +19,7 @@ Establish performance profiling infrastructure to characterize noet-core's behav
 
 ## Goals
 
-1. Create realistic test corpus generator for benchmarking
+1. ~~Create realistic test corpus generator for benchmarking~~ REMOVED in favor of MDN based corpus
 2. Establish macro-benchmarks (10KB → 100MB+ document sets)
 3. Add memory profiling infrastructure
 4. Characterize current performance baselines
@@ -287,24 +287,7 @@ whether it remains significant post-FM1b fix.
 
 ### Realistic Corpus Generator
 
-Generate markdown that resembles real documentation:
-
-**Content mix** (based on typical technical docs):
-- 60% prose paragraphs (low reference density)
-- 20% lists with cross-references (medium density)
-- 10% code blocks (zero density)
-- 10% tables and headings (varied density)
-
-**Reference density** (critical for graph performance):
-- Real docs: 5-20 references per 1KB content
-- Mix of: wikilinks, path references, section anchors
-- Both internal (within corpus) and external references
-
-**Structural patterns**:
-- Nested headings (6 levels deep)
-- Multi-file cross-references
-- Repeated reference targets (collision testing)
-- Long reference chains (A→B→C→D)
+(REMOVED in favor of using MDN as our benchmarking corpus)
 
 ### Key Metrics to Track
 
@@ -340,24 +323,10 @@ Generate markdown that resembles real documentation:
    - [x] `benches/log_analysis/README.md` with quick-start, example output,
          and diagnostic decision tree
 
-### 1. **Corpus Generator** (1 day)
-   - [ ] Create `benches/corpus_generator.rs`
-   - [ ] Implement realistic markdown structure generation:
-     - Prose paragraphs with internal references
-     - Nested lists and code blocks
-     - Multi-file document sets with cross-links
-   - [ ] Parameterize by size (bytes) and reference density
-   - [ ] Generate deterministic output (seeded RNG for reproducibility)
-   - [ ] Validate generated corpus parses correctly
+### 1. **Corpus Generator** (1 day) (REMOVED in favor of using MDN as test corpus)
 
 ### 2. **Macro-Benchmarks** (1 day)
    - [ ] Create `benches/macro_benchmarks.rs`
-   - [ ] Benchmark single-document processing:
-     - 10KB (baseline, similar to network_1)
-     - 100KB (typical reference manual)
-     - 1MB (large specification)
-     - 10MB (comprehensive documentation set)
-     - 100MB (stress test)
    - [ ] Benchmark multi-document sets:
      - 10 files × 50KB each (small project)
      - 100 files × 50KB each (medium project)
@@ -401,8 +370,6 @@ Generate markdown that resembles real documentation:
 
 ## Testing Requirements
 
-- [ ] Corpus generator produces valid, parseable markdown
-- [ ] Generated corpora are deterministic (reproducible benchmarks)
 - [ ] Benchmarks run successfully in CI (optional: store as artifacts)
 - [ ] Memory profiling identifies no obvious leaks
 - [ ] Baseline metrics documented and reviewable
@@ -414,7 +381,6 @@ Generate markdown that resembles real documentation:
 
 ## Success Criteria
 
-- [ ] Realistic corpus generator implemented and validated
 - [ ] Macro-benchmarks characterize 10KB → 100MB+ scaling
 - [ ] Memory profiling infrastructure operational
 - [ ] Baseline performance metrics documented
@@ -432,11 +398,7 @@ Generate markdown that resembles real documentation:
 
 ## Risks
 
-**Risk 1: Generated corpus not representative**
-- Synthetic data may miss real-world patterns
-- **Mitigation**: Validate against actual documentation sets (Rust docs, Linux kernel docs, etc.)
-
-**Risk 2: BN-1 fix changes `add_relations` semantics**
+**Risk 1: BN-1 fix changes `add_relations` semantics**
 - `add_relations_from` with a restricted seed set may fail to pull in nodes that
   the current unbounded DFS would have found, causing missing edges in edge
   cases.
@@ -444,11 +406,11 @@ Generate markdown that resembles real documentation:
   the current output (enforced by Issue 57 step 7). Run the full `tests/network_1`
   suite and the MDN warm-cache idempotency check before merging any fix.
 
-**Risk 3: Memory profiling adds complexity**
+**Risk 2: Memory profiling adds complexity**
 - Tools like `dhat` require specific build configurations
 - **Mitigation**: Keep profiling separate from main benchmarks, optional for CI
 
-**Risk 4: Benchmark noise in CI**
+**Risk 3: Benchmark noise in CI**
 - GitHub Actions runners have variable performance
 - **Mitigation**: Focus on relative comparisons (10× corpus = ~10× time), not absolute numbers
 

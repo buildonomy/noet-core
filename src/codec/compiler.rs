@@ -1,7 +1,7 @@
 use crate::{
-    beliefbase::BeliefBase,
+    beliefbase::{BeliefBase, EpochDrain},
     codec::{
-        assets::get_stylesheet_urls,
+        assets::{get_stylesheet_urls, get_template, Layout},
         belief_ir::IRNode,
         builder::{GraphBuilder, ParseContentWithCodec},
         network::{detect_network_file, NetworkCodec, NETWORK_NAME},
@@ -25,9 +25,13 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use toml_edit::value;
+use tracing::Instrument;
 
 /// A wrapper around GraphBuilder that manages recursive document parsing with queue
 /// management and loop prevention.
@@ -38,72 +42,17 @@ use toml_edit::value;
 /// feeds it to the builder for parsing. It automatically handles the complex dependency
 /// resolution workflow where documents reference each other and need multiple parse passes.
 ///
-/// ## Two-Queue Architecture
+/// ## Single-Queue Architecture
 ///
-/// The compiler maintains two separate queues to handle the recursive nature of document parsing:
-///
-/// ### Primary Queue (Never-Parsed Files)
-/// Contains files that have never been parsed in this session. These are processed first using
-/// a simple FIFO order. Files are added to this queue when:
-/// - Compiler is initialized with an entry point
-/// - A parsed document discovers a new dependency
-/// - File watcher detects a new file
-///
-/// ### Reparse Queue (Pending Re-resolution)
-/// Contains files that were parsed but had unresolved dependencies. These files need to be
-/// re-parsed after their dependencies have been processed so they can inject the resolved BIDs.
-/// This queue uses **priority ordering** - files with the fewest unresolved dependencies are
-/// processed first, maximizing the likelihood of successful resolution.
-///
-/// ## Parse Flow Example
-///
-/// Consider this document structure:
-/// ```text
-/// network/
-///   ├── index.md
-///   ├── README.md           → references sub_1.md, sub_2.md
-///   ├── sub_1.md            → references sub_2.md
-///   └── sub_2.md
-/// ```
-///
-/// Parse sequence:
-/// 1. **Parse .noet** (primary queue)
-///    - Discovers README.md, sub_1.md, sub_2.md via `IRNode::from_file`
-///    - Adds them to primary queue in lexical order
-///
-/// 2. **Parse README.md** (primary queue)
-///    - Contains unresolved links to sub_1.md and sub_2.md
-///    - Returns dependent_paths = ["sub_1.md", "sub_2.md"]
-///    - These are already in queue, so just track the dependency
-///    - README.md added to reparse queue
-///
-/// 3. **Parse sub_1.md** (primary queue)
-///    - Contains unresolved link to sub_2.md
-///    - Returns dependent_paths = ["sub_2.md"]
-///    - sub_1.md added to reparse queue
-///
-/// 4. **Parse sub_2.md** (primary queue)
-///    - No external dependencies
-///    - Returns dependent_paths = []
-///    - NOT added to reparse queue
-///
-/// 5. **Re-parse sub_1.md** (reparse queue, 0 unresolved deps)
-///    - Now sub_2.md is in cache with its BID
-///    - Link to sub_2.md resolved and injected
-///    - Returns dependent_paths = [] (all resolved)
-///    - File content rewritten with BID
-///
-/// 6. **Re-parse README.md** (reparse queue, 0 unresolved deps)
-///    - Now both sub_1.md and sub_2.md are in cache
-///    - Both links resolved and injected
-///    - Returns dependent_paths = []
-///    - File content rewritten with BIDs
+/// The compiler maintains one `remainder_queue` for all pending paths. Items with a low
+/// `processed` count (never-parsed) are treated as initial-pass files; items with a higher
+/// count are re-parses. Within the remainder loop, items are sorted by ascending `processed`
+/// count so never-parsed assets and late-discovered files are dispatched before re-parses.
 ///
 /// ## Loop Prevention
 ///
-/// Each file tracks parse count. If a file is parsed more than `max_reparse_count` times
-/// (default: 3), an error is returned. This prevents infinite loops from circular dependencies
-/// or bugs.
+/// Each file tracks parse count in `processed`. If a file is parsed more than
+/// `max_reparse_count` times (default: 2), a `ReparseLimitExceeded` sentinel is emitted.
 ///
 /// ## Architecture: Cache Separation
 ///
@@ -140,17 +89,19 @@ pub struct DocumentCompiler {
     /// `Arc` handle) so all tasks share one pre-built read-only map with no WalkDir calls
     /// during parsing.
     proto_index: ProtoIndex,
-    primary_queue: VecDeque<PathBuf>,
-    reparse_queue: VecDeque<PathBuf>,
-    pending_dependencies: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Single unified queue for all pending parse paths.
+    ///
+    /// Items are sorted by ascending `processed` count before each remainder-loop
+    /// iteration: count=0 items (never parsed, including assets) run first; count≥1
+    /// items are re-parses.  The `parse_sequential` initial pass drains this queue
+    /// after seeding it with stale files, then the remainder loop handles late
+    /// discoveries and re-parses. The `parse_all` batching path drains this queue into
+    /// run count derived batches.
+    remainder_queue: VecDeque<PathBuf>,
     processed: HashMap<PathBuf, usize>, // Track parse count per path
     max_reparse_count: usize,           // Prevent infinite loops
-    /// Track BIDs of nodes updated since last reparse round
-    last_round_updates: HashSet<Bref>,
-    /// Whether reparse queue is stable (no new dependencies discovered)
-    reparse_stable: bool,
     /// Network files that need HTML generation deferred until all documents are parsed
-    deferred_html: HashSet<PathBuf>,
+    deferred_html: std::collections::HashSet<PathBuf>,
 }
 
 /// Result of parsing a single document
@@ -168,7 +119,7 @@ impl DocumentCompiler {
     /// # Arguments
     /// * `entry_point` - The file or directory to start parsing from
     /// * `tx` - Optional channel sender for BeliefEvents (if None, events are not transmitted)
-    /// * `max_reparse_count` - Maximum times a file can be reparsed (default: 3)
+    /// * `max_reparse_count` - Maximum times a file can be reparsed (default: 2)
     /// * `write` - write back ids to files or read only mode
     pub fn new(
         entry_point: impl AsRef<Path>,
@@ -221,9 +172,6 @@ impl DocumentCompiler {
             ProtoIndex::new()
         });
 
-        let mut primary_queue = VecDeque::new();
-        primary_queue.push_back(entry_path);
-
         // Resolve jobs: explicit arg > NOET_JOBS env var > 1 (sequential default).
         // Parallel dispatch is opt-in: users must pass --jobs N or set NOET_JOBS=N.
         // Default is 1 (sequential) until the parallel path is production-validated.
@@ -245,14 +193,10 @@ impl DocumentCompiler {
             base_url,
             builder,
             proto_index,
-            primary_queue,
-            reparse_queue: VecDeque::new(),
-            pending_dependencies: HashMap::new(),
+            remainder_queue: VecDeque::new(),
             processed: HashMap::new(),
-            max_reparse_count: max_reparse_count.unwrap_or(3),
-            last_round_updates: HashSet::new(),
-            reparse_stable: false,
-            deferred_html: HashSet::new(),
+            max_reparse_count: max_reparse_count.unwrap_or(2),
+            deferred_html: std::collections::HashSet::new(),
         })
     }
 
@@ -288,8 +232,6 @@ impl DocumentCompiler {
             );
             ProtoIndex::new()
         });
-        let mut primary_queue = VecDeque::new();
-        primary_queue.push_back(entry_path);
 
         let jobs = std::env::var("NOET_JOBS")
             .ok()
@@ -306,14 +248,10 @@ impl DocumentCompiler {
             base_url: None,
             builder,
             proto_index,
-            primary_queue,
-            reparse_queue: VecDeque::new(),
-            pending_dependencies: HashMap::new(),
+            remainder_queue: VecDeque::new(),
             processed: HashMap::new(),
-            max_reparse_count: 3,
-            last_round_updates: HashSet::new(),
-            reparse_stable: false,
-            deferred_html: HashSet::new(),
+            max_reparse_count: 2,
+            deferred_html: std::collections::HashSet::new(),
         })
     }
 
@@ -363,10 +301,11 @@ impl DocumentCompiler {
         Ok(file_path)
     }
 
-    /// Parse the next item in the queue, returning None if queue is empty
+    /// Parse the next item in the remainder queue, returning None if queue is empty.
     ///
-    /// This method prioritizes the primary queue (never-parsed files) over the reparse queue.
-    /// For the reparse queue, it selects files with the most resolved dependencies first.
+    /// Used by `parse_sequential` and the watch service. Items are taken from the front
+    /// of `remainder_queue` in FIFO order; callers that want priority ordering should
+    /// sort the queue before calling (see `parse_sequential`'s remainder loop).
     ///
     /// # Arguments
     /// * `global_bb` - The belief cache to query during parsing (typically a DbConnection)
@@ -375,22 +314,16 @@ impl DocumentCompiler {
     /// * `Ok(Some(ParseResult))` - Successfully parsed a document
     /// * `Ok(None)` - Queue is empty, nothing to parse
     /// * `Err(_)` - Parse error or infinite loop detected
-    pub async fn parse_next<B: BeliefSource + Clone + Send>(
+    pub(crate) async fn parse_next<B: BeliefSource + Clone + Send>(
         &mut self,
         global_bb: B,
     ) -> Result<Option<ParseResult>, BuildonomyError> {
         // 1. PEEK at next item (don't pop until we have a successful parse)
-        let path = if let Some(p) = self.primary_queue.front() {
-            p.clone()
-        } else if let Some(p) = self.peek_next_reparse_candidate() {
+        let path = if let Some(p) = self.remainder_queue.front() {
             p.clone()
         } else {
-            self.finalize().await?;
-            let Some(path) = self.primary_queue.front().cloned() else {
-                tracing::debug!("[Compiler] No cached assets to verify, parsing complete");
-                return Ok(None);
-            };
-            path
+            tracing::debug!("[Compiler] Remainder queue empty, parsing complete");
+            return Ok(None);
         };
 
         // 2a. Check parse count before attempting
@@ -616,15 +549,13 @@ impl DocumentCompiler {
 
         let mut dependent_paths = Vec::<(String, Bref)>::new();
 
-        if !unresolved_references.is_empty() && !self.reparse_queue.contains(&path) {
-            // tracing::debug!(
-            //     "[Compiler] File {:?} has unresolved references, adding to reparse queue",
-            //     path
-            // );
-            self.reparse_queue.push_back(path.clone());
-            // New file with unresolved refs means reparse queue is not stable
-            self.reparse_stable = false;
-        }
+        // if !unresolved_references.is_empty() && !self.remainder_queue.contains(&path) {
+        //     tracing::debug!(
+        //         "[Compiler] File {:?} has unresolved references, adding to remainder queue",
+        //         path
+        //     );
+        //     self.remainder_queue.push_back(path.clone());
+        // }
 
         // 9. Handle dependent paths (files that need this file)
         for unresolved in unresolved_references.iter() {
@@ -643,14 +574,9 @@ impl DocumentCompiler {
                 let Some((net_dep_path_str, net)) = unresolved.as_unresolved_source() else {
                     continue;
                 };
-                self.process_unresolved_reference(&path, &net_dep_path_str, net);
+                self.process_unresolved_reference(&path, &net_dep_path_str, net, false);
                 dependent_paths.push((net_dep_path_str, net));
             }
-        }
-
-        // 10. Clean up resolved dependencies
-        if unresolved_references.is_empty() && self.pending_dependencies.contains_key(&path) {
-            self.pending_dependencies.remove(&path);
         }
 
         Ok(Some(ParseResult {
@@ -772,7 +698,7 @@ impl DocumentCompiler {
         Ok(stale_files)
     }
 
-    /// Process the results from one `parse_epoch_parallel` batch.
+    /// Process the results from one `parse_epoch` batch.
     ///
     /// Handles write-back, HTML generation, reparse-queue bookkeeping, and inserting
     /// into `latest`.  Also seeds the compiler's own builder with the repo BID the
@@ -785,6 +711,7 @@ impl DocumentCompiler {
         batch_results: Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)>,
         repo_seeded: &mut bool,
         latest: &mut HashMap<PathBuf, ParseResult>,
+        in_epoch_0: bool,
     ) -> Result<(), BuildonomyError> {
         // Seed repo BID once from the first task that discovers it.
         if !*repo_seeded {
@@ -831,24 +758,6 @@ impl DocumentCompiler {
                 Ok(with_codec) => {
                     *self.processed.entry(path.clone()).or_insert(0) += 1;
                     let (mut parse_result, codec) = (with_codec.result, with_codec.codec);
-
-                    // Write rewritten content if requested.
-                    if let Some(contents) = parse_result.rewritten_content.as_ref() {
-                        if self.write {
-                            let file_path = if path.is_dir() {
-                                detect_network_file(&path).unwrap_or(path.clone())
-                            } else {
-                                path.clone()
-                            };
-                            if let Err(e) = tokio::fs::write(&file_path, contents).await {
-                                parse_result
-                                    .diagnostics
-                                    .push(ParseDiagnostic::warning(format!(
-                                        "Failed to write rewritten content: {e}"
-                                    )));
-                            }
-                        }
-                    }
 
                     // HTML generation (mirrors parse_next logic).
                     if let Some(html_dir) = &self.html_output_dir.clone() {
@@ -914,7 +823,7 @@ impl DocumentCompiler {
                         }
                     }
 
-                    // Reparse / dependency tracking (mirrors parse_next logic).
+                    // Reparse / dependency tracking.
                     let unresolved_references: Vec<&UnresolvedReference> = parse_result
                         .diagnostics
                         .iter()
@@ -922,11 +831,6 @@ impl DocumentCompiler {
                         .collect();
 
                     let mut dependent_paths = Vec::<(String, Bref)>::new();
-
-                    if !unresolved_references.is_empty() && !self.reparse_queue.contains(&path) {
-                        self.reparse_queue.push_back(path.clone());
-                        self.reparse_stable = false;
-                    }
 
                     for unresolved in unresolved_references.iter() {
                         let is_asset_reference = unresolved.other_keys.iter().any(|key| {
@@ -943,15 +847,14 @@ impl DocumentCompiler {
                             else {
                                 continue;
                             };
-                            self.process_unresolved_reference(&path, &net_dep_path_str, net);
+                            self.process_unresolved_reference(
+                                &path,
+                                &net_dep_path_str,
+                                net,
+                                in_epoch_0,
+                            );
                             dependent_paths.push((net_dep_path_str, net));
                         }
-                    }
-
-                    if unresolved_references.is_empty()
-                        && self.pending_dependencies.contains_key(&path)
-                    {
-                        self.pending_dependencies.remove(&path);
                     }
 
                     latest.insert(
@@ -981,7 +884,283 @@ impl DocumentCompiler {
     /// # Returns
     /// * `Ok(Vec<ParseResult>)` - All successfully parsed documents
     /// * `Err(_)` - First unrecoverable error encountered (parsing stops on error)
-    /// Parse all items in the queue until empty.
+
+    /// Drive the compiler to completion using ProtoIndex-ordered iteration.
+    ///
+    /// ## Contract
+    ///
+    /// This method is the pre-epoch baseline: **no `BatchStart`/`BatchEnd` events are
+    /// emitted, no `drain_epoch()` is called.**  It iterates all known document paths
+    /// in depth-first, network-sorted order (root network dir first, subnet dirs before
+    /// sibling plain files, subnet contents immediately after the subnet dir entry).
+    ///
+    /// The caller owns all event processing: events arrive on the channel that was
+    /// passed to `DocumentCompiler::new`.  Because there is no epoch boundary, the
+    /// caller decides when `global_bb` is coherent enough to hand back to a subsequent
+    /// compiler.
+    ///
+    /// `session_bb` accumulates naturally across all parse calls — it is never reset
+    /// mid-run.  This is the property that makes `process_unresolved_reference` work:
+    /// by the time a child document is parsed, the root network's node is already in
+    /// `session_bb`.
+    ///
+    /// ## Relationship to `parse_all`
+    ///
+    /// `parse_all` wraps the epoch machinery on top of this primitive.  If
+    /// `parse_sequential` fails, the bug is in the core parse pipeline, not the
+    /// epoch/accumulator layer.  If `parse_sequential` passes but `parse_all` fails,
+    /// the regression is in the epoch machinery.
+    ///
+    /// ## Stale-file detection
+    ///
+    /// Like `parse_all`, this method calls `check_stale_files` first and seeds
+    /// `remainder_queue` with modified files before the main pass.
+    ///
+    /// ## Arguments
+    ///
+    /// * `global_bb` - The belief cache to query during parsing.
+    /// * `force` - If true, treat all cached files as stale.
+    ///
+    /// ## Returns
+    ///
+    /// `Ok(Vec<ParseResult>)` — one entry per path, last parse wins on reparse.
+    /// Surviving `UnresolvedReference` diagnostics are promoted to `Warning`.
+    pub async fn parse_sequential<B: BeliefSource + Clone + Send + 'static>(
+        &mut self,
+        global_bb: B,
+        force: bool,
+    ) -> Result<Vec<ParseResult>, BuildonomyError> {
+        // Seed remainder_queue with stale/modified files.
+        let stale_files = self.check_stale_files(&global_bb, force).await?;
+        for path in stale_files {
+            if !self.remainder_queue.contains(&path) {
+                self.remainder_queue.push_back(path);
+            }
+        }
+
+        let mut latest: HashMap<PathBuf, ParseResult> = HashMap::new();
+
+        // ── Initial pass: ProtoIndex depth-first order ───────────────────────
+        // Iterate all known paths (root network dir first, subnets before plain files,
+        // DFS). Stale files that are already in remainder_queue are skipped here and
+        // handled in the remainder loop below.
+        for path in self.proto_index.ordered_paths() {
+            // Skip if already queued as stale or already processed this session.
+            if self.processed.contains_key(&path) {
+                tracing::warn!("This shouldn't happen");
+                continue;
+            }
+
+            let (actual_path, result) = Self::parse_one_codec_path(
+                path.clone(),
+                &mut self.builder,
+                global_bb.clone(),
+                self.proto_index.clone(),
+                self.write,
+            )
+            .await;
+
+            match result {
+                Err(e) => {
+                    tracing::warn!("[parse_sequential] parse failed for {:?}: {e}", actual_path);
+                    latest.insert(
+                        actual_path.clone(),
+                        ParseResult {
+                            path: actual_path,
+                            rewritten_content: None,
+                            dependent_paths: Vec::new(),
+                            diagnostics: vec![ParseDiagnostic::parse_error(
+                                format!("Parse failed: {e}"),
+                                0,
+                            )],
+                        },
+                    );
+                }
+                Ok(with_codec) => {
+                    *self.processed.entry(actual_path.clone()).or_insert(0) += 1;
+                    let (parse_result, _codec) = (with_codec.result, with_codec.codec);
+
+                    let unresolved_refs: Vec<&UnresolvedReference> = parse_result
+                        .diagnostics
+                        .iter()
+                        .filter_map(|d| d.as_unresolved_reference())
+                        .collect();
+
+                    let mut dependent_paths = Vec::new();
+                    for unresolved in &unresolved_refs {
+                        let is_asset = unresolved.other_keys.iter().any(|key| {
+                            if let NodeKey::Path { net, .. } = key {
+                                *net == asset_namespace().bref()
+                            } else {
+                                false
+                            }
+                        });
+                        if is_asset {
+                            self.process_asset_reference(&actual_path, unresolved);
+                        } else {
+                            let Some((dep_str, net)) = unresolved.as_unresolved_source() else {
+                                continue;
+                            };
+                            // Use in_epoch_0=true: paths known to ProtoIndex that have not yet
+                            // been processed will be visited by the ordered_paths initial pass —
+                            // don't double-enqueue them into remainder_queue.  The guard inside
+                            // process_unresolved_reference skips enqueue only when
+                            // known_to_proto_index && in_epoch_0 && !already_processed, which
+                            // is exactly the set of paths the ordered_paths loop will cover.
+                            self.process_unresolved_reference(&actual_path, &dep_str, net, true);
+                            dependent_paths.push((dep_str, net));
+                        }
+                    }
+
+                    // If this file still has unresolved references after its initial-pass
+                    // parse, re-queue it so the remainder loop can retry once its
+                    // dependencies have been processed.
+                    if !unresolved_refs.is_empty() {
+                        self.remainder_queue.push_back(actual_path.clone());
+                    }
+
+                    let file_path = if actual_path.is_dir() {
+                        detect_network_file(&actual_path).unwrap_or(actual_path.clone())
+                    } else {
+                        actual_path.clone()
+                    };
+                    let _ = self.builder.tx().send(BeliefEvent::FileParsed(file_path));
+
+                    latest.insert(
+                        actual_path.clone(),
+                        ParseResult {
+                            path: actual_path,
+                            rewritten_content: parse_result.rewritten_content,
+                            dependent_paths,
+                            diagnostics: parse_result.diagnostics,
+                        },
+                    );
+                }
+            }
+        }
+
+        // ── Remainder loop: stale files, assets, and re-parses ───────────────
+        // Sort by processed count ascending each iteration so never-parsed items
+        // (count=0) run before re-parses (count≥1).
+        while !self.remainder_queue.is_empty() {
+            let mut candidates: Vec<PathBuf> = self.remainder_queue.drain(..).collect();
+            candidates.sort_by_key(|p| self.processed.get(p).copied().unwrap_or(0));
+
+            for path in candidates {
+                let parse_count = self.processed.get(&path).copied().unwrap_or(0);
+                if parse_count >= self.max_reparse_count {
+                    tracing::debug!("[parse_sequential] max reparse reached for {:?}", path);
+                    latest
+                        .entry(path.clone())
+                        .or_insert(ParseResult {
+                            path: path.clone(),
+                            rewritten_content: None,
+                            dependent_paths: Vec::new(),
+                            diagnostics: Vec::new(),
+                        })
+                        .diagnostics
+                        .push(ParseDiagnostic::ReparseLimitExceeded);
+                    continue;
+                }
+
+                // Asset files (no registered codec) are handled by process_asset.
+                // Mirrors the early-out in parse_epoch to avoid read_to_string on binary files.
+                let file_path_for_check = if path.is_dir() {
+                    detect_network_file(&path).unwrap_or(path.clone())
+                } else {
+                    path.clone()
+                };
+                if !file_path_for_check.is_dir() && CODECS.path_get(&file_path_for_check).is_none()
+                {
+                    *self.processed.entry(path.clone()).or_insert(0) += 1;
+                    if let Err(e) = self.process_asset(path.clone()).await {
+                        tracing::warn!(
+                            "[parse_sequential] process_asset failed for {:?}: {}",
+                            path,
+                            e
+                        );
+                    }
+                    continue;
+                }
+
+                let (actual_path, result) = Self::parse_one_codec_path(
+                    path.clone(),
+                    &mut self.builder,
+                    global_bb.clone(),
+                    self.proto_index.clone(),
+                    self.write,
+                )
+                .await;
+
+                match result {
+                    Err(e) => {
+                        tracing::warn!(
+                            "[parse_sequential] remainder parse failed for {:?}: {e}",
+                            actual_path
+                        );
+                    }
+                    Ok(with_codec) => {
+                        *self.processed.entry(actual_path.clone()).or_insert(0) += 1;
+                        let (parse_result, _codec) = (with_codec.result, with_codec.codec);
+
+                        let unresolved_refs: Vec<&UnresolvedReference> = parse_result
+                            .diagnostics
+                            .iter()
+                            .filter_map(|d| d.as_unresolved_reference())
+                            .collect();
+
+                        let mut dependent_paths = Vec::new();
+                        for unresolved in &unresolved_refs {
+                            let is_asset = unresolved.other_keys.iter().any(|key| {
+                                if let NodeKey::Path { net, .. } = key {
+                                    *net == asset_namespace().bref()
+                                } else {
+                                    false
+                                }
+                            });
+                            if is_asset {
+                                self.process_asset_reference(&actual_path, unresolved);
+                            } else {
+                                let Some((dep_str, net)) = unresolved.as_unresolved_source() else {
+                                    continue;
+                                };
+                                self.process_unresolved_reference(
+                                    &actual_path,
+                                    &dep_str,
+                                    net,
+                                    false,
+                                );
+                                dependent_paths.push((dep_str, net));
+                            }
+                        }
+
+                        let file_path = if actual_path.is_dir() {
+                            detect_network_file(&actual_path).unwrap_or(actual_path.clone())
+                        } else {
+                            actual_path.clone()
+                        };
+                        let _ = self.builder.tx().send(BeliefEvent::FileParsed(file_path));
+
+                        latest.insert(
+                            actual_path.clone(),
+                            ParseResult {
+                                path: actual_path,
+                                rewritten_content: parse_result.rewritten_content,
+                                dependent_paths,
+                                diagnostics: parse_result.diagnostics,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<ParseResult> = latest.into_values().collect();
+        Self::promote_unresolved_to_warnings(&mut results);
+        Ok(results)
+    }
+
+    /// Parse all items until empty using epoch-structured batching.
     ///
     /// ## Epoch Invariant
     ///
@@ -994,399 +1173,453 @@ impl DocumentCompiler {
     /// in that same epoch.** Cross-file dependencies only flow across epoch boundaries.
     /// This invariant makes intra-epoch parallelism safe.
     ///
-    /// When `jobs > 1`, primary-queue files (epoch 0) are dispatched as a parallel batch.
-    /// Reparse epochs (N ≥ 1) also run in parallel: each task starts with a fresh
-    /// `session_bb` and uses `global_bb` for the fast-path parent-network lookup
-    /// (see `try_initialize_stack_from_session_cache`).
+    /// ## Epoch 0: ProtoIndex-ordered network-first batching
     ///
-    /// When `jobs == 1`, the existing sequential `parse_next` loop is used unchanged.
-    pub async fn parse_all<B: BeliefSource + Clone + Send + 'static>(
+    /// Each network directory is processed in two mini-batches:
+    /// 1. The network's own index.md (single-file batch so its events commit before children run).
+    /// 2. The network's direct leaf children (non-subnet files) as a parallel batch.
+    ///
+    /// Subnet directories appear in `network_dirs()` in shallowest-first order, so by the
+    /// time we process `subnet/` its parent network's index.md is already committed.
+    /// `children_of(net_dir)` only returns files directly owned by that network (subnet files
+    /// are excluded by `iter_net_docs`), so no ancestor-walk ownership check is needed.
+    ///
+    /// ## Remainder loop (epoch ≥ 1)
+    ///
+    /// After epoch-0, `remainder_queue` contains assets and any files that had unresolved
+    /// references.  Items are sorted by ascending `processed` count before each batch:
+    /// assets (count=0) run first, then re-parses ordered by count.
+    pub async fn parse_all<B: BeliefSource + EpochDrain + Clone + Send + 'static>(
         &mut self,
         global_bb: B,
         force: bool,
     ) -> Result<Vec<ParseResult>, BuildonomyError> {
-        // Check for stale files (or all files if force=true)
+        // Seed remainder_queue with stale/modified files.
         let stale_files = self.check_stale_files(&global_bb, force).await?;
-
         if !stale_files.is_empty() {
-            let action = if force {
-                "force re-parse"
-            } else {
-                "modified/deleted files, will re-parse"
-            };
-            tracing::debug!("Found {} files to {}", stale_files.len(), action);
-
+            tracing::debug!("Found {} stale file(s) to re-parse", stale_files.len());
             for path in stale_files {
-                self.enqueue(path);
+                if !self.remainder_queue.contains(&path) {
+                    self.remainder_queue.push_back(path);
+                }
             }
         }
 
-        // Each path maps to its latest real ParseResult. Reparse runs replace earlier attempts,
-        // so callers always see exactly one result per path with no staleness bookkeeping.
-        //
-        // Exception: ReparseLimitExceeded is a compiler-internal sentinel emitted *instead of*
-        // a real parse. When it arrives we merge it into the existing entry's diagnostics so
-        // that the last real parse's UnresolvedReferences are preserved for promotion.
         let mut latest: HashMap<PathBuf, ParseResult> = HashMap::new();
-
-        // `global_bb` is expected to be a `QueryHandle<BeliefBase>` (or any `BeliefSource +
-        // Clone`) that already provides memoised `eval_query` results via `BeliefAccumulator`'s
-        // shared cache.  No additional `CachedBeliefSource` wrapping is needed here — the
-        // caller owns the cache lifecycle and invalidates it on each `BatchEnd`.
-        //
-        // Clone is cheap: `QueryHandle` clones share the same `Arc<Mutex<AccInner>>` and
-        // `Arc<AccCache>` so all `parse_next` / `parse_epoch_parallel` calls within this
-        // invocation see the same memoised results and the same up-to-date backing store.
         let cached_global_bb = global_bb;
+        let mut repo_seeded = self.builder.repo() != Bid::nil();
 
-        if self.jobs <= 1 {
-            // Sequential path — unchanged behaviour, byte-identical output.
-            while let Some(result) = self.parse_next(cached_global_bb.clone()).await? {
-                let is_sentinel = result
-                    .diagnostics
-                    .iter()
-                    .any(|d| matches!(d, ParseDiagnostic::ReparseLimitExceeded));
+        // ── Epoch 0: ProtoIndex-ordered network-first batching ───────────────
+        // in_epoch_0 = true: process_unresolved_reference skips proto_index-known paths
+        // (they will be dispatched by their own subnet batch in this loop).
+        for net_dir in self.proto_index.network_dirs() {
+            // Step 1: parse the network's own index.md as a single-file batch.
+            let _ = self.builder.tx().send(BeliefEvent::BatchStart);
+            let index_results = self
+                .parse_epoch(vec![net_dir.clone()], cached_global_bb.clone())
+                .await?;
+            let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
+            cached_global_bb.drain_epoch().await?;
+            self.process_epoch_batch_results(index_results, &mut repo_seeded, &mut latest, true)
+                .await?;
 
-                if is_sentinel {
-                    latest
-                        .entry(result.path.clone())
-                        .or_insert(result)
-                        .diagnostics
-                        .push(ParseDiagnostic::ReparseLimitExceeded);
-                } else {
-                    latest.insert(result.path.clone(), result);
-                }
-            }
-        } else {
-            // Parallel path.
-            //
-            // ## Epoch 0: depth-limited work-queue dispatch
-            //
-            // We use a `VecDeque` work queue seeded from `primary_queue`.  Each
-            // iteration pops one entry:
-            //
-            //   - If `proto_index.children_of(entry)` returns `Some`, the entry is a
-            //     network directory.  A subnet index.md is structurally just a document
-            //     within its parent network from `initialize_stack`'s perspective, so
-            //     we dispatch it as a **single-file batch** first (so its events commit
-            //     to `global_bb` before its children run).  Then we split its children:
-            //     non-network files go into an immediate parallel leaf batch; subnet
-            //     sub-directories are pushed back onto the queue for their own
-            //     single-file round.
-            //
-            //   - If `children_of` returns `None`, the entry is a plain file (or a
-            //     path not covered by `ProtoIndex`) and is dispatched directly.
-            //
-            // This ensures every file sees its parent network's committed state via
-            // `global_bb` before it is parsed, satisfying the `GlobalCache` fast-path
-            // invariant in `try_initialize_stack_from_session_cache`.
-            if !self.primary_queue.is_empty() {
-                let mut work_queue: std::collections::VecDeque<PathBuf> =
-                    self.primary_queue.drain(..).collect();
+            // Step 2: leaf children (non-subnet files) as a parallel batch.
+            // children_of() only returns files directly owned by this network
+            // (subnet-owned files are excluded by iter_net_docs), so no ownership
+            // check is needed here.
+            let leaf_batch: Vec<PathBuf> = self
+                .proto_index
+                .children_of(&net_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !c.is_dir())
+                .collect();
 
-                // repo_bid seeding: set once from the first task that discovers it.
-                let mut repo_seeded = self.builder.repo() != Bid::nil();
-
-                while let Some(entry) = work_queue.pop_front() {
-                    match self.proto_index.children_of(&entry) {
-                        Some(children) => {
-                            // ── Network directory ────────────────────────────────────
-                            // Step 1: dispatch the network's own index.md alone so its
-                            // events are committed before any child sees global_bb.
-                            //
-                            // The queue stores network dirs by their *directory* path
-                            // (from `normalize_queue_path`), not by the index.md path.
-                            // Resolve whichever form was actually enqueued.
-                            let net_entry = {
-                                let index_path = entry.join(NETWORK_NAME);
-                                let index_canonical = {
-                                    let c = index_path
-                                        .canonicalize()
-                                        .unwrap_or_else(|_| index_path.clone());
-                                    string_to_os_path(&os_path_to_string(&c))
-                                };
-                                // Prefer the directory form (normal case); fall back to
-                                // the file path if that's what was originally enqueued.
-                                if entry.is_dir() {
-                                    entry.clone()
-                                } else {
-                                    index_canonical
-                                }
-                            };
-
-                            let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-                            let index_results = self
-                                .parse_epoch_parallel(vec![net_entry], cached_global_bb.clone())
-                                .await?;
-                            let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-                            self.process_epoch_batch_results(
-                                index_results,
-                                &mut repo_seeded,
-                                &mut latest,
-                            )
-                            .await?;
-
-                            // Step 2: split children — leaf files into a parallel batch,
-                            // subnet sub-directories back onto the work queue.
-                            let mut leaf_batch: Vec<PathBuf> = Vec::new();
-                            for child in children {
-                                if child.is_dir() {
-                                    // Sub-network: handle in its own work-queue iteration
-                                    // so its index.md commits before its children run.
-                                    work_queue.push_back(child);
-                                } else {
-                                    leaf_batch.push(child);
-                                }
-                            }
-
-                            if !leaf_batch.is_empty() {
-                                let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-                                let leaf_results = self
-                                    .parse_epoch_parallel(leaf_batch, cached_global_bb.clone())
-                                    .await?;
-                                let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-                                self.process_epoch_batch_results(
-                                    leaf_results,
-                                    &mut repo_seeded,
-                                    &mut latest,
-                                )
-                                .await?;
-                            }
-                        }
-                        None => {
-                            // ── Plain file (or path not in ProtoIndex) ───────────────
-                            let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-                            let results = self
-                                .parse_epoch_parallel(vec![entry], cached_global_bb.clone())
-                                .await?;
-                            let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-                            self.process_epoch_batch_results(
-                                results,
-                                &mut repo_seeded,
-                                &mut latest,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-
-                // Defensive: primary_queue should be fully drained by the work-queue
-                // loop above.  If anything remains it was not reachable from
-                // `ProtoIndex` (stale index, new file added after build, or a
-                // filtering bug in the work-queue loop above).
-                if !self.primary_queue.is_empty() {
-                    tracing::warn!(
-                        "epoch-0 remainder: {} path(s) not dispatched by the ProtoIndex \
-                         work-queue loop; dispatching as unordered batch. This likely \
-                         indicates a stale ProtoIndex (new files added after build) or \
-                         a subnet-dir filtering bug. Paths: {:?}",
-                        self.primary_queue.len(),
-                        self.primary_queue.iter().collect::<Vec<_>>(),
-                    );
-                    let remainder: Vec<PathBuf> = self.primary_queue.drain(..).collect();
-                    let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-                    let batch_results = self
-                        .parse_epoch_parallel(remainder, cached_global_bb.clone())
-                        .await?;
-                    let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-                    self.process_epoch_batch_results(batch_results, &mut repo_seeded, &mut latest)
-                        .await?;
-                }
-            }
-
-            // Reparse rounds (epochs N ≥ 1): parallel dispatch via parse_epoch_parallel.
-            //
-            // The outer reparse state machine (max_reparse_count, reparse_stable,
-            // last_round_updates, pending_dependencies) is preserved — only the inner
-            // dispatch changes from sequential parse_next to a parallel batch.
-            //
-            // Files within a single reparse epoch are mutually independent by the epoch
-            // invariant: epoch-N files depend only on epoch 0..N-1 output, never on
-            // each other.  Within-round dependency resolution (file B seeing file A's
-            // events from the same round via lazy drain) is NOT a design requirement —
-            // the epoch invariant already guarantees correctness without it.
-            //
-            // Each reparse round is wrapped in one BatchStart/BatchEnd pair so the
-            // accumulator commits all round events as a unit before the next round.
-            while !self.reparse_queue.is_empty() {
-                // Check stability: if the queue is stable and no new node updates
-                // arrived since the last round, there is nothing left to resolve.
-                if self.reparse_stable && self.last_round_updates.is_empty() {
-                    tracing::debug!(
-                        "[Compiler] Reparse queue stable and no new updates — stopping reparse"
-                    );
-                    break;
-                }
-
-                // Collect all current reparse candidates into a batch, ordered by
-                // fewest unresolved dependencies first (mirrors peek_next_reparse_candidate
-                // priority logic, applied once to the whole queue).
-                let mut candidates: Vec<PathBuf> = self.reparse_queue.iter().cloned().collect();
-                candidates.sort_by_key(|path| {
-                    self.pending_dependencies
-                        .get(path)
-                        .map(|deps| {
-                            deps.iter()
-                                .filter(|d| !self.processed.contains_key(*d))
-                                .count()
-                        })
-                        .unwrap_or(0)
-                });
-
-                // Check per-path parse limits; any path at max gets a sentinel result
-                // and is dropped from the batch.
-                let mut sentinel_paths: Vec<PathBuf> = Vec::new();
-                let mut batch: Vec<PathBuf> = Vec::new();
-                for path in candidates {
-                    let parse_count = self.processed.get(&path).copied().unwrap_or(0);
-                    if parse_count >= self.max_reparse_count {
-                        tracing::debug!(
-                            "[Compiler] Max reparse limit reached for {:?} ({} attempts)",
-                            path,
-                            parse_count
-                        );
-                        sentinel_paths.push(path);
-                    } else {
-                        batch.push(path);
-                    }
-                }
-
-                // Emit sentinel results for over-limit paths.
-                for path in sentinel_paths {
-                    self.remove_from_queues(&path);
-                    latest
-                        .entry(path.clone())
-                        .or_insert(ParseResult {
-                            path: path.clone(),
-                            rewritten_content: None,
-                            dependent_paths: Vec::new(),
-                            diagnostics: Vec::new(),
-                        })
-                        .diagnostics
-                        .push(ParseDiagnostic::ReparseLimitExceeded);
-                }
-
-                if batch.is_empty() {
-                    break;
-                }
-
-                // Reset stability tracking for this round — process_epoch_batch_results
-                // will set reparse_stable = false if any new unresolved references appear.
-                self.reparse_stable = true;
-                self.last_round_updates.clear();
-
-                // Drain the reparse_queue of the paths we are about to dispatch.
-                self.reparse_queue.retain(|p| !batch.contains(p));
-
-                // Dispatch the whole round as one parallel batch.
+            if !leaf_batch.is_empty() {
                 let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-                let batch_results = self
-                    .parse_epoch_parallel(batch, cached_global_bb.clone())
+                let leaf_results = self
+                    .parse_epoch(leaf_batch, cached_global_bb.clone())
                     .await?;
                 let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-
-                // process_epoch_batch_results re-enqueues any path that still has
-                // unresolved references (setting reparse_stable = false as needed).
-                let mut repo_seeded = self.builder.repo() != Bid::nil();
-                self.process_epoch_batch_results(batch_results, &mut repo_seeded, &mut latest)
+                cached_global_bb.drain_epoch().await?;
+                self.process_epoch_batch_results(leaf_results, &mut repo_seeded, &mut latest, true)
                     .await?;
             }
         }
 
-        // All passes complete. Exactly one result per path exists in `latest`.
-        // Any remaining UnresolvedReference is a permanent author error — promote to Warning.
+        // Seed remainder_queue with cached assets from session_bb not yet processed.
+        // Assets discovered during epoch-0 via process_asset_reference are already
+        // in remainder_queue; this catches cached assets whose referencing documents
+        // were not re-parsed (mtime hit).
+        {
+            let assets: Vec<(String, Bid)> = self
+                .builder
+                .session_bb()
+                .get_all_paths(asset_namespace(), false)
+                .await
+                .unwrap_or_default();
+            for (repo_relative_path, _bid) in assets {
+                if repo_relative_path.is_empty() {
+                    continue;
+                }
+                let asset_path = Self::normalize_queue_path(
+                    self.builder
+                        .repo_root()
+                        .join(string_to_os_path(&repo_relative_path)),
+                );
+                if !self.processed.contains_key(&asset_path)
+                    && !self.remainder_queue.contains(&asset_path)
+                {
+                    self.remainder_queue.push_back(asset_path);
+                }
+            }
+        }
+
+        // SPA shell reads session_bb, emits no events — safe outside BatchStart/BatchEnd.
+        if self.html_output_dir().is_some() {
+            self.generate_spa_shell().await?;
+        }
+
+        // ── Remainder loop (epoch ≥ 1) ───────────────────────────────────────
+        // Drain and sort by processed count ascending each iteration so assets
+        // (count=0) run before re-parses, and shallower re-parses run first.
+        while !self.remainder_queue.is_empty() {
+            let mut candidates: Vec<PathBuf> = self.remainder_queue.drain(..).collect();
+            candidates.sort_by_key(|p| self.processed.get(p).copied().unwrap_or(0));
+
+            let mut sentinel_paths: Vec<PathBuf> = Vec::new();
+            let mut batch: Vec<PathBuf> = Vec::new();
+            for path in candidates {
+                let count = self.processed.get(&path).copied().unwrap_or(0);
+                if count >= self.max_reparse_count {
+                    sentinel_paths.push(path);
+                } else {
+                    batch.push(path);
+                }
+            }
+
+            for path in sentinel_paths {
+                tracing::debug!("[Compiler] Max reparse limit reached for {:?}", path);
+                latest
+                    .entry(path.clone())
+                    .or_insert(ParseResult {
+                        path: path.clone(),
+                        rewritten_content: None,
+                        dependent_paths: Vec::new(),
+                        diagnostics: Vec::new(),
+                    })
+                    .diagnostics
+                    .push(ParseDiagnostic::ReparseLimitExceeded);
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let _ = self.builder.tx().send(BeliefEvent::BatchStart);
+            let batch_results = self.parse_epoch(batch, cached_global_bb.clone()).await?;
+            let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
+            cached_global_bb.drain_epoch().await?;
+            self.process_epoch_batch_results(batch_results, &mut repo_seeded, &mut latest, false)
+                .await?;
+        }
+
         let mut results: Vec<ParseResult> = latest.into_values().collect();
         Self::promote_unresolved_to_warnings(&mut results);
-
         Ok(results)
     }
 
-    /// Dispatch a batch of paths as concurrent parse tasks.
+    /// Dispatch a batch of paths as parse tasks for one epoch.
     ///
-    /// Each task constructs a fresh `GraphBuilder` (with a clone of the compiler's event
-    /// sender) and calls `parse_content`. Events flow directly to `global_bb` via the
-    /// shared sender — no post-epoch merge step is needed.
+    /// When `self.jobs == 1` each path is parsed inline in the current async context
+    /// using the compiler's own `builder` — no task spawn, no semaphore, no channel
+    /// overhead beyond the normal `tx` send. This gives the sequential path the same
+    /// BatchStart/BatchEnd envelope as the parallel path without any threading.
     ///
-    /// Tasks run sequentially on the current async executor. `parse_content` yields at
-    /// every `await` point (file I/O, `eval_query`), so the tokio reactor interleaves
-    /// I/O across files even without OS-thread parallelism. No `Send` bound is required —
-    /// `BeliefBase` uses `Rc<RefCell<T>>` on WASM, so `GraphBuilder` is not `Send`.
+    /// When `self.jobs > 1` each path is spawned as a `tokio::task::spawn` task.
+    /// Each task owns: a fresh `GraphBuilder`, a cloned `tx`, a cloned `global_bb`
+    /// (`QueryHandle` is `Clone` + `Arc`-backed, cheap to clone), and a cloned
+    /// `proto_index` (zero-copy `Arc` handle). No post-task merge step — events flow
+    /// directly to `BeliefAccumulator` via `tx`. Concurrency is bounded by `self.jobs`
+    /// via an `Arc<Semaphore>`.
     ///
-    /// True multi-thread parallelism (requiring `GraphBuilder: Send`) is left for a
-    /// future issue once the WASM/native `SharedLock` split is resolved.
+    /// Results are returned in input path order for deterministic output.
     ///
     /// Returns `Vec<(PathBuf, Result<ParseContentWithCodec>)>` in path order.
-    async fn parse_epoch_parallel<B: BeliefSource + Clone + Send + 'static>(
-        &self,
+    /// Resolve `path` to its concrete file path, read its content, send a
+    /// `FileParsed` mtime event on `builder.tx()`, call `parse_content`, and
+    /// optionally write rewritten content back to disk.
+    ///
+    /// The write happens inside this function (before returning) so that
+    /// subsequent epochs always read the BID-injected content from disk.
+    /// Ordering is preserved: the write completes before `parse_epoch` returns,
+    /// and `drain_epoch` / `BatchEnd` fences the epoch boundary before the next
+    /// epoch's reads begin.  In the parallel path each task owns a distinct
+    /// `file_path`, so concurrent writes within one epoch are safe.
+    ///
+    /// **Does not** handle the asset early-out — callers must check
+    /// `CODECS.path_get(&file_path).is_none()` before calling this function.
+    async fn parse_one_codec_path<B: BeliefSource + Clone + Send + 'static>(
+        path: PathBuf,
+        builder: &mut GraphBuilder,
+        global_bb: B,
+        proto_index: ProtoIndex,
+        write: bool,
+    ) -> (PathBuf, Result<ParseContentWithCodec, BuildonomyError>) {
+        let file_path = if path.is_dir() {
+            match detect_network_file(&path) {
+                Some(p) => p,
+                None => {
+                    return (
+                        path.clone(),
+                        Err(BuildonomyError::Codec(format!(
+                            "Directory has no index file: {}",
+                            path.display()
+                        ))),
+                    );
+                }
+            }
+        } else {
+            path.clone()
+        };
+
+        tracing::debug!("\n\n");
+        tracing::debug!("[parse_one_codec_path]: parsing {:?}", file_path);
+        let content = match tokio::fs::read_to_string(&file_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    path,
+                    Err(BuildonomyError::Codec(format!(
+                        "Failed to read {}: {e}",
+                        file_path.display()
+                    ))),
+                );
+            }
+        };
+
+        let _ = builder
+            .tx()
+            .send(BeliefEvent::FileParsed(file_path.clone()));
+
+        let mut result = builder
+            .parse_content(&file_path, content, global_bb, proto_index)
+            .await;
+
+        // Write rewritten content (BID injection, link updates) back to disk so
+        // subsequent epoch reads see the stabilised content.  Any write error is
+        // reported as a warning diagnostic rather than aborting the build.
+        if let Ok(ref mut with_codec) = result {
+            if let Some(ref contents) = with_codec.result.rewritten_content {
+                if write {
+                    if let Err(e) = tokio::fs::write(&file_path, contents).await {
+                        with_codec
+                            .result
+                            .diagnostics
+                            .push(crate::codec::ParseDiagnostic::warning(format!(
+                                "Failed to write rewritten content: {e}"
+                            )));
+                    }
+                }
+            }
+        }
+
+        (path, result)
+    }
+
+    async fn parse_epoch<B: BeliefSource + Clone + Send + 'static>(
+        &mut self,
         paths: Vec<PathBuf>,
         global_bb: B,
     ) -> Result<Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)>, BuildonomyError>
     {
-        let repo_root = self.builder.repo_root().to_path_buf();
-        let proto_index = self.proto_index.clone();
-        let tx = self.builder.tx().clone();
+        if self.jobs <= 1 {
+            // ── Sequential (inline) path ─────────────────────────────────────────────
+            // Runs in the current async context using self.builder directly.
+            // Asset paths (non-codec files) are routed to process_asset and their
+            // result is wrapped into the same return type for uniform handling by
+            // process_epoch_batch_results.
+            let mut results = Vec::with_capacity(paths.len());
+            for path in paths {
+                // Resolve directory → file_path here solely to perform the asset
+                // early-out check.  parse_one_codec_path will re-resolve independently
+                // for the actual read + parse work.  The double resolve is intentional:
+                // it keeps parse_one_codec_path's interface simple (takes only `path`)
+                // and detect_network_file is a cheap filesystem stat, not a parse.
+                let file_path = if path.is_dir() {
+                    match detect_network_file(&path) {
+                        Some(p) => p,
+                        None => {
+                            results.push((
+                                path.clone(),
+                                Err(BuildonomyError::Codec(format!(
+                                    "Directory has no index file: {}",
+                                    path.display()
+                                ))),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    path.clone()
+                };
 
-        let mut results = Vec::with_capacity(paths.len());
+                // Asset files (no registered codec) are handled by process_asset
+                // entirely inline. process_asset manages its own queue cleanup and
+                // event emission via tx. We do NOT push anything into results —
+                // process_epoch_batch_results only handles codec documents, and
+                // assets are already fully processed here.
+                if !file_path.is_dir() && CODECS.path_get(&file_path).is_none() {
+                    if let Err(e) = self.process_asset(path.clone()).await {
+                        tracing::warn!("[parse_epoch] process_asset failed for {:?}: {}", path, e);
+                    }
+                    continue;
+                }
 
-        for path in paths {
-            // Resolve the actual file path (directory → index.md).
-            let file_path = if path.is_dir() {
-                match detect_network_file(&path) {
-                    Some(p) => p,
-                    None => {
-                        results.push((
-                            path.clone(),
-                            Err(BuildonomyError::Codec(format!(
-                                "Directory has no index file: {}",
-                                path.display()
-                            ))),
-                        ));
-                        continue;
+                let proto_index = self.proto_index.clone();
+                let write = self.write;
+                results.push(
+                    Self::parse_one_codec_path(
+                        path,
+                        &mut self.builder,
+                        global_bb.clone(),
+                        proto_index,
+                        write,
+                    )
+                    .await,
+                );
+            }
+            Ok(results)
+        } else {
+            // ── Parallel (spawned-task) path ─────────────────────────────────────────
+            //
+            // Each task writes to its own isolated channel rather than the shared `tx`.
+            // After all tasks finish, we drain per-task buffers into the shared `tx` in
+            // original path order (idx 0, 1, 2, …).  This guarantees that within a single
+            // epoch batch the accumulator sees events document-by-document in a
+            // deterministic lexical order, which is required for first-one-wins ID
+            // collision resolution to be stable across runs.
+            //
+            // Concretely: if file A (idx=0) and file B (idx=1) both have `## Configuration`
+            // with no explicit anchor in the same network, A's events always land in
+            // session_bb before B's, so A always wins regardless of which task finishes
+            // first at the OS scheduler level.
+            let repo_root = self.builder.repo_root().to_path_buf();
+            let proto_index = self.proto_index.clone();
+            let shared_tx = self.builder.tx().clone();
+            let write = self.write;
+            let semaphore = Arc::new(Semaphore::new(self.jobs));
+
+            let n = paths.len();
+
+            // Return type now includes the per-task event buffer alongside the parse result.
+            let mut join_set: JoinSet<(
+                usize,
+                PathBuf,
+                Result<ParseContentWithCodec, BuildonomyError>,
+                Vec<BeliefEvent>,
+            )> = JoinSet::new();
+
+            for (idx, path) in paths.into_iter().enumerate() {
+                let repo_root = repo_root.clone();
+                let proto_index = proto_index.clone();
+                let global_bb = global_bb.clone();
+                let sem = Arc::clone(&semaphore);
+                let span = tracing::info_span!(
+                    "parse_task",
+                    task_idx = idx,
+                    path = %path.display(),
+                );
+
+                join_set.spawn(
+                    async move {
+                        // Acquire a semaphore permit before doing any work so that at most
+                        // `jobs` tasks run concurrently. The permit is released when this
+                        // async block returns (i.e. when _permit is dropped).
+                        let _permit = sem.acquire_owned().await.expect("semaphore closed");
+
+                        // Per-task isolated channel.  All events from this document's
+                        // parse_content call land here; they are forwarded to the shared
+                        // channel in idx order after the join set drains, ensuring
+                        // deterministic event ordering within the epoch batch.
+                        let (task_tx, mut task_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<BeliefEvent>();
+
+                        // Construct a fresh builder whose events go to the task-local channel.
+                        let mut builder = match GraphBuilder::new(&repo_root, Some(task_tx.clone()))
+                        {
+                            Ok(b) => b,
+                            Err(e) => return (idx, path, Err(e), Vec::new()),
+                        };
+
+                        // Delegate directory resolution, file read, FileParsed event,
+                        // parse_content, and optional write-back to the shared helper.
+                        // The parallel path never hits the asset early-out (assets are
+                        // pre-filtered before epoch dispatch), so calling
+                        // parse_one_codec_path directly is safe here.
+                        let (orig_path, result) = DocumentCompiler::parse_one_codec_path(
+                            path,
+                            &mut builder,
+                            global_bb,
+                            proto_index,
+                            write,
+                        )
+                        .await;
+
+                        // Drop the builder (and its task_tx clone) so the channel is fully
+                        // closed; then drain all buffered events into a Vec for ordered replay.
+                        drop(builder);
+                        drop(task_tx);
+                        let mut task_events = Vec::new();
+                        while let Some(ev) = task_rx.recv().await {
+                            task_events.push(ev);
+                        }
+
+                        (idx, orig_path, result, task_events)
+                    }
+                    .instrument(span),
+                );
+            }
+
+            // Collect results from JoinSet (completion order) into an index-keyed map,
+            // then reconstruct in original path order for deterministic output.
+            let mut indexed: HashMap<
+                usize,
+                (
+                    PathBuf,
+                    Result<ParseContentWithCodec, BuildonomyError>,
+                    Vec<BeliefEvent>,
+                ),
+            > = HashMap::with_capacity(n);
+            while let Some(join_result) = join_set.join_next().await {
+                match join_result {
+                    Ok((idx, path, result, task_events)) => {
+                        indexed.insert(idx, (path, result, task_events));
+                    }
+                    Err(e) => {
+                        // A task panicked. Propagate as a BuildonomyError.
+                        return Err(BuildonomyError::Custom(format!("parse task panicked: {e}")));
                     }
                 }
-            } else {
-                path.clone()
-            };
+            }
 
-            // Read file content.
-            let content = match tokio::fs::read_to_string(&file_path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    results.push((
-                        path,
-                        Err(BuildonomyError::Codec(format!(
-                            "Failed to read {}: {e}",
-                            file_path.display()
-                        ))),
-                    ));
-                    continue;
+            // Replay per-task events to the shared channel in idx (lexical path) order.
+            // This is the point where ordering is enforced: all of task 0's events are
+            // forwarded before any of task 1's, etc., regardless of which task finished
+            // first.  The surrounding BatchStart/BatchEnd in parse_all brackets the entire
+            // epoch, so the accumulator still sees one coherent batch.
+            let mut results = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some((path, result, task_events)) = indexed.remove(&i) {
+                    for ev in task_events {
+                        let _ = shared_tx.send(ev);
+                    }
+                    results.push((path, result));
                 }
-            };
+            }
 
-            // Construct a fresh builder whose events go to the shared global_bb channel.
-            let mut builder = match GraphBuilder::new(&repo_root, Some(tx.clone())) {
-                Ok(b) => b,
-                Err(e) => {
-                    results.push((path, Err(e)));
-                    continue;
-                }
-            };
-
-            // Send FileParsed mtime event (mirrors parse_next step 6a).
-            let _ = builder
-                .tx()
-                .send(BeliefEvent::FileParsed(file_path.clone()));
-
-            // global_bb here is a QueryHandle (passed from parse_all) — eval_query
-            // results are shared across all tasks in this epoch batch via the AccCache.
-            let result = builder
-                .parse_content(&file_path, content, global_bb.clone(), proto_index.clone())
-                .await;
-
-            results.push((path, result));
+            Ok(results)
         }
-
-        Ok(results)
     }
 
     /// Promote lingering `UnresolvedReference` diagnostics to `Warning`.
@@ -1428,83 +1661,6 @@ impl DocumentCompiler {
         self.builder().session_bb()
     }
 
-    /// Peek at the next file from the reparse queue without removing it
-    ///
-    /// Files with the fewest unresolved dependencies are prioritized first.
-    fn peek_next_reparse_candidate(&mut self) -> Option<PathBuf> {
-        if self.reparse_queue.is_empty() {
-            return None;
-        }
-
-        // If primary queue is empty and reparse queue was stable (no new dependencies
-        // discovered in last round), only reparse if we've seen new node updates
-        if self.primary_queue.is_empty() && self.reparse_stable {
-            if self.last_round_updates.is_empty() {
-                tracing::debug!(
-                    "[Compiler] Reparse queue stable and no new updates - skipping reparse round"
-                );
-                return None;
-            } else {
-                tracing::debug!(
-                    "[Compiler] Reparse queue stable but {} new updates detected - proceeding",
-                    self.last_round_updates.len()
-                );
-            }
-        }
-
-        // Find the file with the fewest unresolved dependencies
-        let (best_idx, _) = self
-            .reparse_queue
-            .iter()
-            .enumerate()
-            .map(|(idx, path)| {
-                let unresolved_count = self
-                    .pending_dependencies
-                    .get(path)
-                    .map(|deps| {
-                        deps.iter()
-                            .filter(|d| !self.processed.contains_key(*d))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                (idx, unresolved_count)
-            })
-            .min_by_key(|(_, count)| *count)?;
-
-        self.reparse_queue.get(best_idx).cloned()
-    }
-
-    // /// Select the next file from the reparse queue, prioritizing by resolution impact
-    // ///
-    // /// Files with the fewest unresolved dependencies are processed first, as they are
-    // /// most likely to complete successfully and unblock other files.
-    // fn next_reparse_candidate(&mut self) -> Option<PathBuf> {
-    //     if self.reparse_queue.is_empty() {
-    //         return None;
-    //     }
-
-    //     // Find the file with the fewest unresolved dependencies
-    //     let (best_idx, _) = self
-    //         .reparse_queue
-    //         .iter()
-    //         .enumerate()
-    //         .map(|(idx, path)| {
-    //             let unresolved_count = self
-    //                 .pending_dependencies
-    //                 .get(path)
-    //                 .map(|deps| {
-    //                     deps.iter()
-    //                         .filter(|d| !self.processed.contains_key(*d))
-    //                         .count()
-    //                 })
-    //                 .unwrap_or(0);
-    //             (idx, unresolved_count)
-    //         })
-    //         .min_by_key(|(_, count)| *count)?;
-
-    //     self.reparse_queue.remove(best_idx)
-    // }
-
     /// Normalise an absolute path for queue storage.
     ///
     /// On Windows, `Path::canonicalize()` returns paths with the `\\?\` extended-path
@@ -1528,134 +1684,52 @@ impl DocumentCompiler {
         string_to_os_path(&os_path_to_string(&resolved))
     }
 
-    /// Add a path to the queue (e.g., from file watcher)
-    ///
-    /// This method checks if the path is already in either queue to avoid duplicates.
-    /// New paths are added to the primary queue.
-    /// Enqueue a path for parsing if not already queued
+    /// Enqueue a path for parsing if not already queued or processed.
     pub fn enqueue(&mut self, path: impl AsRef<Path>) {
         let path = Self::normalize_queue_path(path.as_ref().to_path_buf());
-        if !self.primary_queue.contains(&path) && !self.reparse_queue.contains(&path) {
-            // tracing::debug!("[Compiler] Enqueuing path: {:?}", path);
-            self.primary_queue.push_back(path);
+        if !self.remainder_queue.contains(&path) && !self.processed.contains_key(&path) {
+            self.remainder_queue.push_back(path);
         }
     }
 
-    /// Enqueue a path at the front of the primary queue (for prioritized parsing like file modifications)
+    /// Enqueue a path at the front of the remainder queue (for prioritized parsing).
     pub fn enqueue_front(&mut self, path: impl AsRef<Path>) {
         let path = Self::normalize_queue_path(path.as_ref().to_path_buf());
-        // Remove from reparse queue if present (fresh content takes precedence)
-        self.reparse_queue.retain(|p| p != &path);
-
-        if !self.primary_queue.contains(&path) {
-            // tracing::debug!("[Compiler] Enqueuing path at front (priority): {:?}", path);
-            self.primary_queue.push_front(path);
-        }
+        // Remove any existing entry so it appears only at the front.
+        self.remainder_queue.retain(|p| p != &path);
+        self.remainder_queue.push_front(path);
     }
 
-    /// Handle file modification event (reset parse count and prioritize)
+    /// Handle file modification event (reset parse count and prioritize).
     pub fn on_file_modified(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
-
-        // Reset parse count - it's fresh content
         self.processed.remove(&path);
-
-        // Enqueue at front for priority parsing
         self.enqueue_front(path);
     }
 
-    /// Handle file deletion event (clean up all tracking)
+    /// Handle file deletion event (clean up all tracking).
     pub fn on_file_deleted(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
-
         self.remove_from_queues(&path);
         self.processed.remove(&path);
-        self.pending_dependencies.remove(&path);
     }
 
-    /// Reset the parse count for a path (useful for file watcher re-parses)
-    ///
-    /// This allows a file to be re-parsed even if it has already been processed,
-    /// which is necessary when the file changes on disk.
+    /// Reset the parse count for a path (useful for file watcher re-parses).
     pub fn reset_processed(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref();
         self.processed.remove(path);
-        // Also clear any pending dependency tracking for this file
-        self.pending_dependencies.remove(path);
     }
 
-    /// Clear all processed tracking (for fresh re-parse of entire tree)
+    /// Clear all processed tracking (for fresh re-parse of entire tree).
     ///
-    /// This resets the parse count for all files but keeps the queue state.
-    /// Useful when you want to re-parse everything from scratch while maintaining
-    /// the builder's session_bb.
+    /// Resets the parse count for all files but keeps the queue state.
     pub fn clear_processed(&mut self) {
         self.processed.clear();
-        self.pending_dependencies.clear();
     }
 
-    /// Remove a path from all queues
+    /// Remove a path from the remainder queue.
     fn remove_from_queues(&mut self, path: &PathBuf) {
-        self.primary_queue.retain(|p| p != path);
-        self.reparse_queue.retain(|p| p != path);
-    }
-
-    async fn finalize(&mut self) -> Result<(), BuildonomyError> {
-        // Both queues empty - check if there are cached assets to verify
-        tracing::debug!("[Compiler] Both queues empty, checking for cached assets");
-
-        // Query session_bb for assets discovered during this parse session
-        // (mtime-based invalidation via check_stale_files handles cached assets)
-        let assets: Vec<(String, Bid)> = self
-            .builder
-            .session_bb()
-            .get_all_paths(asset_namespace(), false)
-            .await
-            .unwrap_or_default();
-
-        // Enqueue any assets not yet processed in this session
-        let mut newly_enqueued = 0;
-        for (repo_relative_path, _bid) in assets.iter() {
-            // Skip empty path (represents the network node itself, not an asset file)
-            if repo_relative_path.is_empty() {
-                continue;
-            }
-
-            let asset_absolute_path = Self::normalize_queue_path(
-                self.builder
-                    .repo_root()
-                    .join(string_to_os_path(repo_relative_path)),
-            );
-
-            if !self.processed.contains_key(&asset_absolute_path) {
-                tracing::debug!(
-                    "[Compiler] Enqueuing cached asset for content check: {:?}",
-                    asset_absolute_path
-                );
-                self.primary_queue.push_back(asset_absolute_path);
-                newly_enqueued += 1;
-            }
-        }
-
-        if newly_enqueued > 0 {
-            tracing::debug!(
-                "[Compiler] Enqueued {} cached assets for content verification",
-                newly_enqueued
-            );
-            // Continue to process the newly enqueued assets
-        } else {
-            // Generate HTML outputs now that all documents are parsed
-            if self.html_output_dir().is_some() {
-                self.generate_spa_shell().await?;
-            }
-            // tracing::debug!(
-            //     "State of session_bb at finalize:\n{}\n{}",
-            //     self.builder().session_bb().clone().consume(),
-            //     self.builder().session_bb().paths()
-            // );
-        }
-
-        Ok(())
+        self.remainder_queue.retain(|p| p != path);
     }
 
     /// Finalize HTML generation tasks that require synchronized BeliefBase
@@ -1966,19 +2040,25 @@ impl DocumentCompiler {
                 crate::event::EventOrigin::Remote,
             ));
 
-            // Process into session_bb
+            // Apply events to session_bb directly so the compiler's local cache
+            // reflects asset state immediately (e.g. so process_asset's
+            // maybe_existing check works correctly on subsequent calls within the
+            // same session). Derivative events are collected and appended so the
+            // full set is sent to global_bb via tx.
+            //
+            // doc_bb_mut writes have been removed — doc_bb is a per-parse scratch
+            // space that is rebuilt on each initialize_stack call; assets do not
+            // need to be visible there.
+            //
+            // tx sends go to global_bb through the accumulator's drain_epoch.
+            // session_bb is a separate local store — writing to it here is NOT a
+            // duplicate of the tx send.
             let mut derivatives = Vec::new();
             for event in update_queue.iter() {
                 derivatives.append(&mut self.builder.session_bb_mut().process_event(event)?);
             }
             update_queue.append(&mut derivatives);
 
-            // Process into doc_bb so assets are available for cache lookups
-            for event in update_queue.iter() {
-                self.builder.doc_bb_mut().process_event(event)?;
-            }
-
-            // Send to global cache via tx
             for event in update_queue.into_iter() {
                 self.builder.tx().send(event)?;
             }
@@ -2004,7 +2084,7 @@ impl DocumentCompiler {
         }))
     }
 
-    fn process_asset_reference(&mut self, path: &PathBuf, unresolved: &UnresolvedReference) {
+    fn process_asset_reference(&mut self, _path: &PathBuf, unresolved: &UnresolvedReference) {
         // Extract asset path from NodeKey
         let asset_path_key = unresolved.other_keys.iter().find_map(|key| {
             if let NodeKey::Path { net, path } = key {
@@ -2028,57 +2108,29 @@ impl DocumentCompiler {
             let asset_absolute_path = AnchorPathBuf::from(repo_root.clone())
                 .as_anchor_path()
                 .join(asset_relative_path);
-            let repo_relative_asset: &str = asset_relative_path;
+            let _repo_relative_asset: &str = asset_relative_path;
 
             let absolute_path = Self::normalize_queue_path(string_to_os_path(&asset_absolute_path));
-            // Always enqueue asset files to check for content changes
-            // even if already tracked in session_bb
+            // Add to remainder_queue for processing (dedup check avoids double-dispatch).
             if !self.processed.contains_key(&absolute_path)
-                && !self.primary_queue.contains(&absolute_path)
-                && !self.reparse_queue.contains(&absolute_path)
+                && !self.remainder_queue.contains(&absolute_path)
             {
                 tracing::debug!(
                     "[Compiler] Queueing asset file for content check: {:?}",
                     asset_absolute_path
                 );
-                self.primary_queue.push_back(absolute_path);
-            }
-
-            // Check if asset already tracked via BeliefBase
-            let asset_already_tracked = self
-                .builder
-                .session_bb()
-                .paths()
-                .net_get_from_path(&asset_namespace().bref(), repo_relative_asset)
-                .is_some();
-
-            if !asset_already_tracked {
-                // Asset not yet in session_bb - document needs reparse after asset loads
-                tracing::debug!(
-                    "[Compiler] Document {:?} references untracked asset: {:?}",
-                    path,
-                    asset_absolute_path
-                );
-
-                // Add document to reparse queue (will reparse after asset is processed)
-                if !self.reparse_queue.contains(path) {
-                    tracing::debug!(
-                        "[Compiler] Adding document {:?} to reparse queue (awaiting asset)",
-                        path
-                    );
-                    self.reparse_queue.push_back(path.clone());
-                    self.reparse_stable = false;
-                }
-            } else {
-                tracing::debug!(
-                    "[Compiler] Asset already tracked: {:?}",
-                    repo_relative_asset
-                );
+                self.remainder_queue.push_back(absolute_path);
             }
         }
     }
 
-    fn process_unresolved_reference(&mut self, path: &Path, net_dep_path_str: &str, net_ref: Bref) {
+    fn process_unresolved_reference(
+        &mut self,
+        path: &Path,
+        net_dep_path_str: &str,
+        net_ref: Bref,
+        in_epoch_0: bool,
+    ) {
         // Use session_bb rather than doc_bb here. doc_bb is cleared and rebuilt for each
         // document in initialize_stack, so for plain .md files it only contains that file's
         // local nodes — the root network node (and its pathmap entry) is absent.
@@ -2111,7 +2163,13 @@ impl DocumentCompiler {
             .find(|net| net.bref() == net_ref)
             .copied()
         else {
-            tracing::warn!("self.builder().session_bb() does not have a network node with bref {} initialized in its pathmapmap", net_ref);
+            tracing::warn!(
+                "[process_unresolved_reference] session_bb has no net with bref {} \
+                 (dep={:?}, from={:?})",
+                net_ref,
+                net_dep_path_str,
+                path,
+            );
             return;
         };
         let full_dep_path = if let Some((_home_net, net_path, _order)) =
@@ -2124,6 +2182,21 @@ impl DocumentCompiler {
                     .join(net_dep_path_str)
                     .into_string(),
             );
+
+            // Guard: if dep_path is absolute (e.g. an MDN slug like
+            // "/en-US/docs/Web/JavaScript/Reference/..."), joining it onto
+            // repo_root produces a nonsense path like
+            // "/repo/.bench_corpora/.../en-US/docs/...".  These are external
+            // URL slugs that will never exist on disk — skip them early rather
+            // than letting canonicalize produce a confusing debug message.
+            if dep_path.is_absolute() {
+                tracing::trace!(
+                    "[Compiler] Skipping absolute-slug dependency {:?} (external URL slug, not a repo path)",
+                    dep_path
+                );
+                return;
+            }
+
             // Resolve relative to builder's repo_root
             self.builder.repo_root().join(dep_path)
         } else {
@@ -2138,49 +2211,113 @@ impl DocumentCompiler {
         let canonical_dep_path = match full_dep_path.canonicalize() {
             Ok(p) => Self::normalize_queue_path(p),
             Err(_) => {
-                tracing::debug!(
+                tracing::trace!(
                     "[Compiler] Cannot canonicalize {:?}, treating as external",
                     full_dep_path
                 );
                 return; // Skip external/non-existent dependencies
             }
         };
-        // Enqueue dependency if not already processed or queued
-        if !self.processed.contains_key(&canonical_dep_path)
-            && !self.primary_queue.contains(&canonical_dep_path)
-            && !self.reparse_queue.contains(&canonical_dep_path)
-        {
-            // tracing::debug!(
-            //     "[Compiler] Enqueuing new dependency: {:?}",
-            //     canonical_dep_path
-            // );
-            self.primary_queue.push_back(canonical_dep_path.clone());
+
+        // Guard: reject out-of-repo paths. Cross-repo references are not supported —
+        // strip_prefix(repo_root) would silently fail at HTML/asset write sites.
+        // A future --include-root CLI flag would lift this restriction.
+        if !canonical_dep_path.starts_with(self.builder.repo_root()) {
+            tracing::warn!(
+                "[Compiler] Dependency {:?} (from {:?}) resolves outside repo_root {:?} — \
+                 cross-repo references are not yet supported, skipping",
+                canonical_dep_path,
+                path,
+                self.builder.repo_root(),
+            );
+            return;
         }
 
-        // Track this dependency relationship
-        self.pending_dependencies
-            .entry(path.to_path_buf())
-            .or_default()
-            .push(canonical_dep_path);
+        // Enqueue dependency if not already processed or queued.
+        //
+        // If ProtoIndex has a sort key for this path it is already a known child of some
+        // network directory and will be dispatched by the work-queue leaf batch — no need
+        // to enqueue it again or warn.  The warning is reserved for genuinely unknown paths
+        // (new files added after build, or a ProtoIndex coverage gap).
+        //
+        // NOTE: the "known_to_proto_index → skip" guard was designed for parse_all's
+        // ProtoIndex work-queue, where children are pre-dispatched by epoch batching.
+        // parse_sequential does NOT use the work-queue: it relies on UnresolvedReference
+        // diagnostics from the root network's parse to discover children, which is exactly
+        // this code path.  Skipping enqueue because a path is "known to ProtoIndex" breaks
+        // parse_sequential — the child never gets queued and the corpus is never processed.
+        //
+        // The guard is therefore conditional: only skip if the caller is the parse_all
+        // work-queue path, i.e. self.proto_index_dispatch_active.  For parse_sequential
+        // (and any other caller that drives parse_next directly) we always enqueue.
+        let already_queued = self.processed.contains_key(&canonical_dep_path)
+            || self.remainder_queue.contains(&canonical_dep_path);
+        let known_to_proto_index = self.proto_index.sort_key_for(&canonical_dep_path).is_some();
+
+        tracing::trace!(
+            "[process_unresolved_reference] candidate={:?} already_queued={} \
+             known_to_proto_index={} in_epoch_0={}",
+            canonical_dep_path,
+            already_queued,
+            known_to_proto_index,
+            in_epoch_0,
+        );
+
+        if !already_queued {
+            if known_to_proto_index && in_epoch_0 {
+                // parse_all epoch-0 loop will dispatch this child via its own subnet batch.
+                // Don't double-enqueue.
+                tracing::trace!(
+                    "[process_unresolved_reference] skipping enqueue of {:?}: \
+                     in epoch-0 and ProtoIndex will dispatch it",
+                    canonical_dep_path,
+                );
+            } else if CODECS.path_get(&canonical_dep_path).is_some() && !known_to_proto_index {
+                tracing::warn!(
+                    "[Compiler] Document dependency {:?} (referenced from {:?}) was not in \
+                     the ProtoIndex — possible stale index or new file added after build. \
+                     Enqueueing as late discovery.",
+                    canonical_dep_path,
+                    path,
+                );
+                self.remainder_queue.push_back(canonical_dep_path.clone());
+            } else {
+                // Not known to ProtoIndex, or known but parse_sequential is driving
+                // (in_epoch_0=false) — enqueue unconditionally.
+                tracing::trace!(
+                    "[process_unresolved_reference] enqueueing {:?} \
+                     (known_to_proto_index={} in_epoch_0={})",
+                    canonical_dep_path,
+                    known_to_proto_index,
+                    in_epoch_0,
+                );
+                self.remainder_queue.push_back(canonical_dep_path.clone());
+            }
+        }
     }
-    /// Check if there are pending items to parse
+    /// Check if there are pending items to parse.
     pub fn has_pending(&self) -> bool {
-        !self.primary_queue.is_empty() || !self.reparse_queue.is_empty()
+        !self.remainder_queue.is_empty()
     }
 
-    /// Get the number of items in the primary parse queue
+    /// Get the number of items in the remainder queue.
+    pub fn remainder_queue_len(&self) -> usize {
+        self.remainder_queue.len()
+    }
+
+    /// Backward-compatible alias: returns remainder_queue_len.
     pub fn primary_queue_len(&self) -> usize {
-        self.primary_queue.len()
+        self.remainder_queue.len()
     }
 
-    /// Get the number of items in the reparse queue
+    /// Returns 0 (reparse queue no longer exists separately).
     pub fn reparse_queue_len(&self) -> usize {
-        self.reparse_queue.len()
+        0
     }
 
-    /// Get the total number of items across both queues
+    /// Get the total number of items in the remainder queue.
     pub fn total_queue_len(&self) -> usize {
-        self.primary_queue.len() + self.reparse_queue.len()
+        self.remainder_queue.len()
     }
 
     /// Get a reference to the underlying builder
@@ -2203,57 +2340,21 @@ impl DocumentCompiler {
         self.processed.get(path.as_ref()).copied().unwrap_or(0)
     }
 
-    /// Get statistics about the compiler state (useful for debugging)
+    /// Get statistics about the compiler state (useful for debugging).
     pub fn stats(&self) -> CompilerStats {
         CompilerStats {
-            primary_queue_len: self.primary_queue.len(),
-            reparse_queue_len: self.reparse_queue.len(),
+            remainder_queue_len: self.remainder_queue.len(),
             processed_count: self.processed.len(),
-            pending_dependencies_count: self.pending_dependencies.len(),
             total_parses: self.processed.values().sum(),
         }
     }
 
-    /// Notify compiler of belief events (e.g., from event stream)
+    /// Notify compiler of belief events (e.g., from event stream).
     ///
-    /// This allows the compiler to track when new nodes are created/updated,
-    /// enabling smarter reparse decisions. Only reparse if we've seen updates
-    /// that could resolve pending dependencies.
-    pub fn on_belief_event(&mut self, event: &BeliefEvent) {
-        match event {
-            BeliefEvent::NodeUpdate(keys, _, _) => {
-                // Extract BIDs from keys and track them
-                for key in keys {
-                    match key {
-                        NodeKey::Bid { bid } => {
-                            self.last_round_updates.insert(bid.bref());
-                        }
-                        NodeKey::Bref { .. } => {
-                            // Brefs don't have BIDs, skip
-                        }
-                        NodeKey::Path { net, .. } | NodeKey::Id { net, .. } => {
-                            // Track network BID as a proxy for potential matches
-                            if *net != Bref::default() {
-                                self.last_round_updates.insert(*net);
-                            }
-                        }
-                    }
-                }
-                // New updates mean reparse might be productive
-                self.reparse_stable = false;
-            }
-            BeliefEvent::PathAdded(_, _, bid, _, _) | BeliefEvent::PathUpdate(_, _, bid, _, _) => {
-                self.last_round_updates.insert(bid.bref());
-                self.reparse_stable = false;
-            }
-            BeliefEvent::NodesRemoved(bids, _) => {
-                for bid in bids {
-                    self.last_round_updates.remove(&bid.bref());
-                }
-            }
-            _ => {}
-        }
-    }
+    /// No-op in the simplified single-queue architecture — the remainder loop
+    /// handles re-parses by parse count rather than by tracking specific node updates.
+    /// Kept for API compatibility with the watch service.
+    pub fn on_belief_event(&mut self, _event: &BeliefEvent) {}
 
     /// Export BeliefGraph to JSON file for client-side use
     ///
@@ -2390,7 +2491,6 @@ impl DocumentCompiler {
             })?;
 
         // Generate SPA shell with responsive template
-        use crate::codec::assets::{get_template, Layout};
         let template = get_template(Layout::Responsive);
 
         // Get BID string for entry point
@@ -2539,7 +2639,6 @@ impl DocumentCompiler {
         }
 
         // Wrap body with Layout::Simple template
-        use crate::codec::assets::{get_template, Layout};
         let template = get_template(Layout::Simple);
 
         // Generate SPA route (for interactive link and canonical URL)
@@ -2710,8 +2809,6 @@ impl DocumentCompiler {
         &self,
         manifest_data: &BTreeMap<String, Bid>,
     ) -> Result<(), BuildonomyError> {
-        use std::collections::HashSet;
-
         if manifest_data.is_empty() {
             return Ok(());
         }
@@ -2833,39 +2930,32 @@ impl DocumentCompiler {
 
         Ok(())
     }
-
-    /// Mark that we've completed a reparse round
-    ///
-    /// Call this when primary queue is empty and we're about to start a reparse round.
-    /// This allows tracking whether the reparse queue is stable (no new files discovered).
-    pub fn start_reparse_round(&mut self) {
-        if self.primary_queue.is_empty() && !self.reparse_queue.is_empty() {
-            let had_updates = !self.last_round_updates.is_empty();
-            self.last_round_updates.clear();
-
-            if !had_updates {
-                self.reparse_stable = true;
-                tracing::debug!("[Compiler] Reparse round starting with stable queue");
-            } else {
-                tracing::debug!("[Compiler] Reparse round starting with new updates");
-            }
-        }
-    }
 }
 
-/// Statistics about the compiler's current state
+/// Statistics about the compiler's current state.
 #[derive(Debug, Clone, Default)]
 pub struct CompilerStats {
-    pub primary_queue_len: usize,
-    pub reparse_queue_len: usize,
+    pub remainder_queue_len: usize,
     pub processed_count: usize,
-    pub pending_dependencies_count: usize,
     pub total_parses: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        beliefbase::{BeliefBase, BeliefGraph},
+        codec::{diagnostic::UnresolvedReference, network::NETWORK_CHILDREN_SENTINEL},
+        event::BeliefEvent,
+        nodekey::NodeKey,
+        properties::{Bid, WeightKind},
+        shard::{
+            export::export_beliefbase,
+            manifest::{SearchManifest, ShardConfig},
+        },
+    };
+    use petgraph::Direction;
+    use tokio::sync::mpsc::unbounded_channel;
 
     /// Helper: Create a test network directory with index.md file
     fn create_test_network(dir: &std::path::Path) {
@@ -2909,8 +2999,10 @@ Test network for unit tests.
 
         let compiler = result.unwrap();
         assert_eq!(compiler.max_reparse_count, 5);
-        assert!(compiler.has_pending());
-        assert_eq!(compiler.primary_queue_len(), 1);
+        // Construction no longer pre-seeds the queue; parse_sequential/parse_all
+        // iterate from proto_index.ordered_paths() directly.
+        assert!(!compiler.has_pending());
+        assert_eq!(compiler.remainder_queue_len(), 0);
         assert_eq!(compiler.reparse_queue_len(), 0);
     }
 
@@ -2936,8 +3028,7 @@ Test network for unit tests.
         let compiler = DocumentCompiler::new(temp_dir.path(), None, None, false).unwrap();
 
         let stats = compiler.stats();
-        assert_eq!(stats.primary_queue_len, 1);
-        assert_eq!(stats.reparse_queue_len, 0);
+        assert_eq!(stats.remainder_queue_len, 0);
         assert_eq!(stats.processed_count, 0);
         assert_eq!(stats.total_parses, 0);
     }
@@ -2946,11 +3037,6 @@ Test network for unit tests.
 
     #[test]
     fn test_promote_unresolved_to_warnings_converts_outgoing() {
-        use crate::codec::diagnostic::UnresolvedReference;
-        use crate::nodekey::NodeKey;
-        use crate::properties::{Bid, WeightKind};
-        use petgraph::Direction;
-
         let net_bref = Bid::default().bref();
         let unresolved = UnresolvedReference {
             direction: Direction::Outgoing,
@@ -2992,11 +3078,6 @@ Test network for unit tests.
 
     #[test]
     fn test_promote_unresolved_to_warnings_promotes_unresolved_source() {
-        use crate::codec::diagnostic::UnresolvedReference;
-        use crate::nodekey::NodeKey;
-        use crate::properties::{Bid, WeightKind};
-        use petgraph::Direction;
-
         let net_bref = Bid::default().bref();
         // Direction::Incoming — the source node of a relation could not be found.
         // These are promoted to warnings just like outgoing unresolved refs.
@@ -3030,11 +3111,6 @@ Test network for unit tests.
 
     #[test]
     fn test_promote_unresolved_without_location() {
-        use crate::codec::diagnostic::UnresolvedReference;
-        use crate::nodekey::NodeKey;
-        use crate::properties::{Bid, WeightKind};
-        use petgraph::Direction;
-
         let net_bref = Bid::default().bref();
         let unresolved = UnresolvedReference {
             direction: Direction::Outgoing,
@@ -3118,11 +3194,6 @@ Test network for unit tests.
     /// produces no warning. An unresolved reparse still does.
     #[test]
     fn test_promote_reparse_resolved_produces_no_warning() {
-        use crate::codec::diagnostic::UnresolvedReference;
-        use crate::nodekey::NodeKey;
-        use crate::properties::{Bid, WeightKind};
-        use petgraph::Direction;
-
         let net_bref = Bid::default().bref();
         let unresolved = UnresolvedReference {
             direction: Direction::Outgoing,
@@ -3164,8 +3235,6 @@ Test network for unit tests.
 
     #[tokio::test]
     async fn test_broken_link_produces_warning_in_parse_result() {
-        use crate::beliefbase::BeliefBase;
-
         let temp_dir = tempfile::tempdir().unwrap();
         create_test_network(temp_dir.path());
 
@@ -3216,9 +3285,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         network_dir: &std::path::Path,
         html_dir: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::{beliefbase::BeliefBase, event::BeliefEvent};
-        use tokio::sync::mpsc::unbounded_channel;
-
         let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
 
         // Background task: receive and process all events into global_bb.
@@ -3353,14 +3419,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// require a test-only config parameter.
     #[tokio::test]
     async fn test_sharded_export_writes_correct_structure() {
-        use crate::{
-            beliefbase::BeliefBase,
-            shard::{
-                export::export_beliefbase,
-                manifest::{SearchManifest, ShardConfig},
-            },
-        };
-
         let src_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
 
@@ -3374,9 +3432,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         // Compile to build a synchronized BeliefBase for graph extraction.
         // We use the event-loop pattern so the final_bb is fully populated.
         let final_bb = {
-            use crate::event::BeliefEvent;
-            use tokio::sync::mpsc::unbounded_channel;
-
             let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
             let mut event_bb = BeliefBase::empty();
             let processor = tokio::spawn(async move {
@@ -3470,8 +3525,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// deserialized as a `BeliefGraph` (backward compat with old viewer code).
     #[tokio::test]
     async fn test_monolithic_beliefbase_json_is_valid_belief_graph() {
-        use crate::beliefbase::BeliefGraph;
-
         let src_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
 
@@ -3501,8 +3554,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// Regression test for: sentinel left unreplaced in phase-2 (generate_deferred_html).
     #[tokio::test]
     async fn test_finalize_html_replaces_sentinel_in_index() {
-        use crate::codec::network::NETWORK_CHILDREN_SENTINEL;
-
         let src_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
 
@@ -3552,8 +3603,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// Verify sentinel replacement also works for subnet index.html files.
     #[tokio::test]
     async fn test_finalize_html_replaces_sentinel_in_subnet_index() {
-        use crate::codec::network::NETWORK_CHILDREN_SENTINEL;
-
         let src_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
 

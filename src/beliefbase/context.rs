@@ -43,7 +43,10 @@ impl<'a> ExtendedRelation<'a> {
         set: &'a BeliefBase,
     ) -> Option<ExtendedRelation<'a>> {
         let Some(other) = set.states().get(&other_bid) else {
-            tracing::info!("Could not find 'other' node: {other_bid}");
+            tracing::info!(
+                label = set.label,
+                "Could not find 'other' node: {other_bid}"
+            );
             return None;
         };
 

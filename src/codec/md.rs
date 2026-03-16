@@ -1825,17 +1825,41 @@ impl DocCodec for MdCodec {
                                     );
                                 } else {
                                     // Case B: title slug also collides (or there is no title
-                                    // slug). Insert empty-string sentinel so IRNode::id()
-                                    // suppresses the title fallback entirely; builder.rs
-                                    // assigns a bref-based id.
-                                    current.document.insert("id", value(""));
+                                    // slug). Assign a human-readable slug-N id (e.g.
+                                    // "details-2", "details-3") so the node has a stable,
+                                    // addressable anchor without falling back to a bref.
+                                    // Use seen_ids to find the next free suffix.
+                                    let base = match title_slug.rsplit_once('-') {
+                                        Some((prefix, suffix)) if suffix.parse::<u32>().is_ok() => {
+                                            prefix.to_string()
+                                        }
+                                        _ => title_slug.clone(),
+                                    };
+                                    let mut counter: u32 = 2;
+                                    let slug_n = loop {
+                                        let candidate = format!("{}-{}", base, counter);
+                                        if !self.seen_ids.contains(&candidate) {
+                                            break candidate;
+                                        }
+                                        counter += 1;
+                                        if counter > 9999 {
+                                            tracing::warn!(
+                                                "Pathological title anchor: fall back to original \
+                                                candidate. (bref-based node id will be assigned \
+                                                downstream)."
+                                            );
+                                            break candidate;
+                                        }
+                                    };
+                                    self.seen_ids.insert(slug_n.clone());
+                                    current.document.insert("id", value(slug_n.clone()));
                                     diagnostics.push(
                                         ParseDiagnostic::warning(format!(
                                             "Intra-document heading anchor collision: '{}' \
                                              appears more than once in this document. The \
-                                             second occurrence will not be addressable by \
-                                             this anchor.",
-                                            candidate
+                                             duplicate heading has been assigned the anchor \
+                                             '{}'.",
+                                            candidate, slug_n
                                         ))
                                         .with_location(line, col),
                                     );
@@ -2406,7 +2430,8 @@ schema = "Document"
     #[test]
     fn test_intra_document_heading_anchor_collision_title_derived() {
         // Two headings with the same title: the first claims the title-derived slug via id();
-        // the second collides and gets the empty-string sentinel, so id() returns None for it.
+        // the second collides and is assigned a slug-N id (e.g. "introduction-2") so it has
+        // a stable, human-readable anchor without falling back to a bref.
         // Both survive as section nodes with their titles intact.
         use crate::codec::DocCodec;
         use toml_edit::DocumentMut;
@@ -2445,12 +2470,12 @@ schema = "Document"
             "First section gets the title-derived slug"
         );
 
-        // Second Introduction: collision detected → empty-string sentinel → id() returns None
+        // Second Introduction: collision detected → Case B assigns slug-N → id() returns "introduction-2"
         assert_eq!(sections[1].title().as_deref(), Some("Introduction"));
         assert_eq!(
-            sections[1].id(),
-            None,
-            "Second section must have no id — collision suppressed the title-derived slug"
+            sections[1].id().as_deref(),
+            Some("introduction-2"),
+            "Second section must get a slug-N id — collision triggers stable slug-N assignment"
         );
     }
 
@@ -2515,8 +2540,8 @@ schema = "Document"
     #[test]
     fn test_intra_document_heading_anchor_collision_explicit_vs_title() {
         // An explicit anchor on the first heading blocks the later title-derived slug from
-        // claiming the same anchor. The second heading gets the empty-string sentinel so
-        // id() returns None, not the title-derived fallback "later".
+        // claiming the same anchor. The second heading has no explicit id and its title slug
+        // "later" is already taken — Case B assigns "later-2" as a stable slug-N id.
         use crate::codec::DocCodec;
         use crate::paths::path::to_anchor;
         use toml_edit::DocumentMut;
@@ -2560,11 +2585,11 @@ schema = "Document"
         // Explicit anchor on "First" is kept
         assert_eq!(first.id().as_deref(), Some("later"));
         // "Later" has no explicit anchor; title slug "later" is already taken by "First {#later}".
-        // Collision detected → empty-string sentinel inserted → id() returns None, not "later".
+        // Collision detected → Case B assigns slug-N "later-2" as a stable addressable anchor.
         assert_eq!(
-            later.id(),
-            None,
-            "Title-derived slug blocked by prior explicit anchor — sentinel suppresses fallback"
+            later.id().as_deref(),
+            Some("later-2"),
+            "Title-derived slug blocked by prior explicit anchor — Case B assigns slug-N fallback"
         );
         assert_eq!(to_anchor(&later.title().unwrap()), "later");
     }

@@ -12,7 +12,6 @@ use crate::{
     properties::{BeliefKind, BeliefNode, Bref, Weight, WeightKind},
 };
 use std::path::{Path, PathBuf};
-use walkdir::{DirEntry, WalkDir};
 
 /// Collision-safe placeholder emitted into the HTML body by `NetworkCodec::generate_html()`.
 /// Survives `write_fragment`'s `Layout::Simple` template wrapping because it sits inside
@@ -45,64 +44,6 @@ pub const NETWORK_CHILDREN_MARKER: &str = "<!-- network-children -->";
 /// Format is auto-detected via fallback parsing (YAML → JSON → TOML).
 pub const NETWORK_NAME: &str = "index.md";
 
-/// Iterates through a directory subtree, filtering to return a sorted list of network directories
-/// (directories containing an index.md file), as well as file paths
-/// matching known codec extensions.
-pub(crate) fn iter_net_docs<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
-    fn is_hidden(entry: &DirEntry) -> bool {
-        entry
-            .file_name()
-            .to_str()
-            .map(|s| s.starts_with("."))
-            .unwrap_or(false)
-    }
-    let mut subnets = Vec::default();
-    let mut sorted_files = WalkDir::new(&path)
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e) || e.path() == path.as_ref())
-        .filter_map(|e| e.ok().map(|e| e.into_path()))
-        .filter_map(|mut p| {
-            if p.is_file() {
-                // First check if this is a network config file (.noet)
-                let p_str = os_path_to_string(&p);
-                let p_ap = AnchorPath::new(&p_str);
-                if NETWORK_NAME == p_ap.filename() {
-                    // This is a network config file - return its parent directory
-                    p.pop();
-                    if !p.eq(&path.as_ref()) {
-                        subnets.push(p.clone());
-                        return Some(p);
-                    } else {
-                        return None;
-                    }
-                }
-
-                // Then check if this has a registered codec.
-                // Use new_file since p.is_file() is confirmed above — this prevents
-                // extensionless files (Gemfile, Makefile, etc.) from being classified
-                // as directories by AnchorPath and matching the (None, None) wildcard.
-                let p_ap_file = AnchorPath::new_file(&p_str);
-                if CODECS.get(&p_ap_file).is_some() {
-                    if subnets.iter().any(|subnet_path| p.starts_with(subnet_path)) {
-                        // Don't include subnet files
-                        None
-                    } else {
-                        Some(p)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<PathBuf>>();
-    // Collect parent directories, ordered from deepest to shallowest
-    sorted_files.sort_by(|a, b| a.components().cmp(b.components()));
-    sorted_files.dedup();
-    sorted_files
-}
-
 /// Detect network file in directory and return path to that file.
 pub fn detect_network_file(dir: &Path) -> Option<PathBuf> {
     if dir
@@ -129,29 +70,24 @@ pub fn detect_network_file(dir: &Path) -> Option<PathBuf> {
 pub struct NetworkCodec(MdCodec);
 
 impl DocCodec for NetworkCodec {
-    /// Parse a path into a proto network node, if detect_network_file returns Some, then populate
-    /// that IRNode, discovering direct filesystem descendants and setting path and kind
-    /// correctly.
+    /// Parse a path into a proto network node, setting `path`, `kind`, and `heading`.
     ///
-    /// This method handles filesystem traversal to discover a network's direct children.
-    /// Per the graph design, each network owns a **flat list** of 'document' or 'network' nodes
-    /// that are its **direct filesystem descendants**. This means:
-    ///
-    /// - **Prune subdirectories** containing BeliefNetwork files (they are sub-networks)
-    /// - **Flatten all other files** matching CODEC extensions as direct source→sink connections
-    /// - The parent network treats the entire non-network filetree as its direct children
+    /// Delegates frontmatter reading to `MdCodec::proto`. Does **not** perform any
+    /// filesystem traversal — child relations are populated separately by
+    /// [`DocCodec::prepare_proto_relations`], which is called by
+    /// [`crate::codec::proto_index::ProtoIndex`] after it computes the child list.
     ///
     /// ## Alternative Implementations via Codec Swapping
     ///
-    /// This filesystem-based implementation is just one strategy. The [`crate::codec::CODECS`] map
-    /// allows swapping implementations at runtime for different environments:
+    /// The [`crate::codec::CODECS`] map allows swapping implementations at runtime for
+    /// different environments:
     ///
-    /// - **Native/Desktop**: Use this `IRNode` with direct filesystem access
-    /// - **Browser/WASM**: Swap in a `BrowserIRNode` that reads from IndexedDB
-    /// - **Testing**: Swap in a `MockIRNode` with in-memory content
+    /// - **Native/Desktop**: `ProtoIndex::build` does one `WalkDir` pass and calls
+    ///   `prepare_proto_relations` per network dir.
+    /// - **Browser/WASM**: Swap in a codec that reads child lists from IndexedDB.
+    /// - **Testing**: Swap in a `MockIRNode` with in-memory content.
     ///
-    /// The codec abstraction provides this flexibility without changing the compiler or
-    /// builder layers. See [crate::codec] for details on how to swap out `CODECS`.
+    /// See [`crate::codec`] for details on how to swap out `CODECS`.
     fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError> {
         let Some(network_filepath) = detect_network_file(path) else {
             return Ok(None);
@@ -171,10 +107,25 @@ impl DocCodec for NetworkCodec {
         proto.path = os_path_to_string(network_dir);
         proto.kind.insert(BeliefKind::Network);
         proto.heading = 1;
-        for doc_path in iter_net_docs(network_dir) {
-            let relative_path = doc_path.strip_prefix(network_dir).expect(
-                "We are iterating network dir, we should be getting absolute paths returned.",
-            );
+        Ok(Some(proto))
+    }
+
+    /// Populate `proto.upstream` with `WeightKind::Section` relations for each child path.
+    ///
+    /// `network_dir` is the absolute directory that owns the network. Each entry in
+    /// `child_paths` is stripped to a repo-relative path and inserted as an
+    /// `IntermediateRelation` with an unresolved `Bref::default()` net, which
+    /// `Key::regularize` fills in during processing.
+    fn prepare_proto_relations(
+        &self,
+        proto: &mut IRNode,
+        network_dir: &Path,
+        child_paths: &[std::path::PathBuf],
+    ) -> Result<(), BuildonomyError> {
+        for child_path in child_paths {
+            let relative_path = child_path
+                .strip_prefix(network_dir)
+                .expect("child_paths are always under network_dir");
             let path_str = os_path_to_string(relative_path);
             if !path_str.is_empty() {
                 let node_key = NodeKey::Path {
@@ -191,8 +142,7 @@ impl DocCodec for NetworkCodec {
                 ));
             }
         }
-
-        Ok(Some(proto))
+        Ok(())
     }
 
     fn parse(
@@ -670,4 +620,6 @@ mod tests {
             "file must be unchanged when sentinel is absent"
         );
     }
+
+    // iter_net_docs sort order is tested in proto_index::tests::test_net_dir_children_sort_subnet_first
 }

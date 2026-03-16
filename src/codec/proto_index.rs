@@ -5,15 +5,16 @@
 //!
 //! ## Motivation
 //!
-//! `NetworkCodec::proto` calls `iter_net_docs` (a `WalkDir` subtree scan) every time it is
-//! asked to produce a proto for a network directory.  In `initialize_stack`, this fires once
-//! per ancestor directory per parsed document — O(networks × files) scans total.
+//! `NetworkCodec::proto` used to call `net_dir_children` (a `WalkDir` subtree scan) every time it
+//! is asked to produce a proto for a network directory. In `initialize_stack`, this fires once per
+//! ancestor directory per parsed document — O(networks × files) scans total.
 //!
 //! `ProtoIndex` replaces that pattern:
 //!
 //! 1. **Build once** (`ProtoIndex::build`) — one `WalkDir` from `repo_root` partitions every
-//!    reachable file into its owning network directory.  The result is identical to running
-//!    `iter_net_docs` separately for each network, but costs one filesystem pass instead of N.
+//!    reachable file into its owning network directory via `net_dir_partition`.  The result is
+//!    identical to running `net_dir_children` separately for each network, but costs O(files)
+//!    instead of O(files × depth).
 //!
 //! 2. **Read cheaply** — `sort_key_for` and `proto_for` are pure read-only lookups after
 //!    `build` returns.  No further filesystem access occurs during parsing.
@@ -29,39 +30,34 @@
 //!   resolved belief state.
 //! - Not a `PathMap` — `PathMap` holds `BID → ordered position`; `ProtoIndex` holds
 //!   `PathBuf → Vec<PathBuf>` (pre-belief-resolution filesystem structure).
-//! - Not a full replacement for `NetworkCodec::proto` in all contexts — only replaces it in
-//!   the `initialize_stack` call chain.  `NetworkCodec::proto` keeps its own `iter_net_docs`
-//!   call for contexts where `ProtoIndex` is not available (e.g. `create_network_file`).
 //! - Not a holder of all relation types — `proto_for` only populates `upstream` with
-//!   `WeightKind::Section` child-path relations (the only type `NetworkCodec::proto` puts
-//!   there).  Schema-derived and markdown-link edges are populated later by `MdCodec::parse`
+//!   `WeightKind::Section` child-path relations (via `DocCodec::prepare_proto_relations`).
+//!   Schema-derived and markdown-link edges are populated later by `MdCodec::parse`
 //!   and `traverse_schema`.
 
 use parking_lot::RwLock;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
+use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     codec::{
-        belief_ir::IntermediateRelation,
-        md::MdCodec,
-        network::{detect_network_file, iter_net_docs, NETWORK_NAME},
-        DocCodec, IRNode,
+        network::{detect_network_file, NETWORK_NAME},
+        IRNode, CODECS,
     },
     error::BuildonomyError,
-    nodekey::NodeKey,
-    paths::{os_path_to_string, string_to_os_path},
-    properties::{BeliefKind, Bref, Weight, WeightKind},
+    paths::{os_path_to_string, string_to_os_path, AnchorPath},
+    properties::BeliefKind,
 };
 
 /// Filesystem-level index of every network directory in the repo.
 ///
-/// Maps each absolute network directory path → its lexically-ordered list of direct children
-/// (files with registered codec extensions, plus subnet directories).  The ordering is
-/// identical to `iter_net_docs` output: lexicographic by path components.
+/// Maps each absolute network directory path → its ordered list of direct children
+/// (files with registered codec extensions, plus subnet directories).  The ordering
+/// is lexicographic: subnet directories and plain files interleave alphabetically.
 ///
 /// # Thread Safety
 ///
@@ -71,8 +67,139 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct ProtoIndex {
     /// `PathBuf` = absolute network directory
-    /// `Vec<PathBuf>` = lexically-ordered direct children produced by the repo-wide scan
+    /// `Vec<PathBuf>` = ordered direct children produced by the repo-wide scan
     inner: Arc<RwLock<HashMap<PathBuf, Vec<PathBuf>>>>,
+}
+
+/// Returns the direct children of a network directory: subnet directories (those containing
+/// an `index.md`) and files with registered codec extensions, excluding files owned by
+/// nested subnets.
+///
+/// Sort order is lexicographic: subnet directories and plain files interleave alphabetically
+/// within each group.  Files under non-subnet subdirectories (plain dirs with no `index.md`)
+/// are treated as peers of the plain files at the nearest subnet-ancestor level.
+///
+/// This is the single authoritative implementation.  `network::net_dir_children` delegates here.
+pub(crate) fn net_dir_children<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
+    let call_root = path.as_ref().to_path_buf();
+    let by_group = net_dir_partition(&call_root);
+    let mut result = Vec::with_capacity(by_group.values().map(|v| v.len()).sum());
+    emit_group(&call_root, &by_group, &mut result);
+    result
+}
+
+/// Partition the subtree rooted at `path` into a map of
+/// `network_dir → ordered_direct_children`, in a single `WalkDir` pass.
+///
+/// Each key is a network directory (a directory containing `index.md`), including `path`
+/// Each value is the list of direct children in lexicographic order — exactly
+/// the list that `net_dir_children` would return for that key individually.
+///
+/// This allows `ProtoIndex::build` to build the complete index in O(files) rather than
+/// O(files × depth) by avoiding one `WalkDir` call per network directory.
+pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    fn is_hidden(entry: &DirEntry) -> bool {
+        entry
+            .file_name()
+            .to_str()
+            .map(|s| s.starts_with('.'))
+            .unwrap_or(false)
+    }
+
+    let mut subnets = Vec::default();
+    let files = WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e) || e.path() == path)
+        .filter_map(|e| e.ok().map(|e| e.into_path()))
+        .filter_map(|mut p| {
+            if p.is_file() {
+                let p_str = os_path_to_string(&p);
+                let p_ap = AnchorPath::new(&p_str);
+                if NETWORK_NAME == p_ap.filename() {
+                    // Subnet index.md — represent the subnet as its directory path.
+                    p.pop();
+                    if !p.eq(path) {
+                        subnets.push(p.clone());
+                        return Some(p);
+                    } else {
+                        return None; // root's own index.md — exclude
+                    }
+                }
+                // Use new_file: p.is_file() is confirmed, prevents extensionless files
+                // (Gemfile, Makefile, …) from matching the (None, None) codec wildcard.
+                let p_ap_file = AnchorPath::new_file(&p_str);
+                if CODECS.get(&p_ap_file).is_some() {
+                    if subnets.iter().any(|s| p.starts_with(s)) {
+                        None // owned by a nested subnet — exclude
+                    } else {
+                        Some(p)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<PathBuf>>();
+
+    // Partition into groups and sort lexicographically.
+    //
+    // Only subnet directories (is_dir() entries) form group boundaries.  Files under
+    // non-subnet subdirectories belong to the nearest subnet-ancestor's group.
+    //
+    // Algorithm:
+    //   1. Collect subnet dir paths (all is_dir() entries in `files`).
+    //   2. For each entry compute its "owning group": deepest subnet-dir ancestor,
+    //      or `path` (the call root) if none.
+    //   3. Sort each group lexicographically — subnets and files interleave alphabetically.
+    //   4. emit_group recurses into each subnet at its natural sorted position.
+    let subnet_dirs: std::collections::BTreeSet<PathBuf> =
+        files.iter().filter(|p| p.is_dir()).cloned().collect();
+
+    let owning_group = |p: &PathBuf| -> PathBuf {
+        let mut ancestor = p.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if subnet_dirs.contains(parent) {
+                return parent.to_path_buf();
+            }
+            ancestor = parent;
+        }
+        path.to_path_buf()
+    };
+
+    let mut by_group: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    // Ensure the root key is always present, even for a network with no children.
+    by_group.entry(path.to_path_buf()).or_default();
+    for p in files {
+        by_group.entry(owning_group(&p)).or_default().push(p);
+    }
+
+    // Sort each group lexicographically — subnets and files interleave alphabetically.
+    for entries in by_group.values_mut() {
+        entries.sort();
+    }
+
+    by_group
+}
+
+fn emit_group(
+    group_root: &PathBuf,
+    by_group: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    result: &mut Vec<PathBuf>,
+) {
+    let Some(entries) = by_group.get(group_root) else {
+        return;
+    };
+    // Entries are already sorted lexicographically by net_dir_partition.
+    // Emit each entry; when it's a subnet dir, recurse immediately after so its
+    // contents follow it in DFS order before the next sibling.
+    for entry in entries.clone() {
+        result.push(entry.clone());
+        if entry.is_dir() {
+            emit_group(&entry, by_group, result);
+        }
+    }
 }
 
 impl ProtoIndex {
@@ -85,7 +212,7 @@ impl ProtoIndex {
 
     /// Build by scanning the entire repo tree once from `repo_root`.
     ///
-    /// Produces the same per-directory child lists that calling `iter_net_docs` separately
+    /// Produces the same per-directory child lists that calling `net_dir_children` separately
     /// on each network directory would produce, but in a single `WalkDir` pass.
     ///
     /// The scan partitions every discovered file into the child list of its *owning network
@@ -102,44 +229,31 @@ impl ProtoIndex {
             )));
         }
 
-        // Delegate to iter_net_docs for each discovered network directory.
-        //
-        // Strategy: first collect all network directories in the repo by doing a lightweight
-        // top-down walk looking only for index.md files; then call iter_net_docs once per
-        // network dir to get the correctly-pruned, correctly-sorted child list for that dir.
-        //
-        // Why not a single custom partition walk?  iter_net_docs contains the authoritative
-        // hidden-file filter, extensionless-file guard (new_file vs new AnchorPath), and
-        // subnet-pruning logic.  Duplicating that inline risks drift.  Calling iter_net_docs
-        // per directory is O(total_files) amortised across all calls from a single build()
-        // invocation (each file is visited once by the top-level network-discovery walk, then
-        // once by the iter_net_docs call for its owning network).  This is O(2 × files) total
-        // — still one repo-wide scan's worth of work — rather than the O(networks × files)
-        // that previously happened across the full parse session.
+        // Single-pass construction via net_dir_partition: one WalkDir from repo_root
+        // partitions every reachable file into its owning network directory in O(files).
+        // Each key in the partition is a network dir; each value is the ordered child list
+        // identical to what net_dir_children would return for that dir individually.
         //
         // All map keys and child paths are canonicalized so that lookup keys derived from
         // canonicalized paths (e.g. from Path::canonicalize() in the caller) always match.
-        let mut map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-
-        // Discover all network directories via a lightweight walk.
-        let network_dirs = Self::discover_network_dirs(repo_root);
-
-        // For each discovered network dir, get its direct children via iter_net_docs.
-        // Canonicalize the dir key and each child path so lookups are always consistent.
-        for net_dir in &network_dirs {
-            let key = {
-                let p = net_dir.canonicalize().unwrap_or_else(|_| net_dir.clone());
-                string_to_os_path(&os_path_to_string(&p))
-            };
-            let children: Vec<PathBuf> = iter_net_docs(net_dir)
-                .into_iter()
-                .map(|p| {
-                    let c = p.canonicalize().unwrap_or(p);
-                    string_to_os_path(&os_path_to_string(&c))
-                })
-                .collect();
-            map.insert(key, children);
-        }
+        let partition = net_dir_partition(repo_root);
+        let map: HashMap<PathBuf, Vec<PathBuf>> = partition
+            .into_iter()
+            .map(|(net_dir, children)| {
+                let key = {
+                    let p = net_dir.canonicalize().unwrap_or(net_dir);
+                    string_to_os_path(&os_path_to_string(&p))
+                };
+                let children = children
+                    .into_iter()
+                    .map(|p| {
+                        let c = p.canonicalize().unwrap_or(p);
+                        string_to_os_path(&os_path_to_string(&c))
+                    })
+                    .collect();
+                (key, children)
+            })
+            .collect();
 
         Ok(Self {
             inner: Arc::new(RwLock::new(map)),
@@ -149,12 +263,16 @@ impl ProtoIndex {
     /// Discover all network directories under `root` (directories containing `index.md`),
     /// including `root` itself.  Returns them in lexicographic order (shallowest first).
     ///
-    /// All returned paths are canonicalized so they match the canonicalized keys used in
-    /// `build()` and expected by `children_of` / `sort_key_for` callers.
+    /// All returned paths are canonicalized so they match the canonicalized keys used by
+    /// `children_of` / `sort_key_for` callers.
+    ///
+    /// Note: `build()` does not call this — it uses `net_dir_partition` for a single-pass
+    /// O(files) construction.  This function is retained for tests and utilities that need
+    /// the list of network directories independently of a built index.
+    #[allow(dead_code)]
     pub(crate) fn discover_network_dirs(root: &Path) -> Vec<PathBuf> {
-        use walkdir::WalkDir;
         // Canonicalize root so we can use it as the "allow root even if hidden" reference,
-        // mirroring iter_net_docs's `!is_hidden(e) || e.path() == path.as_ref()` guard.
+        // mirroring net_dir_children's `!is_hidden(e) || e.path() == path.as_ref()` guard.
         let canonical_root = {
             let p = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
             string_to_os_path(&os_path_to_string(&p))
@@ -163,7 +281,7 @@ impl ProtoIndex {
             .into_iter()
             .filter_entry(|e| {
                 // Allow the root entry unconditionally (it may live in a hidden temp dir).
-                // Skip all other hidden entries — same rule as iter_net_docs.
+                // Skip all other hidden entries — same rule as net_dir_children.
                 let entry_canonical = {
                     let p = e
                         .path()
@@ -230,6 +348,47 @@ impl ProtoIndex {
         self.inner.read().get(&canonical).cloned()
     }
 
+    /// Returns all document paths in depth-first, network-sorted order.
+    ///
+    /// Within each network directory, children are returned in the same lexicographic
+    /// order produced by `net_dir_children` (shallow before deep, alphabetical within each
+    /// depth).  Subnet directories appear at their natural alphabetical position among
+    /// siblings — `dfs_ordered` distinguishes them by `child.is_dir()` and recurses into
+    /// them, so their contents immediately follow the subnet dir entry in the output.
+    ///
+    /// The flat list returned here is used by `parse_sequential` for its initial pass.
+    /// `parse_all` uses `network_dirs()` + `children_of()` directly for epoch batching.
+    pub fn ordered_paths(&self) -> Vec<PathBuf> {
+        // DFS from the repo root (first network_dir, shallowest).
+        // network_dirs() returns all network dirs shallowest-first.
+        // For each network dir, children_of() returns its direct children in net_dir_children order.
+        // We emit: the network dir itself (represents index.md), then recurse into subnet children,
+        // interleaved with plain file children in the order children_of() returns them.
+        let dirs = self.network_dirs();
+        let Some(root) = dirs.first().cloned() else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        self.dfs_ordered(&root, &mut result);
+        result
+    }
+
+    fn dfs_ordered(&self, net_dir: &Path, result: &mut Vec<PathBuf>) {
+        // Emit the network dir itself (parse_sequential will resolve to index.md)
+        result.push(net_dir.to_path_buf());
+        let Some(children) = self.children_of(net_dir) else {
+            return;
+        };
+        for child in children {
+            if child.is_dir() {
+                // Subnet: recurse
+                self.dfs_ordered(&child, result);
+            } else {
+                result.push(child);
+            }
+        }
+    }
+
     /// Returns the 0-based sort key for `abs_path` within its owning network directory.
     ///
     /// This is the canonical, single source of truth used by **both** the fast path
@@ -239,7 +398,7 @@ impl ProtoIndex {
     ///
     /// The owning network may not be the immediate parent directory.  For files in a
     /// non-network subdirectory (e.g. `net1_dir1/hsml.md` where `net1_dir1/` has no
-    /// `index.md`), `iter_net_docs` includes the file in the **ancestor** network's child
+    /// `index.md`), `net_dir_children` includes the file in the **ancestor** network's child
     /// list (flattened).  `sort_key_for` walks up the directory tree until it finds a
     /// network directory whose child list contains `abs_path`, then returns that position.
     ///
@@ -289,7 +448,7 @@ impl ProtoIndex {
     ///
     /// This is a drop-in replacement for `NetworkCodec::proto` in the `initialize_stack`
     /// ancestor push() loop.  It is correct because `NetworkCodec::proto` puts *only*
-    /// `WeightKind::Section` entries (derived from `iter_net_docs`) into `upstream`; all
+    /// `WeightKind::Section` entries (derived from `net_dir_children`) into `upstream`; all
     /// other relation types are populated later by `MdCodec::parse` and `traverse_schema`
     /// during Phase 1.
     ///
@@ -307,8 +466,12 @@ impl ProtoIndex {
             .parent()
             .expect("detect_network_file returns a path.is_file() path; parent() must succeed");
 
-        // Read frontmatter only — no WalkDir.
-        let Some(mut proto) = MdCodec::new().proto(network_filepath.as_ref())? else {
+        // Read frontmatter via the registered codec for this file — honours any custom
+        // network codec swapped in via CODECS rather than hardcoding MdCodec.
+        let Some(codec_factory) = CODECS.path_get(network_filepath.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(mut proto) = codec_factory().proto(network_filepath.as_ref())? else {
             return Ok(None);
         };
         if proto.id().is_none() {
@@ -322,14 +485,10 @@ impl ProtoIndex {
         proto.heading = 1;
 
         // Populate upstream with Section child-path relations from the cached child list.
-        // Mirrors exactly what NetworkCodec::proto does, but reads from self instead of
-        // calling iter_net_docs again.
+        // Falls back to net_dir_children for paths not in the index (e.g. out-of-repo callers).
         let children = match self.children_of(network_dir) {
             Some(c) => c,
-            // Directory is not in the index (e.g. built without this dir, or called on a
-            // path that wasn't in the original repo_root scan) — fall back to iter_net_docs
-            // so proto_for is still correct for out-of-index callers.
-            None => iter_net_docs(network_dir)
+            None => net_dir_children(network_dir)
                 .into_iter()
                 .map(|p| {
                     let c = p.canonicalize().unwrap_or(p);
@@ -338,25 +497,9 @@ impl ProtoIndex {
                 .collect(),
         };
 
-        for child_path in &children {
-            let relative_path = child_path
-                .strip_prefix(network_dir)
-                .expect("children are always under network_dir");
-            let path_str = os_path_to_string(relative_path);
-            if !path_str.is_empty() {
-                let node_key = NodeKey::Path {
-                    net: Bref::default(),
-                    path: path_str.clone(),
-                };
-                let mut weight = Weight::default();
-                weight.set_doc_paths(vec![path_str]).ok();
-                proto.upstream.push(IntermediateRelation::new(
-                    node_key,
-                    WeightKind::Section,
-                    Some(weight),
-                ));
-            }
-        }
+        // Call prepare_proto_relations via the registered codec so custom network codec
+        // implementations can express their own file-based child relations.
+        codec_factory().prepare_proto_relations(&mut proto, network_dir, &children)?;
 
         Ok(Some(proto))
     }
@@ -372,6 +515,8 @@ impl Default for ProtoIndex {
 mod tests {
     use super::*;
     use crate::codec::network::NetworkCodec;
+    use crate::codec::DocCodec;
+    use crate::nodekey::NodeKey;
     use std::fs;
     use tempfile::TempDir;
 
@@ -445,21 +590,46 @@ mod tests {
         );
     }
 
-    /// Verify that ProtoIndex::build produces the same per-directory child list as calling
-    /// iter_net_docs directly for each network directory.  This is the ground-truth parity test.
+    /// Verify that ProtoIndex::build produces the same per-directory child list as
+    /// net_dir_partition for each network directory.
+    ///
+    /// Note: `children_of` returns the *direct group* for each network dir (subnet dir
+    /// entries + that network's own plain files), matching one key from `net_dir_partition`.
+    /// This differs from `net_dir_children`, which returns the full recursive DFS output
+    /// (all descendants across all nested subnets in a single flat list).
     #[test]
-    fn test_build_matches_iter_net_docs_per_directory() {
+    fn test_build_matches_net_dir_children_per_directory() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
         let idx = ProtoIndex::build(&root).unwrap();
 
+        let mut partition = net_dir_partition(&root);
+        // Canonicalize partition keys and values to match ProtoIndex's stored paths.
+        let partition: BTreeMap<_, _> = partition
+            .iter_mut()
+            .map(|(net_dir, children)| {
+                let key = {
+                    let p = net_dir.canonicalize().unwrap_or_else(|_| net_dir.clone());
+                    string_to_os_path(&os_path_to_string(&p))
+                };
+                let vals: Vec<PathBuf> = children
+                    .iter()
+                    .map(|p| {
+                        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        string_to_os_path(&os_path_to_string(&c))
+                    })
+                    .collect();
+                (key, vals)
+            })
+            .collect();
+
         let network_dirs = ProtoIndex::discover_network_dirs(&root);
         for net_dir in &network_dirs {
-            let expected = iter_net_docs(net_dir);
+            let expected = partition.get(net_dir).cloned().unwrap_or_default();
             let actual = idx.children_of(net_dir).unwrap_or_default();
             assert_eq!(
                 actual, expected,
-                "children_of({net_dir:?}) should match iter_net_docs output"
+                "children_of({net_dir:?}) should match net_dir_partition direct group"
             );
         }
     }
@@ -531,7 +701,7 @@ mod tests {
         let root_children = idx.children_of(&root).unwrap();
         for (expected_idx, child) in root_children.iter().enumerate() {
             // Only test files whose immediate parent IS root (not subnet files that
-            // iter_net_docs may also include in the root list due to ordering).
+            // net_dir_children may also include in the root list due to ordering).
             if child.parent() != Some(root.as_path()) {
                 continue;
             }
@@ -558,7 +728,7 @@ mod tests {
     /// Files inside a non-network subdirectory (one without an index.md) must be resolved
     /// against their ancestor network's child list.  This is the case that caused the
     /// BN-DB sort-key churn: `net1_dir1/hsml.md` where `net1_dir1/` has no index.md but
-    /// the parent network's `iter_net_docs` returns `net1_dir1/hsml.md` in its child list.
+    /// the parent network's `net_dir_children` returns `net1_dir1/hsml.md` in its child list.
     #[test]
     fn test_sort_key_for_file_in_non_network_subdir() {
         let tmp = build_fixture();
@@ -580,7 +750,7 @@ mod tests {
         );
 
         // But sort_key_for(plain_dir/nested.md) must still succeed by walking up to root,
-        // where iter_net_docs includes nested.md in root's child list.
+        // where net_dir_children includes nested.md in root's child list.
         let nested = plain_dir.join("nested.md");
         let sk = idx.sort_key_for(&nested);
         assert!(
@@ -588,7 +758,7 @@ mod tests {
             "sort_key_for should find nested.md in the ancestor root network's child list"
         );
 
-        // The position must match where iter_net_docs places nested.md in the root list.
+        // The position must match where net_dir_children places nested.md in the root list.
         let root_children = idx.children_of(&root).unwrap();
         let expected_idx = root_children
             .iter()
@@ -596,7 +766,7 @@ mod tests {
         assert_eq!(
             sk,
             expected_idx.map(|i| i as u16),
-            "sort_key should match the position in the root network's iter_net_docs output"
+            "sort_key should match the position in the root network's net_dir_children output"
         );
     }
 
@@ -632,50 +802,77 @@ mod tests {
 
     /// Core parity test: proto_for must produce the same upstream relation list as
     /// NetworkCodec::proto for every network directory in the fixture.
+    /// Core parity test: `proto_for` must produce the same upstream relation list as
+    /// calling `NetworkCodec::proto` + `NetworkCodec::prepare_proto_relations` directly,
+    /// and both must agree with the raw `net_dir_children` output for the same directory.
     #[test]
     fn test_proto_for_upstream_matches_network_codec_proto() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
         let idx = ProtoIndex::build(&root).unwrap();
 
+        // Use net_dir_partition for the codec side: proto_for uses children_of(), which
+        // returns the direct group from the partition (not the full DFS net_dir_children list).
+        // The two must agree, so feed the same direct-group children to prepare_proto_relations.
+        let mut partition = net_dir_partition(&root);
+        let partition: BTreeMap<PathBuf, Vec<PathBuf>> = partition
+            .iter_mut()
+            .map(|(net_dir, children)| {
+                let key = {
+                    let p = net_dir.canonicalize().unwrap_or_else(|_| net_dir.clone());
+                    string_to_os_path(&os_path_to_string(&p))
+                };
+                let vals: Vec<PathBuf> = children
+                    .iter()
+                    .map(|p| {
+                        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        string_to_os_path(&os_path_to_string(&c))
+                    })
+                    .collect();
+                (key, vals)
+            })
+            .collect();
+
         let network_dirs = ProtoIndex::discover_network_dirs(&root);
         for net_dir in &network_dirs {
-            let codec_proto = NetworkCodec::default()
+            // Build the full codec proto the new way: proto() gives frontmatter only;
+            // prepare_proto_relations adds the upstream child entries.
+            let codec = NetworkCodec::default();
+            let mut codec_proto = codec
                 .proto(net_dir)
                 .unwrap()
                 .expect("fixture dirs all have index.md");
+            let children = partition.get(net_dir).cloned().unwrap_or_default();
+            codec
+                .prepare_proto_relations(&mut codec_proto, net_dir, &children)
+                .unwrap();
+
             let index_proto = idx
                 .proto_for(net_dir)
                 .unwrap()
                 .expect("proto_for should succeed for known network dirs");
 
             // Compare upstream path strings — the canonical sort-key ordering.
-            let codec_paths: Vec<String> = codec_proto
-                .upstream
-                .iter()
-                .filter_map(|r| {
-                    if let NodeKey::Path { path, .. } = &r.key {
-                        Some(path.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let index_paths: Vec<String> = index_proto
-                .upstream
-                .iter()
-                .filter_map(|r| {
-                    if let NodeKey::Path { path, .. } = &r.key {
-                        Some(path.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let extract_paths = |proto: &IRNode| -> Vec<String> {
+                proto
+                    .upstream
+                    .iter()
+                    .filter_map(|r| {
+                        if let NodeKey::Path { path, .. } = &r.key {
+                            Some(path.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            let codec_paths = extract_paths(&codec_proto);
+            let index_paths = extract_paths(&index_proto);
 
             assert_eq!(
                 index_paths, codec_paths,
-                "proto_for upstream paths should match NetworkCodec::proto for {net_dir:?}"
+                "proto_for upstream paths should match proto+prepare_proto_relations for {net_dir:?}"
             );
         }
     }
@@ -743,6 +940,221 @@ mod tests {
         assert!(
             result.is_err(),
             "build() without index.md should return Err"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ordered_paths()
+    // -------------------------------------------------------------------------
+
+    /// Verify that `ordered_paths()` returns paths in depth-first, network-sorted order:
+    /// - The root network dir appears first.
+    /// - Children of the root appear in lexicographic order (matching `net_dir_children`).
+    /// - Subnet dir contents appear immediately after the subnet dir entry (DFS recursion).
+    ///
+    /// Structure (reuses build_fixture):
+    /// ```text
+    /// root/
+    ///   index.md          (id = "root")
+    ///   alpha.md
+    ///   beta.md
+    ///   subnet/           ← alphabetically AFTER alpha.md and beta.md
+    ///     index.md        (id = "subnet")
+    ///     delta.md
+    ///     gamma.md
+    /// ```
+    ///
+    /// Expected ordered_paths():
+    ///   [root/, alpha.md, beta.md, subnet/, delta.md, gamma.md]
+    ///   (root dir first, then root's children in lexicographic order — alpha.md and
+    ///    beta.md before subnet/ — with subnet's own children immediately following it
+    ///    DFS)
+    #[test]
+    fn test_ordered_paths_dfs_network_before_children_lex_order() {
+        let tmp = build_fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        let idx = ProtoIndex::build(&root).unwrap();
+
+        let paths = idx.ordered_paths();
+
+        // Extract file_name strings for readability
+        let names: Vec<&str> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        // Root dir must be first
+        assert_eq!(
+            names.first().copied(),
+            Some(root.file_name().unwrap().to_str().unwrap()),
+            "root network dir must be first; names={names:?}"
+        );
+
+        // Pure lex order: alpha.md < beta.md < subnet (s > b).  DFS: root dir first, then
+        // root's children in lexicographic order.  When dfs_ordered hits subnet/, it
+        // recurses immediately — subnet's contents follow the subnet dir entry.
+        let alpha_pos = names
+            .iter()
+            .position(|&n| n == "alpha.md")
+            .expect("alpha.md must be present");
+        let beta_pos = names
+            .iter()
+            .position(|&n| n == "beta.md")
+            .expect("beta.md must be present");
+        let subnet_pos = names
+            .iter()
+            .position(|&n| n == "subnet")
+            .expect("subnet dir must be present");
+        let gamma_pos = names
+            .iter()
+            .position(|&n| n == "gamma.md")
+            .expect("gamma.md must be present");
+        let delta_pos = names
+            .iter()
+            .position(|&n| n == "delta.md")
+            .expect("delta.md must be present");
+
+        // Pure lex order: alpha.md < beta.md < subnet/ (s > b).
+        assert!(
+            alpha_pos < subnet_pos,
+            "alpha.md should sort before subnet/; names={names:?}"
+        );
+        assert!(
+            beta_pos < subnet_pos,
+            "beta.md should sort before subnet/; names={names:?}"
+        );
+        assert!(
+            alpha_pos < beta_pos,
+            "alpha.md should sort before beta.md; names={names:?}"
+        );
+
+        // DFS: subnet's children must immediately follow subnet/.
+        assert!(
+            delta_pos > subnet_pos,
+            "delta.md should appear after subnet/; names={names:?}"
+        );
+        assert!(
+            gamma_pos > subnet_pos,
+            "gamma.md should appear after subnet/; names={names:?}"
+        );
+        // DFS: subnet children follow subnet/ immediately, before any remaining root-level
+        // siblings that sort after subnet/ lexicographically.  alpha.md and beta.md sort
+        // before subnet/ so they appear earlier; no root-level plain files sort after subnet/
+        // in this fixture (z > s would, but none exist here).
+        assert!(
+            delta_pos > beta_pos,
+            "delta.md (subnet child) should appear after beta.md; names={names:?}"
+        );
+        assert!(
+            gamma_pos > beta_pos,
+            "gamma.md (subnet child) should appear after beta.md; names={names:?}"
+        );
+    }
+
+    /// Verify that `ordered_paths()` on an empty ProtoIndex returns an empty vec.
+    #[test]
+    fn test_ordered_paths_empty_index_returns_empty() {
+        let idx = ProtoIndex::new();
+        assert!(
+            idx.ordered_paths().is_empty(),
+            "ordered_paths on empty index must return empty vec"
+        );
+    }
+
+    // ── net_dir_children sort order ───────────────────────────────────────────
+
+    /// Sort order for `net_dir_children`: subnet directories and plain files interleave
+    /// lexicographically within each group.  The sort is hierarchical (DFS): all entries
+    /// at the root level come before entries inside a subnet, with each subnet's contents
+    /// immediately following it in DFS order.
+    ///
+    /// Corpus (from Issue 58 spec):
+    /// ```text
+    /// root/
+    ///   index.md             ← root network (excluded)
+    ///   a.md
+    ///   b_dir/               ← subnet → sorts after a.md (b > a), before c.md
+    ///     index.md
+    ///     a_sub.md
+    ///     aaaa.md
+    ///     c_dir/             ← plain dir (no index.md) → files included flat
+    ///       file.md
+    ///     x.md
+    ///     y_repo/            ← subnet → sorts after x.md (y > x)
+    ///       index.md
+    ///       abc.md
+    ///   c.md
+    ///   d_dir/               ← plain dir (no index.md) → files included flat
+    ///     a.md
+    ///     aaaa.md
+    ///   z.md
+    /// ```
+    ///
+    /// Expected flat order:
+    ///   a.md, b_dir,
+    ///   b_dir/a_sub.md, b_dir/aaaa.md, b_dir/c_dir/file.md, b_dir/x.md, b_dir/y_repo,
+    ///   b_dir/y_repo/abc.md,
+    ///   c.md, d_dir/a.md, d_dir/aaaa.md, z.md
+    #[test]
+    fn test_net_dir_children_sort_lex_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let write_md = |p: PathBuf, body: &str| {
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&p, body).unwrap();
+        };
+
+        write_md(root.join("index.md"), "---\ntitle = \"Root\"\n---\n");
+        write_md(root.join("a.md"), "# A\n");
+        write_md(root.join("c.md"), "# C\n");
+        write_md(root.join("z.md"), "# Z\n");
+        write_md(root.join("d_dir").join("a.md"), "# D/A\n");
+        write_md(root.join("d_dir").join("aaaa.md"), "# D/AAAA\n");
+        write_md(
+            root.join("b_dir").join("index.md"),
+            "---\ntitle = \"B\"\n---\n",
+        );
+        write_md(root.join("b_dir").join("a_sub.md"), "# A_sub\n");
+        write_md(root.join("b_dir").join("aaaa.md"), "# AAAA\n");
+        write_md(root.join("b_dir").join("x.md"), "# X\n");
+        write_md(root.join("b_dir").join("c_dir").join("file.md"), "# File\n");
+        write_md(
+            root.join("b_dir").join("y_repo").join("index.md"),
+            "---\ntitle = \"Y\"\n---\n",
+        );
+        write_md(root.join("b_dir").join("y_repo").join("abc.md"), "# ABC\n");
+
+        let results = net_dir_children(root);
+        let names: Vec<String> = results
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        let expected: Vec<&str> = vec![
+            "a.md",
+            "b_dir",
+            "b_dir/a_sub.md",
+            "b_dir/aaaa.md",
+            "b_dir/c_dir/file.md",
+            "b_dir/x.md",
+            "b_dir/y_repo",
+            "b_dir/y_repo/abc.md",
+            "c.md",
+            "d_dir/a.md",
+            "d_dir/aaaa.md",
+            "z.md",
+        ];
+        assert_eq!(
+            names, expected,
+            "net_dir_children sort order mismatch\ngot:      {names:?}\nexpected: {expected:?}"
         );
     }
 }

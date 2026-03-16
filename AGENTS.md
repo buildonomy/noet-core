@@ -15,7 +15,7 @@ Inspired by Kent Beck, Martin Fowler, Rich Hickey. These apply to code, document
 
 **Boundaries** — Clear interfaces between components. Explicit in-scope / out-of-scope. Cross-references over duplication. Define extension points.
 
-**When writing code:** Readable > terse. Tested > assumed. Refactored > first draft. Named well > commented heavily.
+**When writing code:** Readable > terse. Tested > assumed. Refactored > first draft. Named well > commented heavily. Imports at module top > inline `use` inside function bodies.
 
 ## Hard Rules
 

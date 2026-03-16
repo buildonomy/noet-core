@@ -31,7 +31,7 @@ mod tests;
 
 // Re-export public types to maintain existing API
 #[cfg(not(target_arch = "wasm32"))]
-pub use accumulator::{BeliefAccumulator, QueryHandle};
+pub use accumulator::{BeliefAccumulator, EpochDrain, QueryHandle};
 pub use base::BeliefBase;
 
 pub use context::{BeliefContext, ExtendedRelation};

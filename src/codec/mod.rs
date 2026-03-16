@@ -178,7 +178,6 @@ pub mod belief_ir;
 pub mod builder;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod compiler;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod diagnostic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod md;
@@ -196,7 +195,6 @@ pub use belief_ir::{IRNode, IntermediateRelation};
 pub use builder::GraphBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 pub use compiler::DocumentCompiler;
-#[cfg(not(target_arch = "wasm32"))]
 pub use diagnostic::{byte_offset_to_location, ParseDiagnostic, UnresolvedReference};
 #[cfg(not(target_arch = "wasm32"))]
 pub use proto_index::ProtoIndex;
@@ -247,6 +245,40 @@ type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 pub trait DocCodec: Sync {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
     fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError>;
+
+    /// Populate `proto.upstream` with file-based child relations given a pre-computed
+    /// list of absolute child paths.
+    ///
+    /// Called by [`crate::codec::proto_index::ProtoIndex`] after `proto()` returns, once per
+    /// network directory entry in the index.  The `child_paths` list is the same list that
+    /// `ProtoIndex::build` already computed (via `net_dir_children`) — no additional filesystem
+    /// access is needed.
+    ///
+    /// ## Why a trait method?
+    ///
+    /// Placing this on the trait means:
+    /// - Codec implementations are never required to touch the filesystem directly.
+    /// - Future codecs with file-based relations (e.g. a TOML manifest codec) can express
+    ///   those relations here without adding ad-hoc logic to `ProtoIndex`.
+    /// - All `DocCodec` methods remain filesystem-free; filesystem knowledge lives solely
+    ///   in `ProtoIndex::build` (one WalkDir pass) and the `net_dir_children` helper.
+    ///
+    /// The default implementation is a no-op, so codecs with no file-based relations require
+    /// no change.
+    ///
+    /// ## Parameters
+    /// - `proto`: the `IRNode` returned by `proto()`, mutated in place.
+    /// - `network_dir`: absolute path of the network directory that owns the children.
+    /// - `child_paths`: absolute paths of the direct children, in canonical DFS order
+    ///   (subnet dirs first, then plain files, both groups sorted lexicographically).
+    fn prepare_proto_relations(
+        &self,
+        _proto: &mut IRNode,
+        _network_dir: &Path,
+        _child_paths: &[std::path::PathBuf],
+    ) -> Result<(), BuildonomyError> {
+        Ok(())
+    }
 
     fn parse(
         &mut self,

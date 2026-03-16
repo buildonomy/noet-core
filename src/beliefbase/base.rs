@@ -4,6 +4,9 @@
 //! collection of belief states and their relations while preserving global graph
 //! structure and maintaining indices for efficient queries.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::beliefbase::EpochDrain;
+use crate::codec::ParseDiagnostic;
 use crate::{
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
@@ -54,6 +57,10 @@ type SharedLock<T> = Rc<RefCell<T>>;
 
 #[derive(Debug)]
 pub struct BeliefBase {
+    /// Short diagnostic label identifying which role this instance plays
+    /// (e.g. `"doc_bb"`, `"session_bb"`, `"global_bb"`).  Printed in every
+    /// tracing macro so log lines can be attributed without ambiguity.
+    pub label: &'static str,
     states: BTreeMap<Bid, BeliefNode>,
     relations: SharedLock<BidGraph>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -61,20 +68,32 @@ pub struct BeliefBase {
     #[cfg(target_arch = "wasm32")]
     bid_to_index: RefCell<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
     index_dirty: AtomicBool,
+    /// True when the last `built_in_test` run found no invariant violations.
+    balanced: AtomicBool,
     brefs: BTreeMap<Bref, Bid>,
     paths: SharedLock<PathMapMap>,
-    errors: SharedLock<Vec<String>>,
+    diagnostics: SharedLock<Vec<ParseDiagnostic>>,
     api: BeliefNode,
+}
+
+// ---------------------------------------------------------------------------
+// EpochDrain — no-op impl for BeliefBase (sequential / test path)
+// ---------------------------------------------------------------------------
+
+/// `BeliefBase` is used directly in the sequential parse path and in tests.
+/// It has no event channel to drain, so `drain_epoch` is a no-op.
+#[cfg(not(target_arch = "wasm32"))]
+impl EpochDrain for BeliefBase {
+    fn drain_epoch(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), crate::BuildonomyError>> + Send {
+        std::future::ready(Ok(()))
+    }
 }
 
 impl From<BeliefGraph> for BeliefBase {
     fn from(beliefs: BeliefGraph) -> Self {
-        // tracing::debug!(
-        //     "[BeliefBase::from(BeliefGraph)] Creating BeliefBase with {} states, {} edges",
-        //     beliefs.states.len(),
-        //     beliefs.relations.0.edge_count()
-        // );
-        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false)
+        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false).with_label("bg_bb")
     }
 }
 
@@ -114,26 +133,30 @@ impl Clone for BeliefBase {
         #[cfg(not(target_arch = "wasm32"))]
         {
             BeliefBase {
+                label: self.label,
                 states: self.states.clone(),
                 relations: Arc::new(RwLock::new(self.read_relations().clone())),
                 bid_to_index: RwLock::new(self.read_bid_index().clone()),
                 index_dirty: AtomicBool::new(false),
+                balanced: AtomicBool::new(self.balanced.load(Ordering::SeqCst)),
                 brefs: self.brefs.clone(),
                 paths: Arc::new(RwLock::new(self.read_paths().clone())),
-                errors: Arc::new(RwLock::new(self.read_errors().clone())),
+                diagnostics: Arc::new(RwLock::new(self.read_diagnostics().clone())),
                 api: self.api.clone(),
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             BeliefBase {
+                label: self.label,
                 states: self.states.clone(),
                 relations: Rc::new(RefCell::new(self.read_relations().clone())),
                 bid_to_index: RefCell::new(self.read_bid_index().clone()),
                 index_dirty: AtomicBool::new(false),
+                balanced: AtomicBool::new(self.balanced.load(Ordering::SeqCst)),
                 brefs: self.brefs.clone(),
                 paths: Rc::new(RefCell::new(self.read_paths().clone())),
-                errors: Rc::new(RefCell::new(self.read_errors().clone())),
+                diagnostics: Rc::new(RefCell::new(self.read_diagnostics().clone())),
                 api: self.api.clone(),
             }
         }
@@ -179,29 +202,44 @@ impl BeliefBase {
         #[cfg(not(target_arch = "wasm32"))]
         {
             BeliefBase {
+                label: "bb",
                 states: BTreeMap::default(),
                 relations: Arc::new(RwLock::new(BidGraph(petgraph::Graph::new()))),
                 bid_to_index: RwLock::new(BTreeMap::default()),
                 index_dirty: AtomicBool::new(false),
+                balanced: AtomicBool::new(true),
                 brefs: BTreeMap::default(),
                 paths: Arc::new(RwLock::new(PathMapMap::default())),
-                errors: Arc::new(RwLock::new(Vec::new())),
+                diagnostics: Arc::new(RwLock::new(Vec::new())),
                 api: BeliefNode::api_state(),
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             BeliefBase {
+                label: "bb",
                 states: BTreeMap::default(),
                 relations: Rc::new(RefCell::new(BidGraph(petgraph::Graph::new()))),
                 bid_to_index: RefCell::new(BTreeMap::default()),
                 index_dirty: AtomicBool::new(false),
+                balanced: AtomicBool::new(true),
                 brefs: BTreeMap::default(),
                 paths: Rc::new(RefCell::new(PathMapMap::default())),
-                errors: Rc::new(RefCell::new(Vec::new())),
+                diagnostics: Rc::new(RefCell::new(Vec::new())),
                 api: BeliefNode::api_state(),
             }
         }
+    }
+
+    /// Set the diagnostic label on this instance.  Returns `self` so it can be
+    /// chained directly after construction:
+    ///
+    /// ```ignore
+    /// let bb = BeliefBase::empty().with_label("session_bb");
+    /// ```
+    pub fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     // Helper methods for conditional lock access
@@ -246,23 +284,38 @@ impl BeliefBase {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_errors(&self) -> parking_lot::RwLockReadGuard<'_, Vec<String>> {
-        self.errors.read()
+    fn read_diagnostics(&self) -> parking_lot::RwLockReadGuard<'_, Vec<ParseDiagnostic>> {
+        self.diagnostics.read()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read_errors(&self) -> std::cell::Ref<'_, Vec<String>> {
-        self.errors.borrow()
+    fn read_diagnostics(&self) -> std::cell::Ref<'_, Vec<ParseDiagnostic>> {
+        self.diagnostics.borrow()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_errors(&self) -> parking_lot::RwLockWriteGuard<'_, Vec<String>> {
-        self.errors.write()
+    fn write_diagnostics(&self) -> parking_lot::RwLockWriteGuard<'_, Vec<ParseDiagnostic>> {
+        self.diagnostics.write()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn write_errors(&self) -> std::cell::RefMut<'_, Vec<String>> {
-        self.errors.borrow_mut()
+    fn write_diagnostics(&self) -> std::cell::RefMut<'_, Vec<ParseDiagnostic>> {
+        self.diagnostics.borrow_mut()
+    }
+
+    /// Drain all accumulated [`ParseDiagnostic`] values and clear the internal buffer.
+    /// Invariant-violation messages (written by `built_in_test`) are surfaced as
+    /// `ParseDiagnostic::ParseError`; all other messages (e.g. ID-collision warnings written by
+    /// `insert_state`) are surfaced as `ParseDiagnostic::Warning`.
+    ///
+    /// Use [`is_balanced`] to check whether any error-level diagnostics were recorded.
+    pub fn drain_diagnostics(&self) -> Vec<ParseDiagnostic> {
+        std::mem::take(&mut *self.write_diagnostics())
+    }
+
+    /// Return a snapshot of all accumulated [`ParseDiagnostic`] values without consuming them.
+    pub fn diagnostics(&self) -> Vec<ParseDiagnostic> {
+        self.read_diagnostics().clone()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -340,7 +393,10 @@ impl BeliefBase {
     pub fn paths(&self) -> ArcRwLockReadGuard<RawRwLock, PathMapMap> {
         self.index_sync(false);
         while self.paths.is_locked_exclusive() {
-            tracing::info!("[BeliefBase] Waiting for read access to paths");
+            tracing::info!(
+                label = self.label,
+                "[BeliefBase] Waiting for read access to paths"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.read_paths()
@@ -354,10 +410,6 @@ impl BeliefBase {
 
     pub fn brefs(&self) -> &BTreeMap<Bref, Bid> {
         &self.brefs
-    }
-
-    pub fn errors(&self) -> Vec<String> {
-        self.read_errors().clone()
     }
 
     /// Synchronize our indices (namely the self.paths object and our bid_to_index object), if the
@@ -408,11 +460,11 @@ impl BeliefBase {
                 .flatten()
                 .map(|(path, _, _)| path.clone())
                 .collect();
-            let mut errors = self.write_errors();
-            *errors = self.built_in_test(bit);
+            let mut new_diagnostics = self.built_in_test(bit);
             if event_paths != constructor_paths {
-                errors.push(format!(
-                    "- Event-driven and constructor PathMapMaps should have identical paths.\n \
+                new_diagnostics.push(format!(
+                    "[BeliefBase::index_sync] Event-driven and constructor PathMapMaps should \
+                        have identical paths.\n \
                         \tevent_paths:\n \
                         \t- {} \n \
                         \tconstructor_paths:\n \
@@ -427,10 +479,20 @@ impl BeliefBase {
                         .join("\n\t- ")
                 ));
             }
-            let errors = self.read_errors();
-            if !errors.is_empty() {
-                tracing::debug!("Set isn't balanced. Errors:\n{}", errors.join("\n- "));
+            let has_errors = !new_diagnostics.is_empty();
+            if has_errors {
+                tracing::debug!(
+                    label = self.label,
+                    "Set isn't balanced. Diagnostics:\n{}",
+                    new_diagnostics.join("\n- ")
+                );
             }
+            self.balanced.store(!has_errors, Ordering::SeqCst);
+            self.write_diagnostics().extend(
+                new_diagnostics
+                    .into_iter()
+                    .map(|msg| ParseDiagnostic::parse_error(msg, 0)),
+            );
         }
     }
 
@@ -443,7 +505,10 @@ impl BeliefBase {
     pub fn relations(&self) -> ArcRwLockReadGuard<RawRwLock, BidGraph> {
         self.index_sync(false);
         while self.relations.is_locked_exclusive() {
-            tracing::info!("[BeliefBase] Waiting for read access to relations");
+            tracing::info!(
+                label = self.label,
+                "[BeliefBase] Waiting for read access to relations"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.read_relations()
@@ -479,15 +544,18 @@ impl BeliefBase {
         self.index_sync(false);
         assert!(
             self.is_balanced().is_ok(),
-            "get_context called on an unbalanced BeliefBase. errors: {:?}",
-            self.read_errors().clone()
+            "get_context called on an unbalanced BeliefBase. diagnostics: {:?}",
+            self.diagnostics()
         );
         let Some(node) = self.states.get(bid) else {
-            tracing::debug!("[get_context] node {bid} is not loaded");
+            tracing::debug!(label = self.label, "[get_context] node {bid} is not loaded");
             return None;
         };
         let Some(root_pm) = self.paths().get_map(&root_net.bref()) else {
-            tracing::debug!("[get_context] network {root_net} is not loaded");
+            tracing::debug!(
+                label = self.label,
+                "[get_context] network {root_net} is not loaded"
+            );
             return None;
         };
         root_pm
@@ -502,7 +570,10 @@ impl BeliefBase {
         let mut old_self = std::mem::take(self);
         let states = std::mem::take(&mut old_self.states);
         while self.relations.is_locked() {
-            tracing::info!("[BeliefBase::consume] Waiting for write access to relations");
+            tracing::info!(
+                label = self.label,
+                "[BeliefBase::consume] Waiting for write access to relations"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let relations = std::mem::replace(
@@ -619,10 +690,22 @@ impl BeliefBase {
             |event| match event {
                 DfsEvent::Discover(sink, _) => {
                     if !new_set.states().contains_key(&sink) {
+                        // Node absent from new_set: it was removed (e.g. a node that was
+                        // deleted or superseded). Record it and continue DFS to find any
+                        // stale descendants.
                         old_content.insert(sink);
                         Control::<()>::Continue
                     } else {
-                        // No sense in following traces
+                        // Node is present in new_set. If it was parsed in this pass it is
+                        // a seed we started from — prune here (its own diff is handled by
+                        // Phase 2). If it belongs to a different document, also prune so
+                        // we don't walk into foreign subtrees.
+                        //
+                        // Note: collision BIDs (stale time-based section BIDs replaced by a
+                        // fresh BID on reparse) are removed from session_bb in push() before
+                        // terminate_stack runs, so they will not appear in new_set and will
+                        // be caught by the first branch above. No DFS expansion is needed
+                        // for those cases.
                         Control::Prune
                     }
                 }
@@ -758,7 +841,7 @@ impl BeliefBase {
                 .indexed_path(sink)
                 .map(|(_a, _b, order)| order)
                 .unwrap_or_else(|| {
-                    tracing::warn!("No entry in pathmap for sink {sink}");
+                    tracing::warn!(label = new_set.label, "No entry in pathmap for sink {sink}");
                     Vec::default()
                 });
             new_edges.push((
@@ -796,9 +879,10 @@ impl BeliefBase {
     }
 
     pub fn is_balanced(&self) -> Result<(), BuildonomyError> {
-        let errors = self.read_errors();
-        if !errors.is_empty() {
-            Err(BuildonomyError::Custom(errors.join("\n- ")))
+        if !self.balanced.load(Ordering::SeqCst) {
+            Err(BuildonomyError::Custom(
+                "BeliefBase is unbalanced; check diagnostics for details".into(),
+            ))
         } else {
             Ok(())
         }
@@ -1095,7 +1179,7 @@ impl BeliefBase {
             #[cfg(debug_assertions)]
             {
                 if let Err(e) = self.validate_local_event(event) {
-                    tracing::warn!("Local event validation failed: {}", e);
+                    tracing::warn!(label = self.label, "Local event validation failed: {}", e);
                     debug_assert!(false, "Local event doesn't match internal state: {event:?}");
                 }
             }
@@ -1124,6 +1208,19 @@ impl BeliefBase {
                 // They're returned as derivatives for DbConnection and other subscribers
             }
             BeliefEvent::RelationUpdate(source, sink, weight_set, _) => {
+                // Guard: if either node is absent, update_relation would warn-and-return
+                // anyway, but it would still reach process_event_queue below, which fans
+                // out to every PathMap in O(networks). Skip the whole event early to avoid
+                // the O(N_networks) lock-acquisition cost on every dropped RelationUpdate.
+                if self.bid_to_index(source).is_none() || self.bid_to_index(sink).is_none() {
+                    tracing::debug!(
+                        label = self.label,
+                        "process_event: skipping RelationUpdate ({} -> {}), source or sink missing",
+                        source,
+                        sink,
+                    );
+                    return Ok(vec![]);
+                }
                 // update_relation handles both reindexing and path event generation
                 let mut reindex_events = self.update_relation(*source, *sink, weight_set.clone());
                 derivative_events.append(&mut reindex_events);
@@ -1135,6 +1232,15 @@ impl BeliefBase {
                     else {
                         panic!("Unexpected return value from BeliefBase::generate_edge_update");
                     };
+                    // Same guard as RelationUpdate above.
+                    if self.bid_to_index(&source).is_none() || self.bid_to_index(&sink).is_none() {
+                        tracing::debug!(
+                            label = self.label,
+                            "process_event: skipping RelationChange-derived update ({} -> {}), source or sink missing",
+                            source, sink,
+                        );
+                        return Ok(vec![]);
+                    }
                     let mut reindex_events = self.update_relation(source, sink, weight_set.clone());
                     derivative_events.push(relation_mutated_event);
                     derivative_events.append(&mut reindex_events);
@@ -1143,6 +1249,15 @@ impl BeliefBase {
             BeliefEvent::RelationRemoved(source, sink, _) => {
                 // Call update_relation with empty WeightSet to trigger proper reindexing
                 // of remaining edges on the sink, ensuring contiguous sort indices [0..N)
+                // Guard: if sink is absent there is nothing to reindex.
+                if self.bid_to_index(source).is_none() || self.bid_to_index(sink).is_none() {
+                    tracing::debug!(
+                        label = self.label,
+                        "process_event: skipping RelationRemoved ({} -> {}), source or sink missing",
+                        source, sink,
+                    );
+                    return Ok(vec![]);
+                }
                 let mut reindex_events = self.update_relation(*source, *sink, WeightSet::default());
                 derivative_events.append(&mut reindex_events);
             }
@@ -1187,21 +1302,159 @@ impl BeliefBase {
         Ok(derivative_events)
     }
 
-    /// Insert or replace a state while preserving path uniqueness
+    /// Insert or update a node, enforcing first-one-wins collision policy for `NodeKey::Id`.
+    ///
+    /// # Collision policy
+    ///
+    /// When the incoming node is **new** to this store and its `NodeKey::Id` key already
+    /// resolves to a *different* existing node, the incoming node is the loser.  We clear
+    /// its `id` field to its bref so the conflicting Id key is no longer registered for it,
+    /// and we record the winner's BID in `collision_winner_bids` so the `to_replace` loop
+    /// below skips it (preventing the winner from being incorrectly absorbed into the loser).
+    ///
+    /// This check must happen *before* the `to_replace` loop, which would otherwise
+    /// misinterpret a cross-document Id collision as a same-node BID rename and incorrectly
+    /// replace (remove + rename) the winning node.
+    ///
+    /// **Document-beats-anchor**: when an incoming *document* node shares an Id key with an
+    /// existing *anchor* (section) node, the document wins. The anchor's id is clobbered to its
+    /// bref in-place so the Id key is freed before the document is inserted. `push()` in
+    /// `builder.rs` performs the same clobber on both `doc_bb` and `session_bb` for the builder
+    /// path; this guard covers any path that reaches `insert_state` directly (e.g. parallel epoch
+    /// tasks).
     ///
     /// Return a vector of events for each node that was renamed when matching on the merge keys.
     fn insert_state(&mut self, node: BeliefNode, merge: &[NodeKey]) -> Vec<BeliefEvent> {
         let mut events = Vec::<BeliefEvent>::new();
+
+        let mut node = node;
+        let node_bref = node.bid.bref().to_string();
+        // BIDs of nodes that already own a conflicting NodeKey::Id in this store (the winners).
+        // These must be excluded from `to_replace` below so they are NOT absorbed into the
+        // incoming loser node.
+        let mut collision_winner_bids: BTreeSet<Bid> = BTreeSet::new();
+
+        // ID-collision guard: fires for new nodes, and also for existing nodes that are
+        // *changing* their id to a value already owned by another node.
+        //
+        // New node: any NodeKey::Id collision means the incoming node loses (first-one-wins).
+        //
+        // Existing node with unchanged id: skip — this node already won its ID on a prior
+        // parse; re-checking would treat the stored owner as a spurious loser.
+        //
+        // Existing node with a *changed* id: the update is attempting to claim a new Id key.
+        // If that key is already owned by a different node we cannot evict the owner, so the
+        // incoming node's id is cleared to its bref instead (same first-one-wins rule).
+        // None if node is new; Some(old_id_string) if it already exists in this store.
+        let old_id = self.states.get(&node.bid).map(|old| old.id());
+        let is_new_node_for_collision = old_id.is_none();
+        // An existing node is changing its id when the stored id differs from the incoming one.
+        let id_is_changing = old_id.as_ref().map_or(false, |oid| *oid != node.id());
+
+        if is_new_node_for_collision || id_is_changing {
+            for key in merge.iter() {
+                if let NodeKey::Id { .. } = key {
+                    let results = self.evaluate_expression(&Expression::from(key));
+                    if let Some(existing) = BeliefBase::from(results).get(key) {
+                        if existing.bid != node.bid {
+                            let incoming_is_document = node.kind.0.contains(BeliefKind::Document);
+                            let existing_is_anchor = existing.kind.is_anchor();
+
+                            if incoming_is_document && existing_is_anchor {
+                                // Document beats anchor: clobber the existing anchor's id to its
+                                // bref in-place so the Id key is freed before we insert the
+                                // document.  The winner (document) keeps its id; the anchor loses.
+                                let anchor_bref = existing.bid.bref().to_string();
+                                let msg = format!(
+                                    "ID collision on {:?}: incoming document {} beats existing \
+                                     anchor {}; anchor id reset to bref '{}'. \
+                                     Add an explicit anchor id in the section's source file to resolve.",
+                                    key, node.bid, existing.bid, anchor_bref,
+                                );
+                                tracing::debug!(label = self.label, "insert_state: {}", msg);
+                                self.write_diagnostics().push(ParseDiagnostic::warning(msg));
+                                // Mutate the stored anchor in-place — no eviction needed.
+                                // Emit a NodeUpdate derivative so PathMapMap.process_event_queue
+                                // sees the id change and calls update_path_segment on the
+                                // affected PathMaps to regenerate the stale path string.
+                                if let Some(stored) = self.states.get_mut(&existing.bid) {
+                                    stored.id = Some(anchor_bref);
+                                    // Serialize after mutation so the event carries the new id.
+                                    // Use minimal Bid+Bref keys — PathMapMap only needs the BID
+                                    // to detect the id change; full path keys require a &BeliefBase
+                                    // borrow that conflicts with &mut self here.
+                                    let clobber_event = BeliefEvent::NodeUpdate(
+                                        vec![
+                                            NodeKey::Bid { bid: stored.bid },
+                                            NodeKey::Bref {
+                                                bref: stored.bid.bref(),
+                                            },
+                                        ],
+                                        stored.toml(),
+                                        EventOrigin::Local,
+                                    );
+                                    events.push(clobber_event);
+                                }
+                                // Do NOT add existing.bid to collision_winner_bids: the anchor
+                                // lost, so the to_replace loop may legitimately absorb it if
+                                // another key matches.
+                            } else {
+                                // First-one-wins: incoming loses.
+                                // Clear our id to bref so the conflicting key is no longer
+                                // generated for us when we are inserted below. Record the winner's
+                                // BID so the to_replace loop skips it (we must NOT rename/absorb
+                                // the winner into the incoming loser node).
+                                let msg = format!(
+                                    "ID collision on {:?}: existing node {} keeps the id; \
+                                     incoming node {} has its id cleared to bref '{}'. \
+                                     Add an explicit anchor to one of the headings to resolve.",
+                                    key, existing.bid, node.bid, node_bref,
+                                );
+                                tracing::debug!(label = self.label, "insert_state: {}", msg);
+                                self.write_diagnostics().push(ParseDiagnostic::warning(msg));
+                                collision_winner_bids.insert(existing.bid);
+                                node.id = Some(node_bref.clone());
+                                // If this node was previously stored, emit a NodeUpdate so
+                                // PathMapMap sees the id change and regenerates stale path
+                                // entries — mirrors the clobber event emitted in the
+                                // document-beats-anchor branch above.
+                                if self.states.contains_key(&node.bid) {
+                                    let clobber_event = BeliefEvent::NodeUpdate(
+                                        vec![
+                                            NodeKey::Bid { bid: node.bid },
+                                            NodeKey::Bref {
+                                                bref: node.bid.bref(),
+                                            },
+                                        ],
+                                        node.toml(),
+                                        EventOrigin::Local,
+                                    );
+                                    events.push(clobber_event);
+                                }
+                                // Stop checking: id is now resolved to bref, no further Id keys apply.
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut to_replace = BTreeSet::<Bid>::new();
         for key in merge.iter() {
             let results = self.evaluate_expression(&Expression::from(key));
-            if let Some(node) = BeliefBase::from(results).get(key) {
-                to_replace.insert(node.bid);
+            if let Some(existing) = BeliefBase::from(results).get(key) {
+                // Skip collision winners — they keep their own BID and must not be
+                // absorbed into the incoming (losing) node.
+                if !collision_winner_bids.contains(&existing.bid) {
+                    to_replace.insert(existing.bid);
+                }
             }
         }
         to_replace.remove(&node.bid);
         if !to_replace.is_empty() {
             tracing::debug!(
+                label = self.label,
                 "insert_state: Node bid={}, id={:?}, kind={:?} will REPLACE nodes: {:?}. Merge keys: {:?}",
                 node.bid, node.id, node.kind, to_replace, merge
             );
@@ -1448,7 +1701,10 @@ impl BeliefBase {
     ) -> Vec<BeliefEvent> {
         #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
-            tracing::info!("[BeliefBase::update_relation] Waiting for write access to relations");
+            tracing::info!(
+                label = self.label,
+                "[BeliefBase::update_relation] Waiting for write access to relations"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
@@ -1457,6 +1713,7 @@ impl BeliefBase {
         if maybe_source_idx.is_none() || maybe_sink_idx.is_none() {
             // Skip if either node has been removed
             tracing::warn!(
+                label = self.label,
                 "Skipping update_relation({} -[{}]-> {}), source is missing: {}, sink is missing: {}, index_dirty: {}",
                 self.states().get(&source).map(|n| n.display_title()).unwrap_or(source.to_string()),
                 new_weight_set.weights.keys().map(|k| k.to_string()).collect::<Vec<String>>().join(", "),
@@ -1524,6 +1781,7 @@ impl BeliefBase {
 
         let Some(sink_idx) = self.bid_to_index(sink) else {
             tracing::warn!(
+                label = self.label,
                 "could not acquire bid to index for {}, can't reindex sink edges!",
                 sink
             );
@@ -1692,6 +1950,7 @@ impl BeliefBase {
         }
         if !states.is_empty() {
             tracing::warn!(
+                label = self.label,
                 "Converted a multi-node BeliefBase into a BeliefNode. Remaining nodes: {:?}",
                 states
             );
@@ -1826,7 +2085,10 @@ impl BeliefBase {
     pub fn trim(&mut self, to_retain: Option<BTreeSet<Bid>>) {
         #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
-            tracing::info!("[BeliefBase::trim] Waiting for write access to relations");
+            tracing::info!(
+                label = self.label,
+                "[BeliefBase::trim] Waiting for write access to relations"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let mut write_relations = self.write_relations();
@@ -1940,7 +2202,7 @@ impl BeliefBase {
                             }
                         }),
                 );
-                tracing::debug!("Found {res:?} matches");
+                tracing::debug!(label = self.label, "Found {res:?} matches");
                 res
             }
         }

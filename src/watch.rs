@@ -881,21 +881,12 @@ impl FileUpdateSyncer {
                 loop {
                     // Log queue state before parsing
                     {
-                        let mut compiler_write = compiler_ref.write_arc();
-                        let primary_empty = compiler_write.primary_queue_len() == 0;
-                        let reparse_pending = compiler_write.reparse_queue_len() > 0;
-
+                        let compiler_write = compiler_ref.write_arc();
                         tracing::info!(
-                            "[DocumentCompiler] Loop iteration - primary_queue: {}, reparse_queue: {}, total_parsed: {}",
-                            compiler_write.primary_queue_len(),
-                            compiler_write.reparse_queue_len(),
+                            "[DocumentCompiler] Loop iteration - remainder_queue: {}, total_parsed: {}",
+                            compiler_write.remainder_queue_len(),
                             compiler_write.stats().total_parses
                         );
-
-                        // Mark start of reparse round if transitioning from primary to reparse queue
-                        if primary_empty && reparse_pending {
-                            compiler_write.start_reparse_round();
-                        }
                     }
 
                     // Parse next document
@@ -1007,9 +998,8 @@ impl FileUpdateSyncer {
                                     }
                             };
                             tracing::info!(
-                                "[DocumentCompiler] parse_next returned None - Queue is empty. Final stats: primary={}, reparse={}, total_parses={}",
-                                stats.primary_queue_len,
-                                stats.reparse_queue_len,
+                                "[DocumentCompiler] parse_next returned None - Queue is empty. Final stats: remainder={}, total_parses={}",
+                                stats.remainder_queue_len,
                                 stats.total_parses
                             );
 

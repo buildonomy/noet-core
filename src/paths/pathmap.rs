@@ -126,9 +126,9 @@ fn generate_terminal_path(
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
             .or_else(|| {
-                // Use the stored id only if it is not a bref-fallback (collision-corrected).
-                // When id == bref, the author never set a meaningful id; prefer the title-anchor
-                // for a human-readable path instead.
+                // Use the stored id only if it is not a pure bref-fallback.
+                // When id == bref, the author never set a meaningful id; prefer the
+                // title-anchor for a human-readable path instead.
                 nets.ids
                     .get(source)
                     .filter(|id| id.as_str() != source.bref().to_string().as_str())
@@ -248,6 +248,18 @@ pub struct PathMapMap {
     titles: BTreeMap<Bid, String>,
     ids: BTreeMap<Bid, String>,
     relations: Arc<RwLock<BidGraph>>,
+    /// Reverse index: node BID → set of network Brefs whose PathMap contains that node.
+    ///
+    /// Used by `process_event_queue` to route `RelationUpdate`/`RelationRemoved` events
+    /// only to the PathMaps that actually contain the source or sink node, rather than
+    /// broadcasting to all O(N_networks) PathMaps. For most relations this reduces the
+    /// fan-out from O(N_networks) to O(1).
+    ///
+    /// Maintained by:
+    /// - `rebuild_node_to_nets`: called after a PathMap is (re)constructed.
+    /// - `process_nodes_removed`: removes entries for deleted nodes.
+    /// - `process_node_renamed`: remaps entries under the new BID.
+    node_to_nets: BTreeMap<Bid, BTreeSet<Bref>>,
 }
 
 impl Default for PathMapMap {
@@ -267,8 +279,10 @@ impl Default for PathMapMap {
             titles: BTreeMap::default(),
             ids: BTreeMap::default(),
             relations: relations.clone(),
+            node_to_nets: BTreeMap::default(),
         };
         let api_pm = PathMap::new(WeightKind::Section, root, &pmm, relations);
+        pmm.rebuild_node_to_nets_for(&root.bref(), &api_pm);
         pmm.map.insert(root.bref(), Arc::new(RwLock::new(api_pm)));
         pmm
     }
@@ -312,6 +326,29 @@ impl fmt::Display for PathMapMap {
 }
 
 impl PathMapMap {
+    /// Rebuild the `node_to_nets` reverse-index entries for a single network's PathMap.
+    ///
+    /// Called after any `PathMap` is constructed or replaced.  Removes all stale entries
+    /// for `net_bref` then re-inserts one entry per node currently in the PathMap's
+    /// `bid_map`.
+    fn rebuild_node_to_nets_for(&mut self, net_bref: &Bref, pm: &PathMap) {
+        // Remove stale entries for this network from the reverse index.
+        self.node_to_nets.values_mut().for_each(|nets| {
+            nets.remove(net_bref);
+        });
+        // Prune now-empty entries to keep the map lean.
+        self.node_to_nets.retain(|_, nets| !nets.is_empty());
+        // Insert fresh entries for every node currently in this PathMap.
+        for bid in pm.bid_map.keys() {
+            self.node_to_nets.entry(*bid).or_default().insert(*net_bref);
+        }
+        // The network node itself is always reachable by its own PathMap.
+        self.node_to_nets
+            .entry(pm.net)
+            .or_default()
+            .insert(*net_bref);
+    }
+
     #[tracing::instrument(skip(states, relations))]
     pub fn new(states: &BTreeMap<Bid, BeliefNode>, relations: Arc<RwLock<BidGraph>>) -> PathMapMap {
         // tracing::debug!(
@@ -321,6 +358,7 @@ impl PathMapMap {
         // );
         let mut pmm = PathMapMap {
             relations: relations.clone(),
+            node_to_nets: BTreeMap::default(),
             ..Default::default()
         };
         for node in states.values() {
@@ -378,15 +416,20 @@ impl PathMapMap {
         }
 
         pmm.map.clear();
+        pmm.node_to_nets.clear();
 
-        for net in pmm.nets.iter() {
+        // Collect nets to avoid holding an immutable borrow on pmm.nets while calling
+        // rebuild_node_to_nets_for (which takes &mut self).
+        let nets_to_build: Vec<Bid> = pmm.nets.iter().copied().collect();
+        for net in nets_to_build {
             if !pmm.map.contains_key(&net.bref()) {
-                let pm = PathMap::new(WeightKind::Section, *net, &pmm, relations.clone());
+                let pm = PathMap::new(WeightKind::Section, net, &pmm, relations.clone());
                 // tracing::debug!(
                 //     "[PathMapMap::new] Created PathMap for network {}: {} entries",
                 //     net,
                 //     pm.map().len()
                 // );
+                pmm.rebuild_node_to_nets_for(&net.bref(), &pm);
                 pmm.map.insert(net.bref(), Arc::new(RwLock::new(pm)));
             }
         }
@@ -590,6 +633,18 @@ impl PathMapMap {
         relations: &Arc<RwLock<BidGraph>>,
     ) -> Vec<BeliefEvent> {
         let mut path_events = Vec::new();
+        // Tracks which network Brefs had their PathMap mutated this call, so the
+        // sort pass at the end only touches dirty PathMaps.
+        let mut dirty_nets: BTreeSet<Bref> = BTreeSet::new();
+        // Derivative path events collected per net, used after the sort pass to
+        // update node_to_nets incrementally from PathAdded/PathsRemoved signals.
+        let mut net_derivatives: BTreeMap<Bref, Vec<BeliefEvent>> = BTreeMap::new();
+
+        // Non-network nodes whose id or title changed this batch. Collected in pass 1
+        // (single deserialise per event) so pass 2 can drive targeted path-string
+        // regeneration in affected PathMaps without a full PathMap rebuild.
+        // Value is the BID of the node whose path segment needs refreshing.
+        let mut segment_dirty_bids: Vec<Bid> = Vec::new();
 
         // Pass 1: populate titles, docs, nets, and ids from all NodeUpdate/NodeRemoved events
         // before rebuilding any PathMaps. This ensures that when a network NodeUpdate triggers
@@ -601,6 +656,21 @@ impl PathMapMap {
             match event {
                 BeliefEvent::NodeUpdate(_, toml_str, _) => {
                     if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
+                        // Detect id/title changes for non-network nodes so pass 2 can
+                        // update only their path segments in affected PathMaps.
+                        if !node.kind.is_network() {
+                            let new_id = node.id();
+                            let new_title = node.title.clone();
+                            let id_changed =
+                                self.ids.get(&node.bid).map_or(false, |old| *old != new_id);
+                            let title_changed = self
+                                .titles
+                                .get(&node.bid)
+                                .map_or(false, |old| *old != new_title);
+                            if id_changed || title_changed {
+                                segment_dirty_bids.push(node.bid);
+                            }
+                        }
                         self.titles.insert(node.bid, node.title.clone());
                         self.ids.insert(node.bid, node.id());
                         if node.kind.contains(BeliefKind::API) {
@@ -650,22 +720,105 @@ impl PathMapMap {
                                 self,
                                 relations.clone(),
                             );
+                            self.rebuild_node_to_nets_for(&node.bid.bref(), &pm);
+                            dirty_nets.insert(node.bid.bref());
                             self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
                         }
                     }
                 }
-                BeliefEvent::NodeRenamed(from, to, _) => {
-                    self.process_node_renamed(from, to);
-                    for pm_lock in self.map.values() {
-                        let mut pm = pm_lock.write();
-                        path_events.append(&mut pm.process_event(event, self));
+                // For non-network nodes whose id or title changed, regenerate the path
+                // segment in each PathMap that contains the node. `self.ids`/`self.titles`
+                // were already updated in pass 1, so `update_path_segment` reads the new
+                // values when it calls `generate_path_name`.
+                // This is handled once here rather than per-event so we do a single
+                // targeted update per dirty BID regardless of how many NodeUpdate events
+                // arrived for it in this batch.
+                _ => {}
+            }
+        }
+
+        // Drive targeted path-segment regeneration for non-network nodes that changed
+        // their id or title this batch (e.g. document-beats-anchor id clobber in
+        // insert_state). `self.ids` was updated in pass 1, so each call reads the new id.
+        for bid in &segment_dirty_bids {
+            let target_nets: Vec<Bref> = self
+                .node_to_nets
+                .get(bid)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            for net_bref in &target_nets {
+                if let Some(pm_lock) = self.map.get(net_bref) {
+                    let mut pm = pm_lock.write();
+                    let events = pm.update_path_segment(bid, self);
+                    if !events.is_empty() {
+                        dirty_nets.insert(*net_bref);
+                        net_derivatives
+                            .entry(*net_bref)
+                            .or_default()
+                            .extend(events.iter().cloned());
+                        path_events.extend(events);
                     }
                 }
-                BeliefEvent::RelationUpdate(..) | BeliefEvent::RelationRemoved(..) => {
-                    // Process this relation update for each PathMap that has matching WeightKind
-                    for pm_lock in self.map.values() {
-                        let mut pm = pm_lock.write();
-                        path_events.append(&mut pm.process_event(event, self));
+            }
+        }
+
+        for event in events {
+            match event {
+                BeliefEvent::NodeUpdate(..) => {}
+                BeliefEvent::NodeRenamed(from, to, _) => {
+                    self.process_node_renamed(from, to);
+                    // NodeRenamed affects every PathMap that contains the old BID.
+                    // Use the reverse index if available; fall back to full scan if the
+                    // renamed node was not yet indexed (shouldn't happen in practice).
+                    let target_nets: Vec<Bref> = self
+                        .node_to_nets
+                        .get(from)
+                        .map(|s| s.iter().copied().collect())
+                        .unwrap_or_else(|| self.map.keys().cloned().collect());
+                    for net_bref in &target_nets {
+                        if let Some(pm_lock) = self.map.get(net_bref) {
+                            let mut pm = pm_lock.write();
+                            let events = pm.process_event(event, self);
+                            if !events.is_empty() {
+                                dirty_nets.insert(*net_bref);
+                                net_derivatives
+                                    .entry(*net_bref)
+                                    .or_default()
+                                    .extend(events.iter().cloned());
+                                path_events.extend(events);
+                            }
+                        }
+                    }
+                }
+                BeliefEvent::RelationUpdate(source, sink, ..)
+                | BeliefEvent::RelationRemoved(source, sink, ..) => {
+                    // Route to only the PathMaps that contain source or sink.
+                    // For most relations this is exactly one network; it is at most the
+                    // union of two small sets — O(1) vs the previous O(N_networks) fan-out.
+                    //
+                    // We also include any PathMap whose network node IS the sink, because
+                    // a network node always has an entry in its own PathMap and
+                    // process_relation_update uses self.net == *sink to gate path insertion.
+                    let mut candidate_nets: BTreeSet<Bref> = BTreeSet::new();
+                    if let Some(nets) = self.node_to_nets.get(source) {
+                        candidate_nets.extend(nets);
+                    }
+                    if let Some(nets) = self.node_to_nets.get(sink) {
+                        candidate_nets.extend(nets);
+                    }
+                    for net_bref in &candidate_nets {
+                        if let Some(pm_lock) = self.map.get(net_bref) {
+                            let mut pm = pm_lock.write();
+                            let events = pm.process_event(event, self);
+                            if !events.is_empty() {
+                                dirty_nets.insert(*net_bref);
+                                net_derivatives
+                                    .entry(*net_bref)
+                                    .or_default()
+                                    .extend(events.iter().cloned());
+                                path_events.extend(events);
+                            }
+                        }
                     }
                 }
                 // A RelationChange results in a derivative RelationUpdate if it materially changes
@@ -677,42 +830,135 @@ impl PathMapMap {
                 _ => {}
             }
         }
-        // Sort all PathMaps that may have received out-of-order siblings. RelationUpdate events
-        // are not guaranteed to arrive in WEIGHT_SORT_KEY order, but process_relation_update
-        // inserts new entries at the end of existing children without consulting the sort key.
-        // One O(M log M) pass per network here — rather than per-event — restores correct order.
-        for pm_lock in self.map.values() {
-            let mut pm = pm_lock.write();
-            pm.sort();
-            pm.bid_map.clear();
-            pm.path_map.clear();
-            pm.order_map.clear();
-            let entries: Vec<(String, Bid, Vec<u16>)> = pm
-                .map
+        // (pass 2 loop closed above)
+
+        // Sort-only pass for dirty PathMaps.
+        //
+        // process_relation_update already rebuilds bid_map/path_map/order_map internally
+        // whenever it produces derivatives (L1955–1967). The only thing still needed here
+        // is pm.sort(): process_relation_update appends new entries at the end of self.map
+        // without respecting WEIGHT_SORT_KEY order, so source_sub_indices (which walks
+        // self.map linearly by order prefix) would give wrong results on the next call
+        // within the same batch if we skipped the sort.
+        //
+        // After sorting, update node_to_nets from the derivative events collected above:
+        // - PathAdded(net_bref, _, bid, ..)  → bid is now in net_bref's PathMap.
+        // - PathsRemoved(net_bref, ..)       → no BID info; fall back to full rebuild.
+        // - PathUpdate                        → no membership change, skip.
+        for net_bref in &dirty_nets {
+            let Some(pm_lock) = self.map.get(net_bref) else {
+                continue;
+            };
+            {
+                let mut pm = pm_lock.write();
+                // Skip the sort and index rebuild when the map is already in sorted order.
+                // process_relation_update rebuilds the index maps after appending/updating
+                // entries, so if positions haven't changed (already sorted) those indexes
+                // are still valid.  is_sorted_by is O(N) with no allocations — cheap enough
+                // to always check before paying for an O(N log N) sort + O(N) index rebuild.
+                let already_sorted = pm.map.is_sorted_by(|a, b| {
+                    matches!(
+                        pathmap_order(&a.2, &b.2).then(a.1.cmp(&b.1)),
+                        Ordering::Less | Ordering::Equal
+                    )
+                });
+                if !already_sorted {
+                    pm.sort();
+                    // Rebuild index maps after sort. pm.sort() changes the position of every
+                    // entry in self.map, so all index positions computed by process_relation_update
+                    // are now stale. This is the single authoritative rebuild point.
+                    // Collect entries first to satisfy the borrow checker (can't borrow
+                    // pm.map immutably while mutating pm.bid_map/path_map/order_map).
+                    let entries: Vec<(String, Bid, Vec<u16>)> = pm
+                        .map
+                        .iter()
+                        .map(|(path, bid, order)| (path.clone(), *bid, order.clone()))
+                        .collect();
+                    pm.bid_map.clear();
+                    pm.path_map.clear();
+                    pm.order_map.clear();
+                    for (idx, (path, bid, order)) in entries.iter().enumerate() {
+                        pm.bid_map.entry(*bid).or_default().push(idx);
+                        pm.path_map.insert(path.clone(), idx);
+                        pm.order_map.insert(order_key(order), idx);
+                    }
+                    // Keep subnets consistent with the freshly rebuilt bid_map: a subnet
+                    // whose relation was just removed no longer has a bid_map entry and must
+                    // be evicted so recursive_map doesn't look it up and fail.
+                    let stale_subnets: Vec<Bid> = pm
+                        .subnets
+                        .iter()
+                        .filter(|bid| !pm.bid_map.contains_key(bid))
+                        .copied()
+                        .collect();
+                    for bid in stale_subnets {
+                        pm.subnets.remove(&bid);
+                    }
+                    // pm write guard dropped here.
+                } // end if !already_sorted
+            }
+
+            // Update node_to_nets from derivative events for this net.
+            // This must run regardless of whether the sort was needed: PathAdded events
+            // are collected during the relation-routing pass above and must be reflected
+            // in node_to_nets so that subsequent process_event_queue calls (for deeper
+            // section nodes in the same Phase 1 push loop) can route their RelationUpdate
+            // events to the correct PathMap via the reverse index.
+            // If any PathsRemoved arrived we can't cheaply infer which BIDs left, so
+            // fall back to a full rebuild from bid_map for this net only.
+            let derivs = net_derivatives
+                .get(net_bref)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let has_removal = derivs
                 .iter()
-                .map(|(path, bid, order)| (path.clone(), *bid, order.clone()))
-                .collect();
-            for (idx, (path, bid, order)) in entries.iter().enumerate() {
-                pm.bid_map.entry(*bid).or_default().push(idx);
-                pm.path_map.insert(path.clone(), idx);
-                pm.order_map.insert(order_key(order), idx);
+                .any(|e| matches!(e, BeliefEvent::PathsRemoved(..)));
+
+            if has_removal {
+                // Full rebuild for this net: wipe its stale entries then re-insert.
+                self.node_to_nets.values_mut().for_each(|nets| {
+                    nets.remove(net_bref);
+                });
+                self.node_to_nets.retain(|_, nets| !nets.is_empty());
+                let bids: Vec<Bid> = pm_lock.read().bid_map.keys().copied().collect();
+                for bid in bids {
+                    self.node_to_nets.entry(bid).or_default().insert(*net_bref);
+                }
+            } else {
+                // Incremental update: PathAdded tells us exactly which BID was inserted.
+                for event in derivs {
+                    if let BeliefEvent::PathAdded(_, _, bid, ..) = event {
+                        self.node_to_nets.entry(*bid).or_default().insert(*net_bref);
+                    }
+                }
             }
         }
 
         path_events
     }
 
-    /// Process a NodesRemoved event to clean up nets, docs, and titles
+    /// Process a NodesRemoved event to clean up nets, docs, titles, and the reverse index.
     pub fn process_nodes_removed(&mut self, bids: &[Bid]) {
         for bid in bids {
             self.nets.remove(bid);
             self.ids.remove(bid);
             self.docs.remove(bid);
             self.titles.remove(bid);
-            self.map.remove(&bid.bref());
+            // Remove this node from the reverse index entirely.
+            self.node_to_nets.remove(bid);
+            // If the removed node was a network, remove its PathMap and evict it from
+            // all other nodes' reverse-index sets.
+            let net_bref = bid.bref();
+            if self.map.remove(&net_bref).is_some() {
+                self.node_to_nets.values_mut().for_each(|nets| {
+                    nets.remove(&net_bref);
+                });
+                self.node_to_nets.retain(|_, nets| !nets.is_empty());
+            }
         }
     }
-    /// Process a NodesRemoved event to clean up nets, docs, and titles
+
+    /// Process a NodeRenamed event to update nets, docs, titles, and the reverse index.
     pub fn process_node_renamed(&mut self, from: &Bid, to: &Bid) {
         if self.nets.remove(from) {
             self.nets.insert(*to);
@@ -726,8 +972,24 @@ impl PathMapMap {
         if let Some(title) = self.titles.remove(from) {
             self.titles.insert(*to, title);
         };
+        // Remap the PathMap key if this node was a network.
         if let Some(pm) = self.map.remove(&from.bref()) {
             self.map.insert(to.bref(), pm);
+        }
+        // Remap the reverse-index entry for the renamed node itself.
+        if let Some(net_set) = self.node_to_nets.remove(from) {
+            self.node_to_nets.insert(*to, net_set);
+        }
+        // If this node was a network, all other nodes that referenced it by Bref need
+        // their set entries updated from from.bref() → to.bref().
+        let from_bref = from.bref();
+        let to_bref = to.bref();
+        if from_bref != to_bref {
+            for nets in self.node_to_nets.values_mut() {
+                if nets.remove(&from_bref) {
+                    nets.insert(to_bref);
+                }
+            }
         }
     }
 }
@@ -1440,6 +1702,117 @@ impl PathMap {
         )
     }
 
+    /// Regenerate path strings for all entries belonging to `bid` in this PathMap.
+    ///
+    /// Called when the node's id or title has changed in `nets` (e.g. after the
+    /// document-beats-anchor id-clobber in `insert_state`). `nets.ids` and
+    /// `nets.titles` are already up-to-date before this is called.
+    ///
+    /// For each entry `(old_path, bid, order)` in `self.map`:
+    /// 1. Derive the parent's path from `order[..order.len()-1]` via `order_map`.
+    /// 2. Re-run `generate_path_name` with the updated `nets`.
+    /// 3. If the path string changed, update `self.map`, `self.path_map`, and
+    ///    `self.bid_map` (order vecs hold indices; path_map keys change but the
+    ///    indices themselves do not), and emit `PathUpdate` derivatives.
+    pub(crate) fn update_path_segment(&mut self, bid: &Bid, nets: &PathMapMap) -> Vec<BeliefEvent> {
+        let Some(indices) = self.bid_map.get(bid).cloned() else {
+            return vec![];
+        };
+        let mut derivatives = Vec::new();
+        for idx in indices {
+            let (old_path, _bid, order) = &self.map[idx];
+            let old_path = old_path.clone();
+            let order = order.clone();
+
+            // Derive the sort index (last element of order) and find the parent entry.
+            let Some(&sort_idx) = order.last() else {
+                // This is the network root entry — it has no terminal segment to regenerate.
+                continue;
+            };
+            let parent_order = &order[..order.len() - 1];
+            // The network root ("" entry) has order [] and is not in order_map, but its
+            // path is "". The "index.md" entry has order [NETWORK_SECTION_SORT_KEY] and IS
+            // in order_map. For direct children of the network root, parent_order is [].
+            let parent_path: String = if parent_order.is_empty() {
+                String::new()
+            } else {
+                match self.order_for(parent_order) {
+                    Some((_parent_bid, p)) => p.to_string(),
+                    None => {
+                        tracing::warn!(
+                            "[update_path_segment] net={} bid={}: cannot find parent for order={:?}",
+                            self.net, bid, order
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            // Find the sink BID: look for the entry at parent_order (that's the sink).
+            // For direct children of the network root the sink is self.net itself.
+            let sink_bid: Bid = if parent_order.is_empty() {
+                self.net
+            } else {
+                match self.order_for(parent_order) {
+                    Some((parent_bid, _)) => parent_bid,
+                    None => continue,
+                }
+            };
+
+            // Strip anchor from parent path before generating child path (mirrors
+            // process_relation_update which calls sink_ap.filepath() for this purpose).
+            let sink_ap = crate::paths::AnchorPath::from(parent_path.as_str());
+            let sink_path_without_anchor = sink_ap.filepath().to_string();
+
+            let new_path = self.generate_path_name(
+                bid,
+                &sink_bid,
+                &sink_path_without_anchor,
+                None,
+                sort_idx,
+                nets,
+            );
+
+            if new_path == old_path {
+                continue;
+            }
+
+            tracing::debug!(
+                "[update_path_segment] net={} bid={}: \"{}\" -> \"{}\"",
+                self.net,
+                bid,
+                old_path,
+                new_path
+            );
+
+            // Update path_map: remove old key, insert new key (index unchanged).
+            self.path_map.remove(&old_path);
+            self.path_map.insert(new_path.clone(), idx);
+            self.map[idx].0 = new_path.clone();
+
+            // Update id_map and title_map entries for this bid.
+            // IdMap is keyed by path-string → Bid (id_to_bid) with reverse bid → path.
+            // If this bid had an entry, remove the old path key and insert the new one.
+            if self.id_map.get_id(bid).is_some() {
+                self.id_map.remove(bid);
+                self.id_map.insert(new_path.clone(), *bid);
+            }
+            if self.title_map.get_id(bid).is_some() {
+                self.title_map.remove(bid);
+                self.title_map.insert(new_path.clone(), *bid);
+            }
+
+            derivatives.push(BeliefEvent::PathUpdate(
+                self.net.bref(),
+                new_path,
+                *bid,
+                order,
+                crate::event::EventOrigin::Local,
+            ));
+        }
+        derivatives
+    }
+
     /// Process a relation event and generate path mutations
     pub fn process_event(&mut self, event: &BeliefEvent, nets: &PathMapMap) -> Vec<BeliefEvent> {
         let res = match event {
@@ -1814,24 +2187,34 @@ impl PathMap {
         }
 
         if !derivatives.is_empty() {
-            // Regenerate our support indices
+            // Rebuild all three index maps after any insertions or removals so that
+            // the *next* process_relation_update call within the same Pass 2 batch
+            // reads valid indices. self.map.insert() shifts all subsequent positions
+            // by +1, making every stale index point at the wrong entry — this triggers
+            // the debug_assert!(*sink_bid == *sink) guard at the top of the next call
+            // for bid_map, and would return wrong results for order_for() (order_map)
+            // and any path_map consumer between two calls in the same batch.
+            //
+            // The removal branch (above) already does a full three-map rebuild after
+            // self.map.remove(). This block makes the insert/update branch consistent
+            // with it. The sort pass at the end of process_event_queue does another
+            // full rebuild after pm.sort() reorders everything — that remains the
+            // single authoritative post-sort rebuild point.
             self.bid_map.clear();
             self.path_map.clear();
             self.order_map.clear();
             for (idx, (path, bid, order)) in self.map.iter().enumerate() {
-                let bid_idx_vec = self.bid_map.entry(*bid).or_default();
-                bid_idx_vec.push(idx);
+                self.bid_map.entry(*bid).or_default().push(idx);
                 self.path_map.insert(path.clone(), idx);
                 self.order_map.insert(order_key(order), idx);
             }
 
+            // subnets.retain (which needs bid_map to be current) is also deferred to
+            // the sort pass for the same reason — see process_event_queue.
+
             if nets.nets.contains(source) && self.net != *source {
                 self.subnets.insert(*source);
             }
-            // Keep subnets consistent with bid_map: a subnet whose path was just removed no longer
-            // has a bid_map entry and must be evicted from subnets to prevent recursive_map from
-            // looking it up and failing.
-            self.subnets.retain(|bid| self.bid_map.contains_key(bid));
 
             // Update our title and id maps
             if derivatives
