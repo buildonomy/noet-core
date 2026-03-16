@@ -514,6 +514,49 @@ async fn main() {
 5. **How to distribute VSCode extension?**
    - **Decision**: For v0.2.0, document manual installation. For v0.3.0+, consider publishing to VSCode marketplace.
 
+6. **Where do per-node diagnostics and source positions live?**
+
+   LSP requires source ranges for diagnostics and hover. Currently `ParseDiagnostic`
+   lives in `codec::diagnostic` and is produced in `codec::builder::push()`. Several
+   problems arise when the LSP needs this information:
+
+   - `BeliefBase` (lower layer) cannot hold `ParseDiagnostic` values without a circular
+     dependency on `codec`.
+   - Source position (byte offset, line/column) is available in the codec layer but is
+     discarded before reaching `BeliefBase` or `global_bb`.
+   - Collision diagnostics detected in `BeliefBase::insert_state` (inter-epoch path)
+     currently have no access to `ParseDiagnostic` — they write to a stepping-stone
+     `BeliefBase.diagnostics: SharedLock<Vec<String>>` and are drained by `push()`.
+
+   **Proposed design — `BeliefNode` metadata field**:
+
+   Add a `metadata: HashMap<String, MetadataValue>` field to `BeliefNode` in
+   `src/properties.rs`. This field:
+   - Is **excluded from `toml()` serialization** and from `PartialEq` / `Hash` comparisons
+     (i.e. `node.toml()` is unchanged; equality is purely semantic content).
+   - Carries ephemeral per-node context: source filepath, byte range, parse diagnostics.
+   - Is populated by the codec layer after `push()` resolves the node's BID.
+   - Is accessible to `BeliefBase::insert_state` without any layering change — `metadata`
+     is on the node struct itself, not on `BeliefBase`.
+   - Gives the LSP server direct access to `PositionIndex`-style data without a separate
+     index, since every `BeliefNode` in `doc_bb` carries its own range.
+
+   This eliminates the need for the `BeliefBase.diagnostics` stepping-stone field once
+   implemented. The stepping-stone remains until this design is built.
+
+   **Tradeoffs**:
+   - Adds a field to `BeliefNode` that is silent in serialization — must be carefully
+     documented so future `toml()` callers don't expect it.
+   - `BeliefGraph` merge/union operations must decide how to merge `metadata` (last-write
+     wins, or union of diagnostics). Semantics need specifying.
+   - `Clone` of `BeliefNode` clones metadata too — ephemeral data survives longer than
+     intended in caches. Must be cleared on cache eviction.
+
+   **Decision**: Deferred to implementation of Issue 11 Step 1 (position tracking in
+   DocCodec). Stepping-stone `BeliefBase.diagnostics: SharedLock<Vec<String>>` remains
+   until then. See `src/codec/builder.rs` `push()` and `src/beliefbase/base.rs`
+   `insert_state` for current collision diagnostic wiring.
+
 ## Future Work (Issue 12)
 
 **Navigation features** (2-3 days):
@@ -544,10 +587,20 @@ async fn main() {
 - Rationale: Simpler to implement, sufficient for markdown documents. Incremental sync is optimization for Issue 12.
 - Impact: Re-parse entire document on every change (acceptable for markdown)
 
-**Decision 3: Position tracking in BeliefNode**
+**Decision 3: Position tracking via BeliefNode metadata field (deferred)**
 - Date: [To be filled during implementation]
-- Rationale: Positions are integral to node identity in LSP context. Store with node for easy access.
-- Alternative: Separate index mapping BID → Range (more complex, less ergonomic)
+- Rationale: Positions are integral to node identity in LSP context. A `metadata:
+  HashMap<String, MetadataValue>` field excluded from serialization and equality gives
+  the LSP layer direct access without a separate index structure and without introducing
+  a `codec` → `beliefbase` circular dependency.
+- Alternative considered: `BeliefBase.diagnostics: SharedLock<Vec<String>>` — implemented
+  as a stepping stone (see `src/beliefbase/base.rs`). Works for current collision
+  diagnostic forwarding but loses type structure and source position.
+- Alternative considered: `tracing` side-channel (see `docs/design/instrumentation_design.md`)
+  — adds indirection without benefit; the LSP needs a pull model, not a log stream.
+- Alternative considered: Separate `PositionIndex` mapping BID → Range — more complex,
+  requires a parallel data structure kept in sync with `BeliefBase` states.
+- See Open Question 6 for full design rationale.
 
 **Decision 4: LSP as separate binary (noet-lsp)**
 - Date: [To be filled during implementation]

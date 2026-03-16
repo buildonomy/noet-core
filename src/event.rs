@@ -133,6 +133,24 @@ impl BeliefEvent {
             BeliefEvent::BuiltInTest => BeliefEvent::BuiltInTest,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BeliefEvent::NodeUpdate(..) => "NodeUpdate",
+            BeliefEvent::NodesRemoved(..) => "NodesRemoved",
+            BeliefEvent::NodeRenamed(..) => "NodeRenamed",
+            BeliefEvent::PathAdded(..) => "PathAdded",
+            BeliefEvent::PathUpdate(..) => "PathUpdate",
+            BeliefEvent::PathsRemoved(..) => "PathsRemoved",
+            BeliefEvent::RelationUpdate(..) => "RelationUpdate",
+            BeliefEvent::RelationChange(..) => "RelationChange",
+            BeliefEvent::RelationRemoved(..) => "RelationRemoved",
+            BeliefEvent::FileParsed(..) => "FileParsed",
+            BeliefEvent::BatchStart => "BatchStart",
+            BeliefEvent::BatchEnd => "BatchEnd",
+            BeliefEvent::BuiltInTest => "BuiltInTest",
+        }
+    }
 }
 
 impl Display for BeliefEvent {

@@ -397,6 +397,46 @@ approach does 2-4 queries and is unlikely to be a bottleneck. Implement this
 only if `resolve_net_path` shows up in profiling for large repos with deep or
 wide subnet hierarchies.
 
+## Streaming Drain During Epoch Parse (from Issue 57)
+
+**Priority**: LOW
+**Context**: During parallel epoch compilation (`parse_epoch_parallel`), parse tasks and
+the accumulator drain step run sequentially: all tasks complete, then `drain_epoch` is
+called, then the next epoch starts. The drain step currently takes O(N_events ×
+cost_per_event) and runs entirely after the parse JoinSet is awaited.
+
+### Proposal
+
+Clone the `BeliefBase` at `BatchStart` to produce a frozen snapshot. Parse tasks receive
+`QueryHandle`s wrapping the frozen snapshot (epoch N-1 state). A dedicated drain task
+consumes from `tx` and applies events to the live `inner` concurrently. At `drain_epoch`,
+swap `live → frozen` for the next epoch.
+
+This trades one `BeliefBase::clone()` per epoch for true parse/drain parallelism —
+eliminating the sequential parse→drain→parse→drain cadence entirely.
+
+### Design sketch
+
+`AccInner<S>` gains a `frozen: S` field (cloned at `BatchStart`). `QueryHandle`s wrap
+`Arc<frozen>` (read-only, no mutex contention). The drain task holds exclusive access to
+`live inner` via the existing `Arc<Mutex<AccInner>>`. At `drain_epoch`: `frozen = live`,
+clone a new `live` for next epoch (or swap with a fresh clone).
+
+No `RwLock` refactor needed — drain and query operate on separate objects with no shared
+lock.
+
+### Cost model
+
+`BeliefBase::clone()` at corpus scale: ~1008 PathMaps × ~50 entries, full node state map,
+edge graph deep copy — estimated <100ms on a modern machine. Break-even against drain time
+depends on post-P0 (PathMapMap routing fix) numbers.
+
+### When to Implement
+
+Profile after the PathMapMap reverse-index fix (P0 in Issue 57). If per-epoch drain drops
+below ~200ms, the clone overhead makes streaming overlap a net loss except for pathological
+large final batches. If drain remains dominant, implement as described above.
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

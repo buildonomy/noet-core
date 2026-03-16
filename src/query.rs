@@ -587,7 +587,7 @@ pub trait BeliefSource: Sync {
     fn eval(
         &self,
         expr: &Expression,
-    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> {
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
         async {
             let mut set = self.eval_unbalanced(expr).await?;
             self.balance(&mut set).await?;

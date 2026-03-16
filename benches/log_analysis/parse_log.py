@@ -14,6 +14,7 @@ Usage
     python3 benches/log_analysis/parse_log.py run.log --stalls 2.0
     python3 benches/log_analysis/parse_log.py run.log --warnings
     python3 benches/log_analysis/parse_log.py run.log --file-times
+    python3 benches/log_analysis/parse_log.py run.log --concurrency
     python3 benches/log_analysis/parse_log.py run.log --all
 
 Output modes
@@ -27,6 +28,9 @@ Output modes
     Every gap between consecutive log lines that exceeds SECONDS with
     context lines before and after.  Default threshold: 1.0 s.
 
+    With parallel logs, gaps between lines are expected (other tasks are
+    running).  Use --jobs N to suppress false stalls from concurrent tasks.
+
 --warnings
     Count and group WARN/ERROR lines by module path.  Shows the top-N
     warning types and total counts.  Useful for tracking self-connection
@@ -37,12 +41,20 @@ Output modes
     FILE_FRAGMENT.
 
 --file-times
-    Total parse time per file (from "Parsing file" compiler message to
-    Phase 5 completion), ranked slowest-first with mean/stddev/outlier
-    flagging.  Captures all phases including Phase 5 fan-out, unlike
-    --phase-summary which only measures Phase 0.  Also shows per-attempt
-    breakdown for files parsed more than once.  Includes a linear trend
-    fit (OLS over parse order) to detect O(N) parse-time growth.
+    Total parse time per file (Phase 0 start → Phase 5 end), ranked
+    slowest-first with mean/stddev/outlier flagging.  Also shows
+    per-attempt breakdown for files parsed more than once.  Includes a
+    linear trend fit (OLS over parse order) to detect O(N) parse-time
+    growth.
+
+    With parallel logs the "Sum (sequential)" is shown alongside an
+    estimated wall-clock time derived from actual task overlaps.
+
+--concurrency
+    Concurrency histogram: for each 100 ms bucket show how many
+    parse_task spans were active simultaneously (Phase 0 start →
+    Phase 5 end).  Also prints peak and mean concurrency.  Useful for
+    validating that --jobs N is actually letting N tasks run.
 
 --all
     Run all analyses.
@@ -51,6 +63,7 @@ Output modes
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 import re
 import sys
@@ -68,8 +81,12 @@ _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _LEVEL_RE = re.compile(r"\s+(DEBUG|INFO|WARN|ERROR)\s+")
 
+# Matches the span prefix emitted by .instrument(info_span!("parse_task", ...))
+# Example (after ANSI stripping):
+#   parse_task{task_idx=3 path=/some/path}: noet_core::codec::builder: Phase 0 ...
+_SPAN_RE = re.compile(r"parse_task\{task_idx=(\d+)\s+path=([^}]+)\}:")
 
-# Strip ANSI colour codes that cargo/tracing inject when --color=always is used.
+
 def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s)
 
@@ -88,6 +105,9 @@ class LogLine:
     module: str  # e.g. "noet_core::codec::builder"
     body: str  # remainder after module
     raw: str  # original (ANSI-stripped) line
+    # Populated when the line came from inside a parse_task span:
+    task_idx: Optional[int] = None
+    task_path: Optional[str] = None
 
 
 def _parse_line(raw_line: str) -> Optional[LogLine]:
@@ -100,6 +120,17 @@ def _parse_line(raw_line: str) -> Optional[LogLine]:
         return None
     level = m.group(1)
     after_level = line[m.end() :]
+
+    # Extract span context if present (appears before the module path).
+    task_idx: Optional[int] = None
+    task_path: Optional[str] = None
+    span_m = _SPAN_RE.search(after_level)
+    if span_m:
+        task_idx = int(span_m.group(1))
+        task_path = span_m.group(2).strip()
+        # Advance past the span prefix so module/body parsing sees the rest.
+        after_level = after_level[span_m.end() :].lstrip()
+
     colon = after_level.find(": ")
     if colon == -1:
         module = after_level.strip()
@@ -107,7 +138,16 @@ def _parse_line(raw_line: str) -> Optional[LogLine]:
     else:
         module = after_level[:colon].strip()
         body = after_level[colon + 2 :]
-    return LogLine(ts=ts, level=level, module=module, body=body, raw=line)
+
+    return LogLine(
+        ts=ts,
+        level=level,
+        module=module,
+        body=body,
+        raw=line,
+        task_idx=task_idx,
+        task_path=task_path,
+    )
 
 
 def load_log(path: str) -> list[LogLine]:
@@ -138,6 +178,7 @@ _PHASE_LABELS = {
 _QUEUEING_RE = re.compile(r'Queueing for deferred HTML generation: "(.+)"')
 _WRITE_RE = re.compile(r'Write disabled, skipping file write for "(.+)"')
 _DIFF_RE = re.compile(r"Diff events \((\d+)\).*RelationUpdate\((\d+)\)")
+# Legacy sequential path — still emitted by parse_next for non-parallel runs.
 _PARSING_FILE_RE = re.compile(r"\[Compiler\] Parsing file (.+?) \(attempt (\d+)/")
 
 
@@ -147,10 +188,10 @@ class FileRecord:
     phases: dict[str, datetime] = field(default_factory=dict)
     diff_total: int = 0
     diff_relation_updates: int = 0
-    parse_start: Optional[datetime] = (
-        None  # timestamp of "Parsing file" compiler message
-    )
-    attempt: int = 1  # which parse attempt this record represents
+    parse_start: Optional[datetime] = None
+    attempt: int = 1
+    # Set for records extracted from parse_task spans:
+    task_idx: Optional[int] = None
 
     def phase0_duration(self) -> Optional[float]:
         p0 = self.phases.get("phase0_start")
@@ -173,83 +214,140 @@ class FileRecord:
         return None
 
     def total_duration(self) -> Optional[float]:
-        """Total parse time: 'Parsing file' message → Phase 5 start.
-        Falls back to phase0_start if the compiler message wasn't captured."""
-        start = self.parse_start or self.phases.get("phase0_start")
+        """Phase 0 start → Phase 5 start.  Falls back to parse_start."""
+        start = self.phases.get("phase0_start") or self.parse_start
         end = self.phases.get("phase5")
         if start and end:
             return (end - start).total_seconds()
         return None
 
-
-def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
-    """
-    Walk the log and group phase markers + file-path lines into FileRecord
-    objects, one per parsed file (attempt).
-
-    The "Parsing file" compiler message is the authoritative parse-start
-    timestamp and path source.  Phase markers are matched to the most-recently-
-    seen "Parsing file" record.  Queueing/Write messages are kept as fallback
-    path sources for records where the compiler message wasn't captured.
-    """
-    records: list[FileRecord] = []
-    current: Optional[FileRecord] = None
-    last_file_path = ""
-    attempt_counts: dict[str, int] = {}  # path -> number of attempts seen so far
-
-    for ll in lines:
-        # "[Compiler] Parsing file <path> (attempt N/M)" — primary parse-start
-        # marker emitted by compiler.rs on a single timestamped line.
-        pm = _PARSING_FILE_RE.search(ll.body)
-        if pm:
-            file_path = pm.group(1).strip()
-            attempt = int(pm.group(2))
-            last_file_path = file_path
-            attempt_counts[file_path] = attempt
-            current = FileRecord(
-                path=file_path,
-                parse_start=ll.ts,
-                attempt=attempt,
-            )
-            records.append(current)
-            continue
-
-        # Fallback path sources (used when "Parsing file" wasn't captured)
-        qm = _QUEUEING_RE.search(ll.body)
-        wm = _WRITE_RE.search(ll.body)
-        if qm:
-            last_file_path = qm.group(1)
-        elif wm:
-            last_file_path = wm.group(1)
-
-        # Match phase markers
-        for snippet, key in _PHASE_LABELS.items():
-            if snippet in ll.body:
-                if key == "phase0_start" and current is None:
-                    # Fallback: start a record from phase0 if no "Parsing file" seen
-                    current = FileRecord(path=last_file_path)
-                    records.append(current)
-                if current is not None:
-                    current.phases[key] = ll.ts
-                break
-
-        # Diff events line (lives between phase5 and the next file's phase0)
-        if current is not None and "Diff events" in ll.body:
-            dm = _DIFF_RE.search(ll.body)
-            if dm:
-                current.diff_total = int(dm.group(1))
-                current.diff_relation_updates = int(dm.group(2))
-
-    return records
+    def interval(self) -> Optional[tuple[datetime, datetime]]:
+        """(phase0_start, phase5) pair for concurrency overlap detection."""
+        start = self.phases.get("phase0_start")
+        end = self.phases.get("phase5")
+        if start and end:
+            return (start, end)
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Analysis: Phase 0 summary
+# Record extraction — span-aware
+# ---------------------------------------------------------------------------
+
+
+def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
+    """
+    Build one FileRecord per (task_idx, path) span observed in the log.
+
+    Strategy
+    --------
+    Lines that carry a parse_task span (task_idx + path) are keyed by
+    (task_idx, path).  All phase markers within that span accumulate into
+    the matching record.  This is robust to interleaved output from
+    concurrent tasks.
+
+    Lines without a span (sequential parse_next path, or global compiler
+    messages) fall through to the legacy current-pointer approach: a new
+    record is opened on each "[Compiler] Parsing file" message and phase
+    markers are attributed to the last-opened record.
+
+    The two populations are merged and returned sorted by phase0_start.
+    """
+    # Key: (task_idx, path) -> FileRecord  (for span-keyed lines)
+    span_records: dict[tuple[int, str], FileRecord] = {}
+    # Attempt tracking per path across spans
+    attempt_counts: dict[str, int] = {}
+
+    # Legacy sequential tracking
+    legacy_records: list[FileRecord] = []
+    legacy_current: Optional[FileRecord] = None
+    last_file_path = ""
+
+    for ll in lines:
+        body = ll.body
+
+        if ll.task_idx is not None and ll.task_path is not None:
+            # ── Span-keyed line ──────────────────────────────────────────
+            key = (ll.task_idx, ll.task_path)
+            if key not in span_records:
+                attempt_counts[ll.task_path] = attempt_counts.get(ll.task_path, 0) + 1
+                rec = FileRecord(
+                    path=ll.task_path,
+                    attempt=attempt_counts[ll.task_path],
+                    task_idx=ll.task_idx,
+                    parse_start=ll.ts,
+                )
+                span_records[key] = rec
+
+            rec = span_records[key]
+            for snippet, phase_key in _PHASE_LABELS.items():
+                if snippet in body:
+                    if phase_key not in rec.phases:
+                        rec.phases[phase_key] = ll.ts
+                    break
+
+            if "Diff events" in body:
+                dm = _DIFF_RE.search(body)
+                if dm:
+                    rec.diff_total = int(dm.group(1))
+                    rec.diff_relation_updates = int(dm.group(2))
+
+        else:
+            # ── Legacy / non-span line ───────────────────────────────────
+            pm = _PARSING_FILE_RE.search(body)
+            if pm:
+                file_path = pm.group(1).strip()
+                attempt = int(pm.group(2))
+                last_file_path = file_path
+                attempt_counts[file_path] = attempt
+                legacy_current = FileRecord(
+                    path=file_path,
+                    parse_start=ll.ts,
+                    attempt=attempt,
+                )
+                legacy_records.append(legacy_current)
+                continue
+
+            qm = _QUEUEING_RE.search(body)
+            wm = _WRITE_RE.search(body)
+            if qm:
+                last_file_path = qm.group(1)
+            elif wm:
+                last_file_path = wm.group(1)
+
+            for snippet, phase_key in _PHASE_LABELS.items():
+                if snippet in body:
+                    if phase_key == "phase0_start" and legacy_current is None:
+                        legacy_current = FileRecord(path=last_file_path)
+                        legacy_records.append(legacy_current)
+                    if legacy_current is not None:
+                        legacy_current.phases[phase_key] = ll.ts
+                    break
+
+            if legacy_current is not None and "Diff events" in body:
+                dm = _DIFF_RE.search(body)
+                if dm:
+                    legacy_current.diff_total = int(dm.group(1))
+                    legacy_current.diff_relation_updates = int(dm.group(2))
+
+    all_records = list(span_records.values()) + legacy_records
+
+    # Sort by phase0_start (records without one go to the end).
+    def _sort_key(r: FileRecord):
+        p0 = r.phases.get("phase0_start")
+        return p0 if p0 is not None else datetime.max.replace(tzinfo=timezone.utc)
+
+    all_records.sort(key=_sort_key)
+    return all_records
+
+
+# ---------------------------------------------------------------------------
+# Analysis: helpers
 # ---------------------------------------------------------------------------
 
 
 def _short_path(full: str) -> str:
-    """Return the corpus-relative portion of a path (after /javascript/ etc.)"""
+    """Return the corpus-relative portion of a path."""
     for marker in ("/javascript/", "/mdn-content/files/", "/en-us/"):
         idx = full.find(marker)
         if idx != -1:
@@ -257,13 +355,7 @@ def _short_path(full: str) -> str:
     return Path(full).name or full
 
 
-# ---------------------------------------------------------------------------
-# Analysis: total parse time per file
-# ---------------------------------------------------------------------------
-
-
 def _ols(xs: list[float], ys: list[float]) -> tuple[float, float]:
-    """Ordinary least-squares: returns (slope, intercept)."""
     n = len(xs)
     sx = sum(xs)
     sy = sum(ys)
@@ -278,36 +370,26 @@ def _ols(xs: list[float], ys: list[float]) -> tuple[float, float]:
 
 
 def _rss(xs: list[float], ys: list[float], slope: float, intercept: float) -> float:
-    """Residual sum of squares for a fitted line."""
     return sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
 
 
 def _fit_models(
     xs: list[float], ys: list[float]
 ) -> list[tuple[str, float, float, float]]:
-    """Fit O(N), O(N²), O(log N), O(N log N) models to (xs, ys).
-
-    Returns list of (label, slope, intercept, rss) sorted by rss ascending
-    (best fit first).  xs must be 0-based parse order indices.
-    """
     models = []
 
-    # O(N): feature = x
     xs_linear = xs
     s, i = _ols(xs_linear, ys)
     models.append(("O(N)      ", s, i, _rss(xs_linear, ys, s, i)))
 
-    # O(N²): feature = x²
     xs_sq = [x * x for x in xs]
     s, i = _ols(xs_sq, ys)
     models.append(("O(N²)     ", s, i, _rss(xs_sq, ys, s, i)))
 
-    # O(log N): feature = log(x+1)  (+1 avoids log(0))
     xs_log = [math.log(x + 1) for x in xs]
     s, i = _ols(xs_log, ys)
     models.append(("O(log N)  ", s, i, _rss(xs_log, ys, s, i)))
 
-    # O(N log N): feature = x * log(x+1)
     xs_nlogn = [x * math.log(x + 1) for x in xs]
     s, i = _ols(xs_nlogn, ys)
     models.append(("O(N log N)", s, i, _rss(xs_nlogn, ys, s, i)))
@@ -317,7 +399,6 @@ def _fit_models(
 
 
 def _trend_bar(slope_ms: float) -> str:
-    """ASCII indicator: flat / mild / strong growth or decay."""
     abs_s = abs(slope_ms)
     if abs_s < 0.05:
         return "── flat"
@@ -329,8 +410,39 @@ def _trend_bar(slope_ms: float) -> str:
     return f"{direction}{direction}{direction} STRONG ({slope_ms:+.3f} ms/file)"
 
 
+def _wall_clock_estimate(records: list[FileRecord]) -> Optional[float]:
+    """
+    Estimate actual wall-clock elapsed from the union of all parse intervals.
+
+    Merges overlapping (phase0_start, phase5) intervals and sums the gaps.
+    Returns None if fewer than 2 records have complete intervals.
+    """
+    intervals = sorted(
+        (iv for r in records for iv in ([r.interval()] if r.interval() else [])),
+        key=lambda x: x[0],
+    )
+    if not intervals:
+        return None
+
+    merged: list[tuple[datetime, datetime]] = []
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+    merged.append((cur_start, cur_end))
+
+    return sum((e - s).total_seconds() for s, e in merged)
+
+
+# ---------------------------------------------------------------------------
+# Analysis: total parse time per file
+# ---------------------------------------------------------------------------
+
+
 def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
-    """Total parse time per file (parse_start → phase5), ranked slowest-first."""
     timed = [(r.total_duration(), r) for r in records if r.total_duration() is not None]
     if not timed:
         print("No total parse timing data found.")
@@ -342,18 +454,16 @@ def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
     sigma = math.sqrt(variance)
     threshold = mean + 2 * sigma
 
-    # Split records into attempt-1 (fresh parse) and attempt-2+ (reparse) epochs,
-    # each sorted chronologically so x=0 is the first file in that epoch.
     def _epoch_ordered(attempt_pred):
         return sorted(
             [
                 (r.total_duration(), r)
                 for r in records
                 if r.total_duration() is not None
-                and r.parse_start is not None
+                and r.phases.get("phase0_start") is not None
                 and attempt_pred(r.attempt)
             ],
-            key=lambda t: t[1].parse_start,  # type: ignore[arg-type]
+            key=lambda t: t[1].phases["phase0_start"],
         )
 
     epochs = [
@@ -394,44 +504,52 @@ def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
 
     timed.sort(key=lambda t: t[0], reverse=True)
 
+    total_sequential = sum(vals)
+    wall_clock = _wall_clock_estimate(records)
+
     print(f"\n{'=' * 70}")
-    print(f"  Total parse time (Parsing file → Phase 5) — top {top_n} slowest")
+    print(f"  Total parse time (Phase 0 start → Phase 5) — top {top_n} slowest")
     print(f"{'=' * 70}")
-    print(f"  Records analysed : {len(vals)}")
-    print(f"  Mean             : {mean:.2f}s")
-    print(f"  Std-dev          : {sigma:.2f}s")
-    print(f"  Min              : {min(vals):.2f}s")
-    print(f"  Max              : {max(vals):.2f}s")
-    print(f"  Outlier cutoff   : {threshold:.2f}s  (mean + 2σ)")
-    total_wall = sum(vals)
-    print(f"  Sum (sequential) : {total_wall:.0f}s  ({total_wall / 3600:.2f}h)")
+    print(f"  Records analysed    : {len(vals)}")
+    print(f"  Mean                : {mean:.2f}s")
+    print(f"  Std-dev             : {sigma:.2f}s")
+    print(f"  Min                 : {min(vals):.2f}s")
+    print(f"  Max                 : {max(vals):.2f}s")
+    print(f"  Outlier cutoff      : {threshold:.2f}s  (mean + 2σ)")
+    print(
+        f"  Sum (sequential)    : {total_sequential:.0f}s  ({total_sequential / 3600:.2f}h)"
+    )
+    if wall_clock is not None:
+        speedup = total_sequential / wall_clock if wall_clock > 0 else float("inf")
+        print(
+            f"  Wall-clock (merged) : {wall_clock:.0f}s  ({wall_clock / 3600:.2f}h)  ×{speedup:.1f} speedup"
+        )
     for epoch_label, ordered in epochs:
         _print_fit(epoch_label, ordered)
     print()
 
-    # Per-attempt breakdown for multi-attempt files
-    multi = {}
-    for d, r in timed:
-        if r.attempt > 1:
-            multi.setdefault(r.path, []).append((r.attempt, d))
-
-    print(f"  {'Duration':>9}  {'Att':>3}  {'Flag':<5}  File")
-    print(f"  {'-' * 9}  {'-' * 3}  {'-' * 5}  {'-' * 50}")
+    print(f"  {'Duration':>9}  {'Att':>3}  {'Tidx':>5}  {'Flag':<5}  File")
+    print(f"  {'-' * 9}  {'-' * 3}  {'-' * 5}  {'-' * 5}  {'-' * 50}")
     for dur, rec in timed[:top_n]:
         flag = ">>>" if dur > threshold else "   "
         short = _short_path(rec.path)
-        print(f"  {dur:>8.2f}s  {rec.attempt:>3}  {flag}    {short}")
+        tidx = f"{rec.task_idx}" if rec.task_idx is not None else "seq"
+        print(f"  {dur:>8.2f}s  {rec.attempt:>3}  {tidx:>5}  {flag}    {short}")
 
     outliers = sum(1 for v in vals if v > threshold)
     if outliers:
         print(f"\n  {outliers} outlier(s) above {threshold:.2f}s")
 
-    # Attempts summary
     attempt_dist: Counter = Counter(r.attempt for _, r in timed)
     if max(attempt_dist.keys()) > 1:
         print(f"\n  Parse attempt distribution:")
         for att in sorted(attempt_dist):
             print(f"    attempt {att}: {attempt_dist[att]} records")
+
+
+# ---------------------------------------------------------------------------
+# Analysis: Phase 0 summary
+# ---------------------------------------------------------------------------
 
 
 def report_phase_summary(records: list[FileRecord], top_n: int = 30) -> None:
@@ -462,18 +580,19 @@ def report_phase_summary(records: list[FileRecord], top_n: int = 30) -> None:
     print(f"  Max            : {max(vals):.2f}s")
     print(f"  Outlier cutoff : {threshold:.2f}s  (mean + 2σ)")
     print()
-    print(f"  {'Duration':>9}  {'Flag':<5}  File")
-    print(f"  {'-' * 9}  {'-' * 5}  {'-' * 50}")
+    print(f"  {'Duration':>9}  {'Tidx':>5}  {'Flag':<5}  File")
+    print(f"  {'-' * 9}  {'-' * 5}  {'-' * 5}  {'-' * 50}")
     for dur, _i, rec in durations[:top_n]:
         flag = ">>>" if dur > threshold else "   "
         short = _short_path(rec.path)
-        print(f"  {dur:>8.2f}s  {flag}    {short}")
+        tidx = f"{rec.task_idx}" if rec.task_idx is not None else "seq"
+        print(f"  {dur:>8.2f}s  {tidx:>5}  {flag}    {short}")
 
     outliers = sum(1 for v in vals if v > threshold)
     if outliers:
         print(f"\n  {outliers} outlier(s) above {threshold:.2f}s")
 
-    # Phase 5 post-processing time (time from Phase 5 log to next Phase 0)
+    # Phase 5 post-processing gaps (only meaningful for sequential records)
     phase5_gaps = []
     for i, rec in enumerate(records):
         next_p0 = (
@@ -500,6 +619,97 @@ def report_phase_summary(records: list[FileRecord], top_n: int = 30) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Analysis: concurrency histogram
+# ---------------------------------------------------------------------------
+
+
+def report_concurrency(records: list[FileRecord], bucket_ms: int = 100) -> None:
+    """
+    Show how many parse_task spans were active in each time bucket.
+
+    Each record's interval is (phase0_start → phase5).  We bucket the
+    entire run into `bucket_ms`-millisecond windows and count how many
+    intervals overlap each window.
+
+    Only records from parse_task spans (task_idx is not None) are used,
+    because those are the ones that may truly run concurrently.
+    """
+    intervals = [
+        (r.phases["phase0_start"], r.phases["phase5"])
+        for r in records
+        if r.task_idx is not None and r.interval() is not None
+    ]
+
+    if not intervals:
+        print("\nNo parse_task span intervals found (no parallelism data).")
+        return
+
+    # Compute run boundaries
+    run_start = min(s for s, _ in intervals)
+    run_end = max(e for _, e in intervals)
+    total_secs = (run_end - run_start).total_seconds()
+    bucket_secs = bucket_ms / 1000.0
+    n_buckets = math.ceil(total_secs / bucket_secs) + 1
+
+    counts = [0] * n_buckets
+
+    for start, end in intervals:
+        b_start = int((start - run_start).total_seconds() / bucket_secs)
+        b_end = int((end - run_start).total_seconds() / bucket_secs)
+        for b in range(b_start, min(b_end + 1, n_buckets)):
+            counts[b] += 1
+
+    # Summary stats
+    max_conc = max(counts)
+    nonzero = [c for c in counts if c > 0]
+    mean_conc = sum(nonzero) / len(nonzero) if nonzero else 0.0
+    buckets_gt1 = sum(1 for c in counts if c > 1)
+    pct_parallel = 100.0 * buckets_gt1 / len(nonzero) if nonzero else 0.0
+
+    print(f"\n{'=' * 70}")
+    print(f"  Concurrency histogram  (bucket size: {bucket_ms} ms)")
+    print(f"{'=' * 70}")
+    print(f"  Span intervals    : {len(intervals)}")
+    print(f"  Run duration      : {total_secs:.1f}s")
+    print(f"  Peak concurrency  : {max_conc}")
+    print(f"  Mean concurrency  : {mean_conc:.2f}  (over active buckets)")
+    print(
+        f"  Parallel buckets  : {buckets_gt1} / {len(nonzero)}  ({pct_parallel:.1f}% of active time)"
+    )
+    print()
+
+    # Distribution table: how many buckets at each concurrency level
+    conc_dist: Counter = Counter(counts)
+    print(f"  Concurrency distribution (active buckets only):")
+    print(f"  {'Level':>7}  {'Buckets':>8}  {'% time':>7}  Bar")
+    print(f"  {'-' * 7}  {'-' * 8}  {'-' * 7}  {'-' * 40}")
+    for level in sorted(conc_dist):
+        if level == 0:
+            continue
+        n = conc_dist[level]
+        pct = 100.0 * n / len(nonzero) if nonzero else 0.0
+        bar = "#" * min(int(pct), 40)
+        print(f"  {level:>7}  {n:>8}  {pct:>6.1f}%  {bar}")
+
+    # Timeline: print one row per second showing peak concurrency in that second
+    print(f"\n  Timeline (peak concurrency per second):")
+    print(f"  {'Offset':>8}  {'Peak':>5}  Bar")
+    print(f"  {'-' * 8}  {'-' * 5}  {'-' * 40}")
+    buckets_per_sec = max(1, int(1.0 / bucket_secs))
+    n_seconds = math.ceil(total_secs) + 1
+    for sec in range(n_seconds):
+        b_lo = sec * buckets_per_sec
+        b_hi = min(b_lo + buckets_per_sec, n_buckets)
+        if b_lo >= n_buckets:
+            break
+        peak = max(counts[b_lo:b_hi]) if b_lo < b_hi else 0
+        if peak == 0:
+            continue
+        bar = "#" * min(peak * 5, 40)
+        print(f"  {sec:>7}s  {peak:>5}  {bar}")
+
+
+# ---------------------------------------------------------------------------
 # Analysis: stall detection
 # ---------------------------------------------------------------------------
 
@@ -508,9 +718,12 @@ def report_stalls(
     lines: list[LogLine],
     threshold: float = 1.0,
     context: int = 3,
+    jobs: int = 1,
 ) -> None:
     print(f"\n{'=' * 70}")
     print(f"  Silent stalls > {threshold:.1f}s between consecutive log lines")
+    if jobs > 1:
+        print(f"  (--jobs {jobs}: gaps may reflect concurrent tasks, not true stalls)")
     print(f"{'=' * 70}")
 
     stalls_found = 0
@@ -518,14 +731,28 @@ def report_stalls(
         gap = (lines[i].ts - lines[i - 1].ts).total_seconds()
         if gap < threshold:
             continue
+        # With parallel logs: if adjacent lines have different task_idx, the
+        # gap is a scheduling artifact, not a real stall.  Flag but don't hide.
+        prev_task = lines[i - 1].task_idx
+        next_task = lines[i].task_idx
+        is_task_switch = (
+            jobs > 1
+            and prev_task is not None
+            and next_task is not None
+            and prev_task != next_task
+        )
         stalls_found += 1
-        print(f"\n  --- GAP {gap:.2f}s ---")
+        tag = " [task-switch]" if is_task_switch else ""
+        print(f"\n  --- GAP {gap:.2f}s{tag} ---")
         start = max(0, i - context)
         end = min(len(lines), i + context + 1)
         for j in range(start, end):
             marker = ">>>" if j == i else "   "
             ts_str = lines[j].ts.strftime("%H:%M:%S.%f")[:-3]
-            print(f"  {marker} {ts_str}  {lines[j].body[:120]}")
+            tidx = (
+                f"[t{lines[j].task_idx}]" if lines[j].task_idx is not None else "     "
+            )
+            print(f"  {marker} {ts_str}  {tidx}  {lines[j].body[:110]}")
 
     if stalls_found == 0:
         print(f"  No stalls found above {threshold:.1f}s threshold.")
@@ -549,6 +776,8 @@ _WARN_CLASSIFIER = [
     ("Failed to parse", "File skipped (codec error)"),
     ("cache_fetch FAILED", "cache_fetch returned results but key miss"),
     ("No Codec for extension", "Unknown file extension in codec map"),
+    ("BatchStart received with", "BatchStart with non-empty pending (compiler bug)"),
+    ("parse task panicked", "Spawned parse task panic"),
 ]
 
 
@@ -563,7 +792,6 @@ def report_warnings(lines: list[LogLine], top_n: int = 20) -> None:
         print("  No warnings or errors found.")
         return
 
-    # Classify into known buckets
     bucket_counts: Counter[str] = Counter()
     bucket_examples: dict[str, str] = {}
     uncategorised: list[LogLine] = []
@@ -588,7 +816,6 @@ def report_warnings(lines: list[LogLine], top_n: int = 20) -> None:
         for label, count in bucket_counts.most_common():
             print(f"  {count:>7}  {label}")
 
-    # Group uncategorised by module
     if uncategorised:
         module_counts: Counter[str] = Counter(ll.module for ll in uncategorised)
         print(f"\n  Uncategorised warnings/errors by module (top {top_n}):")
@@ -597,7 +824,6 @@ def report_warnings(lines: list[LogLine], top_n: int = 20) -> None:
         for module, count in module_counts.most_common(top_n):
             print(f"  {count:>7}  {module}")
 
-    # Timeline: warn rate per minute
     if warn_lines:
         buckets: dict[str, int] = defaultdict(int)
         for ll in warn_lines:
@@ -636,7 +862,8 @@ def report_phase_detail(records: list[FileRecord], fragment: str) -> None:
 
     for rec in matches:
         short = _short_path(rec.path)
-        print(f"\n  {short}")
+        tidx = f"task_idx={rec.task_idx}" if rec.task_idx is not None else "sequential"
+        print(f"\n  {short}  [{tidx}, attempt {rec.attempt}]")
         total = 0.0
         for a, b, label in phase_pairs:
             dur = rec.phase_span(a, b)
@@ -691,18 +918,35 @@ def main() -> None:
     ap.add_argument(
         "--file-times",
         action="store_true",
-        help="Total parse time per file (Parsing file → Phase 5), ranked slowest-first",
+        help="Total parse time per file (Phase 0 → Phase 5), ranked slowest-first",
+    )
+    ap.add_argument(
+        "--concurrency",
+        action="store_true",
+        help="Concurrency histogram: active parse_task spans per time bucket",
+    )
+    ap.add_argument(
+        "--bucket-ms",
+        type=int,
+        default=100,
+        help="Bucket size in milliseconds for --concurrency histogram (default 100)",
     )
     ap.add_argument(
         "--all",
         action="store_true",
-        help="Run all analyses (phase-summary + stalls + warnings + file-times)",
+        help="Run all analyses (phase-summary + stalls + warnings + file-times + concurrency)",
     )
     ap.add_argument(
         "--top",
         type=int,
         default=30,
         help="Number of rows in ranked tables (default 30)",
+    )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of parallel jobs used for the run (affects stall interpretation)",
     )
     args = ap.parse_args()
 
@@ -716,7 +960,13 @@ def main() -> None:
     print(f"{len(lines):,} timestamped lines")
 
     records = extract_file_records(lines)
-    print(f"Extracted {len(records)} file records")
+
+    span_records = sum(1 for r in records if r.task_idx is not None)
+    seq_records = len(records) - span_records
+    print(
+        f"Extracted {len(records)} file records  "
+        f"({span_records} from parse_task spans, {seq_records} sequential)"
+    )
 
     any_mode = (
         args.phase_summary
@@ -724,6 +974,7 @@ def main() -> None:
         or args.warnings
         or args.phase_detail
         or args.file_times
+        or args.concurrency
         or args.all
     )
 
@@ -733,9 +984,12 @@ def main() -> None:
     if args.file_times or args.all:
         report_file_times(records, top_n=args.top)
 
+    if args.concurrency or args.all:
+        report_concurrency(records, bucket_ms=args.bucket_ms)
+
     if args.stalls is not None or args.all:
         threshold = args.stalls if args.stalls is not None else 1.0
-        report_stalls(lines, threshold=threshold)
+        report_stalls(lines, threshold=threshold, jobs=args.jobs)
 
     if args.warnings or args.all:
         report_warnings(lines, top_n=args.top)

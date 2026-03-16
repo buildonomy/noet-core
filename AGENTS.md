@@ -224,6 +224,32 @@ runs unless the BIDs were previously persisted in source files. When debugging
 BID mismatches, compare *counts* and *structural position* (parent bref suffix,
 sort order) rather than absolute BID values.
 
+**Network node dual-path representation**: a network node has two valid path
+forms — the directory path (e.g. `"subnet1"`, or `/abs/repo/subnet1`) and the
+index-file path (`"subnet1/index.md"`). These are not interchangeable in code:
+
+- `proto.path` and `GraphBuilder.stack` always hold the **directory form**
+  (absolute, no trailing slash, no `index.md` suffix).
+- `PathMap` registers the network root under **both** `""` (directory form,
+  parent anchor for document children) and `"index.md"` (parent anchor for
+  heading/section children within the network's own index file).
+- `NodeKey::Path` for a document inside a subnet uses the **subnet-relative**
+  file path (e.g. `"doc.md"`) with `net = subnet_BID.bref()`. The path is
+  produced by stripping the network's absolute directory path from the
+  document's absolute file path.
+
+`AnchorPath::new(dir_path)` classifies extension-less paths as directories and
+`filepath()` returns `dir()`, which strips the last path component. Any call
+that constructs an `AnchorPath` from a known directory path and then calls
+`filepath()`, `dir()`, or `strip_prefix` on it **must** use
+`AnchorPath::new_dir(dir_path)` (or append a trailing slash) to prevent the
+last component from being silently dropped. Passing a bare directory path
+without this correction causes `strip_prefix` to strip the grandparent directory
+instead of the network directory — producing a repo-root-relative child path
+paired with the subnet's bref as `net`, an inconsistent `NodeKey::Path` that
+never resolves. See `docs/design/beliefbase_architecture.md` section 2.2 for
+the full specification.
+
 ## File Conventions
 
 | Type | Location | Notes |

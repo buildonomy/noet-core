@@ -184,6 +184,58 @@ Second occurrence - collision! Gets Bref: {#a1b2c3d4e5f6}
 
 **Storage**: `src/paths.rs:PathMapMap` maintains bidirectional mappings
 
+**Network Node Dual-Path Representation**:
+
+Network nodes are special: they exist simultaneously at two filesystem levels,
+and this duality propagates through the system with different invariants at each
+layer.
+
+| Form | Example (absolute) | Example (repo-relative) | Where used |
+|---|---|---|---|
+| **Directory path** | `/repo/subnet1` | `"subnet1"` | `proto.path`, `GraphBuilder` stack, `ProtoIndex` keys |
+| **Index file path** | `/repo/subnet1/index.md` | `"subnet1/index.md"` | Filesystem codec dispatch, `detect_network_file` output |
+
+`detect_network_file` (`src/codec/network.rs`) is the authoritative converter
+between the two forms — given either a directory path or a direct `index.md`
+path it returns the `index.md` file path. It requires a filesystem existence
+check so it cannot be used for in-memory path key construction.
+
+**PathMap dual-entry**: `PathMap::new` registers the network root node under
+*two* path strings:
+- `""` (empty string, directory form) — the parent anchor for document children
+- `"index.md"` (file form) — the parent anchor for heading/section children
+  inside the network's own index file (stored at order key
+  `[NETWORK_SECTION_SORT_KEY]` to keep sections non-colliding with documents)
+
+A subnet as seen from its parent's `PathMap` appears as a single directory-form
+entry (e.g. `"subnet1"`), delegating to the subnet's own `PathMap` for
+sub-lookups via `indexed_get`'s subnet traversal.
+
+**`GraphBuilder` stack always holds the directory form**: `push()` stores
+`proto.path.clone()` for network nodes (heading level 1). `proto.path` is set
+by `NetworkCodec::proto` / `ProtoIndex::proto_for` as
+`os_path_to_string(network_dir)` — the absolute directory path with no trailing
+slash and no `index.md` suffix.
+
+**`NodeKey::Path` for documents inside a subnet**: `build_path_key` uses the
+stack's `net_path` (directory form) as the strip prefix, yielding a
+subnet-relative path such as `"doc.md"`. The `net` field is the subnet BID's
+bref. The subnet's `PathMap` stores documents under the same subnet-relative
+form. These must match; any normalization divergence produces a cache miss and a
+fresh time-based BID for the document.
+
+**`AnchorPath` hazard with directory-form paths**: `AnchorPath::new` classifies
+extension-less paths as directories, and its `filepath()` method returns
+`dir()` for such paths. `dir()` returns everything up to the *last* `/`
+separator — silently stripping the final path component. Callers that construct
+an `AnchorPath` from a directory-form `net_path` and then call `filepath()` or
+`strip_prefix` on it must use `AnchorPath::new_dir(net_path)` (or append a
+trailing slash) so the full directory path is preserved. Passing a bare
+directory path without this correction causes `strip_prefix` to strip the
+grandparent directory instead of the network directory, making the resulting
+child path repo-root-relative while the `net` key is the subnet's bref — an
+internally inconsistent `NodeKey::Path` that never resolves in the `PathMap`.
+
 #### Identity Resolution Hierarchy
 
 When multiple references could match, resolution priority:
@@ -1259,6 +1311,25 @@ impl DocCodec for IRNode {
 
 ### 3.6. The Document Stack: Nested Structure Parsing
 
+The `GraphBuilder` maintains a single stack (`self.stack: Vec<(Bid, String, usize)>`)
+that serves as both the ancestor-network context and the in-document heading
+hierarchy. Each entry is `(bid, absolute_path, heading_level)` where heading
+levels encode node kind:
+
+| `heading` value | Node kind | Notes |
+|---|---|---|
+| `1` | Network | Absolute directory path stored as path component |
+| `2` | Document | Absolute file path |
+| `3` | H1 heading anchor | Absolute section path (net_path joined with anchor) |
+| `4` | H2 heading anchor | |
+| … | … | heading N+2 = HTML heading level N |
+
+`build_path_key` walks the stack in reverse to find the innermost `heading == 1`
+entry (the owning network). It uses that entry's absolute directory path as the
+strip prefix to compute the subnet-relative path for the `NodeKey::Path`. See
+the "Network Node Dual-Path Representation" note in section 2.2 for the
+`AnchorPath::new_dir` requirement at this call site.
+
 The stack mechanism (codec/mod.rs:1160-1402) is a critical innovation enabling hierarchical document parsing:
 
 **Stack Entry**: `(Bid, String, usize)` = (node BID, heading text, heading level)
@@ -1636,22 +1707,37 @@ Optimization is better suited for the **DbConnection** persistent cache (db.rs) 
 
 ### 6.5. Concurrent Parsing
 
-**Current State**: Files are parsed sequentially in the compiler thread work queue.
+**Current State**: Intra-epoch parallelism is implemented (Issue 57). Files
+within the same epoch are dispatched as parallel batches via `parse_epoch`.
+True OS-thread parallelism (Step 6 of Issue 57) is not yet complete — tasks
+currently run cooperatively on the async executor.
 
-**Decision**: **Defer**
+**Epoch invariant**: within a single epoch no file's parse output is an input
+to any other file's parse in that epoch. Cross-file dependencies only flow
+across epoch boundaries. This is what makes intra-epoch parallelism safe without
+locking `GraphBuilder`.
 
-While concurrent parsing could improve throughput for large document sets (100+ files), it introduces complexity:
+**Epoch 0 ordering**: `parse_all` uses a `VecDeque` work-queue that guarantees
+every network's `index.md` is parsed in its own single-file epoch
+(BatchStart → parse → BatchEnd → `drain_epoch`) before its children are
+dispatched. Children of the same network then form a parallel leaf batch. Subnet
+sub-directories are re-enqueued for their own round. This ensures every child
+document's `GlobalCache` fast-path lookup for the parent network finds a
+committed BID in `global_bb`.
 
-1. **Cache consistency challenges**: Multiple threads updating `GraphBuilder` simultaneously requires careful locking
-2. **Multi-pass coordination**: The diagnostic-based unresolved reference resolution algorithm depends on parse ordering for convergence
-3. **Limited bottleneck**: Parsing is already fast; transaction batching and DB writes are typically the bottleneck
-4. **Complexity vs. gain**: Tokio async already provides concurrency for I/O; CPU-bound parsing parallelism adds minimal benefit
+**`BeliefAccumulator`**: the `BatchStart`/`BatchEnd` sentinel pair drives
+accumulator commit and cache invalidation. `drain_epoch()` must not be a no-op
+for the inter-epoch cache invariant to hold — `BeliefBase`'s no-op
+`EpochDrain` implementation is correct only in contexts where no inter-epoch
+state sharing is expected (e.g. single-epoch unit tests).
 
-**Future approach** (when needed):
-- Parse independent files concurrently in Phase 1 (no shared state)
-- Synchronize before Phase 2 (reference resolution with shared builder)
-- Use work-stealing queue for dynamic load balancing
-- Benchmark to confirm bottleneck before implementing
+**Remaining work** (Issue 57 Step 6):
+- Replace the sequential `for path in paths` loop in `parse_epoch` with
+  `tokio::task::spawn` per path, gated by `Arc<Semaphore>` of size `jobs`.
+- Each spawned task gets an owned `GraphBuilder`, `tx.clone()`, and a
+  `global_bb.clone()` (cheap — `QueryHandle` is `Clone` + `Arc`-backed).
+- Collect results via `JoinSet`; preserve path order for determinism.
+- `--jobs 1`: semaphore of size 1 is equivalent to sequential — no special case.
 
 ### 6.6. Formal Grammar Specification
 

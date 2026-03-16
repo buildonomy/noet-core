@@ -5,6 +5,8 @@
 **Dependencies**: None hard. Issue 56 protocol model informs the merge-safety
 argument but does not block implementation.
 **Related**: Issue 56 (PathMap protocol observability)
+**Status**: Steps 1–5, 7 complete. Step 6 (true OS-thread parallelism) deferred.
+2 integration tests failing — known bugs identified, fixes ready (see Risks).
 
 ## Summary
 
@@ -32,6 +34,8 @@ is always live, queryable, and cache-coherent between batch boundaries.
 6. ✅ Parallelize epoch N≥1 reparse rounds via `parse_epoch_parallel`.
 7. ✅ Preserve `--jobs 1` sequential path as byte-identical fallback.
 8. `ProtoIndex` mutability for `FileUpdateSyncer` — follow-on (Step 8).
+9. ⚠️ Fix `build_path_key` and `get_parent_from_stack` `AnchorPath` directory
+   path handling — see Risks section.
 
 ## Architecture
 
@@ -293,7 +297,8 @@ assigned the batch-boundary semantics directly:
 
 ## Testing Requirements
 
-- [x] `cargo test --features service` passes with no regressions (326 tests).
+- [ ] `cargo test --features service,bin --test codec_test` passes with no
+      regressions (blocked on active bugs in Risks section).
 - [ ] `--jobs 1` produces byte-identical output to the pre-Issue-57 sequential
       implementation on `tests/network_1`.
 - [ ] Parallel build of `global_objects/` corpus completes without panic or
@@ -303,6 +308,10 @@ assigned the batch-boundary semantics directly:
       outside batch applied on `into_inner`, `prepare_batch` consolidation,
       `QueryHandle` shares cache, `into_inner` drains before unwrapping.
 - [x] No `CachedBeliefSource` references remain.
+- [ ] `test_belief_set_builder_bid_generation_and_caching`: no EXTRA nodes,
+      no WRITTEN-but-not-cached BIDs, second parse produces no graph events.
+- [ ] `test_belief_set_builder_with_db_cache`: second parse does not rewrite
+      any document content.
 
 ## Success Criteria
 
@@ -312,11 +321,43 @@ assigned the batch-boundary semantics directly:
 - [x] Epoch 0 dispatches files in depth-ordered batches gated by network-parent
       availability in `global_bb`.
 - [x] Epoch N≥1 reparse rounds dispatched in parallel via `parse_epoch_parallel`.
+- [ ] `test_belief_set_builder_bid_generation_and_caching` and
+      `test_belief_set_builder_with_db_cache` pass (blocked on active bugs).
 - [ ] Wall-clock improvement on `global_objects/` corpus is measurable with
       `--jobs 4` vs `--jobs 1` (pending corpus validation run).
 - [x] `--jobs 1` sequential fallback is correct (sequential path unchanged).
 
 ## Risks
+
+- **`AnchorPath` directory-path mangling in `build_path_key` and
+  `get_parent_from_stack`** (ACTIVE BUG — fixes ready):
+  `AnchorPath::new(net_path).strip_prefix(...)` is called in two places in
+  `builder.rs` where `net_path` is an absolute directory path (no extension, no
+  trailing slash). `AnchorPath::filepath()` calls `dir()` for extension-less
+  paths; `dir()` strips the last path component, so `strip_prefix` strips the
+  grandparent directory instead of the network directory. The child path is
+  produced as repo-root-relative while the `net` field in the resulting
+  `NodeKey::Path` is the subnet's bref — an inconsistent key that never resolves
+  in the PathMap. Both call sites (`build_path_key` L1139 and
+  `get_parent_from_stack` L1061 in `src/codec/builder.rs`) must be fixed
+  together by appending a trailing slash (or using `AnchorPath::new_dir`) before
+  `strip_prefix` — they mangle in the same direction, so fixing only one creates
+  a cross-layer mismatch worse than the current consistent-but-wrong state.
+  → **Fix**: append trailing slash to `net_path` / `stack_path` before
+  `strip_prefix`; use `AnchorPath::new_dir` for the `starts_with` filter at
+  `get_parent_from_stack` L1032. See `docs/design/beliefbase_architecture.md`
+  section 2.2 "Network Node Dual-Path Representation".
+
+- **`BeliefBase` no-op `EpochDrain` in integration test** (ACTIVE BUG — fix
+  ready): `test_belief_set_builder_bid_generation_and_caching` passes a bare
+  `BeliefBase` as `global_bb` to `parse_all`. `BeliefBase::drain_epoch` is a
+  no-op, so `global_bb` is never updated between epochs — every epoch's
+  `cache_fetch` queries an effectively empty `global_bb`. The epoch sequencing
+  in `parse_all` is correct by construction (parent network committed before
+  children dispatched), but the no-op drain means the parent's BID is invisible
+  to child epochs, producing fresh time-based BIDs and EXTRA nodes.
+  → **Fix**: replace the bare `BeliefBase` in the test with a
+  `BeliefAccumulator`-backed `QueryHandle`, matching the production path.
 
 - **`BeliefAccumulator` lazy-drain removal**: removing `try_recv` before every
   `eval_query` means mid-epoch queries see the state as of the last `BatchEnd`,
@@ -359,3 +400,116 @@ assigned the batch-boundary semantics directly:
 
 - Step 8 option selection: rebuild `ProtoIndex` per watch cycle (simple) vs
   incremental mutation (optimised). Defer until after corpus validation.
+- After the `build_path_key` fix, verify `test_belief_set_builder_with_db_cache`
+  passes. If it still fails, `DbConnection::resolve_net_path` (db.rs) is a
+  suspect — it is newer code that resolves cross-network paths one segment at a
+  time and may not yet handle all subnet path forms correctly.
+
+## Log Analysis Guide
+
+Use these commands and interpretation rules when analysing corpus compilation
+logs to validate correctness and diagnose performance regressions.
+
+### Grep commands — one-job run (`NOET_JOBS=1`)
+
+```
+grep "accumulator drain complete" <one-job-log>
+grep "ERROR.*outside any BatchStart" <one-job-log>
+grep "generate_deferred_html.*Generating" <one-job-log>
+grep -c "source is missing: true" <one-job-log>
+grep -c "sink is missing: true" <one-job-log>
+python3 benches/log_analysis/parse_log.py --warnings <one-job-log>
+python3 benches/log_analysis/parse_log.py --file-times <one-job-log>
+```
+
+### Grep commands — parallel run (`NOET_JOBS=N`)
+
+```
+# Did it complete?
+tail -5 <parallel-log>
+grep "parsing complete\|Both queues empty" <parallel-log>
+
+# Drain health
+grep "accumulator drain complete" <parallel-log>
+grep "ERROR.*outside any BatchStart" <parallel-log>
+
+# Per-epoch drain census (one line per batch)
+grep "drain_epoch.*drain complete\|drain_epoch" <parallel-log>
+
+# Warning counts
+python3 benches/log_analysis/parse_log.py --warnings <parallel-log>
+python3 benches/log_analysis/parse_log.py --file-times <parallel-log>
+
+# Specific issues
+grep -c "source is missing: true" <parallel-log>
+grep -c "session_bb.*does not have" <parallel-log>
+grep "generate_deferred_html.*Generating" <parallel-log>
+```
+
+### Interpreting `drain_with_census` output
+
+Each `accumulator drain complete` line has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `label` | `"drain_epoch"` (per-epoch) or `"into_inner"` (final shutdown) |
+| `pending_before` | events in pending at drain entry — should be 0 for epoch drains |
+| `in_batch_before` | should be `false` at drain entry for both drain types |
+| `batch_starts` / `batch_ends` | should be 1/1 for epoch drains; 0/0 for `into_inner` |
+| `inside_batch` | event count processed inside a batch window; should be > 0 for epoch drains |
+| `outside_total` | **must be 0** — any non-zero value means events arrived outside a `BatchStart`/`BatchEnd` window (compiler bug) |
+| `outside_census` | per-event-type breakdown of outside-batch events; check `tracing::error!` lines to find the source |
+
+### Expected healthy output — parallel, per epoch batch
+
+```
+INFO noet_core::beliefbase::accumulator: accumulator drain complete
+  label="drain_epoch" pending_before=0 in_batch_before=false
+  batch_starts=1 batch_ends=1 inside_batch=N outside_total=0 outside_census={}
+```
+
+### Expected healthy output — both paths, `into_inner`
+
+```
+INFO noet_core::beliefbase::accumulator: accumulator drain complete
+  label="into_inner" pending_before=0 in_batch_before=false
+  batch_starts=0 batch_ends=0 inside_batch=0 outside_total=0 outside_census={}
+```
+
+If `into_inner` shows `inside_batch > 0`, some batches were not drained by
+`drain_epoch` — investigate for missing `drain_epoch` call sites in `parse_all`.
+
+### Validation checklist (run after every corpus rerun)
+
+1. **Run completed?** — check for `"parsing complete"` or clean exit.
+2. **`outside_total = 0`** in `accumulator drain complete` — if non-zero, find
+   the matching `tracing::error!` lines for event kind and call site.
+3. **`drain_epoch` census** — one line per epoch batch; `inside_batch` > 0,
+   `outside_total` = 0, `batch_starts=1 batch_ends=1`.
+4. **`deferred_html` generated** — `"[generate_deferred_html] Generating HTML
+   for N deferred"` must appear after `accumulator drain complete`.
+5. **`ReparseLimitExceeded` count** — expect ~851 files at `max_reparse_count=2`
+   on the MDN JS corpus.
+6. **`session_bb does not have a network node` WARNs** — count; reduction
+   indicates session_bb population improving for epoch N≥1 tasks.
+7. **`source is missing` WARNs** — count and BID pattern (TQ-2, not yet
+   resolved); distinct from `sink is missing`.
+8. **Wall-clock comparison** — parallel should beat sequential; parse phase was
+   measured at ~9.4× faster before drain overhead was fixed.
+
+### Wall-clock comparison methodology
+
+```
+# Parse phase only (excludes drain):
+python3 benches/log_analysis/parse_log.py --file-times <log> 2>&1 | tail -40
+
+# Concurrency histogram (parallel only):
+python3 benches/log_analysis/parse_log.py --concurrency <parallel-log>
+
+# Stall annotation (task-switch gaps):
+python3 benches/log_analysis/parse_log.py --stalls <log>
+```
+
+Baseline (MDN JS corpus, pre-P0 fix): one-job mean 0.45s/file, parallel mean
+3.11s/file (7× slower due to drain overhead). Post-P0 numbers TBD after next
+corpus run.
