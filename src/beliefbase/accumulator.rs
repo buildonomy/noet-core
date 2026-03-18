@@ -173,6 +173,8 @@ struct AccInner<S> {
     pending: Vec<BeliefEvent>,
     /// Whether we are currently inside a `BatchStart` … `BatchEnd` window.
     in_batch: bool,
+    /// Number of calls to drain_with_census
+    drain_count: usize,
 }
 
 impl<S: BeliefSink + BeliefSource> AccInner<S> {
@@ -224,6 +226,7 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
         let outside_total: usize = outside_batch.values().sum();
         tracing::info!(
             label,
+            drain_count = self.drain_count,
             pending_before,
             in_batch_before,
             batch_starts,
@@ -233,6 +236,7 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
             outside_census = ?outside_batch,
             "accumulator drain complete",
         );
+        self.drain_count += 1;
         Ok(())
     }
 
@@ -372,6 +376,7 @@ where
                 rx,
                 pending: Vec::new(),
                 in_batch: false,
+                drain_count: 0,
             })),
             cache: Arc::new(AccCache::new()),
         }

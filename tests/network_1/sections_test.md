@@ -21,7 +21,7 @@ complexity = "critical"
 note = "This section has no matching heading - should be logged as info"
 ---
 
-# Sections Test Document
+# Sections Test First Heading
 
 This document tests the sections metadata enrichment feature (Issue 02).
 

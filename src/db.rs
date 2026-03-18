@@ -631,7 +631,10 @@ impl BeliefSource for DbConnection {
 
         // For RelationIn queries, mark all nodes as Trace (matches BeliefBase behavior)
         // because we don't guarantee complete relation sets for returned nodes
-        let is_relation_query = matches!(effective_expr, Expression::RelationIn(_));
+        let is_relation_query = matches!(
+            effective_expr,
+            Expression::RelationIn(_) | Expression::RelationNotIn(_)
+        );
         if is_relation_query {
             for node in states.values_mut() {
                 node.kind.insert(BeliefKind::Trace);
@@ -680,7 +683,8 @@ impl BeliefSource for DbConnection {
             //     "[DbConnection.eval_unbalanced] Loading {} missing nodes to complete graph",
             //     missing.len()
             // );
-            let missing_expr = Expression::StateIn(StatePred::Bid(missing));
+            let missing_expr =
+                Expression::StateIn(StatePred::Bid(Vec::from_iter(missing.into_iter())));
             let mut missing_states = self.get_states(&missing_expr).await?;
 
             // Mark missing nodes as Trace (incomplete relation set)

@@ -623,7 +623,7 @@ pub trait BeliefSource: Sync {
             // The initial loop needs to find ALL external sinks for our set, not just subsection
             // sinks. This way we can balance any epistemic/pragmatic links we acquired during the
             // primary 'seed' query.
-            let mut balance_expr = set.build_downstream_expr(None);
+            let mut balance_expr = set.build_downstream_expr(None, true);
 
             while let Some(expr) = balance_expr {
                 if loop_iter > BALANCE_CUTOFF {
@@ -639,7 +639,8 @@ pub trait BeliefSource: Sync {
                     .eval_trace(&expr, WeightSet::from(WeightKind::Section))
                     .await?;
                 set.union_mut(&balance_set);
-                balance_expr = set.build_balance_expr();
+                // Only include orphans on the initial call to build_downstream_expr
+                balance_expr = set.build_balance_expr(false);
 
                 if let Some(ref new_expr) = balance_expr {
                     if *new_expr == expr {
@@ -686,7 +687,7 @@ pub trait BeliefSource: Sync {
                 // walk upstream, accrueing relation sources
                 let mut upstream_set = None;
                 let mut upstream_loop = 0;
-                let mut upstream_expr = bg.build_upstream_expr(neighbor_walk.filter.clone());
+                let mut upstream_expr = bg.build_upstream_expr(neighbor_walk.filter.clone(), true);
                 let upstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.upstream);
                 while let Some(up_expr) = upstream_expr {
                     // Traverse 1 should mean loop once, not twice
@@ -701,7 +702,7 @@ pub trait BeliefSource: Sync {
                     });
                     let upwalk_eval_set = self.eval_unbalanced(&up_expr).await?;
                     up_set.union_mut_with_trace(&upwalk_eval_set);
-                    upstream_expr = up_set.build_upstream_expr(neighbor_walk.filter.clone());
+                    upstream_expr = up_set.build_upstream_expr(neighbor_walk.filter.clone(), false);
                     if let Some(ref new_up_expr) = upstream_expr {
                         if *new_up_expr == up_expr {
                             // Cache exhausted - traversal incomplete, but keep what we have
@@ -714,7 +715,8 @@ pub trait BeliefSource: Sync {
                 // walk downstream, accrueing relation sinks
                 let mut downstream_set = None;
                 let mut downstream_loop = 0;
-                let mut downstream_expr = bg.build_downstream_expr(neighbor_walk.filter.clone());
+                let mut downstream_expr =
+                    bg.build_downstream_expr(neighbor_walk.filter.clone(), true);
                 let downstream_cutoff = cmp::min(MAX_TRAVERSAL, neighbor_walk.downstream);
                 while let Some(down_expr) = downstream_expr {
                     // Traverse 1 should mean loop once, not twice
@@ -729,7 +731,8 @@ pub trait BeliefSource: Sync {
                     });
                     let downwalk_eval_set = self.eval_unbalanced(&down_expr).await?;
                     down_set.union_mut_with_trace(&downwalk_eval_set);
-                    downstream_expr = down_set.build_downstream_expr(neighbor_walk.filter.clone());
+                    downstream_expr =
+                        down_set.build_downstream_expr(neighbor_walk.filter.clone(), false);
                     if let Some(ref new_down_expr) = downstream_expr {
                         if *new_down_expr == down_expr {
                             // Cache exhausted - traversal incomplete, but keep what we have

@@ -607,10 +607,6 @@ fn check_for_link_and_push(
                             relative_path = relative_ap.join(as_anchor(id)).into();
                         }
                     }
-                    tracing::debug!(
-                        "path_to(from: {ctx_ap}, -> to: {}) => {relative_path}",
-                        relation.root_path
-                    );
                     relative_path
                 };
 
@@ -1096,7 +1092,6 @@ impl MdCodec {
                     let should_rewrite = title.contains("bref://");
                     let new_url = if should_rewrite {
                         if url_ap.is_anchor() {
-                            tracing::debug!("is anchor");
                             CowStr::from(as_anchor(url_ap.anchor()))
                         } else if !url_ap.ext().is_empty() && CODECS.get(&url_ap).is_some() {
                             // Only rewrite links that have a known codec extension (e.g. .md).
@@ -1109,14 +1104,13 @@ impl MdCodec {
                                     .as_anchor_path()
                                     .replace_extension("html"),
                             );
-                            tracing::debug!("replacing {dest_url} with {res}");
                             res
                         } else {
-                            tracing::debug!("no codec extension for {dest_url}, leaving unchanged");
+                            tracing::trace!("no codec extension for {dest_url}, leaving unchanged");
                             dest_url
                         }
                     } else {
-                        tracing::debug!("no bref element in title attribute for {dest_url}");
+                        tracing::trace!("no bref element in title attribute for {dest_url}");
                         dest_url
                     };
 
@@ -1560,7 +1554,8 @@ impl DocCodec for MdCodec {
                     None => true, // No existing sections, need to add
                 }
             } else {
-                // No sections in markdown, check if we need to remove existing sections
+                // sections_table is empty — no heading>2 nodes in markdown.
+                // Only update if stale sections exist on-disk that need to be removed.
                 existing_sections.is_some()
             };
 
@@ -1610,7 +1605,6 @@ impl DocCodec for MdCodec {
         self.matched_sections.clear();
         self.seen_ids.clear();
         self.heading_start_offset = None;
-        let mut first_heading = true;
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
@@ -1742,13 +1736,12 @@ impl DocCodec for MdCodec {
                     let accum_title = current.accumulator.take().unwrap_or_default();
                     let current_title = current.title().unwrap_or_default();
                     // Heading 3 is an h1. heading 1 == network, heading 2 == document
-                    let is_document_heading = first_heading && current.heading == 3;
-                    if accum_title.is_empty() || current_title == accum_title || is_document_heading
-                    {
+                    if accum_title.is_empty() || current_title == accum_title {
                         // Don't count this as a new section --- glue it back onto the last proto for these cases:
                         // 1. the new title is empty,
                         // 2. it's the same as the last section title, or
-                        // 3. its an h1 at the start of the document with no prior headings
+                        // 3. BEHAVIOR REMOVED ~~its an h1 at the start of the document with no
+                        //    prior headings~~
                         if let Some((last_proto, mut last_event_vec)) = self.current_events.pop() {
                             current = last_proto;
                             last_event_vec.append(&mut proto_events);
@@ -1761,7 +1754,7 @@ impl DocCodec for MdCodec {
                     // Done here at End(Heading) because this is the first point where both the
                     // explicit id (set at Start) and the accumulated title are available, so we
                     // can mirror the full BeliefNode::id() fallback: explicit id > to_anchor(title).
-                    if current.heading > 2 && !is_document_heading {
+                    if current.heading > 2 && !accum_title.is_empty() {
                         let candidate_id = current
                             .document
                             .get("id")
@@ -1870,7 +1863,6 @@ impl DocCodec for MdCodec {
                         }
                         self.heading_start_offset = None;
                     }
-                    first_heading = false;
                 }
                 _ => {}
             }

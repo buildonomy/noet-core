@@ -559,15 +559,10 @@ impl FromStr for NodeKey {
             // Unrecognized scheme (https:, mailto:, etc.) — the entire original string
             // is stored as a Path under the href_namespace. URLs are locations (paths),
             // not identifiers — storing as Path avoids destructive to_anchor() slugification.
-            NodeKeyScheme::External => {
-                tracing::debug!(
-                    "Found External URL '{s}' - treating as NodeKey::Path with href_namespace"
-                );
-                Ok(NodeKey::Path {
-                    net: href_namespace().bref(),
-                    path: s.to_string(),
-                })
-            }
+            NodeKeyScheme::External => Ok(NodeKey::Path {
+                net: href_namespace().bref(),
+                path: s.to_string(),
+            }),
 
             // --- Bare strings (no scheme) ---
             // Heuristic: try whole-string Bid/Bref, then plain-text Id, then path-like

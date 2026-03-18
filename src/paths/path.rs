@@ -736,7 +736,7 @@ impl<'a> AnchorPath<'a> {
     /// See tests module for examples.
     pub fn join<E: AsRef<str>>(&self, end_ref: E) -> AnchorPathBuf {
         let end = AnchorPath::from(end_ref.as_ref());
-        if end.is_absolute() {
+        if end.is_absolute() || end.has_hostname() && end.hostname() != self.hostname() {
             return AnchorPathBuf::new(end.to_string());
         }
         if end.path.is_empty() {

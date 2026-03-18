@@ -1213,7 +1213,7 @@ impl BeliefBase {
                 // out to every PathMap in O(networks). Skip the whole event early to avoid
                 // the O(N_networks) lock-acquisition cost on every dropped RelationUpdate.
                 if self.bid_to_index(source).is_none() || self.bid_to_index(sink).is_none() {
-                    tracing::debug!(
+                    tracing::warn!(
                         label = self.label,
                         "process_event: skipping RelationUpdate ({} -> {}), source or sink missing",
                         source,
@@ -1234,7 +1234,7 @@ impl BeliefBase {
                     };
                     // Same guard as RelationUpdate above.
                     if self.bid_to_index(&source).is_none() || self.bid_to_index(&sink).is_none() {
-                        tracing::debug!(
+                        tracing::warn!(
                             label = self.label,
                             "process_event: skipping RelationChange-derived update ({} -> {}), source or sink missing",
                             source, sink,
@@ -1251,7 +1251,7 @@ impl BeliefBase {
                 // of remaining edges on the sink, ensuring contiguous sort indices [0..N)
                 // Guard: if sink is absent there is nothing to reindex.
                 if self.bid_to_index(source).is_none() || self.bid_to_index(sink).is_none() {
-                    tracing::debug!(
+                    tracing::warn!(
                         label = self.label,
                         "process_event: skipping RelationRemoved ({} -> {}), source or sink missing",
                         source, sink,
@@ -1324,7 +1324,7 @@ impl BeliefBase {
     /// tasks).
     ///
     /// Return a vector of events for each node that was renamed when matching on the merge keys.
-    fn insert_state(&mut self, node: BeliefNode, merge: &[NodeKey]) -> Vec<BeliefEvent> {
+    pub(crate) fn insert_state(&mut self, node: BeliefNode, merge: &[NodeKey]) -> Vec<BeliefEvent> {
         let mut events = Vec::<BeliefEvent>::new();
 
         let mut node = node;
@@ -2202,7 +2202,6 @@ impl BeliefBase {
                             }
                         }),
                 );
-                tracing::debug!(label = self.label, "Found {res:?} matches");
                 res
             }
         }

@@ -508,11 +508,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if verbose {
                     println!("\n=== Parse Results ===");
-                    println!("Primary queue: {}", stats.primary_queue_len);
-                    println!("Reparse queue: {}", stats.reparse_queue_len);
+                    println!("Remainder  queue: {}", stats.remainder_queue_len);
                     println!("Processed: {}", stats.processed_count);
                     println!("Total parses: {}", stats.total_parses);
-                    println!("Pending dependencies: {}", stats.pending_dependencies_count);
 
                     if write {
                         println!("\n=== Write Results ===");

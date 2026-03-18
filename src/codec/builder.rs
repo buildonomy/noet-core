@@ -26,8 +26,9 @@ use crate::{
     nodekey::NodeKey,
     paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
-        buildonomy_namespace, content_namespaces, href_namespace, BeliefKind, BeliefKindSet,
-        BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
+        buildonomy_href_bid, buildonomy_namespace, content_namespaces, href_namespace, BeliefKind,
+        BeliefKindSet, BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS,
+        WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, Query},
 };
@@ -361,16 +362,7 @@ impl GraphBuilder {
                 // initialize_stack so that RelationChange(doc, repo_root, ...) uses the correct
                 // sibling position regardless of which cache branch cache_fetch takes.
                 // All subsequent nodes (sections) get None and auto-assign their own sort keys.
-                let entry_sort_key = if proto_idx == 0 {
-                    tracing::debug!(
-                        "[parse_content] Phase 1 first push: doc_sort_key={:?} path={:?}",
-                        doc_sort_key,
-                        proto.path
-                    );
-                    doc_sort_key
-                } else {
-                    None
-                };
+                let entry_sort_key = if proto_idx == 0 { doc_sort_key } else { None };
                 let (bid, (source, _nodekeys, unique_oldkeys)) = self
                     .push(
                         proto,
@@ -383,67 +375,10 @@ impl GraphBuilder {
                     )
                     .await?;
                 if !missing_structure.is_empty() {
-                    tracing::debug!(
-                        "Phase 1 {}: merging missing structure onto self.session_bb:",
-                        bid,
-                    );
                     // Seed from the single node just pushed — bounds the DFS to what's
                     // reachable from this node in missing_structure, not all of session_bb.
                     let node_seed: BTreeSet<Bid> = BTreeSet::from([bid]);
-                    // Both BBs need missing_structure, but Section edges must be stripped for
-                    // cache hits before merging into either BB.
-                    //
-                    // For cache hits (StackCache/GlobalCache): cache_fetch's eval_query populates
-                    // missing_structure with the node's full neighborhood — including its own
-                    // Section edges (child→parent relationships). Those Section edges carry
-                    // cached sort keys that may differ from the weight RelationChange just wrote
-                    // inside push(). Merging them into either BB would make compute_diff see them
-                    // as pre-existing in old_parsed_edges (session_bb) or overwrite the freshly
-                    // established PathMap entry (doc_bb), corrupting sort order and causing
-                    // get_context() to return None in Phase 4.
-                    //
-                    // The ancestor chain and external halo in missing_structure (non-Section
-                    // edges) are still needed by both BBs — strip only Section edges for cache
-                    // hits, merge unconditionally for non-cache hits (Generated/SourceFile have
-                    // no Section edges in missing_structure anyway).
-                    let to_merge = if source.is_from_cache() {
-                        // Strip Section weight from each edge's WeightSet rather than
-                        // dropping the whole edge — a single edge may carry both Section
-                        // and Epistemic/Pragmatic weights, and we must preserve the latter.
-                        // Rebuild the relations graph from scratch to avoid petgraph index
-                        // instability from in-place removal. Drop edges that become empty
-                        // after stripping Section.
-                        let stripped_relations = crate::beliefbase::BidGraph::from_edges(
-                            missing_structure
-                                .relations
-                                .as_graph()
-                                .raw_edges()
-                                .iter()
-                                .filter_map(|edge| {
-                                    let source =
-                                        missing_structure.relations.as_graph()[edge.source()];
-                                    let sink =
-                                        missing_structure.relations.as_graph()[edge.target()];
-                                    let mut ws = edge.weight.clone();
-                                    ws.weights.remove(&crate::properties::WeightKind::Section);
-                                    if ws.is_empty() {
-                                        None
-                                    } else {
-                                        Some((source, sink, ws))
-                                    }
-                                }),
-                        );
-                        BeliefGraph {
-                            states: missing_structure.states.clone(),
-                            relations: stripped_relations,
-                        }
-                    } else {
-                        missing_structure.clone()
-                    };
-                    if !to_merge.is_empty() {
-                        self.doc_bb.merge_from(&to_merge, &node_seed);
-                        self.session_bb.merge_from(&to_merge, &node_seed);
-                    }
+                    self.session_bb.merge_from(&missing_structure, &node_seed);
                     missing_structure = BeliefGraph::default();
                 }
 
@@ -473,6 +408,7 @@ impl GraphBuilder {
 
             tracing::debug!("Phase 2: Balance and process relations");
             let mut generated_href_nodes = Vec::new();
+            let mut relation_seeds = BTreeSet::new();
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
                 // Process upstream_relations (sink-owned, default)
                 for (index, relation) in proto.upstream.iter().enumerate() {
@@ -491,6 +427,7 @@ impl GraphBuilder {
 
                     match result {
                         GetOrCreateResult::Resolved(node, source) => {
+                            relation_seeds.insert(node.bid);
                             if source.is_from_cache() {
                                 inject_context = true;
                             } else if matches!(source, NodeSource::Generated) {
@@ -529,6 +466,7 @@ impl GraphBuilder {
 
                     match result {
                         GetOrCreateResult::Resolved(node, source) => {
+                            relation_seeds.insert(node.bid);
                             if source == NodeSource::GlobalCache {
                                 inject_context = true;
                             } else if matches!(source, NodeSource::Generated) {
@@ -549,13 +487,11 @@ impl GraphBuilder {
             // Perform this after going through all the proto relations so we don't destroy our
             // balanced set.
             if !missing_structure.is_empty() {
-                tracing::debug!("Phase 2: merging missing structure onto session_bb and set");
                 // Use merge_from with the current file's parsed_bids as the DFS seed set.
                 // This bounds the DFS to O(rhs_size) rather than O(session_bb_size × rhs_edges),
                 // fixing the O(N²) BN-1 bottleneck on large corpora (Issue 47).
-                let parsed_bid_set: BTreeSet<Bid> = parsed_bids.iter().copied().collect();
                 self.session_bb
-                    .merge_from(&missing_structure, &parsed_bid_set);
+                    .merge_from(&missing_structure, &relation_seeds);
                 // we need to merge this phase 2 missing structure into self.doc_bb as well to ensure
                 // we have full structural paths to all the external nodes we connect to within the
                 // relation_event_queue. Use merge_from with parsed_bid_set (already computed above)
@@ -563,7 +499,7 @@ impl GraphBuilder {
                 // The unbounded merge was the BN-1 bottleneck: on reparse, doc_bb's ancestor chain
                 // includes the root network node, causing a full-graph DFS on every reparse pass.
 
-                self.doc_bb.merge_from(&missing_structure, &parsed_bid_set);
+                self.doc_bb.merge_from(&missing_structure, &relation_seeds);
             }
             for edge_update in relation_event_queue.drain(..) {
                 let _deriv = self.doc_bb.process_event(&edge_update)?;
@@ -654,20 +590,21 @@ impl GraphBuilder {
             tracing::debug!("Phase 4b: codec finalization");
             let finalized_nodes = codec.finalize(&mut diagnostics)?;
             for (_proto, updated_node) in finalized_nodes {
-                let old_toml = self
-                    .doc_bb
-                    .states()
-                    .get(&updated_node.bid)
-                    .map(|node| node.toml());
-                if Some(updated_node.toml()) != old_toml {
+                let old_node = self.doc_bb.states().get(&updated_node.bid);
+                let differs = Some(&updated_node) != old_node;
+                if differs {
                     is_changed = true;
-                    let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
-                        vec![NodeKey::Bid {
+                    let derivatives = self.doc_bb.insert_state(
+                        updated_node.clone(),
+                        &[NodeKey::Bid {
                             bid: updated_node.bid,
                         }],
-                        updated_node.toml(),
-                        EventOrigin::Remote,
-                    ))?;
+                    );
+                    if !derivatives.is_empty() {
+                        tracing::warn!(
+                            "[parse_content] inject_context node update created derivative events. this is unexpected. derivatives: {derivatives:?}",
+                        );
+                    }
                 }
             }
 
@@ -765,40 +702,39 @@ impl GraphBuilder {
         // Guard: only run once per session — these are static global namespaces (href + asset)
         // that never change between files. Repeating this on every initialize_stack call was the
         // primary driver of session_bb O(N²) growth across a corpus run.
-        let content_ns_loaded = content_namespaces()
+        for const_bid in &content_namespaces()
             .iter()
-            .any(|bid| self.session_bb.get(&NodeKey::Bid { bid: *bid }).is_some());
-        if !content_ns_loaded {
-            for const_bid in &content_namespaces() {
-                let key = NodeKey::Bid { bid: *const_bid };
-                if let Some(const_ns_node) = global_bb.get_async(&key).await? {
-                    // Process asset namespace node into session_bb
-                    let const_ns_event = BeliefEvent::NodeUpdate(
-                        vec![key.clone()],
-                        const_ns_node.toml(),
-                        EventOrigin::Remote,
-                    );
-                    self.session_bb.process_event(&const_ns_event)?;
+            .filter(|ns| self.session_bb.get(&NodeKey::Bid { bid: **ns }).is_none())
+            .collect::<Vec<&Bid>>()
+        {
+            let key = NodeKey::Bid { bid: **const_bid };
+            if let Some(const_ns_node) = global_bb.get_async(&key).await? {
+                // Process asset namespace node into session_bb
+                let const_ns_event = BeliefEvent::NodeUpdate(
+                    vec![key.clone()],
+                    const_ns_node.toml(),
+                    EventOrigin::Remote,
+                );
+                self.session_bb.process_event(&const_ns_event)?;
 
-                    // Fetch all assets connected to this namespace
-                    // Use eval to get the namespace and its relations
-                    let const_expr = Expression::from(&key);
-                    let const_graph = global_bb.eval(&const_expr).await?;
+                // Fetch all assets connected to this namespace
+                // Use eval to get the namespace and its relations
+                let const_expr = Expression::from(&key);
+                let const_graph = global_bb.eval(&const_expr).await?;
 
-                    // Merge the fetched asset graph into session_bb.
-                    // Seed from the namespace node itself — bounds DFS to assets reachable
-                    // from this namespace, not all of session_bb.
-                    let ns_seed: BTreeSet<Bid> = BTreeSet::from([*const_bid]);
-                    self.session_bb.merge_from(&const_graph, &ns_seed);
+                // Merge the fetched asset graph into session_bb.
+                // Seed from the namespace node itself — bounds DFS to assets reachable
+                // from this namespace, not all of session_bb.
+                let ns_seed: BTreeSet<Bid> = BTreeSet::from([**const_bid]);
+                self.session_bb.merge_from(&const_graph, &ns_seed);
 
-                    tracing::debug!(
-                        "[initialize_stack] Loaded {} assets from global cache for namespace {}",
-                        const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
-                        const_bid
-                    );
-                }
+                tracing::debug!(
+                    "[initialize_stack] Loaded {} assets from global cache for namespace {}",
+                    const_graph.states.len().saturating_sub(1), // -1 for namespace node itself
+                    const_bid
+                );
             }
-        } // end content_ns_loaded guard
+        }
 
         // Fast-path: if self.repo is already set (not the first file of the session), attempt to
         // look up the entry document directly in session_bb. On a hit, session_bb already contains
@@ -855,6 +791,7 @@ impl GraphBuilder {
                 continue;
             };
 
+            let mut ancestor_clobbers = BTreeSet::new();
             let (ancestor, (_source, _, _)) = self
                 .push(
                     &state_accum,
@@ -863,9 +800,16 @@ impl GraphBuilder {
                     &mut missing_structure,
                     None,            // ancestor network nodes; sort key is not relevant here
                     &mut Vec::new(), // ancestor pushes are trace-only; diagnostics discarded
-                    &mut BTreeSet::new(), // clobbers from trace pushes are not propagated
+                    &mut ancestor_clobbers,
                 )
                 .await?;
+            if !ancestor_clobbers.is_empty() {
+                tracing::error!(
+                    "We should not be rewriting ids in initialize stack! \
+                    Clobbered nodes: {ancestor_clobbers:?}"
+                );
+            }
+
             // Merge missing_structure after each push so it's available for the next iteration.
             if !missing_structure.is_empty() {
                 // Keep self.doc_bb isolated from the structure, that way we can ensure our comparison
@@ -937,6 +881,24 @@ impl GraphBuilder {
             BeliefBase::compute_diff(&self.session_bb, &self.doc_bb, parsed_nodes)?;
         let mut path_events = Vec::new();
         for event in diff_events.iter() {
+            if let BeliefEvent::RelationRemoved(source, sink, _) = event {
+                // Removed relations indicate instability: a previously-known edge is
+                // being retracted. Log at WARN so parse_log.py can surface them without
+                // requiring RUST_LOG=debug.
+                tracing::warn!(
+                    "[terminate_stack] RelationRemoved: \"{}\" → \"{}\"",
+                    self.session_bb
+                        .paths()
+                        .path(source)
+                        .and_then(|(_home_net, path)| Some(path))
+                        .unwrap_or(source.to_string()),
+                    self.session_bb
+                        .paths()
+                        .path(sink)
+                        .and_then(|(_home_net, path)| Some(path))
+                        .unwrap_or(sink.to_string())
+                );
+            }
             let derivative_events = self.session_bb.process_event(event)?;
             for derivative in derivative_events.into_iter() {
                 let insert_event = match &derivative {
@@ -978,12 +940,8 @@ impl GraphBuilder {
                     BeliefEvent::RelationChange(_, _, _, _, _) => {
                         relation_insert_count += 1;
                     }
-                    BeliefEvent::RelationRemoved(source, sink, _) => {
+                    BeliefEvent::RelationRemoved(_, _, _) => {
                         relation_removed_count += 1;
-                        // Removed relations indicate instability: a previously-known edge is
-                        // being retracted. Log at WARN so parse_log.py can surface them without
-                        // requiring RUST_LOG=debug.
-                        tracing::warn!("[terminate_stack] RelationRemoved: {} → {}", source, sink,);
                     }
                     BeliefEvent::RelationUpdate(_, _, _, _) => {
                         relation_update_count += 1;
@@ -1200,6 +1158,12 @@ impl GraphBuilder {
                     return None;
                 }
             };
+            // Early return for id == bref -- this honor's the case when we programmatically update
+            // an ID and set it to the bref in order to avoid an intra network ID collision.
+            if let Ok(bref) = Bref::try_from(section_id.as_str()) {
+                return Some(NodeKey::Bref { bref });
+            }
+
             // No get_from_id guard here: section path keys are always unique per document
             // ("doc.md#slug"), so two sections in different documents with the same slug
             // produce distinct path keys and never collide. The old guard fired on re-parse
@@ -1649,8 +1613,11 @@ impl GraphBuilder {
                         ));
                     }
                     // Now generate the href wrapper node and insert it.
+                    // Use a deterministic BID derived from the URL address so the same href always
+                    // maps to the same BID across parses. This prevents spurious BID collisions in
+                    // the href PathMap that would otherwise cause the path to fall back to the bref.
                     let href_node = BeliefNode {
-                        bid: Bid::new(href_namespace()),
+                        bid: buildonomy_href_bid(&href),
                         kind: BeliefKindSet::from(BeliefKind::External | BeliefKind::Trace),
                         title: String::default(),
                         schema: None,
@@ -1722,7 +1689,7 @@ impl GraphBuilder {
                     };
                     unresolved.self_net = owner_home_net;
                     unresolved.self_path = owner_home_path;
-                    tracing::debug!(
+                    tracing::trace!(
                         "Unresolved relation at index {}: {:?} -> {:?}. Index gap preserved to track missing reference.",
                         index,
                         owner_bid,
@@ -1991,11 +1958,6 @@ impl GraphBuilder {
         // Determine doc_sort_key using the ProtoIndex — the single canonical source of
         // truth for sibling position, shared by both fast and slow paths.
         let doc_sort_key: Option<u16> = proto_index.sort_key_for(abs_path);
-        tracing::debug!(
-            "[try_initialize_stack_from_session_cache] doc_sort_key from proto_index={:?} for path={:?}",
-            doc_sort_key,
-            abs_path
-        );
 
         // Populate doc_bb with ancestor networks only.
         //
@@ -2166,7 +2128,11 @@ impl GraphBuilder {
         let mut source = NodeSource::Generated;
         for key in keys.iter() {
             if check_local {
-                if let Some(existing_state) = self.doc_bb.get(key) {
+                if let Some(existing_state) = self
+                    .doc_bb
+                    .get(key)
+                    .filter(|n| !n.kind.contains(BeliefKind::Trace))
+                {
                     found_state = Some(existing_state);
                     source = NodeSource::SourceFile;
                     break;
@@ -2181,45 +2147,44 @@ impl GraphBuilder {
             // use eval_query in order to receive a balanced_set if/when we get a query hit on
             // one of our caches
             let stack_result = BeliefBase::from(self.session_bb.eval_query(&query, true).await?);
+            if let Some(existing_state) = stack_result
+                .get(key)
+                .filter(|n| !n.kind.contains(BeliefKind::Trace))
+            {
+                found_state = Some(existing_state);
+                // StackCache hit: the node is already in session_bb with a balanced
+                // ancestor chain. We do NOT populate missing_structure here — doing so
+                // caused Phase 2's unconditional doc_bb.merge(&missing_structure) to
+                // overwrite the section→doc Section edges that Phase 1 just established,
+                // corrupting the PathMap and triggering the Phase 4 get_context panic.
+                //
+                // try_initialize_stack_from_session_cache passes its own local
+                // `fast_missing` as the missing_structure argument and reads it directly
+                // after this call — it does not need the population to happen here.
+                source = NodeSource::StackCache;
+                break;
+            }
 
-            match stack_result.get(key) {
-                Some(existing_state) => {
-                    found_state = Some(existing_state);
-                    // StackCache hit: the node is already in session_bb with a balanced
-                    // ancestor chain. We do NOT populate missing_structure here — doing so
-                    // caused Phase 2's unconditional doc_bb.merge(&missing_structure) to
-                    // overwrite the section→doc Section edges that Phase 1 just established,
-                    // corrupting the PathMap and triggering the Phase 4 get_context panic.
-                    //
-                    // try_initialize_stack_from_session_cache passes its own local
-                    // `fast_missing` as the missing_structure argument and reads it directly
-                    // after this call — it does not need the population to happen here.
-                    source = NodeSource::StackCache;
-                    break;
-                }
-                None => {
-                    let mut cache_update =
-                        BeliefBase::from(global_bb.eval_query(&query, false).await?);
+            let mut cache_update = BeliefBase::from(global_bb.eval_query(&query, false).await?);
 
-                    if let Some(cached_state) = cache_update.get(key) {
-                        found_state = Some(cached_state);
-                        let update = cache_update.consume();
-                        // Percolate global cache updates into closer caches.
-                        missing_structure.union_mut(&update);
-                        source = NodeSource::GlobalCache;
-                        break;
-                    } else if !cache_update.is_empty() {
-                        tracing::warn!(
-                            "[cache_fetch FAILED] Why didn't we get our node? The query returned results.\n\
-                            Query key: {}\n
-                            Query paths and relations:\n{}\n\
-                            Query pathmaps:\n{}",
-                            key,
-                            cache_update.clone().consume(),
-                            cache_update.paths()
-                        );
-                    }
-                }
+            if let Some(cached_state) = cache_update.get(key) {
+                found_state = Some(cached_state);
+                let update = cache_update.consume();
+                // Percolate global cache updates into closer caches.
+                missing_structure.union_mut(&update);
+                source = NodeSource::GlobalCache;
+                break;
+            }
+            if !cache_update.is_empty() {
+                tracing::warn!(
+                        "[cache_fetch FAILED] Why didn't we get our node? The query returned results.\n\
+                        Query key: {}\n
+                        Query paths and relations:\n{}\n\
+                        Query pathmaps:\n{}",
+                        key,
+                        cache_update.clone().consume(),
+                        cache_update.paths()
+                    );
             }
         }
 

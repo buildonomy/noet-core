@@ -75,20 +75,45 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
 
     tracing::info!("Found {} heading nodes", heading_nodes.len());
 
-    // We expect 4 heading nodes:
+    // We expect 5 heading nodes, 4 nested underneath the top-level h1:
     // 1. "Sections Test Document" (H1 - document title)
     // 2. "Introduction" (should have BID match with complexity=high)
     // 3. "Background" (should have anchor match with complexity=medium)
     // 4. "API Reference" (should have title match with complexity=low)
     // 5. "Untracked Section" (should have no metadata, default fields only)
     assert!(
-        heading_nodes.len() >= 4,
-        "Should have at least 4 heading nodes, got {}",
+        heading_nodes.len() == 1,
+        "Should one top-level heading node, got {}",
         heading_nodes.len()
     );
 
+    let h1_node = heading_nodes[0];
+    // Find heading nodes that are children of this document
+    let sub_heading_nodes: Vec<_> = global_bb
+        .states()
+        .values()
+        .filter(|node| {
+            // Check if this node has a Section relationship to the document
+            global_bb
+                .relations()
+                .as_graph()
+                .edges_connecting(
+                    global_bb.bid_to_index(&node.bid).unwrap(),
+                    global_bb.bid_to_index(&h1_node.bid).unwrap(),
+                )
+                .any(|edge| edge.weight().weights.contains_key(&WeightKind::Section))
+        })
+        .collect();
+
+    tracing::info!("Found {} sub-heading nodes", sub_heading_nodes.len());
+    assert!(
+        sub_heading_nodes.len() == 4,
+        "Should find four sub headings, got {}",
+        sub_heading_nodes.len()
+    );
+
     // Check for Introduction node (no sections entry, so no enrichment)
-    let intro_node = heading_nodes
+    let intro_node = sub_heading_nodes
         .iter()
         .find(|n| n.title.contains("Introduction"));
     assert!(intro_node.is_some(), "Should find Introduction node");
@@ -107,7 +132,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     );
 
     // Check for Background node with anchor match
-    let background_node = heading_nodes
+    let background_node = sub_heading_nodes
         .iter()
         .find(|n| n.title.contains("Background"));
     assert!(background_node.is_some(), "Should find Background node");
@@ -138,7 +163,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     );
 
     // Check for API Reference node with title slug match
-    let api_node = heading_nodes
+    let api_node = sub_heading_nodes
         .iter()
         .find(|n| n.title.contains("API Reference"));
     assert!(api_node.is_some(), "Should find API Reference node");
@@ -166,7 +191,7 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
     );
 
     // Check for Untracked Section node (should exist and get sections entry added)
-    let untracked_node = heading_nodes
+    let untracked_node = sub_heading_nodes
         .iter()
         .find(|n| n.title.contains("Untracked Section"));
     assert!(
@@ -189,7 +214,9 @@ async fn test_sections_metadata_enrichment() -> Result<(), Box<dyn std::error::E
 
     // The "unmatched" section in frontmatter should NOT create a node
     // (it has no corresponding heading)
-    let unmatched_node = heading_nodes.iter().find(|n| n.title.contains("unmatched"));
+    let unmatched_node = sub_heading_nodes
+        .iter()
+        .find(|n| n.title.contains("unmatched"));
     assert!(
         unmatched_node.is_none(),
         "Should NOT find node for frontmatter-only 'unmatched' section"

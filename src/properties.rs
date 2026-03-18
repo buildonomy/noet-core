@@ -175,8 +175,15 @@ pub fn buildonomy_asset_bid(hash_str: &str) -> Bid {
     Bid(Uuid::from_bytes(bytes))
 }
 
+/// Generate a deterministic BID for an external href node from its URL address.
+///
+/// The BID is derived from the URL string itself (the address), NOT from the fetched content
+/// at that address. This is an intentional design choice: fetching remote content is expensive
+/// and unstable, so URL identity is used as the stable hash surface instead. Two href nodes
+/// pointing to the same URL will always get the same BID, enabling deduplication across parses
+/// without requiring a network fetch.
 pub fn buildonomy_href_bid(hash_str: &str) -> Bid {
-    // Generate a UUID v5 for deterministic versioning
+    // Generate a UUID v5 from the URL string for deterministic, address-based identity
     let uuid = Uuid::new_v5(&UUID_NAMESPACE_HREF, hash_str.as_bytes());
 
     // Replace octets 10-15 with Buildonomy namespace bytes
@@ -956,11 +963,7 @@ impl PartialEq for BeliefNode {
             && self.kind == other.kind
             && self.title == other.title
             && self.schema == other.schema
-            && self
-                .payload
-                .iter()
-                .zip(other.payload.iter())
-                .all(|(a, b)| a == b)
+            && self.payload == other.payload
             && self.id == other.id
     }
 }

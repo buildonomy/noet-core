@@ -272,10 +272,14 @@ fn test_detect_orphaned_edges() {
         relations: BidGraph(relations),
     };
 
-    let orphaned = graph.find_orphaned_edges();
+    let mut orphaned = graph.find_orphaned_edges();
 
     assert_eq!(orphaned.len(), 1, "Should detect 1 orphaned edge");
-    assert_eq!(orphaned[0], orphan, "Should identify the orphan BID");
+    assert_eq!(
+        orphaned.pop_first(),
+        Some(orphan),
+        "Should identify the orphan BID"
+    );
 }
 
 /// Test documenting that orphaned edges may not be caught by is_balanced()

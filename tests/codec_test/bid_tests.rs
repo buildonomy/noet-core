@@ -147,6 +147,7 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     // No epoch boundaries exist, so every event is available immediately after
     // parse_sequential returns.
     while let Ok(event) = rx.try_recv() {
+        tracing::debug!("{event:?}");
         global_bb.process_event(&event)?;
     }
 
@@ -154,7 +155,7 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     for result in &parse_results {
         if let Some(ref content) = result.rewritten_content {
             let bids = apply_rewrite(&result.path, content).await?;
-            eprintln!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
+            tracing::debug!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
             *writes.entry(format!("{:?}", result.path)).or_default() += 1;
             for bid in bids {
                 written_bids.insert(bid);
@@ -180,14 +181,16 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     let cached_bids = cached_non_asset_bids(&global_bb);
     for extra in cached_bids.difference(&written_bids) {
         if let Some(node) = global_bb.states().get(extra) {
-            eprintln!(
+            tracing::warn!(
                 "EXTRA cached (not written): bid={extra} title={:?} id={:?} kind={:?}",
-                node.title, node.id, node.kind
+                node.title,
+                node.id,
+                node.kind
             );
         }
     }
     for missing in written_bids.difference(&cached_bids) {
-        eprintln!(
+        tracing::warn!(
             "WRITTEN but not cached: bid={missing} in_states={} in_paths_nets={}",
             global_bb.states().contains_key(missing),
             global_bb.paths().nets().contains(missing)
@@ -204,7 +207,7 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
         "[Sequential/Memory] Parse 2: expecting no rewrites. Pre-count: {pre_second_parse_count}"
     );
 
-    eprintln!(
+    tracing::debug!(
         "[Sequential/Memory] global_bb before parse 2:\npaths and relations:\n{}\npathmaps:\n{}",
         global_bb.clone().consume(),
         global_bb.paths()
@@ -215,13 +218,23 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
 
     let parse_results2 = compiler2.parse_sequential(global_bb.clone(), false).await?;
 
+    let mut second_event_count = 0usize;
     while let Ok(event) = rx2.try_recv() {
+        if !matches!(event, BeliefEvent::FileParsed(_)) {
+            tracing::warn!("[Sequential/DB] Unexpected event on parse 2: {:?}", event);
+            second_event_count += 1;
+        }
         global_bb.process_event(&event)?;
     }
 
+    assert_eq!(
+        second_event_count, 0,
+        "[Sequential/Memory] Parse 2 must not generate graph-modifying events, got {second_event_count}"
+    );
+
     for result in &parse_results2 {
         if result.rewritten_content.is_some() {
-            eprintln!(
+            tracing::warn!(
                 "[Sequential/Memory] UNEXPECTED REWRITE on parse 2: {:?}",
                 result.path
             );
@@ -290,7 +303,7 @@ async fn test_sequential_db() -> Result<(), Box<dyn std::error::Error>> {
     for result in &parse_results {
         if let Some(ref content) = result.rewritten_content {
             let bids = apply_rewrite(&result.path, content).await?;
-            eprintln!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
+            tracing::debug!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
         }
     }
 
@@ -406,7 +419,7 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     for result in &parse_results {
         if let Some(ref content) = result.rewritten_content {
             let bids = apply_rewrite(&result.path, content).await?;
-            eprintln!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
+            tracing::debug!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
             *writes.entry(format!("{:?}", result.path)).or_default() += 1;
             for bid in bids {
                 written_bids.insert(bid);
@@ -436,14 +449,16 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     let cached_bids = cached_non_asset_bids(&global_bb);
     for extra in cached_bids.difference(&written_bids) {
         if let Some(node) = global_bb.states().get(extra) {
-            eprintln!(
+            tracing::warn!(
                 "EXTRA cached (not written): bid={extra} title={:?} id={:?} kind={:?}",
-                node.title, node.id, node.kind
+                node.title,
+                node.id,
+                node.kind
             );
         }
     }
     for missing in written_bids.difference(&cached_bids) {
-        eprintln!(
+        tracing::warn!(
             "WRITTEN but not cached: bid={missing} in_states={} in_paths_nets={}",
             global_bb.states().contains_key(missing),
             global_bb.paths().nets().contains(missing)
@@ -472,7 +487,7 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     for result in &final_parse_results {
         tracing::debug!("[Parallel/Memory] Parse 2 doc {:?}", result.path);
         if result.rewritten_content.is_some() {
-            eprintln!(
+            tracing::warn!(
                 "[Parallel/Memory] UNEXPECTED REWRITE on parse 2: {:?}",
                 result.path
             );
@@ -543,7 +558,7 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
     for result in &parse_results {
         if let Some(ref content) = result.rewritten_content {
             let bids = apply_rewrite(&result.path, content).await?;
-            eprintln!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
+            tracing::debug!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
         }
     }
 

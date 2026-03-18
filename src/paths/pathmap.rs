@@ -24,7 +24,7 @@ use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 use petgraph::visit::{depth_first_search, Control, DfsEvent};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
     sync::Arc,
 };
@@ -179,6 +179,171 @@ fn generate_path_name_with_collision_check(
         .iter()
         .any(|(path, bid, _)| path == &full_path && *bid != *source));
     full_path
+}
+
+/// Topologically sort the `RelationUpdate` / `RelationRemoved` events within `events`
+/// so that a parent edge (sink→its_parent) is always processed before any child edge
+/// whose source equals that sink.
+///
+/// # Why this is necessary
+///
+/// `PathMap::process_relation_update` requires the sink (parent) node to already have
+/// an entry in the PathMap before it can insert the source (child).  If a child edge
+/// arrives before its parent edge in the same batch, `sink_sub_indices` will be empty
+/// and the insertion is silently dropped.
+///
+/// # Algorithm
+///
+/// Treat each relation event as a node in a dependency DAG.  Draw a dependency edge
+/// from event E1 to event E2 when `E1.source == E2.sink` — meaning E1 establishes the
+/// node that E2 needs as its parent.  Run Kahn's BFS to produce a topological ordering
+/// of the relation events; roots (events whose sink is not produced by any other event
+/// in this batch) are emitted first.
+///
+/// Non-relation events are passed through unchanged at their original positions; only
+/// the relative order of `RelationUpdate`/`RelationRemoved` events changes.
+///
+/// Cycles (which would leave some events with `in_degree > 0` after BFS) are appended
+/// in their original order after all acyclic events and a warning is emitted.
+///
+/// # Return value
+///
+/// Returns `Some(sorted)` when the relation events needed reordering, or `None` when the
+/// original slice is already correct (no intra-batch dependencies, or fewer than 2 relation
+/// events).  The `None` path performs no heap allocation beyond the initial scan.
+fn sort_relation_events<'a>(events: &[&'a BeliefEvent]) -> Option<Vec<&'a BeliefEvent>> {
+    // Collect relation events with their original slot index in `events`.
+    let relation_events: Vec<(usize, &'a BeliefEvent)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                BeliefEvent::RelationUpdate(..) | BeliefEvent::RelationRemoved(..)
+            )
+        })
+        .map(|(i, e)| (i, *e))
+        .collect();
+
+    if relation_events.len() < 2 {
+        // Nothing to reorder.
+        return None;
+    }
+
+    // Helper: extract (source, sink) from a relation event.
+    let relation_bids = |e: &BeliefEvent| -> (Bid, Bid) {
+        match e {
+            BeliefEvent::RelationUpdate(src, snk, ..)
+            | BeliefEvent::RelationRemoved(src, snk, ..) => (*src, *snk),
+            _ => unreachable!("non-relation event in relation_events"),
+        }
+    };
+
+    // source_set: every BID that appears as a source (child) in this batch.
+    // An event whose sink is in source_set depends on whoever establishes that sink.
+    let source_set: HashMap<Bid, usize> = relation_events
+        .iter()
+        .enumerate()
+        .map(|(local_idx, (_, e))| (relation_bids(e).0, local_idx))
+        .collect();
+
+    // Fast path: the input is already a valid topological order when every dependency
+    // edge (i → j) flows forward (i < j).  This covers both the no-dependencies case
+    // (source_set never matches any sink) and the already-ordered case, without
+    // allocating sink_to_dependents or in_degree.
+    let already_ordered = relation_events
+        .iter()
+        .enumerate()
+        .all(|(local_idx, (_, e))| {
+            let (_, sink) = relation_bids(e);
+            // If this event's sink is itself a source in this batch, the event that
+            // establishes it (at source_set[sink]) must appear before us (i < local_idx).
+            source_set
+                .get(&sink)
+                .map_or(true, |&establishes_at| establishes_at < local_idx)
+        });
+    if already_ordered {
+        return None;
+    }
+
+    // Build Kahn's in-degree and adjacency.
+    // sink_to_dependents[S] = local indices of events that need S to be established first
+    //                         (i.e. events whose sink == S).
+    let mut sink_to_dependents: HashMap<Bid, Vec<usize>> = HashMap::new();
+    let mut in_degree: Vec<usize> = vec![0usize; relation_events.len()];
+
+    for (local_idx, (_, e)) in relation_events.iter().enumerate() {
+        let (_, sink) = relation_bids(e);
+        if source_set.contains_key(&sink) {
+            // This event must wait until the event that establishes `sink` has run.
+            in_degree[local_idx] += 1;
+            sink_to_dependents.entry(sink).or_default().push(local_idx);
+        }
+    }
+
+    // Kahn's BFS: start with all events whose sink is already established (in_degree == 0).
+    let mut queue: VecDeque<usize> = in_degree
+        .iter()
+        .enumerate()
+        .filter(|(_, &d)| d == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut sorted_local: Vec<usize> = Vec::with_capacity(relation_events.len());
+    while let Some(local_idx) = queue.pop_front() {
+        sorted_local.push(local_idx);
+        let (source, _) = relation_bids(relation_events[local_idx].1);
+        // Establishing `source` unblocks any event whose sink == source.
+        if let Some(deps) = sink_to_dependents.get(&source) {
+            for &dep_idx in deps {
+                if in_degree[dep_idx] > 0 {
+                    in_degree[dep_idx] -= 1;
+                    if in_degree[dep_idx] == 0 {
+                        queue.push_back(dep_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Any events not yet emitted are part of a cycle; append in original order.
+    if sorted_local.len() < relation_events.len() {
+        let visited: BTreeSet<usize> = sorted_local.iter().copied().collect();
+        let cycle_participants: Vec<usize> = (0..relation_events.len())
+            .filter(|i| !visited.contains(i))
+            .collect();
+        tracing::warn!(
+            "[sort_relation_events] detected {} cyclic relation event(s); appending in \
+             original order. Involved sources: {:?}",
+            cycle_participants.len(),
+            cycle_participants
+                .iter()
+                .map(|&i| relation_bids(relation_events[i].1).0)
+                .collect::<Vec<_>>(),
+        );
+        sorted_local.extend(cycle_participants);
+    }
+
+    // Reassemble: walk `events` in order; whenever we encounter a relation event,
+    // replace it with the next event from `sorted_local` (which re-emits the same
+    // set of relation events in dependency order).  Non-relation events are kept
+    // at their original positions unchanged.
+    tracing::debug!("[sort_relation_events] reordering relation events for dependency order");
+    let mut sorted_local_iter = sorted_local.iter();
+    Some(
+        events
+            .iter()
+            .map(|e| match e {
+                BeliefEvent::RelationUpdate(..) | BeliefEvent::RelationRemoved(..) => {
+                    let local_idx = sorted_local_iter
+                        .next()
+                        .expect("sorted_local must have one entry per relation event");
+                    relation_events[*local_idx].1
+                }
+                _ => *e,
+            })
+            .collect(),
+    )
 }
 
 /// We want to ensure a consistent ordering of pathmaps: first order by the order element, and
@@ -762,7 +927,19 @@ impl PathMapMap {
             }
         }
 
-        for event in events {
+        // Sort RelationUpdate/RelationRemoved events so that a parent edge is always
+        // processed before any child edge that depends on it.  Non-relation events keep
+        // their original relative positions.  See `sort_relation_events` for details.
+        // Returns None (zero allocation) when no reordering is needed.
+        let sorted_storage;
+        let sorted_events: &[&BeliefEvent] = match sort_relation_events(events) {
+            Some(sorted) => {
+                sorted_storage = sorted;
+                sorted_storage.as_slice()
+            }
+            None => events,
+        };
+        for event in sorted_events {
             match event {
                 BeliefEvent::NodeUpdate(..) => {}
                 BeliefEvent::NodeRenamed(from, to, _) => {
@@ -811,6 +988,20 @@ impl PathMapMap {
                             let mut pm = pm_lock.write();
                             let events = pm.process_event(event, self);
                             if !events.is_empty() {
+                                if matches!(**event, BeliefEvent::RelationUpdate(..)) {
+                                    // Keep node_to_nets in sync within the batch: a
+                                    // RelationUpdate that produces derivatives has just
+                                    // inserted `source` into this PathMap.  Register it
+                                    // now so that subsequent events in the same sorted
+                                    // batch can route to this PathMap when `source`
+                                    // appears as a sink.  `sink` was already in
+                                    // node_to_nets — that's how this event was routed
+                                    // here in the first place.
+                                    self.node_to_nets
+                                        .entry(*source)
+                                        .or_default()
+                                        .insert(*net_bref);
+                                }
                                 dirty_nets.insert(*net_bref);
                                 net_derivatives
                                     .entry(*net_bref)
@@ -1875,31 +2066,10 @@ impl PathMap {
         // FIXME: This isn't checking for loops at all
         let mut derivatives = Vec::default();
         let mut sink_sub_indices = self.source_sub_indices(sink, false);
-        tracing::trace!(
-            "[process_relation_update] net={} source={} sink={} weightset_kinds={:?} \
-            sink_in_bid_map={} sink_in_nets={} sink_sub_indices_len={} self.net==sink={}",
-            self.net,
-            source,
-            sink,
-            weightset.weights.keys().collect::<Vec<_>>(),
-            self.bid_map.contains_key(sink),
-            nets.nets.contains(sink),
-            sink_sub_indices.len(),
-            self.net == *sink,
-        );
         if sink_sub_indices.is_empty() {
-            tracing::trace!(
-                "[process_relation_update] EARLY RETURN: sink_sub_indices empty for sink={} in net={}",
-                sink, self.net
-            );
             return derivatives;
         }
         if nets.nets.contains(sink) && self.net != *sink {
-            tracing::trace!(
-                "[process_relation_update] EARLY RETURN: sink={} is a net and self.net={} != sink",
-                sink,
-                self.net
-            );
             return derivatives;
         }
 
@@ -2139,9 +2309,9 @@ impl PathMap {
                         }
                     }
 
-                    // Update existing paths that are kept (order or path may have changed)
-                    for (old_idx, old_path, _) in old_entries.iter() {
-                        if new_paths_set.contains(old_path) {
+                    // Update existing paths if their order changed
+                    for (old_idx, old_path, old_order) in old_entries.iter() {
+                        if new_paths_set.contains(old_path) && *old_order != new_order {
                             // Path is kept, update the order
                             self.map[*old_idx].2 = new_order.clone();
                             derivatives.push(BeliefEvent::PathUpdate(

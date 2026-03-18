@@ -88,9 +88,14 @@ impl<'a> ExtendedRelation<'a> {
                     .find(|cns| other.bid.parent_bref() == cns.bref())
                     .copied()
                     .unwrap_or(root_net);
-                tracing::debug!(
-                    "No path found for node {other_bid} in any path map (root_net={root_net}), \
-                     using fallback net {fallback_net} with empty path"
+                let other_node_title = set
+                    .states()
+                    .get(&other_bid)
+                    .map(|n| n.display_title())
+                    .unwrap_or(other_bid.to_string());
+                tracing::warn!(
+                    "No path found for node \"{other_node_title}\" in any path map\
+                    (root_net={root_net}), using fallback net {fallback_net} with empty path"
                 );
                 (fallback_net, String::new())
             });
