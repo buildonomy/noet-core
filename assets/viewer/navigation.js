@@ -8,6 +8,12 @@
  * once per buildNavigation() call. Toggle clicks re-invoke buildNavigation()
  * which re-renders the whole tree — acceptable given typical tree sizes.
  *
+ * Only expanded nodes have their children rendered into the DOM. Collapsed
+ * nodes render a toggle button and their own label/link, but their children
+ * subtree is omitted entirely. This keeps the DOM size proportional to the
+ * number of visible nodes rather than the total corpus size, which is critical
+ * for large corpora like MDN (~14k files).
+ *
  * Expand/collapse state is tracked in state.expandedNodes (a Set of BIDs).
  * Root nodes are auto-expanded on the first render only.
  */
@@ -219,9 +225,11 @@ function expandAncestors(bid) {
 }
 
 /**
- * Toggle expand/collapse for a node in-place without a full re-render.
- * Flips the is-expanded class on the <li> and updates aria-expanded on the button.
- * State is kept in sync so that a subsequent buildNavigation() call is consistent.
+ * Toggle expand/collapse for a nav node and re-render the tree.
+ *
+ * Because collapsed nodes no longer have their children in the DOM, a class
+ * flip is insufficient — we must re-render to inject or remove the subtree.
+ *
  * @param {string} bid
  */
 function toggleNode(bid) {
@@ -234,21 +242,9 @@ function toggleNode(bid) {
     state.expandedNodes.add(bid);
   }
 
-  // Patch the DOM directly — no full re-render needed.
-  const li = state.navContent.querySelector(`li[data-bid="${CSS.escape(bid)}"]`);
-  if (li) {
-    if (isExpanded) {
-      li.classList.remove("is-expanded");
-    } else {
-      li.classList.add("is-expanded");
-    }
-    const btn = li.querySelector(
-      `:scope > button.noet-nav-tree__toggle[data-bid="${CSS.escape(bid)}"]`,
-    );
-    if (btn) {
-      btn.setAttribute("aria-expanded", String(!isExpanded));
-    }
-  }
+  // Because collapsed nodes no longer have their children in the DOM, a class
+  // flip is insufficient — we must re-render to inject or remove the subtree.
+  buildNavigation();
 }
 
 // =============================================================================
@@ -346,8 +342,10 @@ function renderNavNode(bid, depth = 0, visited = new Set(), activeBid = null) {
     `;
   }
 
-  // Always render children into the DOM — CSS shows/hides via is-expanded on the parent <li>.
-  if (hasChildren) {
+  // Only render children into the DOM when this node is expanded. Collapsed
+  // nodes emit no children markup at all, keeping DOM size proportional to
+  // the number of visible nodes rather than the full corpus size.
+  if (hasChildren && isExpanded) {
     const newVisited = new Set(visited);
     newVisited.add(bid);
 

@@ -758,7 +758,7 @@ html.is-resizing .noet-metadata__collapse {
     white-space: nowrap;
 }
 
-/* Nested navigation children — always in DOM, shown/hidden by is-expanded on parent */
+/* Nested navigation children — only rendered into DOM when parent is expanded */
 .noet-nav-tree__children {
     display: none;
     list-style: none;
