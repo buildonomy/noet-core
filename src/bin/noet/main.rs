@@ -339,18 +339,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                use noet_core::beliefbase::{BeliefAccumulator, BeliefBase};
+                use noet_core::beliefbase::BeliefAccumulator;
                 use noet_core::event::BeliefEvent;
                 use tokio::sync::mpsc::unbounded_channel;
 
                 // Create event channel for belief events.
                 let (tx, rx) = unbounded_channel::<BeliefEvent>();
 
-                // `BeliefAccumulator` replaces the old `tokio::spawn` background processor.
-                // It owns the channel receiver and the in-memory belief store, drains events
-                // lazily before each query, and caches `eval_query` results between `BatchEnd`
-                // boundaries (previously `CachedBeliefSource`).
-                let accumulator = BeliefAccumulator::new(BeliefBase::empty(), rx);
+                // When the `service` feature is enabled, use an ephemeral in-memory SQLite
+                // DB as the accumulator backing store.  `DbConnection::apply_batch` commits
+                // all events for an epoch in a single SQL transaction, which is cheaper than
+                // the `BeliefBase` path that drives `process_event` (including PathMapMap
+                // reconstruction) for every event.  The DB is discarded at end of scope.
+                //
+                // Path events (PathAdded/PathUpdate/PathsRemoved) are harvested by
+                // `terminate_stack` from `session_bb.process_event` derivatives and sent
+                // on `tx`, so the `paths` table is correctly populated during parse.
+                // This means `StatePred::NetId` JOIN queries work correctly for
+                // NodeKey::Id collision detection in cache_fetch.
+                //
+                // Without `service`, fall back to the in-memory `BeliefBase` accumulator.
+                #[cfg(feature = "service")]
+                let accumulator = {
+                    use noet_core::db::{db_init_memory, DbConnection};
+                    let db_pool = db_init_memory().await.map_err(|e| {
+                        noet_core::BuildonomyError::Custom(format!(
+                            "Failed to initialise in-memory belief DB: {e}"
+                        ))
+                    })?;
+                    BeliefAccumulator::new(DbConnection(db_pool), rx)
+                };
+                #[cfg(not(feature = "service"))]
+                let accumulator = {
+                    use noet_core::beliefbase::BeliefBase;
+                    BeliefAccumulator::new(BeliefBase::empty(), rx)
+                };
 
                 // `query_handle()` is a cheap, clonable view backed by the same
                 // `Arc<Mutex<AccInner>>` and `Arc<AccCache>`.  Pass this to `parse_all`
@@ -393,7 +416,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // channel; closing tx is sufficient — no out-of-band drain needed.
                 compiler.builder_mut().close_tx();
 
-                // Extract the fully-populated BeliefBase for post-parse operations.
+                // Extract the fully-populated backing store for post-parse operations.
+                // With `service`: a DbConnection holding the committed belief graph.
+                // Without `service`: a BeliefBase with all events applied in-memory.
                 let final_bb = accumulator.into_inner().await.map_err(|e| {
                     noet_core::BuildonomyError::Custom(format!(
                         "BeliefAccumulator::into_inner failed: {}",
@@ -401,9 +426,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ))
                 })?;
 
-                // Finalize HTML generation with the synchronized BeliefBase.
+                // Finalize HTML generation with the synchronized backing store.
+                // Pass a clone: finalize_html requires B: BeliefSource + Clone by value.
                 let finalize_diagnostics = if html_output.is_some() {
-                    compiler.finalize_html(&final_bb).await?
+                    compiler.finalize_html(final_bb.clone()).await?
                 } else {
                     Vec::new()
                 };

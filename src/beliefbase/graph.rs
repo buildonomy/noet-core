@@ -177,6 +177,79 @@ impl BidGraph {
         BidSubGraph::from_edges(edges)
     }
 
+    /// Like [`Self::as_subgraph`] but DFS-bounded: only edges reachable from `seed` are
+    /// included.  Cost is O(reachable nodes + reachable edges) rather than
+    /// O(all_edges_in_graph), which matters when the full `BidGraph` contains
+    /// thousands of unrelated networks (e.g. `global_bb` after many drain epochs).
+    ///
+    /// `reverse` has the same semantics as in [`Self::as_subgraph`]: when `true` the edge
+    /// direction is flipped so the DFS walks from children toward parents (used by
+    /// [`crate::paths::pathmap::PathMap::new`] which starts from the network root and walks downward in the
+    /// reversed graph).
+    ///
+    /// Returns an empty subgraph when `seed` is not present in the graph.
+    pub fn as_subgraph_seeded(&self, kind: WeightKind, reverse: bool, seed: Bid) -> BidSubGraph {
+        let g = self.as_graph();
+
+        // petgraph::Graph is NodeIndex-keyed, not Bid-keyed. Build a Bid→NodeIndex
+        // map so we can find the seed's NodeIndex, run DFS (which operates on
+        // NodeIndex), then translate back to Bid for the edge-filter pass.
+        let bid_to_idx: BTreeMap<Bid, petgraph::graph::NodeIndex> =
+            g.node_indices().map(|idx| (g[idx], idx)).collect();
+
+        let seed_idx = match bid_to_idx.get(&seed) {
+            Some(idx) => *idx,
+            None => {
+                return BidSubGraph::from_edges(std::iter::empty::<(Bid, Bid, (u16, Vec<String>))>())
+            }
+        };
+
+        // Section edges in BidGraph go child → parent (source=child, sink=parent).
+        // `as_subgraph_seeded(kind, reverse=true, seed=net)` is called from PathMap::new
+        // where `net` is the network root.  To collect all descendants of `net` we must
+        // walk Incoming edges from `net` (i.e., all children that point to it), then
+        // their children, etc.  When reverse=false we want descendants via Outgoing edges.
+        //
+        // We perform a manual BFS/stack walk using edges_directed so we control direction
+        // without needing the Reversed adaptor (which complicates the depth_first_search
+        // call signature).  Correctness: the edge-filter pass below still guarantees only
+        // `kind` edges appear in the result regardless of how wide the reachable set is.
+        let walk_direction = if reverse {
+            Direction::Incoming
+        } else {
+            Direction::Outgoing
+        };
+
+        let mut reachable: BTreeSet<petgraph::graph::NodeIndex> = BTreeSet::new();
+        let mut stack_walk: Vec<petgraph::graph::NodeIndex> = vec![seed_idx];
+        reachable.insert(seed_idx);
+        while let Some(current) = stack_walk.pop() {
+            for neighbor in g.neighbors_directed(current, walk_direction) {
+                if reachable.insert(neighbor) {
+                    stack_walk.push(neighbor);
+                }
+            }
+        }
+
+        // Now collect only `kind` edges between reachable nodes.
+        let edges = g.raw_edges().iter().filter_map(|edge| {
+            if !reachable.contains(&edge.source()) || !reachable.contains(&edge.target()) {
+                return None;
+            }
+            let source = g[edge.source()];
+            let sink = g[edge.target()];
+            let weight = edge.weight.get(&kind)?;
+            let paths: Vec<String> = weight.get_doc_paths();
+            let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+            if reverse {
+                Some((sink, source, (sort_key, paths)))
+            } else {
+                Some((source, sink, (sort_key, paths)))
+            }
+        });
+        BidSubGraph::from_edges(edges)
+    }
+
     pub fn sink_subgraph(&self, start_node: Bid, kind: WeightKind) -> BTreeSet<Bid> {
         let subgraph = self.as_subgraph(kind, false);
         let mut subtree_nodes = BTreeSet::new();

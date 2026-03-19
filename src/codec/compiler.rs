@@ -1233,6 +1233,20 @@ impl DocumentCompiler {
             // session_bb before B's, so A always wins regardless of which task finishes
             // first at the OS scheduler level.
             let repo_root = self.builder.repo_root().to_path_buf();
+            let repo_bid = self.builder.repo();
+            // Snapshot all network-kinded nodes + their Section edges from the compiler's
+            // session_bb so that each spawned task builder can pre-populate its own
+            // session_bb with the full ancestor chain.  This is needed because
+            // try_initialize_stack_from_session_cache walks upward through session_bb
+            // via Section edges; without the full chain present the halo terminates at
+            // the immediate parent, breaking the ancestor relation and causing
+            // "Skipping update_relation" warnings for the repo root node.
+            //
+            // The snapshot is empty for epoch-0 (root not yet parsed); for subsequent
+            // epochs it contains every network node parsed so far + their Section edges,
+            // plus the const-namespace (href + asset) subgraphs so tasks don't hit
+            // global_bb for those on the first file.
+            let network_ancestors = Arc::new(self.builder.epoch_session_snapshot());
             let proto_index = self.proto_index.clone();
             let shared_tx = self.builder.tx().clone();
             let write = self.write;
@@ -1255,6 +1269,7 @@ impl DocumentCompiler {
                 let repo_root = repo_root.clone();
                 let proto_index = proto_index.clone();
                 let global_bb = global_bb.clone();
+                let network_ancestors = Arc::clone(&network_ancestors);
                 let sem = Arc::clone(&semaphore);
                 let span = tracing::info_span!(
                     "parse_task",
@@ -1277,11 +1292,22 @@ impl DocumentCompiler {
                             tokio::sync::mpsc::unbounded_channel::<BeliefEvent>();
 
                         // Construct a fresh builder whose events go to the task-local channel.
+                        // Seed repo_bid from the compiler's main builder so that
+                        // initialize_stack's fast-path guard (`self.repo != Bid::nil()`) passes
+                        // immediately, allowing try_initialize_stack_from_session_cache to query
+                        // global_bb for the parent network instead of running the full O(depth)
+                        // slow-path ancestor walk on every file.  repo_bid is nil for epoch-0
+                        // (root not yet parsed) and stable for all subsequent epochs.
                         let mut builder = match GraphBuilder::new(&repo_root, Some(task_tx.clone()))
                         {
                             Ok(b) => b,
                             Err(e) => return (idx, path, Err(e), Vec::new()),
                         };
+                        // Seed repo_bid and merge the full network ancestor chain into
+                        // this task's session_bb so that try_initialize_stack_from_session_cache
+                        // can walk upward through Section edges all the way to the repo root.
+                        // seed_session is a no-op when repo_bid is nil (epoch-0).
+                        builder.seed_session(repo_bid, &network_ancestors);
 
                         // Delegate directory resolution, file read, FileParsed event,
                         // parse_content, and optional write-back to the shared helper.

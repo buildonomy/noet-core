@@ -352,6 +352,9 @@ impl AsSql for StatePred {
                      WHERE ",
                 );
             }
+            StatePred::NetId(..) => {
+                // Full JOIN query emitted in the second match arm below — no preamble needed.
+            }
             _ => {
                 qb.push(
                     "SELECT DISTINCT bid \
@@ -376,10 +379,27 @@ impl AsSql for StatePred {
             StatePred::Bref(bref_vec) => {
                 push_id_expr(qb, bref_vec, "bref", match_pred);
             }
-            StatePred::NetId(_net, id) => {
-                // FIXME: we should do this, then do a join on the bid results on our paths table
-                qb.push("id = ");
+            StatePred::NetId(net, id) => {
+                // Join the paths table to scope the id lookup to nodes registered under
+                // this network.  A node's parent_bref() is NOT reliably the network bref
+                // — anchors are adopted into their immediate parent (doc or heading), so
+                // the parent_bref chain can be arbitrarily deep.  The paths table records
+                // every node reachable from a network under that network's bref, making
+                // it the correct scoping mechanism regardless of nesting depth.
+                //
+                // The first match arm suppresses the normal beliefs preamble for NetId,
+                // so we emit a complete self-contained SELECT here.  get_states wraps
+                // this in "SELECT * FROM beliefs WHERE bid IN (...)" — the subquery must
+                // return a `bid` column, same shape as all other StatePred variants.
+                qb.push(
+                    "SELECT DISTINCT b.bid \
+                     FROM beliefs b \
+                     JOIN paths p ON p.target = b.bid \
+                     WHERE b.id = ",
+                );
                 qb.push_bind(id.clone());
+                qb.push(" AND p.net = ");
+                qb.push_bind(net.to_string());
             }
             StatePred::Schema(schema) => {
                 push_id_expr(qb, &[schema], "schema", match_pred);

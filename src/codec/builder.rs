@@ -274,12 +274,162 @@ impl GraphBuilder {
         self.repo
     }
 
-    /// Set the repository root BID. Used by the compiler after a parallel epoch-0 batch
-    /// to seed the compiler's own builder with the repo BID discovered by task-builders.
+    /// Set the repository root BID if not already set.
+    ///
+    /// Used after epoch-0 in `parse_all` (`process_epoch_batch_results`) to seed the
+    /// compiler's own long-lived builder with the repo BID discovered by a task-builder
+    /// during the first depth batch.
+    ///
+    /// For seeding fresh **parallel task builders**, use [`seed_session`] instead, which
+    /// atomically sets the repo BID and pre-populates `session_bb` with the full network
+    /// ancestor graph so that `initialize_stack`'s fast path hits `StackCache` immediately
+    /// without any `global_bb` query.
+    ///
+    /// The `nil`-guard prevents accidentally overwriting a legitimately set BID.
     pub(crate) fn set_repo(&mut self, bid: Bid) {
         if self.repo == Bid::nil() {
             self.repo = bid;
         }
+    }
+
+    /// Seed a fresh parallel-task builder from the compiler's [`epoch_session_snapshot`].
+    ///
+    /// Sets `self.repo` so `initialize_stack`'s fast-path guard passes immediately, and
+    /// replaces `self.session_bb` with the snapshot so both:
+    ///
+    /// - `try_initialize_stack_from_session_cache` finds the parent network via a
+    ///   `StackCache` hit (no `global_bb.eval_query` mutex contention), and
+    /// - the `content_namespaces()` guard in `initialize_stack` finds both namespace
+    ///   nodes already present (no `global_bb.eval` calls on the first file).
+    ///
+    /// Call [`epoch_session_snapshot`] once before the task-spawn loop, wrap the result
+    /// in an `Arc`, and clone it cheaply into each task.
+    ///
+    /// This is a no-op when `repo_bid` is `Bid::nil()` (epoch-0, root not yet parsed).
+    ///
+    /// [`epoch_session_snapshot`]: GraphBuilder::epoch_session_snapshot
+    pub(crate) fn seed_session(&mut self, repo_bid: Bid, snapshot: &BeliefGraph) {
+        if repo_bid == Bid::nil() {
+            return;
+        }
+        // Set repo BID so initialize_stack's fast-path guard passes.
+        if self.repo == Bid::nil() {
+            self.repo = repo_bid;
+        }
+        // Replace session_bb directly from the snapshot — cheaper than merge_from for a
+        // fresh (effectively empty) task builder: skips the full to_event_stream diff and
+        // event replay.  The snapshot contains both network ancestors and const-namespace
+        // subgraphs, so the content_namespaces() guard and StackCache fast-path both fire
+        // without touching global_bb.
+        if !snapshot.states.is_empty() {
+            self.session_bb = BeliefBase::from(snapshot.clone()).with_label("session_bb");
+        }
+    }
+
+    /// Build a snapshot of `session_bb` containing everything a fresh parallel-task
+    /// builder needs to avoid hitting `global_bb` during `initialize_stack`.
+    ///
+    /// The snapshot merges two disjoint subsets of `session_bb`:
+    ///
+    /// 1. **Network ancestors** — every node whose `kind.is_network()` is true, plus
+    ///    all edges between them.  Seeding a task builder with this lets
+    ///    `try_initialize_stack_from_session_cache` find the parent network via a
+    ///    cheap `StackCache` hit rather than a mutex-guarded `global_bb.eval_query`.
+    ///
+    /// 2. **Const-namespace subgraphs** — the `href_namespace` and `asset_namespace`
+    ///    nodes, plus all nodes reachable from them in `session_bb`.  Seeding a task
+    ///    builder with these lets the `content_namespaces()` guard in
+    ///    `initialize_stack` find both namespaces already present, skipping the two
+    ///    `global_bb.eval` calls that would otherwise fire on every file in a fresh
+    ///    parallel task.
+    ///
+    /// Call this once before the task-spawn loop, wrap the result in an `Arc`, and
+    /// pass it to [`seed_session`] inside each task.
+    ///
+    /// [`seed_session`]: GraphBuilder::seed_session
+    pub(crate) fn epoch_session_snapshot(&self) -> BeliefGraph {
+        // ── Part 1: network-kinded nodes + edges between them ──────────────────
+        let network_bids: BTreeSet<Bid> = self
+            .session_bb
+            .states()
+            .iter()
+            .filter(|(_, n)| n.kind.is_network())
+            .map(|(bid, _)| *bid)
+            .collect();
+
+        // ── Part 2: const-namespace nodes + all nodes reachable from them ──────
+        // Walk session_bb's relation graph starting from each const-namespace BID
+        // to collect the full asset subgraph.  We do a simple BFS on Incoming edges
+        // (assets point *to* their namespace: source=asset, sink=namespace) so we
+        // need to walk Incoming from the namespace to reach its assets.
+        let mut ns_bids: BTreeSet<Bid> = BTreeSet::new();
+        {
+            let rel = self.session_bb.relations();
+            let g = rel.as_graph();
+            // Build a NodeIndex→Bid map for reverse lookup.
+            let idx_to_bid: std::collections::HashMap<petgraph::graph::NodeIndex, Bid> =
+                g.node_indices().map(|idx| (idx, g[idx])).collect();
+            let bid_to_idx: std::collections::HashMap<Bid, petgraph::graph::NodeIndex> =
+                g.node_indices().map(|idx| (g[idx], idx)).collect();
+
+            for ns_bid in content_namespaces().iter() {
+                if self
+                    .session_bb
+                    .get(&NodeKey::Bid { bid: *ns_bid })
+                    .is_none()
+                {
+                    continue; // namespace not yet loaded into compiler session_bb
+                }
+                ns_bids.insert(*ns_bid);
+                if let Some(&ns_idx) = bid_to_idx.get(ns_bid) {
+                    // Walk Incoming edges: assets are sources, namespace is the sink.
+                    let mut stack: Vec<petgraph::graph::NodeIndex> = vec![ns_idx];
+                    let mut visited: BTreeSet<petgraph::graph::NodeIndex> =
+                        BTreeSet::from([ns_idx]);
+                    while let Some(current) = stack.pop() {
+                        for neighbor in g.neighbors_directed(current, petgraph::Direction::Incoming)
+                        {
+                            if visited.insert(neighbor) {
+                                stack.push(neighbor);
+                            }
+                        }
+                    }
+                    for idx in visited {
+                        if let Some(bid) = idx_to_bid.get(&idx) {
+                            ns_bids.insert(*bid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Merge both sets ─────────────────────────────────────────────────────
+        let included_bids: BTreeSet<Bid> = network_bids.union(&ns_bids).copied().collect();
+
+        if included_bids.is_empty() {
+            return BeliefGraph::default();
+        }
+
+        let states: BTreeMap<Bid, BeliefNode> = included_bids
+            .iter()
+            .filter_map(|bid| self.session_bb.states().get(bid).map(|n| (*bid, n.clone())))
+            .collect();
+
+        let relations = {
+            let rel = self.session_bb.relations();
+            let g = rel.as_graph();
+            crate::beliefbase::BidGraph::from_edges(g.raw_edges().iter().filter_map(|e| {
+                let source = g[e.source()];
+                let sink = g[e.target()];
+                if included_bids.contains(&source) && included_bids.contains(&sink) {
+                    Some((source, sink, e.weight.clone()))
+                } else {
+                    None
+                }
+            }))
+        };
+
+        BeliefGraph { states, relations }
     }
 
     pub fn doc_bb(&self) -> &BeliefBase {

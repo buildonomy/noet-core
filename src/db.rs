@@ -861,6 +861,23 @@ impl MigrationSource<'static> for MigrationList {
     }
 }
 
+/// Shared migration list used by both [`db_init`] and [`db_init_memory`].
+fn belief_migrations() -> MigrationList {
+    MigrationList(vec![Migration {
+        version: 1,
+        description: "create_initial_tables",
+        sql: "\
+            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
+            CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, section TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
+            CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path)); \
+            CREATE TABLE file_mtimes (path TEXT PRIMARY KEY, mtime INTEGER NOT NULL); \
+            CREATE INDEX beliefs_id ON beliefs(id); \
+            CREATE INDEX beliefs_bref ON beliefs(bref); \
+            CREATE INDEX paths_target ON paths(target);",
+        kind: MigrationType::ReversibleUp,
+    }])
+}
+
 pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
     let fqdb = format!("sqlite:{}", db_path.to_str().unwrap());
     tracing::debug!("Initializing cache db from file: {:?}", fqdb);
@@ -887,20 +904,7 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
         .connect_with(options)
         .await?;
 
-    let migrations = MigrationList(vec![
-        // Define your migrations here
-        Migration {
-            version: 1,
-            description: "create_initial_tables",
-            sql: "\
-            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
-            CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, section TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
-            CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path)); \
-            CREATE TABLE file_mtimes (path TEXT PRIMARY KEY, mtime INTEGER NOT NULL);",
-            kind: MigrationType::ReversibleUp,
-        }
-    ]);
-    let migrator = Migrator::new(migrations.clone()).await?;
+    let migrator = Migrator::new(belief_migrations()).await?;
     migrator.run(&pool).await?;
 
     let count_res = sqlx::query("SELECT COUNT(*) as bcount FROM beliefs;")
@@ -917,5 +921,41 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
         rel_res.get::<u32, usize>(0)
     );
 
+    Ok(pool)
+}
+
+/// Initialise an **ephemeral in-memory** SQLite pool with the same schema as
+/// [`db_init`].
+///
+/// Use this for the `parse` command where the DB is a throw-away accumulator:
+/// `DbConnection::apply_batch` commits a single WAL-style transaction per epoch,
+/// which is cheaper than the full `BeliefBase::process_event` + PathMapMap
+/// reconstruction path, but the data does not need to survive the process.
+///
+/// Each call creates a fresh, isolated database.  The pool is dropped (and the
+/// in-memory DB freed) when the last `Pool<Sqlite>` clone goes out of scope.
+pub async fn db_init_memory() -> Result<Pool<Sqlite>, sqlx::Error> {
+    use sqlx::pool::PoolOptions;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    // `?mode=memory&cache=shared` would allow multiple connections to share the
+    // same in-memory DB, but for our use-case a single connection is sufficient
+    // and avoids any shared-cache locking subtleties.
+    let options = SqliteConnectOptions::from_str("sqlite::memory:")?.disable_statement_logging();
+
+    let pool = PoolOptions::<Sqlite>::new()
+        // Keep exactly one connection alive so the in-memory database persists
+        // for the lifetime of the pool.  A min_connections(1) alone is not
+        // sufficient in sqlx — we also set max_connections(1) so the pool never
+        // opens a second connection that would see a different (empty) DB.
+        .min_connections(1)
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+
+    let migrator = Migrator::new(belief_migrations()).await?;
+    migrator.run(&pool).await?;
+
+    tracing::debug!("In-memory DB initialised (ephemeral, parse-command path)");
     Ok(pool)
 }

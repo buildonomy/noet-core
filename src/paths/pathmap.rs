@@ -1245,7 +1245,7 @@ impl PathMap {
         // can sort their child stacks before inserting those stacks into the tree.
         let tree_graph = {
             let relations = relations.read_arc();
-            relations.as_subgraph(kind, true)
+            relations.as_subgraph_seeded(kind, true, net)
         };
         let mut stack =
             BTreeMap::<Bid, (BTreeSet<Bid>, BTreeMap<Bid, (Vec<u16>, Vec<String>)>)>::new();

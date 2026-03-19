@@ -986,6 +986,13 @@ def main() -> None:
     lines = load_log(log_path)
     print(f"{len(lines):,} timestamped lines")
 
+    if lines:
+        wall = (lines[-1].ts - lines[0].ts).total_seconds()
+        m, s = divmod(wall, 60)
+        print(
+            f"Wall time: {int(m)}m {s:.1f}s  ({lines[0].ts.strftime('%H:%M:%S')} → {lines[-1].ts.strftime('%H:%M:%S')})"
+        )
+
     records = extract_file_records(lines)
 
     span_records = sum(1 for r in records if r.task_idx is not None)
