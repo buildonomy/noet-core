@@ -308,7 +308,7 @@ impl BeliefBase {
     /// `ParseDiagnostic::ParseError`; all other messages (e.g. ID-collision warnings written by
     /// `insert_state`) are surfaced as `ParseDiagnostic::Warning`.
     ///
-    /// Use [`is_balanced`] to check whether any error-level diagnostics were recorded.
+    /// Use [`Self::is_balanced`] to check whether any error-level diagnostics were recorded.
     pub fn drain_diagnostics(&self) -> Vec<ParseDiagnostic> {
         std::mem::take(&mut *self.write_diagnostics())
     }
@@ -1349,7 +1349,7 @@ impl BeliefBase {
         let old_id = self.states.get(&node.bid).map(|old| old.id());
         let is_new_node_for_collision = old_id.is_none();
         // An existing node is changing its id when the stored id differs from the incoming one.
-        let id_is_changing = old_id.as_ref().map_or(false, |oid| *oid != node.id());
+        let id_is_changing = old_id.as_ref().is_some_and(|oid| *oid != node.id());
 
         if is_new_node_for_collision || id_is_changing {
             for key in merge.iter() {

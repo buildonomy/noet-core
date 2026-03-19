@@ -606,11 +606,6 @@ impl BeliefSource for DbConnection {
                             &rewritten
                         }
                         None => {
-                            tracing::debug!(
-                                "[eval_unbalanced] resolve_net_path({}, {:?}) → no match",
-                                net,
-                                path
-                            );
                             // No match: return an empty graph rather than a wrong one.
                             return Ok(BeliefGraph::default());
                         }

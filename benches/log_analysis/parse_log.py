@@ -83,7 +83,11 @@ _LEVEL_RE = re.compile(r"\s+(DEBUG|INFO|WARN|ERROR)\s+")
 
 # Matches the span prefix emitted by .instrument(info_span!("parse_task", ...))
 # Example (after ANSI stripping):
-#   parse_task{task_idx=3 path=/some/path}: noet_core::codec::builder: Phase 0 ...
+#   parse_task{task_idx=3 path=/some/path/dir}: noet_core::codec::builder: Phase 0 ...
+# NOTE: in the current compiler, `path` in the span is the *directory* passed to
+# parse_epoch (one per task), NOT the individual file path.  The actual file path
+# comes from the [parse_one_path]: reading "..." line that appears inside the span.
+# task_idx is per-epoch-batch and is used only for concurrency tagging here.
 _SPAN_RE = re.compile(r"parse_task\{task_idx=(\d+)\s+path=([^}]+)\}:")
 
 
@@ -166,20 +170,34 @@ def load_log(path: str) -> list[LogLine]:
 
 _PHASE_LABELS = {
     "Phase 0: initialize stack": "phase0_start",
-    "[initialize_stack]:": "phase0_end",
+    # Phase 0 end: emitted at the start of Phase 1 (first line after initialize_stack returns).
+    # "[initialize_stack]:" was removed; use Phase 1 start as the phase0 end marker instead.
     "Phase 1: Create all nodes": "phase1",
     "Phase 2: Balance and process relations": "phase2",
+    # Phase 3 label changed to include "inform external sinks about nodekey changes"
     "Phase 3: inform external sinks": "phase3",
+    # Phase 4 label now includes "inject_context=…" suffix — match on prefix only
     "Phase 4: context injection": "phase4",
     "Phase 4b: codec finalization": "phase4b",
+    # Phase 5 label now includes full description; match on prefix
     "Phase 5: terminating stack": "phase5",
 }
 
 _QUEUEING_RE = re.compile(r'Queueing for deferred HTML generation: "(.+)"')
 _WRITE_RE = re.compile(r'Write disabled, skipping file write for "(.+)"')
 _DIFF_RE = re.compile(r"Diff events \((\d+)\).*RelationUpdate\((\d+)\)")
-# Legacy sequential path — still emitted by parse_next for non-parallel runs.
-_PARSING_FILE_RE = re.compile(r"\[Compiler\] Parsing file (.+?) \(attempt (\d+)/")
+# Sequential path delineator: emitted by parse_one_path as the FIRST line for each
+# file (before bytes are read).  The Rust {:?} formatter wraps PathBuf in quotes.
+# Format: [parse_one_path]: reading "/abs/path/to/file"
+#
+# We match ONLY the "reading" variant because "codec path" and "asset path" are
+# follow-on lines emitted for the same file (after the bytes have been read and
+# routed) and must NOT open a new FileRecord.
+_PARSING_FILE_RE = re.compile(r'\[parse_one_path\]: reading "(.+)"')
+# Legacy format from older compiler versions (parse_next loop).
+_PARSING_FILE_LEGACY_RE = re.compile(
+    r"\[Compiler\] Parsing file (.+?) \(attempt (\d+)/"
+)
 
 
 @dataclass
@@ -194,8 +212,9 @@ class FileRecord:
     task_idx: Optional[int] = None
 
     def phase0_duration(self) -> Optional[float]:
+        # phase0_end marker was removed from the log; use phase1 start as proxy.
         p0 = self.phases.get("phase0_start")
-        p0e = self.phases.get("phase0_end")
+        p0e = self.phases.get("phase0_end") or self.phases.get("phase1")
         if p0 and p0e:
             return (p0e - p0).total_seconds()
         return None
@@ -237,49 +256,91 @@ class FileRecord:
 
 def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
     """
-    Build one FileRecord per (task_idx, path) span observed in the log.
+    Build one FileRecord per parsed file observed in the log.
 
     Strategy
     --------
-    Lines that carry a parse_task span (task_idx + path) are keyed by
-    (task_idx, path).  All phase markers within that span accumulate into
-    the matching record.  This is robust to interleaved output from
-    concurrent tasks.
+    The universal file delineator is:
 
-    Lines without a span (sequential parse_next path, or global compiler
-    messages) fall through to the legacy current-pointer approach: a new
-    record is opened on each "[Compiler] Parsing file" message and phase
-    markers are attributed to the last-opened record.
+        [parse_one_path]: reading "/abs/path/to/file"
 
-    The two populations are merged and returned sorted by phase0_start.
+    This line is emitted by parse_one_path at the start of every file read,
+    for both sequential and parallel runs.  It opens a new FileRecord keyed
+    by the file path.  Subsequent phase markers (Phase 0–5) and Diff events
+    are attributed to the most recently opened record for that file path.
+
+    For parallel runs, lines carry a parse_task span prefix:
+        parse_task{task_idx=N path=/dir}: module: body
+    The task_idx is recorded on the FileRecord for concurrency analysis.
+    Note: the span's `path` is the *directory* input to parse_epoch, not the
+    individual file; we ignore it for keying and use the file path instead.
+
+    For the legacy "[Compiler] Parsing file" format (older compiler versions),
+    we fall back to that as the delineator.
+
+    Records are returned sorted by phase0_start timestamp.
     """
-    # Key: (task_idx, path) -> FileRecord  (for span-keyed lines)
-    span_records: dict[tuple[int, str], FileRecord] = {}
-    # Attempt tracking per path across spans
+    # Key: file_path -> FileRecord for the *current open* parse of that path.
+    # When a path is seen again (reparse), the old record is closed and a new
+    # one is opened, inheriting the incremented attempt count.
+    open_records: dict[str, FileRecord] = {}
+    # All closed + still-open records in insertion order.
+    all_records: list[FileRecord] = []
+    # Attempt counter per path (incremented each time the path is opened).
     attempt_counts: dict[str, int] = {}
 
-    # Legacy sequential tracking
-    legacy_records: list[FileRecord] = []
-    legacy_current: Optional[FileRecord] = None
-    last_file_path = ""
+    def _open_record(
+        file_path: str, ts: datetime, task_idx: Optional[int]
+    ) -> FileRecord:
+        attempt_counts[file_path] = attempt_counts.get(file_path, 0) + 1
+        rec = FileRecord(
+            path=file_path,
+            parse_start=ts,
+            attempt=attempt_counts[file_path],
+            task_idx=task_idx,
+        )
+        open_records[file_path] = rec
+        all_records.append(rec)
+        return rec
+
+    def _current(file_path: str) -> Optional[FileRecord]:
+        return open_records.get(file_path)
+
+    # Track the most recently opened file path for non-span lines that lack
+    # explicit path context (phase markers, Diff events).
+    last_file_path: str = ""
 
     for ll in lines:
         body = ll.body
 
-        if ll.task_idx is not None and ll.task_path is not None:
-            # ── Span-keyed line ──────────────────────────────────────────
-            key = (ll.task_idx, ll.task_path)
-            if key not in span_records:
-                attempt_counts[ll.task_path] = attempt_counts.get(ll.task_path, 0) + 1
-                rec = FileRecord(
-                    path=ll.task_path,
-                    attempt=attempt_counts[ll.task_path],
-                    task_idx=ll.task_idx,
-                    parse_start=ll.ts,
-                )
-                span_records[key] = rec
+        # ── File delineator: [parse_one_path]: reading "…" ──────────────
+        pm = _PARSING_FILE_RE.search(body)
+        if pm:
+            file_path = pm.group(1).strip()
+            last_file_path = file_path
+            _open_record(file_path, ll.ts, ll.task_idx)
+            continue
 
-            rec = span_records[key]
+        # ── Legacy delineator: [Compiler] Parsing file X (attempt N/…) ──
+        lm = _PARSING_FILE_LEGACY_RE.search(body)
+        if lm:
+            file_path = lm.group(1).strip()
+            last_file_path = file_path
+            _open_record(file_path, ll.ts, ll.task_idx)
+            continue
+
+        # ── Attribute phase markers and Diff events to the current record ─
+        # Determine which file this line belongs to:
+        #   - span lines (task_idx set): look up by task_idx→file via last_file_path
+        #     (since span path is the directory, not the file, we use last_file_path
+        #     as the best proxy; for sequential runs this is always correct).
+        #   - non-span lines: use last_file_path.
+        # For both cases we look up the open record for that path.
+        rec = _current(last_file_path) if last_file_path else None
+
+        if rec is not None:
+            # Phase markers: record first occurrence only (phase0_start may repeat
+            # across nested parse_content calls within one file; first wins).
             for snippet, phase_key in _PHASE_LABELS.items():
                 if snippet in body:
                     if phase_key not in rec.phases:
@@ -289,51 +350,16 @@ def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
             if "Diff events" in body:
                 dm = _DIFF_RE.search(body)
                 if dm:
+                    # Last Diff events line wins (terminate_stack is the one we want).
                     rec.diff_total = int(dm.group(1))
                     rec.diff_relation_updates = int(dm.group(2))
 
-        else:
-            # ── Legacy / non-span line ───────────────────────────────────
-            pm = _PARSING_FILE_RE.search(body)
-            if pm:
-                file_path = pm.group(1).strip()
-                attempt = int(pm.group(2))
-                last_file_path = file_path
-                attempt_counts[file_path] = attempt
-                legacy_current = FileRecord(
-                    path=file_path,
-                    parse_start=ll.ts,
-                    attempt=attempt,
-                )
-                legacy_records.append(legacy_current)
-                continue
-
-            qm = _QUEUEING_RE.search(body)
-            wm = _WRITE_RE.search(body)
-            if qm:
-                last_file_path = qm.group(1)
-            elif wm:
-                last_file_path = wm.group(1)
-
-            for snippet, phase_key in _PHASE_LABELS.items():
-                if snippet in body:
-                    if phase_key == "phase0_start" and legacy_current is None:
-                        legacy_current = FileRecord(path=last_file_path)
-                        legacy_records.append(legacy_current)
-                    if legacy_current is not None:
-                        legacy_current.phases[phase_key] = ll.ts
-                    break
-
-            if legacy_current is not None and "Diff events" in body:
-                dm = _DIFF_RE.search(body)
-                if dm:
-                    legacy_current.diff_total = int(dm.group(1))
-                    legacy_current.diff_relation_updates = int(dm.group(2))
-
-    all_records = list(span_records.values()) + legacy_records
+        # Update task_idx on the open record if we just learned it from a span line.
+        if ll.task_idx is not None and rec is not None and rec.task_idx is None:
+            rec.task_idx = ll.task_idx
 
     # Sort by phase0_start (records without one go to the end).
-    def _sort_key(r: FileRecord):
+    def _sort_key(r: FileRecord) -> datetime:
         p0 = r.phases.get("phase0_start")
         return p0 if p0 is not None else datetime.max.replace(tzinfo=timezone.utc)
 
@@ -851,8 +877,9 @@ def report_phase_detail(records: list[FileRecord], fragment: str) -> None:
     print(f"{'=' * 70}")
 
     phase_pairs = [
-        ("phase0_start", "phase0_end", "Phase 0 (init stack)  "),
-        ("phase0_end", "phase1", "Phase 0→1 gap         "),
+        # phase0_start → phase1: Phase 0 (initialize_stack).
+        # The old "[initialize_stack]:" end-marker was removed; phase1 start is proxy.
+        ("phase0_start", "phase1", "Phase 0 (init stack)  "),
         ("phase1", "phase2", "Phase 1 (create nodes)"),
         ("phase2", "phase3", "Phase 2 (balance)     "),
         ("phase3", "phase4", "Phase 3 (ext sinks)   "),

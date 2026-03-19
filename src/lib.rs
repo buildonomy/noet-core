@@ -123,11 +123,9 @@
 //! // Watch for file changes
 //! watcher.watch(&PathBuf::from("./docs"), RecursiveMode::Recursive)?;
 //!
-//! // On file modification
+//! // On file modification: reset the file's parse count and reparse
 //! compiler.on_file_modified(modified_path);
-//! if let Some(result) = compiler.parse_next(cache.clone()).await? {
-//!     // Handle reparse result
-//! }
+//! compiler.parse_all(cache.clone(), false).await?;
 //! # Ok(())
 //! # }
 //! ```

@@ -5,7 +5,7 @@
 //! Two axes:
 //!
 //! **Axis 1 — parse driver**
-//! - `sequential`: `parse_sequential`, which drives `parse_next` in a naked loop with no
+//! - `sequential`: `parse_sequential`, which drives parse phases in a naked loop with no
 //!   `BatchStart`/`BatchEnd`/`drain_epoch` machinery.  `BeliefBase` / `DbConnection` are
 //!   passed directly (no accumulator).  Child documents are discovered organically via
 //!   `UnresolvedReference` diagnostics, exactly as before the epoch/accumulator layer was
@@ -16,9 +16,10 @@
 //!   machinery.
 //!
 //! **Axis 2 — global cache type**
-//! - `in_memory`: in-memory `BeliefBase`.  No DB.  Parse 1 writes rewrites to source
-//!   files.  Caller drains events from the channel into `global_bb` via `try_recv()` +
-//!   `process_event()` after `parse_sequential` returns.
+//! - `in_memory`: in-memory `BeliefBase`.  No DB.  Parse 1 passes `rx` into
+//!   `parse_sequential` so events are applied to `global_bb` incrementally.  Parse 2
+//!   uses a `CountingBeliefBase` wrapper so graph-modifying events are counted and any
+//!   non-zero count fails the test.
 //! - `db`: `DbConnection` backed by SQLite.  Parse 1 writes rewrites AND commits events
 //!   to the DB.  Parse 2 is cold-started from the DB (fresh `global_bb` = `DbConnection`).
 //!
@@ -38,24 +39,125 @@
 //! ```
 
 use noet_core::{
-    beliefbase::{BeliefAccumulator, BeliefBase},
+    beliefbase::{BeliefAccumulator, BeliefBase, BeliefGraph, BeliefSink},
     codec::{
         network::{detect_network_file, NETWORK_NAME},
         DocumentCompiler, CODECS,
     },
     db::{db_init, DbConnection, Transaction},
+    error::BuildonomyError,
     event::BeliefEvent,
+    properties::{Bid, WeightSet},
+    query::{BeliefSource, Expression, Query},
 };
 use sqlx::Row;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use test_log::test;
 use tokio::sync::mpsc::unbounded_channel;
 
 use super::common::{extract_bids_from_content, generate_test_root};
+
+// ============================================================================
+// CountingBeliefBase — BeliefSink wrapper that counts graph-modifying events
+// ============================================================================
+//
+// Used as `global_bb` for parse-2 runs in the in-memory tests.  Every call to
+// `apply_batch` increments `graph_event_count` for each event that is not a
+// pure metadata event (`FileParsed`, `BatchStart`, `BatchEnd`), then delegates
+// to the inner `BeliefBase`.  After `parse_sequential` / `parse_all` returns,
+// the test asserts that `graph_event_count() == 0`.
+
+#[derive(Clone)]
+struct CountingBeliefBase {
+    inner: BeliefBase,
+    graph_event_count: Arc<Mutex<usize>>,
+}
+
+impl CountingBeliefBase {
+    fn new(inner: BeliefBase) -> Self {
+        Self {
+            inner,
+            graph_event_count: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn graph_event_count(&self) -> usize {
+        *self.graph_event_count.lock().unwrap()
+    }
+
+    fn states_len(&self) -> usize {
+        self.inner.states().len()
+    }
+}
+
+impl BeliefSink for CountingBeliefBase {
+    async fn apply_batch(&mut self, events: &[BeliefEvent]) -> Result<(), BuildonomyError> {
+        for event in events {
+            match event {
+                BeliefEvent::FileParsed(_)
+                | BeliefEvent::BatchStart
+                | BeliefEvent::BatchEnd
+                | BeliefEvent::BuiltInTest => {}
+                other => {
+                    tracing::warn!("[parse 2] Unexpected graph-modifying event: {:?}", other);
+                    *self.graph_event_count.lock().unwrap() += 1;
+                }
+            }
+        }
+        self.inner.apply_batch(events).await
+    }
+}
+
+impl BeliefSource for CountingBeliefBase {
+    fn eval_unbalanced(
+        &self,
+        expr: &Expression,
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+        self.inner.eval_unbalanced(expr)
+    }
+
+    fn eval_trace(
+        &self,
+        expr: &Expression,
+        weight_filter: WeightSet,
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+        self.inner.eval_trace(expr, weight_filter)
+    }
+
+    fn get_all_paths(
+        &self,
+        network_bid: Bid,
+        include_index: bool,
+    ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send {
+        self.inner.get_all_paths(network_bid, include_index)
+    }
+
+    fn get_file_mtimes(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BTreeMap<PathBuf, i64>, BuildonomyError>> + Send
+    {
+        self.inner.get_file_mtimes()
+    }
+
+    fn export_beliefgraph(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+        self.inner.export_beliefgraph()
+    }
+
+    fn eval_query(
+        &self,
+        query: &Query,
+        all_or_none: bool,
+    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+        self.inner.eval_query(query, all_or_none)
+    }
+}
 
 // ============================================================================
 // Shared helpers
@@ -141,15 +243,9 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     written_bids.insert(compiler.builder().api().bid);
 
     tracing::info!("[Sequential/Memory] Parse 1");
-    let parse_results = compiler.parse_sequential(global_bb.clone(), false).await?;
-
-    // Drain all events emitted during parse 1 into global_bb.
-    // No epoch boundaries exist, so every event is available immediately after
-    // parse_sequential returns.
-    while let Ok(event) = rx.try_recv() {
-        tracing::debug!("{event:?}");
-        global_bb.process_event(&event)?;
-    }
+    let parse_results = compiler
+        .parse_sequential(&mut global_bb, false, Some(&mut rx))
+        .await?;
 
     let mut writes = BTreeMap::<String, usize>::default();
     for result in &parse_results {
@@ -216,17 +312,15 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     let (tx2, mut rx2) = unbounded_channel::<BeliefEvent>();
     let mut compiler2 = DocumentCompiler::new(&test_root, Some(tx2), None, false)?;
 
-    let parse_results2 = compiler2.parse_sequential(global_bb.clone(), false).await?;
+    // Wrap global_bb in a counting sink so any graph-modifying events on parse 2
+    // are caught and counted rather than silently absorbed.
+    let mut counting_bb = CountingBeliefBase::new(global_bb);
 
-    let mut second_event_count = 0usize;
-    while let Ok(event) = rx2.try_recv() {
-        if !matches!(event, BeliefEvent::FileParsed(_)) {
-            tracing::warn!("[Sequential/DB] Unexpected event on parse 2: {:?}", event);
-            second_event_count += 1;
-        }
-        global_bb.process_event(&event)?;
-    }
+    let parse_results2 = compiler2
+        .parse_sequential(&mut counting_bb, false, Some(&mut rx2))
+        .await?;
 
+    let second_event_count = counting_bb.graph_event_count();
     assert_eq!(
         second_event_count, 0,
         "[Sequential/Memory] Parse 2 must not generate graph-modifying events, got {second_event_count}"
@@ -258,7 +352,7 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let post_second_parse_count = global_bb.states().len();
+    let post_second_parse_count = counting_bb.states_len();
     debug_assert!(
         post_second_parse_count <= pre_second_parse_count,
         "[Sequential/Memory] Parse 2 introduced new nodes: \
@@ -293,7 +387,9 @@ async fn test_sequential_db() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
     let mut compiler = DocumentCompiler::new(&test_root, Some(tx), None, true)?;
 
-    let parse_results = compiler.parse_sequential(db.clone(), false).await?;
+    let parse_results = compiler
+        .parse_sequential(&mut db.clone(), false, None)
+        .await?;
     tracing::info!(
         "[Sequential/DB] Parse 1 completed: {} documents",
         parse_results.len()
@@ -339,7 +435,9 @@ async fn test_sequential_db() -> Result<(), Box<dyn std::error::Error>> {
     let (tx2, mut rx2) = unbounded_channel::<BeliefEvent>();
     let mut compiler2 = DocumentCompiler::new(&test_root, Some(tx2), None, false)?;
 
-    let parse_results2 = compiler2.parse_sequential(db.clone(), false).await?;
+    let parse_results2 = compiler2
+        .parse_sequential(&mut db.clone(), false, None)
+        .await?;
 
     for result in &parse_results2 {
         if result.rewritten_content.is_some() {
@@ -364,7 +462,10 @@ async fn test_sequential_db() -> Result<(), Box<dyn std::error::Error>> {
     // No graph-modifying events on parse 2.
     let mut second_event_count = 0usize;
     while let Ok(event) = rx2.try_recv() {
-        if !matches!(event, BeliefEvent::FileParsed(_)) {
+        if !matches!(
+            event,
+            BeliefEvent::FileParsed(_) | BeliefEvent::BatchStart | BeliefEvent::BatchEnd
+        ) {
             tracing::warn!("[Sequential/DB] Unexpected event on parse 2: {:?}", event);
             second_event_count += 1;
         }
@@ -620,7 +721,10 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
     // No graph-modifying events on parse 2.
     let mut second_event_count = 0usize;
     while let Ok(event) = accum_rx2.try_recv() {
-        if !matches!(event, BeliefEvent::FileParsed(_)) {
+        if !matches!(
+            event,
+            BeliefEvent::FileParsed(_) | BeliefEvent::BatchStart | BeliefEvent::BatchEnd
+        ) {
             tracing::warn!("[Parallel/DB] Unexpected event on parse 2: {:?}", event);
             second_event_count += 1;
         }

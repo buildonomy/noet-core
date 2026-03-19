@@ -59,6 +59,7 @@ impl BeliefSink for BeliefBase {
     /// flag set by node inserts; no explicit sync call is needed here.
     async fn apply_batch(&mut self, events: &[BeliefEvent]) -> Result<(), BuildonomyError> {
         for event in events {
+            tracing::debug!("{event:?}");
             // Ignore derivatives — process_event drives PathMapMap internally.
             let _ = self.process_event(event);
         }
@@ -86,6 +87,7 @@ impl BeliefSink for DbConnection {
     async fn apply_batch(&mut self, events: &[BeliefEvent]) -> Result<(), BuildonomyError> {
         let mut tx = Transaction::new();
         for event in events {
+            tracing::debug!("{event:?}");
             tx.add_event(event)?;
         }
         if tx.has_pending() {

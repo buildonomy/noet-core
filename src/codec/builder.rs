@@ -1,5 +1,6 @@
 use petgraph::{visit::EdgeRef, Direction};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 /// Utilities for parsing various document types into BeliefBases
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,14 +27,66 @@ use crate::{
     nodekey::NodeKey,
     paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
     properties::{
-        buildonomy_href_bid, buildonomy_namespace, content_namespaces, href_namespace, BeliefKind,
-        BeliefKindSet, BeliefNode, Bid, Bref, Weight, WeightKind, WEIGHT_DOC_PATHS,
-        WEIGHT_SORT_KEY,
+        asset_namespace, buildonomy_href_bid, buildonomy_namespace, content_namespaces,
+        href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, Bref, Weight, WeightKind,
+        WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
     },
     query::{BeliefSource, Expression, Query},
 };
 
-use super::{belief_ir::IntermediateRelation, UnresolvedReference};
+use super::{belief_ir::IntermediateRelation, BeliefContext, UnresolvedReference};
+
+// ---------------------------------------------------------------------------
+// AssetCodec — zero-size no-op codec for static asset files
+// ---------------------------------------------------------------------------
+
+/// A zero-size no-op [`DocCodec`] used as the codec field inside
+/// [`ParseContentWithCodec`] when `GraphBuilder::process_asset` handles a
+/// binary/static asset file.
+///
+/// All trait methods return safe empty-or-default values so that
+/// `process_one_parse_result` in the compiler can treat asset results
+/// identically to document results without any special-casing.
+pub struct AssetCodec;
+
+impl DocCodec for AssetCodec {
+    fn proto(&self, _path: &Path) -> Result<Option<IRNode>, BuildonomyError> {
+        Ok(None)
+    }
+
+    fn parse(
+        &mut self,
+        _content: &str,
+        _current: IRNode,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<(), BuildonomyError> {
+        Ok(())
+    }
+
+    fn nodes(&self) -> Vec<IRNode> {
+        Vec::new()
+    }
+
+    fn inject_context(
+        &mut self,
+        _node: &IRNode,
+        _ctx: &BeliefContext<'_>,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Option<BeliefNode>, BuildonomyError> {
+        Ok(None)
+    }
+
+    fn finalize(
+        &mut self,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
+        Ok(Vec::new())
+    }
+
+    fn generate_source(&self) -> Option<String> {
+        None
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum NodeSource {
@@ -890,12 +943,12 @@ impl GraphBuilder {
                     self.session_bb
                         .paths()
                         .path(source)
-                        .and_then(|(_home_net, path)| Some(path))
+                        .map(|(_home_net, path)| path)
                         .unwrap_or(source.to_string()),
                     self.session_bb
                         .paths()
                         .path(sink)
-                        .and_then(|(_home_net, path)| Some(path))
+                        .map(|(_home_net, path)| path)
                         .unwrap_or(sink.to_string())
                 );
             }
@@ -1205,6 +1258,7 @@ impl GraphBuilder {
     /// old_unique) set of nodekeys for the node. If either is not empty, then this informs
     /// whether we need to rewrite the parsed content and/or inform documents that reference this
     /// content that they should change their references.
+    #[allow(clippy::too_many_arguments)]
     async fn push<B: BeliefSource + Clone>(
         &mut self,
         proto: &IRNode,
@@ -1878,6 +1932,16 @@ impl GraphBuilder {
         };
 
         // Determine the parent network directory (absolute).
+        //
+        // A file may live inside a plain subdirectory that is NOT itself a network
+        // (no `index.md`), e.g. `network1/net1_dir1/hsml.md` where `net1_dir1/` has
+        // no `index.md`.  In that case a single `pop()` lands on `net1_dir1/`, which
+        // is not in the ProtoIndex and causes a hard cache miss → slow path every time.
+        //
+        // Fix: after stripping the filename (and, for subnet index.md, the subnet dir),
+        // keep popping until we reach a directory that ProtoIndex recognises as a
+        // network (i.e. `proto_index.children_of(dir).is_some()`).  We stop no later
+        // than the repo root, which is always a network.
         let abs_path_str = os_path_to_string(abs_path);
         let abs_ap = AnchorPath::new(&abs_path_str);
         let mut parent_abs = abs_path.to_path_buf();
@@ -1891,9 +1955,18 @@ impl GraphBuilder {
             parent_abs.pop();
         }
 
-        // If we've popped above the repo root, this is the repo root index.md — slow path.
-        if parent_abs.strip_prefix(self.repo_root()).is_err() {
-            return Ok(None);
+        // Walk upward until we land on a known network directory.
+        // The repo root is always in the ProtoIndex, so this loop always terminates.
+        loop {
+            // If we've popped above the repo root, fall through to the slow path.
+            if parent_abs.strip_prefix(self.repo_root()).is_err() {
+                return Ok(None);
+            }
+            if proto_index.children_of(&parent_abs).is_some() {
+                break;
+            }
+            // Not a network dir — go up one more level.
+            parent_abs.pop();
         }
 
         // Build the parent network's NodeKey.
@@ -2192,11 +2265,185 @@ impl GraphBuilder {
         if let Some(state) = found_state {
             Ok(GetOrCreateResult::Resolved(state, source))
         } else {
+            tracing::debug!("[cache_fetch] MISS! keys: {keys:?}");
             Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
                 other_keys: keys.into(),
                 ..Default::default()
             }))
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Asset processing
+    // ---------------------------------------------------------------------------
+
+    /// Process a static asset file (non-codec path) and emit belief events.
+    ///
+    /// Reads raw bytes, computes a SHA-256 content hash, checks `session_bb` for an
+    /// existing entry at the same repo-relative path, and emits `NodeUpdate` /
+    /// `RelationChange` events only when the asset is new or its content has changed.
+    ///
+    /// Returns a [`ParseContentWithCodec`] with an [`AssetCodec`] so that
+    /// `process_one_parse_result` in the compiler can handle the result uniformly
+    /// alongside ordinary document parse results.
+    ///
+    /// # Arguments
+    /// * `path`  — Absolute path to the asset file (already confirmed to exist and
+    ///   not be a directory). Must be under `self.repo_root()`.
+    /// * `bytes` — Raw file bytes, pre-read by the caller.
+    pub async fn process_asset<B: BeliefSource + Clone>(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        global_bb: B,
+    ) -> Result<ParseContentWithCodec, BuildonomyError> {
+        // Compute SHA-256 hash of file content.
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash_str = format!("{:x}", hasher.finalize());
+
+        // Build repo-relative path string used as the PathMap key.
+        let repo_relative_path = path
+            .strip_prefix(&self.repo_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // Look up the asset by its repo-relative path key, consulting session_bb
+        // then global_bb (via cache_fetch) so that assets already committed to the
+        // DB are recognised and not re-emitted as new.
+        let asset_key = NodeKey::Path {
+            net: asset_namespace().bref(),
+            path: repo_relative_path.clone(),
+        };
+        let mut missing_structure = BeliefGraph::default();
+        let cache_result = self
+            .cache_fetch(
+                &[asset_key],
+                global_bb,
+                false, // doc_bb is irrelevant for assets
+                &mut missing_structure,
+            )
+            .await?;
+
+        // Percolate any global_bb hits into session_bb so subsequent calls within
+        // the same session see the cached state.
+        if !missing_structure.is_empty() {
+            self.session_bb.merge(&missing_structure);
+        }
+
+        let (asset_bid, needs_update) = match cache_result {
+            GetOrCreateResult::Resolved(ref node, _) => {
+                let existing_hash = node
+                    .payload
+                    .get("content_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if existing_hash == hash_str {
+                    tracing::debug!(
+                        "[GraphBuilder] Asset unchanged: {} (BID: {})",
+                        repo_relative_path,
+                        node.bid
+                    );
+                    (node.bid, false)
+                } else {
+                    tracing::debug!(
+                        "[GraphBuilder] Asset content changed: {} (BID: {}, old: {}, new: {})",
+                        repo_relative_path,
+                        node.bid,
+                        existing_hash,
+                        hash_str
+                    );
+                    (node.bid, true)
+                }
+            }
+            GetOrCreateResult::Unresolved(_) => {
+                let new_bid = Bid::new(asset_namespace());
+                tracing::debug!(
+                    "[GraphBuilder] New asset discovered: {} (BID: {})",
+                    repo_relative_path,
+                    new_bid
+                );
+                (new_bid, true)
+            }
+        };
+
+        if needs_update {
+            let mut payload = toml::Table::new();
+            payload.insert("content_hash".to_string(), toml::Value::String(hash_str));
+
+            let asset_node = BeliefNode {
+                bid: asset_bid,
+                kind: BeliefKind::External.into(),
+                payload,
+                ..Default::default()
+            };
+
+            let node_keys = vec![NodeKey::Bid { bid: asset_bid }];
+
+            let mut update_queue: Vec<BeliefEvent> = Vec::new();
+
+            // Ensure the asset_namespace network node exists before creating relations.
+            if !self.session_bb.states().contains_key(&asset_namespace()) {
+                let asset_net_node = BeliefNode::asset_network();
+                update_queue.push(BeliefEvent::NodeUpdate(
+                    asset_net_node.keys(Some(buildonomy_namespace()), None, &self.session_bb),
+                    asset_net_node.toml(),
+                    EventOrigin::Remote,
+                ));
+                update_queue.push(BeliefEvent::RelationChange(
+                    asset_namespace(),
+                    buildonomy_namespace(),
+                    WeightKind::Section,
+                    None,
+                    EventOrigin::Remote,
+                ));
+            }
+
+            update_queue.push(BeliefEvent::NodeUpdate(
+                node_keys,
+                asset_node.toml(),
+                EventOrigin::Remote,
+            ));
+
+            let mut edge_payload = toml::Table::new();
+            edge_payload.insert(
+                WEIGHT_DOC_PATHS.to_string(),
+                toml::Value::Array(vec![toml::Value::String(repo_relative_path.clone())]),
+            );
+            update_queue.push(BeliefEvent::RelationChange(
+                asset_bid,
+                asset_namespace(),
+                WeightKind::Section,
+                Some(Weight {
+                    payload: edge_payload,
+                }),
+                EventOrigin::Remote,
+            ));
+
+            // Apply events to session_bb so the local cache reflects asset state
+            // immediately (e.g. so a second call within the same session sees the
+            // existing entry and skips the update).
+            let mut derivatives: Vec<BeliefEvent> = Vec::new();
+            for event in update_queue.iter() {
+                derivatives.append(&mut self.session_bb.process_event(event)?);
+            }
+            update_queue.append(&mut derivatives);
+
+            for event in update_queue {
+                self.tx.send(event)?;
+            }
+
+            // Emit FileParsed for mtime tracking.
+            self.tx.send(BeliefEvent::FileParsed(path.to_path_buf()))?;
+        }
+
+        Ok(ParseContentWithCodec {
+            result: ParseContentResult::empty(),
+            codec: Box::new(AssetCodec),
+            repo_bid: Bid::nil(),
+            repo_node: None,
+        })
     }
 }
 
@@ -2761,7 +3008,8 @@ Test network for unit tests.
     async fn test_anchor_collision_section_keeps_document_order() {
         use crate::beliefbase::BeliefBase;
         use crate::codec::compiler::DocumentCompiler;
-
+        use crate::tests::helpers::init_logging;
+        init_logging();
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Minimal network index
@@ -2807,7 +3055,8 @@ Test network for unit tests.
             !doc_entries.is_empty(),
             "Expected section entries for doc.md; got none. All paths: {paths}"
         );
-
+        // The h1 "# Doc" is now its own section node (#doc) at depth 2 ([0, 0]).
+        // The h2 sections Alpha, Beta, Gamma are children of #doc at depth 3 ([0, 0, N]).
         // Find each section by its anchor suffix.
         let order_for = |anchor: &str| -> Vec<u16> {
             doc_entries
@@ -2817,13 +3066,23 @@ Test network for unit tests.
                 .unwrap_or_default()
         };
 
+        let doc_order = order_for("#doc");
         let alpha_order = order_for("#alpha");
         let gamma_order = order_for("#gamma");
 
-        // Beta has no stable anchor after collision; find it as the remaining entry.
+        assert_eq!(
+            doc_order,
+            vec![0, 0],
+            "h1 #doc must be at depth 2 ([0, 0]); got {doc_order:?}. All paths:\n{paths}"
+        );
+
+        // Beta has no stable anchor after collision; find it as the remaining entry
+        // (not #doc, not #alpha, not #gamma).
         let beta_order = doc_entries
             .iter()
-            .find(|(path, _)| !path.ends_with("#alpha") && !path.ends_with("#gamma"))
+            .find(|(path, _)| {
+                !path.ends_with("#doc") && !path.ends_with("#alpha") && !path.ends_with("#gamma")
+            })
             .map(|(_, order)| order.clone())
             .expect("Expected a beta/collision entry");
 

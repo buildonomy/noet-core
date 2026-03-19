@@ -260,7 +260,7 @@ fn sort_relation_events<'a>(events: &[&'a BeliefEvent]) -> Option<Vec<&'a Belief
             // establishes it (at source_set[sink]) must appear before us (i < local_idx).
             source_set
                 .get(&sink)
-                .map_or(true, |&establishes_at| establishes_at < local_idx)
+                .is_none_or(|&establishes_at| establishes_at < local_idx)
         });
     if already_ordered {
         return None;
@@ -708,7 +708,8 @@ impl PathMapMap {
     pub fn indexed_path(&self, bid: &Bid) -> Option<(Bid, String, Vec<u16>)> {
         self.map
             .values()
-            .find_map(|pm| pm.read_arc().path(bid, self))
+            .filter_map(|pm| pm.read_arc().path(bid, self))
+            .min_by(|a, b| pathmap_order(&a.2, &b.2).then_with(|| a.1.cmp(&b.1)))
     }
 
     pub fn all_local_paths(&self, bid: &Bid) -> Vec<(Bid, Vec<String>)> {
@@ -827,11 +828,11 @@ impl PathMapMap {
                             let new_id = node.id();
                             let new_title = node.title.clone();
                             let id_changed =
-                                self.ids.get(&node.bid).map_or(false, |old| *old != new_id);
+                                self.ids.get(&node.bid).is_some_and(|old| *old != new_id);
                             let title_changed = self
                                 .titles
                                 .get(&node.bid)
-                                .map_or(false, |old| *old != new_title);
+                                .is_some_and(|old| *old != new_title);
                             if id_changed || title_changed {
                                 segment_dirty_bids.push(node.bid);
                             }
@@ -861,44 +862,30 @@ impl PathMapMap {
         // parsed) are already in self.titles because merge_graph_mut now fires NodeUpdate events
         // through the PathMapMap for every newly-added state. No backfill needed here.
         for event in events {
-            match event {
-                BeliefEvent::NodeUpdate(_, toml_str, _) => {
-                    if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
-                        // Rebuild the PathMap for newly registered network nodes. All source nodes
-                        // referenced in relations are already in self.titles (from pass 1 for nodes
-                        // in this batch, from merge_graph_mut's NodeUpdate events for prior batches).
-                        //
-                        // Guard against Trace network nodes only when a PathMap already exists:
-                        // a Trace node is balance scaffolding emitted by to_event_stream to satisfy
-                        // process_relation_update's sink-must-exist requirement. If a PathMap already
-                        // exists for this network (built from a prior complete NodeUpdate), skip the
-                        // rebuild — the existing PathMap is correct and the O(session_bb) DFS would
-                        // only produce a stale result. If no PathMap exists yet, build one even for
-                        // a Trace node so that child RelationUpdate events can find the sink.
-                        let pm_already_exists = self.map.contains_key(&node.bid.bref());
-                        if node.kind.is_network()
-                            && !(node.kind.contains(BeliefKind::Trace) && pm_already_exists)
-                        {
-                            let pm = PathMap::new(
-                                WeightKind::Section,
-                                node.bid,
-                                self,
-                                relations.clone(),
-                            );
-                            self.rebuild_node_to_nets_for(&node.bid.bref(), &pm);
-                            dirty_nets.insert(node.bid.bref());
-                            self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
-                        }
+            if let BeliefEvent::NodeUpdate(_, toml_str, _) = event {
+                if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
+                    // Rebuild the PathMap for newly registered network nodes. All source nodes
+                    // referenced in relations are already in self.titles (from pass 1 for nodes
+                    // in this batch, from merge_graph_mut's NodeUpdate events for prior batches).
+                    //
+                    // Guard against Trace network nodes only when a PathMap already exists:
+                    // a Trace node is balance scaffolding emitted by to_event_stream to satisfy
+                    // process_relation_update's sink-must-exist requirement. If a PathMap already
+                    // exists for this network (built from a prior complete NodeUpdate), skip the
+                    // rebuild — the existing PathMap is correct and the O(session_bb) DFS would
+                    // only produce a stale result. If no PathMap exists yet, build one even for
+                    // a Trace node so that child RelationUpdate events can find the sink.
+                    let pm_already_exists = self.map.contains_key(&node.bid.bref());
+                    if node.kind.is_network()
+                        && !(node.kind.contains(BeliefKind::Trace) && pm_already_exists)
+                    {
+                        let pm =
+                            PathMap::new(WeightKind::Section, node.bid, self, relations.clone());
+                        self.rebuild_node_to_nets_for(&node.bid.bref(), &pm);
+                        dirty_nets.insert(node.bid.bref());
+                        self.map.insert(node.bid.bref(), Arc::new(RwLock::new(pm)));
                     }
                 }
-                // For non-network nodes whose id or title changed, regenerate the path
-                // segment in each PathMap that contains the node. `self.ids`/`self.titles`
-                // were already updated in pass 1, so `update_path_segment` reads the new
-                // values when it calls `generate_path_name`.
-                // This is handled once here rather than per-event so we do a single
-                // targeted update per dirty BID regardless of how many NodeUpdate events
-                // arrived for it in this batch.
-                _ => {}
             }
         }
 
@@ -1459,7 +1446,7 @@ impl PathMap {
         map.sort_by(|a, b| {
             let order_cmp = pathmap_order(&a.2, &b.2);
             match &order_cmp {
-                Ordering::Equal => a.1.cmp(&b.1),
+                Ordering::Equal => a.0.cmp(&b.0),
                 _ => order_cmp,
             }
         });
@@ -1511,7 +1498,7 @@ impl PathMap {
         self.map.sort_by(|a, b| {
             let order_cmp = pathmap_order(&a.2, &b.2);
             match &order_cmp {
-                Ordering::Equal => a.1.cmp(&b.1),
+                Ordering::Equal => a.0.cmp(&b.0),
                 _ => order_cmp,
             }
         });

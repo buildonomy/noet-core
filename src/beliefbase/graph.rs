@@ -892,14 +892,14 @@ impl BeliefGraph {
     ///
     /// Sibling ordering within the event stream is not required to be correct —
     /// `process_event_queue` sorts all PathMaps at end of pass 2.
-    /// Build the ordered list of [`MergeOp`]s needed to merge `self` (rhs) into `lhs`.
+    /// Build the ordered list of `MergeOp`s needed to merge `self` (rhs) into `lhs`.
     ///
     /// The returned ops are suitable for direct application by
-    /// [`super::BeliefBase::merge_graph_mut`]:
+    /// `super::BeliefBase::merge_graph_mut`:
     ///
-    /// * [`MergeOp::NodeUpsert`] — node already filtered by lhs-wins / Trace-downgrade;
+    /// * `MergeOp::NodeUpsert` — node already filtered by lhs-wins / Trace-downgrade;
     ///   apply with `self.states.insert` directly, no TOML round-trip.
-    /// * [`MergeOp::RelationUpdate`] — apply via `update_relation` after all node ops
+    /// * `MergeOp::RelationUpdate` — apply via `update_relation` after all node ops
     ///   and a single `index_dirty` flush.
     ///
     /// Replaces the old `to_event_stream → Vec<BeliefEvent>` signature.  The

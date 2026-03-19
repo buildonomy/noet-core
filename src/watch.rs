@@ -623,47 +623,50 @@ impl WatchService {
                                         return;
                                     }
 
-                                    // Filter paths to only include files with registered codec extensions
-                                    // Note: Assets are discovered and tracked during document parsing
-                                    let sync_paths: Vec<&PathBuf> = event
+                                    // Collect paths that are relevant to the compiler,
+                                    // skipping directories and compiler-written files.
+                                    let is_remove =
+                                        matches!(event.event.kind, EventKind::Remove(_));
+                                    let relevant_paths: Vec<&PathBuf> = event
                                         .paths
                                         .iter()
                                         .filter(|&p| {
-                                            // Only watch files, not directories
-                                            if !p.is_file() {
+                                            // Deletions: any path the compiler tracks is relevant.
+                                            // Modifications/creates: only files (not directories).
+                                            if !is_remove && !p.is_file() {
                                                 return false;
                                             }
 
                                             // Fine-grained per-file guard: skip paths the
                                             // compiler has written in this idle window.
-                                            // Normalize path to handle ./ and other variations.
-                                            {
-                                                let normalized = match p.canonicalize() {
-                                                    Ok(canonical) => {
-                                                        tracing::trace!("[Debouncer] Normalized {:?} -> {:?}", p, canonical);
-                                                        canonical
-                                                    },
-                                                    Err(_) => {
-                                                        tracing::trace!("[Debouncer] Failed to normalize {:?}, using as-is", p);
-                                                        p.clone() // File might not exist yet, use as-is
-                                                    }
-                                                };
-                                                let ignored = ignored_write_paths.lock().unwrap();
-                                                if ignored.contains(&normalized) {
-                                                    tracing::debug!("[Debouncer] Ignoring write to {:?} (normalized: {:?}, compiler wrote this file)", p, normalized);
-                                                    return false;
+                                            let normalized = match p.canonicalize() {
+                                                Ok(canonical) => {
+                                                    tracing::trace!("[Debouncer] Normalized {:?} -> {:?}", p, canonical);
+                                                    canonical
                                                 }
+                                                Err(_) => {
+                                                    tracing::trace!("[Debouncer] Failed to normalize {:?}, using as-is", p);
+                                                    p.clone()
+                                                }
+                                            };
+                                            let ignored = ignored_write_paths.lock().unwrap();
+                                            if ignored.contains(&normalized) {
+                                                tracing::debug!("[Debouncer] Ignoring write to {:?} (normalized: {:?}, compiler wrote this file)", p, normalized);
+                                                return false;
                                             }
 
-                                            debouncer_codec.path_get(p).is_some()
+                                            // For modifications/creates, only codec files and
+                                            // assets trigger a re-parse. Deletions of any
+                                            // tracked file should be forwarded.
+                                            is_remove || debouncer_codec.path_get(p).is_some()
                                         })
                                         .collect();
 
-                                    if !sync_paths.is_empty() {
-                                        // Enqueue changed files for re-parsing
+                                    if !relevant_paths.is_empty() {
                                         tracing::info!(
-                                            "[Debouncer] {} files to enqueue",
-                                            sync_paths.len()
+                                            "[Debouncer] {} files to process (is_remove={})",
+                                            relevant_paths.len(),
+                                            is_remove
                                         );
                                         while compiler_ref.is_locked() {
                                             tracing::debug!(
@@ -673,16 +676,22 @@ impl WatchService {
                                         }
                                         tracing::info!("[Debouncer] Acquired write lock");
                                         let mut compiler = compiler_ref.write();
-                                        for path in sync_paths {
-                                            tracing::info!(
-                                                "[Debouncer] File changed, enqueuing for re-parse: {:?}",
-                                                path
-                                            );
-                                            // Reset processed count to allow re-parsing
-                                            compiler.reset_processed(path);
-                                            compiler.enqueue(path);
+                                        for path in relevant_paths {
+                                            if is_remove {
+                                                tracing::info!(
+                                                    "[Debouncer] File deleted: {:?}",
+                                                    path
+                                                );
+                                                compiler.on_file_deleted(path);
+                                            } else {
+                                                tracing::info!(
+                                                    "[Debouncer] File modified, enqueuing for re-parse: {:?}",
+                                                    path
+                                                );
+                                                compiler.on_file_modified(path);
+                                            }
                                         }
-                                        tracing::info!("[Debouncer] Finished enqueuing, compiler.has_pending()={}", compiler.has_pending());
+                                        tracing::info!("[Debouncer] Finished processing, compiler.has_pending()={}", compiler.has_pending());
 
                                         // Notify compiler thread that work is available.
                                         work_notifier.notify_one();
@@ -856,8 +865,7 @@ impl FileUpdateSyncer {
                                 stale_files.len()
                             );
                             for stale_file in stale_files {
-                                compiler_write.reset_processed(&stale_file);
-                                compiler_write.enqueue(&stale_file);
+                                compiler_write.on_file_modified(&stale_file);
                             }
                         }
                     }
@@ -877,33 +885,22 @@ impl FileUpdateSyncer {
                     "[DocumentCompiler] Notification received, processing all pending work"
                 );
 
-                // Process all pending work in a loop (like parse_all does)
-                loop {
-                    // Log queue state before parsing
-                    {
-                        let compiler_write = compiler_ref.write_arc();
-                        tracing::info!(
-                            "[DocumentCompiler] Loop iteration - remainder_queue: {}, total_parsed: {}",
-                            compiler_write.remainder_queue_len(),
-                            compiler_write.stats().total_parses
-                        );
-                    }
+                // Drive the queue to completion with parse_all.
+                let parse_results = {
+                    let mut compiler_write = compiler_ref.write_arc();
+                    tracing::info!(
+                        "[DocumentCompiler] Starting parse_all - remainder_queue: {}, total_parsed: {}",
+                        compiler_write.remainder_queue_len(),
+                        compiler_write.stats().total_parses
+                    );
+                    compiler_write.parse_all(compiler_global_bb.clone(), false).await
+                };
 
-                    // Parse next document
-                    let parse_result = {
-                        while compiler_ref.is_locked() {
-                            tracing::debug!(
-                                "[DocumentCompiler] Waiting for write access to compiler"
-                            );
-                            sleep(Duration::from_millis(100)).await;
-                        }
-                        tracing::info!("[DocumentCompiler] Calling parse_next");
-                        let mut compiler_write = compiler_ref.write_arc();
-                        compiler_write.parse_next(compiler_global_bb.clone()).await
-                    };
-
-                    match parse_result {
-                        Ok(Some(result)) => {
+                match parse_results {
+                    Ok(results) => {
+                        // Update the debounce-ignore set for every path that was written,
+                        // and log dependency discoveries.
+                        for result in &results {
                             tracing::debug!(
                                 "[belief-compiler] Successfully parsed: {:?}",
                                 result.path
@@ -911,28 +908,33 @@ impl FileUpdateSyncer {
 
                             // Add this path to the ignore set so the debouncer does not
                             // re-enqueue it when the file watcher fires for a compiler write.
-                            // Normalize to a canonical path for consistent keying.
-                            // For BeliefNetwork directories, resolve to the actual file path.
-                            {
-                                let mut path_to_ignore = result.path.clone();
-
-                                if path_to_ignore.is_dir() {
-                                    if let Some(network_file_path) = detect_network_file(&path_to_ignore) {
-                                        tracing::trace!("[DocumentCompiler] Resolved BeliefNetwork directory {:?} -> file {:?}", path_to_ignore, network_file_path);
-                                        path_to_ignore = network_file_path;
-                                    }
+                            let mut path_to_ignore = result.path.clone();
+                            if path_to_ignore.is_dir() {
+                                if let Some(network_file_path) = detect_network_file(&path_to_ignore) {
+                                    tracing::trace!(
+                                        "[DocumentCompiler] Resolved BeliefNetwork directory {:?} -> file {:?}",
+                                        path_to_ignore, network_file_path
+                                    );
+                                    path_to_ignore = network_file_path;
                                 }
-
-                                let normalized_path = match path_to_ignore.canonicalize() {
-                                    Ok(canonical) => {
-                                        tracing::trace!("[DocumentCompiler] Normalized {:?} -> {:?}", path_to_ignore, canonical);
-                                        canonical
-                                    },
-                                    Err(_) => {
-                                        tracing::trace!("[DocumentCompiler] Failed to normalize {:?}, using as-is", path_to_ignore);
-                                        path_to_ignore.clone()
-                                    }
-                                };
+                            }
+                            let normalized_path = match path_to_ignore.canonicalize() {
+                                Ok(canonical) => {
+                                    tracing::trace!(
+                                        "[DocumentCompiler] Normalized {:?} -> {:?}",
+                                        path_to_ignore, canonical
+                                    );
+                                    canonical
+                                }
+                                Err(_) => {
+                                    tracing::trace!(
+                                        "[DocumentCompiler] Failed to normalize {:?}, using as-is",
+                                        path_to_ignore
+                                    );
+                                    path_to_ignore.clone()
+                                }
+                            };
+                            {
                                 let mut ignored = compiler_ignored_paths.lock().unwrap();
                                 ignored.insert(normalized_path.clone());
                                 tracing::debug!(
@@ -941,10 +943,6 @@ impl FileUpdateSyncer {
                                 );
                             }
 
-                            // Note: DocumentCompiler handles writing when created with write=true
-                            // We don't write here to avoid duplicate writes
-
-                            // Note: dependent_paths are already enqueued by parse_next()
                             if !result.dependent_paths.is_empty() {
                                 tracing::info!(
                                     "[DocumentCompiler] Discovered {} dependent paths from {:?}: {:?}",
@@ -952,89 +950,60 @@ impl FileUpdateSyncer {
                                     result.path,
                                     result.dependent_paths.iter().map(|(p, _)| p).collect::<Vec<_>>()
                                 );
-                            } else {
-                                tracing::info!(
-                                    "[DocumentCompiler] No dependent paths discovered from {:?}",
-                                    result.path
-                                );
                             }
-                            // Continue to next file in queue
                         }
-                        Ok(None) => {
-                            let stats = {
-                                let compiler_read = compiler_ref.read_arc();
-                                match compiler_read
-                                    .finalize_html(compiler_global_bb.clone())
-                                    .await {
-                                        Ok(diagnostics) => {
-                                            // Surface export-phase warnings (e.g. oversized
-                                            // networks) through tracing so they appear in
-                                            // the watch server's log output.
-                                            for d in &diagnostics {
-                                                match d {
-                                                    crate::codec::ParseDiagnostic::Warning { message, .. } => {
-                                                        tracing::warn!(
-                                                            "[finalize_html] {}", message
-                                                        );
-                                                    }
-                                                    crate::codec::ParseDiagnostic::Info { message, .. } => {
-                                                        tracing::info!(
-                                                            "[finalize_html] {}", message
-                                                        );
-                                                    }
-                                                    _ => {}
-                                                }
+
+                        let stats = {
+                            let compiler_read = compiler_ref.read_arc();
+                            match compiler_read.finalize_html(compiler_global_bb.clone()).await {
+                                Ok(diagnostics) => {
+                                    for d in &diagnostics {
+                                        match d {
+                                            crate::codec::ParseDiagnostic::Warning { message, .. } => {
+                                                tracing::warn!("[finalize_html] {}", message);
                                             }
-                                            compiler_read.stats()
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                "[DocumentCompiler] Finalize html failed with \
-                                                 error: {:?}",
-                                                err
-                                            );
-                                            CompilerStats::default()
+                                            crate::codec::ParseDiagnostic::Info { message, .. } => {
+                                                tracing::info!("[finalize_html] {}", message);
+                                            }
+                                            _ => {}
                                         }
                                     }
-                            };
-                            tracing::info!(
-                                "[DocumentCompiler] parse_next returned None - Queue is empty. Final stats: remainder={}, total_parses={}",
-                                stats.remainder_queue_len,
-                                stats.total_parses
-                            );
-
-                            // Queues are drained: flush ignored_write_paths and signal idle.
-                            // The debouncer holds off while compiler_idle is false, so all
-                            // compiler-written paths are safe to forget at this point —
-                            // tokio::fs::write has already returned for every parsed file.
-                            {
-                                let mut ignored = compiler_ignored_paths.lock().unwrap();
-                                let count = ignored.len();
-                                ignored.clear();
-                                if count > 0 {
-                                    tracing::debug!(
-                                        "[DocumentCompiler] Flushed {} ignored write paths on idle",
-                                        count
+                                    compiler_read.stats()
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "[DocumentCompiler] Finalize html failed with error: {:?}",
+                                        err
                                     );
+                                    CompilerStats::default()
                                 }
                             }
-                            compiler_idle_flag.store(true, Ordering::SeqCst);
-                            // Notify the transaction task that the compiler has gone idle.
-                            // The transaction task will drain any remaining channel events,
-                            // commit them, and then signal wait_for_idle. The compiler does
-                            // not inspect the transaction channel directly.
-                            compiler_idle_notify_flag.notify_one();
-
-                            // Break inner loop to wait for next notification
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!("[belief-compiler] Parse error: {}", e);
-                            // Continue processing other files despite error
-                            sleep(Duration::from_millis(500)).await;
-                        }
+                        };
+                        tracing::info!(
+                            "[DocumentCompiler] parse_all complete. Final stats: remainder={}, total_parses={}",
+                            stats.remainder_queue_len,
+                            stats.total_parses
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[belief-compiler] parse_all error: {}", e);
                     }
                 }
+
+                // Queues are drained: flush ignored_write_paths and signal idle.
+                {
+                    let mut ignored = compiler_ignored_paths.lock().unwrap();
+                    let count = ignored.len();
+                    ignored.clear();
+                    if count > 0 {
+                        tracing::debug!(
+                            "[DocumentCompiler] Flushed {} ignored write paths on idle",
+                            count
+                        );
+                    }
+                }
+                compiler_idle_flag.store(true, Ordering::SeqCst);
+                compiler_idle_notify_flag.notify_one();
             }
         });
 

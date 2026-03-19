@@ -344,7 +344,7 @@ fn prepare_batch(events: &mut Vec<BeliefEvent>) {
 
 /// Unified batch accumulator and query cache for the compile pipeline.
 ///
-/// See the [module documentation](self) for full design rationale.
+/// See the module documentation for full design rationale.
 ///
 /// # Type parameter
 ///
@@ -766,21 +766,19 @@ mod tests {
             async move { Ok(result) }
         }
 
-        fn eval_unbalanced(
+        async fn eval_unbalanced(
             &self,
             _expr: &Expression,
-        ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send
-        {
-            async { Ok(BeliefGraph::default()) }
+        ) -> Result<BeliefGraph, BuildonomyError> {
+            Ok(BeliefGraph::default())
         }
 
-        fn eval_trace(
+        async fn eval_trace(
             &self,
             _expr: &Expression,
             _weight_filter: WeightSet,
-        ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send
-        {
-            async { Ok(BeliefGraph::default()) }
+        ) -> Result<BeliefGraph, BuildonomyError> {
+            Ok(BeliefGraph::default())
         }
     }
 

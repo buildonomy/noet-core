@@ -106,7 +106,51 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
             .unwrap_or(false)
     }
 
-    let mut subnets = Vec::default();
+    // ── Pass 1: discover all subnet directories ───────────────────────────────
+    //
+    // WalkDir does not guarantee that `index.md` is yielded before sibling files
+    // within the same directory — the order depends on the underlying `readdir(2)`
+    // call, which is filesystem- and OS-dependent.  A single-pass approach that
+    // populates `subnets` lazily as `index.md` files are encountered therefore
+    // misclassifies sibling files that are yielded *before* their directory's
+    // `index.md`: the `subnets.iter().any(|s| p.starts_with(s))` guard fires
+    // false, so those files are included in the root group instead of being
+    // excluded (and later assigned to their correct subnet group).
+    //
+    // Pre-scanning for all subnet dirs in one pass makes Pass 2 order-independent.
+    let subnet_dirs: std::collections::BTreeSet<PathBuf> = WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e) || e.path() == path)
+        .filter_map(|e| e.ok().map(|e| e.into_path()))
+        .filter_map(|mut p| {
+            if p.is_file() {
+                let p_str = os_path_to_string(&p);
+                let p_ap = AnchorPath::new(&p_str);
+                if NETWORK_NAME == p_ap.filename() {
+                    p.pop(); // file → its containing directory
+                    if !p.eq(path) {
+                        return Some(p); // subnet dir
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // ── Pass 2: collect and assign files to their owning subnet ──────────────
+    //
+    // Now that `subnet_dirs` is complete, classify every file correctly regardless
+    // of the order WalkDir yields entries within a directory.
+    //
+    // Files yielded by Pass 2 filter_map:
+    //   • subnet `index.md`  → represented as the subnet directory path (is_dir());
+    //     `group_of` routes it to its parent subnet (or root)
+    //   • codec files owned by any subnet OR root → all included; `group_of` routes
+    //     each file to its deepest owning subnet key in the by_group loop below.
+    //     No per-file filtering is needed here because `group_of` uses the complete
+    //     `subnet_dirs` set from Pass 1 and is therefore order-independent.
+    //   • root `index.md` → excluded entirely
+    //   • non-codec files → excluded entirely
     let files = WalkDir::new(path)
         .into_iter()
         .filter_entry(|e| !is_hidden(e) || e.path() == path)
@@ -119,8 +163,7 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
                     // Subnet index.md — represent the subnet as its directory path.
                     p.pop();
                     if !p.eq(path) {
-                        subnets.push(p.clone());
-                        return Some(p);
+                        return Some(p); // subnet dir entry (is_dir() in by_group loop)
                     } else {
                         return None; // root's own index.md — exclude
                     }
@@ -129,11 +172,7 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
                 // (Gemfile, Makefile, …) from matching the (None, None) codec wildcard.
                 let p_ap_file = AnchorPath::new_file(&p_str);
                 if CODECS.get(&p_ap_file).is_some() {
-                    if subnets.iter().any(|s| p.starts_with(s)) {
-                        None // owned by a nested subnet — exclude
-                    } else {
-                        Some(p)
-                    }
+                    Some(p)
                 } else {
                     None
                 }
@@ -149,30 +188,36 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
     // non-subnet subdirectories belong to the nearest subnet-ancestor's group.
     //
     // Algorithm:
-    //   1. Collect subnet dir paths (all is_dir() entries in `files`).
+    //   1. `subnet_dirs` is the complete set of subnet dir paths from Pass 1.
     //   2. For each entry compute its "owning group": deepest subnet-dir ancestor,
     //      or `path` (the call root) if none.
     //   3. Sort each group lexicographically — subnets and files interleave alphabetically.
     //   4. emit_group recurses into each subnet at its natural sorted position.
-    let subnet_dirs: std::collections::BTreeSet<PathBuf> =
-        files.iter().filter(|p| p.is_dir()).cloned().collect();
-
-    let owning_group = |p: &PathBuf| -> PathBuf {
-        let mut ancestor = p.as_path();
-        while let Some(parent) = ancestor.parent() {
-            if subnet_dirs.contains(parent) {
-                return parent.to_path_buf();
-            }
-            ancestor = parent;
-        }
-        path.to_path_buf()
+    let group_of = |p: &PathBuf| -> PathBuf {
+        // For a regular file: deepest subnet ancestor, or root.
+        // For a subnet dir: deepest subnet ancestor that is a *strict* prefix of p
+        // (i.e. the parent subnet), or root.  Using `starts_with` alone would match
+        // the dir against itself; we exclude self-matches by requiring strict prefix.
+        subnet_dirs
+            .iter()
+            .filter(|s| {
+                // strict prefix: s must be an ancestor of p, not p itself
+                p.starts_with(s.as_path()) && *s != p
+            })
+            .max_by_key(|s| s.components().count())
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
     };
 
     let mut by_group: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     // Ensure the root key is always present, even for a network with no children.
     by_group.entry(path.to_path_buf()).or_default();
+    // Ensure every subnet has its own key, even if it has no files.
+    for subnet in &subnet_dirs {
+        by_group.entry(subnet.clone()).or_default();
+    }
     for p in files {
-        by_group.entry(owning_group(&p)).or_default().push(p);
+        by_group.entry(group_of(&p)).or_default().push(p);
     }
 
     // Sort each group lexicographically — subnets and files interleave alphabetically.
@@ -324,14 +369,34 @@ impl ProtoIndex {
     /// Returns all known network directories, sorted shallowest-first (by component count,
     /// then lexicographically).
     ///
-    /// This is the same order as [`discover_network_dirs`](Self::discover_network_dirs) but
+    /// This is the same order as `discover_network_dirs` but
     /// reads from the already-built index rather than performing a new filesystem scan.
     ///
     /// Use this in `parse_all` to iterate epoch-0 batches in the correct network order
     /// without redundant `WalkDir` calls.
+    /// Returns all known network directories sorted **shallowest-first**: primary
+    /// key is component count (ascending), secondary key is lexicographic order
+    /// within the same depth.
+    ///
+    /// This ordering guarantee is **load-bearing**: callers that group consecutive
+    /// entries by component count (e.g. `parse_sequential` and `parse_all` phase 1)
+    /// rely on all dirs at depth D being contiguous in the returned slice.  If the
+    /// sort order ever changes, those grouping loops must be updated accordingly.
     pub fn network_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self.inner.read().keys().cloned().collect();
-        dirs.sort_by(|a, b| a.components().cmp(b.components()));
+        dirs.sort_by(|a, b| {
+            a.components()
+                .count()
+                .cmp(&b.components().count())
+                .then_with(|| a.components().cmp(b.components()))
+        });
+        // Verify the load-bearing invariant: component counts must be non-decreasing
+        // so that depth-grouping by consecutive runs is correct.
+        debug_assert!(
+            dirs.windows(2)
+                .all(|w| w[0].components().count() <= w[1].components().count()),
+            "network_dirs: sort invariant violated — component counts not non-decreasing"
+        );
         dirs
     }
 
@@ -358,6 +423,19 @@ impl ProtoIndex {
     ///
     /// The flat list returned here is used by `parse_sequential` for its initial pass.
     /// `parse_all` uses `network_dirs()` + `children_of()` directly for epoch batching.
+    /// Returns a map from each known path to its global DFS position in `ordered_paths()`.
+    ///
+    /// Use this as a tiebreaker when sorting the remainder queue within a single `processed`
+    /// count bucket, so that reparse order is deterministic regardless of the order paths
+    /// were enqueued by `process_unresolved_reference`.
+    pub fn ordered_path_index(&self) -> std::collections::HashMap<PathBuf, usize> {
+        self.ordered_paths()
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, i))
+            .collect()
+    }
+
     pub fn ordered_paths(&self) -> Vec<PathBuf> {
         // DFS from the repo root (first network_dir, shallowest).
         // network_dirs() returns all network dirs shallowest-first.
