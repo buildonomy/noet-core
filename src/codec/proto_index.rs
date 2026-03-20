@@ -81,7 +81,11 @@ pub struct ProtoIndex {
 ///
 /// This is the single authoritative implementation.  `network::net_dir_children` delegates here.
 pub(crate) fn net_dir_children<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
-    let call_root = path.as_ref().to_path_buf();
+    // Normalize through the round-trip so that on Windows a \\?\-prefixed path
+    // (from canonicalize()) is reduced to the plain C:\... form that WalkDir yields.
+    // Without this, the equality checks inside net_dir_partition fire false because
+    // the root passed in is \\?\C:\... while WalkDir entries are C:\....
+    let call_root = string_to_os_path(&os_path_to_string(path.as_ref()));
     let by_group = net_dir_partition(&call_root);
     let mut result = Vec::with_capacity(by_group.values().map(|v| v.len()).sum());
     emit_group(&call_root, &by_group, &mut result);
@@ -98,6 +102,14 @@ pub(crate) fn net_dir_children<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
 /// This allows `ProtoIndex::build` to build the complete index in O(files) rather than
 /// O(files × depth) by avoiding one `WalkDir` call per network directory.
 pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    // Normalize through the round-trip so that on Windows a \\?\-prefixed path
+    // (from canonicalize()) is reduced to the plain C:\... form that WalkDir yields.
+    // All equality and prefix comparisons below use `path` as the reference; if it
+    // carries the \\?\ extended-length prefix but WalkDir entries do not, every
+    // `p.eq(path)` / `e.path() == path` check silently misfires.
+    let path_buf = string_to_os_path(&os_path_to_string(path));
+    let path = path_buf.as_path();
+
     fn is_hidden(entry: &DirEntry) -> bool {
         entry
             .file_name()
@@ -281,7 +293,13 @@ impl ProtoIndex {
         //
         // All map keys and child paths are canonicalized so that lookup keys derived from
         // canonicalized paths (e.g. from Path::canonicalize() in the caller) always match.
-        let partition = net_dir_partition(repo_root);
+        // Normalize repo_root before passing to net_dir_partition so that on Windows a
+        // \\?\-prefixed canonical path is reduced to the plain C:\... form that WalkDir
+        // yields.  net_dir_partition also normalizes internally, but doing it here keeps
+        // the partition keys consistent with the canonicalized+round-tripped values we
+        // store in the map below.
+        let repo_root_buf = string_to_os_path(&os_path_to_string(repo_root));
+        let partition = net_dir_partition(&repo_root_buf);
         let map: HashMap<PathBuf, Vec<PathBuf>> = partition
             .into_iter()
             .map(|(net_dir, children)| {
