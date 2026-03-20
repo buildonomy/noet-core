@@ -540,9 +540,16 @@ impl ProtoIndex {
         let Some(network_filepath) = detect_network_file(dir) else {
             return Ok(None);
         };
-        let network_dir = network_filepath
+        let network_dir_raw = network_filepath
             .parent()
             .expect("detect_network_file returns a path.is_file() path; parent() must succeed");
+        // Normalize through os_path_to_string/string_to_os_path so that on Windows the
+        // \\?\ extended-length prefix is stripped, matching the form used by build() when
+        // it stores child paths in the inner map.  Without this, strip_prefix inside
+        // prepare_proto_relations fails because network_dir is still \\?\C:\... while
+        // children are stored as C:/... after the round-trip.
+        let network_dir_buf = string_to_os_path(&os_path_to_string(network_dir_raw));
+        let network_dir = network_dir_buf.as_path();
 
         // Read frontmatter via the registered codec for this file — honours any custom
         // network codec swapped in via CODECS rather than hardcoding MdCodec.
@@ -838,9 +845,14 @@ mod tests {
 
         // The position must match where net_dir_children places nested.md in the root list.
         let root_children = idx.children_of(&root).unwrap();
-        let expected_idx = root_children
-            .iter()
-            .position(|p| p == &nested.canonicalize().unwrap_or_else(|_| nested.clone()));
+        // Normalize nested's canonical form the same way build() normalizes child paths
+        // (os_path_to_string + string_to_os_path strips the \\?\ prefix on Windows),
+        // so the comparison against root_children entries is apples-to-apples.
+        let nested_canonical = {
+            let c = nested.canonicalize().unwrap_or_else(|_| nested.clone());
+            string_to_os_path(&os_path_to_string(&c))
+        };
+        let expected_idx = root_children.iter().position(|p| p == &nested_canonical);
         assert_eq!(
             sk,
             expected_idx.map(|i| i as u16),
