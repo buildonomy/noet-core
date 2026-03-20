@@ -379,7 +379,7 @@ implementation details, and the MyST directive pipeline, see:
 - `DocCodec` trait: Pluggable parsers for different formats
 - `DocumentCompiler`: Queue-based multi-pass compilation orchestrator
 - `GraphBuilder`: Stateful builder for constructing BeliefBases
-- Built-in codecs: `MdCodec` (Markdown), `TomlCodec` (TOML)
+- Built-in codecs: `MdCodec` (Markdown), `TomlCodec` (TOML), `myst.rs` (MyST directive registry)
 
 **[`properties`](../src/properties.rs)**: Node and edge types
 - `BeliefNode`: Node structure with BID, schema, payload

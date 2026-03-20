@@ -1107,13 +1107,38 @@ drivers:
 
 | Method | Description |
 |--------|-------------|
-| `parse_sequential` | Single-threaded. Iterates `ProtoIndex::ordered_paths()` directly, then drains `remainder_queue`. No epoch/batch machinery. Used as the baseline for sequential tests. |
-| `parse_all` | Parallel. Drives epoch batches via `BeliefAccumulator`; epoch-0 uses network-first ProtoIndex ordering; subsequent epochs drain `remainder_queue`. |
+| `parse_sequential` | Single-threaded. Three-phase: (1) network dirs depth-grouped shallowest-first, (2) all leaf documents, (3) remainder loop for assets and re-parses. Uses `BeliefSink::apply_batch` to drain the event channel between files. No epoch/batch machinery. |
+| `parse_all` | Parallel. Drives epoch batches via `BeliefAccumulator`; epoch-0 uses depth-grouped network dirs then a single leaf batch; remainder loop handles assets and re-parses. Each batch is bounded by `BatchStart`/`BatchEnd`/`drain_epoch`. |
 
 **State:**
 
 ```rust
 pub struct DocumentCompiler {
+    /// Whether to write rewritten content back to disk.
+    write: bool,
+
+    /// Maximum number of parallel parse tasks. 1 = sequential path.
+    jobs: usize,
+
+    /// Optional HTML output directory. `None` means source-only mode.
+    html_output_dir: Option<PathBuf>,
+
+    /// Injected `<script>` tag for the HTML template.
+    html_script: Option<String>,
+
+    /// Whether to use CDN-hosted assets instead of local copies.
+    use_cdn: bool,
+
+    /// Optional base URL prefix for generated HTML links.
+    base_url: Option<String>,
+
+    /// The GraphBuilder that owns the session belief state and the event tx channel.
+    builder: GraphBuilder,
+
+    /// Pre-built filesystem index: network dirs → ordered child lists.
+    /// Built once at startup via a single O(files) WalkDir pass.
+    proto_index: ProtoIndex,
+
     /// Ordered work queue for remainder (reparse) passes.
     /// Entries are sorted by `processed[path]` ascending: assets (count=0)
     /// sort before doc rereparses (count=1+), which sort before repeated rereparses.
@@ -1127,44 +1152,74 @@ pub struct DocumentCompiler {
     /// ReparseLimitExceeded and dropping the path.
     max_reparse_count: usize,
 
-    /// Pre-built filesystem index: network dirs → ordered child lists.
-    /// Built once at startup via a single O(files) WalkDir pass.
-    proto_index: ProtoIndex,
+    /// Latest ParseResult per path — final output after the last parse of each file.
+    latest_results: HashMap<PathBuf, ParseResult>,
 
-    // ... HTML output config, tx channel, etc.
+    /// Paths whose HTML generation was deferred (contain MyST directives that need
+    /// a graph query pass). Processed by `generate_deferred_html` after parse_all.
+    deferred_html: Vec<PathBuf>,
 }
 ```
 
-**`ProtoIndex::ordered_paths()` — canonical iteration order:**
+**`BeliefSink`**: the trait used by `parse_sequential` (and `BeliefAccumulator` internally)
+to apply a batch of `BeliefEvent`s to a backing store in one call:
 
-Returns a flat depth-first list of all repo paths. Within each network directory,
-entries are sorted lexicographically (subnet directories interleave alphabetically
-with plain files at their natural sort position). This guarantees:
-
-```
-repo/index.md               ← network root always first in its group
-repo/a.md
-repo/b_dir/                 ← subnet dir, at its lex position (b < c)
-repo/b_dir/index.md         ← subnet's own root first within b_dir
-repo/b_dir/a_sub.md
-repo/b_dir/x.md
-repo/b_dir/y_repo/          ← nested subnet
-repo/b_dir/y_repo/index.md
-repo/b_dir/y_repo/abc.md
-repo/c.md
-repo/d_dir/a.md             ← plain dir (no index.md) — files included flat
-repo/z.md
+```rust
+pub trait BeliefSink: Send {
+    fn apply_batch(&mut self, events: &[BeliefEvent])
+        -> impl Future<Output = Result<(), BuildonomyError>> + Send;
+}
 ```
 
-Every network `index.md` is committed to `global_bb` before its children are
-dispatched, eliminating the slow-path fallback in
-`try_initialize_stack_from_session_cache` for all files in the initial pass.
+`BeliefBase` applies events one-by-one via `process_event`. `DbConnection` (feature
+`service`) wraps the batch into a single database `Transaction` for atomic commit.
+`parse_sequential`'s `drain_rx!` macro calls `apply_batch` after each file or
+depth-group to keep the caller's `global_bb` incrementally warm between files.
 
-**Watch service integration** (planned): `on_file_modified(path)` resets
-`processed[path] = 0` and pushes to the front of `remainder_queue`.
-`on_file_deleted(path)` removes from `remainder_queue` and `processed`. The watch
-service then calls `parse_all` (or a future incremental `parse_modified`) with no
-other coordination needed.
+**Three-phase structure of `parse_sequential` and `parse_all`:**
+
+Both drivers share the same logical phases; `parse_sequential` uses sequential
+`run_one!` + `drain_rx!` macros while `parse_all` uses `parse_epoch` batches
+bounded by `BatchStart`/`BatchEnd`/`drain_epoch`:
+
+```
+Phase 1 — network dirs, one depth-level at a time:
+  net_dirs = proto_index.network_dirs()   // shallowest-first
+  for each depth group in net_dirs:
+    [parse_sequential]: run each dir individually, drain rx after each
+    [parse_all]:        BatchStart → parse_epoch(group) → BatchEnd → drain_epoch()
+
+Phase 2 — all leaf documents (non-dir children of every network dir):
+  leaf_batch = all non-dir children not yet processed
+  [parse_sequential]: run each leaf individually, drain rx after each
+  [parse_all]:        BatchStart → parse_epoch(leaf_batch) → BatchEnd → drain_epoch()
+
+Phase 3 — remainder loop (assets + re-parses):
+  while remainder_queue is non-empty:
+    candidates = remainder_queue.drain(), sorted by (processed_count, DFS_order)
+    [parse_sequential]: run each individually, drain rx after each
+    [parse_all]:        BatchStart → parse_epoch(candidates) → BatchEnd → drain_epoch()
+```
+
+**Why depth-grouping matters**: `try_initialize_stack_from_session_cache` needs the
+parent network node already in `global_bb` to fire the `GlobalCache` fast path.
+Committing all depth-D dirs before any depth-D+1 dir is dispatched guarantees this
+invariant. Within a depth group all dirs are mutually independent (no parent/child
+relationship), so they may run in parallel safely.
+
+**`ProtoIndex::network_dirs()` — canonical network directory order:**
+
+Returns every directory that owns an `index.md`, sorted shallowest-first (primary
+key: component count ascending, secondary key: lexicographic). Subnet directories
+are returned at their natural depth; plain directories (no `index.md`) are not
+included.
+
+**Watch service integration**: `on_file_modified(path)` resets `processed[path] = 0`
+and pushes to the front of `remainder_queue`. `on_file_deleted(path)` removes from
+`remainder_queue` and `processed`. The watch service calls `parse_all` with a live
+`DbConnection` as `global_bb`; `BatchStart`/`BatchEnd` are no-ops in
+`Transaction::add_event`, so the epoch machinery is inert and the watch path is
+unchanged by the parallel compilation work.
 
 ### 3.4. BeliefBase vs BeliefGraph: Full API vs Transport Layer
 
@@ -1765,58 +1820,62 @@ Optimization is better suited for the **DbConnection** persistent cache (db.rs) 
 
 ### 6.5. Concurrent Parsing
 
-**Current State**: Intra-epoch parallelism is architecturally complete (Issue 57).
-The `BeliefAccumulator` + `QueryHandle<T>` + `EpochDrain` machinery is in place.
-True OS-thread parallelism (spawning one `tokio::task` per path within an epoch,
-gated by `Arc<Semaphore>`) is the remaining step.
+**Current State**: Intra-epoch parallelism is fully implemented (Issue 57 complete).
+`parse_epoch` spawns one `tokio::task` per path, gated by `Arc<Semaphore>` of size
+`jobs`. `--jobs 1` uses a sequential inline loop as a deterministic baseline.
 
 **Epoch invariant**: within a single epoch no file's parse output is an input to
 any other file's parse in that epoch. Cross-file dependencies only flow across epoch
 boundaries. This is what makes intra-epoch parallelism safe without locking
 `GraphBuilder`.
 
-**`parse_all` epoch structure:**
+**`parse_epoch` — parallel implementation (`jobs > 1`)**:
+
+Each spawned task owns:
+- A fresh `GraphBuilder` seeded with `repo_bid` and the full network-ancestor
+  snapshot (`epoch_session_snapshot`) so `try_initialize_stack_from_session_cache`
+  can walk upward through Section edges.
+- A per-task `UnboundedSender<BeliefEvent>` (isolated channel). Events from each
+  document accumulate in the task's local buffer.
+- A clone of `global_bb` (cheap — `QueryHandle` is `Clone` + `Arc`-backed).
+
+After `JoinSet::join_next` drains all tasks, per-task event buffers are forwarded
+to the shared `tx` in original path index order (task 0's events before task 1's,
+etc.). This enforces deterministic first-one-wins collision resolution regardless
+of OS task scheduling order. The surrounding `BatchStart`/`BatchEnd` pair in
+`parse_all` brackets the entire epoch so the accumulator sees one coherent batch.
+
+**`parse_all` epoch structure (actual):**
 
 ```
-Epoch 0 (ProtoIndex-ordered):
-  for each network dir in ProtoIndex::network_dirs() [shallowest-first]:
-    BatchStart → parse index.md alone → BatchEnd → drain_epoch()
-    BatchStart → parse_epoch(leaf children of this net) → BatchEnd → drain_epoch()
+Phase 1 — network dirs, depth-grouped:
+  for each depth group in network_dirs() [shallowest-first]:
+    BatchStart → parse_epoch(group) → BatchEnd → drain_epoch()
+    // all depth-D dirs committed before any depth-D+1 dir is dispatched
 
-Remainder epochs (epoch ≥ 1):
+Phase 2 — leaf documents (single parallel batch):
+  leaf_batch = all non-dir children of all network dirs not yet processed
+  BatchStart → parse_epoch(leaf_batch) → BatchEnd → drain_epoch()
+
+Remainder loop (epoch ≥ 1):
   while remainder_queue is non-empty:
-    batch = remainder_queue.drain(), sorted by processed[path] ascending
+    batch = remainder_queue.drain(), sorted by (processed_count, DFS_order)
     BatchStart → parse_epoch(batch) → BatchEnd → drain_epoch()
 ```
 
-The epoch-0 per-network split guarantees every `index.md` is committed to
-`global_bb` before its children are dispatched, so
-`try_initialize_stack_from_session_cache` always finds the parent network on the
-`GlobalCache` fast path.
+**`parse_sequential` (no epochs, single-threaded):**
 
-**`parse_sequential` (no epochs):**
-
-```
-Initial pass:
-  for path in proto_index.ordered_paths():
-    result = parse_one_codec_path(path)
-    unresolved non-proto_index deps → remainder_queue
-
-Remainder loop:
-  while remainder_queue is non-empty:
-    path = remainder_queue.pop_front()
-    result = parse_one_codec_path(path)
-    new unresolved deps → remainder_queue
-```
-
-No `BatchStart`/`BatchEnd`, no `drain_epoch`. Used as the sequential baseline
-and for contexts where no inter-epoch accumulator is needed.
+Structurally mirrors `parse_all` with three identical phases but uses sequential
+`run_one!` + `drain_rx!` macros instead of epoch batches. No `BatchStart`/`BatchEnd`,
+no `drain_epoch`. Takes `BeliefSink` (not `EpochDrain`) as its `global_bb` bound.
+Used as a stable sequential baseline and in contexts where no inter-epoch
+accumulator is available (e.g. watch service via `DbConnection`).
 
 **`BeliefAccumulator`**: the `BatchStart`/`BatchEnd` sentinel pair drives
 accumulator commit and cache invalidation. `drain_epoch()` must not be a no-op
 for the inter-epoch cache invariant to hold — `BeliefBase`'s no-op `EpochDrain`
 implementation is correct only in contexts where no inter-epoch state sharing is
-expected (e.g. single-epoch unit tests).
+expected (e.g. single-epoch unit tests that pass a bare `BeliefBase` as `global_bb`).
 
 **`node_to_nets` reverse index**: `PathMapMap` maintains
 `node_to_nets: BTreeMap<Bid, BTreeSet<Bref>>` to route `RelationUpdate` events
@@ -1827,14 +1886,6 @@ pass of `process_event_queue`. **Critical invariant**: the `node_to_nets`
 incremental update must run regardless of whether the PathMap required a sort —
 skipping it when `already_sorted=true` causes section nodes at depth ≥ 2 to be
 silently dropped from the PathMap.
-
-**Remaining work** (Issue 57):
-- Replace the sequential `for path in paths` loop in `parse_epoch` with
-  `tokio::task::spawn` per path, gated by `Arc<Semaphore>` of size `jobs`.
-- Each spawned task gets an owned `GraphBuilder`, `tx.clone()`, and a
-  `global_bb.clone()` (cheap — `QueryHandle` is `Clone` + `Arc`-backed).
-- Collect results via `JoinSet`; preserve path order for determinism.
-- `--jobs 1`: semaphore of size 1 is equivalent to sequential — no special case.
 
 ### 6.6. Formal Grammar Specification
 

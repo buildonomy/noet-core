@@ -493,7 +493,7 @@ fn get_all_paths(
         let rows = sqlx::query_as::<_, (String, String, String)>(
             "SELECT path, target, ordering FROM paths WHERE net = ?",
         )
-        .bind(network_bid.to_string())
+        .bind(network_bid.bref().to_string())
         .fetch_all(&pool)
         .await?;
         let mut row_results = rows

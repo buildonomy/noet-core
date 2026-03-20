@@ -2191,7 +2191,7 @@ impl DocumentCompiler {
             path: repo_relative_str.clone(),
         };
 
-        // ── Step 0: resolve the document node (graphs[0]) ────────────────────
+        // ── Step 0: resolve the document node ────────────────────────────────
         // Seed-only query — we only need the node itself. The directive pipeline
         // fetches additional data lazily, one eval_query call per refiner.
         let node_graph = global_bb
@@ -2204,16 +2204,21 @@ impl DocumentCompiler {
             )
             .await?;
 
-        let node_bb = BeliefBase::from(node_graph.clone());
+        let mut node_bb = BeliefBase::from(node_graph);
         let Some(node) = node_bb.get(&nodekey) else {
-            tracing::warn!(
-                "[generate_html_for_path] No match found for path: '{}'\nbb.paths:\n{}",
-                nodekey,
-                node_bb.paths()
-            );
+            tracing::warn!("[generate_html_for_path] No match found for path: '{nodekey}'",);
             return Ok(());
         };
         let node_bid = node.bid;
+        let root_net_bid = self.builder.repo();
+        let Some(ctx) = node_bb.get_context(&root_net_bid, &node_bid) else {
+            tracing::warn!(
+                "[generate_html_for_path] No context found for node {} (path: '{}')",
+                node_bid,
+                nodekey,
+            );
+            return Ok(());
+        };
         let title = node.display_title().to_string();
 
         // Convert absolute path to repo-relative path.
@@ -2281,7 +2286,6 @@ impl DocumentCompiler {
             None
         };
 
-        let mut graphs: Vec<BeliefGraph> = vec![node_graph];
         // (sentinel, built_html) pairs collected for splicing / fallback write.
         let mut splice_pairs: Vec<(String, String)> = Vec::new();
 
@@ -2298,9 +2302,11 @@ impl DocumentCompiler {
                 continue;
             }
 
-            // Run each refiner, appending its result to `graphs`.
+            // Run each refiner in sequence, accumulating results.
+            // graphs[i] is the result of d.queries[i]; ctx carries the resolved node.
+            let mut graphs: Vec<BeliefGraph> = Vec::new();
             for refiner in d.queries {
-                let expr = refiner(&graphs);
+                let expr = refiner(&ctx, &graphs);
                 let next = global_bb
                     .eval_query(
                         &Query {
@@ -2313,9 +2319,9 @@ impl DocumentCompiler {
                 graphs.push(next);
             }
 
-            // Call the sync builder with the full accumulated slice.
+            // Call the sync builder with ctx and the accumulated query results.
             if let Some(builder) = d.builder {
-                let html = builder(&graphs)?;
+                let html = builder(&ctx, &graphs)?;
                 splice_pairs.push((d.sentinel.to_string(), html));
             }
         }

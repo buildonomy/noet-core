@@ -56,6 +56,12 @@ export const state = {
   /** @type {HTMLSelectElement|null} */
   themeSelect: null,
 
+  /** @type {HTMLInputElement|null} */
+  searchInput: null,
+
+  /** @type {HTMLButtonElement|null} */
+  searchClear: null,
+
   /** @type {HTMLButtonElement|null} */
   metadataClose: null,
 

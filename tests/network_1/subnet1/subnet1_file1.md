@@ -20,7 +20,7 @@ Section A text.
 ```{implements}
 ```
 
-The following list are items from other docs in this corpus whic we will treat as requirements: 
+The following list are items from other docs in this corpus which we will treat as requirements: 
 
 * [HSML]
 * [HSTP]

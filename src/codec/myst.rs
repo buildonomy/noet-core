@@ -54,13 +54,26 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    beliefbase::{BeliefBase, BeliefGraph},
+    beliefbase::{BeliefBase, BeliefContext, BeliefGraph},
     codec::{md::build_title_attribute, CODECS},
     error::BuildonomyError,
     paths::AnchorPath,
     properties::{Bid, WeightKind},
     query::{Expression, RelationPred},
 };
+
+/// Query refiner function type for MyST directive deferred-render pipelines.
+///
+/// Each refiner receives the resolved node's [`BeliefContext`] and the slice of
+/// [`BeliefGraph`] results accumulated by preceding refiners, and returns an
+/// [`Expression`] to evaluate against the global BeliefBase.
+pub type DirectiveRefiner = fn(&BeliefContext, &[BeliefGraph]) -> Expression;
+
+/// Sync builder function type for MyST directive deferred-render pipelines.
+///
+/// Receives the resolved node's [`BeliefContext`] and the full slice of
+/// [`BeliefGraph`] results from the query pipeline, and returns an HTML fragment.
+pub type DirectiveBuilder = fn(&BeliefContext, &[BeliefGraph]) -> Result<String, BuildonomyError>;
 
 /// Full definition of a noet MyST directive.
 ///
@@ -72,7 +85,7 @@ use crate::{
 ///
 /// 1. Add a `DirectiveDef` entry to [`DIRECTIVES`].
 /// 2. If it has a deferred render phase, implement query refiners in `queries` and a
-///    `fn(&[BeliefGraph]) -> Result<String, BuildonomyError>` builder and set
+///    `fn(&BeliefContext, &[BeliefGraph]) -> Result<String, BuildonomyError>` builder and set
 ///    `builder: Some(my_builder)`.
 /// 3. Document it in the module doc comment above.
 pub struct DirectiveDef {
@@ -95,25 +108,23 @@ pub struct DirectiveDef {
     pub is_block_opener: bool,
     /// Async query pipeline, run by `generate_html_for_path` before the sync builder.
     ///
-    /// `graphs[0]` is always the node-resolution graph (resolved before this pipeline runs).
-    /// Each refiner receives the full `&[BeliefGraph]` slice accumulated so far — use
-    /// `graphs[0]` to reference the resolved node and `graphs[graphs.len()-1]` to reference
-    /// the immediately preceding step's result.  The `Expression` returned is passed to
+    /// Each refiner receives the resolved node's [`BeliefContext`] and the slice of
+    /// `BeliefGraph` results accumulated by preceding refiners (`graphs[graphs.len()-1]`
+    /// is the immediately preceding step's result). The `Expression` returned is passed to
     /// `eval_query`; the result is appended to the slice before the next refiner is called.
     ///
     /// Empty slice means no deferred phase.
-    pub queries: &'static [fn(&[BeliefGraph]) -> Expression],
+    pub queries: &'static [DirectiveRefiner],
     /// Sync deferred-render builder.
     ///
-    /// Receives the full `Vec<BeliefGraph>` accumulated by the pipeline:
-    /// - `graphs[0]`   — node-resolution graph (always present)
-    /// - `graphs[1..]` — one entry per step in `queries`, in order
+    /// Receives the resolved node's [`BeliefContext`] and the slice of `BeliefGraph` results
+    /// accumulated by the pipeline (one entry per step in `queries`, in order).
     ///
     /// **Builders must filter by edge kind** — the slice contains everything fetched by all
     /// prior steps; do not assume it contains only the edges you queried for.
     ///
     /// `None` for parse-only or marker-only directives (i.e. when `queries` is empty).
-    pub builder: Option<fn(&[BeliefGraph]) -> Result<String, BuildonomyError>>,
+    pub builder: Option<DirectiveBuilder>,
 }
 
 /// Registry of all noet MyST directives.
@@ -132,8 +143,11 @@ pub static DIRECTIVES: &[DirectiveDef] = &[
         sentinel: "<!--@@noet-network-children@@-->",
         directive: "````{network_children}",
         is_block_opener: false,
-        queries: &[network_children_query],
-        builder: Some(build_listing_html),
+        queries: &[net_path_in],
+        builder: Some(
+            build_listing_html
+                as fn(&BeliefContext, &[BeliefGraph]) -> Result<String, BuildonomyError>,
+        ),
     },
     DirectiveDef {
         name: "implements",
@@ -159,7 +173,7 @@ pub static DIRECTIVES: &[DirectiveDef] = &[
         sentinel: "<!--@@noet-requirements-table@@-->",
         directive: "",
         is_block_opener: false,
-        queries: &[req_table_step1, req_table_step2],
+        queries: &[net_path_in, req_table_step2],
         builder: Some(build_requirements_table_html),
     },
     // DirectiveDef { name: "toc", marker: "<!-- noet-toc -->", sentinel: "<!--@@noet-toc@@-->",
@@ -348,34 +362,17 @@ pub(crate) fn splice_sentinels(
 // The returned Expression is passed to `eval_query`; the result is appended to the
 // accumulated slice before the next refiner (or the builder) is called.
 
-/// Refiner for `network_children` (step 1 of 1).
-///
-/// `graphs[0]` contains the resolved network node. Returns an Expression that fetches
-/// all nodes that have a Section-weighted edge **into** that node (i.e. its direct
-/// children in the document tree).
-fn network_children_query(graphs: &[BeliefGraph]) -> Expression {
-    let node_bid = node_bid_from_graphs(graphs);
-    Expression::RelationIn(RelationPred::SinkIn(vec![node_bid]))
-}
-
 /// Refiner for `requirements_table` step 1 of 2.
 ///
-/// `graphs[0]` contains the resolved document node. Finds that node's home network BID
-/// and returns an Expression that fetches every node belonging to that network
-/// (i.e. every node whose `net` key equals the home network's bref).
-fn req_table_step1(graphs: &[BeliefGraph]) -> Expression {
-    let node_bid = node_bid_from_graphs(graphs);
-    // Walk states looking for the first network-kind ancestor.
-    // The node-resolution graph produced by a seed-only Query contains the document
-    // node itself in states; the network node is its Section-edge sink and may not be
-    // present — use the node's own bid as a fallback (covers the network-index case).
-    // graphs[0] is an eval_query, which is balanced
-    let bb = BeliefBase::from(graphs[0].clone());
-    let home_net_bid = bb
-        .paths()
-        .path(&node_bid)
-        .map(|(home_net, _)| home_net)
-        .unwrap_or(node_bid);
+/// Uses the resolved node's [`BeliefContext`] to find the home network BID, then returns
+/// an Expression that fetches every node belonging to that network (i.e. every node whose
+/// `net` key equals the home network's bref).
+fn net_path_in(ctx: &BeliefContext, _graphs: &[BeliefGraph]) -> Expression {
+    let home_net_bid = if ctx.node.kind.is_network() {
+        ctx.node.bid
+    } else {
+        ctx.home_net
+    };
     // StatePred::NetPathIn(Bid) returns all nodes whose path is registered under
     // the given network BID — i.e. every document in the home network.
     Expression::StateIn(StatePred::NetPathIn(home_net_bid))
@@ -383,66 +380,65 @@ fn req_table_step1(graphs: &[BeliefGraph]) -> Expression {
 
 /// Refiner for `requirements_table` step 2 of 2.
 ///
-/// `graphs[1]` (the result of step 1) contains all nodes in the home network. Collects
+/// `graphs[0]` (the result of step 1) contains all nodes in the home network. Collects
 /// their BIDs and returns an Expression that fetches every Pragmatic-weighted edge whose
 /// source is one of those nodes.
-fn req_table_step2(graphs: &[BeliefGraph]) -> Expression {
-    // graphs[1] is the home-network node set from step 1.
-    let all_bids: Vec<Bid> = if graphs.len() >= 2 {
-        graphs[1].states.keys().copied().collect()
+fn req_table_step2(ctx: &BeliefContext, graphs: &[BeliefGraph]) -> Expression {
+    // graphs[0] is the home-network node set from step 1.
+    let home_net_bid = if ctx.node.kind.is_network() {
+        ctx.node.bid
+    } else {
+        ctx.home_net
+    };
+    let all_net_bids: Vec<Bid> = if let Some(home_net_graph) = graphs.first() {
+        let all_net_bids: Vec<Bid> = home_net_graph
+            .relations
+            .as_subgraph_seeded(WeightKind::Section, true, home_net_bid)
+            .nodes()
+            .collect();
+        if all_net_bids.is_empty() {
+            tracing::debug!(
+                "[req_table_step2] home net graph is empty! results:\n{home_net_graph}",
+            );
+        }
+        all_net_bids
     } else {
         // Fallback: use only the document node itself.
-        vec![node_bid_from_graphs(graphs)]
+        tracing::debug!("[req_table_step2] no results from net_path_in query!");
+        vec![ctx.node.bid]
     };
-    Expression::RelationIn(RelationPred::SinkIn(all_bids))
-}
 
-/// Extract the single resolved node BID from `graphs[0]`.
-///
-/// `graphs[0]` is the node-resolution graph produced by the initial `eval_query` call in
-/// `generate_html_for_path`. It contains the document node as the sole non-Trace state,
-/// plus any Trace nodes pulled in via its immediate edges. We must find the non-Trace node
-/// specifically — `BTreeMap` ordering means `.next()` may return a Trace neighbour first.
-///
-/// Panics only if called before the node-resolution graph has been pushed, which cannot
-/// happen in a correctly constructed pipeline.
-fn node_bid_from_graphs(graphs: &[BeliefGraph]) -> Bid {
-    use crate::properties::BeliefKind;
-    graphs[0]
-        .states
-        .values()
-        .find(|n| !n.kind.contains(BeliefKind::Trace))
-        .or_else(|| {
-            tracing::warn!("Could not find the non-trace node from our initial query!");
-            graphs[0].states.values().next()
-        })
-        .map(|n| n.bid)
-        .expect("graphs[0] is the node-resolution graph and must be non-empty")
+    Expression::RelationIn(RelationPred::SinkIn(all_net_bids))
 }
 
 /// Build the child-listing HTML fragment for the `network_children` directive.
 ///
 /// `graphs` layout:
-/// - `graphs[0]` — node-resolution graph; the single state is the network node being rendered.
-/// - `graphs[1]` — result of [`network_children_query`]: all nodes that have a
+/// - `graphs[0]` — result of [`network_children_query`]: all nodes that have a
 ///   `WeightKind::Section` edge **into** the network node (its direct children).
+///
+/// `ctx` is the resolved network node's [`BeliefContext`].
 ///
 /// Produces an HTML `<ul>` of linked child documents sorted by `WEIGHT_SORT_KEY`.
 /// Returns an empty-state message when there are no children.
-pub(crate) fn build_listing_html(graphs: &[BeliefGraph]) -> Result<String, BuildonomyError> {
+pub(crate) fn build_listing_html(
+    ctx: &BeliefContext,
+    graphs: &[BeliefGraph],
+) -> Result<String, BuildonomyError> {
     use crate::beliefbase::ExtendedRelation;
     use crate::properties::WEIGHT_SORT_KEY;
 
-    let node_bid = node_bid_from_graphs(graphs);
+    let node_bid = ctx.node.bid;
 
-    // graphs[1] holds the children query result; fall back to an empty graph when absent.
+    // graphs[0] holds the children query result; fall back to an empty graph when absent.
     let static_empty = BeliefGraph::default();
-    let children_graph = graphs.get(1).unwrap_or(&static_empty);
+    let children_graph = graphs.first().unwrap_or(&static_empty);
 
     // Build a temporary BeliefBase from the children graph so we can call
     // ExtendedRelation::new, which requires a BeliefBase for path/bref lookups.
-    // Union in graphs[0] so the network node's state is available for path resolution.
-    let mut bb = BeliefBase::from(graphs[0].clone());
+    // Union in the node-resolution graph from ctx so the network node's state is
+    // available for path resolution.
+    let mut bb = ctx.beliefbase().clone();
     bb.merge(children_graph);
 
     let relations = bb.relations();
@@ -479,15 +475,22 @@ pub(crate) fn build_listing_html(graphs: &[BeliefGraph]) -> Result<String, Build
             // Only render documents, not file contents
             continue;
         }
-        let mut link_path = edge.root_path.clone();
         let link_ap = AnchorPath::from(&edge.root_path);
-        if CODECS.get(&link_ap).is_some() {
+        // Convert the source path to its HTML equivalent before computing a relative link.
+        let html_path = if CODECS.get(&link_ap).is_some() {
             if link_ap.is_dir() {
-                link_path = link_ap.join("index.html").into_string();
+                link_ap.join("index.html").into_string()
             } else {
-                link_path = link_ap.replace_extension("html");
+                link_ap.replace_extension("html")
             }
-        }
+        } else {
+            edge.root_path.clone()
+        };
+
+        // Compute a relative path from the rendering document (ctx.root_path) to the
+        // child's HTML path. Both are network-relative, so rooted=false is correct.
+        let ctx_ap = AnchorPath::from(&ctx.root_path);
+        let rel_link = ctx_ap.path_to(&html_path, false);
 
         let title = edge.other.display_title();
         if link_ap.dir().is_empty() {
@@ -508,8 +511,8 @@ pub(crate) fn build_listing_html(graphs: &[BeliefGraph]) -> Result<String, Build
         let bref_attr = bref_attr_for_bid(edge.other.bid, &bb);
 
         html.push_str(&format!(
-            "  <li><a href=\"/{}\"{}>{}</a></li>\n",
-            link_path, bref_attr, title
+            "  <li><a href=\"{}\"{}>{}</a></li>\n",
+            rel_link, bref_attr, title
         ));
     }
 
@@ -547,10 +550,11 @@ fn bref_attr_for_bid(bid: Bid, bb: &BeliefBase) -> String {
 /// Build the requirements-table HTML fragment for the `requirements_table` directive.
 ///
 /// `graphs` layout:
-/// - `graphs[0]` — node-resolution graph (the document node being rendered).
-/// - `graphs[1]` — result of [`req_table_step1`]: all nodes in the home network.
-/// - `graphs[2]` — result of [`req_table_step2`]: all `Pragmatic`-weighted edges whose
+/// - `graphs[0]` — result of [`req_table_step1`]: all nodes in the home network.
+/// - `graphs[1]` — result of [`req_table_step2`]: all `Pragmatic`-weighted edges whose
 ///   source is a home-network node.
+///
+/// `ctx` is the resolved document node's [`BeliefContext`].
 ///
 /// Each `Pragmatic` edge represents an `{implements}` link:
 ///   `source` = the implementing node (inside the home network)
@@ -564,22 +568,35 @@ fn bref_attr_for_bid(bid: Bid, bb: &BeliefBase) -> String {
 ///
 /// Returns an empty-state message when no Pragmatic relations are found.
 pub(crate) fn build_requirements_table_html(
+    ctx: &BeliefContext,
     graphs: &[BeliefGraph],
 ) -> Result<String, BuildonomyError> {
-    // ── Step 1: collect all BIDs in the home network (graphs[1]) ─────────
+    // ── Step 1: collect all BIDs in the home network (graphs[0]) ─────────
     let static_empty = BeliefGraph::default();
-    let home_net_graph = graphs.get(1).unwrap_or(&static_empty);
-    let pragmatic_graph = graphs.get(2).unwrap_or(&static_empty);
+    let home_net_graph = graphs.first().unwrap_or(&static_empty);
+    let pragmatic_graph = graphs.get(1).unwrap_or(&static_empty);
 
-    let mut all_bids: Vec<Bid> = home_net_graph.states.keys().copied().collect();
-    all_bids.sort();
-    all_bids.dedup();
+    let home_net_bid = if ctx.node.kind.is_network() {
+        ctx.node.bid
+    } else {
+        ctx.home_net
+    };
+    let all_net_bids: Vec<Bid> = if let Some(home_net_graph) = graphs.first() {
+        home_net_graph
+            .relations
+            .as_subgraph_seeded(WeightKind::Section, true, home_net_bid)
+            .nodes()
+            .collect()
+    } else {
+        // Fallback: use only the document node itself.
+        tracing::debug!("[build_requirements_table_html] no results from net_path_in query!");
+        vec![ctx.node.bid]
+    };
 
-    if all_bids.is_empty() {
-        tracing::warn!("[build_requirements_table_html] home network graph is empty");
+    if all_net_bids.is_empty() {
+        tracing::debug!("[build_requirements_table_html] home network graph is empty");
         return Ok("<p><em>No requirements found for this section.</em></p>\n".to_string());
     }
-    tracing::debug!("[build_requirements_table_html] {all_bids:?}");
 
     // ── Step 2: group by requirement (sink): sink_bid → Vec<source_bid> ──
     // Source = implementor (in home network); sink = requirement (external).
@@ -590,49 +607,67 @@ pub(crate) fn build_requirements_table_html(
         let source_bid = req_graph[edge.source()]; // implementor
         let sink_bid = req_graph[edge.target()]; // requirement
                                                  // Only include sinks that are NOT in the home network (they are external requirements).
-        tracing::debug!("{source_bid} -> {sink_bid}");
-        if all_bids.contains(&sink_bid) {
+        if !edge.weight.weights.contains_key(&WeightKind::Pragmatic) {
             continue;
         }
-        if !edge.weight.get(&WeightKind::Pragmatic).is_some() {
+        if !all_net_bids.contains(&sink_bid) {
             continue;
         }
         req_to_implementors
-            .entry(sink_bid)
+            .entry(source_bid)
             .or_default()
-            .push(source_bid);
+            .push(sink_bid);
     }
 
     if req_to_implementors.is_empty() {
-        tracing::warn!("[build_requirements_table_html] req_to_implementors is empty");
+        tracing::debug!("[build_requirements_table_html] req_to_implementors is empty");
         return Ok("<p><em>No requirements found for this section.</em></p>\n".to_string());
     }
 
     // ── Step 3: build a unified BeliefBase for title/path resolution ──────
-    // Union all pipeline graphs so we can resolve both home-net nodes and
-    // external requirement nodes.
-    let mut bb = BeliefBase::from(graphs[0].clone());
+    // Union the node-resolution BB from ctx with all pipeline graphs so we can
+    // resolve both home-net nodes and external requirement nodes.
+    let mut bb = ctx.beliefbase().clone();
     bb.merge(home_net_graph);
     bb.merge(pragmatic_graph);
-    let paths = bb.paths();
+    let pmm = bb.paths();
 
     // ── Step 4: render the table ──────────────────────────────────────────
-    // Helper: resolve a BID to (display_title, Option<html_url>).
+    // Helper: resolve a BID to (display_title, Option<relative_html_url>).
+    //
+    // Prefer net_indexed_path so we get the network-local path (no cross-net BID prefix),
+    // then compute a relative link from the rendering document's location (ctx.root_path).
+    let mut table_file_path = ctx.root_path.clone();
+    let mut table_doc_ap = AnchorPath::from(&table_file_path);
+    if table_doc_ap.is_dir() || table_doc_ap.ext().is_empty() {
+        table_file_path = format!("{}/index.html", ctx.root_path.trim_end_matches('/'));
+        table_doc_ap = AnchorPath::new_file(&table_file_path);
+    }
+
     let resolve = |bid: &Bid| -> (String, Option<String>) {
         let title = bb
             .states()
             .get(bid)
             .map(|n| n.display_title())
             .unwrap_or_else(|| bid.bref().to_string());
-        let url = paths.indexed_path(bid).map(|(_net, path, _order)| {
+        // Try the home network first; fall back to indexed_path for external nodes.
+        let maybe_net_path = pmm
+            .get_map(&ctx.root_net.bref())
+            .and_then(|pm| pm.path(bid, &pmm));
+        let url = maybe_net_path.map(|(_home_net, path, _order)| {
             let ap = AnchorPath::from(&path);
-            if ap.ext().eq_ignore_ascii_case("md") {
-                format!("/{}", ap.replace_extension("html"))
+            let html_path = if ap.ext().eq_ignore_ascii_case("md") {
+                ap.replace_extension("html")
             } else if ap.is_dir() || ap.ext().is_empty() {
-                format!("/{}/index.html", path.trim_end_matches('/'))
+                format!("{}/index.html", path.trim_end_matches('/'))
             } else {
-                format!("/{}", path)
-            }
+                path.clone()
+            };
+            // Both ctx.root_path and the resolved path are network-relative, so
+            // rooted=false produces a correct relative link between them.
+            let res = table_doc_ap.path_to(&html_path, true);
+            tracing::warn!("table_doc_ap: {table_doc_ap}, html_path: {html_path}, res: {res}");
+            res
         });
         (title, url)
     };
@@ -669,6 +704,11 @@ pub(crate) fn build_requirements_table_html(
     }
 
     html.push_str("</tbody>\n</table>\n");
+    tracing::debug!(
+        "[build_requirements_table_html] generated table for {}: {}",
+        ctx.node.bid.bref(),
+        ctx.node.display_title()
+    );
     Ok(html)
 }
 

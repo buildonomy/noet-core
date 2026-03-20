@@ -1682,3 +1682,190 @@ h6:hover .noet-header-anchor {
         display: none !important;
     }
 }
+
+/* =========================================================================
+   Search Bar (inside nav panel header)
+   ========================================================================= */
+
+.noet-search-wrapper {
+    position: relative;
+    margin: var(--size-2) 0 var(--size-3) 0;
+}
+
+.noet-search-input {
+    width: 100%;
+    padding: var(--size-2) var(--size-3);
+    padding-right: var(--size-7); /* room for the clear button */
+    background-color: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-1);
+    font-family: inherit;
+    box-sizing: border-box;
+    transition:
+        border-color 0.15s var(--ease-2),
+        box-shadow 0.15s var(--ease-2);
+}
+
+.noet-search-input::placeholder {
+    color: var(--noet-text-tertiary);
+}
+
+.noet-search-input:focus {
+    outline: none;
+    border-color: var(--noet-border-focus);
+    box-shadow: 0 0 0 2px var(--noet-bg-tertiary);
+}
+
+/* Clear (×) button inside the input */
+.noet-search-clear {
+    display: none; /* shown via JS when input is non-empty */
+    position: absolute;
+    right: var(--size-2);
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    padding: var(--size-1);
+    cursor: pointer;
+    color: var(--noet-text-tertiary);
+    font-size: var(--font-size-2);
+    line-height: 1;
+}
+
+.noet-search-clear:hover {
+    color: var(--noet-text-primary);
+}
+
+/* Keyboard shortcut hint shown when input is focused and empty */
+.noet-search-hint {
+    display: none;
+    font-size: var(--font-size-00);
+    color: var(--noet-text-tertiary);
+    text-align: right;
+    margin-top: var(--size-1);
+}
+
+@media (min-width: 1024px) {
+    .noet-search-hint {
+        display: block;
+    }
+}
+
+/* =========================================================================
+   Search Results Panel
+   ========================================================================= */
+
+.noet-search-results {
+    background-color: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    box-shadow: var(--noet-shadow-medium);
+    max-height: 60vh;
+    overflow-y: auto;
+    margin-bottom: var(--size-3);
+}
+
+.noet-search-results__empty {
+    padding: var(--size-3) var(--size-4);
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-1);
+    margin: 0;
+}
+
+.noet-search-results__list {
+    list-style: none;
+    padding: var(--size-1) 0;
+    margin: 0;
+}
+
+/* Individual result row */
+.noet-search-result {
+    border-bottom: 1px solid var(--noet-border-secondary);
+    cursor: pointer;
+}
+
+.noet-search-result:last-child {
+    border-bottom: none;
+}
+
+.noet-search-result.is-selected,
+.noet-search-result:hover {
+    background-color: var(--noet-bg-tertiary);
+}
+
+.noet-search-result__link {
+    display: block;
+    padding: var(--size-2) var(--size-3);
+    text-decoration: none;
+    color: inherit;
+}
+
+.noet-search-result__title {
+    display: flex;
+    align-items: baseline;
+    gap: var(--size-2);
+    font-size: var(--font-size-1);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.noet-search-result__path {
+    display: block;
+    font-size: var(--font-size-00);
+    color: var(--noet-text-tertiary);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: var(--size-1);
+}
+
+.noet-search-result__snippet {
+    display: block;
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    margin-top: var(--size-1);
+    line-height: var(--font-lineheight-3);
+    /* Allow snippet to wrap — content is useful */
+    white-space: normal;
+    overflow: hidden;
+    /* Clamp to 3 lines */
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+}
+
+/* Term highlight inside snippet */
+.noet-search-result__snippet mark,
+.noet-search-results mark {
+    background-color: var(--noet-highlight-bg, rgba(255, 200, 0, 0.35));
+    color: inherit;
+    border-radius: var(--radius-1);
+    padding: 0 1px;
+}
+
+/* "idx" badge for results from unloaded network shards */
+.noet-search-result__badge {
+    flex-shrink: 0;
+    font-size: var(--font-size-00);
+    font-weight: var(--font-weight-5);
+    color: var(--noet-text-tertiary);
+    background-color: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-1);
+    padding: 0 var(--size-1);
+    vertical-align: middle;
+}
+
+/* Print: hide search entirely */
+@media print {
+    .noet-search-wrapper,
+    .noet-search-results {
+        display: none !important;
+    }
+}

@@ -67,6 +67,26 @@
                 <div class="noet-nav__content">
                     <div class="noet-nav-header">
                         <h2>Navigation</h2>
+                        <div class="noet-search-wrapper">
+                            <input
+                                type="search"
+                                id="search-input"
+                                class="noet-search-input"
+                                placeholder="Search… (Ctrl+K)"
+                                autocomplete="off"
+                                spellcheck="false"
+                                aria-label="Search documents"
+                            />
+                            <button
+                                id="search-clear"
+                                class="noet-search-clear"
+                                aria-label="Clear search"
+                                tabindex="-1"
+                            >
+                                ×
+                            </button>
+                        </div>
+                        <p class="noet-search-hint">Ctrl+K to focus</p>
                     </div>
                     <div id="nav-error" class="noet-error" hidden>
                         <h3 class="noet-error__title">Navigation Error</h3>

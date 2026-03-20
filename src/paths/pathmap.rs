@@ -328,7 +328,6 @@ fn sort_relation_events<'a>(events: &[&'a BeliefEvent]) -> Option<Vec<&'a Belief
     // replace it with the next event from `sorted_local` (which re-emits the same
     // set of relation events in dependency order).  Non-relation events are kept
     // at their original positions unchanged.
-    tracing::debug!("[sort_relation_events] reordering relation events for dependency order");
     let mut sorted_local_iter = sorted_local.iter();
     Some(
         events
@@ -1849,7 +1848,7 @@ impl PathMap {
                     .expect("all identified subnets to be registered with the pathmapmap");
                 // Use new_dir() so that dotted directory names (e.g. "symbol.iterator")
                 // are treated as directory components in join(), not as files.
-                let sub_ap = AnchorPath::new_dir(&elem_path);
+                let sub_ap = AnchorPath::new_dir(elem_path);
                 for tuple in subs.iter_mut() {
                     tuple.0 = sub_ap.join(&tuple.0).into_string();
                     let mut new_order = elem_order.clone();

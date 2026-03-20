@@ -2,7 +2,7 @@
 
 **Purpose**: Explain how documentation is organized in noet-core to avoid duplication and establish clear sources of truth.
 
-**Last Updated**: 2025-01-17
+**Last Updated**: 2025-07-14
 
 ## Overview
 
@@ -51,7 +51,7 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 - Getting started examples (with explanations)
 - Use cases
 
-**Length**: ~250-300 lines
+**Length**: ~400-550 lines (has grown to cover MyST directives, sharding, and search)
 
 **Source of Truth For**: "How does the library work at a conceptual level?"
 
@@ -74,11 +74,31 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 - Examples with detailed explanations
 - Architectural concerns and future enhancements
 
-**Length**: ~700-800 lines
+**Length**: ~1800-2000 lines (comprehensive technical spec; split at ~2500+ lines)
 
 **Source of Truth For**: "How is this implemented and why?"
 
 **References**: Code locations (e.g., `beliefbase.rs:660-2420`)
+
+### 3a. `docs/design/search_and_sharding.md`: "Shard and Search Specification"
+
+**Purpose**: Complete specification for the sharding export pipeline and compile-time search index system
+
+**Target Audience**: Contributors working on export, search, or the viewer WASM layer
+
+**Content**:
+- Shard threshold and export decision logic
+- Manifest and wire format schemas (`ShardManifest`, `NetworkShardMeta`, `SearchManifest`)
+- Compile-time search index format (`SearchIndex`, tokenizer, stemmer, title weighting)
+- TF-IDF query model and fuzzy matching specification
+- WASM integration: `ShardManager`, `loadMonolithicSearchIndices`, `state.searchIndex`
+- Memory budget model
+
+**Length**: ~400-600 lines
+
+**Source of Truth For**: "How does sharding and full-text search work end-to-end?"
+
+**Cross-referenced from**: `beliefbase_architecture.md` §3.8, `architecture.md` §BeliefBase Sharding
 
 ### 4. Module-Level Rustdoc: "API Guide"
 
@@ -128,6 +148,8 @@ src/lib.rs (rustdoc)
 docs/architecture.md
     ↓ (Deep dive)
 docs/design/beliefbase_architecture.md
+    ↓ (Shard/search deep dive)
+docs/design/search_and_sharding.md
     ↓ (Use API)
 Module-level rustdoc
 ```

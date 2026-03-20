@@ -57,6 +57,7 @@ import {
 import { initializeWasm } from "./viewer/wasm.js";
 import { initNetworkSelector } from "./viewer/network-selector.js";
 import { initResizeHandles } from "./viewer/resize.js";
+import { initSearch } from "./viewer/search.js";
 
 // =============================================================================
 // Bootstrap
@@ -94,6 +95,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     window.noet = state.wasmModule.BeliefBaseWasm;
     // Initialize network selector panel (sharded mode only; no-op in monolithic mode).
     initNetworkSelector();
+    // Initialize full-text search (requires state.searchIndex populated by initializeWasm).
+    initSearch();
   } catch (error) {
     console.error(
       "[Noet] WASM initialization failed (theme and basic features still work):",
@@ -129,6 +132,9 @@ function initializeDOMReferences() {
   state.graphContainer = document.getElementById("graph-container");
   state.graphCanvas = document.getElementById("graph-canvas");
   state.footerElement = document.querySelector(".noet-footer");
+
+  state.searchInput = document.getElementById("search-input");
+  state.searchClear = document.getElementById("search-clear");
 
   state.themeSelect = document.getElementById("theme-select");
   state.metadataClose = document.getElementById("metadata-close");

@@ -133,11 +133,11 @@ See `docs/design/search_and_sharding.md` §7 for the full search design.
 - [ ] Search returns results from **all** networks immediately after viewer init
 - [ ] `.idx.json` files generated for every network in both monolithic and sharded modes
 - [ ] Search indices are ~3-5% the size of their corresponding data
-- [ ] Fuzzy search finds results with 1–2 character typos
+- [x] Fuzzy search finds results with 1–2 character typos
 - [ ] Search latency < 200ms for typical queries across 10 networks
 - [ ] Results from loaded networks include content snippets
 - [ ] Results from unloaded networks show title + path with `loaded: false`
-- [ ] Clicking unloaded result prompts shard load (with size), then navigates
+- [x] Clicking unloaded result prompts shard load (with size), then navigates
 - [ ] Old outputs without `search/` directory still work (substring search fallback)
 - [ ] No new WASM dependencies — zero binary size increase for search
 - [ ] No index building in WASM — all indexing is compile-time

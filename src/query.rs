@@ -423,7 +423,7 @@ impl AsSql for StatePred {
             }
             StatePred::NetPathIn(net) => {
                 qb.push("net = ");
-                qb.push_bind(net.to_string());
+                qb.push_bind(net.bref().to_string());
             }
             StatePred::Path(path_vec) => {
                 push_string_expr(qb, path_vec, "path", match_pred, false);
