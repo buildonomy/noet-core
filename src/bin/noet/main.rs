@@ -88,12 +88,12 @@ enum Commands {
         #[arg(long)]
         summary: Option<String>,
 
-        /// Insert a <!-- network-children --> placement marker in the body to control where the
+        /// Insert a ````{network_children} placement marker in the body to control where the
         /// auto-generated child listing appears. If neither flag is passed, you will be prompted.
         #[arg(long, overrides_with = "no_children_marker")]
         children_marker: bool,
 
-        /// Skip the <!-- network-children --> placement marker. If neither flag is passed, you
+        /// Skip the ````{network_children} placement marker. If neither flag is passed, you
         /// will be prompted.
         #[arg(long, overrides_with = "children_marker")]
         no_children_marker: bool,

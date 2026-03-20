@@ -2163,7 +2163,7 @@ impl BeliefBase {
                 let path_bid_tuples = paths_guard
                     .get_map(&net.bref())
                     .map(|pm| {
-                        pm.recursive_map(&paths_guard, &mut std::collections::BTreeSet::new())
+                        pm.recursive_map(None, &paths_guard, &mut std::collections::BTreeSet::new())
                     })
                     .unwrap_or_default();
                 // Extract just the bids from (path, bid) tuples
@@ -2464,7 +2464,7 @@ impl BeliefSource for BeliefBase {
             .paths()
             .get_map(&network_bid.bref())
             .map(|pm| {
-                pm.recursive_map(&self.paths(), &mut BTreeSet::default())
+                pm.recursive_map(None, &self.paths(), &mut BTreeSet::default())
                     .into_iter()
                     .filter_map(|(path, bid, order)| {
                         // Filter out network index files and subsections
@@ -2508,7 +2508,7 @@ impl BeliefSource for &BeliefBase {
             .paths()
             .get_map(&network_bid.bref())
             .map(|pm| {
-                pm.recursive_map(&self.paths(), &mut BTreeSet::default())
+                pm.recursive_map(None, &self.paths(), &mut BTreeSet::default())
                     .into_iter()
                     .filter_map(|(path, bid, order)| {
                         // Filter out network index files and subsections

@@ -1658,14 +1658,12 @@ impl PathMap {
     /// Returns: (home_network Bid, full_path from this pathmap to the bid,
     /// crossing any subnet paths)
     pub fn path(&self, bid: &Bid, nets: &PathMapMap) -> Option<(Bid, String, Vec<u16>)> {
-        self.map
-            .iter()
-            .find_map(|(a_path, a_bid, order)| {
-                if *bid == *a_bid {
-                    Some((self.net, a_path.clone(), order.clone()))
-                } else {
-                    None
-                }
+        self.bid_map
+            .get(bid)
+            .and_then(|idx_vec| idx_vec.first().copied())
+            .map(|idx| {
+                let (path, _bid, order) = &self.map()[idx];
+                (self.net, path.clone(), order.clone())
             })
             .or_else(|| {
                 self.subnets.iter().find_map(|net_bid| {
@@ -1781,9 +1779,11 @@ impl PathMap {
         paths
     }
 
-    /// Return a list of all networks connected to this subnet (always includes self as ("", self.net))
+    /// Return a list of all networks connected to this subnet (always includes self as ("",
+    /// self.net)) If entry is some, starts the map at the first index of that bid entry.
     pub fn recursive_map(
         &self,
+        entry: Option<Bid>,
         nets: &PathMapMap,
         visited: &mut BTreeSet<Bid>,
     ) -> Vec<(String, Bid, Vec<u16>)> {
@@ -1791,35 +1791,65 @@ impl PathMap {
         if visited.contains(&self.net) {
             return paths;
         }
+        let start_idx = match entry {
+            Some(entry) => {
+                let Some(start_idx) = self.bid_map.get(&entry).and_then(|starts| starts.first())
+                else {
+                    // Bid may be in a subnet, find out, and if it is run a recursive map on the
+                    // home net for that bid, prepending the subnet path and subnet order onto the
+                    // results.
+                    if let Some((home_net, _path, _order)) = self.path(&entry, nets) {
+                        debug_assert!(
+                            home_net != self.net,
+                            "If we don't have a bid_map index for entry, its path isn't in this map"
+                        );
+                        let Some(home_net_pm) = nets.get_map(&home_net.bref()) else {
+                            tracing::warn!(
+                                "Found bid with a recursive path search but not its home net"
+                            );
+                            return paths;
+                        };
+                        let Some((_home_net, path_to_home_net, entry_home_order)) =
+                            self.path(&home_net, nets)
+                        else {
+                            tracing::warn!(
+                                "Found bid with a recursive path search but not its home net"
+                            );
+                            return paths;
+                        };
+                        let to_home_ap = AnchorPath::new_dir(&path_to_home_net);
+                        return home_net_pm
+                            .recursive_map(Some(entry), nets, visited)
+                            .into_iter()
+                            .map(|(path, bid, mut order)| {
+                                let mut full_order = entry_home_order.clone();
+                                full_order.append(&mut order);
+                                (to_home_ap.join(path).into_string(), bid, full_order)
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                    return paths;
+                };
+                *start_idx
+            }
+            None => 0,
+        };
+        let order_prefix = self.map[start_idx].2.clone();
         visited.insert(self.net);
-        let subnet_idxs = self
-            .subnets()
-            .iter()
-            .filter_map(|net_bid| match self.bid_map.get(net_bid) {
-                Some(idx_vec) => Some(idx_vec[0]),
-                None => {
-                    tracing::error!(
-                        "[recursive_map] Invariant violation: subnet {net_bid} is registered \
-                        in self.subnets for net {} but has no entry in self.bid_map. \
-                        Skipping this subnet. This indicates a bug in PathMap construction \
-                        or event processing -- a subnet was inserted into subnets before \
-                        its corresponding relation event was processed.",
-                        self.net
-                    );
-                    None
-                }
-            })
-            .collect::<Vec<usize>>();
 
-        for (idx, (elem_path, elem_bid, elem_order)) in self.map.iter().enumerate() {
-            if subnet_idxs.contains(&idx) {
+        for idx in start_idx..self.map.len() {
+            let (elem_path, elem_bid, elem_order) = &self.map[idx];
+            if elem_order[..order_prefix.len()] != order_prefix {
+                break;
+            }
+            if self.subnets().contains(elem_bid) && !visited.contains(elem_bid) {
                 let mut subs = nets
                     .get_map(&elem_bid.bref())
-                    .map(|pm| pm.recursive_map(nets, visited))
+                    .map(|pm| pm.recursive_map(None, nets, visited))
                     .expect("all identified subnets to be registered with the pathmapmap");
                 // Use new_dir() so that dotted directory names (e.g. "symbol.iterator")
                 // are treated as directory components in join(), not as files.
-                let sub_ap = AnchorPath::new_dir(elem_path);
+                let sub_ap = AnchorPath::new_dir(&elem_path);
                 for tuple in subs.iter_mut() {
                     tuple.0 = sub_ap.join(&tuple.0).into_string();
                     let mut new_order = elem_order.clone();

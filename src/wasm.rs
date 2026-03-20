@@ -1470,8 +1470,9 @@ impl BeliefBaseWasm {
 
             // Use recursive_map to discover transitively reachable nodes, then collect any that are themselves network roots (subnets at any depth).
             let mut recursive_visited = BTreeSet::default();
-            for (path, bid, _order_indices) in
-                pm.recursive_map(&paths, &mut recursive_visited).iter()
+            for (path, bid, _order_indices) in pm
+                .recursive_map(None, &paths, &mut recursive_visited)
+                .iter()
             {
                 // Check if this bid is a network (subnet)
                 if paths.nets().contains(bid) && *bid != *net_bid_for_prefix {
@@ -1532,7 +1533,9 @@ impl BeliefBaseWasm {
             let mut stack: Vec<(String, usize)> = Vec::new();
             stack.push((network_bid_str.clone(), 0)); // Network is at depth 0
 
-            for (path_str, bid, order_indices) in pm.recursive_map(&paths, &mut visited).iter() {
+            for (path_str, bid, order_indices) in
+                pm.recursive_map(None, &paths, &mut visited).iter()
+            {
                 let path = path_str.to_string();
                 let mut depth = order_indices.len();
                 let bid_str = bid.to_string();

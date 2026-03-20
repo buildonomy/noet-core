@@ -13,3 +13,18 @@ Section A text.
 
 
 [External Link](https://github.com/buildonomy/noet-core)
+
+
+## Requirements
+
+```{implements}
+```
+
+The following list are items from other docs in this corpus whic we will treat as requirements: 
+
+* [HSML]
+* [HSTP]
+* [API Reference]
+
+```{end}
+```

@@ -1261,19 +1261,32 @@ The `bid_to_index` mapping is rebuilt only when `index_dirty` is set, enabling b
 
 ### 3.5. DocCodec: The Frontend Interface
 
+> **Note**: The HTML generation API shown in this section reflects an earlier design.
+> The `generate_deferred_html` trait method has been removed. The deferred phase is now
+> owned entirely by `DocumentCompiler::generate_html_for_path`, which runs an async query
+> pipeline defined in `src/codec/myst.rs`. See
+> [`myst_directive_architecture.md`](./myst_directive_architecture.md) for the current
+> specification of the deferred pipeline, sentinel splicing, and the `DirectiveDef`
+> registry. The conceptual two-phase model (immediate → deferred) remains accurate;
+> only the implementation boundary has moved from the codec to the compiler.
+
 The `DocCodec` trait defines the contract for file format parsers:
 
 ```rust
 pub trait DocCodec {
-    fn parse(&mut self, content: String, current: IRNode) -> Result<(), BuildonomyError>;
+    fn parse(&mut self, content: &str, current: IRNode,
+        diagnostics: &mut Vec<ParseDiagnostic>) -> Result<(), BuildonomyError>;
     fn nodes(&self) -> Vec<IRNode>;
-    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext,
+        diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Option<BeliefNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
-    
-    // HTML Generation API (dual-phase)
-    fn should_defer(&self) -> bool { false }
-    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError> { Ok(vec![]) }
-    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> { Ok(vec![]) }
+
+    // HTML Generation API
+    fn should_defer(&self) -> bool { false }  // true if document contains deferred directives
+    fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> { Ok(vec![]) }
+    // Note: generate_deferred_html has been removed from this trait.
+    // The deferred phase is now handled by DocumentCompiler::generate_html_for_path
+    // via the myst::DIRECTIVES query pipeline. See myst_directive_architecture.md.
 }
 ```
 
@@ -1314,50 +1327,29 @@ HTML generation happens in two phases to handle different codec needs:
 - Called immediately after parsing, before context injection
 - Codec has parsed AST but no graph context
 - Use for: Static content (Markdown → HTML, syntax highlighting)
-- Returns: `Vec<(PathBuf, String)>` of (repo-relative-path, html-body)
+- For documents containing MyST directives with deferred content, `generate_html` emits
+  a sentinel placeholder string (e.g. `<!--@@noet-network-children@@-->`) at the
+  directive's position. `should_defer()` returns `true` to signal the deferred pass.
+- Returns: `Vec<(String, String)>` of (filename, html-body)
 
-**Phase 2: Deferred Generation** (`generate_deferred_html`)
-- Called after all documents parsed and context injected
-- Codec has full `BeliefContext` with graph relationships
-- Use for: Dynamic content (network indices, backlinks, cross-references)
-- Returns: Same format as immediate generation
+**Phase 2: Deferred Generation** (compiler-owned, not a codec method)
+- After all documents are parsed, `DocumentCompiler::generate_html_for_path` runs an
+  async query pipeline for each document in the deferred queue.
+- Each `DirectiveDef` in `myst::DIRECTIVES` that has a non-empty sentinel declares a
+  `queries` slice of refiner functions. The compiler runs these against the live
+  `BeliefSource`, accumulating results in a `Vec<BeliefGraph>`. The sync `builder`
+  function receives this slice and produces HTML. `myst::splice_sentinels` replaces
+  the placeholder in the on-disk HTML file.
+- Use for: Dynamic content (network child listings, requirements traceability tables,
+  cross-references that need full graph context).
 
-**Deferral Signal**: `should_defer()` tells compiler which phase to use:
-- `false` (default): Only immediate generation
-- `true`: Skip immediate, use deferred with context
+**Deferral Signal**: `should_defer()` tells the compiler to enqueue this document:
+- `false` (default): Only immediate generation needed
+- `true`: Document contains at least one sentinel-bearing directive; deferred pass required
 
-**Example: Network Index Generation**
-```rust
-impl DocCodec for IRNode {
-    fn should_defer(&self) -> bool {
-        self.kind.contains(BeliefKind::Network)
-    }
-    
-    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError> {
-        // Query child documents via Section (subsection) edges
-        let mut children: Vec<_> = ctx.sources()
-            .iter()
-            .filter_map(|edge| {
-                edge.weight.get(&WeightKind::Section).map(|section_weight| {
-                    let sort_key: u16 = section_weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
-                    (edge, sort_key)
-                })
-            })
-            .collect();
-        
-        // Sort by sort_key, generate HTML list
-        children.sort_by_key(|(_, sort_key)| *sort_key);
-        let html = format!("<ul>{}</ul>", 
-            children.iter()
-                .map(|(edge, _)| format!("<li><a href='/{}'>{}</a></li>", 
-                    edge.home_path.replace(".md", ".html"), 
-                    edge.other.display_title()))
-                .collect::<String>());
-        
-        Ok(vec![(self.path.with_extension("html"), html)])
-    }
-}
-```
+**See** [`myst_directive_architecture.md`](./myst_directive_architecture.md) for the
+complete specification of the directive registry, query pipeline, sentinel protocol, and
+extension point.
 
 **Current Implementations:**
 

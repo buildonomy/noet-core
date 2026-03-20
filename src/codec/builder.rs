@@ -34,7 +34,8 @@ use crate::{
     query::{BeliefSource, Expression, Query},
 };
 
-use super::{belief_ir::IntermediateRelation, BeliefContext, UnresolvedReference};
+use super::{belief_ir::IntermediateRelation, UnresolvedReference};
+use crate::beliefbase::BeliefContext;
 
 // ---------------------------------------------------------------------------
 // AssetCodec — zero-size no-op codec for static asset files

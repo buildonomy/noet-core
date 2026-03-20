@@ -313,7 +313,7 @@ fn partition_graph(graph: &BeliefGraph, pathmap: &PathMapMap) -> GraphPartition 
         networks.push((net_bref, net_bid));
 
         if let Some(pm) = pathmap.get_map(&net_bref) {
-            let all_paths = pm.recursive_map(pathmap, &mut BTreeSet::new());
+            let all_paths = pm.recursive_map(None, pathmap, &mut BTreeSet::new());
             for (_path, bid, _order) in all_paths {
                 bid_to_net.entry(bid).or_insert(net_bref);
             }

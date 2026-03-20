@@ -1,42 +1,14 @@
 use crate::{
     beliefbase::BeliefContext,
     codec::{
-        belief_ir::IntermediateRelation,
-        diagnostic::ParseDiagnostic,
-        md::{build_title_attribute, MdCodec},
-        DocCodec, IRNode, CODECS,
+        belief_ir::IntermediateRelation, diagnostic::ParseDiagnostic, md::MdCodec, DocCodec, IRNode,
     },
     error::BuildonomyError,
     nodekey::NodeKey,
-    paths::{os_path_to_string, AnchorPath},
+    paths::os_path_to_string,
     properties::{BeliefKind, BeliefNode, Bref, Weight, WeightKind},
 };
 use std::path::{Path, PathBuf};
-
-/// Collision-safe placeholder emitted into the HTML body by `NetworkCodec::generate_html()`.
-/// Survives `write_fragment`'s `Layout::Simple` template wrapping because it sits inside
-/// `{{BODY}}`. Always replaced by `generate_deferred_html` before the file is considered
-/// complete.
-///
-/// This string is reserved and must not appear in user content.
-pub const NETWORK_CHILDREN_SENTINEL: &str = "<!--@@noet-network-children@@-->";
-
-/// Author-facing placement marker. Write this exact raw HTML comment anywhere in the body of
-/// an `index.md` file to control where the auto-generated child listing is injected.
-///
-/// Example:
-/// ```markdown
-/// # My Network
-///
-/// Some introductory prose.
-///
-/// <!-- network-children -->
-///
-/// Additional notes below the listing.
-/// ```
-///
-/// If this marker is absent, the child listing is appended after all rendered content.
-pub const NETWORK_CHILDREN_MARKER: &str = "<!-- network-children -->";
 
 /// Standard filename designating a directory as the root of a BeliefNetwork.
 ///
@@ -187,176 +159,27 @@ impl DocCodec for NetworkCodec {
     }
 
     fn should_defer(&self) -> bool {
-        true
+        self.0.should_defer() || self.0.has_network_children
     }
 
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
-        // Network nodes always output "index.html" — we cannot use MdCodec::generate_html
-        // because it derives the filename from proto.path, which for network nodes is the
-        // directory path (not a file), producing an empty filestem error.
-        //
-        // Instead we call render_html_body() directly (which handles link rewriting) and
-        // inject the sentinel ourselves.
-        //
-        // Sentinel injection operates on the fully rendered HTML string, which is the
-        // concatenation of all current_events entries (the root node and every subsection).
-        // The marker is therefore found regardless of which section of index.md it appears in.
-        //
-        // - If NETWORK_CHILDREN_MARKER appears anywhere in the rendered body, replace the
-        //   first occurrence with the sentinel.
-        // - If absent, append the sentinel after all rendered content.
-        //
-        // IMPORTANT: current_events is never mutated here. All substitution is done on the
-        // rendered HTML string so that generate_source() round-trips remain clean.
+        use crate::codec::myst::{marker, promote_markers, sentinel};
+        // NetworkCodec always outputs to index.html. proto.path is the directory form
+        // (no filename component), so we cannot use MdCodec::generate_html's
+        // path-derived filename logic — call render_html_body directly instead.
+        let raw = self.0.render_html_body();
+        let nc_marker = marker("network_children");
+        let nc_sentinel = sentinel("network_children");
 
-        let mut body = self.0.render_html_body();
-
-        if body.contains(NETWORK_CHILDREN_MARKER) {
-            // Marker was present and rendered as an HTML comment — replace with sentinel.
-            body = body.replace(NETWORK_CHILDREN_MARKER, NETWORK_CHILDREN_SENTINEL);
+        // If the author placed the network_children marker, replace it with the sentinel.
+        // If absent, the directive was not present — no child listing is generated.
+        let body = if raw.contains(nc_marker) {
+            promote_markers(&raw.replace(nc_marker, nc_sentinel))
         } else {
-            // No marker — append sentinel after all content.
-            body.push_str(NETWORK_CHILDREN_SENTINEL);
-        }
+            promote_markers(&raw)
+        };
 
         Ok(vec![("index.html".to_string(), body)])
-    }
-
-    fn generate_deferred_html(
-        &self,
-        ctx: &BeliefContext<'_>,
-        existing_html_path: &Path,
-    ) -> Result<Option<(String, String)>, BuildonomyError> {
-        // Only generate index content for Network nodes.
-        if !ctx.node.kind.is_network() {
-            return Ok(None);
-        }
-
-        // Build the child listing HTML from context.
-        let listing_html = Self::build_listing_html(ctx);
-
-        // If the HTML file already exists on disk, splice the listing in at the sentinel.
-        if existing_html_path.exists() {
-            let content = std::fs::read_to_string(existing_html_path).map_err(|e| {
-                BuildonomyError::Codec(format!(
-                    "Failed to read existing HTML at {:?}: {}",
-                    existing_html_path, e
-                ))
-            })?;
-
-            if content.contains(NETWORK_CHILDREN_SENTINEL) {
-                let merged = content.replace(NETWORK_CHILDREN_SENTINEL, &listing_html);
-                std::fs::write(existing_html_path, merged).map_err(|e| {
-                    BuildonomyError::Codec(format!(
-                        "Failed to write merged HTML to {:?}: {}",
-                        existing_html_path, e
-                    ))
-                })?;
-                return Ok(None);
-            } else {
-                // Sentinel absent — generate_html intentionally did not emit one
-                // (author opt-out or future config). Respect the decision and do nothing.
-                tracing::info!(
-                    "[NetworkCodec] sentinel not found in {:?}, skipping child listing injection",
-                    existing_html_path
-                );
-                return Ok(None);
-            }
-        }
-
-        // Fallback: immediate phase was skipped (no html_output_dir at parse time).
-        // Return a fragment so the compiler can write it via write_fragment.
-        Ok(Some(("index.html".to_string(), listing_html)))
-    }
-}
-
-impl NetworkCodec {
-    /// Build the child-listing HTML fragment from the given BeliefContext.
-    ///
-    /// Queries Section-weighted edges, sorts by `WEIGHT_SORT_KEY`, and produces an HTML `<ul>`
-    /// of linked child documents grouped by subdirectory. Returns an empty-state message when
-    /// there are no children.
-    fn build_listing_html(ctx: &BeliefContext<'_>) -> String {
-        use crate::properties::{WeightKind, WEIGHT_SORT_KEY};
-
-        let sources = ctx.sources();
-        let mut children: Vec<_> = sources
-            .iter()
-            .filter_map(|edge| {
-                edge.weight.get(&WeightKind::Section).map(|section_weight| {
-                    let sort_key: u16 = section_weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
-                    (edge, sort_key)
-                })
-            })
-            .collect();
-
-        children.sort_by_key(|(_, sort_key)| *sort_key);
-
-        if children.is_empty() {
-            return "<p><em>No documents in this network yet.</em></p>\n".to_string();
-        }
-
-        let mut html = String::from("<ul>\n");
-        let mut last_subdir: Option<String> = None;
-
-        for (edge, _sort_key) in children {
-            if !edge.other.kind.is_document() {
-                // Only render documents, not file contents
-                continue;
-            }
-            let mut link_path = edge.root_path.clone();
-            let link_ap = AnchorPath::from(&edge.root_path);
-            if CODECS.get(&link_ap).is_some() {
-                if link_ap.is_dir() {
-                    link_path = link_ap.join("index.html").into_string();
-                } else {
-                    link_path = link_ap.replace_extension("html");
-                }
-            }
-
-            let title = edge.other.display_title();
-            if link_ap.dir().is_empty() {
-                if last_subdir.is_some() {
-                    html.push_str("</ul></li>");
-                    last_subdir = None;
-                }
-            } else if let Some(ref last_dir) = last_subdir {
-                if link_ap.dir() != last_dir {
-                    html.push_str(&format!("</ul></li><li><span>{}</span><ul>", link_ap.dir()));
-                    last_subdir = Some(link_ap.dir().to_string());
-                }
-            } else {
-                html.push_str(&format!("<li><span>{}</span><ul>", link_ap.dir()));
-                last_subdir = Some(link_ap.dir().to_string());
-            }
-
-            let bref_attr = ctx
-                .beliefbase()
-                .brefs()
-                .iter()
-                .find_map(|(bref, bid)| {
-                    if bid == &edge.other.bid {
-                        Some(format!(
-                            " title=\"{}\"",
-                            build_title_attribute(&format!("bref://{}", bref), false, None)
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            html.push_str(&format!(
-                "  <li><a href=\"/{}\"{}>{}</a></li>\n",
-                link_path, bref_attr, title
-            ));
-        }
-
-        if last_subdir.is_some() {
-            html.push_str("</ul></li>\n");
-        }
-        html.push_str("</ul>\n");
-        html
     }
 }
 
@@ -377,6 +200,7 @@ impl std::ops::DerefMut for NetworkCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::myst::{marker, sentinel};
     use crate::tests::helpers::init_logging;
 
     /// Write a minimal valid network index.md to `dir`.
@@ -414,19 +238,12 @@ mod tests {
         let (_, body) = &fragments[0];
 
         assert!(
-            body.contains(NETWORK_CHILDREN_SENTINEL),
-            "sentinel should be appended when no marker present; body:\n{body}"
+            !body.contains(sentinel("network_children")),
+            "sentinel should NOT be present when no marker in source; body:\n{body}"
         );
         assert!(
             body.contains("Some prose."),
             "authored prose should be present; body:\n{body}"
-        );
-        // Sentinel should appear after prose
-        let prose_pos = body.find("Some prose.").unwrap();
-        let sentinel_pos = body.find(NETWORK_CHILDREN_SENTINEL).unwrap();
-        assert!(
-            sentinel_pos > prose_pos,
-            "sentinel should appear after prose; body:\n{body}"
         );
     }
 
@@ -436,7 +253,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_index(
             dir.path(),
-            "# My Network\n\nProse before.\n\n<!-- network-children -->\n\nProse after.\n",
+            "# My Network\n\nProse before.\n\n````{network_children}\n````\n\nProse after.\n",
         );
         let codec = parse_network(dir.path());
 
@@ -445,11 +262,11 @@ mod tests {
         let (_, body) = &fragments[0];
 
         assert!(
-            body.contains(NETWORK_CHILDREN_SENTINEL),
+            body.contains(sentinel("network_children")),
             "sentinel should replace marker; body:\n{body}"
         );
         assert!(
-            !body.contains(NETWORK_CHILDREN_MARKER),
+            !body.contains(marker("network_children")),
             "author marker should not appear in output; body:\n{body}"
         );
         assert!(
@@ -463,7 +280,7 @@ mod tests {
         // Sentinel between the two prose blocks
         let before_pos = body.find("Prose before.").unwrap();
         let after_pos = body.find("Prose after.").unwrap();
-        let sentinel_pos = body.find(NETWORK_CHILDREN_SENTINEL).unwrap();
+        let sentinel_pos = body.find(sentinel("network_children")).unwrap();
         assert!(sentinel_pos > before_pos, "sentinel after 'before' prose");
         assert!(sentinel_pos < after_pos, "sentinel before 'after' prose");
     }
@@ -477,7 +294,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_index(
             dir.path(),
-            "# My Network\n\nIntro prose.\n\n## Contents\n\n<!-- network-children -->\n\nFooter.\n",
+            "# My Network\n\nIntro prose.\n\n## Contents\n\n````{network_children}\n````\n\nFooter.\n",
         );
         let codec = parse_network(dir.path());
 
@@ -486,11 +303,11 @@ mod tests {
         let (_, body) = &fragments[0];
 
         assert!(
-            body.contains(NETWORK_CHILDREN_SENTINEL),
+            body.contains(sentinel("network_children")),
             "sentinel should replace marker even inside a subsection; body:\n{body}"
         );
         assert!(
-            !body.contains(NETWORK_CHILDREN_MARKER),
+            !body.contains(marker("network_children")),
             "author marker should not appear in output; body:\n{body}"
         );
         assert!(
@@ -504,7 +321,7 @@ mod tests {
         // Sentinel appears after intro and before footer
         let intro_pos = body.find("Intro prose.").unwrap();
         let footer_pos = body.find("Footer.").unwrap();
-        let sentinel_pos = body.find(NETWORK_CHILDREN_SENTINEL).unwrap();
+        let sentinel_pos = body.find(sentinel("network_children")).unwrap();
         assert!(sentinel_pos > intro_pos, "sentinel after intro prose");
         assert!(sentinel_pos < footer_pos, "sentinel before footer prose");
     }
@@ -526,13 +343,113 @@ mod tests {
             .expect("generate_source should return Some");
 
         assert!(
-            !source.contains(NETWORK_CHILDREN_SENTINEL),
+            !source.contains(sentinel("network_children")),
             "sentinel must not appear in generate_source output; source:\n{source}"
         );
         assert!(
-            source.contains(NETWORK_CHILDREN_MARKER),
+            source.contains(marker("network_children")),
             "author marker should be preserved in source; source:\n{source}"
         );
+    }
+
+    #[test]
+    fn test_generate_html_myst_directive_injects_sentinel() {
+        // The MyST backtick-fence form must produce identical HTML output to the old
+        // <!-- network-children --> marker form.
+        init_logging();
+        let dir = tempfile::tempdir().unwrap();
+        write_index(
+            dir.path(),
+            "# My Network\n\nProse before.\n\n````{network_children}\n````\n\nProse after.\n",
+        );
+        let codec = parse_network(dir.path());
+
+        let fragments = codec.generate_html().expect("generate_html should succeed");
+        assert_eq!(fragments.len(), 1);
+        let (_, body) = &fragments[0];
+
+        assert!(
+            body.contains(sentinel("network_children")),
+            "sentinel should replace MyST directive; body:\n{body}"
+        );
+        assert!(
+            !body.contains("network_children"),
+            "directive name must not appear in HTML output; body:\n{body}"
+        );
+        assert!(
+            body.contains("Prose before."),
+            "prose before directive should be present; body:\n{body}"
+        );
+        assert!(
+            body.contains("Prose after."),
+            "prose after directive should be present; body:\n{body}"
+        );
+        // Sentinel between the two prose blocks
+        let before_pos = body.find("Prose before.").unwrap();
+        let after_pos = body.find("Prose after.").unwrap();
+        let sentinel_pos = body.find(sentinel("network_children")).unwrap();
+        assert!(sentinel_pos > before_pos, "sentinel after 'before' prose");
+        assert!(sentinel_pos < after_pos, "sentinel before 'after' prose");
+    }
+
+    #[test]
+    fn test_generate_source_round_trips_myst_directive() {
+        // Round-trip fidelity: parse + generate_source must preserve the MyST directive
+        // verbatim — the backtick-fence must not be rewritten or dropped.
+        init_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let directive_body = "````{network_children}\n````\n";
+        let body = format!("# My Network\n\nSome prose.\n\n{directive_body}\nMore prose.\n");
+        write_index(dir.path(), &body);
+        let codec = parse_network(dir.path());
+
+        let source = codec
+            .generate_source()
+            .expect("generate_source should return Some");
+
+        assert!(
+            source.contains(directive_body),
+            "MyST directive must be preserved verbatim in generate_source output; source:\n{source}"
+        );
+        assert!(
+            !source.contains(sentinel("network_children")),
+            "sentinel must not appear in generate_source output; source:\n{source}"
+        );
+        assert!(
+            !source.contains(marker("network_children")),
+            "HTML comment marker must not appear when MyST form was used; source:\n{source}"
+        );
+    }
+
+    #[test]
+    fn test_generate_html_backward_compat_html_comment_marker() {
+        // The old <!-- network-children --> form must still produce the sentinel in HTML
+        // output — no migration required for existing files.
+        init_logging();
+        let dir = tempfile::tempdir().unwrap();
+        write_index(
+            dir.path(),
+            "# My Network\n\nProse before.\n\n<!-- network-children -->\n\nProse after.\n",
+        );
+        let codec = parse_network(dir.path());
+
+        let fragments = codec.generate_html().expect("generate_html should succeed");
+        assert_eq!(fragments.len(), 1);
+        let (_, body) = &fragments[0];
+
+        assert!(
+            body.contains(sentinel("network_children")),
+            "sentinel should be present for old HTML comment form; body:\n{body}"
+        );
+        assert!(
+            !body.contains(marker("network_children")),
+            "HTML comment marker should be replaced, not appear in output; body:\n{body}"
+        );
+        let before_pos = body.find("Prose before.").unwrap();
+        let after_pos = body.find("Prose after.").unwrap();
+        let sentinel_pos = body.find(sentinel("network_children")).unwrap();
+        assert!(sentinel_pos > before_pos);
+        assert!(sentinel_pos < after_pos);
     }
 
     // ── generate_deferred_html: in-place replacement ──────────────────────────
@@ -569,7 +486,7 @@ mod tests {
         // Simulate what write_fragment produces: a file containing the sentinel in its body.
         let fake_html = format!(
             "<html><body><h1>My Network</h1><p>Prose.</p>{}</body></html>",
-            NETWORK_CHILDREN_SENTINEL
+            sentinel("network_children")
         );
         let html_path = dir.path().join("index.html");
         std::fs::write(&html_path, &fake_html).unwrap();
@@ -578,15 +495,15 @@ mod tests {
         // since constructing a full BeliefContext requires a live BeliefBase.
         // We simulate what generate_deferred_html does internally:
         let content = std::fs::read_to_string(&html_path).unwrap();
-        assert!(content.contains(NETWORK_CHILDREN_SENTINEL));
+        assert!(content.contains(sentinel("network_children")));
 
         let listing = "<ul><li>child</li></ul>";
-        let merged = content.replace(NETWORK_CHILDREN_SENTINEL, listing);
+        let merged = content.replace(sentinel("network_children"), listing);
         std::fs::write(&html_path, &merged).unwrap();
 
         let result = std::fs::read_to_string(&html_path).unwrap();
         assert!(
-            !result.contains(NETWORK_CHILDREN_SENTINEL),
+            !result.contains(sentinel("network_children")),
             "sentinel must not appear in final file; content:\n{result}"
         );
         assert!(
@@ -611,7 +528,7 @@ mod tests {
 
         // Simulate the no-sentinel branch: content is unchanged.
         let content = std::fs::read_to_string(&html_path).unwrap();
-        assert!(!content.contains(NETWORK_CHILDREN_SENTINEL));
+        assert!(!content.contains(sentinel("network_children")));
         // The real generate_deferred_html would tracing::info! and return Ok(None).
         // Verify the file is unchanged (no write occurred).
         let after = std::fs::read_to_string(&html_path).unwrap();

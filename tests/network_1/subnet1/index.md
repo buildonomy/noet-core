@@ -9,4 +9,11 @@ A sub-network identifies a set of files that are embedded/stitched into [[belief
 
 ## Documents
 
-<!-- network-children -->
+````{network_children}
+````
+
+
+## Requirements Table
+
+```{requirements_table}
+```

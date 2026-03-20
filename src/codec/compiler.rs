@@ -1,4 +1,5 @@
 use crate::{
+    beliefbase::BeliefGraph,
     beliefbase::{BeliefBase, BeliefSink, EpochDrain},
     codec::{
         assets::{get_stylesheet_urls, get_template, Layout},
@@ -13,7 +14,7 @@ use crate::{
     nodekey::NodeKey,
     paths::{os_path_to_string, string_to_os_path, AnchorPath, AnchorPathBuf},
     properties::{asset_namespace, Bid, Bref},
-    query::{BeliefSource, Expression, NeighborsExpression, Query},
+    query::{BeliefSource, Expression, Query},
 };
 
 use std::{
@@ -296,8 +297,8 @@ impl DocumentCompiler {
         let mut body = format!("---{}\n---\n", proto.document);
         if insert_children_marker {
             body.push_str(&format!(
-                "\n{}\n",
-                crate::codec::network::NETWORK_CHILDREN_MARKER
+                "\n{}\n````\n",
+                crate::codec::myst::directive("network_children")
             ));
         }
         file.write_all(body.as_bytes())?;
@@ -2172,11 +2173,12 @@ impl DocumentCompiler {
         // Get file extension
         let path_str = os_path_to_string(source_path);
         let source_path_ap = AnchorPath::new(&path_str);
-        let codec_factory = CODECS.get(&source_path_ap).ok_or_else(|| {
+        let _codec_factory = CODECS.get(&source_path_ap).ok_or_else(|| {
             let msg = format!("No codec available for {} files", source_path_ap);
             tracing::warn!("{}", msg);
             BuildonomyError::Codec(msg)
         })?;
+
         // Query for the node using repo-relative path. source_path is an absolute filesystem
         // path (stored in self.deferred_html), which was normalised by normalize_queue_path
         // before insertion, so strip_prefix against repo_root is safe.
@@ -2188,42 +2190,31 @@ impl DocumentCompiler {
             net: self.builder.repo().bref(),
             path: repo_relative_str.clone(),
         };
-        let mut bb = BeliefBase::from(
-            global_bb
-                .eval_query(
-                    &Query {
-                        seed: Expression::from(&nodekey),
-                        traverse: Some(NeighborsExpression {
-                            filter: None,
-                            upstream: 1,
-                            downstream: 0,
-                        }),
-                    },
-                    true,
-                )
-                .await?,
-        );
-        let Some(node) = bb.get(&nodekey) else {
+
+        // ── Step 0: resolve the document node (graphs[0]) ────────────────────
+        // Seed-only query — we only need the node itself. The directive pipeline
+        // fetches additional data lazily, one eval_query call per refiner.
+        let node_graph = global_bb
+            .eval_query(
+                &Query {
+                    seed: Expression::from(&nodekey),
+                    traverse: None,
+                },
+                true,
+            )
+            .await?;
+
+        let node_bb = BeliefBase::from(node_graph.clone());
+        let Some(node) = node_bb.get(&nodekey) else {
             tracing::warn!(
                 "[generate_html_for_path] No match found for path: '{}'\nbb.paths:\n{}",
                 nodekey,
-                bb.paths()
+                node_bb.paths()
             );
             return Ok(());
         };
-        let Some(ctx) = bb.get_context(&self.builder.repo(), &node.bid) else {
-            tracing::warn!(
-                "[generate_html_for_path] No match found for path: '{}'",
-                nodekey
-            );
-            return Ok(());
-        };
-
-        // Generate HTML using fresh codec instance (deferred generation)
-        let codec = codec_factory();
-
-        // Get title for write_fragment fallback path
-        let title = ctx.node.display_title().to_string();
+        let node_bid = node.bid;
+        let title = node.display_title().to_string();
 
         // Convert absolute path to repo-relative path.
         // source_path is normalised (via normalize_queue_path at insertion), so
@@ -2233,23 +2224,19 @@ impl DocumentCompiler {
             .unwrap_or(source_path);
 
         // Get base directory for output (ctx.path for directories, parent for files)
-        // ctx.path is home-network relative, so for network nodes it's just the network name
-        // For document files, use the parent directory
+        // ctx.path is home-network relative, so for network nodes it's just the network name.
+        // For document files, use the parent directory.
         let base_dir = if source_path.is_dir() {
-            // Network nodes may pass in directories as source_path
             repo_relative_path
         } else {
-            // Document nodes: use parent directory of the source file
             repo_relative_path.parent().unwrap_or(Path::new(""))
         };
 
-        // Compute the expected on-disk HTML output path so the deferred codec can read and
-        // modify it in place (sentinel replacement). This mirrors write_fragment's layout:
-        // html_output_dir / "pages" / base_dir / filename.
-        //
+        // Compute the expected on-disk HTML output path for sentinel splicing.
+        // This mirrors write_fragment's layout: html_output_dir / "pages" / base_dir / filename.
         // For network nodes the deferred output filename is always "index.html".
         let deferred_filename_buf;
-        let deferred_filename = if ctx.node.kind.is_network() {
+        let deferred_filename = if node.kind.is_network() {
             "index.html"
         } else {
             deferred_filename_buf = format!(
@@ -2266,14 +2253,96 @@ impl DocumentCompiler {
             .join(base_dir)
             .join(deferred_filename);
 
-        match codec.generate_deferred_html(&ctx, &existing_html_path)? {
-            None => {
-                // Codec handled the write itself (in-place sentinel replacement). Nothing to do.
+        // ── Directive query pipeline ──────────────────────────────────────────
+        //
+        // `graphs` is the shared accumulator for all directive pipelines on this document.
+        //
+        //   graphs[0]   — node-resolution graph (always present, produced above)
+        //   graphs[1..] — one entry per eval_query call across all directive pipelines,
+        //                 in the order the directives appear in DIRECTIVES and their
+        //                 queries slices.
+        //
+        // Each refiner fn receives `&graphs[..]` so it can reference any prior result by
+        // index. The builder receives the same full slice.
+        //
+        // We only run directives whose sentinel appears in the on-disk HTML, avoiding
+        // unnecessary DB round-trips for documents that don't use a given directive.
+        // When the file does not yet exist we run all directives that have a non-empty
+        // sentinel (fallback path: the compiler will write the fragment via write_fragment).
+        let html_exists = existing_html_path.exists();
+        let existing_html = if html_exists {
+            Some(std::fs::read_to_string(&existing_html_path).map_err(|e| {
+                BuildonomyError::Codec(format!(
+                    "Failed to read existing HTML at {:?}: {}",
+                    existing_html_path, e
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        let mut graphs: Vec<BeliefGraph> = vec![node_graph];
+        // (sentinel, built_html) pairs collected for splicing / fallback write.
+        let mut splice_pairs: Vec<(String, String)> = Vec::new();
+
+        for d in crate::codec::myst::DIRECTIVES {
+            if d.sentinel.is_empty() || d.builder.is_none() {
+                continue;
             }
-            Some((filename, html_body)) => {
-                // Codec returned a fragment — write it via write_fragment as normal.
-                let rel_path = base_dir.join(&filename);
-                self.write_fragment(html_output_dir, &rel_path, html_body, &title, &node.bid)
+            // Skip this directive if its sentinel is not present in the output.
+            let sentinel_present = existing_html
+                .as_deref()
+                .map(|h| h.contains(d.sentinel))
+                .unwrap_or(true); // file absent → assume all sentinels relevant
+            if !sentinel_present {
+                continue;
+            }
+
+            // Run each refiner, appending its result to `graphs`.
+            for refiner in d.queries {
+                let expr = refiner(&graphs);
+                let next = global_bb
+                    .eval_query(
+                        &Query {
+                            seed: expr,
+                            traverse: None,
+                        },
+                        true,
+                    )
+                    .await?;
+                graphs.push(next);
+            }
+
+            // Call the sync builder with the full accumulated slice.
+            if let Some(builder) = d.builder {
+                let html = builder(&graphs)?;
+                splice_pairs.push((d.sentinel.to_string(), html));
+            }
+        }
+
+        // ── Sentinel splicing or fallback write ───────────────────────────────
+        if splice_pairs.is_empty() {
+            return Ok(());
+        }
+
+        let refs: Vec<(&str, &str)> = splice_pairs
+            .iter()
+            .map(|(s, h)| (s.as_str(), h.as_str()))
+            .collect();
+
+        if html_exists {
+            crate::codec::myst::splice_sentinels(&existing_html_path, &refs)?;
+        } else {
+            // Fallback: no on-disk file yet — concatenate all fragments and let
+            // write_fragment handle the full page wrap.
+            let fallback_body: String = splice_pairs
+                .iter()
+                .map(|(_, h)| h.as_str())
+                .collect::<Vec<_>>()
+                .concat();
+            if !fallback_body.is_empty() {
+                let rel_path = base_dir.join(deferred_filename);
+                self.write_fragment(html_output_dir, &rel_path, fallback_body, &title, &node_bid)
                     .await?;
             }
         }
@@ -2436,7 +2505,7 @@ mod tests {
     use super::*;
     use crate::{
         beliefbase::{BeliefBase, BeliefGraph},
-        codec::{diagnostic::UnresolvedReference, network::NETWORK_CHILDREN_SENTINEL},
+        codec::diagnostic::UnresolvedReference,
         event::BeliefEvent,
         nodekey::NodeKey,
         properties::{Bid, WeightKind},
@@ -3075,7 +3144,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let content = std::fs::read_to_string(&index_path).unwrap();
 
         assert!(
-            !content.contains(NETWORK_CHILDREN_SENTINEL),
+            !content.contains(crate::codec::myst::sentinel("network_children")),
             "sentinel must be replaced by finalize_html; raw sentinel found in:\n{}",
             &content[..content.len().min(1000)]
         );
@@ -3128,7 +3197,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let content = std::fs::read_to_string(&subnet_index).unwrap();
 
         assert!(
-            !content.contains(NETWORK_CHILDREN_SENTINEL),
+            !content.contains(crate::codec::myst::sentinel("network_children")),
             "sentinel must be replaced in subnet index.html; raw sentinel found in:\n{}",
             &content[..content.len().min(1000)]
         );

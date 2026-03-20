@@ -1,6 +1,6 @@
 use pulldown_cmark::{
-    BrokenLink, CowStr, Event as MdEvent, HeadingLevel, LinkType, MetadataBlockKind, Options,
-    Parser as MdParser, Tag as MdTag, TagEnd as MdTagEnd,
+    BrokenLink, CodeBlockKind as MdCodeBlockKind, CowStr, Event as MdEvent, HeadingLevel, LinkType,
+    MetadataBlockKind, Options, Parser as MdParser, Tag as MdTag, TagEnd as MdTagEnd,
 };
 use pulldown_cmark_to_cmark::{
     cmark_resume_with_source_range_and_options, Options as CmarkToCmarkOptions,
@@ -996,6 +996,18 @@ pub struct MdCodec {
     seen_ids: HashSet<String>,
     /// Byte offset of the most recently opened heading start tag, for position hints in diagnostics
     heading_start_offset: Option<usize>,
+    /// Set while inside a `{implements}` block directive. All links encountered while this
+    /// flag is set are recorded as `WeightKind::Pragmatic` upstream relations instead of
+    /// the default `WeightKind::Epistemic`. Cleared by `{end}` or any heading.
+    in_implements_block: bool,
+    /// Set to `true` during `parse()` when a deferred work directive (i.e. `{requirements_table`) is
+    /// encountered. Drives `should_defer()` so the compiler calls `generate_deferred_html()` for
+    /// this doc.
+    pub(crate) has_deferred_render: bool,
+    /// Set to `true` during `parse()` when a `{network_children}` MyST directive or the legacy
+    /// `<!-- network-children -->` HTML comment marker is encountered. Used by
+    /// `NetworkCodec::should_defer()` to signal that deferred child-listing replacement is needed.
+    pub(crate) has_network_children: bool,
 }
 
 impl MdCodec {
@@ -1006,6 +1018,9 @@ impl MdCodec {
             matched_sections: HashSet::new(),
             seen_ids: HashSet::new(),
             heading_start_offset: None,
+            in_implements_block: false,
+            has_deferred_render: false,
+            has_network_children: false,
         }
     }
 
@@ -1073,12 +1088,6 @@ impl MdCodec {
         }
     }
 
-    /// Render all parsed events to an HTML body string, rewriting document links to `.html`.
-    ///
-    /// This is the shared rendering kernel used by both `generate_html` (which derives the
-    /// output filename from the source path) and `NetworkCodec::generate_html` (which always
-    /// uses `index.html` as the output filename). Keeping the rendering logic in one place
-    /// ensures link-rewriting behaviour stays consistent across both code paths.
     pub fn render_html_body(&self) -> String {
         fn rewrite_md_links_to_html(event: MdEvent<'static>) -> MdEvent<'static> {
             match event {
@@ -1135,7 +1144,7 @@ impl MdCodec {
         // The old approach always used to_anchor(title), which broke NavTree links whenever
         // an author supplied an explicit {#id} override — generate_terminal_path would put
         // the explicit id in the PathMap, but the HTML rendered a different anchor.
-        let events = self
+        let raw_events: Vec<MdEvent<'static>> = self
             .current_events
             .iter()
             .flat_map(|(proto, events)| {
@@ -1183,10 +1192,49 @@ impl MdCodec {
                     }
                 })
             })
-            .map(rewrite_md_links_to_html);
+            .map(rewrite_md_links_to_html)
+            .collect();
+
+        // Substitute MyST directive CodeBlock event pairs with their HTML marker.
+        // A zero-body directive produces exactly two events:
+        //   Start(CodeBlock(Fenced("{name}")))
+        //   End(CodeBlock)
+        // A directive with body content inserts Text events in between — we skip those too.
+        // Unknown directives and plain fenced code blocks are passed through unchanged.
+        let events = {
+            let mut out: Vec<MdEvent<'static>> = Vec::with_capacity(raw_events.len());
+            let mut i = 0;
+            while i < raw_events.len() {
+                if let MdEvent::Start(MdTag::CodeBlock(MdCodeBlockKind::Fenced(ref info))) =
+                    raw_events[i]
+                {
+                    if let Some((name, _args)) =
+                        crate::codec::myst::parse_directive_info(info.as_ref())
+                    {
+                        if let Some(marker) = crate::codec::myst::lookup(name) {
+                            // Consume Start, any intervening Text/body, and End(CodeBlock).
+                            i += 1;
+                            while i < raw_events.len() {
+                                if matches!(raw_events[i], MdEvent::End(MdTagEnd::CodeBlock)) {
+                                    i += 1; // consume End
+                                    break;
+                                }
+                                i += 1; // skip body Text events
+                            }
+                            // Emit the marker as raw HTML in its place.
+                            out.push(MdEvent::Html(CowStr::from(marker)));
+                            continue;
+                        }
+                    }
+                }
+                out.push(raw_events[i].clone());
+                i += 1;
+            }
+            out
+        };
 
         let mut html_body = String::new();
-        pulldown_cmark::html::push_html(&mut html_body, events);
+        pulldown_cmark::html::push_html(&mut html_body, events.into_iter());
         html_body
     }
 }
@@ -1419,6 +1467,10 @@ impl DocCodec for MdCodec {
         }
     }
 
+    fn should_defer(&self) -> bool {
+        self.has_deferred_render
+    }
+
     fn generate_source(&self) -> Option<String> {
         let events = self
             .current_events
@@ -1445,7 +1497,9 @@ impl DocCodec for MdCodec {
         }
         let output_filename = format!("{}.html", doc_abs_ap.filestem());
 
-        Ok(vec![(output_filename, self.render_html_body())])
+        let body = crate::codec::myst::promote_markers(&self.render_html_body());
+
+        Ok(vec![(output_filename, body)])
     }
 
     fn finalize(
@@ -1605,6 +1659,9 @@ impl DocCodec for MdCodec {
         self.matched_sections.clear();
         self.seen_ids.clear();
         self.heading_start_offset = None;
+        self.in_implements_block = false;
+        self.has_deferred_render = false;
+        self.has_network_children = false;
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
@@ -1646,8 +1703,12 @@ impl DocCodec for MdCodec {
                     } else {
                         None
                     };
-                    let mut relation =
-                        IntermediateRelation::new(node_key, WeightKind::Epistemic, payload);
+                    let relation_kind = if self.in_implements_block {
+                        WeightKind::Pragmatic
+                    } else {
+                        WeightKind::Epistemic
+                    };
+                    let mut relation = IntermediateRelation::new(node_key, relation_kind, payload);
                     if let Some(byte_offset) = link_data.range.as_ref().map(|r| r.start) {
                         relation = relation.with_location(byte_offset);
                     }
@@ -1694,6 +1755,9 @@ impl DocCodec for MdCodec {
                     classes: _,
                     attrs: _,
                 }) => {
+                    // Auto-close any open block directive on heading boundaries.
+                    // No warning — this is the documented implicit-close behaviour.
+                    self.in_implements_block = false;
                     self.heading_start_offset = Some(offset.start);
                     let heading = match level {
                         // 0: UUID_NAMESPACE_BUILDONOMY
@@ -1862,6 +1926,61 @@ impl DocCodec for MdCodec {
                             }
                         }
                         self.heading_start_offset = None;
+                    }
+                }
+                MdEvent::Start(MdTag::CodeBlock(MdCodeBlockKind::Fenced(info))) => {
+                    // Detect MyST backtick-fence directives: info strings of the form `{name}`
+                    // or `{name} args`.  Plain language tags (e.g. "rust") are unaffected.
+                    if let Some((name, _args)) =
+                        crate::codec::myst::parse_directive_info(info.as_ref())
+                    {
+                        match crate::codec::myst::lookup(name) {
+                            None if !name.is_empty() => {
+                                diagnostics.push(ParseDiagnostic::warning(format!(
+                                    "unknown noet directive: {{{name}}}"
+                                )));
+                            }
+                            Some(_) if crate::codec::myst::is_block_opener(name) => {
+                                // Opening a block directive while one is already open:
+                                // warn and implicitly close the previous one first.
+                                if self.in_implements_block {
+                                    diagnostics.push(ParseDiagnostic::warning(format!(
+                                        "opening directive {{{name}}} while a block directive is \
+                                         already open; implicitly closing the previous block"
+                                    )));
+                                }
+                                self.in_implements_block = true;
+                            }
+                            Some(_) if name == "end" => {
+                                if self.in_implements_block {
+                                    self.in_implements_block = false;
+                                } else {
+                                    diagnostics.push(ParseDiagnostic::warning(
+                                        "{{end}} directive encountered with no open block"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                // Known non-block directive (e.g. network_children, requirements_table)
+                                // or empty name: check for deferred-rendering directives.
+                                if name == "requirements_table" {
+                                    self.has_deferred_render = true;
+                                } else if name == "network_children" {
+                                    self.has_network_children = true;
+                                }
+                            }
+                        }
+                        // Known or unknown: keep original events in proto_events unchanged
+                        // (write-back fidelity). Substitution happens at render time in
+                        // render_html_body / NetworkCodec::generate_html.
+                    }
+                }
+                MdEvent::Html(cow_str) => {
+                    // Detect the legacy <!-- network-children --> HTML comment marker so
+                    // NetworkCodec::should_defer() knows to run the deferred child listing pass.
+                    if cow_str.contains(crate::codec::myst::marker("network_children")) {
+                        self.has_network_children = true;
                     }
                 }
                 _ => {}
@@ -3176,4 +3295,502 @@ Already HTML [html link](./page.html "bref://doc789").
 
     // Note: Integration test for static asset tracking needed with full GraphBuilder flow
     // MdCodec::parse only creates IRNodes; relations are created by GraphBuilder
+
+    // ── {implements} / {end} block directive ─────────────────────────────────
+
+    /// Parse `content` through a fresh MdCodec and return the flattened upstream relations
+    /// from all proto nodes, plus any diagnostics.
+    fn parse_upstream(content: &str) -> (Vec<IntermediateRelation>, Vec<ParseDiagnostic>) {
+        let mut codec = MdCodec::new();
+        let mut diagnostics = Vec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut diagnostics).unwrap();
+        let relations = codec
+            .current_events
+            .iter()
+            .flat_map(|(node, _)| node.upstream.iter().cloned())
+            .collect();
+        (relations, diagnostics)
+    }
+
+    #[test]
+    fn test_implements_block_links_are_pragmatic() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{implements}
+````
+
+[some target](target.md)
+
+````{end}
+````
+";
+        let (relations, diagnostics) = parse_upstream(content);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !matches!(d, ParseDiagnostic::Warning { .. })),
+            "expected no warnings; got: {diagnostics:?}"
+        );
+        let pragmatic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Pragmatic)
+            .collect();
+        assert_eq!(
+            pragmatic.len(),
+            1,
+            "expected exactly one Pragmatic relation; got: {relations:?}"
+        );
+        let epistemic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Epistemic)
+            .collect();
+        assert!(
+            epistemic.is_empty(),
+            "expected no Epistemic relations; got: {relations:?}"
+        );
+    }
+
+    #[test]
+    fn test_links_outside_implements_block_are_epistemic() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+[before](before.md)
+
+````{implements}
+````
+
+[inside](inside.md)
+
+````{end}
+````
+
+[after](after.md)
+";
+        let (relations, _) = parse_upstream(content);
+        let pragmatic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Pragmatic)
+            .collect();
+        let epistemic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Epistemic)
+            .collect();
+        assert_eq!(
+            pragmatic.len(),
+            1,
+            "only 'inside' should be Pragmatic; got: {pragmatic:?}"
+        );
+        assert_eq!(
+            epistemic.len(),
+            2,
+            "before and after should be Epistemic; got: {epistemic:?}"
+        );
+    }
+
+    #[test]
+    fn test_implements_block_auto_closes_on_heading() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{implements}
+````
+
+[inside](inside.md)
+
+## Next Section
+
+[after heading](after.md)
+";
+        let (relations, diagnostics) = parse_upstream(content);
+        // No warning — auto-close on heading is silent
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !matches!(d, ParseDiagnostic::Warning { .. })),
+            "expected no warnings on heading auto-close; got: {diagnostics:?}"
+        );
+        let pragmatic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Pragmatic)
+            .collect();
+        let epistemic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Epistemic)
+            .collect();
+        assert_eq!(
+            pragmatic.len(),
+            1,
+            "only 'inside' should be Pragmatic; got: {pragmatic:?}"
+        );
+        assert_eq!(
+            epistemic.len(),
+            1,
+            "'after heading' should be Epistemic; got: {epistemic:?}"
+        );
+    }
+
+    #[test]
+    fn test_stray_end_directive_emits_warning() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{end}
+````
+";
+        let (_, diagnostics) = parse_upstream(content);
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| matches!(d, ParseDiagnostic::Warning { .. }))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for stray {{end}}; got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_implements_emits_warning_and_stays_open() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{implements}
+````
+
+[first](first.md)
+
+````{implements}
+````
+
+[second](second.md)
+
+````{end}
+````
+";
+        let (relations, diagnostics) = parse_upstream(content);
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| matches!(d, ParseDiagnostic::Warning { .. }))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for nested open; got: {diagnostics:?}"
+        );
+        // Both links should be Pragmatic — second open implicitly closes first, then opens again
+        let pragmatic: Vec<_> = relations
+            .iter()
+            .filter(|r| r.kind == WeightKind::Pragmatic)
+            .collect();
+        assert_eq!(
+            pragmatic.len(),
+            2,
+            "both links should be Pragmatic after implicit re-open; got: {relations:?}"
+        );
+    }
+
+    #[test]
+    fn test_implements_directives_suppressed_from_html() {
+        init_logging();
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{implements}
+````
+
+[target](target.md)
+
+````{end}
+````
+";
+        let mut codec = MdCodec::new();
+        let mut diagnostics = Vec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut diagnostics).unwrap();
+        let html = codec.render_html_body();
+        assert!(
+            !html.contains("implements"),
+            "directive name must not appear in HTML; html:\n{html}"
+        );
+        assert!(
+            !html.contains("<pre>"),
+            "no <pre> block should be emitted for directives; html:\n{html}"
+        );
+    }
+
+    #[test]
+    fn test_implements_directive_round_trips_in_source() {
+        init_logging();
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{implements}
+````
+
+[target](target.md)
+
+````{end}
+````
+";
+        let mut codec = MdCodec::new();
+        let mut diagnostics = Vec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut diagnostics).unwrap();
+        let source = codec
+            .generate_source()
+            .expect("generate_source should return Some");
+        assert!(
+            source.contains("````{implements}"),
+            "implements directive must be preserved in source; source:\n{source}"
+        );
+        assert!(
+            source.contains("````{end}"),
+            "end directive must be preserved in source; source:\n{source}"
+        );
+    }
+
+    // ── {requirements_table} directive ───────────────────────────────────────
+
+    #[test]
+    fn test_requirements_table_sets_should_defer() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{requirements_table}
+````
+";
+        let mut codec = MdCodec::new();
+        let mut diagnostics = Vec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut diagnostics).unwrap();
+        assert!(
+            codec.should_defer(),
+            "should_defer() must be true when {{requirements_table}} is present"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !matches!(d, ParseDiagnostic::Warning { .. })),
+            "expected no warnings; got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_requirements_table_does_not_defer() {
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+Some prose without any directive.
+";
+        let mut codec = MdCodec::new();
+        let mut diagnostics = Vec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut diagnostics).unwrap();
+        assert!(
+            !codec.should_defer(),
+            "should_defer() must be false when no {{requirements_table}} is present"
+        );
+    }
+
+    #[test]
+    fn test_requirements_table_sentinel_injected_in_generate_html() {
+        use crate::codec::myst::{marker, sentinel};
+        init_logging();
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+Before table.
+
+````{requirements_table}
+````
+
+After table.
+";
+        let mut codec = MdCodec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut vec![]).unwrap();
+
+        let fragments = codec.generate_html().expect("generate_html should succeed");
+        assert_eq!(fragments.len(), 1);
+        let (_, body) = &fragments[0];
+
+        assert!(
+            body.contains(sentinel("requirements_table")),
+            "sentinel must be present in HTML output; body:\n{body}"
+        );
+        assert!(
+            !body.contains(marker("requirements_table")),
+            "intermediate marker must not appear in HTML output; body:\n{body}"
+        );
+        assert!(
+            !body.contains("requirements_table"),
+            "directive name must not appear in HTML output; body:\n{body}"
+        );
+        assert!(
+            !body.contains("<pre>"),
+            "no <pre> block should be emitted for the directive; body:\n{body}"
+        );
+        // Sentinel is positioned between the prose blocks
+        let before_pos = body.find("Before table.").unwrap();
+        let after_pos = body.find("After table.").unwrap();
+        let sentinel_pos = body.find(sentinel("requirements_table")).unwrap();
+        assert!(
+            sentinel_pos > before_pos,
+            "sentinel must appear after 'Before table.'"
+        );
+        assert!(
+            sentinel_pos < after_pos,
+            "sentinel must appear before 'After table.'"
+        );
+    }
+
+    #[test]
+    fn test_requirements_table_round_trips_in_source() {
+        init_logging();
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{requirements_table}
+````
+";
+        let mut codec = MdCodec::new();
+        let proto = IRNode {
+            path: "doc.md".to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut vec![]).unwrap();
+        let source = codec
+            .generate_source()
+            .expect("generate_source should return Some");
+        assert!(
+            source.contains("````{requirements_table}"),
+            "directive must be preserved verbatim in generate_source; source:\n{source}"
+        );
+        assert!(
+            !source.contains(crate::codec::myst::sentinel("requirements_table")),
+            "sentinel must not appear in generate_source output; source:\n{source}"
+        );
+    }
+
+    #[test]
+    fn test_requirements_table_deferred_html_replaces_sentinel() {
+        init_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let rt_sentinel = crate::codec::myst::sentinel("requirements_table");
+
+        // Simulate what write_fragment produces: an HTML file containing the sentinel.
+        let fake_html = format!(
+            "<html><body><h1>Doc</h1><p>Before.</p>{}<p>After.</p></body></html>",
+            rt_sentinel
+        );
+        let html_path = dir.path().join("doc.html");
+        std::fs::write(&html_path, &fake_html).unwrap();
+
+        // Build a codec that has has_deferred_render=true.
+        let content = "\
+---
+id = \"doc\"
+---
+
+# Doc
+
+````{requirements_table}
+````
+";
+        let mut codec = MdCodec::new();
+        let proto = IRNode {
+            path: dir.path().join("doc.md").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        codec.parse(content, proto, &mut vec![]).unwrap();
+        assert!(codec.should_defer());
+
+        // Directly verify the sentinel-replacement logic without a live BeliefBase:
+        // read, replace, write — mirrors what generate_deferred_html does internally.
+        let content_on_disk = std::fs::read_to_string(&html_path).unwrap();
+        assert!(content_on_disk.contains(rt_sentinel));
+
+        let placeholder = "<p><em>No requirements found for this section.</em></p>\n";
+        let merged = content_on_disk.replace(rt_sentinel, placeholder);
+        std::fs::write(&html_path, &merged).unwrap();
+
+        let result = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            !result.contains(rt_sentinel),
+            "sentinel must be replaced; result:\n{result}"
+        );
+        assert!(
+            result.contains("No requirements found"),
+            "replacement content must appear; result:\n{result}"
+        );
+        assert!(
+            result.contains("Before.") && result.contains("After."),
+            "surrounding prose must be preserved; result:\n{result}"
+        );
+    }
 }

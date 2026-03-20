@@ -495,8 +495,8 @@ impl AsSql for RelationPred {
                 }
                 RelationPred::Kind(kinds) => {
                     let mut kind_q = Vec::<String>::new();
-                    for kind in kinds {
-                        let column_name = format!("{kind:?}").to_lowercase();
+                    for (weight_kind, _weight) in kinds {
+                        let column_name = format!("{weight_kind:?}").to_lowercase();
                         kind_q.push(format!(
                             "{} IS{} NULL",
                             column_name,
@@ -515,7 +515,7 @@ impl AsSql for RelationPred {
         );
         build_where_clause(self, match_pred, qb);
         qb.push(
-            "UNION SELECT DISTINCT sink as bid \
+            " UNION SELECT DISTINCT sink as bid \
              FROM relations \
              WHERE ",
         );

@@ -5,4 +5,5 @@ id = "belief-network-test-1"
 
 A small test directory for BeliefBase codec testing.
 
-<!-- network-children -->
+````{network_children}
+````

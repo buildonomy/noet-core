@@ -182,6 +182,8 @@ pub mod diagnostic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod md;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod myst;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod network;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proto_index;
@@ -375,73 +377,6 @@ pub trait DocCodec: Sync {
     /// Default implementation returns empty vec (no HTML generation).
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
         Ok(vec![])
-    }
-
-    /// Generate HTML with full BeliefContext (deferred phase).
-    ///
-    /// Called after all parsing completes, with full context available.
-    /// Use for codecs that need to query relationships (e.g., network indices listing children).
-    ///
-    /// Only called if `should_defer()` returns `true`.
-    ///
-    /// # Parameters
-    /// - `ctx`: BeliefContext with full graph relationships and metadata
-    /// - `existing_html_path`: Absolute path to the HTML file already written by the immediate
-    ///   `generate_html()` phase. The codec may read this file, modify it in place, and return
-    ///   `Ok(None)` to signal that the write is complete. If the file does not exist (e.g.
-    ///   `html_output_dir` was not configured at parse time), the codec should fall back to
-    ///   returning a body fragment for the compiler to write via `write_fragment`.
-    ///
-    /// # Returns
-    /// - `Ok(None)` — codec handled the write itself (in-place modification). Compiler does
-    ///   nothing further. Also the correct return value when there is nothing to write.
-    /// - `Ok(Some((filename, body)))` — compiler calls `write_fragment` to write the body.
-    ///   `filename` is relative to the source file's directory.
-    /// - `Err(_)` — generation failed.
-    ///
-    /// # Sentinel Protocol
-    ///
-    /// Codecs that want to splice context-dependent content into authored prose should emit a
-    /// sentinel string from `generate_html()` at the desired injection point. The sentinel
-    /// survives `write_fragment`'s template wrapping (it sits inside `{{BODY}}`). The deferred
-    /// phase reads the on-disk file, replaces the sentinel, and writes back.
-    ///
-    /// If the sentinel is absent from the existing file, the codec should log
-    /// `tracing::info!` and return `Ok(None)` — its absence is intentional (author opt-out
-    /// or future config).
-    ///
-    /// # Example: Network Index
-    /// ```ignore
-    /// fn generate_deferred_html(
-    ///     &self,
-    ///     ctx: &BeliefContext,
-    ///     existing_html_path: &Path,
-    /// ) -> Result<Option<(String, String)>, BuildonomyError> {
-    ///     let listing_html = /* build child listing from ctx */;
-    ///
-    ///     if existing_html_path.exists() {
-    ///         let mut content = std::fs::read_to_string(existing_html_path)?;
-    ///         if content.contains(SENTINEL) {
-    ///             content = content.replace(SENTINEL, &listing_html);
-    ///             std::fs::write(existing_html_path, content)?;
-    ///             Ok(None)
-    ///         } else {
-    ///             tracing::info!("sentinel not found in {:?}, skipping injection", existing_html_path);
-    ///             Ok(None)
-    ///         }
-    ///     } else {
-    ///         Ok(Some(("index.html".to_string(), listing_html)))
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// Default implementation returns `Ok(None)` (nothing to write).
-    fn generate_deferred_html(
-        &self,
-        _ctx: &BeliefContext<'_>,
-        _existing_html_path: &std::path::Path,
-    ) -> Result<Option<(String, String)>, BuildonomyError> {
-        Ok(None)
     }
 }
 

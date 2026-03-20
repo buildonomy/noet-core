@@ -308,15 +308,16 @@ noet-core supports **multiple document formats** through a pluggable codec syste
 
 ```rust
 pub trait DocCodec {
-    fn parse(&mut self, content: String, current: IRNode) -> Result<(), BuildonomyError>;
+    fn parse(&mut self, content: &str, current: IRNode, diagnostics: &mut Vec<ParseDiagnostic>)
+        -> Result<(), BuildonomyError>;
     fn nodes(&self) -> Vec<IRNode>;
-    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext,
+        diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Option<BeliefNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
-    
-    // HTML Generation API
-    fn should_defer(&self) -> bool;  // Signal if codec needs full context
-    fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, BuildonomyError>;  // Immediate generation
-    fn generate_deferred_html(&self, ctx: &BeliefContext) -> Result<Vec<(PathBuf, String)>, BuildonomyError>;  // Context-aware generation
+
+    // HTML Generation API (two-phase)
+    fn should_defer(&self) -> bool { false }  // Signal if codec needs deferred pass
+    fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> { Ok(vec![]) }
 }
 ```
 
@@ -326,22 +327,43 @@ pub trait DocCodec {
 use noet_core::codec::{CODECS, DocCodec, CodecFactory};
 
 // Register factory function for .org files
-CODECS.insert("org".to_string(), || Box::new(OrgModeCodec::new()));
+CODECS.insert_codec("org", || Box::new(OrgModeCodec::new()));
 ```
 
-**Dual-Phase HTML Generation**:
-1. **Immediate** (`generate_html`): Called after parsing, uses parsed AST. Example: Markdown → HTML
-2. **Deferred** (`generate_deferred_html`): Called after all parsing, with full graph context. Example: Network indices listing child documents
+**Two-Phase HTML Generation**:
+
+1. **Immediate** (`generate_html`): Called after parsing, uses parsed AST. Example:
+   Markdown → HTML. For documents containing MyST directives that need graph context
+   (e.g. `{network_children}`), `generate_html` emits a sentinel placeholder string at
+   the directive's position in the output. `should_defer` returns `true` to signal that
+   the deferred pass must replace the sentinel.
+
+2. **Deferred** (compiler-owned): After all parsing completes, `DocumentCompiler`
+   runs an async query pipeline for each document in the deferred queue. Each directive's
+   `queries` refiners fetch the data they need from the belief graph; the sync `builder`
+   produces HTML; `splice_sentinels` replaces the placeholder in the on-disk file.
+   Codecs do **not** implement a deferred method — the compiler owns this phase.
 
 **Built-in codecs**:
-- **MdCodec** (`.md`) - Markdown with frontmatter, immediate HTML generation
-- **IRNode** (`.toml`, `.json`, `.yaml`) - Schema-aware, deferred generation for networks
+- **MdCodec** (`.md`) — Markdown with TOML frontmatter; immediate HTML generation;
+  MyST backtick-fence directive detection
+- **NetworkCodec** — wraps `MdCodec` for network index files; always outputs
+  `index.html`; handles `{network_children}` sentinel injection
 
-**Key principle**: Codecs handle **syntax only** (parsing documents into `IRNode` structures). The `GraphBuilder` handles **semantics** (resolving references, creating relations, managing identity). HTML generation is **presentation** (codecs return body content, compiler wraps with templates).
+**Key principle**: Codecs handle **syntax only** (parsing documents into `IRNode`
+structures). The `GraphBuilder` handles **semantics** (resolving references, creating
+relations, managing identity). HTML generation is **presentation** (codecs return body
+content, compiler wraps with templates and handles deferred graph queries).
 
-**Example**: MdCodec parses headings into a stack-based hierarchy, generates HTML from AST immediately. IRNode (network nodes) defer HTML generation until full context is available to query child documents.
+**MyST directives**: noet extends Markdown with backtick-fence block directives such as
+`{network_children}` and `{requirements_table}`. These are detected at parse time and
+resolved during the compiler's deferred pass via a declarative query pipeline defined in
+`src/codec/myst.rs`.
 
-**For detailed specification** including the document stack algorithm and codec implementation details, see [`beliefbase_architecture.md` § 3.5-3.6](./beliefbase_architecture.md#35-doccodec-the-frontend-interface).
+**For detailed specification** including the document stack algorithm, codec
+implementation details, and the MyST directive pipeline, see:
+- [`beliefbase_architecture.md` § 3.5-3.6](./beliefbase_architecture.md#35-doccodec-the-frontend-interface) — `DocCodec` trait and dual-phase generation
+- [`myst_directive_architecture.md`](./myst_directive_architecture.md) — MyST directive registry, query pipeline, and extension point
 
 ## Architecture Overview
 

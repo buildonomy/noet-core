@@ -579,7 +579,7 @@ pub async fn build_search_indices(
         // contains `(path_string, bid, sort_order)` entries for every node.
         if let Some(pm) = pathmap.get_map(&net_bref) {
             // We iterate the full recursive map to include subnets' documents too.
-            let all_paths = pm.recursive_map(pathmap, &mut std::collections::BTreeSet::new());
+            let all_paths = pm.recursive_map(None, pathmap, &mut std::collections::BTreeSet::new());
             for (path, bid, _order) in all_paths {
                 if let Some(node) = states.get(&bid) {
                     idx.index_node(bid, node, &path, &stemmer);
