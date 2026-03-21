@@ -163,6 +163,31 @@ impl<'a> BeliefContext<'a> {
         self.bb
     }
 
+    /// Construct a minimal `BeliefContext` for unit tests.
+    ///
+    /// The relations guard is empty (no edges), which is sufficient for functions
+    /// that only read `ctx.root_net` and `ctx.beliefbase()` (e.g. `compute_source_url`).
+    #[cfg(test)]
+    pub fn new_for_test(
+        node: &'a BeliefNode,
+        root_net: Bid,
+        root_path: String,
+        bb: &'a BeliefBase,
+    ) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let relations_guard = bb.relations();
+        #[cfg(target_arch = "wasm32")]
+        let relations_guard = bb.relations();
+        BeliefContext {
+            node,
+            root_path,
+            root_net,
+            home_net: root_net,
+            bb,
+            relations_guard,
+        }
+    }
+
     /// Lazily compute source relations for this node
     pub fn sources(&'a self) -> Vec<ExtendedRelation<'a>> {
         let graph = self.relations_guard.as_graph();

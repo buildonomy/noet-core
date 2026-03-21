@@ -737,7 +737,7 @@ impl BeliefBase {
                     // NodeUpdate when it is the sole difference between session_bb and doc_bb.
                     let mut old_node_normalized = old_node.clone();
                     old_node_normalized.kind.remove(BeliefKind::Trace);
-                    new_node.toml() != old_node_normalized.toml()
+                    new_node != old_node_normalized
                 } else {
                     true
                 };

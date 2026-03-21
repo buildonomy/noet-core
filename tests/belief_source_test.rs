@@ -64,11 +64,9 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         net_bid,
         BeliefNode {
             bid: net_bid,
-            kind: Default::default(),
             title: "Test Network".to_string(),
             schema: Some("buildonomy.Network".to_string()),
-            payload: Default::default(),
-            id: None,
+            ..Default::default()
         },
     );
 
@@ -77,11 +75,9 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         doc1_bid,
         BeliefNode {
             bid: doc1_bid,
-            kind: Default::default(),
             title: "Document 1".to_string(),
             schema: Some("buildonomy.Document".to_string()),
-            payload: Default::default(),
-            id: None,
+            ..Default::default()
         },
     );
 
@@ -90,11 +86,9 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         doc2_bid,
         BeliefNode {
             bid: doc2_bid,
-            kind: Default::default(),
             title: "Document 2".to_string(),
             schema: Some("buildonomy.Document".to_string()),
-            payload: Default::default(),
-            id: None,
+            ..Default::default()
         },
     );
 
@@ -103,11 +97,9 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         section1_bid,
         BeliefNode {
             bid: section1_bid,
-            kind: Default::default(),
             title: "Section 1".to_string(),
             schema: Some("buildonomy.Section".to_string()),
-            payload: Default::default(),
-            id: None,
+            ..Default::default()
         },
     );
 
@@ -116,11 +108,9 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         section2_bid,
         BeliefNode {
             bid: section2_bid,
-            kind: Default::default(),
             title: "Section 2".to_string(),
             schema: Some("buildonomy.Section".to_string()),
-            payload: Default::default(),
-            id: None,
+            ..Default::default()
         },
     );
 

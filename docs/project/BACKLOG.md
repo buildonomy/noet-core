@@ -437,6 +437,31 @@ Profile after the PathMapMap reverse-index fix (P0 in Issue 57). If per-epoch dr
 below ~200ms, the clone overhead makes streaming overlap a net loss except for pathological
 large final batches. If drain remains dominant, implement as described above.
 
+## Directory Link Integration Test (from Issue 59)
+
+**Priority**: MEDIUM
+**Source**: Issue 59, Step 4 (deferred)
+
+End-to-end test for the `UnresolvedReference → process_asset_reference → remainder_queue →
+parse_one_path → process_asset_dir → re-parse → relation wiring` chain for Case B
+(local directory listing).
+
+The unit tests (`test_directory_asset_listing`, `test_directory_asset_case_a_git_tracked`,
+`test_directory_asset_case_c_nonexistent`) cover `process_asset_dir` directly. The
+`bid_tests` implicitly exercise the full chain via the `../net1_dir1` and `../assets`
+directory links in `tests/network_1/subnet1/subnet1_file1.md`. What is missing is an
+**explicit assertion** on the `External` node contents after a full `parse_all` run:
+
+- Run `DocumentCompiler::simple("tests/network_1")` (or `with_html_output`) with
+  `write=false` so no source files are modified.
+- Assert that `net1_dir1` and `assets` each produce a `BeliefKind::External` node in
+  `session_bb` with `payload["listing"]` (non-empty array) and `payload["content_hash"]`
+  (non-empty hex string).
+- Assert that `subnet1_file1` has `Section` relations to those `External` nodes.
+
+Test location: `src/codec/compiler.rs` tests, no feature flags required (Case B does not
+need `git-tracking` or `service`).
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

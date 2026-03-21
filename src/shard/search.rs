@@ -790,6 +790,7 @@ mod tests {
             schema: None,
             payload,
             id: None,
+            metadata: toml::Table::new(),
         }
     }
 

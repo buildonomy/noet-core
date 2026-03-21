@@ -25,7 +25,7 @@ use crate::{
     error::BuildonomyError,
     event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
-    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath},
+    paths::{as_anchor, os_path_to_string, path::string_to_os_path, AnchorPath, AnchorPathBuf},
     properties::{
         asset_namespace, buildonomy_href_bid, buildonomy_namespace, content_namespaces,
         href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, Bref, Weight, WeightKind,
@@ -80,8 +80,8 @@ impl DocCodec for AssetCodec {
     fn finalize(
         &mut self,
         _diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
-        Ok(Vec::new())
+    ) -> Result<std::collections::HashMap<Bid, IRNode>, BuildonomyError> {
+        Ok(std::collections::HashMap::new())
     }
 
     fn generate_source(&self) -> Option<String> {
@@ -457,6 +457,15 @@ impl GraphBuilder {
     ///
     /// This signals the event receiver to finish processing and exit.
     /// Used by parse command to ensure all events are drained before export.
+    /// Replace the event transmitter with a new one.
+    ///
+    /// Used in tests that run multiple parse passes on the same compiler instance
+    /// and need each pass to drain into a separate event channel.
+    pub fn set_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<BeliefEvent>) {
+        let _old_tx = std::mem::replace(&mut self.tx, tx);
+        // old_tx is dropped here, closing the previous channel
+    }
+
     pub fn close_tx(&mut self) {
         // Create a dummy channel and swap it with the real one
         // Dropping the old tx closes the channel
@@ -561,12 +570,57 @@ impl GraphBuilder {
                 self.session_bb.is_balanced().is_ok(),
                 "Why isn't session_bb balanced? (phase 1 start)"
             );
+            // For the root network node (proto_idx == 0 and kind contains Network), git
+            // metadata is NOT injected by initialize_stack (which only pushes ancestor
+            // networks above the entry point).  Compute it here from proto_index so the
+            // root network's BeliefNode gets metadata["git"] on first parse just like
+            // any ancestor network does.
+            #[cfg(feature = "git-tracking")]
+            let root_network_git_override: Option<toml::value::Table> = {
+                use crate::codec::git::NetworkGitStatus;
+                // The root network dir is full_path's parent if it's an index.md,
+                // or full_path itself if it's a directory.
+                let net_dir = if full_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == NETWORK_NAME)
+                    .unwrap_or(false)
+                {
+                    full_path.parent().map(|p| p.to_path_buf())
+                } else {
+                    Some(full_path.clone())
+                };
+                net_dir.and_then(|dir| {
+                    proto_index
+                        .git_status_for(&dir)
+                        .map(|gs: &NetworkGitStatus| {
+                            let mut meta = toml::value::Table::new();
+                            meta.insert(
+                                "git".to_string(),
+                                toml::Value::Table(gs.to_metadata_table()),
+                            );
+                            meta
+                        })
+                })
+            };
+            #[cfg(not(feature = "git-tracking"))]
+            let root_network_git_override: Option<toml::value::Table> = None;
+
             for (proto_idx, proto) in codec.nodes().iter().enumerate() {
                 // The first node is always the entry document. Pass the sort key captured by
                 // initialize_stack so that RelationChange(doc, repo_root, ...) uses the correct
                 // sibling position regardless of which cache branch cache_fetch takes.
                 // All subsequent nodes (sections) get None and auto-assign their own sort keys.
                 let entry_sort_key = if proto_idx == 0 { doc_sort_key } else { None };
+                // For the root network node (first proto, Network kind), inject git metadata.
+                // All other nodes (documents, sections) get None — their source_url is
+                // computed in Phase 4 inject_context via the network ancestor's metadata.
+                let metadata_override =
+                    if proto_idx == 0 && proto.kind.contains(BeliefKind::Network) {
+                        root_network_git_override.clone()
+                    } else {
+                        None
+                    };
                 let (bid, (source, _nodekeys, unique_oldkeys)) = self
                     .push(
                         proto,
@@ -576,6 +630,7 @@ impl GraphBuilder {
                         entry_sort_key,
                         &mut diagnostics,
                         &mut clobbered_bids,
+                        metadata_override,
                     )
                     .await?;
                 if !missing_structure.is_empty() {
@@ -772,12 +827,15 @@ impl GraphBuilder {
                             proto.heading, proto.path
                         )
                     });
-                let old_node = ctx.node.toml();
+                let old_node = ctx.node.clone();
                 // Inject proto text into our self set here, because inject context is where the
                 // markdown parser generates section-specific text fields regardless of whether
                 // it changes the markdown itself due to the injected context.
                 if let Some(updated_node) = codec.inject_context(proto, &ctx, &mut diagnostics)? {
-                    if old_node != updated_node.toml() {
+                    // Compare via PartialEq rather than round-tripping through TOML strings:
+                    // string comparison is fragile (key ordering, whitespace) and silently
+                    // ignores fields like metadata that are not round-tripped through IRNode.
+                    if updated_node != old_node {
                         is_changed = true;
                         let _derivatives = self.doc_bb.process_event(&BeliefEvent::NodeUpdate(
                             vec![NodeKey::Bid {
@@ -793,21 +851,46 @@ impl GraphBuilder {
             // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
             tracing::debug!("Phase 4b: codec finalization");
             let finalized_nodes = codec.finalize(&mut diagnostics)?;
-            for (_proto, updated_node) in finalized_nodes {
-                let old_node = self.doc_bb.states().get(&updated_node.bid);
-                let differs = Some(&updated_node) != old_node;
-                if differs {
-                    is_changed = true;
-                    let derivatives = self.doc_bb.insert_state(
-                        updated_node.clone(),
-                        &[NodeKey::Bid {
-                            bid: updated_node.bid,
-                        }],
-                    );
-                    if !derivatives.is_empty() {
-                        tracing::warn!(
-                            "[parse_content] inject_context node update created derivative events. this is unexpected. derivatives: {derivatives:?}",
-                        );
+            for (bid, ir_node) in finalized_nodes {
+                // Apply source-file-derived fields (kind, title, schema, payload, id) to the
+                // existing doc_bb node via apply_source_update, which leaves runtime-only
+                // fields (bid, metadata) untouched.  This avoids losing metadata (e.g. git
+                // status) that push() injected but that IRNode→BeliefNode conversion drops.
+                if let Some(existing) = self.doc_bb.states().get(&bid).cloned() {
+                    let mut updated_node = existing.clone();
+                    let changed = updated_node.apply_source_update(&ir_node).unwrap_or(false);
+                    if changed {
+                        is_changed = true;
+                        let derivatives = self
+                            .doc_bb
+                            .insert_state(updated_node, &[NodeKey::Bid { bid }]);
+                        if !derivatives.is_empty() {
+                            tracing::warn!(
+                                "[parse_content] finalize() node update created derivative events; this is unexpected. derivatives: {derivatives:?}",
+                            );
+                        }
+                    }
+                } else {
+                    // Node not yet in doc_bb — insert fresh (no runtime fields to preserve).
+                    // Construct from the IRNode directly since there's nothing in doc_bb to update.
+                    match crate::properties::BeliefNode::try_from(&ir_node) {
+                        Ok(mut fresh_node) => {
+                            fresh_node.bid = bid;
+                            is_changed = true;
+                            let derivatives = self
+                                .doc_bb
+                                .insert_state(fresh_node, &[NodeKey::Bid { bid }]);
+                            if !derivatives.is_empty() {
+                                tracing::warn!(
+                                    "[parse_content] finalize() new node created derivative events; this is unexpected. derivatives: {derivatives:?}",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[parse_content] finalize() returned IRNode for bid={bid} that could not be converted: {e}"
+                            );
+                        }
                     }
                 }
             }
@@ -991,11 +1074,30 @@ impl GraphBuilder {
         while let Some(path) = parent_path_stack.pop() {
             // Use the ProtoIndex (built once at compiler startup via a single WalkDir pass)
             // to look up the ancestor network proto without redundant filesystem scans.
-            let Some(state_accum) = proto_index.proto_for(&path)? else {
+            let Some((state_accum, git_status)) = proto_index.proto_for(&path)? else {
                 continue;
             };
 
             let mut ancestor_clobbers = BTreeSet::new();
+            let git_metadata_override: Option<TomlTable> = {
+                #[cfg(feature = "git-tracking")]
+                {
+                    git_status.as_ref().map(|gs| {
+                        let mut meta = TomlTable::new();
+                        meta.insert(
+                            "git".to_string(),
+                            toml::Value::Table(gs.to_metadata_table()),
+                        );
+                        meta
+                    })
+                }
+                #[cfg(not(feature = "git-tracking"))]
+                {
+                    let _ = git_status;
+                    None
+                }
+            };
+
             let (ancestor, (_source, _, _)) = self
                 .push(
                     &state_accum,
@@ -1005,6 +1107,7 @@ impl GraphBuilder {
                     None,            // ancestor network nodes; sort key is not relevant here
                     &mut Vec::new(), // ancestor pushes are trace-only; diagnostics discarded
                     &mut ancestor_clobbers,
+                    git_metadata_override,
                 )
                 .await?;
             if !ancestor_clobbers.is_empty() {
@@ -1419,6 +1522,7 @@ impl GraphBuilder {
         explicit_sort_key: Option<u16>,
         diagnostics: &mut Vec<ParseDiagnostic>,
         clobbered_bids: &mut BTreeSet<Bid>,
+        metadata_override: Option<TomlTable>,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
         let (parent_bid, path_info, _parent_full_path) = self.get_parent_from_stack(proto);
 
@@ -1595,6 +1699,12 @@ impl GraphBuilder {
         //     node.bid = bid;
         //     source = NodeSource::Merged;
         // }
+
+        // Apply metadata override last — always stomps any stale cached metadata so the
+        // freshly-computed parse-time annotations (e.g. git status) win unconditionally.
+        if let Some(meta) = metadata_override {
+            node.metadata = meta;
+        }
 
         let node_update_event =
             BeliefEvent::NodeUpdate(keys.clone(), node.toml(), EventOrigin::Remote);
@@ -1776,6 +1886,42 @@ impl GraphBuilder {
         let other_key_regularized =
             other_key.regularize_unchecked(self.repo(), &owner_rel_path, &repo_root_str);
 
+        // Reclassify repo-namespace path keys that resolve to non-network directories on
+        // disk as asset_namespace. Directory links (e.g. `[docs](../net1_dir1)`) are
+        // regularized to `NodeKey::Path { net: repo_bid.bref(), path: "net1_dir1" }` by
+        // regularize_unchecked, which has no filesystem awareness. Without this correction
+        // the key flows through cache_fetch as a document reference (miss → UnresolvedReference),
+        // then process_one_parse_result routes it through process_unresolved_reference instead
+        // of process_asset_reference, producing spurious dependent_paths on parse 2 when the
+        // asset node is already cached. Fixing the namespace here means every downstream
+        // consumer — cache_fetch, inject_context, UnresolvedReference routing — sees the
+        // correct key without special-casing.
+        let other_key_regularized = match &other_key_regularized {
+            NodeKey::Path { net, path } if *net == self.repo().bref() => {
+                let abs_path = string_to_os_path(
+                    &AnchorPathBuf::from(repo_root_str.clone())
+                        .as_anchor_path()
+                        .join(path),
+                );
+                if abs_path.is_dir()
+                    && crate::codec::network::detect_network_file(&abs_path).is_none()
+                {
+                    tracing::debug!(
+                        "[push_relation] Reclassifying dir link {:?} → asset_namespace (path: {})",
+                        abs_path,
+                        path,
+                    );
+                    NodeKey::Path {
+                        net: asset_namespace().bref(),
+                        path: path.clone(),
+                    }
+                } else {
+                    other_key_regularized
+                }
+            }
+            _ => other_key_regularized,
+        };
+
         let other_keys = vec![other_key_regularized.clone()];
         let mut weight = maybe_weight.clone().unwrap_or_default();
         weight.set(WEIGHT_SORT_KEY, index as u16)?;
@@ -1828,6 +1974,7 @@ impl GraphBuilder {
                         schema: None,
                         payload: TomlTable::default(),
                         id: Some(href.clone()),
+                        metadata: TomlTable::default(),
                     };
                     update_queue.push(BeliefEvent::NodeUpdate(
                         href_node.keys(Some(href_namespace()), None, &self.doc_bb),
@@ -2447,6 +2594,7 @@ impl GraphBuilder {
         path: &Path,
         bytes: &[u8],
         global_bb: B,
+        _proto_index: ProtoIndex,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
         // Compute SHA-256 hash of file content.
         let mut hasher = Sha256::new();
@@ -2596,6 +2744,288 @@ impl GraphBuilder {
             repo_node: None,
         })
     }
+
+    /// Process a directory referenced from a markdown link.
+    ///
+    /// Two cases are handled:
+    ///
+    /// **Case A** (`#[cfg(feature = "git-tracking")]`): the directory is a registered
+    /// network tracked by `proto_index`.  Emits an `href_namespace` node pointing to
+    /// the upstream remote URL — identical in structure to an external HTTP link —
+    /// so that the SPA viewer can render a "View on remote ↗" link.  Gated on the
+    /// `git-tracking` feature; falls through to Case B when the feature is disabled
+    /// or the directory is not in `proto_index`.
+    ///
+    /// **Case B**: the directory exists but is not a tracked network (or
+    /// `git-tracking` is disabled).  Reads the directory listing, caps at 256
+    /// entries, computes a hash over the repo-relative path + sorted names, and
+    /// emits a `BeliefKind::External` node with `payload["listing"]` and
+    /// `payload["content_hash"]`.  Change detection follows the same pattern as
+    /// file assets: the node is only updated when the hash differs from the cached
+    /// value.
+    ///
+    /// # Arguments
+    /// * `path` — Absolute path to the directory.  Must exist and be navigable.
+    /// * `global_bb` — Shared belief source for cache lookups.
+    /// * `proto_index` — Used by Case A to query git status.
+    pub async fn process_asset_dir<B: BeliefSource + Clone>(
+        &mut self,
+        path: &Path,
+        global_bb: B,
+        proto_index: ProtoIndex,
+    ) -> Result<ParseContentWithCodec, BuildonomyError> {
+        // Build repo-relative path string — same convention as process_asset.
+        let repo_relative_path = match path.strip_prefix(&self.repo_root) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => {
+                tracing::warn!(
+                    "[GraphBuilder] process_asset_dir: path {:?} is outside repo root {:?} — skipping",
+                    path,
+                    self.repo_root,
+                );
+                return Ok(ParseContentWithCodec {
+                    result: ParseContentResult::empty(),
+                    codec: Box::new(AssetCodec),
+                    repo_bid: Bid::nil(),
+                    repo_node: None,
+                });
+            }
+        };
+
+        // ------------------------------------------------------------------
+        // Case A: directory is a git-tracked registered network → href node.
+        // ------------------------------------------------------------------
+        #[cfg(feature = "git-tracking")]
+        if let Some(status) = proto_index.git_status_for(path) {
+            if status.repo.remote_url.is_none() {
+                tracing::warn!(
+                    "[GraphBuilder] Directory asset (Case A): {} is a git-tracked network but \
+                    has no recognised remote URL — cannot generate href node. \
+                    Set payload[\"git_remote_url\"] on the network node to override.",
+                    repo_relative_path,
+                );
+            }
+            if let Some(remote_url) = status.repo.remote_url.as_deref() {
+                let href = remote_url.trim_end_matches('/').to_string();
+                let href_bid = buildonomy_href_bid(&href);
+
+                let mut update_queue: Vec<BeliefEvent> = Vec::new();
+
+                // Ensure the href_namespace network node exists.
+                if !self.session_bb.states().contains_key(&href_namespace()) {
+                    let href_net_node = BeliefNode::href_network();
+                    update_queue.push(BeliefEvent::NodeUpdate(
+                        href_net_node.keys(Some(buildonomy_namespace()), None, &self.session_bb),
+                        href_net_node.toml(),
+                        EventOrigin::Remote,
+                    ));
+                }
+
+                let href_node = BeliefNode {
+                    bid: href_bid,
+                    kind: BeliefKindSet::from(BeliefKind::External | BeliefKind::Trace),
+                    title: String::default(),
+                    schema: None,
+                    payload: TomlTable::default(),
+                    id: Some(href.clone()),
+                    metadata: TomlTable::default(),
+                };
+                update_queue.push(BeliefEvent::NodeUpdate(
+                    href_node.keys(Some(href_namespace()), None, &self.session_bb),
+                    href_node.toml(),
+                    EventOrigin::Remote,
+                ));
+                let mut href_weight = Weight::default();
+                href_weight.set(WEIGHT_DOC_PATHS, vec![href.clone()])?;
+                update_queue.push(BeliefEvent::RelationChange(
+                    href_bid,
+                    href_namespace(),
+                    WeightKind::Section,
+                    Some(href_weight),
+                    EventOrigin::Remote,
+                ));
+
+                let mut derivatives: Vec<BeliefEvent> = Vec::new();
+                for event in update_queue.iter() {
+                    derivatives.append(&mut self.session_bb.process_event(event)?);
+                }
+                update_queue.append(&mut derivatives);
+                for event in update_queue {
+                    self.tx.send(event)?;
+                }
+
+                tracing::debug!(
+                    "[GraphBuilder] Directory asset (Case A / git-tracked): {} → href {}",
+                    repo_relative_path,
+                    href,
+                );
+
+                return Ok(ParseContentWithCodec {
+                    result: ParseContentResult::empty(),
+                    codec: Box::new(AssetCodec),
+                    repo_bid: Bid::nil(),
+                    repo_node: None,
+                });
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Case B: local-only directory → External node with listing payload.
+        // ------------------------------------------------------------------
+
+        // Read directory entries, sort by name, cap at 256.
+        const MAX_LISTING: usize = 256;
+        let mut entries: Vec<String> = match std::fs::read_dir(path) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) => {
+                return Err(BuildonomyError::Codec(format!(
+                    "process_asset_dir: cannot read directory {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        entries.sort();
+        let truncated = entries.len() > MAX_LISTING;
+        if truncated {
+            tracing::warn!(
+                "[GraphBuilder] Directory listing truncated at {} entries: {}",
+                MAX_LISTING,
+                repo_relative_path,
+            );
+            entries.truncate(MAX_LISTING);
+        }
+
+        // Hash = SHA-256 over repo-relative-path + newline + sorted names.
+        let mut hasher = Sha256::new();
+        hasher.update(repo_relative_path.as_bytes());
+        hasher.update(b"\n");
+        for name in &entries {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\n");
+        }
+        let hash_str = format!("{:x}", hasher.finalize());
+
+        // Cache lookup — same pattern as process_asset.
+        let asset_key = NodeKey::Path {
+            net: asset_namespace().bref(),
+            path: repo_relative_path.clone(),
+        };
+        let mut missing_structure = BeliefGraph::default();
+        let cache_result = self
+            .cache_fetch(&[asset_key], global_bb, false, &mut missing_structure)
+            .await?;
+
+        if !missing_structure.is_empty() {
+            self.session_bb.merge(&missing_structure);
+        }
+
+        let (asset_bid, needs_update) = match cache_result {
+            GetOrCreateResult::Resolved(ref node, _) => {
+                let existing_hash = node
+                    .payload
+                    .get("content_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if existing_hash == hash_str {
+                    tracing::debug!(
+                        "[GraphBuilder] Directory listing unchanged: {}",
+                        repo_relative_path,
+                    );
+                    (node.bid, false)
+                } else {
+                    (node.bid, true)
+                }
+            }
+            GetOrCreateResult::Unresolved(_) => (Bid::new(asset_namespace()), true),
+        };
+
+        if needs_update {
+            let entry_count = entries.len();
+            let mut payload = TomlTable::new();
+            payload.insert("content_hash".to_string(), toml::Value::String(hash_str));
+            payload.insert(
+                "listing".to_string(),
+                toml::Value::Array(entries.into_iter().map(toml::Value::String).collect()),
+            );
+            if truncated {
+                payload.insert("truncated".to_string(), toml::Value::Boolean(true));
+            }
+
+            let asset_node = BeliefNode {
+                bid: asset_bid,
+                kind: BeliefKind::External.into(),
+                title: repo_relative_path.clone(),
+                payload,
+                ..Default::default()
+            };
+
+            let node_keys = vec![NodeKey::Bid { bid: asset_bid }];
+            let mut update_queue: Vec<BeliefEvent> = Vec::new();
+
+            // Ensure the asset_namespace network node exists.
+            if !self.session_bb.states().contains_key(&asset_namespace()) {
+                let asset_net_node = BeliefNode::asset_network();
+                update_queue.push(BeliefEvent::NodeUpdate(
+                    asset_net_node.keys(Some(buildonomy_namespace()), None, &self.session_bb),
+                    asset_net_node.toml(),
+                    EventOrigin::Remote,
+                ));
+                update_queue.push(BeliefEvent::RelationChange(
+                    asset_namespace(),
+                    buildonomy_namespace(),
+                    WeightKind::Section,
+                    None,
+                    EventOrigin::Remote,
+                ));
+            }
+
+            update_queue.push(BeliefEvent::NodeUpdate(
+                node_keys,
+                asset_node.toml(),
+                EventOrigin::Remote,
+            ));
+
+            let mut edge_payload = TomlTable::new();
+            edge_payload.insert(
+                WEIGHT_DOC_PATHS.to_string(),
+                toml::Value::Array(vec![toml::Value::String(repo_relative_path.clone())]),
+            );
+            update_queue.push(BeliefEvent::RelationChange(
+                asset_bid,
+                asset_namespace(),
+                WeightKind::Section,
+                Some(Weight {
+                    payload: edge_payload,
+                }),
+                EventOrigin::Remote,
+            ));
+
+            let mut derivatives: Vec<BeliefEvent> = Vec::new();
+            for event in update_queue.iter() {
+                derivatives.append(&mut self.session_bb.process_event(event)?);
+            }
+            update_queue.append(&mut derivatives);
+            for event in update_queue {
+                self.tx.send(event)?;
+            }
+
+            tracing::debug!(
+                "[GraphBuilder] Directory asset (Case B / local): {} ({} entries)",
+                repo_relative_path,
+                entry_count,
+            );
+        }
+
+        Ok(ParseContentWithCodec {
+            result: ParseContentResult::empty(),
+            codec: Box::new(AssetCodec),
+            repo_bid: Bid::nil(),
+            repo_node: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2651,6 +3081,7 @@ Test network for unit tests.
             path: path.to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading,
         }
     }
@@ -2665,6 +3096,7 @@ Test network for unit tests.
             schema: None,
             payload: Default::default(),
             id: None,
+            metadata: Default::default(),
         }
     }
 

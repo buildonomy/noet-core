@@ -294,6 +294,10 @@ pub struct IRNode {
     pub kind: BeliefKindSet,
     pub errors: Vec<BuildonomyError>,
     pub heading: usize,
+    /// 1-based line number of this node's heading (or 1 for the document root node)
+    /// in the source file. Populated by MdCodec during parsing. Used to construct
+    /// `#L<n>` source backlinks. `None` when the codec does not track line numbers.
+    pub source_line: Option<usize>,
 }
 
 impl PartialEq for IRNode {
@@ -305,6 +309,7 @@ impl PartialEq for IRNode {
             && self.kind.eq(&other.kind)
             && self.upstream.eq(&other.upstream)
             && self.downstream.eq(&other.downstream)
+        // source_line intentionally excluded: positional parse-time info, not structural identity
     }
 }
 
@@ -418,6 +423,8 @@ impl IRNode {
         &mut self,
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
+        // `metadata` is runtime-only and must never enter IRNode.document (source files).
+        // The strip is handled unconditionally inside TryFrom<&BeliefNode> for IRNode.
         let mut changed = self.merge(&mut IRNode::try_from(ctx.node)?);
         // Only update path from context for section nodes (heading > 2)
         // Document nodes already have correct path from IRNode::new()
@@ -657,6 +664,15 @@ impl TryFrom<&BeliefNode> for IRNode {
         let content = to_string(src)?;
         let mut proto = IRNode::from_str(&content)?;
         proto.kind = src.kind.clone();
+        // `metadata` is a runtime-only field on `BeliefNode` and must never appear in
+        // `IRNode.document`.  If it does, it means the caller serialized a BeliefNode
+        // with non-empty metadata through `to_string` and we're about to corrupt a
+        // source file.  Warn loudly so we can find the propagation path.
+        // `metadata` is runtime-only and must never appear in IRNode.document (which maps
+        // to source-file frontmatter). Strip it unconditionally after deserialisation.
+        // `to_string(src)` serialises all BeliefNode fields including metadata when non-empty,
+        // so this remove is the designated strip point for the BeliefNode → IRNode conversion.
+        proto.document.remove("metadata");
         Ok(proto)
     }
 }

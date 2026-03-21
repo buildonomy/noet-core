@@ -34,6 +34,81 @@ use crate::{
     properties::{href_namespace, BeliefKind, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 
+/// Compute a `source_url` for `node` given its parse context.
+///
+/// Returns `None` when:
+/// - The ancestor network node has no `metadata["git"]["remote_url"]` (git tracking
+///   disabled, no recognised remote, or no git repo).
+/// - `root_path` is empty.
+///
+/// The network node's `payload["git_remote_url"]` overrides the auto-detected remote,
+/// allowing operators to hard-code a base URL (Gitea, Bitbucket, forks, etc.).
+///
+/// `source_line` is read directly from the `IRNode` — no intermediate encoding needed.
+fn compute_source_url(node: &IRNode, ctx: &BeliefContext<'_>) -> Option<String> {
+    // Look up the ancestor network node.
+    let network_node = ctx.beliefbase().get(&NodeKey::Bid { bid: ctx.root_net })?;
+
+    // Helper: look up a string field inside metadata["git"].
+    let git_str = |key: &str| -> Option<&str> {
+        network_node
+            .metadata
+            .get("git")
+            .and_then(|g: &toml::Value| g.as_table())
+            .and_then(|t: &toml::value::Table| t.get(key))
+            .and_then(|v: &toml::Value| v.as_str())
+    };
+
+    // Determine the remote base URL:
+    // 1. Explicit payload override on the network node takes precedence.
+    // 2. Fall back to auto-detected remote_url stored in metadata["git"].
+    let remote_base: String = if let Some(override_url) = network_node
+        .payload
+        .get("git_remote_url")
+        .and_then(|v: &toml::Value| v.as_str())
+    {
+        if override_url.is_empty() {
+            // Explicit empty string suppresses source_url for this network.
+            return None;
+        }
+        override_url.to_string()
+    } else {
+        git_str("remote_url").map(|s| s.to_string())?
+    };
+
+    // Determine branch: prefer metadata["git"]["branch"], fall back to "HEAD".
+    let branch = git_str("branch").unwrap_or("HEAD");
+
+    // root_path is network-root-relative (e.g. "subnet1/file.md").
+    // network_prefix is the git-workdir-relative path to the network directory
+    // (e.g. "tests/network_1"). Joining them gives the git-root-relative path.
+    // When network_prefix is absent or empty the network IS the git root, so
+    // root_path is already correct.
+    let root_path = &ctx.root_path;
+    if root_path.is_empty() {
+        return None;
+    }
+    let full_path = match git_str("network_prefix") {
+        Some(prefix) if !prefix.is_empty() => format!("{}/{}", prefix, root_path),
+        _ => root_path.clone(),
+    };
+
+    // Build the blob URL.
+    let base = format!(
+        "{}/blob/{}/{}",
+        remote_base.trim_end_matches('/'),
+        branch,
+        full_path
+    );
+
+    // Append line anchor if available.
+    if let Some(line) = node.source_line {
+        Some(format!("{}#L{}", base, line))
+    } else {
+        Some(base)
+    }
+}
+
 pub use pulldown_cmark;
 
 /// A markdown event with optional source range information
@@ -1429,20 +1504,32 @@ impl DocCodec for MdCodec {
             None
         };
 
-        if let Some(text) = maybe_text {
+        // Helper: carry forward runtime metadata from ctx.node into any newly-constructed
+        // BeliefNode.  Metadata (git status, source backlinks) is never stored in source
+        // files and is not part of the IRNode/TOML round-trip, so BeliefNode::try_from
+        // always produces an empty metadata table.  Any metadata injected by push() via
+        // metadata_override must survive the inject_context rewrite unchanged.
+        let propagate_metadata = |mut node: BeliefNode| -> BeliefNode {
+            if node.metadata.is_empty() && !ctx.node.metadata.is_empty() {
+                node.metadata = ctx.node.metadata.clone();
+            }
+            node
+        };
+
+        let result: Result<Option<BeliefNode>, BuildonomyError> = if let Some(text) = maybe_text {
             proto_events.0.document.insert("text", value(text.clone()));
             // If sections metadata was merged OR frontmatter changed, create new node from proto
             // This ensures we capture both context updates AND sections metadata
             let new_node = if sections_metadata_merged || frontmatter_changed.is_some() {
                 match BeliefNode::try_from(&proto_events.0) {
-                    Ok(node) => node,
+                    Ok(node) => propagate_metadata(node),
                     Err(e) => {
                         tracing::warn!("Failed to convert updated proto to BeliefNode: {:?}", e);
-                        frontmatter_changed.unwrap_or(ctx.node.clone())
+                        propagate_metadata(frontmatter_changed.unwrap_or(ctx.node.clone()))
                     }
                 }
             } else {
-                frontmatter_changed.unwrap_or(ctx.node.clone())
+                propagate_metadata(frontmatter_changed.unwrap_or(ctx.node.clone()))
             };
             let mut new_node_with_text = new_node;
             new_node_with_text
@@ -1453,18 +1540,43 @@ impl DocCodec for MdCodec {
             // No text regeneration needed, but metadata was merged or context changed
             // Create new BeliefNode from the updated IRNode
             match BeliefNode::try_from(&proto_events.0) {
-                Ok(new_node) => Ok(Some(new_node)),
+                Ok(new_node) => Ok(Some(propagate_metadata(new_node))),
                 Err(e) => {
                     tracing::warn!(
                         "Failed to convert proto with merged metadata to BeliefNode: {:?}",
                         e
                     );
-                    Ok(frontmatter_changed)
+                    Ok(frontmatter_changed.map(propagate_metadata))
                 }
             }
         } else {
             Ok(None)
+        };
+
+        // Inject source_url into metadata for every node that has a recognised remote.
+        // This runs regardless of whether other inject_context logic produced a change —
+        // if there is no other change, we promote the result from None to Some so the
+        // metadata is propagated through the event system.
+        let source_url = compute_source_url(node, ctx);
+        if let Some(url) = source_url {
+            let result_node = match result? {
+                Some(mut n) => {
+                    n.metadata
+                        .insert("source_url".to_string(), toml::Value::String(url));
+                    Ok(Some(n))
+                }
+                None => {
+                    // No other change — clone ctx.node and inject source_url.
+                    let mut n = ctx.node.clone();
+                    n.metadata
+                        .insert("source_url".to_string(), toml::Value::String(url));
+                    Ok(Some(n))
+                }
+            };
+            return result_node;
         }
+
+        result
     }
 
     fn should_defer(&self) -> bool {
@@ -1505,8 +1617,8 @@ impl DocCodec for MdCodec {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
-        let mut modified_nodes = Vec::new();
+    ) -> Result<std::collections::HashMap<crate::properties::Bid, IRNode>, BuildonomyError> {
+        let mut modified_nodes = std::collections::HashMap::new();
 
         // Step 1: Build sections table from all section nodes (heading > 2)
         // This happens AFTER all inject_context() calls, so sections have BIDs
@@ -1629,15 +1741,26 @@ impl DocCodec for MdCodec {
                 let metadata_string = doc_proto.0.as_frontmatter();
                 update_or_insert_frontmatter(&mut doc_proto.1, &metadata_string)?;
 
-                // Document was modified, need to create updated BeliefNode
-                match BeliefNode::try_from(&doc_proto.0) {
-                    Ok(updated_node) => {
-                        modified_nodes.push((doc_proto.0.clone(), updated_node));
+                // Document was modified — return the (Bid, IRNode) pair so the caller can
+                // apply source-file-derived field changes via BeliefNode::apply_source_update,
+                // which preserves runtime-only fields (bid, metadata) that IRNode lacks.
+                // Extract the BID from the document table (inject_context wrote it there).
+                // If the BID is absent or malformed, skip rather than inserting under a nil key.
+                let bid_opt = doc_proto
+                    .0
+                    .document
+                    .get("bid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| crate::properties::Bid::try_from(s).ok());
+                match bid_opt {
+                    Some(bid) => {
+                        modified_nodes.insert(bid, doc_proto.0.clone());
                     }
-                    Err(e) => {
+                    None => {
                         tracing::warn!(
-                            "Failed to convert modified document node to BeliefNode: {:?}",
-                            e
+                            "[finalize] document IRNode has no valid BID in its document table; \
+                             skipping apply_source_update for title={:?}",
+                            doc_proto.0.document.get("title").and_then(|v| v.as_str())
                         );
                     }
                 }
@@ -1662,6 +1785,8 @@ impl DocCodec for MdCodec {
         self.in_implements_block = false;
         self.has_deferred_render = false;
         self.has_network_children = false;
+        // Document root node always starts at line 1
+        current.source_line = Some(1);
         let mut proto_events = VecDeque::new();
         let mut link_stack: Vec<LinkAccumulator> = Vec::new();
         for (event, offset) in MdParser::new_with_broken_link_callback(
@@ -1759,6 +1884,7 @@ impl DocCodec for MdCodec {
                     // No warning — this is the documented implicit-close behaviour.
                     self.in_implements_block = false;
                     self.heading_start_offset = Some(offset.start);
+                    let heading_line = byte_offset_to_location(&self.content, offset.start).0;
                     let heading = match level {
                         // 0: UUID_NAMESPACE_BUILDONOMY
                         // 1: Network Node
@@ -1775,6 +1901,7 @@ impl DocCodec for MdCodec {
                     let mut new_current = IRNode {
                         path: current.path.clone(),
                         heading,
+                        source_line: Some(heading_line),
                         ..Default::default()
                     };
                     if let Some(normalized_id) = maybe_normalized_id {
@@ -2209,6 +2336,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2246,6 +2374,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2283,6 +2412,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2329,6 +2459,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2376,6 +2507,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2404,6 +2536,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 4,
         };
 
@@ -2504,6 +2637,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -2564,6 +2698,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -2615,6 +2750,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -2675,6 +2811,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -2728,6 +2865,7 @@ schema = "Document"
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -2973,6 +3111,7 @@ Mixed content.
             path: "test.md".to_string(),
             kind: crate::properties::BeliefKindSet::default(),
             errors: Vec::new(),
+            source_line: None,
             heading: 2,
         };
 
@@ -3791,6 +3930,418 @@ id = \"doc\"
         assert!(
             result.contains("Before.") && result.contains("After."),
             "surrounding prose must be preserved; result:\n{result}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // source_line tests
+    // -------------------------------------------------------------------------
+
+    /// Helper: parse markdown with MdCodec and return the list of (heading_level, source_line)
+    /// pairs for every IRNode produced.
+    fn parse_source_lines(content: &str) -> Vec<(usize, Option<usize>)> {
+        use crate::codec::belief_ir::IRNode;
+        use crate::codec::DocCodec;
+
+        let mut codec = MdCodec::new();
+        let root = IRNode {
+            path: "net/doc.md".to_string(),
+            heading: 2,
+            source_line: Some(1),
+            ..Default::default()
+        };
+        let mut diagnostics = vec![];
+        codec.parse(content, root, &mut diagnostics).unwrap();
+        codec
+            .nodes()
+            .iter()
+            .map(|n| (n.heading, n.source_line))
+            .collect()
+    }
+
+    #[test]
+    fn test_source_line_document_root_is_one() {
+        let md = "---\ntitle: \"Doc\"\nid: \"doc\"\n---\n\nSome prose.\n";
+        let nodes = parse_source_lines(md);
+        // Only the document root node (heading == 2)
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].0, 2);
+        assert_eq!(nodes[0].1, Some(1), "document root must always be line 1");
+    }
+
+    #[test]
+    fn test_source_line_h1_section() {
+        // heading level H1 in markdown → heading == 3 in our model (network=1, doc=2, h1=3)
+        let md = "---\ntitle: \"Doc\"\nid: \"doc\"\n---\n\n# First Section\n\nProse.\n";
+        let nodes = parse_source_lines(md);
+        // doc root + 1 section
+        assert_eq!(nodes.len(), 2);
+        let (lvl, line) = nodes[1];
+        assert_eq!(lvl, 3);
+        // "# First Section" starts at line 6
+        assert_eq!(line, Some(6));
+    }
+
+    #[test]
+    fn test_source_line_h2_section() {
+        let md = "---\ntitle: \"Doc\"\nid: \"doc\"\n---\n\n# H1\n\nProse.\n\n## H2 Section\n\nMore prose.\n";
+        let nodes = parse_source_lines(md);
+        // doc root + H1 + H2
+        assert_eq!(nodes.len(), 3);
+        // H2 → heading == 4
+        let (lvl, line) = nodes[2];
+        assert_eq!(lvl, 4);
+        // "## H2 Section" is at line 10
+        assert_eq!(line, Some(10));
+    }
+
+    #[test]
+    fn test_source_line_h3_section() {
+        let md =
+            "---\ntitle: \"Doc\"\nid: \"doc\"\n---\n\n# H1\n\n## H2\n\n### H3 Section\n\nProse.\n";
+        let nodes = parse_source_lines(md);
+        assert_eq!(nodes.len(), 4);
+        // H3 → heading == 5
+        let (lvl, line) = nodes[3];
+        assert_eq!(lvl, 5);
+        // "### H3 Section" is at line 10
+        assert_eq!(line, Some(10));
+    }
+
+    // -------------------------------------------------------------------------
+    // compute_source_url tests
+    // -------------------------------------------------------------------------
+
+    /// Build a minimal BeliefBase containing a network node with the given payload
+    /// and metadata, then call compute_source_url directly via BeliefContext::new_for_test.
+    fn make_source_url(
+        net_payload: toml::value::Table,
+        net_metadata: toml::value::Table,
+        source_line: Option<usize>,
+        root_path: &str,
+    ) -> Option<String> {
+        use crate::beliefbase::{BeliefBase, BeliefContext};
+        use crate::codec::belief_ir::IRNode;
+        use crate::properties::{BeliefKind, BeliefNode, Bid};
+        use std::collections::BTreeMap;
+
+        let net_bid = Bid::new(crate::properties::buildonomy_namespace());
+        let net_node = BeliefNode {
+            bid: net_bid,
+            kind: BeliefKind::Network.into(),
+            title: "Test Network".to_string(),
+            payload: net_payload,
+            metadata: net_metadata,
+            ..Default::default()
+        };
+
+        let mut states = BTreeMap::new();
+        states.insert(net_bid, net_node);
+        let bb = BeliefBase::new(states, crate::beliefbase::BidGraph::default()).unwrap();
+
+        // BeliefContext::new_for_test constructs a context with an empty relations guard,
+        // which is sufficient for compute_source_url (only reads root_net + beliefbase()).
+        let node_ref = bb.states().get(&net_bid)?;
+        let ctx = BeliefContext::new_for_test(node_ref, net_bid, root_path.to_string(), &bb);
+
+        let ir_node = IRNode {
+            source_line,
+            path: root_path.to_string(),
+            heading: 3,
+            ..Default::default()
+        };
+
+        compute_source_url(&ir_node, &ctx)
+    }
+
+    #[test]
+    fn test_compute_source_url_no_git_metadata_returns_none() {
+        // No metadata["git"] and no payload["git_remote_url"] → None
+        let url = make_source_url(
+            toml::value::Table::new(),
+            toml::value::Table::new(),
+            None,
+            "docs/guide.md",
+        );
+        assert!(url.is_none());
+    }
+
+    #[test]
+    fn test_compute_source_url_from_git_metadata_no_line() {
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let url = make_source_url(toml::value::Table::new(), meta, None, "docs/guide.md");
+        assert_eq!(
+            url,
+            Some("https://github.com/org/repo/blob/main/docs/guide.md".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_from_git_metadata_with_line() {
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let url = make_source_url(toml::value::Table::new(), meta, Some(42), "docs/guide.md");
+        assert_eq!(
+            url,
+            Some("https://github.com/org/repo/blob/main/docs/guide.md#L42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_detached_head_falls_back_to_head() {
+        // No "branch" key in metadata["git"] → falls back to "HEAD"
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        // branch intentionally absent
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let url = make_source_url(toml::value::Table::new(), meta, None, "src/lib.rs");
+        assert_eq!(
+            url,
+            Some("https://github.com/org/repo/blob/HEAD/src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_payload_override_takes_precedence() {
+        // payload["git_remote_url"] overrides metadata["git"]["remote_url"]
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let mut payload = toml::value::Table::new();
+        payload.insert(
+            "git_remote_url".to_string(),
+            toml::Value::String("https://github.com/org/fork".to_string()),
+        );
+
+        let url = make_source_url(payload, meta, Some(7), "README.md");
+        assert_eq!(
+            url,
+            Some("https://github.com/org/fork/blob/main/README.md#L7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_empty_payload_override_suppresses() {
+        // payload["git_remote_url"] = "" suppresses source_url entirely
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let mut payload = toml::value::Table::new();
+        payload.insert(
+            "git_remote_url".to_string(),
+            toml::Value::String(String::new()),
+        );
+
+        let url = make_source_url(payload, meta, None, "docs/guide.md");
+        assert!(
+            url.is_none(),
+            "empty git_remote_url must suppress source_url"
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_empty_root_path_returns_none() {
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        // root_path is empty → None
+        let url = make_source_url(toml::value::Table::new(), meta, None, "");
+        assert!(url.is_none(), "empty root_path must return None");
+    }
+
+    #[test]
+    fn test_compute_source_url_with_network_prefix() {
+        // network_prefix = "tests/network_1" means the network dir is not the git root.
+        // root_path = "subnet1/file.md" (network-relative).
+        // Expected full path: "tests/network_1/subnet1/file.md".
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        git.insert(
+            "network_prefix".to_string(),
+            toml::Value::String("tests/network_1".to_string()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let url = make_source_url(toml::value::Table::new(), meta, Some(1), "subnet1/file.md");
+        assert_eq!(
+            url,
+            Some(
+                "https://github.com/org/repo/blob/main/tests/network_1/subnet1/file.md#L1"
+                    .to_string()
+            ),
+            "network_prefix must be prepended to root_path in source_url"
+        );
+    }
+
+    #[test]
+    fn test_compute_source_url_empty_network_prefix_is_ignored() {
+        // network_prefix = "" means the network IS the git root — root_path used as-is.
+        let mut git = toml::value::Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            toml::Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert(
+            "branch".to_string(),
+            toml::Value::String("main".to_string()),
+        );
+        git.insert(
+            "network_prefix".to_string(),
+            toml::Value::String(String::new()),
+        );
+        let mut meta = toml::value::Table::new();
+        meta.insert("git".to_string(), toml::Value::Table(git));
+
+        let url = make_source_url(toml::value::Table::new(), meta, Some(5), "docs/guide.md");
+        assert_eq!(
+            url,
+            Some("https://github.com/org/repo/blob/main/docs/guide.md#L5".to_string()),
+            "empty network_prefix must not add a leading slash"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // generate_source metadata exclusion test
+    // -------------------------------------------------------------------------
+
+    /// Confirm that metadata fields (git status, source_url) never appear in the
+    /// markdown output produced by generate_source.
+    ///
+    /// generate_source drives exclusively from MdCodec::current_events (the raw
+    /// pulldown-cmark event stream) and never reads BeliefNode::metadata.  This
+    /// test verifies that invariant by parsing a document, manually injecting
+    /// metadata into the first IRNode (simulating what push() does via
+    /// metadata_override), and asserting that generate_source output is clean.
+    #[test]
+    fn test_metadata_not_in_generate_source() {
+        use crate::codec::DocCodec;
+
+        let md = "---\ntitle: \"Doc\"\nid: \"doc\"\n---\n\n# Section\n\nProse.\n";
+
+        let mut codec = MdCodec::new();
+        let root = IRNode {
+            path: "net/doc.md".to_string(),
+            heading: 2,
+            source_line: Some(1),
+            ..Default::default()
+        };
+        let mut diagnostics = vec![];
+        codec.parse(md, root, &mut diagnostics).unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        // Simulate metadata_override: inject git + source_url into the first IRNode's
+        // associated BeliefNode, exactly as push() does at runtime.  generate_source
+        // must not include any of these fields in its output.
+        // (The IRNode event stream is unaffected — we only mutate the proto document
+        // to verify that generate_source never reads from it for metadata fields.)
+        if let Some((proto, _events)) = codec.current_events.first_mut() {
+            proto.document.insert(
+                "metadata",
+                toml_edit::Item::Value(toml_edit::Value::InlineTable({
+                    let mut t = toml_edit::InlineTable::new();
+                    t.insert(
+                        "source_url",
+                        toml_edit::Value::String(toml_edit::Formatted::new(
+                            "https://github.com/org/repo/blob/main/net/doc.md".to_string(),
+                        )),
+                    );
+                    t
+                })),
+            );
+        }
+
+        let output = codec
+            .generate_source()
+            .expect("generate_source must return Some");
+
+        assert!(
+            !output.contains("metadata"),
+            "generate_source must not contain 'metadata'; got:\n{output}"
+        );
+        assert!(
+            !output.contains("source_url"),
+            "generate_source must not contain 'source_url'; got:\n{output}"
+        );
+        assert!(
+            !output.contains("git"),
+            "generate_source must not contain 'git'; got:\n{output}"
+        );
+        // Sanity: the real content must survive the round-trip.
+        assert!(
+            output.contains("Doc"),
+            "title must be preserved; got:\n{output}"
+        );
+        assert!(
+            output.contains("Section"),
+            "heading must be preserved; got:\n{output}"
+        );
+        assert!(
+            output.contains("Prose."),
+            "body prose must be preserved; got:\n{output}"
         );
     }
 }

@@ -6,7 +6,7 @@ use crate::{
     error::BuildonomyError,
     nodekey::NodeKey,
     paths::os_path_to_string,
-    properties::{BeliefKind, BeliefNode, Bref, Weight, WeightKind},
+    properties::{BeliefKind, BeliefNode, Bid, Bref, Weight, WeightKind},
 };
 use std::path::{Path, PathBuf};
 
@@ -150,7 +150,7 @@ impl DocCodec for NetworkCodec {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
+    ) -> Result<std::collections::HashMap<Bid, IRNode>, BuildonomyError> {
         self.0.finalize(diagnostics)
     }
 

@@ -133,6 +133,11 @@ enum Commands {
         /// Use 1 for sequential execution. Can also be set via NOET_JOBS env var.
         #[arg(short = 'j', long)]
         jobs: Option<usize>,
+
+        /// Inject git repository metadata (commit, branch, dirty status, source backlinks)
+        /// into BeliefNetwork nodes during parse. Can also be set via NOET_GIT_TRACKING=1.
+        #[arg(long)]
+        git_tracking: bool,
     },
 
     /// Watch a directory for changes and continuously parse
@@ -174,6 +179,11 @@ enum Commands {
         /// Port for dev server (default: 9037)
         #[arg(long, default_value = "9037")]
         port: u16,
+
+        /// Inject git repository metadata (commit, branch, dirty status, source backlinks)
+        /// into BeliefNetwork nodes during parse. Can also be set via NOET_GIT_TRACKING=1.
+        #[arg(long)]
+        git_tracking: bool,
     },
 }
 
@@ -321,9 +331,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cdn,
             base_url,
             jobs,
+            git_tracking,
         } => {
             // Read base_url from environment if not provided via CLI
             let base_url = base_url.or_else(|| std::env::var("NOET_BASE_URL").ok());
+            // Resolve git_tracking: CLI flag > NOET_GIT_TRACKING env var > false.
+            let git_tracking = git_tracking
+                || std::env::var("NOET_GIT_TRACKING")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
 
             if verbose {
                 println!("Parsing: {path:?}");
@@ -393,9 +410,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cdn,
                         base_url,
                         jobs,
+                        git_tracking,
                     )?
                 } else {
-                    let mut c = DocumentCompiler::new(&path, Some(tx), None, write)?;
+                    let mut c = DocumentCompiler::with_html_output(
+                        &path,
+                        Some(tx),
+                        None,
+                        write,
+                        None,
+                        None,
+                        false,
+                        None,
+                        jobs,
+                        git_tracking,
+                    )?;
                     if let Some(j) = jobs {
                         c.set_jobs(j);
                     }
@@ -580,9 +609,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url,
             serve,
             port,
+            git_tracking,
         } => {
             // Read base_url from environment if not provided via CLI
             let base_url = base_url.or_else(|| std::env::var("NOET_BASE_URL").ok());
+            // Resolve git_tracking: CLI flag > NOET_GIT_TRACKING env var > false.
+            let git_tracking = git_tracking
+                || std::env::var("NOET_GIT_TRACKING")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             #[cfg(not(feature = "service"))]
             {
                 eprintln!("Error: The 'watch' subcommand requires the 'service' feature.");
@@ -698,9 +734,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         live_reload_script,
                         cdn,
                         base_url,
+                        git_tracking,
                     )?
                 } else {
-                    WatchService::new(root_dir.clone(), tx, write)?
+                    WatchService::new(root_dir.clone(), tx, write, git_tracking)?
                 };
 
                 // Enable network syncer for the path

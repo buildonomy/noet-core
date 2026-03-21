@@ -39,7 +39,7 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
 
     // Initialize service (creates database at workspace_root/belief_cache.db)
     println!("Initializing WatchService at: {}", workspace_root.display());
-    let service = WatchService::new(workspace_root.clone(), tx, true)?;
+    let service = WatchService::new(workspace_root.clone(), tx, true, false)?;
 
     // Enable watching for a network
     let network_path = workspace_root.join("docs");
@@ -96,7 +96,7 @@ fn example_multiple_networks(workspace_root: PathBuf) -> Result<(), Box<dyn std:
     println!("\n=== Example 2: Multiple Networks with Configuration ===\n");
 
     let (tx, _rx) = channel::<Event>();
-    let service = WatchService::new(workspace_root.clone(), tx, true)?;
+    let service = WatchService::new(workspace_root.clone(), tx, true, false)?;
 
     // Get current networks (reads from config.toml)
     let networks = service.get_networks()?;
@@ -111,12 +111,9 @@ fn example_multiple_networks(workspace_root: PathBuf) -> Result<(), Box<dyn std:
     updated_networks.push(NetworkRecord {
         path: new_network_path.to_string_lossy().to_string(),
         node: BeliefNode {
-            bid: Bid::nil(),
-            kind: Default::default(),
             title: "New Network Example".to_string(),
-            schema: None,
-            payload: Default::default(),
             id: Some("new-network-example".to_string()),
+            ..Default::default()
         },
     });
 
@@ -144,7 +141,7 @@ fn example_event_processing(workspace_root: PathBuf) -> Result<(), Box<dyn std::
     println!("\n=== Example 3: Detailed Event Processing ===\n");
 
     let (tx, rx) = channel::<Event>();
-    let service = WatchService::new(workspace_root.clone(), tx, true)?;
+    let service = WatchService::new(workspace_root.clone(), tx, true, false)?;
 
     let network_path = workspace_root.join("docs");
     if !network_path.exists() {
@@ -233,7 +230,7 @@ fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::erro
     println!("This example runs until Ctrl-C is pressed\n");
 
     let (tx, rx) = channel::<Event>();
-    let service = WatchService::new(workspace_root.clone(), tx, true)?;
+    let service = WatchService::new(workspace_root.clone(), tx, true, false)?;
 
     let network_path = workspace_root.join("docs");
     if !network_path.exists() {

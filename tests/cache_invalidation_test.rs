@@ -33,7 +33,7 @@ fn test_mtime_tracking() {
     let (tx, _rx) = channel::<Event>();
 
     // Create WatchService with database
-    let service = WatchService::new(root_dir.clone(), tx, false).unwrap();
+    let service = WatchService::new(root_dir.clone(), tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -90,7 +90,7 @@ fn test_stale_file_detection_and_reparse() {
     let (tx, rx) = channel::<Event>();
 
     // Create WatchService
-    let service = WatchService::new(root_dir.clone(), tx, false).unwrap();
+    let service = WatchService::new(root_dir.clone(), tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -197,7 +197,7 @@ fn test_multiple_files_mtime_tracking() {
     let (tx, _rx) = channel::<Event>();
 
     // Create WatchService
-    let service = WatchService::new(root_dir.clone(), tx, false).unwrap();
+    let service = WatchService::new(root_dir.clone(), tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -250,7 +250,7 @@ fn test_deleted_file_handling() {
     let (tx, _rx) = channel::<Event>();
 
     // Create WatchService
-    let service = WatchService::new(root_dir.clone(), tx, false).unwrap();
+    let service = WatchService::new(root_dir.clone(), tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -307,7 +307,7 @@ fn test_unchanged_files_keep_same_mtime() {
     let (tx, _rx) = channel::<Event>();
 
     // Create WatchService
-    let service = WatchService::new(root_dir.clone(), tx, false).unwrap();
+    let service = WatchService::new(root_dir.clone(), tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();

@@ -399,6 +399,7 @@ mod tests {
             schema: None,
             payload: toml::Table::new(),
             id: None,
+            metadata: toml::Table::new(),
         }
     }
 

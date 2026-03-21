@@ -948,6 +948,15 @@ pub struct BeliefNode {
     /// Optional semantic identifier from TOML schema (e.g., "asp_sarah_embodiment_rest")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Runtime metadata: per-parse annotations such as git status and source backlinks.
+    /// Serialized via `toml()` (carried in `BeliefEvent::NodeUpdate`) and persisted in the
+    /// DB `metadata` column so it survives the full parse → DB → export → browser round-trip.
+    /// Never appears in source files: `generate_source` is driven by the markdown event
+    /// stream and `IRNode::as_frontmatter`, neither of which reads `BeliefNode::metadata`.
+    /// Included in `PartialEq` so merges and `compute_diff` propagate it correctly.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Table::is_empty")]
+    pub metadata: Table,
 }
 
 impl Hash for BeliefNode {
@@ -965,6 +974,7 @@ impl PartialEq for BeliefNode {
             && self.schema == other.schema
             && self.payload == other.payload
             && self.id == other.id
+            && self.metadata == other.metadata
     }
 }
 
@@ -1004,6 +1014,7 @@ impl BeliefNode {
             // API node is _always_ also a Trace, as we never can assume we have all api relations
             kind: BeliefKindSet(BeliefKind::API | BeliefKind::Trace),
             id: Some("buildonomy_api".to_string()),
+            metadata: Table::new(),
         }
     }
 
@@ -1027,6 +1038,7 @@ impl BeliefNode {
             // API node is _always_ also a Trace, as we never can assume we have all api relations
             kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
             id: Some("buildonomy_href_network".to_string()),
+            metadata: Table::new(),
         }
     }
 
@@ -1048,6 +1060,7 @@ impl BeliefNode {
             // Asset network is always a Trace as we track external resources
             kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
             id: Some("buildonomy_asset_network".to_string()),
+            metadata: Table::new(),
         }
     }
 
@@ -1192,6 +1205,44 @@ impl BeliefNode {
     pub fn toml(&self) -> String {
         to_string(self).expect("Serialization of BeliefNodes cannot fail")
     }
+
+    /// Apply source-file-derived fields from `ir` into `self`, leaving runtime-only
+    /// fields (`bid`, `metadata`) untouched.
+    ///
+    /// `finalize()` in codecs constructs `IRNode`s that reflect what changed in the
+    /// source (sections table, payload updates, etc.).  The caller needs to push those
+    /// changes into the canonical `BeliefNode` that lives in `doc_bb` without losing
+    /// runtime annotations (git status, source backlinks) that were injected by
+    /// `push()` and are not stored in source files.
+    ///
+    /// Fields updated: `kind`, `title`, `schema`, `payload`, `id`.
+    /// Fields preserved: `bid`, `metadata`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_source_update(&mut self, ir: &IRNode) -> Result<bool, BuildonomyError> {
+        let updated = BeliefNode::try_from(ir)?;
+        let mut changed = false;
+        if self.kind != updated.kind {
+            self.kind = updated.kind;
+            changed = true;
+        }
+        if self.title != updated.title {
+            self.title = updated.title;
+            changed = true;
+        }
+        if self.schema != updated.schema {
+            self.schema = updated.schema;
+            changed = true;
+        }
+        if self.payload != updated.payload {
+            self.payload = updated.payload;
+            changed = true;
+        }
+        if self.id != updated.id {
+            self.id = updated.id;
+            changed = true;
+        }
+        Ok(changed)
+    }
 }
 
 impl Display for BeliefNode {
@@ -1210,6 +1261,7 @@ impl Display for BeliefNode {
             self.schema.as_deref().unwrap_or("default"),
             self.payload.to_string().replace("\n", "\n\t")
         )
+        // metadata omitted from Display: ephemeral, not part of stable node identity
     }
 }
 
@@ -1227,6 +1279,13 @@ impl FromRow<'_, SqliteRow> for BeliefNode {
         let maybe_id_str: Option<&str> = row.try_get("id")?;
         let serde_str: &str = row.try_get("payload")?;
         let table = toml::from_str::<Table>(serde_str).map_err(BuildonomyError::from)?;
+        let metadata_str: Option<&str> = row.try_get("metadata")?;
+        let metadata = match metadata_str {
+            Some(s) if !s.is_empty() => {
+                toml::from_str::<Table>(s).map_err(BuildonomyError::from)?
+            }
+            _ => Table::new(),
+        };
 
         Ok(BeliefNode {
             bid,
@@ -1235,6 +1294,7 @@ impl FromRow<'_, SqliteRow> for BeliefNode {
             schema: schema_str.map(|schema| schema.to_string()),
             payload: table,
             id: maybe_id_str.map(|id_str| id_str.to_string()),
+            metadata,
         })
     }
 }
@@ -1254,6 +1314,12 @@ impl TryFrom<&IRNode> for BeliefNode {
 
     fn try_from(proto: &IRNode) -> Result<Self, Self::Error> {
         let mut doc = proto.document.clone();
+        // `metadata` is runtime-only and must never bleed into `payload`.  Strip it
+        // unconditionally here: `TryFrom<&BeliefNode> for IRNode` already removes it from
+        // IRNode.document at the conversion boundary, so under normal operation this remove
+        // is a no-op.  It remains as a belt-and-suspenders guard against any future
+        // propagation path that bypasses that strip.
+        doc.remove("metadata");
         Ok(BeliefNode {
             bid: doc
                 .remove("bid")
@@ -1271,6 +1337,7 @@ impl TryFrom<&IRNode> for BeliefNode {
                 .and_then(|val| val.as_str().map(|s| s.to_string())),
             payload: from_str(&doc.to_string())?,
             kind: proto.kind.clone(),
+            metadata: Table::new(),
         })
     }
 }
@@ -1711,6 +1778,106 @@ mod tests {
         assert_eq!(
             mixed_weight.get_doc_paths(),
             vec!["new_path1.md".to_string(), "new_path2.md".to_string()]
+        );
+    }
+    #[test]
+    fn test_belief_node_metadata_serde_round_trip_json() {
+        // metadata must survive a JSON round-trip (the beliefbase.json → browser path).
+        let mut metadata = Table::new();
+        let mut git = Table::new();
+        git.insert(
+            "remote_url".to_string(),
+            Value::String("https://github.com/org/repo".to_string()),
+        );
+        git.insert("branch".to_string(), Value::String("main".to_string()));
+        git.insert("dirty".to_string(), Value::Boolean(false));
+        metadata.insert("git".to_string(), Value::Table(git));
+        metadata.insert(
+            "source_url".to_string(),
+            Value::String("https://github.com/org/repo/blob/main/docs/guide.md#L42".to_string()),
+        );
+
+        let node = BeliefNode {
+            bid: Bid::new(Bid::nil()),
+            kind: crate::properties::BeliefKind::Document.into(),
+            title: "Guide".to_string(),
+            schema: None,
+            payload: Table::new(),
+            id: Some("guide".to_string()),
+            metadata,
+        };
+
+        let json = serde_json::to_string(&node).expect("serialize to JSON");
+        let restored: BeliefNode = serde_json::from_str(&json).expect("deserialize from JSON");
+
+        assert_eq!(node, restored, "BeliefNode must round-trip through JSON");
+        assert_eq!(
+            restored.metadata.get("source_url").and_then(|v| v.as_str()),
+            Some("https://github.com/org/repo/blob/main/docs/guide.md#L42"),
+            "source_url must survive JSON round-trip"
+        );
+        assert!(
+            restored.metadata.get("git").is_some(),
+            "git sub-table must survive JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn test_belief_node_metadata_serde_round_trip_toml() {
+        // metadata must survive a TOML round-trip (the NodeUpdate event → DB path).
+        let mut metadata = Table::new();
+        metadata.insert(
+            "source_url".to_string(),
+            Value::String("https://github.com/org/repo/blob/main/src/lib.rs".to_string()),
+        );
+
+        let node = BeliefNode {
+            bid: Bid::new(Bid::nil()),
+            kind: crate::properties::BeliefKind::Document.into(),
+            title: "Lib".to_string(),
+            schema: None,
+            payload: Table::new(),
+            id: None,
+            metadata,
+        };
+
+        let toml_str = node.toml();
+        let restored: BeliefNode =
+            toml::from_str(&toml_str).expect("deserialize BeliefNode from TOML");
+
+        assert_eq!(node, restored, "BeliefNode must round-trip through TOML");
+        assert_eq!(
+            restored.metadata.get("source_url").and_then(|v| v.as_str()),
+            Some("https://github.com/org/repo/blob/main/src/lib.rs"),
+            "source_url must survive TOML round-trip"
+        );
+    }
+
+    /// The actual generate_source round-trip test lives in `codec::md::tests` as
+    /// `test_metadata_not_in_generate_source`, where MdCodec is available.
+    ///
+    /// This test previously used `IRNode::try_from(&BeliefNode)` as a proxy for
+    /// `generate_source`, but that conversion is not on the generate_source path.
+    /// `generate_source` drives exclusively from the markdown event stream
+    /// (`MdCodec::current_events`) and never reads `BeliefNode::metadata`, so
+    /// metadata exclusion must be verified via a full MdCodec parse + generate_source
+    /// round-trip, not via IRNode frontmatter serialization.
+    #[test]
+    fn test_belief_node_metadata_serde_excludes_metadata_when_empty() {
+        // Confirm that an empty metadata table is not serialized (skip_serializing_if).
+        let node = BeliefNode {
+            bid: Bid::new(Bid::nil()),
+            kind: crate::properties::BeliefKind::Document.into(),
+            title: "Doc".to_string(),
+            schema: None,
+            payload: Table::new(),
+            id: Some("doc".to_string()),
+            metadata: Table::new(),
+        };
+        let toml = node.toml();
+        assert!(
+            !toml.contains("metadata"),
+            "empty metadata must be omitted from serialization; got:\n{toml}"
         );
     }
 }

@@ -54,7 +54,7 @@
 //! Register custom codecs via [`CodecMap::insert_codec`] (by stem/extension):
 //!
 //! ```rust
-//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, IRNode, ParseDiagnostic}, properties::BeliefNode};
+//! use noet_core::{beliefbase::BeliefContext, BuildonomyError, codec::{CODECS, DocCodec, IRNode, ParseDiagnostic}, properties::{BeliefNode, Bid}};
 //! use std::path::Path;
 //!
 //! #[derive(Default, Clone)]
@@ -93,8 +93,8 @@
 //!         todo!();
 //!     }
 //!
-//!     fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError> {
-//!         Ok(Vec::new())
+//!     fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>) -> Result<std::collections::HashMap<Bid, IRNode>, BuildonomyError> {
+//!         Ok(std::collections::HashMap::new())
 //!     }
 //!
 //!     fn generate_source(&self) -> Option<String> {
@@ -159,7 +159,7 @@ use crate::{
     codec::{md::MdCodec, network::NetworkCodec},
     error::BuildonomyError,
     paths::os_path_to_string,
-    properties::BeliefNode,
+    properties::{BeliefNode, Bid},
 };
 
 use crate::paths::AnchorPath;
@@ -179,6 +179,8 @@ pub mod builder;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod compiler;
 pub mod diagnostic;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod git;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod md;
 #[cfg(not(target_arch = "wasm32"))]
@@ -315,8 +317,13 @@ pub trait DocCodec: Sync {
     /// Any author-visible warnings discovered during finalization should be pushed onto
     /// `diagnostics` rather than emitted via `tracing`.
     ///
-    /// Returns a vector of (IRNode, BeliefNode) pairs for nodes that were modified
-    /// during finalization and need NodeUpdate events emitted.
+    /// Returns a `HashMap<Bid, IRNode>` for nodes whose source-file-derived fields changed
+    /// during finalization.  The `Bid` key is authoritative — the IRNode is not guaranteed
+    /// to embed its own BID, so the map makes the mapping explicit and infallible.
+    /// The caller applies each delta to the existing `BeliefNode` in `doc_bb` via
+    /// `BeliefNode::apply_source_update`, which updates only the source-file fields
+    /// (`kind`, `title`, `schema`, `payload`, `id`) and leaves runtime-only fields
+    /// (`bid`, `metadata`) untouched.
     ///
     /// Every implementor must explicitly handle this. Codecs that wrap other codecs (e.g.,
     /// `NetworkCodec` wrapping `MdCodec`) must delegate to the inner codec's `finalize()`.
@@ -324,7 +331,7 @@ pub trait DocCodec: Sync {
     fn finalize(
         &mut self,
         diagnostics: &mut Vec<ParseDiagnostic>,
-    ) -> Result<Vec<(IRNode, BeliefNode)>, BuildonomyError>;
+    ) -> Result<std::collections::HashMap<Bid, IRNode>, BuildonomyError>;
 
     fn generate_source(&self) -> Option<String>;
 
@@ -926,7 +933,7 @@ Test network for unit tests.
 
         // Parse with factory method - should return owned codec
         let session_bb = builder.session_bb().clone();
-        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_default();
+        let proto_index = ProtoIndex::build(builder.repo_root(), false).unwrap_or_default();
         let result = builder
             .parse_content(&test_file, content.to_string(), session_bb, proto_index)
             .await;
@@ -972,7 +979,7 @@ Test network for unit tests.
 
         // Parse with factory method - should return owned codec
         let session_bb = builder.session_bb().clone();
-        let proto_index = ProtoIndex::build(builder.repo_root()).unwrap_or_default();
+        let proto_index = ProtoIndex::build(builder.repo_root(), false).unwrap_or_default();
         let result = builder
             .parse_content(&test_file, content.to_string(), session_bb, proto_index)
             .await;

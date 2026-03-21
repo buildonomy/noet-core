@@ -36,7 +36,7 @@
 //!
 //! // Initialize service (creates its own runtime and database)
 //! let root_dir = PathBuf::from("/path/to/workspace");
-//! let service = WatchService::new(root_dir, tx, true)?;
+//! let service = WatchService::new(root_dir, tx, true, false)?;
 //!
 //! // Enable file watching for a document network
 //! let network_path = PathBuf::from("/path/to/workspace/my_network");
@@ -69,7 +69,7 @@
 //! use std::{sync::mpsc::channel, path::PathBuf};
 //!
 //! let (tx, rx) = channel::<Event>();
-//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true)?;
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true, false)?;
 //!
 //! // Enable watching - initial parse happens automatically
 //! let network_path = PathBuf::from("/workspace/docs");
@@ -102,7 +102,7 @@
 //! use std::{sync::mpsc::channel, path::PathBuf};
 //!
 //! let (tx, _rx) = channel::<Event>();
-//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true)?;
+//! let service = WatchService::new(PathBuf::from("/workspace"), tx, true, false)?;
 //!
 //! // Get current networks (reads from config.toml)
 //! let networks = service.get_networks()?;
@@ -113,12 +113,9 @@
 //! networks.push(NetworkRecord {
 //!     path: "/workspace/new_network".to_string(),
 //!     node: BeliefNode {
-//!         bid: Bid::nil(),
-//!         kind: Default::default(),
 //!         title: "New Network".to_string(),
-//!         schema: None,
-//!         payload: Default::default(),
 //!         id: Some("new-network".to_string()),
+//!         ..Default::default()
 //!     },
 //! });
 //! service.set_networks(Some(networks))?;
@@ -181,7 +178,7 @@
 //! let root_dir = PathBuf::from("/workspace");
 //!
 //! // Database created at /workspace/belief_cache.db
-//! let service = WatchService::new(root_dir.clone(), tx, true)?;
+//! let service = WatchService::new(root_dir.clone(), tx, true, false)?;
 //!
 //! // Database location is fixed: {root_dir}/belief_cache.db
 //! let db_path = root_dir.join("belief_cache.db");
@@ -312,6 +309,7 @@ pub struct WatchService {
     html_script: Option<String>,
     use_cdn: bool,
     base_url: Option<String>,
+    git_tracking: bool,
 }
 
 impl WatchService {
@@ -319,8 +317,18 @@ impl WatchService {
         root_dir: PathBuf,
         event_tx: Sender<Event>,
         write: bool,
+        git_tracking: bool,
     ) -> Result<Self, BuildonomyError> {
-        Self::with_html_output(root_dir, event_tx, write, None, None, false, None)
+        Self::with_html_output(
+            root_dir,
+            event_tx,
+            write,
+            None,
+            None,
+            false,
+            None,
+            git_tracking,
+        )
     }
 
     pub fn with_html_output(
@@ -331,6 +339,7 @@ impl WatchService {
         html_script: Option<String>,
         use_cdn: bool,
         base_url: Option<String>,
+        git_tracking: bool,
     ) -> Result<Self, BuildonomyError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -364,6 +373,7 @@ impl WatchService {
             html_script,
             use_cdn,
             base_url,
+            git_tracking,
         })
     }
 
@@ -576,6 +586,7 @@ impl WatchService {
             self.html_script.clone(),
             self.use_cdn,
             self.base_url.clone(),
+            self.git_tracking,
         )?;
 
         let compiler_ref = network_syncer.compiler.clone();
@@ -782,6 +793,7 @@ impl FileUpdateSyncer {
         html_script: Option<String>,
         use_cdn: bool,
         base_url: Option<String>,
+        git_tracking: bool,
     ) -> Result<FileUpdateSyncer, BuildonomyError> {
         let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
 
@@ -822,13 +834,20 @@ impl FileUpdateSyncer {
                 use_cdn,
                 base_url,
                 None,
+                git_tracking,
             )?
         } else {
-            DocumentCompiler::new(
+            DocumentCompiler::with_html_output(
                 root,
                 Some(accum_tx),
                 Some(3), // max_reparse_count
                 write,   // write rewritten content back to files
+                None,
+                None,
+                false,
+                None,
+                None,
+                git_tracking,
             )?
         }));
 

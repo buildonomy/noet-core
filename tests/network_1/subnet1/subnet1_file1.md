@@ -28,3 +28,9 @@ The following list are items from other docs in this corpus which we will treat 
 
 ```{end}
 ```
+
+
+## Project Links
+
+* [net1 directory](../net1_dir1)
+* [assets directory](../assets)

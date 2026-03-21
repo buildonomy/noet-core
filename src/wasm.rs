@@ -35,8 +35,19 @@
 //!
 //! # ⚠️ CRITICAL: Rust→JavaScript Serialization Patterns
 //!
-//! **Problem**: Rust `BTreeMap` and `HashMap` serialize to JavaScript `Map` objects (not plain objects)
-//! when using `serde_wasm_bindgen::to_value()`. This breaks JavaScript code expecting plain objects.
+//! **Problem**: `serde_wasm_bindgen::to_value()` dispatches through serde's generic
+//! serialization traits. Any type whose `Serialize` impl calls `serialize_map` —
+//! including `BTreeMap`, `HashMap`, AND `serde_json::Value::Object` — will produce
+//! a JavaScript `Map`, not a plain object. This breaks JS code expecting plain objects.
+//!
+//! **Key distinction — top-level vs. nested**:
+//! - `serde_wasm_bindgen::to_value(&serde_json::Value::Object(...))` **at the top level**
+//!   produces a plain JS object ✅ (the top-level dispatcher handles `Value` specially)
+//! - A `serde_json::Value::Object` field **nested inside a `#[derive(Serialize)]` struct**
+//!   still calls `serialize_map` → JS `Map` ❌
+//!
+//! This means Option A below only works when `serde_json::Value` is the *return type*
+//! of the function, not when it is a field inside another serialized struct.
 //!
 //! ## Symptoms
 //! ```javascript,ignore
@@ -45,11 +56,14 @@
 //! Object.keys(data);        // Returns [] (empty array!)
 //! data[key];                // Returns undefined (bracket notation fails!)
 //! Object.entries(data);     // Returns [] (empty array!)
+//! // Object.prototype.toString.call(data) === "[object Map]"  ← diagnostic
 //! ```
 //!
 //! ## Solutions
 //!
-//! ### Option A: Return Plain JavaScript Object (Recommended for dictionary-like data)
+//! ### Option A: Return serde_json::Value directly (top-level only)
+//! Only works when the entire return value is `serde_json::Value`. Do NOT use for
+//! fields nested inside a struct — see Option D for that case.
 //! ```rust,ignore
 //! use serde_json::json;
 //!
@@ -60,7 +74,7 @@
 //!         map.insert(key.to_string(), json!(value));
 //!     }
 //!     let obj = serde_json::Value::Object(map);
-//!     serde_wasm_bindgen::to_value(&obj).unwrap()  // ✅ Plain object
+//!     serde_wasm_bindgen::to_value(&obj).unwrap()  // ✅ Plain object (top-level only)
 //! }
 //! ```
 //!
@@ -86,19 +100,46 @@
 //! }
 //! ```
 //!
+//! ### Option D: Patch a nested field via js_sys::JSON::parse (plain object inside a struct)
+//! When a field inside a serialized struct must be a plain JS object, serialize that
+//! field to a JSON string in Rust and parse it via the JS JSON engine after the fact.
+//! `js_sys::JSON::parse` always produces plain objects regardless of serde dispatch.
+//! ```rust,ignore
+//! use js_sys::{Reflect, JSON};
+//!
+//! #[wasm_bindgen]
+//! pub fn get_data(&self) -> JsValue {
+//!     let ctx = build_node_context(); // struct with a serde_json::Value metadata field
+//!     let js_val = serde_wasm_bindgen::to_value(&ctx).unwrap_or(JsValue::NULL);
+//!     // metadata came out as a JS Map — replace it with a plain object via JSON roundtrip
+//!     if js_val.is_object() {
+//!         if let Ok(json_str) = serde_json::to_string(&ctx.metadata) {
+//!             if let Ok(parsed) = JSON::parse(&json_str) {
+//!                 let _ = Reflect::set(&js_val, &JsValue::from_str("metadata"), &parsed);
+//!             }
+//!         }
+//!     }
+//!     js_val  // ✅ metadata is now a plain JS object
+//! }
+//! ```
+//!
 //! ## Checklist for New Functions
-//! - [ ] Does this function return BTreeMap/HashMap?
+//! - [ ] Does this function return or contain BTreeMap/HashMap/serde_json::Value::Object?
+//! - [ ] Is the map-like type the top-level return value, or nested inside a struct?
+//!   - Top-level → Option A (serde_json::Value) or Option B/C
+//!   - Nested inside struct → Option D (JSON string shim) or restructure to avoid nesting
 //! - [ ] Does JavaScript need plain object access (obj[key], Object.keys)?
-//!   - YES → Use Option A (serde_json::Map)
-//!   - NO → Use Option B and document as Map
+//!   - YES → Option A (if top-level) or Option D (if nested)
+//!   - NO → Option B and document as Map
 //! - [ ] Add JSDoc comment showing JavaScript type
 //! - [ ] Verify viewer.js uses correct access pattern
 //!
 //! ## Current Functions Status
-//! - ✅ `get_paths()` - Returns plain object (uses serde_json)
-//! - ⚠️ `get_context()` - Returns NodeContext with Map fields (related_nodes, graph)
-//! - ⚠️ `get_nav_tree()` - Returns NavTree with Map field (nodes)
-//! - ⚠️ `query()` - Returns BeliefGraph with Map field (states)
+//! - ✅ `get_paths()` - Returns plain object (serde_json::Value top-level, Option A)
+//! - ✅ `get_context()` - Returns NodeContext; `metadata` patched via Option D (JSON shim)
+//! - ⚠️ `get_context()` - `related_nodes` and `graph` fields are intentional JS Maps
+//! - ⚠️ `get_nav_tree()` - Returns NavTree with Map field (nodes) — intentional
+//! - ⚠️ `query()` - Returns BeliefGraph with Map field (states) — intentional
 //!
 //! See viewer.js header for JavaScript-side usage patterns.
 
@@ -291,6 +332,15 @@ pub struct NodeContext {
     pub root_path: String,
     /// Home network BID (which Network node owns this document)
     pub home_net: Bid,
+    /// Runtime metadata for this node (e.g. `source_url`, `git` status).
+    /// Mirrors `node.metadata` as a top-level field for convenient JS access:
+    /// `context.metadata?.source_url` rather than `context.node.metadata?.source_url`.
+    ///
+    /// Stored as `serde_json::Value` (not `toml::Table`) so that
+    /// `serde_wasm_bindgen::to_value` produces a plain JavaScript object rather
+    /// than a `Map`. A `toml::Table` serialized via `serde_wasm_bindgen` becomes
+    /// a JS `Map`, making `metadata?.source_url` silently return `undefined`.
+    pub metadata: serde_json::Value,
     /// All nodes related to this one (other end of all edges, both sources and sinks)
     /// Map from BID to RelatedNode for O(1) lookup when displaying graph relations
     /// Each RelatedNode includes the root_path needed for href generation
@@ -1186,6 +1236,32 @@ impl BeliefBaseWasm {
     /// // ❌ WRONG: ctx.related_nodes[bid] returns undefined
     /// ```
     fn extract_node_context(&self, ns: &Bid, bid: &Bid) -> Option<NodeContext> {
+        /// Convert a `toml::value::Table` to a `serde_json::Value::Object` so it
+        /// serializes as a plain JS object (not a Map) via `serde_wasm_bindgen`.
+        fn toml_table_to_json(table: &toml::value::Table) -> serde_json::Value {
+            let mut map = serde_json::Map::new();
+            for (k, v) in table {
+                map.insert(k.clone(), toml_value_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+
+        fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
+            match v {
+                toml::Value::String(s) => serde_json::Value::String(s.clone()),
+                toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+                toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+                toml::Value::Array(arr) => {
+                    serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect())
+                }
+                toml::Value::Table(t) => toml_table_to_json(t),
+                toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+            }
+        }
+
         let mut inner = self.inner.borrow_mut();
 
         inner.get_context(ns, bid).map(|ctx| {
@@ -1258,6 +1334,7 @@ impl BeliefBaseWasm {
                 node: ctx.node.clone(),
                 root_path: normalize_path_extension_impl(&ctx.root_path),
                 home_net: ctx.home_net,
+                metadata: toml_table_to_json(&ctx.node.metadata),
                 related_nodes,
                 graph: sorted_graph,
             }
@@ -1293,7 +1370,27 @@ impl BeliefBaseWasm {
 
         console::log_1(&format!("✅ Got context for node: {}", node_context.node.title).into());
 
-        serde_wasm_bindgen::to_value(&node_context).unwrap_or(JsValue::NULL)
+        // serde_wasm_bindgen v0.6 serializes any map-like Serde type (including
+        // serde_json::Value::Object) as a JS Map rather than a plain object.
+        // To guarantee `metadata` is a plain JS object (so `metadata?.source_url`
+        // works), we:
+        //   1. Serialize the full NodeContext via serde_wasm_bindgen (gets us the
+        //      struct fields as a plain JS object, but metadata comes out as a Map).
+        //   2. Re-serialize just `metadata` to a JSON string and parse it via
+        //      js_sys::JSON::parse — the JS JSON parser always produces plain objects.
+        //   3. Patch the `metadata` property on the returned JS object.
+        let js_val = serde_wasm_bindgen::to_value(&node_context).unwrap_or(JsValue::NULL);
+
+        // Patch metadata: serialize to JSON string then parse via JS JSON engine.
+        if js_val.is_object() {
+            if let Ok(metadata_json) = serde_json::to_string(&node_context.metadata) {
+                if let Ok(metadata_js) = js_sys::JSON::parse(&metadata_json) {
+                    let _ = Reflect::set(&js_val, &JsValue::from_str("metadata"), &metadata_js);
+                }
+            }
+        }
+
+        js_val
     }
 
     /// Get href namespace BID (external HTTP/HTTPS links tracking network)

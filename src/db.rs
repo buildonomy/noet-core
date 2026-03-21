@@ -188,15 +188,21 @@ impl<'a> Transaction<'a> {
 
     fn update_node(&mut self, belief: &BeliefNode) {
         self.qb
-            .push("INSERT OR REPLACE INTO beliefs(bid, bref, kind, title, schema, payload, id) ");
+            .push("INSERT OR REPLACE INTO beliefs(bid, bref, kind, title, schema, payload, id, metadata) ");
         self.qb.push_values(vec![belief], |mut b, belief| {
+            let metadata_str = if belief.metadata.is_empty() {
+                None
+            } else {
+                Some(belief.metadata.to_string())
+            };
             b.push_bind::<String>(belief.bid.into())
                 .push_bind::<String>(belief.bid.bref().to_string())
                 .push_bind(belief.kind.as_u32())
                 .push_bind::<String>(belief.title.clone())
                 .push_bind::<Option<String>>(belief.schema.clone())
                 .push_bind::<String>(belief.payload.to_string())
-                .push_bind::<Option<String>>(belief.id.clone());
+                .push_bind::<Option<String>>(belief.id.clone())
+                .push_bind::<Option<String>>(metadata_str);
         });
         self.qb.push("; ");
         self.staged += 1;
@@ -867,7 +873,7 @@ fn belief_migrations() -> MigrationList {
         version: 1,
         description: "create_initial_tables",
         sql: "\
-            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT); \
+            CREATE TABLE beliefs (bid TEXT PRIMARY KEY, bref TEXT, kind INTEGER, title TEXT, schema TEXT, payload TEXT, id TEXT, metadata TEXT); \
             CREATE TABLE relations (sink TEXT, source TEXT, epistemic TEXT, section TEXT, pragmatic TEXT, UNIQUE(sink, source)); \
             CREATE TABLE paths (net TEXT, path TEXT, target TEXT, ordering TEXT, UNIQUE(net, path)); \
             CREATE TABLE file_mtimes (path TEXT PRIMARY KEY, mtime INTEGER NOT NULL); \

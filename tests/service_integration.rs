@@ -32,7 +32,7 @@ fn test_watch_service_initialization() {
     let (tx, _rx) = channel::<Event>();
 
     // Create WatchService - it creates its own runtime and db internally
-    let service = WatchService::new(root_dir, tx, false);
+    let service = WatchService::new(root_dir, tx, false, false);
 
     // Service should initialize successfully (this is just a compile/construction test)
     assert!(
@@ -51,7 +51,7 @@ fn test_watch_service_enable_disable_network_syncer() {
 
     let (tx, _rx) = channel::<Event>();
 
-    let service = WatchService::new(root_dir, tx, false).unwrap();
+    let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
     // Enable network syncer
     let enable_result = service.enable_network_syncer(&network_path);
@@ -87,7 +87,7 @@ fn test_file_modification_triggers_reparse() {
 
     let (tx, rx) = channel::<Event>();
 
-    let service = WatchService::new(root_dir, tx, false).unwrap();
+    let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -141,7 +141,7 @@ fn test_multiple_file_changes_processed() {
 
     let (tx, _rx) = channel::<Event>();
 
-    let service = WatchService::new(root_dir, tx, false).unwrap();
+    let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -178,7 +178,7 @@ fn test_service_handles_empty_files() {
 
     let (tx, _rx) = channel::<Event>();
 
-    let service = WatchService::new(root_dir, tx, false).unwrap();
+    let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
     // Enable network syncer
     service.enable_network_syncer(&network_path).unwrap();
@@ -204,7 +204,7 @@ fn test_shutdown_cleanup() {
     let (tx, _rx) = channel::<Event>();
 
     {
-        let service = WatchService::new(root_dir, tx, false).unwrap();
+        let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
         // Enable network syncer
         service.enable_network_syncer(&network_path).unwrap();
@@ -232,7 +232,7 @@ fn test_get_set_networks() {
 
     let (tx, _rx) = channel::<Event>();
 
-    let service = WatchService::new(root_dir, tx, false).unwrap();
+    let service = WatchService::new(root_dir, tx, false, false).unwrap();
 
     // Initially no networks
     let networks = service.get_networks().unwrap();
@@ -241,11 +241,9 @@ fn test_get_set_networks() {
     // Set a network (set_networks returns the updated list)
     let node = BeliefNode {
         bid: Bid::new(Bid::nil()),
-        kind: Default::default(),
         title: "Test Network".to_string(),
-        schema: None,
-        payload: Default::default(),
         id: Some("test-network".to_string()),
+        ..Default::default()
     };
     let record = NetworkRecord {
         path: network_path.to_string_lossy().to_string(),

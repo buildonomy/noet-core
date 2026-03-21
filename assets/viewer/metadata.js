@@ -107,7 +107,7 @@ export function updateMetadataPanel() {
  * @returns {string} HTML string ready to assign to innerHTML
  */
 function renderNodeContext(context) {
-  const { node, root_path, home_net, related_nodes, graph } = context;
+  const { node, root_path, home_net, related_nodes, graph, metadata } = context;
 
   let html = '<div class="noet-metadata-section">';
 
@@ -138,6 +138,49 @@ function renderNodeContext(context) {
   html += `<dt>Network</dt><dd>${escapeHtml(netTitle)}</dd>`;
   html += "</dl>";
   html += "</div>";
+
+  // ---- Source backlink ----
+  if (metadata?.source_url) {
+    html += '<div class="noet-metadata-section">';
+    html += "<h3>Source</h3>";
+    html += '<dl class="noet-metadata-list">';
+    html +=
+      `<dt>Edit</dt><dd><a href="${escapeHtml(metadata.source_url)}" ` +
+      `target="_blank" rel="noopener noreferrer">View on remote ↗</a></dd>`;
+    html += "</dl>";
+    html += "</div>";
+  }
+
+  // ---- Git Status (network nodes only) ----
+  const isNetwork = Array.isArray(node.kind)
+    ? node.kind.includes("Network")
+    : node.kind === "Network";
+  if (isNetwork && metadata?.git) {
+    const git = metadata.git;
+    html += '<div class="noet-metadata-section">';
+    html += "<details>";
+    html += '<summary><h3 style="display:inline">Git Status</h3></summary>';
+    html += '<dl class="noet-metadata-list">';
+    if (git.branch) {
+      html += `<dt>Branch</dt><dd><code>${escapeHtml(git.branch)}</code></dd>`;
+    }
+    if (git.commit_short) {
+      html += `<dt>Commit</dt><dd><code>${escapeHtml(git.commit_short)}</code></dd>`;
+    }
+    html += `<dt>Dirty</dt><dd>${git.dirty ? "Yes ⚠️" : "No ✓"}</dd>`;
+    if (git.upstream) {
+      html += `<dt>Upstream</dt><dd><code>${escapeHtml(git.upstream)}</code></dd>`;
+    }
+    if (git.ahead !== undefined || git.behind !== undefined) {
+      html += `<dt>Ahead / Behind</dt><dd>${git.ahead ?? 0} / ${git.behind ?? 0}</dd>`;
+    }
+    if (git.last_commit_date) {
+      html += `<dt>Last Commit</dt><dd>${escapeHtml(git.last_commit_date)}</dd>`;
+    }
+    html += "</dl>";
+    html += "</details>";
+    html += "</div>";
+  }
 
   // ---- Payload ----
   if (node.payload && Object.keys(node.payload).length > 0) {

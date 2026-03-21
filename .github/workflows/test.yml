@@ -3,6 +3,14 @@
 # Tests multiple Rust versions and feature flag combinations
 # Provides free CI/CD for platform testing per Issue 7
 #
+# ### Feature Combinations Tested
+# - no-default:          library-only smoke test (no WASM build, no git, no service)
+# - bin,service:         full CLI minus git-tracking (tests the feature boundary)
+# - (default):           bin + service + git-tracking — the standard developer build
+#
+# Benchmarks intentionally omit git-tracking to keep results feature-stable.
+# WASM interface test uses --features bin only (git-tracking is a native-only concern).
+#
 # ## Testing Patterns & Gotchas
 #
 # ### WASM Module Testing
@@ -24,7 +32,7 @@
 # 1. Install wasm32 target: rustup target add wasm32-unknown-unknown
 # 2. Install wasm-bindgen: cargo install wasm-bindgen-cli --version 0.2.108
 # 3. Run same commands as CI jobs below (cargo build/test/clippy with same flags)
-# 4. Check feature combinations: no-default, service, bin, "bin service"
+# 4. Check feature combinations: no-default, "bin,service", default (bin,service,git-tracking)
 
 name: Comprehensive Testing
 
@@ -50,9 +58,8 @@ jobs:
         rust: [stable, beta]
         features:
           - "no-default"
-          - "service"
-          - "bin"
-          - "bin service"
+          - "bin,service"
+          - "default"
         exclude:
           # Reduce matrix: only test beta on Linux
           - os: macos-latest
@@ -99,53 +106,35 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Build (no default features)
-        if: matrix.features == 'no-default'
-        run: cargo build --verbose --no-default-features
+      - name: Build
+        run: |
+          if [ "${{ matrix.features }}" = "no-default" ]; then
+            cargo build --verbose --no-default-features
+          elif [ "${{ matrix.features }}" = "bin,service" ]; then
+            cargo build --verbose --no-default-features --features bin,service
+          else
+            cargo build --verbose
+          fi
 
-      - name: Build (service feature)
-        if: matrix.features == 'service'
-        run: cargo build --verbose --features service
+      - name: Test
+        run: |
+          if [ "${{ matrix.features }}" = "no-default" ]; then
+            cargo test --verbose --no-default-features
+          elif [ "${{ matrix.features }}" = "bin,service" ]; then
+            cargo test --verbose --no-default-features --features bin,service
+          else
+            cargo test --verbose
+          fi
 
-      - name: Build (bin feature)
-        if: matrix.features == 'bin'
-        run: cargo build --verbose --features bin
-
-      - name: Build (bin + service features)
-        if: matrix.features == 'bin service'
-        run: cargo build --verbose --features "bin service"
-
-      - name: Test (no default features)
-        if: matrix.features == 'no-default'
-        run: cargo test --verbose --no-default-features
-
-      - name: Test (service feature)
-        if: matrix.features == 'service'
-        run: cargo test --verbose --features service
-
-      - name: Test (bin feature)
-        if: matrix.features == 'bin'
-        run: cargo test --verbose --features bin
-
-      - name: Test (bin + service features)
-        if: matrix.features == 'bin service'
-        run: cargo test --verbose --features "bin service"
-
-      - name: Doc tests (no default features)
-        if: matrix.features == 'no-default'
-        run: cargo test --doc --no-default-features
-
-      - name: Doc tests (service feature)
-        if: matrix.features == 'service'
-        run: cargo test --doc --features service
-
-      - name: Doc tests (bin feature)
-        if: matrix.features == 'bin'
-        run: cargo test --doc --features bin
-
-      - name: Doc tests (bin + service features)
-        if: matrix.features == 'bin service'
-        run: cargo test --doc --features "bin service"
+      - name: Doc tests
+        run: |
+          if [ "${{ matrix.features }}" = "no-default" ]; then
+            cargo test --doc --no-default-features
+          elif [ "${{ matrix.features }}" = "bin,service" ]; then
+            cargo test --doc --no-default-features --features bin,service
+          else
+            cargo test --doc
+          fi
 
   # MSRV (Minimum Supported Rust Version) check
   msrv:
@@ -210,7 +199,7 @@ jobs:
           shared-key: examples
 
       - name: Build examples
-        run: cargo build --examples --features service
+        run: cargo build --examples
 
       - name: Run basic_usage example
         run: cargo run --example basic_usage
@@ -605,10 +594,10 @@ jobs:
         if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
-      - name: Build noet-core with bin features
+      - name: Build noet-core with default features
         run: |
           cd noet-core
-          cargo build --features bin
+          cargo build
 
       - name: Create standalone test project
         run: |
@@ -617,7 +606,7 @@ jobs:
           cargo init --name standalone_test
 
           # Add noet-core as path dependency using cargo add
-          cargo add noet-core --path ../noet-core --features bin
+          cargo add noet-core --path ../noet-core
 
           # Create minimal example using public API
           cat > src/main.rs << 'EOF'

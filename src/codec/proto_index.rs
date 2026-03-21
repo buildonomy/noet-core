@@ -53,6 +53,14 @@ use crate::{
     properties::BeliefKind,
 };
 
+#[cfg(feature = "git-tracking")]
+use crate::codec::git::{GitCache, NetworkGitStatus};
+
+/// Placeholder type used in `proto_for`'s return signature when the `git-tracking`
+/// feature is disabled.  Always `None` at runtime; zero cost.
+#[cfg(not(feature = "git-tracking"))]
+pub struct NetworkGitStatus;
+
 /// Filesystem-level index of every network directory in the repo.
 ///
 /// Maps each absolute network directory path → its ordered list of direct children
@@ -69,6 +77,10 @@ pub struct ProtoIndex {
     /// `PathBuf` = absolute network directory
     /// `Vec<PathBuf>` = ordered direct children produced by the repo-wide scan
     inner: Arc<RwLock<HashMap<PathBuf, Vec<PathBuf>>>>,
+    /// Git status cache, populated during `build` when the `git-tracking` feature
+    /// is enabled and `git_tracking = true`.  `None` when git tracking is disabled.
+    #[cfg(feature = "git-tracking")]
+    git_cache: Arc<GitCache>,
 }
 
 /// Returns the direct children of a network directory: subnet directories (those containing
@@ -264,6 +276,8 @@ impl ProtoIndex {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "git-tracking")]
+            git_cache: Arc::new(GitCache::default()),
         }
     }
 
@@ -278,7 +292,7 @@ impl ProtoIndex {
     /// # Errors
     ///
     /// Returns `Err` if `repo_root` is not a valid network root (no `index.md` found).
-    pub fn build(repo_root: &Path) -> Result<Self, BuildonomyError> {
+    pub fn build(repo_root: &Path, git_tracking: bool) -> Result<Self, BuildonomyError> {
         // Verify repo_root is actually a network root.
         if detect_network_file(repo_root).is_none() {
             return Err(BuildonomyError::Codec(format!(
@@ -318,8 +332,21 @@ impl ProtoIndex {
             })
             .collect();
 
+        #[cfg(feature = "git-tracking")]
+        let git_cache = if git_tracking {
+            // Collect all network dirs from the partition keys (already canonicalized).
+            let network_dirs: Vec<PathBuf> = map.keys().cloned().collect();
+            Arc::new(GitCache::populate(&network_dirs))
+        } else {
+            Arc::new(GitCache::default())
+        };
+        // Suppress unused-variable warning when feature is disabled.
+        let _ = git_tracking;
+
         Ok(Self {
             inner: Arc::new(RwLock::new(map)),
+            #[cfg(feature = "git-tracking")]
+            git_cache,
         })
     }
 
@@ -554,7 +581,15 @@ impl ProtoIndex {
     ///
     /// Returns `Err` if the `index.md` frontmatter cannot be parsed, or if the network node
     /// has no semantic ID (same invariant enforced by `NetworkCodec::proto`).
-    pub fn proto_for(&self, dir: &Path) -> Result<Option<IRNode>, BuildonomyError> {
+    ///
+    /// Returns a tuple of `(IRNode, Option<NetworkGitStatus>)`.  The git status is `Some`
+    /// only when the `git-tracking` feature is enabled, `git_tracking` was `true` at
+    /// `build` time, and the network directory resides inside a git repository.
+    #[allow(clippy::type_complexity)]
+    pub fn proto_for(
+        &self,
+        dir: &Path,
+    ) -> Result<Option<(IRNode, Option<NetworkGitStatus>)>, BuildonomyError> {
         let Some(network_filepath) = detect_network_file(dir) else {
             return Ok(None);
         };
@@ -604,7 +639,27 @@ impl ProtoIndex {
         // implementations can express their own file-based child relations.
         codec_factory().prepare_proto_relations(&mut proto, network_dir, &children)?;
 
-        Ok(Some(proto))
+        // Look up cached git status for this network directory (None when git tracking
+        // is disabled or the directory is not inside any git repository).
+        #[cfg(feature = "git-tracking")]
+        let git_status: Option<NetworkGitStatus> = self.git_cache.get(network_dir).cloned();
+        #[cfg(not(feature = "git-tracking"))]
+        let git_status: Option<NetworkGitStatus> = None;
+
+        Ok(Some((proto, git_status)))
+    }
+
+    /// Look up the cached git status for a network directory directly.
+    ///
+    /// Used by `GraphBuilder::parse_content` to inject git metadata into the root
+    /// network node during Phase 1 (the ancestor push loop in `initialize_stack` only
+    /// covers networks *above* the entry point, not the entry network itself).
+    ///
+    /// Returns `None` when git tracking is disabled or the directory is not inside
+    /// any git repository.
+    #[cfg(feature = "git-tracking")]
+    pub fn git_status_for(&self, dir: &Path) -> Option<&NetworkGitStatus> {
+        self.git_cache.get(dir)
     }
 }
 
@@ -674,7 +729,7 @@ mod tests {
     fn test_build_discovers_correct_network_dirs() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         // Root and subnet should be in the index; .hidden should not.
         assert!(
@@ -704,7 +759,7 @@ mod tests {
     fn test_build_matches_net_dir_children_per_directory() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let mut partition = net_dir_partition(&root);
         // Canonicalize partition keys and values to match ProtoIndex's stored paths.
@@ -741,7 +796,7 @@ mod tests {
     fn test_root_children_contains_alpha_and_beta() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let root_children = idx.children_of(&root).unwrap();
 
@@ -771,7 +826,7 @@ mod tests {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
         let subnet = root.join("subnet");
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let subnet_children = idx.children_of(&subnet).unwrap();
         let names: Vec<_> = subnet_children
@@ -798,7 +853,7 @@ mod tests {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
         let subnet = root.join("subnet");
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         // Verify direct root children (alpha.md, beta.md) get their root-list position.
         let root_children = idx.children_of(&root).unwrap();
@@ -844,7 +899,7 @@ mod tests {
         fs::write(plain_dir.join("nested.md"), "# Nested\n").unwrap();
 
         // Rebuild the index after adding the new file.
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         // plain_dir is NOT a network dir, so children_of(plain_dir) returns None.
         assert!(
@@ -882,7 +937,7 @@ mod tests {
     fn test_sort_key_unknown_path_returns_none() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let nonexistent = root.join("does_not_exist.md");
         assert_eq!(idx.sort_key_for(&nonexistent), None);
@@ -893,7 +948,7 @@ mod tests {
         // The network's own index.md is not a child of itself.
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let index_path = root.join(NETWORK_NAME);
         // index.md's parent is root; root's child list should not contain index.md.
@@ -917,7 +972,7 @@ mod tests {
     fn test_proto_for_upstream_matches_network_codec_proto() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         // Use net_dir_partition for the codec side: proto_for uses children_of(), which
         // returns the direct group from the partition (not the full DFS net_dir_children list).
@@ -955,7 +1010,7 @@ mod tests {
                 .prepare_proto_relations(&mut codec_proto, net_dir, &children)
                 .unwrap();
 
-            let index_proto = idx
+            let (index_proto, _git_status) = idx
                 .proto_for(net_dir)
                 .unwrap()
                 .expect("proto_for should succeed for known network dirs");
@@ -989,9 +1044,9 @@ mod tests {
     fn test_proto_for_sets_network_kind_and_heading() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
-        let proto = idx.proto_for(&root).unwrap().unwrap();
+        let (proto, _git_status) = idx.proto_for(&root).unwrap().unwrap();
         assert!(proto.kind.contains(BeliefKind::Network));
         assert_eq!(proto.heading, 1);
     }
@@ -1000,7 +1055,7 @@ mod tests {
     fn test_proto_for_unknown_dir_returns_none() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         // A directory with no index.md.
         let no_net = root.join("subnet").join("subsubdir");
@@ -1020,7 +1075,7 @@ mod tests {
     fn test_clone_shares_inner_map() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
         let clone = idx.clone();
 
         // Both handles should see the same data.
@@ -1044,7 +1099,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         // No index.md in root.
-        let result = ProtoIndex::build(&root);
+        let result = ProtoIndex::build(&root, false);
         assert!(
             result.is_err(),
             "build() without index.md should return Err"
@@ -1081,7 +1136,7 @@ mod tests {
     fn test_ordered_paths_dfs_network_before_children_lex_order() {
         let tmp = build_fixture();
         let root = tmp.path().canonicalize().unwrap();
-        let idx = ProtoIndex::build(&root).unwrap();
+        let idx = ProtoIndex::build(&root, false).unwrap();
 
         let paths = idx.ordered_paths();
 

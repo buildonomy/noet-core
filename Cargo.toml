@@ -37,6 +37,7 @@ enumset = { version = "1.1", features = ["serde"] }
 futures = { version = "0.3", optional = true }
 futures-core = { version = "0.3", optional = true }
 getrandom = { version = "0.2", features = ["js"] }
+git2 = { version = "0.19", optional = true, default-features = false }
 hex = { version = "0.4", features = ["serde", "std"] }
 http = { version = "1.1.0" }
 include_dir = "0.7"
@@ -98,7 +99,7 @@ tracing-subscriber = "0.3.20"
 trybuild = "1.0"
 
 [features]
-default = []
+default = ["bin", "service", "git-tracking"]
 bin = ["clap", "dep:tracing-subscriber", "wasm", "stemming"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber"]
@@ -107,22 +108,31 @@ wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", 
 # implementation (same Snowball English algorithm, applied to query terms).
 # Enabled by default for 'bin' builds. Can be disabled for minimal builds.
 stemming = ["dep:rust-stemmers"]
+# Git repository metadata injection into BeliefNetwork nodes.
+# Requires libgit2. When enabled, --git-tracking CLI flag and NOET_GIT_TRACKING
+# env var become available. Disabled by default (no performance impact when off).
+git-tracking = ["dep:git2"]
 
 # Feature Notes:
 # - 'wasm' is for browser WASM target (no filesystem, no native I/O)
 # - 'service' includes daemon, file watching, database sync (native platform only)
 # - 'bin' is the CLI with parsing and HTML generation (includes embedded WASM)
 #   (build.rs compiles WASM separately with isolated target directory)
+# - 'git-tracking' enables --git-tracking CLI flag and NOET_GIT_TRACKING env var
+#
+# Default features (bin + service + git-tracking) give a fully functional CLI.
+# The wasm-pack profiles override this with `default-features = false` so WASM
+# builds are unaffected.
 #
 # Valid build commands:
-#   cargo build                         # Library only (no features)
-#   cargo build --features service      # Library with daemon/watch features
-#   cargo build --features bin          # CLI for parsing and HTML generation
-#   cargo build --features "bin service" # CLI with all features
-#   cargo test --features service       # Run tests
+#   cargo build                         # Full CLI (default features)
+#   cargo build --no-default-features   # Library only (no features)
+#   cargo build --no-default-features --features service  # Library with daemon/watch
+#   cargo test                          # Full test suite (default features)
 #
 # Note: The 'wasm' feature is for the WASM target build, not the native build.
 # When building with 'bin', build.rs automatically compiles a separate WASM module.
+# Requires: wasm-bindgen-cli, wasm32-unknown-unknown target, libgit2.
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.40", features = ["fs", "time", "rt", "rt-multi-thread"] }
