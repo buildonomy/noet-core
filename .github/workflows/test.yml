@@ -56,10 +56,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
-        features:
-          - "no-default"
-          - "bin,service"
-          - "default"
+        features: ["no-default", "bin,service", "default"]
+        include:
+          - features: "no-default"
+            cargo_flags: "--no-default-features"
+          - features: "bin,service"
+            cargo_flags: "--no-default-features --features bin,service"
+          - features: "default"
+            cargo_flags: ""
         exclude:
           # Reduce matrix: only test beta on Linux
           - os: macos-latest
@@ -107,34 +111,13 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
       - name: Build
-        run: |
-          if [ "${{ matrix.features }}" = "no-default" ]; then
-            cargo build --verbose --no-default-features
-          elif [ "${{ matrix.features }}" = "bin,service" ]; then
-            cargo build --verbose --no-default-features --features bin,service
-          else
-            cargo build --verbose
-          fi
+        run: cargo build --verbose ${{ matrix.cargo_flags }}
 
       - name: Test
-        run: |
-          if [ "${{ matrix.features }}" = "no-default" ]; then
-            cargo test --verbose --no-default-features
-          elif [ "${{ matrix.features }}" = "bin,service" ]; then
-            cargo test --verbose --no-default-features --features bin,service
-          else
-            cargo test --verbose
-          fi
+        run: cargo test --verbose ${{ matrix.cargo_flags }}
 
       - name: Doc tests
-        run: |
-          if [ "${{ matrix.features }}" = "no-default" ]; then
-            cargo test --doc --no-default-features
-          elif [ "${{ matrix.features }}" = "bin,service" ]; then
-            cargo test --doc --no-default-features --features bin,service
-          else
-            cargo test --doc
-          fi
+        run: cargo test --doc ${{ matrix.cargo_flags }}
 
   # MSRV (Minimum Supported Rust Version) check
   msrv:

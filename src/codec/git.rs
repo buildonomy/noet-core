@@ -1,8 +1,8 @@
 //! Git repository metadata for BeliefNetwork nodes.
 //!
-//! Provides [`GitCache`], which is built once during [`ProtoIndex::build`] (when the
+//! Provides [`GitCache`], which is built once during [`super::proto_index::ProtoIndex::build`] (when the
 //! `git-tracking` feature is enabled) and shared across all parallel parse tasks via
-//! [`ProtoIndex`]'s existing `Arc<RwLock<...>>` pattern.
+//! [`super::proto_index::ProtoIndex`]'s existing `Arc<RwLock<...>>` pattern.
 //!
 //! ## Design
 //!

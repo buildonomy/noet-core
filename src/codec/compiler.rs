@@ -3738,7 +3738,11 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         // ── Setup ────────────────────────────────────────────────────────────
         let repo_dir = TempDir::new().unwrap();
-        let repo_path = repo_dir.path();
+        // Canonicalize so the path matches GraphBuilder::new's canonicalized repo_root.
+        // On macOS, TempDir paths are under /var/folders which is a symlink to
+        // /private/var/folders; without canonicalization strip_prefix silently fails.
+        let repo_path = repo_dir.path().canonicalize().unwrap();
+        let repo_path = repo_path.as_path();
 
         // Minimal network index so GraphBuilder has a repo root.
         create_test_network(repo_path);
@@ -3864,12 +3868,15 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// to a diagnostic rather than a node update.
     #[tokio::test]
     async fn test_directory_asset_case_c_nonexistent() {
-        use std::path::PathBuf;
         use tempfile::TempDir;
         use tokio::sync::mpsc::unbounded_channel;
 
         let repo_dir = TempDir::new().unwrap();
-        let repo_path = repo_dir.path();
+        // Canonicalize so the path matches GraphBuilder::new's canonicalized repo_root.
+        // On macOS, TempDir paths are under /var/folders which is a symlink to
+        // /private/var/folders; without canonicalization strip_prefix silently fails.
+        let repo_path = repo_dir.path().canonicalize().unwrap();
+        let repo_path = repo_path.as_path();
         create_test_network(repo_path);
 
         let (tx, mut rx) = unbounded_channel::<crate::event::BeliefEvent>();
@@ -3879,7 +3886,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let proto_index = crate::codec::proto_index::ProtoIndex::default();
 
         // A directory that does not exist.
-        let ghost_dir = PathBuf::from(repo_path).join("nonexistent_dir");
+        let ghost_dir = repo_path.join("nonexistent_dir");
         assert!(
             !ghost_dir.exists(),
             "precondition: directory must not exist"
