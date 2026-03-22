@@ -228,8 +228,11 @@ jobs:
           mkdir -p tests/browser/test-output
           ./target/debug/noet parse tests/network_1 --html-output tests/browser/test-output
 
-      - name: Run WASM interface test
+      - name: Run WASM interface test (related nodes)
         run: node tests/browser/test_related_nodes.js
+
+      - name: Run WASM interface test (nav tree subnet placement)
+        run: node tests/browser/test_nav_tree.js
 
       - name: Upload test artifacts on failure
         if: failure()
