@@ -182,8 +182,7 @@ mod inner {
         ///
         /// Returns `None` if the directory was not inside any git repository at populate time.
         pub fn get(&self, network_dir: &Path) -> Option<&NetworkGitStatus> {
-            let canonical = network_dir
-                .canonicalize()
+            let canonical = crate::paths::canonicalize_path(network_dir)
                 .unwrap_or_else(|_| network_dir.to_path_buf());
             self.by_network.get(&canonical)
         }
@@ -193,13 +192,12 @@ mod inner {
         // ------------------------------------------------------------------
 
         fn compute_for_network(&mut self, network_dir: &Path) -> Result<(), git2::Error> {
-            let canonical_dir = network_dir
-                .canonicalize()
+            let canonical_dir = crate::paths::canonicalize_path(network_dir)
                 .unwrap_or_else(|_| network_dir.to_path_buf());
 
             let repo = Repository::discover(&canonical_dir)?;
             let workdir = match repo.workdir() {
-                Some(w) => w.canonicalize().unwrap_or_else(|_| w.to_path_buf()),
+                Some(w) => crate::paths::canonicalize_path(w).unwrap_or_else(|_| w.to_path_buf()),
                 None => {
                     // Bare repository — skip.
                     tracing::debug!(

@@ -210,7 +210,7 @@ impl GraphBuilder {
     where
         P: AsRef<std::path::Path> + std::fmt::Debug,
     {
-        let canonicalized_path = PathBuf::from(repo_path.as_ref()).canonicalize()?;
+        let canonicalized_path = crate::paths::canonicalize_path(repo_path.as_ref())?;
         let Some(mut repo_root) = detect_network_file(canonicalized_path.as_ref()) else {
             return Err(BuildonomyError::Codec(format!(
                 "GraphBuilder initialization failed. Received root path {repo_path:?}. \
@@ -219,11 +219,9 @@ impl GraphBuilder {
         };
         // network index file is now network dir
         repo_root.pop();
-        // Normalize repo_root through os_path_to_string + string_to_os_path to strip any Windows
-        // \\?\ extended-path prefix that canonicalize() adds. Without this, repo_root would be e.g.
-        // \\?\C:\tmp\xxx while parent_path (reconstructed from os_path_to_string) is C:\tmp\xxx ---
-        // causing strip_prefix to always fail on Windows.
-        let repo_root = string_to_os_path(&os_path_to_string(&repo_root));
+        // canonicalize_path already strips any Windows \\?\ prefix, so repo_root is
+        // a plain C:\... path consistent with all other canonicalized paths in the system.
+        let repo_root = crate::paths::canonicalize_path(&repo_root).unwrap_or(repo_root);
 
         let tx = match maybe_tx.take() {
             Some(tx) => tx,

@@ -651,7 +651,7 @@ impl WatchService {
 
                                             // Fine-grained per-file guard: skip paths the
                                             // compiler has written in this idle window.
-                                            let normalized = match p.canonicalize() {
+                                            let normalized = match crate::paths::canonicalize_path(p) {
                                                 Ok(canonical) => {
                                                     tracing::trace!("[Debouncer] Normalized {:?} -> {:?}", p, canonical);
                                                     canonical
@@ -938,7 +938,7 @@ impl FileUpdateSyncer {
                                     path_to_ignore = network_file_path;
                                 }
                             }
-                            let normalized_path = match path_to_ignore.canonicalize() {
+                            let normalized_path = match crate::paths::canonicalize_path(&path_to_ignore) {
                                 Ok(canonical) => {
                                     tracing::trace!(
                                         "[DocumentCompiler] Normalized {:?} -> {:?}",

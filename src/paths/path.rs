@@ -75,6 +75,28 @@ pub fn string_to_os_path(path_string: &str) -> PathBuf {
     PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR))
 }
 
+/// Canonicalize a filesystem path and normalize away any platform-specific
+/// prefix artifacts, returning a plain `PathBuf` suitable for comparison
+/// with other canonicalized paths in the system.
+///
+/// This is the standard composition to use whenever you call
+/// [`std::fs::canonicalize`] / [`Path::canonicalize`] and then compare or
+/// strip-prefix the result against another path that went through the same
+/// pipeline:
+///
+/// 1. `canonicalize()` — resolves symlinks (macOS `/var` → `/private/var`)
+///    and, on Windows, adds a `\\?\` verbatim prefix.
+/// 2. [`os_path_to_string`] — strips the `\\?\` prefix and converts to a
+///    forward-slash string.
+/// 3. [`string_to_os_path`] — converts back to a `PathBuf` using the
+///    platform separator, yielding a plain `C:\…` path on Windows.
+///
+/// Returns `Err` if `canonicalize()` fails (e.g. the path does not exist).
+pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
+    let canonical = path.as_ref().canonicalize()?;
+    Ok(string_to_os_path(&os_path_to_string(&canonical)))
+}
+
 /// Turn a title string into a regularized anchor string.
 ///
 /// Rules:

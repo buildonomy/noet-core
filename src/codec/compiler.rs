@@ -1453,8 +1453,7 @@ impl DocumentCompiler {
     /// Phase 4 context injection.  Canonicalize first to resolve short-name aliases,
     /// falling back to the original path if the file does not (yet) exist.
     fn normalize_queue_path(path: PathBuf) -> PathBuf {
-        let resolved = path.canonicalize().unwrap_or(path);
-        string_to_os_path(&os_path_to_string(&resolved))
+        crate::paths::canonicalize_path(&path).unwrap_or(path)
     }
 
     /// Enqueue a path for parsing if not already queued or processed.
@@ -3738,11 +3737,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         // ── Setup ────────────────────────────────────────────────────────────
         let repo_dir = TempDir::new().unwrap();
-        // Canonicalize so the path matches GraphBuilder::new's canonicalized repo_root.
-        // On macOS, TempDir paths are under /var/folders which is a symlink to
-        // /private/var/folders; without canonicalization strip_prefix silently fails.
-        let repo_path = repo_dir.path().canonicalize().unwrap();
-        let repo_path = repo_path.as_path();
+        // Normalize so the path matches GraphBuilder::new's repo_root on all platforms
+        // (macOS symlinks, Windows \\?\ prefix from canonicalize()).
+        let repo_path_buf = crate::paths::canonicalize_path(repo_dir.path()).unwrap();
+        let repo_path = repo_path_buf.as_path();
 
         // Minimal network index so GraphBuilder has a repo root.
         create_test_network(repo_path);
@@ -3872,11 +3870,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         use tokio::sync::mpsc::unbounded_channel;
 
         let repo_dir = TempDir::new().unwrap();
-        // Canonicalize so the path matches GraphBuilder::new's canonicalized repo_root.
-        // On macOS, TempDir paths are under /var/folders which is a symlink to
-        // /private/var/folders; without canonicalization strip_prefix silently fails.
-        let repo_path = repo_dir.path().canonicalize().unwrap();
-        let repo_path = repo_path.as_path();
+        // Normalize so the path matches GraphBuilder::new's repo_root on all platforms
+        // (macOS symlinks, Windows \\?\ prefix from canonicalize()).
+        let repo_path_buf = crate::paths::canonicalize_path(repo_dir.path()).unwrap();
+        let repo_path = repo_path_buf.as_path();
         create_test_network(repo_path);
 
         let (tx, mut rx) = unbounded_channel::<crate::event::BeliefEvent>();
@@ -3952,7 +3949,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         // ── Setup: git repo with a github remote ─────────────────────────────
         let repo_dir = TempDir::new().unwrap();
-        let repo_path = repo_dir.path();
+        // Normalize so the path matches GraphBuilder::new's repo_root on all platforms
+        // (macOS symlinks, Windows \\?\ prefix from canonicalize()).
+        let repo_path_buf = crate::paths::canonicalize_path(repo_dir.path()).unwrap();
+        let repo_path = repo_path_buf.as_path();
 
         let repo = Repository::init(repo_path).expect("git init");
 

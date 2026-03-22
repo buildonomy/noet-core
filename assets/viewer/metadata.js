@@ -24,7 +24,7 @@
  */
 
 import { state, callbacks } from "./state.js";
-import { escapeHtml, formatBid } from "./utils.js";
+import { escapeHtml, brefFromBid } from "./utils.js";
 import { applyPanelState, savePanelState, showMetadataError } from "./panels.js";
 
 // =============================================================================
@@ -114,9 +114,10 @@ function renderNodeContext(context) {
   // ---- Node Information ----
   html += "<h3>Node Information</h3>";
   html += '<dl class="noet-metadata-list">';
-  const displayTitle = node.title && node.title.length > 0 ? node.title : formatBid(node.bid);
+  const displayTitle = node.title && node.title.length > 0 ? node.title : node.bid;
   html += `<dt>Title</dt><dd>${escapeHtml(displayTitle)}</dd>`;
-  html += `<dt>BID</dt><dd><code>${formatBid(node.bid)}</code></dd>`;
+  html += `<dt>BID</dt><dd><span style="white-space:nowrap"><code>${escapeHtml(node.bid)}</code></span></dd>`;
+  html += `<dt>Bref</dt><dd><code>${escapeHtml(brefFromBid(node.bid))}</code></dd>`;
 
   if (node.kind && node.kind.length > 0) {
     const kinds = Array.isArray(node.kind) ? node.kind.join(", ") : node.kind;
@@ -133,8 +134,7 @@ function renderNodeContext(context) {
 
   html += `<dt>Path</dt><dd><code>${escapeHtml(root_path)}</code></dd>`;
   const netNode = state.beliefbase ? state.beliefbase.get_by_bid(home_net) : null;
-  const netTitle =
-    netNode && netNode.title && netNode.title.length > 0 ? netNode.title : formatBid(home_net);
+  const netTitle = netNode && netNode.title && netNode.title.length > 0 ? netNode.title : home_net;
   html += `<dt>Network</dt><dd>${escapeHtml(netTitle)}</dd>`;
   html += "</dl>";
   html += "</div>";
@@ -231,13 +231,15 @@ function renderNodeContext(context) {
   } else if (node.payload && Object.keys(node.payload).length > 0) {
     // ---- Payload (generic fallback for non-listing nodes) ----
     html += '<div class="noet-metadata-section">';
-    html += "<h3>Payload</h3>";
+    html += "<details>";
+    html += '<summary><h3 style="display:inline">Payload</h3></summary>';
     html += '<dl class="noet-metadata-list">';
     for (const [key, value] of Object.entries(node.payload)) {
-      const valueStr = typeof value === "object" ? JSON.stringify(value) : String(value);
-      html += `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(valueStr)}</dd>`;
+      const valueStr = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+      html += `<dt>${escapeHtml(key)}</dt><dd><pre><code>${escapeHtml(valueStr)}</code></pre></dd>`;
     }
     html += "</dl>";
+    html += "</details>";
     html += "</div>";
   }
 
@@ -300,7 +302,7 @@ function renderRelationGroup(bids, label, related_nodes) {
         html += `<li><span title="BID: ${bid}">${title}</span></li>`;
       }
     } else {
-      html += `<li><span title="BID: ${bid}">${formatBid(bid)}</span></li>`;
+      html += `<li><span title="BID: ${bid}"><code>${escapeHtml(brefFromBid(bid))}</code></span></li>`;
     }
   }
 

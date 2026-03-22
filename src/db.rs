@@ -87,7 +87,8 @@ impl<'a> Transaction<'a> {
         // Canonicalize to resolve Windows 8.3 short-name aliases and symlinks so that
         // the same file is always stored under a single consistent key regardless of
         // which alias the compiler or file-watcher happened to use at call time.
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical =
+            crate::paths::canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf());
         match fs::metadata(&canonical) {
             Ok(metadata) => match metadata.modified() {
                 Ok(modified) => match modified.duration_since(SystemTime::UNIX_EPOCH) {

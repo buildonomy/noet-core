@@ -317,16 +317,10 @@ impl ProtoIndex {
         let map: HashMap<PathBuf, Vec<PathBuf>> = partition
             .into_iter()
             .map(|(net_dir, children)| {
-                let key = {
-                    let p = net_dir.canonicalize().unwrap_or(net_dir);
-                    string_to_os_path(&os_path_to_string(&p))
-                };
+                let key = crate::paths::canonicalize_path(&net_dir).unwrap_or(net_dir);
                 let children = children
                     .into_iter()
-                    .map(|p| {
-                        let c = p.canonicalize().unwrap_or(p);
-                        string_to_os_path(&os_path_to_string(&c))
-                    })
+                    .map(|p| crate::paths::canonicalize_path(&p).unwrap_or(p))
                     .collect();
                 (key, children)
             })
@@ -363,21 +357,16 @@ impl ProtoIndex {
     pub(crate) fn discover_network_dirs(root: &Path) -> Vec<PathBuf> {
         // Canonicalize root so we can use it as the "allow root even if hidden" reference,
         // mirroring net_dir_children's `!is_hidden(e) || e.path() == path.as_ref()` guard.
-        let canonical_root = {
-            let p = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-            string_to_os_path(&os_path_to_string(&p))
-        };
+        let canonical_root =
+            crate::paths::canonicalize_path(root).unwrap_or_else(|_| root.to_path_buf());
         let mut dirs: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| {
                 // Allow the root entry unconditionally (it may live in a hidden temp dir).
                 // Skip all other hidden entries — same rule as net_dir_children.
                 let entry_canonical = {
-                    let p = e
-                        .path()
-                        .canonicalize()
-                        .unwrap_or_else(|_| e.path().to_path_buf());
-                    string_to_os_path(&os_path_to_string(&p))
+                    crate::paths::canonicalize_path(e.path())
+                        .unwrap_or_else(|_| e.path().to_path_buf())
                 };
                 entry_canonical == canonical_root
                     || !e
@@ -397,8 +386,7 @@ impl ProtoIndex {
                 {
                     // Return the canonicalized parent directory, not the index.md file itself.
                     p.parent().map(|d| {
-                        let c = d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
-                        string_to_os_path(&os_path_to_string(&c))
+                        crate::paths::canonicalize_path(d).unwrap_or_else(|_| d.to_path_buf())
                     })
                 } else {
                     None
@@ -451,10 +439,7 @@ impl ProtoIndex {
     /// This is a read-only lookup after `build()` completes.
     pub fn children_of(&self, dir: &Path) -> Option<Vec<PathBuf>> {
         // Canonicalize the lookup key so callers using raw or canonicalized paths both hit.
-        let canonical = {
-            let p = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-            string_to_os_path(&os_path_to_string(&p))
-        };
+        let canonical = crate::paths::canonicalize_path(dir).unwrap_or_else(|_| dir.to_path_buf());
         self.inner.read().get(&canonical).cloned()
     }
 
@@ -541,12 +526,8 @@ impl ProtoIndex {
             };
 
         // Canonicalize once for all comparisons against canonicalized child entries.
-        let canonical = {
-            let p = lookup_path
-                .canonicalize()
-                .unwrap_or_else(|_| lookup_path.to_path_buf());
-            string_to_os_path(&os_path_to_string(&p))
-        };
+        let canonical = crate::paths::canonicalize_path(lookup_path.as_ref())
+            .unwrap_or_else(|_| lookup_path.to_path_buf());
 
         // Walk up the directory tree, checking each ancestor directory that is a known
         // network dir (i.e. present in the ProtoIndex).  The first hit that contains
@@ -628,10 +609,7 @@ impl ProtoIndex {
             Some(c) => c,
             None => net_dir_children(network_dir)
                 .into_iter()
-                .map(|p| {
-                    let c = p.canonicalize().unwrap_or(p);
-                    string_to_os_path(&os_path_to_string(&c))
-                })
+                .map(|p| crate::paths::canonicalize_path(&p).unwrap_or(p))
                 .collect(),
         };
 
@@ -728,7 +706,7 @@ mod tests {
     #[test]
     fn test_build_discovers_correct_network_dirs() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         // Root and subnet should be in the index; .hidden should not.
@@ -758,7 +736,7 @@ mod tests {
     #[test]
     fn test_build_matches_net_dir_children_per_directory() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let mut partition = net_dir_partition(&root);
@@ -766,16 +744,11 @@ mod tests {
         let partition: BTreeMap<_, _> = partition
             .iter_mut()
             .map(|(net_dir, children)| {
-                let key = {
-                    let p = net_dir.canonicalize().unwrap_or_else(|_| net_dir.clone());
-                    string_to_os_path(&os_path_to_string(&p))
-                };
+                let key =
+                    crate::paths::canonicalize_path(net_dir).unwrap_or_else(|_| net_dir.clone());
                 let vals: Vec<PathBuf> = children
                     .iter()
-                    .map(|p| {
-                        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
-                        string_to_os_path(&os_path_to_string(&c))
-                    })
+                    .map(|p| crate::paths::canonicalize_path(p).unwrap_or_else(|_| p.clone()))
                     .collect();
                 (key, vals)
             })
@@ -795,7 +768,7 @@ mod tests {
     #[test]
     fn test_root_children_contains_alpha_and_beta() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let root_children = idx.children_of(&root).unwrap();
@@ -824,7 +797,7 @@ mod tests {
     #[test]
     fn test_subnet_children_correct() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let subnet = root.join("subnet");
         let idx = ProtoIndex::build(&root, false).unwrap();
 
@@ -851,7 +824,7 @@ mod tests {
         // sort_key_for walks up the directory tree to find the owning network, so files
         // inside non-network subdirectories are also handled (see test below).
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let subnet = root.join("subnet");
         let idx = ProtoIndex::build(&root, false).unwrap();
 
@@ -890,7 +863,7 @@ mod tests {
     #[test]
     fn test_sort_key_for_file_in_non_network_subdir() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
 
         // Add a non-network subdirectory with a file directly under root.
         let plain_dir = root.join("plain_dir");
@@ -921,10 +894,8 @@ mod tests {
         // Normalize nested's canonical form the same way build() normalizes child paths
         // (os_path_to_string + string_to_os_path strips the \\?\ prefix on Windows),
         // so the comparison against root_children entries is apples-to-apples.
-        let nested_canonical = {
-            let c = nested.canonicalize().unwrap_or_else(|_| nested.clone());
-            string_to_os_path(&os_path_to_string(&c))
-        };
+        let nested_canonical =
+            crate::paths::canonicalize_path(&nested).unwrap_or_else(|_| nested.clone());
         let expected_idx = root_children.iter().position(|p| p == &nested_canonical);
         assert_eq!(
             sk,
@@ -936,7 +907,7 @@ mod tests {
     #[test]
     fn test_sort_key_unknown_path_returns_none() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let nonexistent = root.join("does_not_exist.md");
@@ -947,7 +918,7 @@ mod tests {
     fn test_sort_key_index_md_itself_returns_none() {
         // The network's own index.md is not a child of itself.
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let index_path = root.join(NETWORK_NAME);
@@ -971,7 +942,7 @@ mod tests {
     #[test]
     fn test_proto_for_upstream_matches_network_codec_proto() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         // Use net_dir_partition for the codec side: proto_for uses children_of(), which
@@ -981,16 +952,11 @@ mod tests {
         let partition: BTreeMap<PathBuf, Vec<PathBuf>> = partition
             .iter_mut()
             .map(|(net_dir, children)| {
-                let key = {
-                    let p = net_dir.canonicalize().unwrap_or_else(|_| net_dir.clone());
-                    string_to_os_path(&os_path_to_string(&p))
-                };
+                let key =
+                    crate::paths::canonicalize_path(net_dir).unwrap_or_else(|_| net_dir.clone());
                 let vals: Vec<PathBuf> = children
                     .iter()
-                    .map(|p| {
-                        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
-                        string_to_os_path(&os_path_to_string(&c))
-                    })
+                    .map(|p| crate::paths::canonicalize_path(p).unwrap_or_else(|_| p.clone()))
                     .collect();
                 (key, vals)
             })
@@ -1043,7 +1009,7 @@ mod tests {
     #[test]
     fn test_proto_for_sets_network_kind_and_heading() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let (proto, _git_status) = idx.proto_for(&root).unwrap().unwrap();
@@ -1054,7 +1020,7 @@ mod tests {
     #[test]
     fn test_proto_for_unknown_dir_returns_none() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         // A directory with no index.md.
@@ -1074,7 +1040,7 @@ mod tests {
     #[test]
     fn test_clone_shares_inner_map() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
         let clone = idx.clone();
 
@@ -1097,7 +1063,7 @@ mod tests {
     #[test]
     fn test_build_fails_without_index_md() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         // No index.md in root.
         let result = ProtoIndex::build(&root, false);
         assert!(
@@ -1135,7 +1101,7 @@ mod tests {
     #[test]
     fn test_ordered_paths_dfs_network_before_children_lex_order() {
         let tmp = build_fixture();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
         let idx = ProtoIndex::build(&root, false).unwrap();
 
         let paths = idx.ordered_paths();

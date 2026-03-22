@@ -54,8 +54,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    beliefbase::{BeliefBase, BeliefContext, BeliefGraph},
-    codec::{md::build_title_attribute, CODECS},
+    beliefbase::{BeliefContext, BeliefGraph},
+    codec::CODECS,
     error::BuildonomyError,
     paths::AnchorPath,
     properties::{Bid, WeightKind},
@@ -508,7 +508,7 @@ pub(crate) fn build_listing_html(
             last_subdir = Some(link_ap.dir().to_string());
         }
 
-        let bref_attr = bref_attr_for_bid(edge.other.bid, &bb);
+        let bref_attr = format!("bref://{}", edge.other.bid.bref());
 
         html.push_str(&format!(
             "  <li><a href=\"{}\"{}>{}</a></li>\n",
@@ -521,24 +521,6 @@ pub(crate) fn build_listing_html(
     }
     html.push_str("</ul>\n");
     Ok(html)
-}
-
-// ── bref_attr helper (used by build_listing_html) ────────────────────────────
-
-fn bref_attr_for_bid(bid: Bid, bb: &BeliefBase) -> String {
-    bb.brefs()
-        .iter()
-        .find_map(|(bref, b)| {
-            if b == &bid {
-                Some(format!(
-                    " title=\"{}\"",
-                    build_title_attribute(&format!("bref://{}", bref), false, None)
-                ))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
 }
 
 /// Render all parsed events to an HTML body string, rewriting document links to `.html`.
@@ -679,7 +661,12 @@ pub(crate) fn build_requirements_table_html(
     for (req_bid, implementor_bids) in &req_to_implementors {
         let (req_title, req_url) = resolve(req_bid);
         let req_cell = match req_url {
-            Some(url) => format!("<a href=\"{}\">{}</a>", url, req_title),
+            Some(url) => format!(
+                "<a href=\"{}\" title=\"bref://{}\">{}</a>",
+                url,
+                req_bid.bref(),
+                req_title
+            ),
             None => req_title,
         };
 
@@ -688,7 +675,12 @@ pub(crate) fn build_requirements_table_html(
             .map(|impl_bid| {
                 let (impl_title, impl_url) = resolve(impl_bid);
                 match impl_url {
-                    Some(url) => format!("<a href=\"{}\">{}</a>", url, impl_title),
+                    Some(url) => format!(
+                        "<a href=\"{}\" title=\"bref://{}\">{}</a>",
+                        url,
+                        impl_bid.bref(),
+                        impl_title
+                    ),
                     None => impl_title,
                 }
             })
