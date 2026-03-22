@@ -2204,9 +2204,28 @@ impl DocumentCompiler {
             .strip_prefix(self.builder.repo_root())
             .map(os_path_to_string)
             .unwrap_or_else(|_| path_str.clone());
-        let nodekey = NodeKey::Path {
-            net: self.builder.repo().bref(),
-            path: repo_relative_str.clone(),
+
+        // Network nodes are registered under NodeKey::Id / NodeKey::Bid, never under
+        // NodeKey::Path (see speculative_path_key).  When a network directory is queued
+        // into deferred_html, strip_prefix(repo_root) yields "" for the root network
+        // (source_path == repo_root) or a subnet-relative dir name for nested networks.
+        // Neither form has a matching NodeKey::Path entry.
+        //
+        // Build the correct key upfront:
+        //   - Root network dir (empty repo_relative_str): use NodeKey::Bid directly —
+        //     the repo BID is known from the builder.
+        //   - Everything else (documents, subnet dirs): use NodeKey::Path as before.
+        //     Subnet-dir deferred HTML is currently dead code (only triggered by nested
+        //     networks or {requirements_table} in a subnet), left as a TODO.
+        let nodekey = if source_path.is_dir() && repo_relative_str.is_empty() {
+            NodeKey::Bid {
+                bid: self.builder.repo(),
+            }
+        } else {
+            NodeKey::Path {
+                net: self.builder.repo().bref(),
+                path: repo_relative_str.clone(),
+            }
         };
 
         // ── Step 0: resolve the document node ────────────────────────────────
@@ -2223,6 +2242,7 @@ impl DocumentCompiler {
             .await?;
 
         let mut node_bb = BeliefBase::from(node_graph);
+
         let Some(node) = node_bb.get(&nodekey) else {
             tracing::warn!("[generate_html_for_path] No match found for path: '{nodekey}'",);
             return Ok(());
@@ -2450,10 +2470,20 @@ impl DocumentCompiler {
             if !copied_canonical.contains(&canonical) {
                 let repo_full_path = self.builder.repo_root().join(string_to_os_path(asset_path));
 
-                // Verify source file exists
+                // Verify source file exists and is not a directory.
+                // process_asset_dir (Case B) emits directory listing nodes into
+                // asset_namespace — they carry a content_hash but there is no single
+                // file to copy; attempting fs::copy on a directory returns InvalidInput.
                 if !repo_full_path.exists() {
                     tracing::warn!(
                         "[Compiler] Asset source file not found, skipping: {}",
+                        repo_full_path.display()
+                    );
+                    continue;
+                }
+                if repo_full_path.is_dir() {
+                    tracing::debug!(
+                        "[Compiler] Skipping directory asset (listing-only, no file to copy): {}",
                         repo_full_path.display()
                     );
                     continue;
@@ -4004,7 +4034,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         // No External asset-namespace nodes should have been emitted (Case B must
         // not fire when Case A succeeds).
-        use crate::properties::asset_namespace;
         let asset_nodes: Vec<_> = local_bb
             .states()
             .values()

@@ -331,6 +331,7 @@ impl WatchService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_html_output(
         root_dir: PathBuf,
         event_tx: Sender<Event>,

@@ -458,12 +458,22 @@ export function navigateToLink(href, link, targetBid = null) {
     return;
   }
 
-  // 3. Asset link — open original href directly, no path resolution
+  // 3. Asset link — directory listings show metadata panel; file assets open in new tab.
   if (
     targetBid &&
     state.wasmModule &&
     targetBid.endsWith(state.wasmModule.BeliefBaseWasm.asset_namespace().bref)
   ) {
+    // Directory listing nodes carry payload.listing — show metadata panel instead of
+    // trying to open a nonexistent /pages/<dir> URL.
+    const assetNode = state.beliefbase ? state.beliefbase.get_by_bid(targetBid) : null;
+    if (assetNode?.payload?.listing !== undefined) {
+      console.log(`[Noet] Directory asset: showing metadata panel for ${targetBid}`);
+      if (callbacks.showMetadataPanel) {
+        callbacks.showMetadataPanel(targetBid);
+      }
+      return;
+    }
     console.log(`[Noet] Opening asset: /pages/${href}`);
     window.open(`/pages/${href}`, "_blank");
     return;

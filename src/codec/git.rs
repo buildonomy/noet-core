@@ -574,7 +574,7 @@ mod inner {
             // A temp directory with no git repo should produce an empty cache.
             let dir = std::env::temp_dir().join("noet_gitcache_test_no_repo");
             std::fs::create_dir_all(&dir).ok();
-            let cache = GitCache::populate(&[dir.clone()]);
+            let cache = GitCache::populate(std::slice::from_ref(&dir));
             // No git repo → no entry in cache.
             assert!(cache.get(&dir).is_none());
         }
@@ -584,7 +584,7 @@ mod inner {
             // The noet-core source tree is itself a git repo — use it as a fixture.
             // This test is only meaningful when run from within the repo.
             let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let cache = GitCache::populate(&[repo_root.clone()]);
+            let cache = GitCache::populate(std::slice::from_ref(&repo_root));
             if let Some(status) = cache.get(&repo_root) {
                 // Commit hash should be 40 hex chars.
                 assert_eq!(status.repo.commit.len(), 40);

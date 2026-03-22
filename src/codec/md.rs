@@ -642,6 +642,33 @@ fn check_for_link_and_push(
             let root_abs_path = &doc_stem[0..(doc_stem.len() - ctx_stem.len())];
             let regularized =
                 normalized_abs.regularize_unchecked(ctx.root_net, &ctx.root_path, root_abs_path);
+
+            // Mirror push_relation's dir-reclassification: if the regularized key is a
+            // repo-namespace path that resolves to a non-network directory on disk,
+            // reclassify it to asset_namespace so the ctx.sources() lookup below finds
+            // the asset node that push_relation already stored under that key.
+            let regularized = match &regularized {
+                NodeKey::Path { net, path } if *net == ctx.root_net.bref() || net.is_default() => {
+                    use crate::paths::string_to_os_path;
+                    let abs_path = string_to_os_path(
+                        &crate::paths::AnchorPathBuf::from(root_abs_path.to_string())
+                            .as_anchor_path()
+                            .join(path),
+                    );
+                    if abs_path.is_dir()
+                        && crate::codec::network::detect_network_file(&abs_path).is_none()
+                    {
+                        NodeKey::Path {
+                            net: crate::properties::asset_namespace().bref(),
+                            path: path.clone(),
+                        }
+                    } else {
+                        regularized
+                    }
+                }
+                _ => regularized,
+            };
+
             let keys = [regularized];
 
             // Check sources (upstream) for the link target. Assets and document links are sources

@@ -258,7 +258,8 @@ async fn run_parse_with_html(corpus_root: &Path, html_out: &Path) -> usize {
         None,  // no live-reload script
         false, // no CDN
         base_url,
-        None, // Set parallel jobs with NOET_JOBS env variable
+        None,  // Set parallel jobs with NOET_JOBS env variable
+        false, // git_tracking=false: no git metadata in benchmarks
     )
     .expect("DocumentCompiler::with_html_output failed");
 

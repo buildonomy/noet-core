@@ -182,8 +182,54 @@ function renderNodeContext(context) {
     html += "</div>";
   }
 
-  // ---- Payload ----
-  if (node.payload && Object.keys(node.payload).length > 0) {
+  // ---- Directory listing (asset nodes with payload.listing) ----
+  const listing = node.payload?.listing;
+  if (Array.isArray(listing)) {
+    const remoteUrl = node.payload.remote_url;
+    const branch = node.payload.branch || "HEAD";
+    const networkPrefix = node.payload.network_prefix || "";
+    const dirPath = node.payload.dir_path || node.title || "";
+
+    // Construct the base tree URL for this directory:
+    //   {remote_url}/tree/{branch}/{network_prefix}/{dirPath}
+    // network_prefix may be empty (network IS repo root).
+    const remotePathParts = [networkPrefix, dirPath].filter(Boolean).join("/");
+    const dirRemoteUrl = remoteUrl
+      ? `${remoteUrl.replace(/\/$/, "")}/tree/${branch}/${remotePathParts}`
+      : null;
+
+    html += '<div class="noet-metadata-section">';
+    html += "<h3>Directory</h3>";
+    if (dirRemoteUrl) {
+      html +=
+        `<p><a href="${escapeHtml(dirRemoteUrl)}" target="_blank" rel="noopener noreferrer">` +
+        `View on remote ↗</a></p>`;
+    }
+    if (node.payload.truncated) {
+      html += `<p><em>Listing truncated at ${listing.length} entries.</em></p>`;
+    }
+    if (listing.length === 0) {
+      html += "<p><em>Empty directory.</em></p>";
+    } else {
+      html += '<ul class="noet-relation-list">';
+      for (const entry of listing) {
+        if (remoteUrl) {
+          const entryRemoteParts = [networkPrefix, dirPath, entry].filter(Boolean).join("/");
+          // Use /blob/ for files (have an extension), /tree/ for subdirs (no dot after last slash).
+          const entryType = entry.includes(".") ? "blob" : "tree";
+          const entryUrl = `${remoteUrl.replace(/\/$/, "")}/${entryType}/${branch}/${entryRemoteParts}`;
+          html +=
+            `<li><a href="${escapeHtml(entryUrl)}" target="_blank" rel="noopener noreferrer">` +
+            `${escapeHtml(entry)}</a></li>`;
+        } else {
+          html += `<li>${escapeHtml(entry)}</li>`;
+        }
+      }
+      html += "</ul>";
+    }
+    html += "</div>";
+  } else if (node.payload && Object.keys(node.payload).length > 0) {
+    // ---- Payload (generic fallback for non-listing nodes) ----
     html += '<div class="noet-metadata-section">';
     html += "<h3>Payload</h3>";
     html += '<dl class="noet-metadata-list">';

@@ -17,7 +17,7 @@
 use noet_core::{
     config::NetworkRecord,
     event::{BeliefEvent, Event},
-    properties::{BeliefNode, Bid},
+    properties::BeliefNode,
     watch::WatchService,
 };
 #[cfg(feature = "service")]

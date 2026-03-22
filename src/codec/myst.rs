@@ -665,9 +665,7 @@ pub(crate) fn build_requirements_table_html(
             };
             // Both ctx.root_path and the resolved path are network-relative, so
             // rooted=false produces a correct relative link between them.
-            let res = table_doc_ap.path_to(&html_path, true);
-            tracing::warn!("table_doc_ap: {table_doc_ap}, html_path: {html_path}, res: {res}");
-            res
+            table_doc_ap.path_to(&html_path, true)
         });
         (title, url)
     };

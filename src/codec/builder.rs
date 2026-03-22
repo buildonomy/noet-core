@@ -2873,6 +2873,45 @@ impl GraphBuilder {
         // Case B: local-only directory → External node with listing payload.
         // ------------------------------------------------------------------
 
+        // Case B git enrichment: even though this directory isn't a registered
+        // belief network, it may still live inside a git repo.  Walk up from
+        // `path` to find the closest ancestor that IS a registered network in
+        // proto_index; if that network has a remote URL, store the info needed
+        // to construct tree URLs in the payload.
+        //
+        // payload fields added when git info is available:
+        //   "remote_url"       — normalized remote base (e.g. "https://github.com/org/repo")
+        //   "branch"           — current branch or "HEAD"
+        //   "network_prefix"   — git-workdir-relative path to the parent network dir
+        //   "dir_path"         — repo-relative path to this directory (= repo_relative_path)
+        //
+        // The viewer constructs tree URLs as:
+        //   {remote_url}/tree/{branch}/{network_prefix}/{dir_relative_to_network}/{entry}
+        #[cfg(feature = "git-tracking")]
+        let dir_git_info: Option<(String, String, String)> = {
+            // Walk from `path` upward, stopping at the first ancestor that appears
+            // in proto_index as a registered network.
+            let mut ancestor = path.parent();
+            let mut found: Option<(String, String, String)> = None;
+            while let Some(dir) = ancestor {
+                if let Some(status) = proto_index.git_status_for(dir) {
+                    if let Some(remote_url) = status.repo.remote_url.as_deref() {
+                        let branch = status.repo.branch.as_deref().unwrap_or("HEAD").to_string();
+                        let network_prefix = status
+                            .network_prefix
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        found = Some((remote_url.to_string(), branch, network_prefix));
+                    }
+                    break; // stop at first registered network ancestor regardless
+                }
+                ancestor = dir.parent();
+            }
+            found
+        };
+        #[cfg(not(feature = "git-tracking"))]
+        let dir_git_info: Option<(String, String, String)> = None;
+
         // Read directory entries, sort by name, cap at 256.
         const MAX_LISTING: usize = 256;
         let mut entries: Vec<String> = match std::fs::read_dir(path) {
@@ -2952,6 +2991,19 @@ impl GraphBuilder {
             );
             if truncated {
                 payload.insert("truncated".to_string(), toml::Value::Boolean(true));
+            }
+            // Store git remote info so the viewer can construct tree/blob URLs.
+            payload.insert(
+                "dir_path".to_string(),
+                toml::Value::String(repo_relative_path.clone()),
+            );
+            if let Some((remote_url, branch, network_prefix)) = dir_git_info {
+                payload.insert("remote_url".to_string(), toml::Value::String(remote_url));
+                payload.insert("branch".to_string(), toml::Value::String(branch));
+                payload.insert(
+                    "network_prefix".to_string(),
+                    toml::Value::String(network_prefix),
+                );
             }
 
             let asset_node = BeliefNode {

@@ -995,7 +995,19 @@ impl BeliefBaseWasm {
         match inner.get(&node_key) {
             Some(node) => {
                 console::log_1(&format!("✅ Found node: {}", node.title).into());
-                serde_wasm_bindgen::to_value(&node).unwrap_or(JsValue::NULL)
+                let js_val = serde_wasm_bindgen::to_value(&node).unwrap_or(JsValue::NULL);
+                // Patch payload: toml::value::Table serializes as a JS Map via
+                // serde_wasm_bindgen; JSON roundtrip produces a plain object so that
+                // payload?.listing (and other plain-property accesses) work correctly.
+                if js_val.is_object() {
+                    if let Ok(payload_json) = serde_json::to_string(&node.payload) {
+                        if let Ok(payload_js) = js_sys::JSON::parse(&payload_json) {
+                            let _ =
+                                Reflect::set(&js_val, &JsValue::from_str("payload"), &payload_js);
+                        }
+                    }
+                }
+                js_val
             }
             None => {
                 console::warn_1(&format!("⚠️ Node not found: {}", bid).into());
@@ -1276,7 +1288,15 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: normalize_path_extension_impl(&ext_rel.root_path),
+                    // Asset-namespace paths are opaque repo-relative identifiers (e.g.
+                    // "net1_dir1", "assets/img.png") — not navigable HTML paths.
+                    // normalize_path_extension_impl would incorrectly convert "net1_dir1"
+                    // to "net1_dir1/index.html", treating it as a network directory.
+                    root_path: if ext_rel.home_net == asset_namespace() {
+                        ext_rel.root_path.clone()
+                    } else {
+                        normalize_path_extension_impl(&ext_rel.root_path)
+                    },
                     link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
@@ -1298,7 +1318,11 @@ impl BeliefBaseWasm {
                 let related_node = RelatedNode {
                     node: ext_rel.other.clone(),
                     home_net: ext_rel.home_net,
-                    root_path: normalize_path_extension_impl(&ext_rel.root_path),
+                    root_path: if ext_rel.home_net == asset_namespace() {
+                        ext_rel.root_path.clone()
+                    } else {
+                        normalize_path_extension_impl(&ext_rel.root_path)
+                    },
                     link_title: ext_rel.link_title.clone(),
                 };
                 related_nodes.insert(ext_rel.other.bid, related_node);
@@ -1332,7 +1356,13 @@ impl BeliefBaseWasm {
 
             NodeContext {
                 node: ctx.node.clone(),
-                root_path: normalize_path_extension_impl(&ctx.root_path),
+                root_path: if *bid == asset_namespace()
+                    || bid.parent_bref() == asset_namespace().bref()
+                {
+                    ctx.root_path.clone()
+                } else {
+                    normalize_path_extension_impl(&ctx.root_path)
+                },
                 home_net: ctx.home_net,
                 metadata: toml_table_to_json(&ctx.node.metadata),
                 related_nodes,
@@ -1375,17 +1405,34 @@ impl BeliefBaseWasm {
         // To guarantee `metadata` is a plain JS object (so `metadata?.source_url`
         // works), we:
         //   1. Serialize the full NodeContext via serde_wasm_bindgen (gets us the
-        //      struct fields as a plain JS object, but metadata comes out as a Map).
-        //   2. Re-serialize just `metadata` to a JSON string and parse it via
+        //      struct fields as a plain JS object, but metadata and node.payload come
+        //      out as JS Maps because toml::value::Table serializes via serialize_map).
+        //   2. Re-serialize `metadata` and `node.payload` to JSON strings and parse via
         //      js_sys::JSON::parse — the JS JSON parser always produces plain objects.
-        //   3. Patch the `metadata` property on the returned JS object.
+        //   3. Patch both properties on the returned JS object.
         let js_val = serde_wasm_bindgen::to_value(&node_context).unwrap_or(JsValue::NULL);
 
-        // Patch metadata: serialize to JSON string then parse via JS JSON engine.
         if js_val.is_object() {
+            // Patch metadata: toml::value::Table → plain JS object.
             if let Ok(metadata_json) = serde_json::to_string(&node_context.metadata) {
                 if let Ok(metadata_js) = js_sys::JSON::parse(&metadata_json) {
                     let _ = Reflect::set(&js_val, &JsValue::from_str("metadata"), &metadata_js);
+                }
+            }
+
+            // Patch node.payload: toml::value::Table → plain JS object.
+            // Without this, payload?.listing returns undefined (it's a Map entry, not a
+            // plain property) and the directory listing panel never renders.
+            if let Ok(payload_json) = serde_json::to_string(&node_context.node.payload) {
+                if let Ok(payload_js) = js_sys::JSON::parse(&payload_json) {
+                    // js_val.node is itself a plain JS object (BeliefNode struct fields
+                    // serialize correctly except for the toml::value::Table payload field).
+                    if let Ok(node_js) = Reflect::get(&js_val, &JsValue::from_str("node")) {
+                        if node_js.is_object() {
+                            let _ =
+                                Reflect::set(&node_js, &JsValue::from_str("payload"), &payload_js);
+                        }
+                    }
                 }
             }
         }
