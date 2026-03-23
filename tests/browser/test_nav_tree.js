@@ -362,6 +362,9 @@ async function runTests() {
   console.log(
     `${BLUE}  Required fixture structure:${RESET}
     root
+    ├── net1_dir1/                    ← non-network directory
+    │   └── net1_dir1_subnet/         ← subnet inside non-network dir
+    │       └── net1_dir1_subnet_doc.md
     ├── subnet1/
     │   ├── subnet1_file1.md
     │   └── subnet1a/
@@ -378,11 +381,18 @@ async function runTests() {
   const subnet1FileBids = findByTitle("subnet1 file1", allBids, getNode);
   const subnet1aDocBids = findByTitle("subnet 1a document", allBids, getNode);
   const subnet2DocBids = findByTitle("subnet 2 document", allBids, getNode);
+  // net1_dir1_subnet: subnet inside a non-network intermediate directory.
+  // Its PathMap key in root is "net1_dir1/net1_dir1_subnet" — a multi-component
+  // string — which is the case the stack-reconstruction fix must handle.
+  const net1Dir1SubnetBids = findByTitle("subnet inside a non-network directory", allBids, getNode);
+  const net1Dir1SubnetDocBids = findByTitle("net1 dir1 subnet document", allBids, getNode);
 
   log(
     `Located by title: subnet1=${subnet1Bids.length}, subnet2=${subnet2Bids.length}, ` +
       `subnet1a=${subnet1aBids.length}, subnet1_file1=${subnet1FileBids.length}, ` +
-      `subnet1a_doc=${subnet1aDocBids.length}, subnet2_doc=${subnet2DocBids.length}`,
+      `subnet1a_doc=${subnet1aDocBids.length}, subnet2_doc=${subnet2DocBids.length}, ` +
+      `net1_dir1_subnet=${net1Dir1SubnetBids.length}, ` +
+      `net1_dir1_subnet_doc=${net1Dir1SubnetDocBids.length}`,
     "info",
   );
 
@@ -404,12 +414,23 @@ async function runTests() {
   assert(subnet1aDocBids.length >= 1, `subnet1a_doc node found (got ${subnet1aDocBids.length})`);
   assert(subnet2DocBids.length >= 1, `subnet2_doc node found (got ${subnet2DocBids.length})`);
 
+  assert(
+    net1Dir1SubnetBids.length === 1,
+    `Exactly one net1_dir1_subnet node found (got ${net1Dir1SubnetBids.length}; check fixture id/title)`,
+  );
+  assert(
+    net1Dir1SubnetDocBids.length >= 1,
+    `net1_dir1_subnet_doc node found (got ${net1Dir1SubnetDocBids.length})`,
+  );
+
   const subnet1Bid = subnet1Bids[0];
   const subnet2Bid = subnet2Bids[0];
   const subnet1aBid = subnet1aBids[0];
   const subnet1FileBid = subnet1FileBids[0];
   const subnet1aDocBid = subnet1aDocBids[0];
   const subnet2DocBid = subnet2DocBids[0];
+  const net1Dir1SubnetBid = net1Dir1SubnetBids[0];
+  const net1Dir1SubnetDocBid = net1Dir1SubnetDocBids[0];
 
   // 5a. Subnets must NOT appear in roots (they are not top-level networks).
   check(
@@ -433,6 +454,8 @@ async function runTests() {
   );
   const rootBid = tree.roots[0];
   const rootDirectChildren = directChildBids(rootBid, getNode);
+  // net1_dir1_subnet must NOT appear in roots.
+  check(!rootSet.has(net1Dir1SubnetBid), `net1_dir1_subnet does NOT appear in NavTree.roots`);
 
   log(
     `Root ("${getNode(rootBid)?.title}") has ${rootDirectChildren.size} direct child(ren)`,
@@ -440,6 +463,14 @@ async function runTests() {
   );
   check(rootDirectChildren.has(subnet1Bid), `subnet1 is a direct child of the root network node`);
   check(rootDirectChildren.has(subnet2Bid), `subnet2 is a direct child of the root network node`);
+
+  // 5b continued: net1_dir1_subnet must be a direct child of root.
+  // Its PathMap key in root is "net1_dir1/net1_dir1_subnet" — verifies that
+  // the stack reconstruction correctly handles a multi-component path key.
+  check(
+    rootDirectChildren.has(net1Dir1SubnetBid),
+    `net1_dir1_subnet is a direct child of the root network node`,
+  );
 
   // 5c. subnet1a must be a direct child of subnet1, NOT of root or subnet2.
   const subnet1DirectChildren = directChildBids(subnet1Bid, getNode);
@@ -459,6 +490,7 @@ async function runTests() {
   const subnet1Descendants = allDescendants(subnet1Bid, getNode);
   const subnet2Descendants = allDescendants(subnet2Bid, getNode);
   const subnet1aDescendants = allDescendants(subnet1aBid, getNode);
+  const net1Dir1SubnetDescendants = allDescendants(net1Dir1SubnetBid, getNode);
 
   // subnet1_file1 must be under subnet1.
   check(subnet1Descendants.has(subnet1FileBid), `subnet1_file1 is a descendant of subnet1`);
@@ -472,51 +504,49 @@ async function runTests() {
   );
   check(!subnet1Descendants.has(subnet2DocBid), `subnet2_doc is NOT under subnet1`);
 
+  // net1_dir1_subnet_doc must be under net1_dir1_subnet and not a direct child of root.
+  // This is the primary regression test for the non-network intermediate directory case:
+  // if stack reconstruction fails, the doc gets a Section relation to root with path
+  // "net1_dir1/net1_dir1_subnet/net1_dir1_subnet_doc.md" instead of being correctly
+  // owned by net1_dir1_subnet.
+  check(
+    net1Dir1SubnetDescendants.has(net1Dir1SubnetDocBid),
+    `net1_dir1_subnet_doc is a descendant of net1_dir1_subnet`,
+  );
+  check(
+    rootDescendants.has(net1Dir1SubnetDocBid),
+    `net1_dir1_subnet_doc is a descendant of root (transitively)`,
+  );
+  check(
+    !rootDirectChildren.has(net1Dir1SubnetDocBid),
+    `net1_dir1_subnet_doc is NOT a direct child of root`,
+  );
+
   // 5e. Parent field consistency for directly-verifiable key nodes.
+  check(getNode(net1Dir1SubnetBid)?.parent === rootBid, `net1_dir1_subnet.parent === rootBid`);
+  check(
+    getNode(net1Dir1SubnetDocBid)?.parent === net1Dir1SubnetBid,
+    `net1_dir1_subnet_doc.parent === net1Dir1SubnetBid`,
+  );
   check(getNode(subnet1Bid)?.parent === rootBid, `subnet1.parent === rootBid`);
   check(getNode(subnet2Bid)?.parent === rootBid, `subnet2.parent === rootBid`);
   check(getNode(subnet1aBid)?.parent === subnet1Bid, `subnet1a.parent === subnet1Bid`);
   check(getNode(subnet2DocBid)?.parent === subnet2Bid, `subnet2_doc.parent === subnet2Bid`);
 
-  // ── Known limitation: subnet1a_doc compiler placement ────────────────────
+  // 5f (formerly known limitation). subnet1a_doc placement — compiler bug now fixed.
   //
-  // subnet1a_doc.md lives in subnet1a/ but the compiler currently assigns it a
-  // Section relation to the root network rather than to subnet1a.  This is a
-  // separate compiler-level bug (the AnchorPath::new_dir strip_prefix issue
-  // described in AGENTS.md §"Network node dual-path representation") and is NOT
-  // a regression of the get_nav_tree visited-set fix.
-  //
-  // get_nav_tree correctly reflects whatever the beliefbase contains, so these
-  // assertions would pass once the compiler bug is fixed.  They are logged here
-  // as informational checks (not counted in pass/fail) so that:
-  //   1. The CI job stays green.
-  //   2. The expected correct behaviour is documented in one place.
-  //   3. When the compiler bug is fixed, removing the KNOWN_LIMITATION guard
-  //      and changing log() → check() below will immediately validate the fix.
-  //
-  // TODO: fix compiler bug → subnet1a_doc gets Section relation to subnet1a →
-  //   change these log() calls to check() and remove this comment block.
-  const KNOWN_LIMITATION = (condition, message) => {
-    const actual = condition ? "✓ (already correct)" : "⚠ known limitation";
-    log(`${actual}: ${message}`, condition ? "pass" : "warn");
-  };
-
-  KNOWN_LIMITATION(
-    subnet1aDescendants.has(subnet1aDocBid),
-    `[TODO] subnet1a_doc is a descendant of subnet1a`,
-  );
-  KNOWN_LIMITATION(
+  // subnet1a_doc.md was previously mis-assigned a Section relation to the root network
+  // instead of subnet1a, due to try_initialize_stack_from_session_cache calling
+  // order_for_bid on root's PathMap when parent_bid was a deeply-nested subnet (subnet1a
+  // lives in subnet1's PathMap, not root's).  Fixed by using PathMapMap::indexed_path
+  // which searches across all PathMaps and returns the combined order vector.
+  check(subnet1aDescendants.has(subnet1aDocBid), `subnet1a_doc is a descendant of subnet1a`);
+  check(
     subnet1Descendants.has(subnet1aDocBid),
-    `[TODO] subnet1a_doc is a descendant of subnet1 (transitively)`,
+    `subnet1a_doc is a descendant of subnet1 (transitively)`,
   );
-  KNOWN_LIMITATION(
-    !rootDirectChildren.has(subnet1aDocBid),
-    `[TODO] subnet1a_doc is NOT a direct child of root`,
-  );
-  KNOWN_LIMITATION(
-    getNode(subnet1aDocBid)?.parent === subnet1aBid,
-    `[TODO] subnet1a_doc.parent === subnet1aBid`,
-  );
+  check(!rootDirectChildren.has(subnet1aDocBid), `subnet1a_doc is NOT a direct child of root`);
+  check(getNode(subnet1aDocBid)?.parent === subnet1aBid, `subnet1a_doc.parent === subnet1aBid`);
 
   // 5f. Total reachability: every non-root node in the tree must be reachable
   // from the root via the children graph.  Unreachable nodes indicate the old

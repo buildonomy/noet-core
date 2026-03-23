@@ -1589,27 +1589,39 @@ impl BeliefBaseWasm {
         let states = base.states();
         let brefs = base.brefs();
 
-        // ── Strategy: mirror ProtoIndex's per-network traversal ──────────────
+        // ── Strategy ─────────────────────────────────────────────────────────
         //
-        // ProtoIndex iterates each network directory independently (net_dir_partition /
-        // children_of) and treats subnet directories as opaque child entries — it never
-        // "inlines" a subnet's contents into its parent's flat list.  We do the same here:
+        // Each network's PathMap (pm.map()) stores entries with *network-relative*
+        // path strings.  Subnet directories appear as single opaque entries; their
+        // internal nodes are not inlined.  However, Section relations with pre-joined
+        // paths mean that a document owned by a deeply nested subnet (e.g.
+        // "subnet1/subnet1a/doc.md") can appear in an ancestor's pm.map() too.
         //
-        //   • Iterate PathMapMap.map() once — one entry per network (Bref → PathMap).
-        //   • For each PathMap read pm.map() directly (the flat sorted Vec of this
-        //     network's own entries).  Subnet BIDs appear as single entries at their
-        //     natural sort position; their internal contents live in their own PathMap
-        //     and are processed when we reach that PathMap in the outer loop.
-        //   • Two-phase construction:
-        //       Phase 1 — for every network, build NavNodes for all entries in pm.map()
-        //                 and record cross-network (subnet) parent-child edges separately.
-        //       Phase 2 — apply the recorded cross-network edges to wire subnet root nodes
-        //                 into their parent network's children list and set parent fields.
+        // Two derived facts we need per network:
         //
-        // This eliminates recursive_map entirely from the build pass, removing the
-        // visited-set cross-contamination that caused subnet nodes to be silently dropped.
+        //   1. Mount path  — the repo-root-relative prefix for this network.
+        //      Root network → "".  subnet1 (entry "subnet1" in root) → "subnet1".
+        //      subnet1a (entry "subnet1a" in subnet1) → "subnet1/subnet1a".
+        //      Used to:
+        //        (a) prefix local path strings so NavNode.path is repo-root-relative, and
+        //        (b) identify which entries in pm.map() belong to THIS network vs. a
+        //            deeper subnet (ownership = path does NOT start with any direct
+        //            subnet's local entry path + "/").
+        //
+        //   2. Direct-subnet local paths — the path strings under which direct subnets
+        //      appear in THIS network's pm.map() (e.g. "subnet1", "subnet2" for root).
+        //      Any pm.map() entry whose path starts with "<subnet_local_path>/" is owned
+        //      by that subnet and must be skipped here.
+        //
+        // Algorithm:
+        //   Pass 0 — build net_mount_path: BTreeMap<Bid, String> by scanning every
+        //            non-reserved PathMap for subnet entries and propagating prefixes.
+        //   Pass 1 — for every non-reserved network, iterate pm.map(), skip entries
+        //            owned by direct subnets (path-prefix test), skip gateway aliases
+        //            (u16::MAX), build NavNodes with correctly prefixed paths.
+        //   Pass 2 — wire subnet parent/child edges recorded during Pass 1.
 
-        // Collect all non-reserved network BIDs so we can classify entries as subnets.
+        // Collect all non-reserved network BIDs.
         let all_net_bids: BTreeSet<Bid> = paths
             .map()
             .keys()
@@ -1623,62 +1635,67 @@ impl BeliefBaseWasm {
             })
             .collect();
 
-        // Build a global map: non-network BID → the Bref of its home network.
+        // Pass 0 — build net_mount_path.
         //
-        // A BID's "home network" is the network whose PathMap contains it with the
-        // fewest order-vector components (shallowest depth).  When a document from a
-        // deeply nested subnet also appears in an ancestor's PathMap with a
-        // prefix-joined path (e.g. "subnet1/subnet1a/doc.md" in root's PathMap),
-        // the home network is the innermost one — the one with the shortest order vec
-        // for that BID.
-        //
-        // This is computed once here and used inside every per-network loop iteration
-        // to skip entries that belong to a different (deeper) network.
-        let mut bid_home_bref: BTreeMap<Bid, Bref> = BTreeMap::new();
-        for (net_bref, pm_lock) in paths.map().iter() {
-            let net_bid = match brefs.get(net_bref) {
-                Some(bid) => *bid,
-                None => continue,
-            };
-            if net_bid.is_reserved() {
-                continue;
-            }
-            let pm = pm_lock.read();
-            for (_path, bid, order) in pm.map().iter() {
-                if all_net_bids.contains(bid) {
-                    // Network BIDs are handled separately; skip them here.
+        // Start with every non-reserved network mapped to "" (unknown / root candidate).
+        // Then, for each network's pm.map(), find entries whose BID is itself a network
+        // (subnet entries) and set that subnet's mount path to
+        //   parent_mount_path + subnet_local_path
+        // We iterate in BTreeMap order (by Bref), which processes shallower networks
+        // first because shallower networks were registered earlier and have smaller Brefs
+        // in practice.  A fixpoint loop would be more robust; two passes is sufficient
+        // for any finite nesting depth because we process parent before child when the
+        // parent's mount path is already known.
+        let mut net_mount_path: BTreeMap<Bid, String> = all_net_bids
+            .iter()
+            .map(|bid| (*bid, String::new()))
+            .collect();
+
+        // Two-pass fixpoint: iterate until no mount path changes.  In practice one pass
+        // suffices for the vast majority of corpora; two passes handle edge cases where
+        // BTreeMap iteration order puts a child before its parent.
+        for _fixpoint_pass in 0..2 {
+            for (net_bref, pm_lock) in paths.map().iter() {
+                let net_bid = match brefs.get(net_bref) {
+                    Some(bid) => *bid,
+                    None => continue,
+                };
+                if net_bid.is_reserved() {
                     continue;
                 }
-                let depth = order.len();
-                bid_home_bref
-                    .entry(*bid)
-                    .and_modify(|existing_bref| {
-                        // Replace if this network's entry is shallower.
-                        if let Some(existing_pm) = paths.get_map(existing_bref) {
-                            let existing_depth = existing_pm
-                                .map()
-                                .iter()
-                                .find(|(_p, b, _o)| *b == *bid)
-                                .map(|(_p, _b, o)| o.len())
-                                .unwrap_or(usize::MAX);
-                            if depth < existing_depth {
-                                *existing_bref = *net_bref;
+                let parent_mount = match net_mount_path.get(&net_bid) {
+                    Some(m) => m.clone(),
+                    None => continue,
+                };
+                let pm = pm_lock.read();
+                for (local_path, entry_bid, _order) in pm.map().iter() {
+                    if !all_net_bids.contains(entry_bid) || *entry_bid == net_bid {
+                        continue;
+                    }
+                    // This is a direct subnet entry.  Compute its mount path.
+                    let subnet_mount = if parent_mount.is_empty() {
+                        local_path.clone()
+                    } else {
+                        format!("{}/{}", parent_mount, local_path)
+                    };
+                    net_mount_path
+                        .entry(*entry_bid)
+                        .and_modify(|existing| {
+                            // Keep the longer (more specific) mount path when there are
+                            // multiple routes to the same subnet.
+                            if subnet_mount.len() > existing.len() {
+                                *existing = subnet_mount.clone();
                             }
-                        }
-                    })
-                    .or_insert(*net_bref);
+                        })
+                        .or_insert(subnet_mount);
+                }
             }
         }
 
-        // Phase 1 — per-network node construction.
-        //
-        // subnet_parent_edges: (subnet_bid, parent_bid) pairs discovered while scanning
-        // parent networks.  Applied in Phase 2.
+        // Pass 1 — per-network node construction.
         let mut root_nodes_map: BTreeMap<String, NavNode> = BTreeMap::new();
-        let mut root_net_bids: Vec<Bid> = Vec::new(); // non-subnet root networks, in iteration order
-
-        // subnet_bid → parent_bid: populated when a parent network's pm.map() contains a
-        // subnet entry.  Used in Phase 2 to wire up cross-network parent/child links.
+        let mut root_net_bids: Vec<Bid> = Vec::new();
+        // subnet_bid → parent_bid recorded while scanning parent networks.
         let mut subnet_parent_edges: BTreeMap<Bid, Bid> = BTreeMap::new();
 
         for (net_bref, pm_lock) in paths.map().iter() {
@@ -1686,20 +1703,42 @@ impl BeliefBaseWasm {
                 Some(bid) => *bid,
                 None => continue,
             };
-
             if net_bid.is_reserved() {
                 continue;
             }
 
             let pm = pm_lock.read();
+            let mount = net_mount_path.get(&net_bid).cloned().unwrap_or_default();
 
-            // Resolve the network's own navigable path.
-            // The network BID is stored under "" in its own PathMap;
-            // normalize_path_extension_impl converts "" → "/index.html".
-            let net_root_path = pm
-                .path(&net_bid, &paths)
-                .map(|(_home_net, raw_path, _order)| Self::normalize_path_extension(&raw_path))
-                .unwrap_or_default();
+            // Helper: convert a network-relative path string to a repo-root-relative
+            // .html path.  The empty string (the network's own "" key) maps to
+            // "<mount>/index.html" or just "index.html" for the root network.
+            let make_html_path = |local: &str| -> String {
+                let repo_relative = if mount.is_empty() {
+                    local.to_string()
+                } else if local.is_empty() {
+                    mount.clone()
+                } else {
+                    format!("{}/{}", mount, local)
+                };
+                Self::normalize_path_extension(&repo_relative)
+            };
+
+            // Collect the local path strings of direct subnets so we can skip
+            // pm.map() entries owned by them (path-prefix ownership rule).
+            let direct_subnet_local_paths: Vec<String> = pm
+                .map()
+                .iter()
+                .filter_map(|(local_path, bid, _order)| {
+                    if all_net_bids.contains(bid) && *bid != net_bid {
+                        Some(local_path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let net_root_path = make_html_path("");
             let net_bid_str = net_bid.to_string();
             let net_kind = states
                 .get(&net_bid)
@@ -1710,8 +1749,7 @@ impl BeliefBaseWasm {
                 .map(|node| node.title.clone())
                 .unwrap_or_else(|| net_bid_str.clone());
 
-            // Insert the network root node.  parent is None for now; Phase 2 sets it
-            // for subnet roots once we know which parent network claims them.
+            // Insert the network root node.  parent is set in Pass 2 for subnet roots.
             root_nodes_map.insert(
                 net_bid_str.clone(),
                 NavNode {
@@ -1725,82 +1763,78 @@ impl BeliefBaseWasm {
                 },
             );
 
-            // Stack of (bid, bid_str, depth) for tracking parent hierarchy within this network.
-            // The network root sits at depth 0.
+            // Stack of (bid, bid_str, depth) for parent-chain tracking.
+            // Network root sits at depth 0.
             let mut stack: Vec<(Bid, String, usize)> = vec![(net_bid, net_bid_str.clone(), 0)];
 
-            // Iterate pm.map() directly — no recursive_map.
-            //
-            // IMPORTANT: pm.map() is NOT limited to direct children of this network.
-            // PathMap construction stores direct Section relations with pre-joined paths,
-            // so a document from a deeply nested subnet (e.g. subnet1a_doc) can appear in
-            // an ancestor network's pm.map() with a path like "subnet1/subnet1a/doc.md".
-            // Its order_indices may collide with direct-child sort keys (both [0], [1], …),
-            // and it may not appear in any intermediate subnet's PathMap either — only in
-            // the deepest subnet's own PathMap.
-            //
-            // The correct ownership test uses the pre-built `bid_home_bref` map: a BID
-            // belongs to this network only if `bid_home_bref[bid] == net_bref`.  Any BID
-            // whose home is a different (deeper) network is skipped here and will be
-            // processed when the outer loop reaches that network's PathMap.
-            //
-            // Entries with order_vec containing u16::MAX are PathMap gateway aliases:
-            //   ("index.md",      net_bid,    [u16::MAX])        — network's own gateway alias
-            //   ("index.md#slug", section_bid,[u16::MAX, N])     — section under gateway alias
-            // These must be skipped or depth-adjusted exactly as before.
-
-            for (path_str, bid, order_indices) in pm.map().iter() {
-                let mut depth = order_indices.len();
+            for (local_path, bid, order_indices) in pm.map().iter() {
                 let bid_str = bid.to_string();
 
-                // Skip the network node itself (it is already inserted above).
+                // Skip the network's own root entry (already inserted above).
                 if *bid == net_bid {
                     continue;
                 }
 
-                // Skip entries whose home network is not this network.  Such entries
-                // propagated upward into this PathMap via Section relation path-joining
-                // but belong to a deeper subnet and will be processed there.
-                // Exception: subnet root BIDs (is_subnet_bid) are opaque child pointers
-                // that we do want to keep — they represent the subnet entry in this tree.
                 let is_subnet_bid = all_net_bids.contains(bid);
+
+                // Ownership filter (non-subnet entries only):
+                // skip any entry whose local path starts with a direct subnet's local
+                // path + "/" — it belongs to that subnet and will be processed there.
                 if !is_subnet_bid {
-                    if let Some(home) = bid_home_bref.get(bid) {
-                        if home != net_bref {
-                            continue;
-                        }
+                    let owned_by_subnet = direct_subnet_local_paths
+                        .iter()
+                        .any(|subnet_local| local_path.starts_with(&format!("{}/", subnet_local)));
+                    if owned_by_subnet {
+                        continue;
                     }
                 }
 
-                // Skip / adjust gateway alias entries (order contains u16::MAX).
+                // Gateway alias handling.
                 //
-                // ("index.md",      net_bid, [u16::MAX])          → skip entirely
-                // ("index.md#slug", sec_bid, [u16::MAX, N])       → skip entirely (covered
-                //    by the network's own section entries at depth 1 via the "" key plane)
-                // ("subnet/index.md#slug", sec_bid, [N, u16::MAX, M]) → depth -= 1 so that
-                //    sections of a subnet's index file sit directly under the subnet node.
+                // PathMap stores two entries per network BID:
+                //   ("",         net_bid, [])           — canonical doc-slot (skipped above)
+                //   ("index.md", net_bid, [u16::MAX])   — gateway alias → skip
+                //
+                // Section headings from the network's own index.md are stored as:
+                //   ("index.md#slug", sec_bid, [u16::MAX, N])
+                // These are the network's own index sections and SHOULD appear in the tree
+                // as children of the network node.  We keep them but collapse the u16::MAX
+                // prefix level so their depth is 1 (direct children of the network).
+                //
+                // For subnet entries like ("subnet1/index.md#slug", sec_bid, [N, u16::MAX, M])
+                // that propagated upward: the ownership filter above already skips them
+                // (they start with "subnet1/").  No extra handling needed here.
                 if order_indices.is_empty() {
-                    // Shouldn't happen for non-root entries, but be safe.
                     continue;
                 }
+                let mut depth = order_indices.len();
                 if order_indices[depth - 1] == u16::MAX {
-                    // Last component is the gateway sentinel — this is a pure alias; skip.
+                    // Pure gateway alias ("index.md" entry for the net BID) — skip.
                     continue;
                 }
-                if order_indices.len() > 1 && order_indices[order_indices.len() - 2] == u16::MAX {
-                    // Second-to-last is the gateway sentinel: section anchored through the
-                    // index.md plane.  Collapse one level so it sits under the subnet node.
+                if order_indices[0] == u16::MAX {
+                    // index.md#slug section: strip the leading u16::MAX level.
+                    // depth becomes order_indices.len() - 1, but we want these as
+                    // depth-1 children of the network node, so clamp to 1.
+                    depth = depth.saturating_sub(1).max(1);
+                } else if order_indices.len() > 1
+                    && order_indices[order_indices.len() - 2] == u16::MAX
+                {
+                    // Section reached through the gateway plane inside a subnet's subtree
+                    // (e.g. "subnet/index.md#slug" with order [N, u16::MAX, M]).
+                    // The ownership filter handles these for non-subnet entries; for subnet
+                    // entries we collapse one level so sections sit under the subnet node.
                     depth -= 1;
                 }
+
+                let html_path = make_html_path(local_path);
 
                 let (node_title, node_kind) = states
                     .get(bid)
                     .map(|node| (node.title.clone(), node.kind.clone()))
-                    .unwrap_or_else(|| (path_str.clone(), Default::default()));
+                    .unwrap_or_else(|| (local_path.clone(), Default::default()));
 
-                let html_path = Self::normalize_path_extension(path_str);
-
-                // Pop stack until we reach the correct parent depth.
+                // Pop stack to the correct parent depth.
                 while stack.len() > 1 && stack.last().unwrap().2 >= depth {
                     stack.pop();
                 }
@@ -1809,16 +1843,9 @@ impl BeliefBaseWasm {
                     (top.0, top.1.clone())
                 };
 
-                // If this entry is a subnet root, record the cross-network parent edge
-                // for Phase 2 rather than setting parent inline.  We still push it onto
-                // the stack so depth tracking remains correct for any subsequent siblings.
-                if all_net_bids.contains(bid) {
-                    // Record that this subnet belongs to the current parent network.
-                    // Children list wiring is done in Phase 2.
+                if is_subnet_bid {
+                    // Record cross-network parent edge; wire children in Pass 2.
                     subnet_parent_edges.insert(*bid, parent_bid);
-                    // Insert a placeholder node for the subnet if not yet present.
-                    // The subnet's own outer-loop iteration will overwrite this with
-                    // full title/path/kind data.
                     root_nodes_map
                         .entry(bid_str.clone())
                         .or_insert_with(|| NavNode {
@@ -1834,33 +1861,32 @@ impl BeliefBaseWasm {
                     continue;
                 }
 
-                // Skip BIDs already inserted (a BID can appear at multiple paths in a PathMap).
+                // Skip BIDs already inserted (multiple paths in a PathMap → take first).
                 if root_nodes_map.contains_key(&bid_str) {
                     continue;
                 }
 
-                let new_node = NavNode {
-                    bid: bid_str.clone(),
-                    title: node_title,
-                    path: html_path,
-                    parent: Some(parent_bid_str.clone()),
-                    children: Vec::new(),
-                    is_network: node_kind.is_network(),
-                    is_document: node_kind.is_document(),
-                };
-                root_nodes_map.insert(bid_str.clone(), new_node);
-
+                root_nodes_map.insert(
+                    bid_str.clone(),
+                    NavNode {
+                        bid: bid_str.clone(),
+                        title: node_title,
+                        path: html_path,
+                        parent: Some(parent_bid_str.clone()),
+                        children: Vec::new(),
+                        is_network: node_kind.is_network(),
+                        is_document: node_kind.is_document(),
+                    },
+                );
                 if let Some(parent_node) = root_nodes_map.get_mut(&parent_bid_str) {
                     parent_node.children.push(bid_str.clone());
                 }
-
                 stack.push((*bid, bid_str, depth));
             }
         }
 
-        // Determine which networks are root networks vs subnets.
-        // Any network that appears as a value in subnet_parent_edges is a subnet.
-        for (net_bref, _pm_lock) in paths.map().iter() {
+        // Determine root networks (those not claimed as subnets by any parent).
+        for (net_bref, _) in paths.map().iter() {
             let net_bid = match brefs.get(net_bref) {
                 Some(bid) => *bid,
                 None => continue,
@@ -1873,23 +1899,13 @@ impl BeliefBaseWasm {
             }
         }
 
-        // Phase 2 — wire cross-network parent/child edges.
-        //
-        // For each subnet_bid → parent_bid edge:
-        //   • Set subnet node's parent field.
-        //   • Add subnet_bid to parent node's children list (at the position it occupies
-        //     in the parent's pm.map() — already correct because we appended in order
-        //     during Phase 1).
+        // Pass 2 — wire cross-network parent/child edges.
         for (subnet_bid, parent_bid) in &subnet_parent_edges {
             let subnet_bid_str = subnet_bid.to_string();
             let parent_bid_str = parent_bid.to_string();
-
-            // Set parent on the subnet node.
             if let Some(subnet_node) = root_nodes_map.get_mut(&subnet_bid_str) {
                 subnet_node.parent = Some(parent_bid_str.clone());
             }
-
-            // Add subnet to parent's children if not already present.
             if let Some(parent_node) = root_nodes_map.get_mut(&parent_bid_str) {
                 if !parent_node.children.contains(&subnet_bid_str) {
                     parent_node.children.push(subnet_bid_str);

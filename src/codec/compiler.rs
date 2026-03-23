@@ -1133,7 +1133,6 @@ impl DocumentCompiler {
         };
 
         // Read raw bytes — works for both text documents and binary assets.
-        tracing::debug!("\n\n");
         tracing::debug!("[parse_one_path]: reading {:?}", file_path);
         let bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
@@ -1166,7 +1165,6 @@ impl DocumentCompiler {
         }
 
         // Codec document: decode bytes to UTF-8 then parse.
-        tracing::debug!("[parse_one_path]: codec path {:?}", file_path);
         let content = match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(e) => {
@@ -1658,7 +1656,7 @@ impl DocumentCompiler {
                 && !self.remainder_queue.contains(&absolute_path)
             {
                 tracing::debug!(
-                    "[Compiler] Queueing asset file for content check: {:?}",
+                    "[Compiler] Queueing asset file for content check: {}",
                     asset_absolute_path
                 );
                 self.remainder_queue.push_back(absolute_path);

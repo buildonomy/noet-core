@@ -515,7 +515,7 @@ impl GraphBuilder {
         global_bb: B,
         proto_index: ProtoIndex,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
-        tracing::debug!("Phase 0: initialize stack");
+        tracing::trace!("Phase 0: initialize stack");
         let full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let (initial, doc_sort_key) = self
             .initialize_stack(input_path.as_ref(), global_bb.clone(), &proto_index)
@@ -563,7 +563,7 @@ impl GraphBuilder {
             let mut relation_event_queue = Vec::<BeliefEvent>::default();
             let mut missing_structure = BeliefGraph::default();
 
-            tracing::debug!("Phase 1: Create all nodes");
+            tracing::trace!("Phase 1: Create all nodes");
             debug_assert!(
                 self.session_bb.is_balanced().is_ok(),
                 "Why isn't session_bb balanced? (phase 1 start)"
@@ -663,7 +663,7 @@ impl GraphBuilder {
                 parsed_bids.push(bid);
             }
 
-            tracing::debug!("Phase 2: Balance and process relations");
+            tracing::trace!("Phase 2: Balance and process relations");
             let mut generated_href_nodes = Vec::new();
             let mut relation_seeds = BTreeSet::new();
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
@@ -762,7 +762,7 @@ impl GraphBuilder {
                 let _deriv = self.doc_bb.process_event(&edge_update)?;
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 "Phase 3: inform external sinks about nodekey changes from this document"
             );
             // (re)parse documents are are either to
@@ -793,9 +793,9 @@ impl GraphBuilder {
                         }
                     }
                 }
-                tracing::debug!("Phase 3: affected_sinks: {:?}", docs_to_parse);
+                tracing::trace!("Phase 3: affected_sinks: {:?}", docs_to_parse);
             }
-            tracing::debug!(
+            tracing::trace!(
                 "Phase 4: context injection. inject_context={}",
                 inject_context
             );
@@ -847,7 +847,7 @@ impl GraphBuilder {
             }
 
             // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
-            tracing::debug!("Phase 4b: codec finalization");
+            tracing::trace!("Phase 4b: codec finalization");
             let finalized_nodes = codec.finalize(&mut diagnostics)?;
             for (bid, ir_node) in finalized_nodes {
                 // Apply source-file-derived fields (kind, title, schema, payload, id) to the
@@ -894,7 +894,7 @@ impl GraphBuilder {
             }
 
             if is_changed || has_new_bids {
-                tracing::debug!("Generating source");
+                tracing::trace!("Generating source");
                 let maybe_new_content = codec.generate_source();
                 if let Some(new_content) = maybe_new_content.as_ref() {
                     // Always rewrite when new BIDs were assigned, even if markdown text is
@@ -915,7 +915,7 @@ impl GraphBuilder {
             )));
         };
 
-        tracing::debug!("Phase 5: terminating stack and transmitting updates to global_bb");
+        tracing::trace!("Phase 5: terminating stack and transmitting updates to global_bb");
         // Include any BIDs clobbered by insert_state during Phase 1 pushes.  These belong
         // to foreign nodes (not parsed in this pass) whose id was reset in-place due to a
         // collision with an incoming document or section.  Adding them to parsed_nodes lets
@@ -1274,7 +1274,7 @@ impl GraphBuilder {
                     BeliefEvent::BuiltInTest => {}
                 }
             }
-            tracing::debug!(
+            tracing::trace!(
                 "Diff events ({}): NodeUpdate({}), NodeRemoved({}), NodeRenamed({}), RelationChange({}), RelationRemoved({}), RelationUpdate({}), PathsAdded({}), PathsRemoved({})",
                 tx_events.len(),
                 node_update_count,
@@ -1796,7 +1796,6 @@ impl GraphBuilder {
             // We don't do this operation in [GraphBuilder::new] because
             // reading the repo source is part of our async operations.
             if self.repo == Bid::nil() && parent_bid == self.api().bid {
-                tracing::debug!("Setting repo to {}", node.bid);
                 self.repo = node.bid;
             }
 
@@ -2277,6 +2276,11 @@ impl GraphBuilder {
             net: self.repo.bref(),
             path: parent_rel_path.clone(),
         };
+        tracing::debug!(
+            "[try_initialize_stack_from_session_cache] abs_path={:?} parent_rel_path={:?}",
+            abs_path,
+            parent_rel_path,
+        );
 
         // Query the parent network. Accept either a StackCache hit (session_bb already has
         // the parent from a prior sibling parse in this task) or a GlobalCache hit (parallel
@@ -2367,7 +2371,7 @@ impl GraphBuilder {
             },
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "[try_initialize_stack_from_session_cache] ancestors_only: {} states, {} edges",
             ancestors_only.states.len(),
             ancestors_only.relations.as_graph().edge_count(),
@@ -2428,46 +2432,116 @@ impl GraphBuilder {
             return Ok(None);
         }
 
-        let stack_entries: Vec<(Bid, String, usize)> = self
-            .doc_bb
-            .paths()
-            .get_map(&self.repo.bref())
-            .and_then(|pm| {
-                // Look up the parent network's order vec.  For the repo-root network,
-                // parent_rel_path is "" and order_for_bid gives order=[].
-                // For a subnet parent, order_for_bid gives e.g. [sk] where sk is the
-                // subnet's own sort key within the root network.
-                let (parent_order, parent_rel) = pm.order_for_bid(&parent_bid)?;
+        let stack_entries: Vec<(Bid, String, usize)> = {
+            // Reconstruct the ancestor stack for the entry document.
+            //
+            // The challenge: parent_abs may be separated from the repo root by
+            // non-network intermediate directories (e.g. root/a_dir/b_dir/index.md
+            // where a_dir/ has no index.md).  PathMaps only contain network
+            // directories, not arbitrary filesystem directories, so we cannot simply
+            // split parent_rel_path by '/' and look up each component.
+            //
+            // Instead we use proto_index — which already knows exactly which
+            // directories are networks — to build the ordered list of ancestor network
+            // directories between repo_root and parent_abs.  Then for each hop we look
+            // up the child network's path string in its parent network's PathMap.
+            //
+            // Example: root/a_dir/b_dir/b_net_file.md
+            //   parent_abs = root/a_dir/b_dir
+            //   proto_index ancestor chain: [root/a_dir/b_dir]   (a_dir is not a network)
+            //   parent rel to root: "a_dir/b_dir"
+            //   root PathMap contains "a_dir/b_dir" → b_dir_bid
+            //   Stack: [root, b_dir]  ✓
+            //
+            // Example: root/subnet1/subnet1a/subnet1a_doc.md
+            //   parent_abs = root/subnet1/subnet1a
+            //   proto_index ancestor chain: [root/subnet1, root/subnet1/subnet1a]
+            //   hop 1: root PathMap contains "subnet1" → subnet1_bid
+            //   hop 2: subnet1 PathMap contains "subnet1a" → subnet1a_bid
+            //   Stack: [root, subnet1, subnet1a]  ✓
 
-                // Build the parent's absolute path for its stack entry.
-                let parent_abs_str = if parent_rel.is_empty() {
-                    repo_root_str.clone()
-                } else {
-                    format!("{repo_root_str}/{parent_rel}")
-                };
+            let mut stack = vec![(self.repo, repo_root_str.clone(), heading_for(&self.repo))];
 
-                // Walk ancestor prefixes above the parent to collect any deeper subnet chain.
-                let mut prefix = parent_order.to_vec();
-                let mut ancestors: Vec<(Bid, String, usize)> = Vec::new();
-                while prefix.pop().is_some() && !prefix.is_empty() {
-                    if let Some((anc_bid, anc_rel)) = pm.order_for(&prefix) {
-                        let abs = format!("{repo_root_str}/{anc_rel}");
-                        ancestors.push((anc_bid, abs, heading_for(&anc_bid)));
+            if parent_bid != self.repo && !parent_rel_path.is_empty() {
+                // Build the ordered list of ancestor network directories strictly
+                // between repo_root (exclusive) and parent_abs (inclusive), from
+                // shallowest to deepest.  proto_index.children_of(dir) is Some only
+                // for known network directories.
+                let mut ancestor_net_dirs: Vec<PathBuf> = Vec::new();
+                let mut dir = parent_abs.clone();
+                loop {
+                    if proto_index.children_of(&dir).is_some() {
+                        ancestor_net_dirs.push(dir.clone());
+                    }
+                    if dir == string_to_os_path(&repo_root_str) {
+                        break;
+                    }
+                    if !dir.pop() {
+                        break;
                     }
                 }
-                ancestors.reverse();
+                // ancestor_net_dirs is deepest-first; reverse to get shallowest-first,
+                // then drop the repo root itself (already on the stack).
+                ancestor_net_dirs.reverse();
+                // Drop the repo root entry (it's the repo root, already pushed above).
+                let ancestor_net_dirs: Vec<PathBuf> = ancestor_net_dirs
+                    .into_iter()
+                    .filter(|d| d != &string_to_os_path(&repo_root_str))
+                    .collect();
 
-                // Stack order: repo root → intermediate subnets → immediate parent network.
-                // The entry doc itself is NOT on the stack here; Phase 1 push() adds it.
-                let mut stack = vec![(self.repo, repo_root_str.clone(), heading_for(&self.repo))];
-                stack.extend(ancestors);
-                // Only push the parent explicitly if it is not the repo root itself.
-                if parent_bid != self.repo {
-                    stack.push((parent_bid, parent_abs_str, heading_for(&parent_bid)));
+                let paths_guard = self.doc_bb.paths();
+
+                // For each ancestor network, look up its path string in its parent
+                // network's PathMap and push a stack frame.
+                let mut current_net_bref = self.repo.bref();
+                let mut current_net_abs = repo_root_str.clone();
+
+                for net_dir in &ancestor_net_dirs {
+                    let net_dir_str = os_path_to_string(net_dir);
+                    // The path key stored in the parent PathMap is net_dir stripped of
+                    // current_net_abs (with a trailing slash to avoid AnchorPath dir/file
+                    // ambiguity).
+                    let prefix_with_slash = format!("{}/", current_net_abs);
+                    let local_path = net_dir_str
+                        .strip_prefix(&prefix_with_slash)
+                        .unwrap_or(&net_dir_str)
+                        .to_string();
+
+                    let maybe_bid =
+                        paths_guard.get_map(&current_net_bref).and_then(|pm| {
+                            pm.map().iter().find_map(|(p, bid, _)| {
+                                if p == &local_path {
+                                    Some(*bid)
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+
+                    match maybe_bid {
+                        Some(bid) => {
+                            stack.push((bid, net_dir_str.clone(), heading_for(&bid)));
+                            current_net_bref = bid.bref();
+                            current_net_abs = net_dir_str;
+                        }
+                        None => {
+                            tracing::debug!(
+                                "[try_initialize_stack_from_session_cache] {:?} \
+                                 (local={:?}) not found in PathMap for net={}; \
+                                 stopping stack reconstruction at depth {}",
+                                net_dir,
+                                local_path,
+                                current_net_bref,
+                                stack.len(),
+                            );
+                            break;
+                        }
+                    }
                 }
-                Some(stack)
-            })
-            .unwrap_or_else(|| vec![(self.repo, repo_root_str.clone(), heading_for(&self.repo))]);
+            }
+
+            stack
+        };
 
         self.stack = stack_entries;
 
@@ -2561,7 +2635,7 @@ impl GraphBuilder {
         if let Some(state) = found_state {
             Ok(GetOrCreateResult::Resolved(state, source))
         } else {
-            tracing::debug!("[cache_fetch] MISS! keys: {keys:?}");
+            tracing::trace!("[cache_fetch] MISS! keys: {keys:?}");
             Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
                 other_keys: keys.into(),
                 ..Default::default()
