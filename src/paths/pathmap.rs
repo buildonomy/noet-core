@@ -969,6 +969,28 @@ impl PathMapMap {
                     if let Some(nets) = self.node_to_nets.get(sink) {
                         candidate_nets.extend(nets);
                     }
+                    // Instrumentation: log routing state for RelationUpdates where
+                    // source is itself a network node (subnet→parent registration path).
+                    // Log unconditionally for this case so we can see what's in
+                    // self.nets and node_to_nets regardless of whether sink is already
+                    // registered as a network.
+                    if self.nets.contains(source) {
+                        tracing::debug!(
+                            target: "noet_core::paths::subnet_registration",
+                            source = %source,
+                            sink = %sink,
+                            source_is_net = true,
+                            sink_in_self_nets = self.nets.contains(sink),
+                            sink_in_self_map = self.map.contains_key(&sink.bref()),
+                            source_in_node_to_nets = self.node_to_nets.contains_key(source),
+                            sink_in_node_to_nets = self.node_to_nets.contains_key(sink),
+                            candidate_nets = ?candidate_nets,
+                            node_to_nets_for_source = ?self.node_to_nets.get(source),
+                            node_to_nets_for_sink = ?self.node_to_nets.get(sink),
+                            nets_contains_sink = self.nets.contains(sink),
+                            "routing RelationUpdate: source is a network node (subnet→parent path)",
+                        );
+                    }
                     for net_bref in &candidate_nets {
                         if let Some(pm_lock) = self.map.get(net_bref) {
                             let mut pm = pm_lock.write();
@@ -2085,7 +2107,15 @@ impl PathMap {
         if sink_sub_indices.is_empty() {
             return derivatives;
         }
-        if nets.nets.contains(sink) && self.net != *sink {
+        // Block non-network source nodes from being inserted into a foreign network's
+        // PathMap via node_to_nets routing (e.g. a doc in subnet_A must not appear in
+        // the root PathMap via RelationUpdate(doc, subnet_A)).
+        //
+        // Exception: when source is itself a network node (subnet linking up to its
+        // parent), allow it through — this mirrors what PathMap::new's DFS does via
+        // Control::Prune: record the subnet as a child in ancestor PathMaps but don't
+        // recurse into the subnet's own children.
+        if nets.nets.contains(sink) && self.net != *sink && !nets.nets.contains(source) {
             return derivatives;
         }
 

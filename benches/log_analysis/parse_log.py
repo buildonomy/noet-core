@@ -306,9 +306,13 @@ def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
     def _current(file_path: str) -> Optional[FileRecord]:
         return open_records.get(file_path)
 
-    # Track the most recently opened file path for non-span lines that lack
-    # explicit path context (phase markers, Diff events).
+    # For sequential runs: track the most recently opened file path for lines
+    # that lack a task_idx span prefix.
     last_file_path: str = ""
+    # For parallel runs: map task_idx → file_path so that interleaved phase
+    # marker lines from different tasks are routed to the correct FileRecord
+    # rather than all being attributed to whichever file was opened last.
+    task_file_map: dict[int, str] = {}
 
     for ll in lines:
         body = ll.body
@@ -318,6 +322,8 @@ def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
         if pm:
             file_path = pm.group(1).strip()
             last_file_path = file_path
+            if ll.task_idx is not None:
+                task_file_map[ll.task_idx] = file_path
             _open_record(file_path, ll.ts, ll.task_idx)
             continue
 
@@ -326,17 +332,21 @@ def extract_file_records(lines: list[LogLine]) -> list[FileRecord]:
         if lm:
             file_path = lm.group(1).strip()
             last_file_path = file_path
+            if ll.task_idx is not None:
+                task_file_map[ll.task_idx] = file_path
             _open_record(file_path, ll.ts, ll.task_idx)
             continue
 
-        # ── Attribute phase markers and Diff events to the current record ─
-        # Determine which file this line belongs to:
-        #   - span lines (task_idx set): look up by task_idx→file via last_file_path
-        #     (since span path is the directory, not the file, we use last_file_path
-        #     as the best proxy; for sequential runs this is always correct).
-        #   - non-span lines: use last_file_path.
-        # For both cases we look up the open record for that path.
-        rec = _current(last_file_path) if last_file_path else None
+        # ── Attribute phase markers and Diff events to the correct record ─
+        # For parallel runs use the task_idx→file_path map so that interleaved
+        # lines from different tasks don't cross-contaminate each other's phase
+        # timestamps.  Fall back to last_file_path for sequential lines (no
+        # task_idx) or for span lines whose task hasn't opened a file yet.
+        if ll.task_idx is not None:
+            current_path = task_file_map.get(ll.task_idx, last_file_path)
+        else:
+            current_path = last_file_path
+        rec = _current(current_path) if current_path else None
 
         if rec is not None:
             # Phase markers: record first occurrence only (phase0_start may repeat
@@ -498,21 +508,62 @@ def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
     ]
 
     def _print_fit(epoch_label: str, ordered: list) -> None:
-        if len(ordered) < 2:
-            if ordered:
+        # Complexity fit: Phase 0 duration vs task_idx.
+        #
+        # We fit Phase 0 duration (initialize_stack cost) rather than total parse
+        # duration, because total duration conflates file content complexity,
+        # asset-loading volume, and global_bb size effects — making it impossible
+        # to isolate scaling behaviour.
+        #
+        # X axis: task_idx (dispatch order within each epoch batch).
+        # task_idx is assigned sequentially as tasks are spawned and is the
+        # cleanest available proxy for "how many nodes were already in global_bb
+        # when this task ran its initialize_stack".
+        #
+        # Why not wall-clock offset or sort-order position?
+        #   - Sort-order (range(N)): interleaved parallel tasks mean slow files
+        #     with low task_idx appear early in the phase0_start-sorted list,
+        #     giving them low X values while fast concurrent tasks get mid-range
+        #     positions — producing a spurious positive slope.
+        #   - Wall-clock offset: same confound. Slow files cluster at low X
+        #     (started early, heavy asset load) while fast files scatter across
+        #     all X values, again producing a fake positive trend.
+        #   - task_idx: monotonically assigned at dispatch time; independent of
+        #     how long each task takes. Correctly captures "was this task among
+        #     the first or last to be dispatched into the pool?"
+        #
+        # Records without task_idx (sequential runs) fall back to parse-order
+        # position, which is correct for sequential logs.
+        p0_recs = [r for _, r in ordered if r.phase0_duration() is not None]
+        if len(p0_recs) < 2:
+            if p0_recs:
                 print(
-                    f"\n  Complexity fit — {epoch_label}: only {len(ordered)} record(s), skipping fit."
+                    f"\n  Complexity fit — {epoch_label}: only {len(p0_recs)} record(s) with Phase 0 timing, skipping fit."
                 )
             return
-        xs = [float(i) for i in range(len(ordered))]
-        ys = [d for d, _ in ordered]
+
+        parallel = any(r.task_idx is not None for r in p0_recs)
+        if parallel:
+            xs = [float(r.task_idx) for r in p0_recs if r.task_idx is not None]
+            p0_recs = [r for r in p0_recs if r.task_idx is not None]
+            x_label = "task_idx"
+        else:
+            # Sequential log: use parse-order position (correct for non-parallel runs).
+            xs = list(range(len(p0_recs)))
+            x_label = "parse-order position"
+
+        ys = [r.phase0_duration() for r in p0_recs]
         models = _fit_models(xs, ys)
         lin = next(m for m in models if m[0].startswith("O(N)"))
         slope_ms = lin[1] * 1000.0
         intercept_ms = lin[2] * 1000.0
-        pred_last = intercept_ms + slope_ms * (len(ordered) - 1)
+        x_max = max(xs)
+        pred_last = (lin[1] * x_max + lin[2]) * 1000.0
         best_label = models[0][0].strip()
-        print(f"\n  Complexity fit — {epoch_label} ({len(ordered)} records):")
+        print(
+            f"\n  Complexity fit (Phase 0 only) — {epoch_label}"
+            f" ({len(p0_recs)} records, X = {x_label}):"
+        )
         print(f"    Best fit   : {best_label}  (lowest residual)")
         print(f"    {'Model':<12}  {'Slope':>12}  {'Intercept':>10}  {'RSS':>14}")
         print(f"    {'-' * 12}  {'-' * 12}  {'-' * 10}  {'-' * 14}")
@@ -521,11 +572,15 @@ def report_file_times(records: list[FileRecord], top_n: int = 30) -> None:
             print(
                 f"    {label}  {slope * 1000:>+10.4f}ms  {intercept * 1000:>8.1f}ms  {rss:>14.4f}  {marker}"
             )
-        print(f"\n    O(N) detail:")
-        print(f"      Slope      : {slope_ms:+.3f} ms/file  {_trend_bar(slope_ms)}")
-        print(f"      Intercept  : {intercept_ms:.1f} ms  (predicted cost of file #0)")
+        x_unit = "task" if parallel else "file"
+        print(f"\n    O(N) detail (X = {x_label}):")
+        print(f"      Slope      : {slope_ms:+.3f} ms/{x_unit}  {_trend_bar(slope_ms)}")
         print(
-            f"      Predicted  : {intercept_ms:.0f} ms → {pred_last:.0f} ms  (first → last file)"
+            f"      Intercept  : {intercept_ms:.1f} ms  (predicted Phase 0 cost at {x_label}=0)"
+        )
+        print(
+            f"      Predicted  : {intercept_ms:.0f} ms → {pred_last:.0f} ms"
+            f"  ({x_label}=0 → {x_label}={x_max:.0f})"
         )
 
     timed.sort(key=lambda t: t[0], reverse=True)

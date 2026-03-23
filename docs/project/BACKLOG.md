@@ -462,6 +462,120 @@ directory links in `tests/network_1/subnet1/subnet1_file1.md`. What is missing i
 Test location: `src/codec/compiler.rs` tests, no feature flags required (Case B does not
 need `git-tracking` or `service`).
 
+## `initialize_stack` Asset-Loading Performance
+
+**Priority**: HIGH
+**Context**: Identified during parallel-jobs (Issue 57) corpus run analysis
+(`/tmp/jobs-8-refix.log`, MDN JS corpus, `--jobs 8`).
+
+During Phase 0 (`initialize_stack`), attempt-2+ (remainder-epoch) tasks independently
+load the full asset set for their parent network(s) by querying `global_bb` via
+`eval_unbalanced`. Subtrees with large asset counts — `intl/*` and `temporal/*` each
+load ~366 assets — cost ~10.9 ms/asset, producing Phase 0 outliers of 9–15s on reparse.
+
+### Observed Data
+
+From corpus run analysis (`/tmp/jobs-8-refix.log`):
+- OLS: **+10.9 ms / loaded_asset** (n=933 records with asset counts, all attempt-2+)
+- Asset range per file: 106–403
+- Worst offenders: `intl/collator/collator/index.md` (366 assets, 9.25s Phase 0),
+  `array/copywithin/index.md` (366 assets, 15.17s Phase 0 on attempt 2)
+- **Epoch-0 (leaf batch) tasks load zero assets** — correct behaviour. Assets don't
+  exist in `global_bb` during epoch-0 (they haven't been parsed yet), so
+  `initialize_stack` correctly gets misses and those files connect to assets later
+  in epoch 1+. The asset-loading cost is entirely on remainder-epoch reparsing.
+
+### Root Cause
+
+Two compounding issues:
+
+**Issue A — epoch-0 tasks should never touch `global_bb` at all.**
+`epoch_session_snapshot` is designed to give each task everything it needs in
+`session_bb` so `global_bb` is never consulted. If epoch-0 tasks are hitting
+`global_bb.eval_unbalanced` for assets, that is a gap in snapshot coverage — the
+namespace nodes are present but the const-namespace guard still falls through.
+By definition, epoch-0 tasks should receive a stubbed empty `global_bb`; any miss
+would then be immediately visible rather than silently falling through to the live
+(but logically-empty-for-this-epoch) DB connection. This also eliminates the Bug 2
+class of DB errors for epoch-0 tasks entirely.
+
+**Issue B — remainder-epoch snapshot has an empty asset subgraph.**
+`epoch_session_snapshot` Part 2 walks `self.builder.session_bb` for const-namespace
+nodes and assets. But `self.builder.session_bb` is only updated by events through
+`self.builder.tx()`. Parallel task events flow `shared_tx → BeliefAccumulator →
+global_bb` — never replayed into `self.builder.session_bb`. This is the same
+structural gap as Bug 1 (Issue 57). Assets discovered in epoch-0 tasks exist in
+`global_bb` after `drain_epoch`, but `epoch_session_snapshot` for the remainder
+epoch still has zero asset children, so every remainder task loads assets from
+`global_bb` individually.
+
+### Fix Direction
+
+Two independent fixes, one per issue:
+
+**Fix A — stub `global_bb` for epoch-0 parallel tasks.**
+Inside `parse_epoch`'s parallel branch, pass `BeliefBase::empty()` to spawned tasks
+instead of `cached_global_bb` when dispatching epoch-0 batches (network-dir groups
+and the leaf batch). `BeliefBase` already satisfies `BeliefSource + EpochDrain +
+Clone + Send + 'static`. Any `global_bb` miss in an epoch-0 task becomes an explicit
+miss rather than a live DB call, surfacing snapshot coverage gaps immediately.
+Requires threading a separate `epoch0_global_bb` parameter into `parse_epoch`, or
+detecting epoch-0 inside the spawned task closure.
+
+**Fix B — post-drain asset pull into `self.builder.session_bb`.**
+After each `drain_epoch` call in `parse_all`, query `global_bb` for the
+const-namespace subgraph and merge it into `self.builder.session_bb` directly —
+the same logic as `initialize_stack`'s const-namespace guard, but executed once on
+the compiler's own builder. The next `epoch_session_snapshot` then includes the full
+asset set. Cost: one `eval` call per epoch boundary; no task-level changes required.
+
+Fix B alone is sufficient to eliminate the asset-loading cost on remainder epochs.
+Fix A is a correctness/observability improvement; see note below on type-system
+constraints.
+
+### Implementation State
+
+**Fix B — IMPLEMENTED** (`src/codec/compiler.rs`).
+`DocumentCompiler::sync_asset_snapshot` is called after every `drain_epoch` in
+`parse_all` (pre-epoch root parse, depth-group loop, leaf batch, remainder loop).
+It queries `global_bb` for each `content_namespaces()` BID, emits a `NodeUpdate`
+into `self.builder.session_bb_mut()`, then evals the full namespace subgraph and
+merges it via `merge_from` with a namespace-seeded BFS. The next
+`epoch_session_snapshot` then includes the full asset subgraph, and every
+remainder-epoch task's `initialize_stack` hits the `content_namespaces()` guard
+and short-circuits before touching `global_bb`.
+
+**Fix A — DEFERRED.** `parse_epoch<B: BeliefSource + ...>` uses a single concrete
+`B` throughout; substituting `BeliefBase::empty()` (a different type) for epoch-0
+tasks requires a second type parameter or a trait-object indirection. Since
+epoch-0 tasks already get empty misses in practice (assets don't exist in
+`global_bb` at epoch-0), this is a polish item. Verify necessity via
+`parse_log.py --warnings` after Fix B; if no epoch-0 `eval_unbalanced` hits appear,
+Fix A is unnecessary.
+
+### Future Optimization — Scope-Narrowed Asset Query
+
+`sync_asset_snapshot` currently issues one `global_bb.eval` per namespace per epoch
+boundary — O(1) per epoch vs. the previous O(tasks) per epoch, which is the
+meaningful win. A further optimization: scope the query to assets reachable from
+the current epoch's parent network node rather than the full namespace subgraph.
+The query shape would be:
+`Expression(StatePred::Bid(epoch_parent ∪ const_nodes), traverse: upstream: depth=1)`.
+This avoids pulling the entire ~366-asset namespace graph when only a subset is
+relevant to the current epoch's batch. Not blocking; revisit if `sync_asset_snapshot`
+shows up in profiles on very large corpora.
+
+### When to Verify
+
+Run `--jobs 8` on the MDN JS corpus and check `parse_log.py --phase-summary`:
+- Phase 0 mean for attempt-2+ should drop significantly (target: <1s vs. prior 4–9s)
+- `[initialize_stack] Loaded N assets` log lines should show 0 for all remainder tasks
+- `snapshot_states` count in task seeding logs should increase by ~400 (asset count)
+- `snapshot_edges` still ≥ 1 on all tasks (Bug 1 regression check)
+- Zero `no such table: beliefs` errors (Bug 2 regression check)
+
+---
+
 ## Notes
 
 - Items are extracted from completed issues in `docs/project/completed/`

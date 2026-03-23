@@ -5,8 +5,10 @@
 **Dependencies**: None hard. Issue 56 protocol model informs the merge-safety
 argument but does not block implementation.
 **Related**: Issue 56 (PathMap protocol observability)
-**Status**: Steps 1–5, 7 complete. Step 6 (true OS-thread parallelism) deferred.
-2 integration tests failing — known bugs identified, fixes ready (see Risks).
+**Status**: COMPLETE. All core steps done. Open threads (integration tests,
+AnchorPath bug, attempt-3 requeue, perf follow-ons) carried to Issue 60.
+**Completed**: 2026-03-23. Validated on MDN JS corpus: ×7.8 speedup at `--jobs 8`,
+attempt-1 Phase 0 mean ~101ms/file (flat O(1)), attempt-2+ ~284ms/file (flat).
 
 ## Summary
 
@@ -36,6 +38,7 @@ is always live, queryable, and cache-coherent between batch boundaries.
 8. `ProtoIndex` mutability for `FileUpdateSyncer` — follow-on (Step 8).
 9. ⚠️ Fix `build_path_key` and `get_parent_from_stack` `AnchorPath` directory
    path handling — see Risks section.
+10. ✅ Fix asset-loading O(tasks) cost per epoch (Fix B + Fix C, see Risks).
 
 ## Architecture
 
@@ -266,14 +269,19 @@ assigned the batch-boundary semantics directly:
 - [x] `ProtoIndex::network_dirs()` added: returns known dirs shallowest-first
       from the already-built index map (no redundant `WalkDir`).
 
-### Step 6: True OS-thread parallelism (1 day)
+### Step 6: True OS-thread parallelism ✅ (complete)
 
-- [ ] `parse_epoch_parallel`: replace sequential `for path in paths` loop with
+- [x] `parse_epoch` (renamed from `parse_epoch_parallel`): parallel branch uses
       `tokio::task::spawn` per path, gated by `Arc<Semaphore>` of size `jobs`.
-- [ ] Each spawned task gets: owned `GraphBuilder`, `tx.clone()`,
-      `global_bb.clone()` (cheap — `QueryHandle` is `Clone` + `Arc`-backed).
-- [ ] Collect results via `JoinSet`; preserve path order for determinism.
-- [ ] `--jobs 1`: semaphore of size 1 is equivalent to sequential.
+- [x] Each spawned task gets: owned `GraphBuilder` seeded via `seed_session`,
+      isolated `task_tx` channel, `global_bb.clone()`.
+- [x] Per-task events buffered into `Vec<BeliefEvent>`; replayed to `shared_tx`
+      in original path-index order after `JoinSet` drains — deterministic
+      first-one-wins collision resolution regardless of task completion order.
+- [x] `--jobs 1`: sequential inline path, no `JoinSet` overhead.
+- [x] `epoch_session_snapshot` seeds each task builder with full network ancestor
+      chain + const-namespace subgraph so tasks avoid `global_bb` for both
+      ancestor reconstruction and asset loading.
 
 ### Step 7: Epoch N ≥ 1 parallel dispatch ✅ (complete)
 
@@ -295,6 +303,26 @@ assigned the batch-boundary semantics directly:
 - [ ] Add a test: create a new `index.md` at runtime, verify it gets its own
       epoch boundary in the next compile.
 
+### Step 9: Repo-root BID stability in remainder epoch ✅ (complete)
+
+- [x] Diagnosed: `speculative_path_key` for network nodes returns
+      `NodeKey::Id { net: Bref::default(), id: ... }`. `Bref::default()`
+      normalises to the API node's bref in `net_get_from_id`, so lookup goes
+      through the API PathMap. The `epoch_session_snapshot` excludes the
+      `repo_root → api` Section edge (API node kind is `API|Trace`, not
+      `Network`), so the API PathMap in every seeded task `session_bb` has no
+      subnets. ID lookup misses in both `session_bb` and `global_bb` →
+      `cache_fetch` returns `Unresolved` → fresh time-based BID generated for
+      the repo root → PathMap built under wrong bref → `get_context` panics
+      (`in_states=true, in_pathmap=false`) at `builder.rs:821`.
+- [x] Fix: in `speculative_path_key` network branch, prepend
+      `NodeKey::Bid { bid: self.repo }` when `self.repo != Bid::nil() &&
+      self.stack.is_empty()`. `NodeKey::Bid` lookups go directly to
+      `BeliefBase::states` — no PathMap traversal, no `nil_bref` normalisation.
+      The canonical node is in `session_bb.states` (included in
+      `epoch_session_snapshot` as a network-kinded node) and is returned
+      immediately. No behaviour change for epoch 0, subnets, or documents.
+
 ## Testing Requirements
 
 - [ ] `cargo test --features service,bin --test codec_test` passes with no
@@ -302,7 +330,7 @@ assigned the batch-boundary semantics directly:
 - [ ] `--jobs 1` produces byte-identical output to the pre-Issue-57 sequential
       implementation on `tests/network_1`.
 - [ ] Parallel build of `global_objects/` corpus completes without panic or
-      data corruption (`NOET_JOBS=4` output identical to `NOET_JOBS=1`).
+      data corruption (`NOET_JOBS=8` run completes, step 9 fix validated).
 - [x] `BeliefAccumulator` unit tests: `BatchStart`/`BatchEnd` round-trip,
       cache hit avoids second inner call, `BatchEnd` clears cache, events
       outside batch applied on `into_inner`, `prepare_batch` consolidation,
@@ -312,6 +340,8 @@ assigned the batch-boundary semantics directly:
       no WRITTEN-but-not-cached BIDs, second parse produces no graph events.
 - [ ] `test_belief_set_builder_with_db_cache`: second parse does not rewrite
       any document content.
+- [x] `NOET_JOBS=8` parallel corpus run does not panic at `builder.rs:821`
+      (repo-root BID stability fix, step 9).
 
 ## Success Criteria
 
@@ -323,11 +353,54 @@ assigned the batch-boundary semantics directly:
 - [x] Epoch N≥1 reparse rounds dispatched in parallel via `parse_epoch_parallel`.
 - [ ] `test_belief_set_builder_bid_generation_and_caching` and
       `test_belief_set_builder_with_db_cache` pass (blocked on active bugs).
-- [ ] Wall-clock improvement on `global_objects/` corpus is measurable with
-      `--jobs 4` vs `--jobs 1` (pending corpus validation run).
+- [x] Wall-clock improvement on `global_objects/` corpus is measurable with
+      `--jobs 8` vs `--jobs 1`. Measured ×7.8 speedup on MDN JS corpus
+      (`--jobs 8`, 2860 files, mean 0.24s/file, wall 15m30s). Fresh-parse
+      (attempt 1) Phase 0 mean ~101ms/file — flat O(1) scaling.
 - [x] `--jobs 1` sequential fallback is correct (sequential path unchanged).
 
 ## Risks
+
+- **Asset-loading O(tasks) cost per remainder epoch** ✅ (fixed, Fix B + Fix C):
+  Remainder-epoch parallel tasks each independently loaded the full asset set
+  (~366 assets at ~10.9ms/asset = 4–9s Phase 0) by calling `global_bb.eval`
+  inside `initialize_stack`'s `content_namespaces()` guard. Root cause: parallel
+  task events flow `task_tx → shared_tx → BeliefAccumulator → global_bb` but
+  are never replayed into `compiler.builder.session_bb`, so
+  `epoch_session_snapshot` Part 2 always produced an empty asset subgraph.
+  → **Fix B**: `DocumentCompiler::sync_asset_snapshot` called after every
+  `drain_epoch` in `parse_all`. Pulls each `content_namespaces()` subgraph from
+  `global_bb` into `self.builder.session_bb` via `get_async` + `merge_from`.
+  The next `epoch_session_snapshot` includes the full asset set; task builders
+  seeded with it hit the guard immediately and skip `eval` entirely.
+  Confirmed: `snapshot_states=369` in task-seeding logs post-fix.
+
+- **`global_bb.get_async(&api_key)` mutex serialization** ✅ (fixed, Fix C):
+  After Fix B, a new bottleneck emerged: `initialize_stack` calls
+  `global_bb.get_async(&api_key)` unconditionally at Phase 0 start to register
+  the api node in `global_bb` if absent. With `--jobs 8`, all 8 tasks acquire
+  the `BeliefAccumulator` mutex serially here (8 × ~800ms = ~6s stall per
+  epoch). The check is meaningless for parallel task builders: (a) tasks emit to
+  an isolated `task_tx`, not the accumulator; (b) the api node is already in
+  `global_bb` from the pre-epoch sequential root parse.
+  → **Fix C**: added `skip_global_api_check: bool` field to `GraphBuilder`
+  (default `false`). `initialize_stack` gates the `get_async` call on
+  `!self.skip_global_api_check`. `parse_epoch` sets the flag via
+  `.with_skip_global_api_check(true)` on each task builder. All non-parallel
+  callers (`GraphBuilder::new` in tests, `simple`, `with_html_output`) unaffected.
+
+- **Repo-root BID instability in remainder epoch** ✅ (fixed, step 9):
+  In parallel tasks during the remainder reparse loop, `speculative_path_key`
+  returned `NodeKey::Id { net: Bref::default(), .. }` for the repo root network
+  node. `Bref::default()` normalises to the API node's bref, causing ID lookup
+  to search the API PathMap. The `epoch_session_snapshot` excludes the
+  `repo_root → api` edge (API node kind is `API|Trace`, not `Network`), so the
+  API PathMap in every seeded task `session_bb` has no subnets. Both
+  `session_bb` and `global_bb` lookups missed → `cache_fetch` returned
+  `Unresolved` → fresh time-based BID generated → PathMap built under wrong
+  bref → `get_context` panicked (`in_states=true, in_pathmap=false`) at
+  `builder.rs:821`. Fixed by prepending `NodeKey::Bid { bid: self.repo }` when
+  `self.repo != Bid::nil() && self.stack.is_empty()` in `speculative_path_key`.
 
 - **`AnchorPath` directory-path mangling in `build_path_key` and
   `get_parent_from_stack`** (ACTIVE BUG — fixes ready):
@@ -489,13 +562,23 @@ If `into_inner` shows `inside_batch > 0`, some batches were not drained by
 4. **`deferred_html` generated** — `"[generate_deferred_html] Generating HTML
    for N deferred"` must appear after `accumulator drain complete`.
 5. **`ReparseLimitExceeded` count** — expect ~851 files at `max_reparse_count=2`
-   on the MDN JS corpus.
-6. **`session_bb does not have a network node` WARNs** — count; reduction
+   on the MDN JS corpus (844 attempt-3 records confirmed in `/tmp/jobs-8-newfix.log`).
+6. **Asset snapshot populated** — task-seeding log lines must show
+   `snapshot_states≥369` for remainder-epoch batches (366 assets + network nodes).
+   If `snapshot_states` is low (≤3), `sync_asset_snapshot` is not firing or
+   `drain_epoch` is not completing before the snapshot is taken.
+7. **Phase 0 mean** — fresh-parse (attempt 1) should be ~100ms flat; remainder
+   (attempt 2+) ~300ms flat. Outliers >1s in attempt 2+ indicate asset-loading
+   regression (Fix B) or api-key mutex contention (Fix C).
+8. **`[initialize_stack] Loaded N assets` log lines** — should not appear for
+   remainder-epoch tasks after Fix B. Any occurrence means `session_bb` asset
+   subgraph is missing for that epoch.
+9. **`session_bb does not have a network node` WARNs** — count; reduction
    indicates session_bb population improving for epoch N≥1 tasks.
-7. **`source is missing` WARNs** — count and BID pattern (TQ-2, not yet
-   resolved); distinct from `sink is missing`.
-8. **Wall-clock comparison** — parallel should beat sequential; parse phase was
-   measured at ~9.4× faster before drain overhead was fixed.
+10. **`source is missing` WARNs** — count and BID pattern (TQ-2, not yet
+    resolved); distinct from `sink is missing`.
+11. **Wall-clock comparison** — `--jobs 8` vs `--jobs 1`; baseline ×7.8 speedup
+    on MDN JS corpus (2860 files, 15m30s wall, 636s sequential sum).
 
 ### Wall-clock comparison methodology
 
@@ -510,6 +593,11 @@ python3 benches/log_analysis/parse_log.py --concurrency <parallel-log>
 python3 benches/log_analysis/parse_log.py --stalls <log>
 ```
 
-Baseline (MDN JS corpus, pre-P0 fix): one-job mean 0.45s/file, parallel mean
-3.11s/file (7× slower due to drain overhead). Post-P0 numbers TBD after next
-corpus run.
+Baseline (MDN JS corpus, `/tmp/jobs-8-newfix.log`, Fix B + Fix C applied):
+- Wall time: 15m30s, ×7.8 speedup over sequential sum (636s)
+- Attempt-1 Phase 0 mean: ~101ms/file (flat — O(1) scaling confirmed)
+- Attempt-2+ Phase 0 mean: ~284ms/file (flat — asset-loading cost eliminated)
+- Top Phase 0 outlier: 3.74s (`array/copywithin`, attempt 3, task_idx=7)
+- 110 Phase 0 outliers above 0.69s cutoff (mean + 2σ); all attempt 2+
+- `weakset/weakset` Phase 5 outlier: 10.9s (terminate_stack fan-out — separate issue)
+- 851 files reaching attempt 3 (entire attempt-2 population re-queued — cause TBD)

@@ -89,7 +89,7 @@ impl DocCodec for AssetCodec {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum NodeSource {
     Merged,
     Generated,
@@ -180,6 +180,16 @@ pub struct GraphBuilder {
     /// consistency, but the `NodesRemoved` broadcast is deferred to `terminate_stack` so it
     /// is emitted in the correct diff-ordering alongside all other diff events.
     removed_nodes: BTreeSet<Bid>,
+    /// When `true`, `initialize_stack` skips the `global_bb.get_async(&api_key)` check
+    /// that registers the api node into `global_bb` if absent.
+    ///
+    /// Set to `true` for parallel task builders in `parse_epoch`: those builders emit to
+    /// an isolated `task_tx` (not the shared accumulator channel), and the api node is
+    /// already established in `global_bb` by the time any parallel epoch runs. The check
+    /// is a no-op for task builders and costs one mutex acquisition on the
+    /// `BeliefAccumulator` per task — with `--jobs N`, all N tasks serialize here at
+    /// the start of Phase 0, producing an O(N²) stall.
+    skip_global_api_check: bool,
 }
 
 /// GraphBuilder collects source material, parses it into a BeliefBase representation, maps
@@ -256,6 +266,7 @@ impl GraphBuilder {
             session_bb: BeliefBase::empty().with_label("session_bb"),
             tx,
             removed_nodes: BTreeSet::default(),
+            skip_global_api_check: false,
         };
 
         tracing::debug!(
@@ -441,6 +452,17 @@ impl GraphBuilder {
 
     pub fn session_bb_mut(&mut self) -> &mut BeliefBase {
         &mut self.session_bb
+    }
+
+    /// Set `skip_global_api_check`, returning `self` for chaining.
+    ///
+    /// Pass `true` for parallel task builders constructed inside `parse_epoch`:
+    /// those builders emit to an isolated channel, the api node is already in
+    /// `global_bb`, and the check costs one `BeliefAccumulator` mutex acquisition
+    /// per task — O(N) serialization at the start of every parallel epoch.
+    pub fn with_skip_global_api_check(mut self, skip: bool) -> Self {
+        self.skip_global_api_check = skip;
+        self
     }
 
     pub fn doc_bb_mut(&mut self) -> &mut BeliefBase {
@@ -978,7 +1000,7 @@ impl GraphBuilder {
         if self.session_bb.get(&api_key).is_none() {
             self.session_bb.process_event(&api_node_event)?;
         }
-        if global_bb.get_async(&api_key).await?.is_none() {
+        if !self.skip_global_api_check && global_bb.get_async(&api_key).await?.is_none() {
             self.tx.send(api_node_event)?;
         }
 
@@ -1036,6 +1058,14 @@ impl GraphBuilder {
             {
                 return Ok((initial, doc_sort_key));
             }
+            tracing::warn!(
+                target: "noet_core::codec::fast_path",
+                path = %abs_path.as_ref().display(),
+                repo = %self.repo,
+                "[initialize_stack] fast-path returned None — falling through to slow path. \
+                 If this path is a child of a known subnet, parent PathMap registration \
+                 may be missing in global_bb (RelationUpdate dropped?)."
+            );
         }
 
         let initial_factory = CODECS
@@ -1396,7 +1426,7 @@ impl GraphBuilder {
             };
             let id_key = NodeKey::Id {
                 net: Bref::default(),
-                id: network_id,
+                id: network_id.clone(),
             };
             // Network|Document dual-kind nodes (e.g. MDN constructor pages where the filename
             // matches the parent directory name, like `duration/duration/index.md`) must NOT
@@ -2301,7 +2331,9 @@ impl GraphBuilder {
         let (parent_bid, use_global_bb) = match fast_result {
             GetOrCreateResult::Resolved(ref node, NodeSource::StackCache) => (node.bid, false),
             GetOrCreateResult::Resolved(ref node, NodeSource::GlobalCache) => (node.bid, true),
-            _ => return Ok(None),
+            GetOrCreateResult::Unresolved(_) | GetOrCreateResult::Resolved(_, _) => {
+                return Ok(None);
+            }
         };
 
         // Populate fast_missing from the appropriate source:
@@ -2314,7 +2346,18 @@ impl GraphBuilder {
             traverse: None,
         };
         let fast_missing: BeliefGraph = if use_global_bb {
-            global_bb.eval_query(&parent_query, true).await?
+            let result = global_bb.eval_query(&parent_query, true).await?;
+            if result.states.len() <= 1 && result.relations.as_graph().edge_count() == 0 {
+                tracing::warn!(
+                    target: "noet_core::codec::fast_path",
+                    path = %abs_path.display(),
+                    parent_rel_path = %parent_rel_path,
+                    parent_bid = %parent_bid,
+                    "[initialize_stack] GlobalCache hit but fast_missing has no ancestor edges \
+                     — parent PathMap registration may be missing in global_bb (RelationUpdate dropped?)"
+                );
+            }
+            result
         } else {
             self.session_bb.eval_query(&parent_query, true).await?
         };
@@ -2557,6 +2600,15 @@ impl GraphBuilder {
             .ok_or(BuildonomyError::Codec(format!(
                 "Codec could not resolve path '{abs_path:?}' into a proto node"
             )))?;
+        tracing::debug!(
+            target: "noet_core::codec::fast_path",
+            path = %abs_path.display(),
+            parent_rel_path = %parent_rel_path,
+            parent_bid = %parent_bid,
+            source = if use_global_bb { "GlobalCache" } else { "StackCache" },
+            stack_depth = self.stack.len(),
+            "[initialize_stack] fast path: stack reconstructed"
+        );
         Ok(Some((initial, doc_sort_key)))
     }
 
@@ -2635,7 +2687,16 @@ impl GraphBuilder {
         if let Some(state) = found_state {
             Ok(GetOrCreateResult::Resolved(state, source))
         } else {
-            tracing::trace!("[cache_fetch] MISS! keys: {keys:?}");
+            tracing::warn!(
+                target: "noet_core::codec::fast_path",
+                keys = ?keys,
+                repo = %self.repo,
+                "[cache_fetch] MISS on all caches (session_bb + global_bb). \
+                 If keys contain NodeKey::Id {{ net: nil_bref, .. }}, the node's ID \
+                 may not yet be registered in global_bb (global_bb not yet drained \
+                 for the current epoch), or the parent network's PathMap subnet list \
+                 is incomplete."
+            );
             Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
                 other_keys: keys.into(),
                 ..Default::default()

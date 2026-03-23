@@ -13,7 +13,7 @@ use crate::{
     event::BeliefEvent,
     nodekey::NodeKey,
     paths::{os_path_to_string, string_to_os_path, AnchorPath, AnchorPathBuf},
-    properties::{asset_namespace, Bid, Bref},
+    properties::{asset_namespace, content_namespaces, Bid, Bref},
     query::{BeliefSource, Expression, Query},
 };
 
@@ -606,28 +606,13 @@ impl DocumentCompiler {
         batch_results: Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)>,
         repo_seeded: &mut bool,
     ) -> Result<(), BuildonomyError> {
-        // Seed repo BID once from the first task that discovers it.
-        if !*repo_seeded {
-            for (_, task_result) in &batch_results {
-                if let Ok(ref with_codec) = task_result {
-                    if with_codec.repo_bid != Bid::nil() {
-                        self.builder.set_repo(with_codec.repo_bid);
-                        if let Some(ref repo_node) = with_codec.repo_node {
-                            let event = BeliefEvent::NodeUpdate(
-                                vec![NodeKey::Bid {
-                                    bid: with_codec.repo_bid,
-                                }],
-                                repo_node.toml(),
-                                crate::event::EventOrigin::Remote,
-                            );
-                            let _ = self.builder.session_bb_mut().process_event(&event);
-                        }
-                        *repo_seeded = true;
-                        break;
-                    }
-                }
-            }
-        }
+        // Note: repo_bid / API-node backfill was removed. The repo root is now parsed
+        // sequentially by self.builder before the first parallel epoch (see parse_all
+        // pre-epoch block), so self.builder.repo() is already set and session_bb already
+        // contains the canonical repo BID and its api→repo_root Section edge by the time
+        // any parallel task snapshot is taken. repo_seeded is kept as a parameter for
+        // call-site symmetry but no longer drives any backfill logic here.
+        let _ = repo_seeded; // used only to preserve call-site API
 
         for (path, task_result) in batch_results {
             self.process_one_parse_result(path, task_result).await;
@@ -902,6 +887,53 @@ impl DocumentCompiler {
         let cached_global_bb = global_bb;
         let mut repo_seeded = self.builder.repo() != Bid::nil();
 
+        // ── Pre-epoch: parse repo root sequentially with self.builder ────────
+        //
+        // The compiler's session_bb is only populated by events that flow through
+        // self.builder. In the parallel path, every task uses its own GraphBuilder
+        // and its events go task_tx → shared_tx → BeliefAccumulator → global_bb —
+        // they are never replayed into self.builder.session_bb.
+        //
+        // Consequence: if the repo-root index.md is parsed for the first time inside
+        // a parallel epoch, epoch_session_snapshot sees snapshot_edges=0 (no
+        // api→repo_root Section edge in session_bb), so every parallel task builder
+        // gets an API PathMap with zero subnets. cache_fetch then returns Unresolved
+        // for every NodeKey::Id{net:API_bref} lookup, generating a fresh time-based
+        // BID for the repo-root network node. That fresh BID ends up in doc_bb.states
+        // but not in any PathMap → Phase 4 get_context panics.
+        //
+        // Fix: parse the repo root once, sequentially, through self.builder before
+        // any parallel epoch runs. This commits the canonical repo BID and the
+        // api→repo_root Section edge into self.builder.session_bb (and global_bb
+        // after drain_epoch) via the normal terminate_stack → tx → BeliefAccumulator
+        // pipeline. All subsequent epoch_session_snapshot calls will include the
+        // Section edge, giving every parallel task a properly populated API PathMap.
+        //
+        // The repo-root is the shallowest network dir (first entry in network_dirs(),
+        // which is sorted by component count). We mark it in self.processed so the
+        // depth-1 group in Phase 1 skips it.
+        if !repo_seeded {
+            if let Some(root_dir) = self.proto_index.network_dirs().first().cloned() {
+                if !self.processed.contains_key(&root_dir) {
+                    *self.processed.entry(root_dir.clone()).or_insert(0) += 1;
+                    let _ = self.builder.tx().send(BeliefEvent::BatchStart);
+                    let root_result = Self::parse_one_path(
+                        root_dir,
+                        &mut self.builder,
+                        cached_global_bb.clone(),
+                        self.proto_index.clone(),
+                        self.write,
+                    )
+                    .await;
+                    let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
+                    cached_global_bb.drain_epoch().await?;
+                    self.sync_asset_snapshot(&cached_global_bb).await?;
+                    self.process_epoch_batch_results(vec![root_result], &mut repo_seeded)
+                        .await?;
+                }
+            }
+        }
+
         // ── Epoch 0, Phase 1: network dirs grouped by component depth ────────
         //
         // Build depth groups from network_dirs() (already sorted shallowest-first,
@@ -952,6 +984,7 @@ impl DocumentCompiler {
             let results = self.parse_epoch(batch, cached_global_bb.clone()).await?;
             let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
             cached_global_bb.drain_epoch().await?;
+            self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(results, &mut repo_seeded)
                 .await?;
         }
@@ -991,6 +1024,7 @@ impl DocumentCompiler {
                 .await?;
             let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
             cached_global_bb.drain_epoch().await?;
+            self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(leaf_results, &mut repo_seeded)
                 .await?;
         }
@@ -1055,6 +1089,7 @@ impl DocumentCompiler {
                 .await?;
             let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
             cached_global_bb.drain_epoch().await?;
+            self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(batch_results, &mut repo_seeded)
                 .await?;
         }
@@ -1317,7 +1352,7 @@ impl DocumentCompiler {
                         // (root not yet parsed) and stable for all subsequent epochs.
                         let mut builder = match GraphBuilder::new(&repo_root, Some(task_tx.clone()))
                         {
-                            Ok(b) => b,
+                            Ok(b) => b.with_skip_global_api_check(true),
                             Err(e) => return (idx, path, Err(e), Vec::new()),
                         };
                         // Seed repo_bid and merge the full network ancestor chain into
@@ -1325,6 +1360,13 @@ impl DocumentCompiler {
                         // can walk upward through Section edges all the way to the repo root.
                         // seed_session is a no-op when repo_bid is nil (epoch-0).
                         builder.seed_session(repo_bid, &network_ancestors);
+                        tracing::debug!(
+                            target: "noet_core::codec::fast_path",
+                            task_idx = idx,
+                            snapshot_states = %network_ancestors.states.len(),
+                            snapshot_edges = %network_ancestors.relations.as_graph().edge_count(),
+                            "[parse_epoch] task seeded"
+                        );
 
                         // Delegate directory resolution, file read, FileParsed event,
                         // parse_content, and optional write-back to the shared helper.
@@ -1391,6 +1433,60 @@ impl DocumentCompiler {
 
             Ok(results)
         }
+    }
+
+    /// After `drain_epoch`, pull the const-namespace (asset + href) subgraph from
+    /// `global_bb` into `self.builder.session_bb` so that `epoch_session_snapshot`
+    /// includes the full asset set for the next epoch's parallel tasks.
+    ///
+    /// Without this, `epoch_session_snapshot` Part 2 always produces an empty asset
+    /// subgraph (namespace nodes present, zero children) because parallel-task events
+    /// flow `shared_tx → BeliefAccumulator → global_bb` but are never replayed into
+    /// `self.builder.session_bb`. Every remainder-epoch task then falls through to
+    /// `global_bb.eval_unbalanced` inside `initialize_stack`, loading ~366 assets at
+    /// ~10.9 ms/asset = 4–9s of Phase 0 per task on every reparse.
+    ///
+    /// After this call the next `epoch_session_snapshot` includes the full asset
+    /// subgraph, and the `content_namespaces()` guard in `initialize_stack` fires
+    /// immediately, skipping `eval_unbalanced` entirely for all remainder tasks.
+    ///
+    /// Must be called **after** `drain_epoch` — `global_bb` does not have the new
+    /// epoch's assets until the drain is complete.
+    async fn sync_asset_snapshot<B: BeliefSource + Clone>(
+        &mut self,
+        global_bb: &B,
+    ) -> Result<(), BuildonomyError> {
+        for ns_bid in content_namespaces().iter() {
+            let key = NodeKey::Bid { bid: *ns_bid };
+            // Only pull namespaces that global_bb actually knows about.
+            if let Some(ns_node) = global_bb.get_async(&key).await? {
+                // Ensure the namespace node itself is present in session_bb.
+                let ns_event = BeliefEvent::NodeUpdate(
+                    vec![key.clone()],
+                    ns_node.toml(),
+                    crate::event::EventOrigin::Remote,
+                );
+                self.builder.session_bb_mut().process_event(&ns_event)?;
+
+                // Fetch the full asset subgraph reachable from this namespace and
+                // merge it into session_bb.  merge_from is idempotent: re-merging
+                // on every drain is safe and picks up any newly-discovered assets.
+                let ns_expr = Expression::from(&key);
+                let ns_graph = global_bb.eval(&ns_expr).await?;
+                let ns_seed: std::collections::BTreeSet<Bid> =
+                    std::collections::BTreeSet::from([*ns_bid]);
+                self.builder
+                    .session_bb_mut()
+                    .merge_from(&ns_graph, &ns_seed);
+
+                tracing::debug!(
+                    "[sync_asset_snapshot] Merged {} asset nodes for namespace {}",
+                    ns_graph.states.len().saturating_sub(1), // -1 for the namespace node itself
+                    ns_bid
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Promote lingering `UnresolvedReference` diagnostics to `Warning`.

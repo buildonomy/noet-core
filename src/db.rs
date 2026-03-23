@@ -945,18 +945,30 @@ pub async fn db_init_memory() -> Result<Pool<Sqlite>, sqlx::Error> {
     use sqlx::pool::PoolOptions;
     use sqlx::sqlite::SqliteConnectOptions;
 
-    // `?mode=memory&cache=shared` would allow multiple connections to share the
-    // same in-memory DB, but for our use-case a single connection is sufficient
-    // and avoids any shared-cache locking subtleties.
-    let options = SqliteConnectOptions::from_str("sqlite::memory:")?.disable_statement_logging();
+    // Use a named shared-cache in-memory database: `file:noet_parse?mode=memory&cache=shared`.
+    //
+    // The plain `sqlite::memory:` URI creates a *separate* in-memory database for
+    // every new connection.  Under the previous `max_connections(1)` guard this was
+    // safe as long as sqlx never recycled or timed-out the single connection — but
+    // under heavy parallel load (~200 concurrent tasks all calling `eval_unbalanced`
+    // in the same remainder-epoch batch) the pool's idle-connection logic can drop
+    // and recreate the connection, producing a fresh empty DB that has never had
+    // migrations run ("no such table: beliefs").
+    //
+    // The named shared-cache URI fixes this: all connections to
+    // `file:noet_parse?mode=memory&cache=shared` within the same process see the
+    // same in-memory schema, so the pool is free to open, close, and recycle
+    // connections without losing the migrated schema.  We retain min_connections(1)
+    // to keep the DB alive for the pool's lifetime (SQLite drops a named in-memory
+    // DB when the last connection to it closes).
+    let options = SqliteConnectOptions::from_str("file:noet_parse?mode=memory&cache=shared")?
+        .disable_statement_logging();
 
     let pool = PoolOptions::<Sqlite>::new()
-        // Keep exactly one connection alive so the in-memory database persists
-        // for the lifetime of the pool.  A min_connections(1) alone is not
-        // sufficient in sqlx — we also set max_connections(1) so the pool never
-        // opens a second connection that would see a different (empty) DB.
+        // Keep at least one connection alive so the named in-memory database is
+        // never dropped.  max_connections is unconstrained: all connections share
+        // the same schema via the shared-cache URI, so concurrent access is safe.
         .min_connections(1)
-        .max_connections(1)
         .connect_with(options)
         .await?;
 
