@@ -4,7 +4,7 @@ parse_log.py — Analyse a noet corpus-run debug log.
 
 Extracts timing information from RUST_LOG=debug output produced by:
 
-    cargo run --features service,bin -- --color=always parse \\
+    RUST_LOG=debug cargo run --features service,bin -- --color=always parse \\
         --html-output /tmp/bench-output <corpus_path> 2>&1 | tee run.log
 
 Usage

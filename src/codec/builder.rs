@@ -515,7 +515,7 @@ impl GraphBuilder {
         global_bb: B,
         proto_index: ProtoIndex,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
-        tracing::trace!("Phase 0: initialize stack");
+        tracing::debug!("Phase 0: initialize stack");
         let full_path = input_path.as_ref().canonicalize()?.to_path_buf();
         let (initial, doc_sort_key) = self
             .initialize_stack(input_path.as_ref(), global_bb.clone(), &proto_index)
@@ -563,7 +563,7 @@ impl GraphBuilder {
             let mut relation_event_queue = Vec::<BeliefEvent>::default();
             let mut missing_structure = BeliefGraph::default();
 
-            tracing::trace!("Phase 1: Create all nodes");
+            tracing::debug!("Phase 1: Create all nodes");
             debug_assert!(
                 self.session_bb.is_balanced().is_ok(),
                 "Why isn't session_bb balanced? (phase 1 start)"
@@ -663,7 +663,7 @@ impl GraphBuilder {
                 parsed_bids.push(bid);
             }
 
-            tracing::trace!("Phase 2: Balance and process relations");
+            tracing::debug!("Phase 2: Balance and process relations");
             let mut generated_href_nodes = Vec::new();
             let mut relation_seeds = BTreeSet::new();
             for (proto, bid) in codec.nodes().iter().zip(parsed_bids.iter()) {
@@ -762,7 +762,7 @@ impl GraphBuilder {
                 let _deriv = self.doc_bb.process_event(&edge_update)?;
             }
 
-            tracing::trace!(
+            tracing::debug!(
                 "Phase 3: inform external sinks about nodekey changes from this document"
             );
             // (re)parse documents are are either to
@@ -795,7 +795,7 @@ impl GraphBuilder {
                 }
                 tracing::trace!("Phase 3: affected_sinks: {:?}", docs_to_parse);
             }
-            tracing::trace!(
+            tracing::debug!(
                 "Phase 4: context injection. inject_context={}",
                 inject_context
             );
@@ -847,7 +847,7 @@ impl GraphBuilder {
             }
 
             // Phase 4b: Finalize codec (cross-node cleanup, emit events for modified nodes)
-            tracing::trace!("Phase 4b: codec finalization");
+            tracing::debug!("Phase 4b: codec finalization");
             let finalized_nodes = codec.finalize(&mut diagnostics)?;
             for (bid, ir_node) in finalized_nodes {
                 // Apply source-file-derived fields (kind, title, schema, payload, id) to the
@@ -915,7 +915,7 @@ impl GraphBuilder {
             )));
         };
 
-        tracing::trace!("Phase 5: terminating stack and transmitting updates to global_bb");
+        tracing::debug!("Phase 5: terminating stack and transmitting updates to global_bb");
         // Include any BIDs clobbered by insert_state during Phase 1 pushes.  These belong
         // to foreign nodes (not parsed in this pass) whose id was reset in-place due to a
         // collision with an incoming document or section.  Adding them to parsed_nodes lets
@@ -1274,7 +1274,7 @@ impl GraphBuilder {
                     BeliefEvent::BuiltInTest => {}
                 }
             }
-            tracing::trace!(
+            tracing::debug!(
                 "Diff events ({}): NodeUpdate({}), NodeRemoved({}), NodeRenamed({}), RelationChange({}), RelationRemoved({}), RelationUpdate({}), PathsAdded({}), PathsRemoved({})",
                 tx_events.len(),
                 node_update_count,
