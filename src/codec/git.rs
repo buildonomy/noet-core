@@ -388,10 +388,11 @@ mod inner {
     ///
     /// Returns `None` when:
     /// - No `origin` remote is configured.
-    /// - The remote URL pattern is not recognized (not GitHub or GitLab).
+    /// - The remote URL pattern is not recognized.
     ///
-    /// SSH remotes (`git@github.com:org/repo.git`) are converted to HTTPS form.
+    /// SSH remotes (`git@host:org/repo.git`) are converted to HTTPS form.
     /// The `.git` suffix is stripped.
+    /// Any host is accepted; GitHub/GitLab-style blob URL construction is assumed.
     pub fn normalize_remote_url(raw: &str) -> Option<String> {
         let raw = raw.trim();
 
@@ -401,9 +402,7 @@ mod inner {
             if let Some(colon_pos) = rest.find(':') {
                 let host = &rest[..colon_pos];
                 let path = rest[colon_pos + 1..].trim_end_matches(".git");
-                if is_known_host(host) {
-                    return Some(format!("https://{}/{}", host, path));
-                }
+                return Some(format!("https://{}/{}", host, path));
             }
             return None;
         }
@@ -413,21 +412,14 @@ mod inner {
             .strip_prefix("https://")
             .or_else(|| raw.strip_prefix("http://"))
         {
-            if let Some(slash_pos) = rest.find('/') {
-                let host = &rest[..slash_pos];
-                if is_known_host(host) {
-                    let path = rest.trim_end_matches('/').trim_end_matches(".git");
-                    return Some(format!("https://{}", path));
-                }
+            if rest.contains('/') {
+                let path = rest.trim_end_matches('/').trim_end_matches(".git");
+                return Some(format!("https://{}", path));
             }
             return None;
         }
 
         None
-    }
-
-    fn is_known_host(host: &str) -> bool {
-        host == "github.com" || host == "gitlab.com"
     }
 
     fn normalize_origin_url(repo: &Repository) -> Option<String> {
@@ -529,19 +521,22 @@ mod inner {
         }
 
         #[test]
-        fn test_normalize_unknown_host_returns_none() {
+        fn test_normalize_unknown_host_resolves() {
             assert_eq!(
                 normalize_remote_url("https://bitbucket.org/org/repo.git"),
-                None
+                Some("https://bitbucket.org/org/repo".to_string())
             );
-            assert_eq!(normalize_remote_url("git@bitbucket.org:org/repo.git"), None);
+            assert_eq!(
+                normalize_remote_url("git@bitbucket.org:org/repo.git"),
+                Some("https://bitbucket.org/org/repo".to_string())
+            );
         }
 
         #[test]
-        fn test_normalize_gitea_returns_none() {
+        fn test_normalize_gitea_resolves() {
             assert_eq!(
                 normalize_remote_url("https://git.example.com/org/repo.git"),
-                None
+                Some("https://git.example.com/org/repo".to_string())
             );
         }
 
