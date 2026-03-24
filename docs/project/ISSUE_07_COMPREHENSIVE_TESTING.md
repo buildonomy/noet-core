@@ -498,6 +498,45 @@ echo "# Document 1\n\nModified content." > /tmp/noet_test/network/doc1.md
    - Check: https://github.com/notify-rs/notify/issues
    - Version: currently using notify-debouncer-full v0.3.1
 
+### 10. Deferred Integration Tests (from Issues 50, 59) (1 day)
+
+**Source**: Issue 50 Step 4 (deferred from sharding), Issue 59 Step 4 (deferred from
+git metadata / asset dirs).
+
+#### 10.1 Directory Link Integration Test (from Issue 59) (0.5 days)
+
+End-to-end assertion that the full `UnresolvedReference → process_asset_reference →
+remainder_queue → parse_one_path → process_asset_dir → re-parse → relation wiring`
+chain works correctly for Case B (local directory listing).
+
+The unit tests (`test_directory_asset_listing`, `test_directory_asset_case_a_git_tracked`,
+`test_directory_asset_case_c_nonexistent`) cover `process_asset_dir` in isolation. The
+`bid_tests` implicitly exercise the chain via `../net1_dir1` and `../assets` directory
+links in `tests/network_1/subnet1/subnet1_file1.md`. What is missing is an explicit
+assertion on the resulting node contents:
+
+- [ ] Run `DocumentCompiler::simple("tests/network_1")` with `write=false`
+- [ ] Assert `net1_dir1` and `assets` each produce a `BeliefKind::External` node in
+      `session_bb` with `payload["listing"]` (non-empty array) and
+      `payload["content_hash"]` (non-empty hex string)
+- [ ] Assert `subnet1_file1` has `Section` relations to those `External` nodes
+- [ ] Location: `src/codec/compiler.rs` tests, no feature flags required
+
+#### 10.2 Cross-Network Navigation Load Prompt (from Issue 50) (0.5 days)
+
+Issue 50 deferred viewer-side handling of navigation to an unloaded network shard to
+Issue 54. Issue 54 is now complete but this item was not addressed. The viewer should
+detect when a nav-tree or search result targets a BID in an unloaded shard and prompt
+the user to load it rather than silently navigating to a dead link.
+
+- [ ] In `wasm.js` / `shard-manager.js`: when `getNavNode(bid)` or equivalent returns
+      null and `ShardManager` knows the BID belongs to an unloaded network (via
+      `search/manifest.json` network membership), surface a load prompt in the metadata
+      panel ("Network X is not loaded — click to load")
+- [ ] On confirmation, call `ShardManager.loadNetwork(bref)` and re-navigate
+- [ ] Integration test: load global shard only, attempt to navigate to a BID in an
+      unloaded network shard, assert the prompt text is present (JSDOM or Playwright)
+
 ### 9. Service Testing Infrastructure (from Issue 10) (1-1.5 days)
 
 **Context**: Core library is well-tested. Service layer (`watch.rs`, feature = "service") has comprehensive rustdoc examples but minimal integration tests. Test skeleton exists at `tests/service_integration.rs`.
@@ -585,6 +624,10 @@ Expand `tests/service_integration.rs` skeleton to cover:
 - [x] **`cargo test --doc` passes** - 11 passed, 0 ignored ✅
 - [ ] Service integration tests at `tests/service_integration.rs` complete and passing
 - [ ] End-to-end service layer testing (file watching → compilation → DB sync) verified
+- [ ] **Directory link integration test** (Issue 59 §4 / Issue 7 §10.1): explicit
+      `External` node assertions for `net1_dir1` and `assets` after full `parse_all` run
+- [ ] **Cross-network navigation load prompt** (Issue 50 §4 / Issue 7 §10.2): viewer
+      surfaces load prompt when navigating to BID in unloaded network shard
 - [x] **GitHub Actions test-summary job passes** (indicates all required tests green) ✅
 - [ ] **Interactive viewer accessibility testing complete** (ISSUE_39 Phase 2):
   - [ ] Screen reader testing (NVDA, JAWS, VoiceOver, TalkBack)

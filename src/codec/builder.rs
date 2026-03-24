@@ -284,24 +284,6 @@ impl GraphBuilder {
         self.repo
     }
 
-    /// Set the repository root BID if not already set.
-    ///
-    /// Used after epoch-0 in `parse_all` (`process_epoch_batch_results`) to seed the
-    /// compiler's own long-lived builder with the repo BID discovered by a task-builder
-    /// during the first depth batch.
-    ///
-    /// For seeding fresh **parallel task builders**, use [`seed_session`] instead, which
-    /// atomically sets the repo BID and pre-populates `session_bb` with the full network
-    /// ancestor graph so that `initialize_stack`'s fast path hits `StackCache` immediately
-    /// without any `global_bb` query.
-    ///
-    /// The `nil`-guard prevents accidentally overwriting a legitimately set BID.
-    pub(crate) fn set_repo(&mut self, bid: Bid) {
-        if self.repo == Bid::nil() {
-            self.repo = bid;
-        }
-    }
-
     /// Seed a fresh parallel-task builder from the compiler's [`epoch_session_snapshot`].
     ///
     /// Sets `self.repo` so `initialize_stack`'s fast-path guard passes immediately, and
@@ -536,6 +518,7 @@ impl GraphBuilder {
         content: String,
         global_bb: B,
         proto_index: ProtoIndex,
+        parse_number: usize,
     ) -> Result<ParseContentWithCodec, BuildonomyError> {
         tracing::debug!("Phase 0: initialize stack");
         let full_path = input_path.as_ref().canonicalize()?.to_path_buf();
@@ -651,6 +634,7 @@ impl GraphBuilder {
                         &mut diagnostics,
                         &mut clobbered_bids,
                         metadata_override,
+                        parse_number,
                     )
                     .await?;
                 if !missing_structure.is_empty() {
@@ -701,6 +685,7 @@ impl GraphBuilder {
                             global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
+                            parse_number,
                         )
                         .await?;
 
@@ -740,6 +725,7 @@ impl GraphBuilder {
                             global_bb.clone(),
                             &mut relation_event_queue,
                             &mut missing_structure,
+                            parse_number,
                         )
                         .await?;
 
@@ -1136,6 +1122,7 @@ impl GraphBuilder {
                     &mut Vec::new(), // ancestor pushes are trace-only; diagnostics discarded
                     &mut ancestor_clobbers,
                     git_metadata_override,
+                    0, // ancestor trace pushes — cache misses always expected
                 )
                 .await?;
             if !ancestor_clobbers.is_empty() {
@@ -1551,6 +1538,9 @@ impl GraphBuilder {
         diagnostics: &mut Vec<ParseDiagnostic>,
         clobbered_bids: &mut BTreeSet<Bid>,
         metadata_override: Option<TomlTable>,
+        // 0 = ancestor/trace (misses always expected), 1 = first parse
+        // (forward-ref misses expected), >1 = re-parse (misses are unexpected).
+        parse_number: usize,
     ) -> Result<(Bid, (NodeSource, BTreeSet<NodeKey>, BTreeSet<NodeKey>)), BuildonomyError> {
         let (parent_bid, path_info, _parent_full_path) = self.get_parent_from_stack(proto);
 
@@ -1568,7 +1558,13 @@ impl GraphBuilder {
         // nodekeys).
 
         let cache_fetch_result = self
-            .cache_fetch(&keys, global_bb.clone(), false, missing_structure)
+            .cache_fetch(
+                &keys,
+                global_bb.clone(),
+                false,
+                missing_structure,
+                parse_number,
+            )
             .await?;
 
         let (mut node, source) = match cache_fetch_result {
@@ -1650,6 +1646,7 @@ impl GraphBuilder {
                     global_bb.clone(),
                     true, // check doc_bb first
                     &mut id_missing_structure,
+                    parse_number,
                 )
                 .await?;
 
@@ -1873,6 +1870,7 @@ impl GraphBuilder {
         global_bb: B,
         update_queue: &mut Vec<BeliefEvent>,
         missing_structure: &mut BeliefGraph,
+        parse_number: usize,
     ) -> Result<GetOrCreateResult, BuildonomyError> {
         let other_key = &relation.key;
         let kind = &relation.kind;
@@ -1959,7 +1957,13 @@ impl GraphBuilder {
         weight.set(crate::properties::WEIGHT_OWNED_BY, owner).ok();
         // Translate relative paths into absolute paths and resolve the "other" node
         let cache_fetch_result = self
-            .cache_fetch(&other_keys, global_bb.clone(), true, missing_structure)
+            .cache_fetch(
+                &other_keys,
+                global_bb.clone(),
+                true,
+                missing_structure,
+                parse_number,
+            )
             .await?;
         let (other_node, other_node_source) = match cache_fetch_result {
             GetOrCreateResult::Resolved(mut other_node, other_node_source) => {
@@ -2325,6 +2329,7 @@ impl GraphBuilder {
                 global_bb.clone(),
                 false,
                 &mut _unused_missing,
+                0, // fast-path infrastructure — miss means fall-through to slow path, always expected
             )
             .await?;
 
@@ -2618,6 +2623,7 @@ impl GraphBuilder {
         global_bb: B,
         check_local: bool,
         missing_structure: &mut BeliefGraph,
+        parse_number: usize,
     ) -> Result<GetOrCreateResult, BuildonomyError> {
         let mut found_state: Option<BeliefNode> = None;
         let mut source = NodeSource::Generated;
@@ -2686,16 +2692,30 @@ impl GraphBuilder {
         // If we found a state in any cache, return it as Resolved
         if let Some(state) = found_state {
             Ok(GetOrCreateResult::Resolved(state, source))
-        } else {
+        } else if parse_number > 1 {
             tracing::warn!(
                 target: "noet_core::codec::fast_path",
                 keys = ?keys,
                 repo = %self.repo,
-                "[cache_fetch] MISS on all caches (session_bb + global_bb). \
-                 If keys contain NodeKey::Id {{ net: nil_bref, .. }}, the node's ID \
-                 may not yet be registered in global_bb (global_bb not yet drained \
-                 for the current epoch), or the parent network's PathMap subnet list \
-                 is incomplete."
+                parse_number,
+                "[cache_fetch] MISS on re-parse. This is unexpected — the node should have \
+                 been resolved on pass 1. If keys contain \
+                 NodeKey::Id {{ net: nil_bref, .. }}, the parent network's PathMap subnet \
+                 list may be incomplete or global_bb has not drained for this epoch.",
+            );
+            Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
+                other_keys: keys.into(),
+                ..Default::default()
+            }))
+        } else {
+            tracing::trace!(
+                target: "noet_core::codec::fast_path",
+                keys = ?keys,
+                repo = %self.repo,
+                parse_number,
+                "[cache_fetch] MISS on pass 1 (forward-reference misses are expected on \
+                 pass 1 and resolve on pass 2; surviving misses are promoted to warnings \
+                 by promote_unresolved_to_warnings).",
             );
             Ok(GetOrCreateResult::Unresolved(UnresolvedReference {
                 other_keys: keys.into(),
@@ -2755,6 +2775,7 @@ impl GraphBuilder {
                 global_bb,
                 false, // doc_bb is irrelevant for assets
                 &mut missing_structure,
+                0, // new asset discovery — miss is always expected
             )
             .await?;
 
@@ -3087,7 +3108,7 @@ impl GraphBuilder {
         };
         let mut missing_structure = BeliefGraph::default();
         let cache_result = self
-            .cache_fetch(&[asset_key], global_bb, false, &mut missing_structure)
+            .cache_fetch(&[asset_key], global_bb, false, &mut missing_structure, 0)
             .await?;
 
         if !missing_structure.is_empty() {

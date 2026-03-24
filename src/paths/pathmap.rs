@@ -2107,15 +2107,21 @@ impl PathMap {
         if sink_sub_indices.is_empty() {
             return derivatives;
         }
-        // Block non-network source nodes from being inserted into a foreign network's
-        // PathMap via node_to_nets routing (e.g. a doc in subnet_A must not appear in
-        // the root PathMap via RelationUpdate(doc, subnet_A)).
+        // Block insertions into a foreign network's PathMap via node_to_nets routing.
+        // Only the network whose BID matches self.net should receive entries for its
+        // own children. Any RelationUpdate whose sink is a different network node must
+        // be ignored here; it will be processed by that network's own PathMap instance
+        // when the event is routed there.
         //
-        // Exception: when source is itself a network node (subnet linking up to its
-        // parent), allow it through — this mirrors what PathMap::new's DFS does via
-        // Control::Prune: record the subnet as a child in ancestor PathMaps but don't
-        // recurse into the subnet's own children.
-        if nets.nets.contains(sink) && self.net != *sink && !nets.nets.contains(source) {
+        // This guard was previously loosened with a `!nets.nets.contains(source)`
+        // exception intended to allow subnet→parent registration to propagate into
+        // grandparent PathMaps. That exception was incorrect: it also let reserved-
+        // namespace edges (e.g. asset_namespace → buildonomy_namespace, pulled in by
+        // sync_asset_snapshot's balance() walk) propagate into content network PathMaps,
+        // inserting entries with the wrong sort-order depth that triggered PathsRemoved
+        // churn on every subsequent parse. The grandparent-registration problem must be
+        // solved differently (e.g. by explicit fan-out at event-emit time, not here).
+        if nets.nets.contains(sink) && self.net != *sink {
             return derivatives;
         }
 

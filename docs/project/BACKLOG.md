@@ -202,15 +202,13 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 **Related**: Used in `built_in_test()` to check for orphaned edges without cloning entire graph.
 
 
-## BeliefBase Sharding and Built-In Search (from Issues 50/54)
+## BeliefBase Sharding and Built-In Search (from Issues 50/54) ✅ Complete
 
-**Priority**: MEDIUM - Performance improvement for large repositories
+**Status**: Issues 50 and 54 are complete (`docs/project/completed/`).
 
-**Context**: Issue 50 implements per-network BeliefBase sharding (JSON export/loading with memory budget) and always generates compile-time `search/*.idx.json` files alongside the data export. Issue 54 adds full-text search by deserializing those pre-built indices in `BeliefBaseWasm` — no Tantivy, no runtime index construction, no WASM binary size increase. Search covers the entire corpus from init, including networks whose data shards haven't been loaded. See `docs/design/search_and_sharding.md` for the architecture. See `docs/project/ISSUE_49_FULL_TEXT_SEARCH_PRODUCTION.md` for post-MVP search enhancement ideas (stemming, boolean queries, phrase search, ranking boosts).
+**Context**: Issue 50 implemented per-network BeliefBase sharding (JSON export/loading with memory budget) and always generates compile-time `search/*.idx.json` files alongside the data export. Issue 54 added full-text search by deserializing those pre-built indices in `BeliefBaseWasm` — no Tantivy, no runtime index construction, no WASM binary size increase. Search covers the entire corpus from init, including networks whose data shards haven't been loaded. See `docs/design/search_and_sharding.md` for the architecture. See `docs/project/ISSUE_49_FULL_TEXT_SEARCH_PRODUCTION.md` for post-MVP search enhancement ideas (stemming, boolean queries, phrase search, ranking boosts).
 
-### Implementation Status
-- Issue 50 (BeliefBase Sharding): Per-network export, `ShardManager`, memory budget, `search/*.idx.json` generation
-- Issue 54 (Search MVP): Compile-time per-network search indices, TF-IDF ranking, fuzzy matching, viewer search UI
+**Deferred item**: Cross-network navigation load prompt moved to `ISSUE_07_COMPREHENSIVE_TESTING.md` §10.2.
 
 ### Future Enhancements
 - Per-document sharding for very large networks (1000+ documents)
@@ -221,11 +219,11 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 - Federated shard access: remote `BeliefSource` for data not loaded locally (see `federated_belief_network.md` §3.6)
 
 **Related Files**:
-- Export: `src/codec/compiler.rs::export_beliefbase_json()` and `finalize_html` (search index generation)
+- Export: `src/codec/compiler.rs` `finalize_html` (search index generation, sharding decision)
 - Search index output: `search/manifest.json`, `search/{bref}.idx.json` (generated at compile time)
 - Loading: `assets/viewer/wasm.js::initializeWasm()`, `assets/viewer/shard-manager.js`
 - Search query: `src/wasm.rs::BeliefBaseWasm` (deserializes `.idx.json`, runs TF-IDF queries)
-- Sharding: `src/shard/` (to be implemented in Issue 50)
+- Sharding: `src/shard/`
 
 ## Windows WatchService mtime Tracking Failure
 
@@ -439,28 +437,7 @@ large final batches. If drain remains dominant, implement as described above.
 
 ## Directory Link Integration Test (from Issue 59)
 
-**Priority**: MEDIUM
-**Source**: Issue 59, Step 4 (deferred)
-
-End-to-end test for the `UnresolvedReference → process_asset_reference → remainder_queue →
-parse_one_path → process_asset_dir → re-parse → relation wiring` chain for Case B
-(local directory listing).
-
-The unit tests (`test_directory_asset_listing`, `test_directory_asset_case_a_git_tracked`,
-`test_directory_asset_case_c_nonexistent`) cover `process_asset_dir` directly. The
-`bid_tests` implicitly exercise the full chain via the `../net1_dir1` and `../assets`
-directory links in `tests/network_1/subnet1/subnet1_file1.md`. What is missing is an
-**explicit assertion** on the `External` node contents after a full `parse_all` run:
-
-- Run `DocumentCompiler::simple("tests/network_1")` (or `with_html_output`) with
-  `write=false` so no source files are modified.
-- Assert that `net1_dir1` and `assets` each produce a `BeliefKind::External` node in
-  `session_bb` with `payload["listing"]` (non-empty array) and `payload["content_hash"]`
-  (non-empty hex string).
-- Assert that `subnet1_file1` has `Section` relations to those `External` nodes.
-
-Test location: `src/codec/compiler.rs` tests, no feature flags required (Case B does not
-need `git-tracking` or `service`).
+**Moved to `docs/project/ISSUE_07_COMPREHENSIVE_TESTING.md` §10.1.**
 
 ## `initialize_stack` Asset-Loading Performance
 

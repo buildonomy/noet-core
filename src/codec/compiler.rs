@@ -683,12 +683,14 @@ impl DocumentCompiler {
         macro_rules! run_one {
             ($path:expr) => {{
                 let path: PathBuf = $path;
+                let parse_number = self.processed.get(&path).copied().unwrap_or(1);
                 let (actual_path, result) = Self::parse_one_path(
                     path.clone(),
                     &mut self.builder,
                     global_bb.clone(), // clone the snapshot for this dispatch
                     self.proto_index.clone(),
                     self.write,
+                    parse_number,
                 )
                 .await;
                 self.process_one_parse_result(actual_path, result).await;
@@ -923,6 +925,7 @@ impl DocumentCompiler {
                         cached_global_bb.clone(),
                         self.proto_index.clone(),
                         self.write,
+                        1, // first parse of the repo root
                     )
                     .await;
                     let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
@@ -1141,6 +1144,7 @@ impl DocumentCompiler {
         global_bb: B,
         proto_index: ProtoIndex,
         write: bool,
+        parse_number: usize,
     ) -> (PathBuf, Result<ParseContentWithCodec, BuildonomyError>) {
         // Resolve directory → index file, or dispatch to process_asset_dir.
         //
@@ -1218,7 +1222,7 @@ impl DocumentCompiler {
             .send(BeliefEvent::FileParsed(file_path.clone()));
 
         let mut result = builder
-            .parse_content(&file_path, content, global_bb, proto_index)
+            .parse_content(&file_path, content, global_bb, proto_index, parse_number)
             .await;
 
         // Write rewritten content (BID injection, link updates) back to disk so
@@ -1258,6 +1262,7 @@ impl DocumentCompiler {
             for path in paths {
                 let proto_index = self.proto_index.clone();
                 let write = self.write;
+                let parse_number = self.processed.get(&path).copied().unwrap_or(1);
                 results.push(
                     Self::parse_one_path(
                         path,
@@ -1265,6 +1270,7 @@ impl DocumentCompiler {
                         global_bb.clone(),
                         proto_index,
                         write,
+                        parse_number,
                     )
                     .await,
                 );
@@ -1323,6 +1329,7 @@ impl DocumentCompiler {
                 let global_bb = global_bb.clone();
                 let network_ancestors = Arc::clone(&network_ancestors);
                 let sem = Arc::clone(&semaphore);
+                let parse_number = self.processed.get(&path).copied().unwrap_or(1);
                 let span = tracing::info_span!(
                     "parse_task",
                     task_idx = idx,
@@ -1378,6 +1385,7 @@ impl DocumentCompiler {
                             global_bb,
                             proto_index,
                             write,
+                            parse_number,
                         )
                         .await;
 
@@ -1648,7 +1656,13 @@ impl DocumentCompiler {
         // Step 2: Build compile-time search indices (always, before sharding decision).
         let search_manifest = {
             let pathmap = temp_bb.paths();
-            crate::shard::search::build_search_indices(&graph.states, &pathmap, &html_dir).await
+            crate::shard::search::build_search_indices(
+                &graph.states,
+                &pathmap,
+                self.builder.repo(),
+                &html_dir,
+            )
+            .await
         };
 
         let search_manifest = match search_manifest {

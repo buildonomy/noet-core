@@ -935,7 +935,7 @@ Test network for unit tests.
         let session_bb = builder.session_bb().clone();
         let proto_index = ProtoIndex::build(builder.repo_root(), false).unwrap_or_default();
         let result = builder
-            .parse_content(&test_file, content.to_string(), session_bb, proto_index)
+            .parse_content(&test_file, content.to_string(), session_bb, proto_index, 1)
             .await;
 
         assert!(
@@ -981,7 +981,7 @@ Test network for unit tests.
         let session_bb = builder.session_bb().clone();
         let proto_index = ProtoIndex::build(builder.repo_root(), false).unwrap_or_default();
         let result = builder
-            .parse_content(&test_file, content.to_string(), session_bb, proto_index)
+            .parse_content(&test_file, content.to_string(), session_bb, proto_index, 1)
             .await;
 
         assert!(result.is_ok(), "parse_content should succeed");

@@ -547,6 +547,7 @@ pub fn tokenize<'a>(text: &'a str, stemmer: &'a Stemmer) -> impl Iterator<Item =
 pub async fn build_search_indices(
     states: &BTreeMap<Bid, BeliefNode>,
     pathmap: &PathMapMap,
+    repo_bid: crate::properties::Bid,
     output_dir: &Path,
 ) -> Result<(SearchManifest, Vec<crate::codec::ParseDiagnostic>), BuildonomyError> {
     let search_dir = output_dir.join("search");
@@ -560,42 +561,80 @@ pub async fn build_search_indices(
     // stemmer; without it this is a zero-cost no-op.
     let stemmer = Stemmer::new();
 
-    // Iterate over every network in the PathMapMap.
-    // `nets()` returns the set of network BIDs registered with the pathmap.
-    for &net_bid in pathmap.nets() {
-        let net_bref = net_bid.bref();
+    // Build per-network indices using a SINGLE traversal from the repo root.
+    //
+    // Why single-root traversal?
+    //
+    // The previous approach called `pm.recursive_map(None, ...)` independently
+    // for EACH network in `pathmap.nets()`. For a subnet (e.g. `subnet1`), this
+    // returned paths relative to THAT subnet's root — `subnet1a/index.md` instead
+    // of `subnet1/subnet1a/index.md`. The search link then navigated to the wrong
+    // URL (`/subnet1a/index.html` instead of `/subnet1/subnet1a/index.html`).
+    //
+    // `recursive_map` called on the repo-root PathMap already traverses all
+    // subnets recursively and prepends each subnet's path prefix, so every
+    // returned path is repo-root-relative and correct. We then use
+    // `pathmap.path(bid)` to determine which network each node belongs to and
+    // partition the results into per-network `SearchIndex` instances.
+    //
+    // The per-network split is still useful: the viewer loads only the index for
+    // the currently active network rather than a single monolithic index.
+    //
+    // We traverse from the REPO root PathMap (not the API/buildonomy root). The API
+    // PathMap registers each network via a `network → API` Section edge whose terminal
+    // path is the network's BID string (see `generate_terminal_path`). Traversing from
+    // the API root therefore produces BID-prefixed paths for every document. The repo
+    // network's PathMap only contains document/section paths and subnet directory paths,
+    // so its `recursive_map` returns clean repo-relative paths with no BID prefix.
+    let root_bref = repo_bid.bref();
 
-        // Retrieve the network node title.
+    // One SearchIndex per network bref encountered during traversal.
+    let mut indices: std::collections::BTreeMap<crate::properties::Bref, SearchIndex> =
+        std::collections::BTreeMap::new();
+
+    if let Some(root_pm) = pathmap.get_map(&root_bref) {
+        let all_paths =
+            root_pm.recursive_map(None, pathmap, &mut std::collections::BTreeSet::new());
+        for (path, bid, _order) in all_paths {
+            let Some(node) = states.get(&bid) else {
+                continue;
+            };
+            // Determine which network this node belongs to.
+            // `PathMapMap::path` returns (home_net_bid, repo_relative_path).
+            // We use our already-computed `path` (from the root traversal) which
+            // is guaranteed to be repo-root-relative, and look up the home_net
+            // purely for the purpose of assigning the node to the right index.
+            let home_net_bref = pathmap
+                .path(&bid)
+                .map(|(home_net, _)| home_net.bref())
+                .unwrap_or(root_bref);
+            let idx = indices
+                .entry(home_net_bref)
+                .or_insert_with(|| SearchIndex::new(home_net_bref));
+            idx.index_node(bid, node, &path, &stemmer);
+        }
+    }
+
+    // Finalize and write each network's index.
+    for (&net_bref, idx) in indices.iter_mut() {
+        let net_bid = pathmap
+            .nets()
+            .iter()
+            .find(|b| b.bref() == net_bref)
+            .copied()
+            .unwrap_or(repo_bid);
+
         let net_title = states
             .get(&net_bid)
             .map(|n| n.display_title())
             .unwrap_or_else(|| net_bref.to_string());
 
-        // Build a search index for this network.
-        let mut idx = SearchIndex::new(net_bref);
-
-        // Enumerate all nodes that belong to this network via the PathMapMap.
-        // `PathMapMap::get_map(bref)` returns the PathMap for one network, which
-        // contains `(path_string, bid, sort_order)` entries for every node.
-        if let Some(pm) = pathmap.get_map(&net_bref) {
-            // We iterate the full recursive map to include subnets' documents too.
-            let all_paths = pm.recursive_map(None, pathmap, &mut std::collections::BTreeSet::new());
-            for (path, bid, _order) in all_paths {
-                if let Some(node) = states.get(&bid) {
-                    idx.index_node(bid, node, &path, &stemmer);
-                }
-            }
-        }
-
         idx.finalize();
 
-        // Serialize the index.
-        let idx_json = serde_json::to_string(&idx)
+        let idx_json = serde_json::to_string(idx)
             .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
         let idx_bytes = idx_json.len();
 
-        // Warn when a network's search index is suspiciously large — this is a
-        // proxy for a network that has grown too large and should be split.
         if idx_bytes >= LARGE_INDEX_WARN_BYTES {
             let msg = format!(
                 "Network '{}' has a very large search index ({:.1} MB). \
@@ -636,6 +675,33 @@ pub async fn build_search_indices(
         .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
     let manifest_path = search_dir.join("manifest.json");
     tokio::fs::write(&manifest_path, manifest_json).await?;
+
+    // Delete stale index files from previous runs whose network brefs no longer
+    // exist (e.g. from ephemeral time-based BIDs that changed since the last
+    // compile). Without this, the search/ directory accumulates one file per
+    // unique bref ever generated, growing unboundedly.
+    let current_filenames: std::collections::BTreeSet<String> = search_manifest
+        .networks
+        .iter()
+        .map(|n| n.path.clone())
+        .collect();
+    if let Ok(mut read_dir) = tokio::fs::read_dir(&search_dir).await {
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if fname_str.ends_with(".idx.json") && !current_filenames.contains(fname_str.as_ref()) {
+                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                    tracing::warn!(
+                        "[build_search_indices] Failed to remove stale index {}: {}",
+                        fname_str,
+                        e
+                    );
+                } else {
+                    tracing::debug!("[build_search_indices] Removed stale index {}", fname_str);
+                }
+            }
+        }
+    }
 
     let total_size_kb: f64 = search_manifest.networks.iter().map(|n| n.size_kb).sum();
     tracing::info!(
