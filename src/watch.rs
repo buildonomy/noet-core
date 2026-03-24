@@ -264,11 +264,7 @@ use std::{
     fs::{read_to_string, write},
     path::{Path, PathBuf},
     result::Result,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc::Sender,
-        Arc,
-    },
+    sync::{atomic::Ordering, mpsc::Sender, Arc},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -276,6 +272,7 @@ use tokio::{
     sync::{
         broadcast,
         mpsc::{unbounded_channel, UnboundedReceiver},
+        watch,
     },
     task::JoinHandle,
     time::sleep,
@@ -437,60 +434,65 @@ impl WatchService {
         self.db.clone()
     }
 
-    /// Block until the debouncer, compiler, and transaction handler are all idle
-    /// for every active network syncer, or until `timeout` elapses.
+    /// Block until at least one full compile+transaction cycle has completed for every
+    /// active network syncer, or until `timeout` elapses.
     ///
-    /// "Idle" means all three pipeline stages have quiesced simultaneously:
-    /// - The debouncer callback has no paths left to enqueue.
-    /// - Both compiler queues (primary and reparse) are empty.
-    /// - The transaction handler channel is empty and the last commit has completed.
-    ///
-    /// Note: idle detection for the transaction stage has up to ~1 s latency due to
-    /// its current poll-based loop.
-    ///
-    /// Block until a full compile+transaction cycle completes for every active network
-    /// syncer since this method was called, or until `timeout` elapses.
-    ///
-    /// Internally this snapshots the commit generation counter for each syncer and waits
-    /// until the transaction task increments it, which only happens after a successful
-    /// `execute()` call that staged at least one event. This guarantees the caller
-    /// observes results from a parse that began after `wait_for_idle` was invoked.
-    ///
-    /// Note: the transaction task polls on a 1-second loop, so idle detection has up to
-    /// ~1 s of additional latency beyond the compile time itself.
+    /// Uses a `watch::Receiver` which is level-triggered: if the generation has already
+    /// advanced past zero when this is called, it returns immediately without waiting.
+    /// This eliminates the subscribe-before-update race that existed with `AtomicU64 +
+    /// Notify`.
     ///
     /// Returns `Err(BuildonomyError::Timeout)` if the deadline is exceeded.
     pub fn wait_for_idle(&self, timeout: Duration) -> Result<(), BuildonomyError> {
+        self.wait_for_next_idle(timeout, 0)
+    }
+
+    /// Snapshot the current commit generation for all active network syncers.
+    ///
+    /// Call this before triggering work, then pass the result to `wait_for_next_idle`
+    /// to wait for a cycle that began *after* this snapshot was taken.
+    pub fn current_generation(&self) -> u64 {
+        let binding = self.watchers.lock();
+        let watchers = binding.0.lock();
+        watchers
+            .values()
+            .map(|(_debouncer, syncer)| *syncer.commit_generation_rx.borrow())
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Wait until every active network syncer has a commit generation strictly greater
+    /// than `after_gen`, or until `timeout` elapses.
+    ///
+    /// The `watch::Receiver::wait_for` predicate is level-triggered: it checks the
+    /// current value first and returns immediately if already satisfied.
+    ///
+    /// Returns `Err(BuildonomyError::Timeout)` if the deadline is exceeded.
+    pub fn wait_for_next_idle(
+        &self,
+        timeout: Duration,
+        after_gen: u64,
+    ) -> Result<(), BuildonomyError> {
         let deadline = std::time::Instant::now() + timeout;
 
-        // Snapshot generation + clone notifier handles while holding the lock briefly,
-        // then drop the lock before calling block_on.
-        let syncer_handles: Vec<(u64, Arc<AtomicU64>, Arc<tokio::sync::Notify>)> = {
+        // Clone the receiver handles while holding the lock, then release it before
+        // entering block_on.
+        let receivers: Vec<watch::Receiver<u64>> = {
             let binding = self.watchers.lock();
             let watchers = binding.0.lock();
             watchers
                 .values()
-                .map(|(_debouncer, syncer)| {
-                    (
-                        syncer.commit_generation.load(Ordering::SeqCst),
-                        syncer.commit_generation.clone(),
-                        syncer.commit_notify.clone(),
-                    )
-                })
+                .map(|(_debouncer, syncer)| syncer.commit_generation_rx.clone())
                 .collect()
         };
 
-        for (snapshot, generation, notifier) in syncer_handles {
+        for mut rx in receivers {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             self.runtime
                 .block_on(async move {
                     tokio::time::timeout(remaining, async move {
-                        loop {
-                            if generation.load(Ordering::SeqCst) > snapshot {
-                                return;
-                            }
-                            notifier.notified().await;
-                        }
+                        // wait_for is level-triggered: checks current value first.
+                        let _ = rx.wait_for(|&g| g > after_gen).await;
                     })
                     .await
                 })
@@ -748,13 +750,17 @@ pub(crate) struct FileUpdateSyncer {
     pub transaction_handle: JoinHandle<Result<(), BuildonomyError>>,
     pub work_notifier: Arc<tokio::sync::Notify>,
     pub ignored_write_paths: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
-    /// Incremented by the transaction task after each successful commit at true pipeline
-    /// idle (channel empty AND compiler_idle == true). `wait_for_idle` snapshots this
-    /// value and waits until it advances, guaranteeing a full compile+commit cycle has
-    /// completed since the snapshot was taken.
-    pub commit_generation: Arc<AtomicU64>,
-    /// Notified whenever `commit_generation` is incremented.
-    pub commit_notify: Arc<tokio::sync::Notify>,
+    /// Sender half of the commit-generation watch channel. The transaction task calls
+    /// `send` to increment the generation after each true pipeline-idle commit.
+    /// `wait_for_idle` / `wait_for_next_idle` clone the receiver and use `wait_for`,
+    /// which is level-triggered and immune to the subscribe-before-update race.
+    /// Must be retained here to keep the channel open; dropping it would make all
+    /// `wait_for` calls return `Err` immediately.
+    #[allow(dead_code)]
+    pub commit_generation_tx: watch::Sender<u64>,
+    /// Receiver half — cloned by `wait_for_idle` / `wait_for_next_idle` and by
+    /// `current_generation` to read the latest value without blocking.
+    pub commit_generation_rx: watch::Receiver<u64>,
     /// Compiler-idle flag: true when both compiler queues are empty. The debouncer reads
     /// this to decide whether to hold off enqueueing (avoiding false positives from
     /// compiler-written files appearing in the watcher event stream).
@@ -804,11 +810,9 @@ impl FileUpdateSyncer {
         // Set of paths to ignore in debouncer (files we're currently writing)
         let ignored_write_paths = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-        // Generation counter incremented by the transaction task only at true pipeline idle:
-        // channel empty AND compiler_idle == true. wait_for_idle snapshots this and waits
-        // until it advances, guaranteeing a full compile+commit cycle has completed.
-        let commit_generation = Arc::new(AtomicU64::new(0));
-        let commit_notify = Arc::new(tokio::sync::Notify::new());
+        // watch channel for generation tracking. Level-triggered: wait_for checks the
+        // current value before subscribing, so no notification can be lost.
+        let (commit_generation_tx, commit_generation_rx) = watch::channel::<u64>(0);
 
         // Compiler-idle flag used by the debouncer hold-off logic.
         // Starts false (busy) because the network root will be enqueued immediately.
@@ -863,8 +867,7 @@ impl FileUpdateSyncer {
         // transaction task owns accum_rx exclusively — no RwLock wrapper needed.
         let transaction_global_bb = global_bb.clone();
         let transaction_tx = tx.clone();
-        let transaction_commit_generation = commit_generation.clone();
-        let transaction_commit_notify = commit_notify.clone();
+        let transaction_commit_generation = commit_generation_tx.clone();
         let transaction_compiler_idle = compiler_idle.clone();
         let transaction_compiler_idle_notify = compiler_idle_notify.clone();
         let transaction_belief_broadcast = belief_broadcast.clone();
@@ -1092,12 +1095,12 @@ impl FileUpdateSyncer {
                                 if transaction_compiler_idle.load(Ordering::SeqCst)
                                     && accum_rx.is_empty()
                                 {
-                                    transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
-                                    transaction_commit_notify.notify_waiters();
+                                    let next_gen = *transaction_commit_generation.borrow() + 1;
+                                    let _ = transaction_commit_generation.send(next_gen);
                                     tracing::debug!(
                                         "[transaction handler] Channel empty + compiler idle \
                                          after batch: signalled wait_for_idle (generation={})",
-                                        transaction_commit_generation.load(Ordering::SeqCst)
+                                        next_gen
                                     );
                                 }
                             }
@@ -1138,12 +1141,12 @@ impl FileUpdateSyncer {
                             }
                         }
                         // Channel is now empty and compiler is idle: full cycle complete.
-                        transaction_commit_generation.fetch_add(1, Ordering::SeqCst);
-                        transaction_commit_notify.notify_waiters();
+                        let next_gen = *transaction_commit_generation.borrow() + 1;
+                        let _ = transaction_commit_generation.send(next_gen);
                         tracing::debug!(
                             "[transaction handler] Compiler-idle notification processed: \
                              signalled wait_for_idle (generation={})",
-                            transaction_commit_generation.load(Ordering::SeqCst)
+                            next_gen
                         );
                     }
                 }
@@ -1156,8 +1159,8 @@ impl FileUpdateSyncer {
             transaction_handle,
             work_notifier: work_notifier.clone(),
             ignored_write_paths,
-            commit_generation,
-            commit_notify,
+            commit_generation_tx,
+            commit_generation_rx,
             compiler_idle,
             compiler_idle_notify,
             belief_broadcast,

@@ -119,6 +119,11 @@ fn test_stale_file_detection_and_reparse() {
     // Drain initial events
     while rx.try_recv().is_ok() {}
 
+    // Snapshot the generation *before* triggering the file modification. This value is
+    // passed to wait_for_next_idle so it waits for a cycle that started *after* the
+    // modification, not for the cycle that was already completed above.
+    let gen_before_modify = service.current_generation();
+
     // Sleep to ensure the new mtime will be strictly greater than the cached one.
     // This is logically required: filesystem mtime resolution may be coarse (1–2 s on
     // some platforms), so without a pause the re-written file could carry the same mtime
@@ -138,10 +143,12 @@ fn test_stale_file_detection_and_reparse() {
     let future_mtime = FileTime::from_unix_time(current_time.unix_seconds() + 60, 0);
     set_file_mtime(&doc_path, future_mtime).unwrap();
 
-    // Wait for the file watcher to fire, the debounce window to elapse, and the full
-    // compile + transaction cycle to complete.
+    // Wait for a generation strictly greater than the one we snapshotted before the
+    // modification. wait_for_next_idle is level-triggered (watch::Receiver::wait_for),
+    // so it returns immediately if the generation has already advanced — no lost-
+    // notification race possible.
     service
-        .wait_for_idle(Duration::from_secs(30))
+        .wait_for_next_idle(Duration::from_secs(30), gen_before_modify)
         .expect("Pipeline should become idle within timeout after file modification");
 
     // Verify we received events (indicating reparse happened)
