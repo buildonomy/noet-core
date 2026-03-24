@@ -76,6 +76,33 @@ export function setLogLevel(level) {
 // =============================================================================
 
 /**
+ * Read the asset version token embedded by the site generator.
+ *
+ * The token is the FNV-1a hex hash of the serialized beliefbase content,
+ * written into every SPA shell as `<script id="noet-asset-version">`.
+ * Appending it as `?v=<token>` to dynamic imports and data fetches busts
+ * both the HTTP cache and the browser module-specifier cache when the
+ * beliefbase changes between deployments.
+ *
+ * Falls back to the current timestamp (ms) when the tag is absent so that
+ * a locally-served page without the tag still gets fresh assets.
+ *
+ * @returns {string}
+ */
+function readAssetVersion() {
+  const script = document.getElementById("noet-asset-version");
+  if (script) {
+    try {
+      return JSON.parse(script.textContent);
+    } catch (_) {
+      // fall through
+    }
+  }
+  console.warn("[Noet] noet-asset-version tag missing — using timestamp as cache-buster");
+  return String(Date.now());
+}
+
+/**
  * Load and initialize the WASM module, BeliefBase, and navigation tree.
  *
  * Detects sharded vs monolithic format automatically by probing for
@@ -90,8 +117,15 @@ export function setLogLevel(level) {
 export async function initializeWasm() {
   console.log("[Noet] Loading WASM module...");
 
-  // Dynamically import the generated JS/WASM glue module
-  state.wasmModule = await import("/assets/noet_core.js");
+  // Read the asset version token before any fetch so every request in this
+  // function uses the same value.
+  const assetVersion = readAssetVersion();
+  console.log("[Noet] Asset version:", assetVersion);
+
+  // Dynamically import the generated JS/WASM glue module.
+  // The ?v= query parameter makes the URL unique per beliefbase version,
+  // defeating both the HTTP cache and the browser module-specifier cache.
+  state.wasmModule = await import(`/assets/noet_core.js?v=${assetVersion}`);
   await state.wasmModule.default();
   console.log("[Noet] WASM module loaded successfully");
 
@@ -105,7 +139,7 @@ export async function initializeWasm() {
   console.log("[Noet] Entry point BID from script tag:", entryBidString);
 
   // --- Format detection: probe for shard manifest ---
-  const shardManifestResp = await fetch("/beliefbase/manifest.json");
+  const shardManifestResp = await fetch(`/beliefbase/manifest.json?v=${assetVersion}`);
   const isSharded = shardManifestResp.ok;
 
   if (isSharded) {
@@ -121,7 +155,8 @@ export async function initializeWasm() {
     console.log("[Noet] BeliefBaseWasm (sharded) initialized");
 
     // ShardManager loads search indices + global shard + entry network.
-    state.shardManager = new ShardManager(state.beliefbase, manifest);
+    // Pass assetVersion so it can cache-bust all shard and search fetches.
+    state.shardManager = new ShardManager(state.beliefbase, manifest, assetVersion);
     await state.shardManager.init();
 
     // Expose the search index from the shard manager on state for Issue 54.
@@ -134,7 +169,7 @@ export async function initializeWasm() {
     // =========================================================================
     console.log("[Noet] No shard manifest found — loading monolithic beliefbase.json...");
 
-    const response = await fetch("/beliefbase.json");
+    const response = await fetch(`/beliefbase.json?v=${assetVersion}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch beliefbase.json: ${response.status}`);
     }
@@ -147,7 +182,7 @@ export async function initializeWasm() {
     state.shardManager = null;
 
     // Load search indices for full-corpus search (monolithic mode).
-    state.searchIndex = await loadMonolithicSearchIndices();
+    state.searchIndex = await loadMonolithicSearchIndices(assetVersion);
   }
 
   // =========================================================================

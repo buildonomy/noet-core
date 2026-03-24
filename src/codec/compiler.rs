@@ -558,6 +558,15 @@ impl DocumentCompiler {
 
                 let mut dependent_paths = Vec::<(String, Bref)>::new();
 
+                // Track whether any dependency was actually enqueued. Only enqueued
+                // dependencies can be resolved by a future parse, so self-requeue is
+                // only warranted when at least one was queued.  The previous condition
+                // (`!unresolved_refs.is_empty()`) fired for href_namespace externals
+                // (e.g. MDN absolute-path slugs) whose process_unresolved_reference
+                // calls bail out without enqueuing — causing O(n) requeue churn on
+                // every file that references an out-of-corpus slug.
+                let mut any_dependency_enqueued = false;
+
                 for unresolved in &unresolved_refs {
                     let is_asset = unresolved.other_keys.iter().any(|key| {
                         if let NodeKey::Path { net, .. } = key {
@@ -567,20 +576,26 @@ impl DocumentCompiler {
                         }
                     });
                     if is_asset {
-                        self.process_asset_reference(&path, unresolved);
+                        if self.process_asset_reference(&path, unresolved) {
+                            any_dependency_enqueued = true;
+                        }
                     } else {
                         let Some((dep_str, net)) = unresolved.as_unresolved_source() else {
                             continue;
                         };
-                        self.process_unresolved_reference(&path, &dep_str, net);
+                        if self.process_unresolved_reference(&path, &dep_str, net) {
+                            any_dependency_enqueued = true;
+                        }
                         dependent_paths.push((dep_str, net));
                     }
                 }
 
-                // Re-queue self if any references are still unresolved. The remainder
-                // loop's max_reparse_count gate (checked at the top of this function)
-                // prevents infinite cycling.
-                if !unresolved_refs.is_empty() && !self.remainder_queue.contains(&path) {
+                // Re-queue self only when a dependency was actually enqueued. When
+                // that dependency resolves, this file will be re-parsed and the
+                // unresolved reference may clear.  If no dependency was enqueued all
+                // remaining unresolved refs are permanent externals — re-queuing would
+                // loop until max_reparse_count with no possibility of progress.
+                if any_dependency_enqueued && !self.remainder_queue.contains(&path) {
                     self.remainder_queue.push_back(path.clone());
                 }
 
@@ -1058,11 +1073,6 @@ impl DocumentCompiler {
                     self.remainder_queue.push_back(asset_path);
                 }
             }
-        }
-
-        // SPA shell reads session_bb, emits no events — safe outside BatchStart/BatchEnd.
-        if self.html_output_dir().is_some() {
-            self.generate_spa_shell().await?;
         }
 
         // ── Remainder loop (epoch ≥ 1) ───────────────────────────────────────
@@ -1600,6 +1610,17 @@ impl DocumentCompiler {
         self.remainder_queue.retain(|p| p != path);
     }
 
+    /// Compute a short FNV-1a 64-bit hash of a byte slice, returned as a 16-char hex string.
+    /// Used to produce an asset version token that changes whenever beliefbase content changes.
+    fn fnv1a_hex(data: &[u8]) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{:016x}", h)
+    }
+
     /// Finalize HTML generation tasks that require synchronized BeliefBase
     ///
     /// This method handles HTML finalization tasks that need complete event processing:
@@ -1707,18 +1728,28 @@ impl DocumentCompiler {
             )
             .await
         };
-        match export_result {
+        let asset_version = match export_result {
             Ok(crate::shard::ExportMode::Monolithic { size_mb }) => {
                 tracing::debug!(
                     "[finalize_html] Exported monolithic beliefbase.json ({:.2} MB)",
                     size_mb
                 );
+                // Re-read the written file to hash its content.  It was already
+                // serialized above; reading it back avoids holding the full string
+                // in memory across the sharding branch.
+                let json_path = html_dir.join("beliefbase.json");
+                let bytes = tokio::fs::read(&json_path).await.unwrap_or_default();
+                Self::fnv1a_hex(&bytes)
             }
             Ok(crate::shard::ExportMode::Sharded { manifest }) => {
                 tracing::info!(
                     "[finalize_html] Exported {} network shards to beliefbase/",
                     manifest.networks.len()
                 );
+                // Hash the manifest file — it changes whenever any shard content changes.
+                let manifest_path = html_dir.join("beliefbase").join("manifest.json");
+                let bytes = tokio::fs::read(&manifest_path).await.unwrap_or_default();
+                Self::fnv1a_hex(&bytes)
             }
             Err(e) => {
                 // Log and fall back to the legacy exporter so a build failure here
@@ -1728,13 +1759,27 @@ impl DocumentCompiler {
                 );
                 let graph_fallback = global_bb.export_beliefgraph().await?;
                 self.export_beliefbase_json(graph_fallback).await?;
+                // Hash the fallback file.
+                let json_path = html_dir.join("beliefbase.json");
+                let bytes = tokio::fs::read(&json_path).await.unwrap_or_default();
+                Self::fnv1a_hex(&bytes)
             }
-        }
+        };
+
+        // Write the SPA shell now that we have a stable asset_version derived from
+        // the beliefbase content.  This replaces the earlier call that was made from
+        // parse_all before the data files existed.
+        self.generate_spa_shell(&asset_version).await?;
 
         Ok(finalize_diagnostics)
     }
 
-    fn process_asset_reference(&mut self, _path: &PathBuf, unresolved: &UnresolvedReference) {
+    /// Returns `true` if an asset path was actually enqueued for processing.
+    fn process_asset_reference(
+        &mut self,
+        _path: &PathBuf,
+        unresolved: &UnresolvedReference,
+    ) -> bool {
         // Extract asset path from NodeKey
         let asset_path_key = unresolved.other_keys.iter().find_map(|key| {
             if let NodeKey::Path { net, path } = key {
@@ -1770,11 +1815,19 @@ impl DocumentCompiler {
                     asset_absolute_path
                 );
                 self.remainder_queue.push_back(absolute_path);
+                return true;
             }
         }
+        false
     }
 
-    fn process_unresolved_reference(&mut self, path: &Path, net_dep_path_str: &str, net_ref: Bref) {
+    /// Returns `true` if a dependency path was actually enqueued for processing.
+    fn process_unresolved_reference(
+        &mut self,
+        path: &Path,
+        net_dep_path_str: &str,
+        net_ref: Bref,
+    ) -> bool {
         // Use session_bb rather than doc_bb here. doc_bb is cleared and rebuilt for each
         // document in initialize_stack, so for plain .md files it only contains that file's
         // local nodes — the root network node (and its pathmap entry) is absent.
@@ -1814,7 +1867,7 @@ impl DocumentCompiler {
                 net_dep_path_str,
                 path,
             );
-            return;
+            return false;
         };
         let full_dep_path = if let Some((_home_net, net_path, _order)) =
             repo_pathmap.path(&net, &self.builder().session_bb().paths())
@@ -1838,7 +1891,7 @@ impl DocumentCompiler {
                     "[Compiler] Skipping absolute-slug dependency {:?} (external URL slug, not a repo path)",
                     dep_path
                 );
-                return;
+                return false;
             }
 
             // Resolve relative to builder's repo_root
@@ -1848,7 +1901,7 @@ impl DocumentCompiler {
                 "No connectivity between builder.repo and dependent path network {}",
                 net
             );
-            return;
+            return false;
         };
 
         // Canonicalize if it exists, then normalise to strip any \\?\ prefix (Windows).
@@ -1859,7 +1912,7 @@ impl DocumentCompiler {
                     "[Compiler] Cannot canonicalize {:?}, treating as external",
                     full_dep_path
                 );
-                return; // Skip external/non-existent dependencies
+                return false; // Skip external/non-existent dependencies
             }
         };
 
@@ -1874,7 +1927,7 @@ impl DocumentCompiler {
                 path,
                 self.builder.repo_root(),
             );
-            return;
+            return false;
         }
 
         // Enqueue the dependency if it has not yet been processed (count == 0 means
@@ -1910,7 +1963,9 @@ impl DocumentCompiler {
                 );
             }
             self.remainder_queue.push_back(canonical_dep_path.clone());
+            return true;
         }
+        false
     }
     /// Check if there are pending items to parse.
     pub fn has_pending(&self) -> bool {
@@ -2089,8 +2144,14 @@ impl DocumentCompiler {
         Ok(())
     }
 
-    /// Generate SPA shell (index.html) at HTML output root using Responsive template
-    async fn generate_spa_shell(&self) -> Result<(), BuildonomyError> {
+    /// Generate SPA shell (index.html) at HTML output root using Responsive template.
+    ///
+    /// `asset_version` is a short hex string derived from the serialized beliefbase
+    /// content.  It is embedded in the page as `<script id="noet-asset-version">` and
+    /// appended as a `?v=` query parameter by the viewer to all dynamic imports and
+    /// data fetches, busting both the HTTP cache and the browser module-specifier cache
+    /// when beliefbase content changes between deployments.
+    async fn generate_spa_shell(&self, asset_version: &str) -> Result<(), BuildonomyError> {
         let html_output_dir = match &self.html_output_dir {
             Some(dir) => dir.clone(),
             None => return Ok(()), // No HTML output configured
@@ -2132,6 +2193,7 @@ impl DocumentCompiler {
             )
             .replace("{{TITLE}}", &title)
             .replace("{{BID}}", &bid)
+            .replace("{{ASSET_VERSION}}", asset_version)
             .replace("{{SCRIPT}}", &script_tag)
             .replace("{{STYLESHEET_OPEN_PROPS}}", &stylesheet_urls.open_props)
             .replace("{{STYLESHEET_NORMALIZE}}", &stylesheet_urls.normalize)

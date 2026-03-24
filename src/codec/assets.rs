@@ -369,6 +369,7 @@ mod tests {
         assert!(template.contains("{{CONTENT}}"));
         assert!(template.contains("{{TITLE}}"));
         assert!(template.contains("{{BID}}"));
+        assert!(template.contains("{{ASSET_VERSION}}"));
         assert!(template.contains("noet-container"));
         assert!(template.contains("noet-nav"));
         assert!(template.contains("noet-metadata"));
@@ -426,6 +427,10 @@ mod tests {
         assert!(
             responsive.contains("{{BID}}"),
             "Missing BID placeholder in responsive"
+        );
+        assert!(
+            responsive.contains("{{ASSET_VERSION}}"),
+            "Missing ASSET_VERSION placeholder in responsive"
         );
     }
 }

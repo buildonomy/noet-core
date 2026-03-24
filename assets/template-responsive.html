@@ -52,6 +52,14 @@
         <script type="application/json" id="noet-entry-bid">
             "{{BID}}"
         </script>
+
+        <!-- Asset version token (FNV-1a hex of beliefbase content).
+             Appended as ?v= to all dynamic imports and data fetches to bust
+             both the HTTP cache and the browser module-specifier cache when
+             beliefbase content changes between deployments. -->
+        <script type="application/json" id="noet-asset-version">
+            "{{ASSET_VERSION}}"
+        </script>
         {{SCRIPT}}
     </head>
     <body>

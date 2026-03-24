@@ -70,12 +70,19 @@ export class ShardManager {
    * @param {ShardManifest} manifest
    *   Parsed contents of `beliefbase/manifest.json`.
    */
-  constructor(beliefbase, manifest) {
+  constructor(beliefbase, manifest, assetVersion = "") {
     /** @type {import('./wasm.js').BeliefBaseWasm} */
     this.beliefbase = beliefbase;
 
     /** @type {ShardManifest} */
     this.manifest = manifest;
+
+    /**
+     * Asset version token — appended as `?v=` to all fetch URLs to bust the
+     * HTTP cache and browser module-specifier cache between deployments.
+     * @type {string}
+     */
+    this._assetVersion = assetVersion;
 
     /**
      * Per-network search indices, keyed by bref string.
@@ -132,9 +139,7 @@ export class ShardManager {
     // Step 3: Load the entry-point network shard.
     const entryPoint = this.beliefbase.entryPoint();
     const entryBref = entryPoint.bref;
-    const entryNetworkMeta = this.manifest.networks.find(
-      (n) => n.bref === entryBref,
-    );
+    const entryNetworkMeta = this.manifest.networks.find((n) => n.bref === entryBref);
 
     if (!entryNetworkMeta) {
       // Entry point may be a top-level API node not in any network shard —
@@ -170,7 +175,7 @@ export class ShardManager {
 
     let searchManifest;
     try {
-      const resp = await fetch(`${SEARCH_DIR}/manifest.json`);
+      const resp = await fetch(`${SEARCH_DIR}/manifest.json?v=${this._assetVersion}`);
       if (!resp.ok) {
         console.warn(
           `[ShardManager] search/manifest.json not found (${resp.status}). ` +
@@ -185,14 +190,12 @@ export class ShardManager {
     }
 
     const networks = searchManifest.networks ?? [];
-    console.log(
-      `[ShardManager] Fetching ${networks.length} search index file(s)...`,
-    );
+    console.log(`[ShardManager] Fetching ${networks.length} search index file(s)...`);
 
     // Fetch all indices in parallel.
     const fetches = networks.map(async (meta) => {
       try {
-        const resp = await fetch(`${SEARCH_DIR}/${meta.path}`);
+        const resp = await fetch(`${SEARCH_DIR}/${meta.path}?v=${this._assetVersion}`);
         if (!resp.ok) {
           console.warn(
             `[ShardManager] Failed to fetch search index '${meta.path}': ${resp.status}`,
@@ -202,9 +205,7 @@ export class ShardManager {
         const index = await resp.json();
         this.searchIndex.set(meta.bref, index);
       } catch (err) {
-        console.warn(
-          `[ShardManager] Error loading search index for '${meta.bref}': ${err}`,
-        );
+        console.warn(`[ShardManager] Error loading search index for '${meta.bref}': ${err}`);
       }
     });
 
@@ -230,18 +231,14 @@ export class ShardManager {
    */
   async _loadGlobalShard() {
     console.log("[ShardManager] Loading global shard...");
-    const resp = await fetch(`${BELIEFBASE_DIR}/global.json`);
+    const resp = await fetch(`${BELIEFBASE_DIR}/global.json?v=${this._assetVersion}`);
     if (!resp.ok) {
-      throw new Error(
-        `[ShardManager] Failed to fetch global shard: ${resp.status}`,
-      );
+      throw new Error(`[ShardManager] Failed to fetch global shard: ${resp.status}`);
     }
     const json = await resp.text();
     const nodeCount = this.beliefbase.load_shard("global", json);
     this._globalLoaded = true;
-    console.log(
-      `[ShardManager] Global shard loaded. BeliefBase node count: ${nodeCount}`,
-    );
+    console.log(`[ShardManager] Global shard loaded. BeliefBase node count: ${nodeCount}`);
   }
 
   /**
@@ -260,9 +257,7 @@ export class ShardManager {
   async loadNetwork(bref) {
     const meta = this.manifest.networks.find((n) => n.bref === bref);
     if (!meta) {
-      throw new Error(
-        `[ShardManager] loadNetwork: bref '${bref}' not in manifest`,
-      );
+      throw new Error(`[ShardManager] loadNetwork: bref '${bref}' not in manifest`);
     }
 
     // Budget check (skip if already loaded — reload is always safe).
@@ -276,19 +271,15 @@ export class ShardManager {
     }
 
     console.log(`[ShardManager] Loading network shard '${bref}'...`);
-    const resp = await fetch(`${BELIEFBASE_DIR}/networks/${bref}.json`);
+    const resp = await fetch(`${BELIEFBASE_DIR}/networks/${bref}.json?v=${this._assetVersion}`);
     if (!resp.ok) {
-      throw new Error(
-        `[ShardManager] Failed to fetch network shard '${bref}': ${resp.status}`,
-      );
+      throw new Error(`[ShardManager] Failed to fetch network shard '${bref}': ${resp.status}`);
     }
     const json = await resp.text();
     const nodeCount = this.beliefbase.load_shard(bref, json);
     this._loadedNetworks.add(bref);
     this._notifyListeners({ type: "loaded", bref, nodeCount });
-    console.log(
-      `[ShardManager] Network '${bref}' loaded. Total nodes: ${nodeCount}`,
-    );
+    console.log(`[ShardManager] Network '${bref}' loaded. Total nodes: ${nodeCount}`);
     return nodeCount;
   }
 
@@ -303,9 +294,7 @@ export class ShardManager {
    */
   async unloadNetwork(bref) {
     if (!this._loadedNetworks.has(bref)) {
-      console.warn(
-        `[ShardManager] unloadNetwork: '${bref}' is not currently loaded — ignoring`,
-      );
+      console.warn(`[ShardManager] unloadNetwork: '${bref}' is not currently loaded — ignoring`);
       return this.beliefbase.node_count();
     }
 
@@ -313,9 +302,7 @@ export class ShardManager {
     const nodeCount = this.beliefbase.unload_shard(bref);
     this._loadedNetworks.delete(bref);
     this._notifyListeners({ type: "unloaded", bref, nodeCount });
-    console.log(
-      `[ShardManager] Network '${bref}' unloaded. Remaining nodes: ${nodeCount}`,
-    );
+    console.log(`[ShardManager] Network '${bref}' unloaded. Remaining nodes: ${nodeCount}`);
     return nodeCount;
   }
 
@@ -448,16 +435,14 @@ export class ShardManager {
  *
  * @returns {Promise<Map<string, NetworkSearchIndex>>}
  */
-export async function loadMonolithicSearchIndices() {
+export async function loadMonolithicSearchIndices(assetVersion = "") {
   const searchIndex = new Map();
 
   let manifest;
   try {
-    const resp = await fetch(`${SEARCH_DIR}/manifest.json`);
+    const resp = await fetch(`${SEARCH_DIR}/manifest.json?v=${assetVersion}`);
     if (!resp.ok) {
-      console.warn(
-        `[Noet] search/manifest.json not found (${resp.status}). Search unavailable.`,
-      );
+      console.warn(`[Noet] search/manifest.json not found (${resp.status}). Search unavailable.`);
       return searchIndex;
     }
     manifest = await resp.json();
@@ -469,7 +454,7 @@ export async function loadMonolithicSearchIndices() {
   const networks = manifest.networks ?? [];
   const fetches = networks.map(async (meta) => {
     try {
-      const resp = await fetch(`${SEARCH_DIR}/${meta.path}`);
+      const resp = await fetch(`${SEARCH_DIR}/${meta.path}?v=${assetVersion}`);
       if (!resp.ok) {
         console.warn(`[Noet] Could not fetch '${meta.path}': ${resp.status}`);
         return;
@@ -482,9 +467,7 @@ export async function loadMonolithicSearchIndices() {
   });
 
   await Promise.all(fetches);
-  console.log(
-    `[Noet] Monolithic search indices loaded: ${searchIndex.size} / ${networks.length}`,
-  );
+  console.log(`[Noet] Monolithic search indices loaded: ${searchIndex.size} / ${networks.length}`);
   return searchIndex;
 }
 
