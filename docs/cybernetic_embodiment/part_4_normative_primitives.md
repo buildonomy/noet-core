@@ -48,8 +48,9 @@ A corollary to the commitment to the will staying home is that death is a sovere
 A note on FEP vocabulary. We use POMDP convention: **observations** `o` for
 sensory inputs, **states** `s` for the policy's hidden variables (latent causes).
 **State preferences** are a prior over `s`, hence generalized free energy is the
-local planning functional (Section 6.3). The **likelihood** `p(o∣s)` predicts observations
-from states. We deliberately do *not* make actions a declared primitive (Section 2.5).
+local planning functional (Section 6.3). The likelihood `p(o∣s)` is local rigging
+--- domain-specific structural content that stays private (Section 2.4). We
+deliberately do *not* make actions or `p(o∣s)` declared primitives.
 
 ---
 
@@ -91,26 +92,55 @@ Note: We are defining model-optimality here loosely. The good-regulator theorem 
 
 ## 2. The policy: an atom of a generative model
 
-A policy declares four schemas. Two are **referent vocabularies**: what the loop can sense (`o`, Section 2.1) and
-the latent causes it tracks (`s`, Section 2.2). The other two are **total logic over
-those referents**: how it ranks states (`C`, Section 2.3) and how it predicts
-observations (`p(o∣s)`, Section 2.4). That logic is deliberately **sub-Turing** --- a
+A policy declares three schemas. Two are **referent vocabularies**: what the loop
+can sense (`o`, Section 2.1) and the latent causes it tracks (`s`, Section 2.2).
+The third is **total logic over those referents**: how it ranks states (`C`,
+Section 2.3). That logic is deliberately **sub-Turing** --- a
 strongly-normalizing (guaranteed-terminating) expression language --- chosen so the
-four things the protocol must compute about a policy all stay tractable:
+three things the protocol must compute about a policy all stay tractable:
 evaluating a peer's policy always **halts**, and policy **equivalence**,
 ordering-**totality**, and **diff-is-a-no-op** stay *decidable* (Section 3, Section 4).
 Expressiveness is bounded by analyzability, not the reverse; the specific formalism
 (Datalog-with-aggregation, a total scoring DSL) is what our first experiment fixes.
 
+The predictive model `p(o∣s)` --- how observations are expected to follow from
+states --- is **not** a declared policy primitive. It is domain-specific structural
+content (`S` in the N/S/P/R sense): the thermal equations, numerical integrators,
+or coordination dynamics that a particular host uses to evolve state. Publishing it
+would require receivers to understand the sender's domain-specific implementation,
+violating the policy surface's purpose as a coordination interface readable without
+inspecting the model's internals. Surprise does not require prediction: `C`
+evaluated directly against `o` detects constraint violations and optimization
+gradient reversals without a predictive model (Section 2.3). How a loop predicts
+future observations is local rigging, like actions (Section 2.4).
+
 ### 2.1. Observation schema (`o`)
 
-The referents for what the loop can sense: its input alphabet.
+The referents for what the loop can sense: its input alphabet. The schema need
+not be self-contained. It may declare **ontology dependencies** --- opaque pointers
+to external vocabularies (schemas, catalogs, classification outputs, interface
+definitions) that define what the observation terms mean. A loop that observes
+"cabin pressure" need not define pressure; it points at the referent source that
+does. Resolution is lazy and one level deep: the dependency tells you where to
+look, not what you will find. Shared observation vocabulary between loops emerges
+from co-dependency on the same external referent (Section 6.5), not from a
+imposed universal schema.
 
 ### 2.2. State schema (`s`)
 
 The referents for the loop's hidden variables --- the latent causes it tracks.
 These are the distinctions the policy treats as real and salient: the few axes of
 the world it resolves into. This is the organ's frame --- what it attends to.
+
+Like `o`, the state schema declares its referents through ontology dependencies.
+A safety analysis that classifies system functions by criticality is authoring an
+ontology that downstream policies reference --- it
+mints new state variables that constraints in `C` can then bind to. The analysis
+itself is not a policy; it is a **dependency** that policies consume. When the
+ontology changes (a function is reclassified, a new failure mode is identified),
+every policy whose `s` depends on it receives a staleness signal: its referents
+may have shifted. This is orientation coupling --- it changes what is *sayable*
+over `s`, not what is *preferred* within it.
 
 ### 2.3. State preferences (`C` over `s`)
 
@@ -119,6 +149,27 @@ but an ordering, so the policy is richly falsifiable: a loop can be surprised by
 violated *ranking*, not only a failed top choice. This is the organ's values made
 legible. Formally it is a prior over hidden states, which is why local planning
 uses generalized free energy (Section 6.3).
+
+`C` has two modes that compose into a single partial order over available
+intentions:
+
+- **Constraints** impose hard boundaries on the feasible region of `s`. A
+  constraint is a `C` component where every state satisfying it dominates every
+  state violating it, regardless of other preferences. Constraint surprise is
+  **acute**: the boundary was crossed, the observation `o` fell outside the
+  declared region, and the signal propagates with high conductance.
+
+- **Optimization signals** order the feasible region --- the gradient that selects
+  among non-dominated states. Optimization surprise is **chronic**: the gradient
+  is travelling the wrong direction, or the proxy that operationalizes the
+  gradient has decoupled from the real objective it was meant to track.
+
+Both are `C` and both compose into the same ordering. The distinction matters for
+surprise propagation: constraint violation is a boundary event (acute, high
+conductance); optimization divergence is a trajectory event (chronic, lower
+conductance, susceptible to proxy drift). Surprise in both cases is `C` evaluated
+against `o` --- no predictive model is needed to detect a boundary crossing or a
+gradient reversal.
 
 `C` is declared **intensionally** --- as a scoring/selection expression over `s`
 (logic), not an enumerated ranking --- so the ordering is the expression's evaluated
@@ -131,6 +182,19 @@ over a permutation. The receiver
 recovers what the change *does* by evaluating that logic over its own state space,
 which is how magnitude stays local (Section 3.2).
 
+**Open tension: `C` as logic over opaque `s`.** The intensional declaration assumes
+`s` is available as a computable vocabulary, but `s` is defined through ontology
+dependencies (Section 2.2) --- opaque pointers, not inline schemas. How scoring
+logic composes with externally-defined referents is an open design question. In
+practice, `C` may reference `s` terms by name (the dependency providing
+type/domain information), or `C` itself may be a compiled representation
+extracted from natural-language artifacts (requirements, trade studies) rather
+than a directly-authored expression. The constraint/optimization typing
+(Section 2.3 above) is the minimal compiled `C` --- ordinal classification of
+preference mode --- that does not require resolving `s` into a formal schema.
+Whether a richer compiled `C` is needed, and what form it takes, is an empirical
+question gated behind the first proof of concept.
+
 The declared `C` --- and the policy as a whole --- is the sovereign's **optimal published
 pointer** at its own principles: optimal in the good-regulator sense (Section 1, the cheapest
 sufficient representation for coordination), and therefore *lossy by construction*. It
@@ -139,26 +203,19 @@ finger, not the moon. "Declared / made legible" here and "sovereign and local" i
 name the two ends of that pointer: the moon stays home; the finger is what gets
 published and diffed.
 
-### 2.4. Likelihood / predictive model (`p(o∣s)`)
+### 2.4. What is *not* declared
 
-How observations are expected to follow from states. This component **closes the
-loop**: combined with the loop's inferred states it yields a predicted next
-observation `ô`, which is what makes the redline (Section 3) computable. A policy without
-a predictive model is inert --- it can prefer but cannot be surprised. Like `C`, it
-is declared as logic --- a generative expression mapping `s` to expected `o` --- so it
-too is diffable and mergeable as an expression, not as opaque parameters.
+#### 2.4.1. Actions and predictive models
 
-### 2.5. What is *not* declared
+Conspicuously absent: actions, transition dynamics `p(s'∣s,u)`, the predictive
+model `p(o∣s)`, and the machinery of movement. These are **local rigging**, not
+part of the shared interface. An action is how a particular host realizes a
+preferred state; `p(o∣s)` is domain-specific structural content --- the physics,
+equations, or coordination dynamics a particular host uses to evolve and predict
+state. Both vary per host and stay private. The principle: **you share what you
+prefer and how you read the world, never how you act or how you predict.**
 
-#### 2.5.1. actions
-
-Conspicuously absent: actions, transition dynamics `p(s'∣s,u)`, and the machinery
-of movement. These are **local rigging**, not part of the shared interface. An
-action is how a particular host realizes a preferred state; it varies per host and
-stays private. The principle: **you share what you prefer and how you read the
-world, never how you act.**
-
-#### 2.5.2. Precision
+#### 2.4.2. Precision
 
 What the message omits is as load-bearing as what it carries. A policy diff does include the ordering function `C` --- and in one sense `C` is a gain: it encodes what the sender values. But it crosses as **dashboard content**, raw material for the receiver's model of the sender's normativity, not as an instruction applied to the receiver's own `C`. There is still **no precision field** --- no weight saying *how much this should move you* --- and the reason is structural rather than merely normative. Precision weights *surprise* (VFE, the divergence between predicted and actual observations). What crosses the wire is a *policy amendment*: the sender's folded response to its own surprise, not the surprise itself. The transmitter's precision has no grip on this payload; the payload is not the kind of thing precision can weight. The sovereignty point follows as a consequence: if such a field were added, it would attach to the receiver's update magnitude --- a piece of its will --- relocating it into the sender, the move that turns an organ into a subordinate layer. Precision is never transmitted as an *applicable weight* --- no field on the wire sets how far the receiver moves. But it is not secret either; it **leaks two ways**, both inferential rather than transmitted:
 
@@ -171,9 +228,14 @@ What stays strictly local is the **applied** precision: how far the *receiver* m
 
 ## 3. The redline is a learned lesson
 
-A loop's raw surprise is its variational free energy (VFE) --- a scalar. What *drives* its minimization is the precision-weighted prediction error, the mismatch between the observation it got and the one its policy predicted: `ε_Π = Π·(o_{t+1} − ô_{t+1∣t})`. (VFE is the quantity; `ε_Π` is the gradient that discharges it --- not the same object.) Internally that error is consumed the standard active-inference way: it updates beliefs about states (perception) and drives
-action that discharges the error (movement). What the protocol *distributes* to
-connected loops is not the raw observation error.
+A loop's raw surprise is its variational free energy (VFE) --- a scalar discharged
+by the mismatch between what the loop's `C` preferred and what `o` delivered.
+Internally that surprise is consumed in the standard active-inference way: it
+updates beliefs about states (perception) and drives action that discharges it
+(movement). The predictive machinery a loop uses to anticipate `o` --- its
+`p(o∣s)` --- is local rigging (Section 2.4); VFE is the quantity that matters, not the
+specific gradient form that discharges it. What the protocol *distributes* to
+connected loops is not the raw surprise.
 
 ### 3.1. The redline is a second-order computation
 
@@ -234,7 +296,7 @@ The redline names versions; it does not carry them. Two read operations back it 
 the content-addressed analogue of an HTTP conditional GET:
 
 - `fetch(referent) → policy` resolves an *immutable* version `{bid, policy_hash}`
-  (Section 4) to the four declared schemas it names.
+  (Section 4) to the three declared schemas it names.
 - `resolve(bid) → policy_hash` returns a lineage's current head --- the mutable-name
   lookup. (Section 5.1 extends this to a lifecycle state --- a live head, a
   fork, or a tombstone.) `resolve` then yields the lineage's **lifecycle state** (Section 5): *alive* (a
@@ -277,9 +339,10 @@ questions pulling opposite ways:
   rewritten under a fixed name.
 
 Resolution: `referent = { bid, policy_hash }`, where `policy_hash` is a content
-hash over the four declared schemas (Section 2). It does *not* cover the local rigging
-(Section 2.5), so swapping how a host realizes an action leaves redlines about the policy
-valid; changing what the policy *prefers* or *predicts* mints a new hash and
+hash over the three declared schemas (Section 2). It does *not* cover the local rigging
+(Section 2.4), so swapping how a host realizes an action or how it predicts observations
+leaves redlines about the policy valid; changing what the policy *prefers* mints a new
+hash and
 surfaces as version skew. A redline diff (Section 3.2) is two policy hash values over one
 `bid` --- `from_hash` (the base) and `to_hash` (the amendment) --- so the version
 identity travels even when the materialized `delta` does not, and either end can
@@ -514,10 +577,10 @@ about that affordance, not about phenomenology.
 Call what the protocol puts within reach the **model** --- a dashboard into another loop’s normativity, built from its redlines. The contract that matters here is that the dashboard is *neutral*: whether it elicits care, indifference, or animosity depends on a **local preference** --- the sign and magnitude of the weight on the other’s referents in the receiver’s own `C` --- that the protocol neither carries nor sets (Section 6.3). Why that sign, and not the model, is the seat of normative surprise --- and why the same dashboard serves the lover and the con artist --- is argued in Part II, "The cost is a sign."
 
 Give a loop a **redline channel into its own observation schema** --- let other
-loops' redlines be among the things it senses. The four primitives of Section 2 then
+loops' redlines be among the things it senses. The three primitives of Section 2 then
 apply *recursively*: the loop has observation referents that include others'
-redlines, state referents that include others' normativity, a preference, and a
-likelihood that **predicts other loops' redlines**.
+redlines, state referents that include others' normativity, and a preference `C`
+that ranks states of the world that includes those redlines.
 
 > What a sufficiently capable loop detects is the VFE *it* computes on that
 > channel: the precision-weighted difference between another loop's *actual*
@@ -550,7 +613,7 @@ Two further consequences fall out rather than being posited:
 
 ### 6.2. Computational Cost
 
-The four primitives (`o`, `s`, `C`, `p(o∣s)`) are a *design choice* --- a richly structured instantiation of the minimum-ante layer, adding explicit publishing, diffing, and liveness probing. But the layer they sit on is defined by a more fundamental epistemic threshold: **homeostasis**. A loop crosses the lower threshold when it maintains a stable preferred state --- an attractor it returns to after perturbation --- regardless of whether it implements the formal primitives. That is what gives it something to defend and something that can be wounded. Normative surprise only raises the floor further: to be normatively surprised by another loop you must *model* its normativity in your own state space --- simulate it, not import it. Keeping the construction yours enables you to keep deliberately incomplete, and also avoid external capture through injection of false policies. So there are two thresholds: a lower **homeostatic** one --- a loop acquires a preferred state worth defending --- and a higher **representational** one --- a loop can model another loop’s preferred state. Beneath the higher threshold a loop can be *normatively predicted* but cannot itself be normatively surprised. Between the two thresholds, loops coordinate through field and substrate signals, defending setpoints without modeling who else is defending theirs; the formal protocol’s total logic is the structured design choice that operates at this layer. Above the higher threshold, the same machinery coordinates across Markov blankets, only the referents changing. A real body is therefore three-layered --- normative prediction between the loops large enough to model one another, homeostatic coordination in the middle, and reactive gradient-following at the base. See Part III, *Scale* for further exposition.
+The three primitives (`o`, `s`, `C`) are a *design choice* --- a richly structured instantiation of the minimum-ante layer, adding explicit publishing, diffing, and liveness probing. But the layer they sit on is defined by a more fundamental epistemic threshold: **homeostasis**. A loop crosses the lower threshold when it maintains a stable preferred state --- an attractor it returns to after perturbation --- regardless of whether it implements the formal primitives. That is what gives it something to defend and something that can be wounded. Normative surprise only raises the floor further: to be normatively surprised by another loop you must *model* its normativity in your own state space --- simulate it, not import it. Keeping the construction yours enables you to keep deliberately incomplete, and also avoid external capture through injection of false policies. So there are two thresholds: a lower **homeostatic** one --- a loop acquires a preferred state worth defending --- and a higher **representational** one --- a loop can model another loop’s preferred state. Beneath the higher threshold a loop can be *normatively predicted* but cannot itself be normatively surprised. Between the two thresholds, loops coordinate through field and substrate signals, defending setpoints without modeling who else is defending theirs; the formal protocol’s total logic is the structured design choice that operates at this layer. Above the higher threshold, the same machinery coordinates across Markov blankets, only the referents changing. A real body is therefore three-layered --- normative prediction between the loops large enough to model one another, homeostatic coordination in the middle, and reactive gradient-following at the base. See Part III, *Scale* for further exposition.
 
 ---
 

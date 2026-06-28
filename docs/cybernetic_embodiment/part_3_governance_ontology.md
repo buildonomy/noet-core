@@ -179,6 +179,25 @@ axis opens contextually as a marginal computation.
   `C` in the opposite direction
 - **Wound**: `C` violation → free energy spike, centralized in that sovereign’s experience
 
+> **Connection to Bayesian mechanics and the model ontology.** The four cells
+> correspond to Friston's "particular kinds" (Friston et al., 2023) — classes of
+> systems classified by their Markov blanket structure. Chaos (A) has no stable
+> blanket — the system is undifferentiated from its environment. Mechanism (C) has
+> a rigid blanket — a fixed boundary with deterministic response, no normative
+> adaptation. Egregore (B) has a collective blanket — the boundary is maintained
+> by a group, not an individual. Sovereign (D) has a self-maintaining blanket —
+> the system actively adapts its own boundary through iterated projection.
+>
+> In the engineering model ontology ([wp-model-ontology]), this maps to model
+> lifecycle: pre-registration content (no blanket = Chaos), frozen models with
+> externalized N/S/P but no active convergence (Mechanism), team-owned models
+> whose boundary is maintained by organizational practice (Egregore), and
+> owner-maintained models with active predict-evaluate-update cycles (Sovereign).
+> The registration event (§5.3 of [wp-model-ontology]) is the transition from
+> Chaos to one of the other cells — the formation of the Markov blanket. Which
+> cell the model enters depends on the blanket type: rigid process, collective
+> practice, or adaptive ownership.
+
 ### Five moves from the old to the new
 
 1. **“Forces / sovereigns” → dynamic × normative.** No hard ontological threshold --- a
