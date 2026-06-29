@@ -105,7 +105,7 @@ Expressiveness is bounded by analyzability, not the reverse; the specific formal
 
 The predictive model `p(o∣s)` --- how observations are expected to follow from
 states --- is **not** a declared policy primitive. It is domain-specific structural
-content (`S` in the N/S/P/R sense): the thermal equations, numerical integrators,
+content: the thermal equations, numerical integrators,
 or coordination dynamics that a particular host uses to evolve state. Publishing it
 would require receivers to understand the sender's domain-specific implementation,
 violating the policy surface's purpose as a coordination interface readable without
