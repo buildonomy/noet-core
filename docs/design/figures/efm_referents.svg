@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 550" font-family="system-ui, sans-serif">
+  <rect width="800" height="550" fill="#fafafa"/>
+
+  <defs>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9z" fill="#2d7d2d"/>
+    </marker>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9z" fill="#c44"/>
+    </marker>
+    <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9z" fill="#4455aa"/>
+    </marker>
+    <marker id="ad" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9z" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="400" y="22" text-anchor="middle" font-size="16" font-weight="bold"
+        fill="#222">Environment, Factory, and Model</text>
+  <text x="400" y="40" text-anchor="middle" font-size="10.5" fill="#555"
+        font-style="italic">Three referents with N/S/P surfaces. Explore/exploit are intentional subsets of the full E-F interaction.</text>
+
+  <!-- E — Environment (outermost) -->
+  <rect x="20" y="48" width="760" height="435" rx="14"
+        fill="#f5f5f5" stroke="#ccc" stroke-width="1.5"/>
+  <text x="40" y="72" font-size="14" font-weight="bold" fill="#555">E — Environment</text>
+  <text x="40" y="89" font-size="9.5" fill="#888">No explicit N. Contains everything. Source of all surprise.</text>
+
+  <!-- F — Factory (middle layer) -->
+  <rect x="80" y="120" width="640" height="340" rx="10"
+        fill="#e8ecf4" stroke="#4455aa" stroke-width="1.5"/>
+  <text x="100" y="142" font-size="13" font-weight="bold" fill="#4455aa">F — Factory</text>
+  <text x="100" y="160" font-size="10.5" fill="#444">
+    <tspan>N</tspan><tspan font-size="7.5" baseline-shift="sub">F</tspan>
+    <tspan> = model portfolio</tspan>
+    <tspan dx="16">S</tspan><tspan font-size="7.5" baseline-shift="sub">F</tspan>
+    <tspan> = capital</tspan>
+    <tspan dx="16">P</tspan><tspan font-size="7.5" baseline-shift="sub">F</tspan>
+    <tspan> = labor</tspan>
+  </text>
+  <text x="100" y="177" font-size="9.5" fill="#666" font-style="italic">
+    QMS = coupling specification between N_F, S_F, P_F
+  </text>
+
+  <!-- RWS Models (left zone inside F) -->
+  <rect x="100" y="200" width="255" height="240" rx="8"
+        fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1.5"/>
+  <text x="120" y="280" font-size="13" font-weight="bold" fill="#2d7d2d">RWS Models</text>
+  <text x="120" y="300" font-size="11" fill="#333">Maps of E</text>
+  <text x="120" y="320" font-size="10" fill="#555">Ingests E signals</text>
+  <text x="120" y="335" font-size="10" fill="#555">Exploit redirected inward</text>
+  <text x="120" y="350" font-size="10" fill="#555">(serves as surrogate for M_internal)</text>
+
+  <!-- Internal Models (right zone inside F) -->
+  <rect x="405" y="200" width="295" height="240" rx="8"
+        fill="#f4ece8" stroke="#7d4d2d" stroke-width="1.5"/>
+  <text x="425" y="280" font-size="13" font-weight="bold" fill="#7d4d2d">Internal Models</text>
+  <text x="425" y="300" font-size="11" fill="#333">Products acting on E</text>
+  <text x="425" y="320" font-size="10" fill="#555">Validated via RWS surrogates</text>
+  <text x="425" y="335" font-size="10" fill="#555">Operational effects flow to E</text>
+
+  <!-- ═══ ARROWS ═══ -->
+
+  <!-- 1. F(E)→F': environment → factory -->
+  <!-- Arrow from E border, splits to both model zones -->
+  <!-- Main arrow E → RWS -->
+  <line x1="25" y1="280" x2="97" y2="280"
+        stroke="#2d7d2d" stroke-width="2.5" marker-end="url(#ag)"/>
+  <!-- Branch arrow E → Internal (angled from entry point) -->
+  <path d="M 60,280 L 60,395 L 402,395"
+        fill="none" stroke="#2d7d2d" stroke-width="1.5" marker-end="url(#ag)"/>
+  <!-- Label block to the left -->
+  <text x="28" y="255" font-size="9.5" fill="#2d7d2d" font-weight="bold">F(E)→F'</text>
+  <text x="28" y="268" font-size="8.5" fill="#2d7d2d">adaptation</text>
+  <text x="28" y="310" font-size="8" fill="#888" font-style="italic">explore</text>
+  <text x="28" y="321" font-size="8" fill="#888" font-style="italic">= intentional</text>
+  <text x="28" y="332" font-size="8" fill="#888" font-style="italic">subset</text>
+
+  <!-- 2. E(F)→E': factory → environment (through Internal zone) -->
+  <!-- Arrow from Internal zone out to E border -->
+  <line x1="702" y1="310" x2="775" y2="310"
+        stroke="#c44" stroke-width="2.5" stroke-dasharray="5,3"
+        marker-end="url(#ar)"/>
+  <!-- Label block to the right -->
+  <text x="772" y="280" text-anchor="end" font-size="9.5" fill="#c44"
+        font-weight="bold">E(F)→E'</text>
+  <text x="772" y="293" text-anchor="end" font-size="8.5" fill="#c44">= Σ E(Mᵢ)</text>
+  <text x="772" y="338" text-anchor="end" font-size="8" fill="#888"
+        font-style="italic">exploit</text>
+  <text x="772" y="349" text-anchor="end" font-size="8" fill="#888"
+        font-style="italic">= intentional</text>
+  <text x="772" y="360" text-anchor="end" font-size="8" fill="#888"
+        font-style="italic">subset</text>
+
+  <!-- 3a. Surrogate coupling: RWS → Internal (center gap, upper) -->
+  <line x1="357" y1="295" x2="402" y2="295"
+        stroke="#555" stroke-width="2" marker-end="url(#ad)"/>
+  <text x="380" y="285" text-anchor="middle" font-size="8.5" fill="#555">surrogate</text>
+  <text x="380" y="308" text-anchor="middle" font-size="8.5" fill="#555">coupling</text>
+
+  <!-- 3b. Internal → RWS: demand signal (center gap, lower) -->
+  <line x1="402" y1="340" x2="357" y2="340"
+        stroke="#555" stroke-width="1.5" stroke-dasharray="4,3"
+        marker-end="url(#ad)"/>
+  <text x="380" y="355" text-anchor="middle" font-size="8" fill="#666"
+        font-style="italic">demand: which</text>
+  <text x="380" y="366" text-anchor="middle" font-size="8" fill="#666"
+        font-style="italic">RWS to maintain</text>
+
+  <!-- 4. M(F)→M': vesicle budding (F→model gap) -->
+  <line x1="200" y1="182" x2="200" y2="197"
+        stroke="#4455aa" stroke-width="1.5" marker-end="url(#ab)"/>
+  <text x="210" y="194" font-size="8" fill="#4455aa">M(F)→M': budding</text>
+
+  <!-- 5. F(M)→F': resource consumption (model→F gap) -->
+  <line x1="550" y1="197" x2="550" y2="182"
+        stroke="#4455aa" stroke-width="1.5" marker-end="url(#ab)"/>
+  <text x="560" y="194" font-size="8" fill="#4455aa">F(M)→F': consumption</text>
+
+  <!-- ═══ LEGEND ═══ -->
+  <line x1="100" y1="490" x2="700" y2="490" stroke="#ddd" stroke-width="0.5"/>
+
+  <line x1="100" y1="510" x2="140" y2="510"
+        stroke="#2d7d2d" stroke-width="2.5" marker-end="url(#ag)"/>
+  <text x="150" y="514" font-size="10" fill="#444">Primitive (full E-F interaction; explore/exploit are intentional subsets)</text>
+
+  <line x1="100" y1="532" x2="140" y2="532"
+        stroke="#c44" stroke-width="2.5" stroke-dasharray="5,3"
+        marker-end="url(#ar)"/>
+  <text x="150" y="536" font-size="10" fill="#444">Aggregate (partially observable; includes unintentional externalities)</text>
+</svg>

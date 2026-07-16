@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 700" width="800" height="700" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <style>
+      .title { font-size: 18px; font-weight: 700; fill: #1a1a1a; }
+      .subtitle { font-size: 12px; fill: #666; }
+      .col-header { font-size: 15px; font-weight: 600; fill: #1a1a1a; }
+      .col-sub { font-size: 10px; fill: #888; }
+      .row-header { font-size: 15px; font-weight: 600; fill: #1a1a1a; }
+      .row-sub { font-size: 10px; fill: #888; }
+      .cell-label { font-size: 12px; font-weight: 600; fill: #1a1a1a; }
+      .cell-desc { font-size: 11px; fill: #444; }
+      .cell-tag { font-size: 10px; fill: #777; font-style: italic; }
+      .legend-label { font-size: 11px; fill: #444; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="700" rx="8" fill="#fafafa"/>
+
+  <!-- Title -->
+  <text x="400" y="36" text-anchor="middle" class="title">The 3×3 Interaction Matrix: E × F × M</text>
+  <text x="400" y="56" text-anchor="middle" class="subtitle">Rows = acted upon, Columns = acting agent. Tiers: axiom (gray), primitive (colored), aggregate (outlined).</text>
+
+  <!-- Grid origin -->
+  <!-- Headers start at x=170, y=80 -->
+  <!-- Row headers at x=30..160, grid cells at x=170..740, y=130..580 -->
+  <!-- Each cell: 190 wide, 150 tall -->
+
+  <!-- Column Headers -->
+  <text x="265" y="92" text-anchor="middle" class="col-header">E</text>
+  <text x="265" y="106" text-anchor="middle" class="col-sub">(agent)</text>
+
+  <text x="455" y="92" text-anchor="middle" class="col-header">F</text>
+  <text x="455" y="106" text-anchor="middle" class="col-sub">(agent)</text>
+
+  <text x="645" y="92" text-anchor="middle" class="col-header">M</text>
+  <text x="645" y="106" text-anchor="middle" class="col-sub">(agent)</text>
+
+  <!-- Row Headers -->
+  <text x="95" y="197" text-anchor="middle" class="row-header">E</text>
+  <text x="95" y="213" text-anchor="middle" class="row-sub">(acted upon)</text>
+
+  <text x="95" y="347" text-anchor="middle" class="row-header">F</text>
+  <text x="95" y="363" text-anchor="middle" class="row-sub">(acted upon)</text>
+
+  <text x="95" y="497" text-anchor="middle" class="row-header">M</text>
+  <text x="95" y="513" text-anchor="middle" class="row-sub">(acted upon)</text>
+
+  <!-- ===================== ROW 1: E acted upon ===================== -->
+
+  <!-- E(E)→E': Axiom — gray -->
+  <rect x="170" y="125" width="190" height="150" rx="8" fill="#f0f0f0" stroke="#aaa" stroke-width="1.5"/>
+  <text x="265" y="172" text-anchor="middle" class="cell-label">E(E)→E'</text>
+  <text x="265" y="192" text-anchor="middle" class="cell-desc">Unobservable change</text>
+  <text x="265" y="212" text-anchor="middle" class="cell-tag">Axiom</text>
+
+  <!-- E(F)→E': Aggregate — dashed -->
+  <rect x="360" y="125" width="190" height="150" rx="8" fill="#fff" stroke="#666" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="455" y="172" text-anchor="middle" class="cell-label">E(F)→E'</text>
+  <text x="455" y="192" text-anchor="middle" class="cell-desc">= Σ E(M_i)→E'</text>
+  <text x="455" y="212" text-anchor="middle" class="cell-tag">Aggregate impact</text>
+
+  <!-- E(M)→E': Primitive — red-ish -->
+  <rect x="550" y="125" width="190" height="150" rx="8" fill="#f4e8e8" stroke="#7d2d2d" stroke-width="1.5"/>
+  <text x="645" y="172" text-anchor="middle" class="cell-label">E(M)→E'</text>
+  <text x="645" y="192" text-anchor="middle" class="cell-desc">Operational effects</text>
+  <text x="645" y="212" text-anchor="middle" class="cell-tag">Model acts on world</text>
+
+  <!-- ===================== ROW 2: F acted upon ===================== -->
+
+  <!-- F(E)→F': Primitive — green-ish -->
+  <rect x="170" y="280" width="190" height="150" rx="8" fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1.5"/>
+  <text x="265" y="327" text-anchor="middle" class="cell-label">F(E)→F'</text>
+  <text x="265" y="347" text-anchor="middle" class="cell-desc">Factory adaptation</text>
+  <text x="265" y="367" text-anchor="middle" class="cell-tag">Discovery + Production</text>
+
+  <!-- F(F)→F': Aggregate — dashed -->
+  <rect x="360" y="280" width="190" height="150" rx="8" fill="#fff" stroke="#666" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="455" y="327" text-anchor="middle" class="cell-label">F(F)→F'</text>
+  <text x="455" y="347" text-anchor="middle" class="cell-desc">= F(M_total)→F'</text>
+  <text x="455" y="367" text-anchor="middle" class="cell-tag">Aggregate self-change</text>
+
+  <!-- F(M)→F': Primitive — blue-ish -->
+  <rect x="550" y="280" width="190" height="150" rx="8" fill="#e8e8f4" stroke="#2d2d7d" stroke-width="1.5"/>
+  <text x="645" y="327" text-anchor="middle" class="cell-label">F(M)→F'</text>
+  <text x="645" y="347" text-anchor="middle" class="cell-desc">Resource consumption</text>
+  <text x="645" y="367" text-anchor="middle" class="cell-tag">R + knowledge produced</text>
+
+  <!-- ===================== ROW 3: M acted upon ===================== -->
+
+  <!-- M(E)→M': Primitive — green-ish -->
+  <rect x="170" y="435" width="190" height="150" rx="8" fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1.5"/>
+  <text x="265" y="482" text-anchor="middle" class="cell-label">M(E)→M'</text>
+  <text x="265" y="502" text-anchor="middle" class="cell-desc">Validation</text>
+  <text x="265" y="522" text-anchor="middle" class="cell-tag">All verification is simulation</text>
+
+  <!-- M(F)→M': Primitive — blue-ish -->
+  <rect x="360" y="435" width="190" height="150" rx="8" fill="#e8e8f4" stroke="#2d2d7d" stroke-width="1.5"/>
+  <text x="455" y="482" text-anchor="middle" class="cell-label">M(F)→M'</text>
+  <text x="455" y="502" text-anchor="middle" class="cell-desc">Conway's law</text>
+  <text x="455" y="522" text-anchor="middle" class="cell-tag">Vesicle installation</text>
+
+  <!-- M(M)→M': Self-reference — lighter purple -->
+  <rect x="550" y="435" width="190" height="150" rx="8" fill="#f0e8f4" stroke="#5d2d7d" stroke-width="1.5"/>
+  <text x="645" y="482" text-anchor="middle" class="cell-label">M(M)→M'</text>
+  <text x="645" y="502" text-anchor="middle" class="cell-desc">Intra-model projection</text>
+  <text x="645" y="522" text-anchor="middle" class="cell-tag">§5 six projections</text>
+
+  <!-- ===================== LEGEND ===================== -->
+
+  <!-- Legend background -->
+  <rect x="130" y="615" width="540" height="60" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+
+  <!-- Axiom -->
+  <rect x="150" y="630" width="16" height="16" rx="3" fill="#f0f0f0" stroke="#aaa" stroke-width="1"/>
+  <text x="172" y="643" class="legend-label">Axiom (boundary condition)</text>
+
+  <!-- Primitive -->
+  <rect x="370" y="630" width="16" height="16" rx="3" fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1"/>
+  <text x="392" y="643" class="legend-label">Primitive (model-level)</text>
+
+  <!-- Already covered -->
+  <rect x="150" y="655" width="16" height="16" rx="3" fill="#f0e8f4" stroke="#5d2d7d" stroke-width="1"/>
+  <text x="172" y="668" class="legend-label">Already covered (§5)</text>
+
+  <!-- Aggregate -->
+  <rect x="370" y="655" width="16" height="16" rx="3" fill="#fff" stroke="#666" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="392" y="668" class="legend-label">Aggregate (marginal calculation)</text>
+</svg>
