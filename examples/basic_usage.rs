@@ -169,7 +169,7 @@ This is the main index document. It links to:
 This knowledge base demonstrates noet's ability to:
 - Parse markdown documents
 - Resolve cross-document references
-- Build a queryable hypergraph
+- Build a queryable multigraph
 - Inject stable BIDs for permanent references
 "#,
     )?;
@@ -205,7 +205,7 @@ Return to the [[index]] for more topics.
 
 ## BeliefBase
 
-A BeliefBase is a hypergraph that stores:
+A BeliefBase is a multigraph that stores:
 - Nodes (documents, sections, metadata). Each node specifies its schema
 - Edges (relationships between nodes). Each edge has a type (currently Section, Epistemic, Pragmatic)
 - Nodes and Edges can each contain a schema-specific Payload (key-value data)

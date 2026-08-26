@@ -64,6 +64,7 @@
  */
 
 import { readFile } from "fs/promises";
+import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -210,35 +211,26 @@ async function runTests() {
   await wasmModule.default(wasmBuffer);
   assert(true, "WASM module loaded");
 
-  // ── 2. Load beliefbase.json ─────────────────────────────────────────────
-  console.log(`\n${BLUE}[2/5] Loading beliefbase.json${RESET}`);
+  // ── 2. Load beliefbase.msgpack ──────────────────────────────────────────
+  console.log(`\n${BLUE}[2/5] Loading beliefbase.msgpack${RESET}`);
 
-  const beliefbaseJson = await readFile(join(__dirname, "test-output/beliefbase.json"), "utf-8");
-  assert(beliefbaseJson.length > 0, "beliefbase.json is non-empty");
-
-  const beliefbaseData = JSON.parse(beliefbaseJson);
-  assert(
-    beliefbaseData.states && Object.keys(beliefbaseData.states).length > 0,
-    "beliefbase.json has at least one node in states",
-  );
-
-  // Find the root network node (has kind containing "Network" and no parent
-  // network in the corpus — identified as the shallowest Network node).
-  const networkNodes = Object.values(beliefbaseData.states).filter(
-    (node) => node.kind && node.kind.includes("Network"),
-  );
-  assert(networkNodes.length > 0, `Found ${networkNodes.length} Network node(s) in beliefbase`);
-
-  // Use the Network node with the shortest id as the entry point (heuristic
-  // matching how the test runner identifies the corpus root).
-  const rootNetworkNode = networkNodes[0];
-  const entryBid = rootNetworkNode.bid;
+  // Extract entry BID from index.html (injected by generate_spa_shell).
+  const indexHtml = readFileSync(join(__dirname, "test-output/index.html"), "utf-8");
+  const entryBidMatch = indexHtml.match(/id="noet-entry-bid"[^>]*>\s*"([^"]+)"/);
+  assert(entryBidMatch !== null, "Found noet-entry-bid script tag in index.html");
+  const entryBid = entryBidMatch[1];
   assert(typeof entryBid === "string" && entryBid.length > 0, `Entry BID identified: ${entryBid}`);
+
+  const beliefbaseBytes = await readFile(join(__dirname, "test-output/beliefbase.msgpack"));
+  assert(beliefbaseBytes.length > 0, "beliefbase.msgpack is non-empty");
 
   // ── 3. Initialise BeliefBase and call get_nav_tree ──────────────────────
   console.log(`\n${BLUE}[3/5] Initialising BeliefBase${RESET}`);
 
-  const bb = new wasmModule.BeliefBaseWasm(beliefbaseJson, entryBid);
+  const bb = wasmModule.BeliefBaseWasm.from_msgpack(
+    new Uint8Array(beliefbaseBytes.buffer, beliefbaseBytes.byteOffset, beliefbaseBytes.byteLength),
+    entryBid,
+  );
   assert(bb !== null, "BeliefBaseWasm constructed");
 
   const tree = bb.get_nav_tree();

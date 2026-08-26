@@ -14,14 +14,14 @@ body {
     margin: 0;
     padding: 0;
     font-family:
-        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+        sans-serif;
     color: #333;
     background-color: #fff;
 }
 
 /* Main content container */
 article {
-    max-width: 800px;
     margin: 0 auto;
     padding: 2rem 1.5rem;
 }

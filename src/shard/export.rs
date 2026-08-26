@@ -2,16 +2,16 @@
 //!
 //! Implements the two export paths for `finalize_html`:
 //!
-//! - **Monolithic** (below `SHARD_THRESHOLD`): writes `beliefbase.json` as today.
+//! - **Monolithic** (below `SHARD_THRESHOLD`): writes `beliefbase.msgpack`.
 //! - **Sharded** (at or above threshold): writes `beliefbase/manifest.json`,
-//!   `beliefbase/global.json`, and `beliefbase/networks/{bref}.json`.
+//!   `beliefbase/global.msgpack`, and `beliefbase/networks/{bref}.msgpack`.
 //!
 //! The top-level entry point is [`export_beliefbase`], which chooses between
 //! the two paths and returns an [`ExportMode`] describing what was written.
 //!
 //! ## Global Shard
 //!
-//! The `global.json` shard contains nodes that must always be available for
+//! The `global.msgpack` shard contains nodes that must always be available for
 //! cross-network link resolution:
 //!
 //! - The API node (`buildonomy_api_bid`)
@@ -28,8 +28,15 @@
 //! Each network shard contains the `BeliefGraph` subset for one network:
 //! all `BeliefNode` states reachable from the network's PathMap, plus all
 //! edges whose both endpoints are in that network. Trace nodes introduced by
-//! `evaluate_expression` (cross-network references) are excluded — they belong
+//! balanced traversal (cross-network references) are excluded — they belong
 //! to the global shard or to other network shards.
+//!
+//! ## Wire Format
+//!
+//! All shards are serialized as **MessagePack** using `rmp_serde::to_vec_named`.
+//! The manifest (`beliefbase/manifest.json`) remains JSON — it is tiny and is
+//! read by JavaScript before WASM initializes. The monolithic export uses
+//! MessagePack (`beliefbase.msgpack`) to match the sharded wire format.
 //!
 //! ## References
 //!
@@ -41,26 +48,36 @@ use crate::{
     beliefbase::{BeliefGraph, BidGraph},
     error::BuildonomyError,
     paths::PathMapMap,
-    properties::{BeliefKind, Bid, Bref},
+    properties::{Bid, Bref, WEIGHT_OWNED_BY},
     shard::{
         manifest::{
-            estimate_size_mb, network_shard_meta, GlobalShardMeta, SearchManifest, ShardConfig,
-            ShardManifest,
+            estimate_size_mb, network_shard_meta, CodecManifest, GlobalShardMeta, SearchManifest,
+            ShardConfig, ShardManifest,
         },
         wire::{GlobalShard, NetworkShard, SerializableBidGraph},
     },
 };
+use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+
+/// Serialize a shard value to MessagePack bytes using named fields.
+///
+/// `to_vec_named` uses string field names (like JSON) rather than integer
+/// indices, which makes the format self-describing and forward-compatible
+/// with optional fields added in future versions.
+fn to_msgpack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, BuildonomyError> {
+    rmp_serde::to_vec_named(value).map_err(|e| BuildonomyError::Serialization(e.to_string()))
+}
 
 // ── Export mode result ────────────────────────────────────────────────────────
 
 /// Describes the result of [`export_beliefbase`].
 #[derive(Debug)]
 pub enum ExportMode {
-    /// Wrote `beliefbase.json` (total size below [`ShardConfig::shard_threshold`]).
+    /// Wrote `beliefbase.msgpack` (total size below [`ShardConfig::shard_threshold`]).
     Monolithic { size_mb: f64 },
     /// Wrote `beliefbase/` directory with manifest and per-network shards.
     Sharded { manifest: ShardManifest },
@@ -73,7 +90,7 @@ pub enum ExportMode {
 /// This is the replacement for `DocumentCompiler::export_beliefbase_json`. It:
 ///
 /// 1. Serializes the full graph to measure its size.
-/// 2. If below [`ShardConfig::shard_threshold`]: writes `beliefbase.json` and
+/// 2. If below [`ShardConfig::shard_threshold`]: writes `beliefbase.msgpack` and
 ///    returns [`ExportMode::Monolithic`].
 /// 3. If at or above threshold: calls `export_sharded` and returns
 ///    [`ExportMode::Sharded`].
@@ -94,6 +111,7 @@ pub async fn export_beliefbase(
     output_dir: &Path,
     config: &ShardConfig,
     search_manifest: &SearchManifest,
+    codec_manifest: &CodecManifest,
 ) -> Result<ExportMode, BuildonomyError> {
     // Serialize the full graph to measure its size.
     let json_string = serde_json::to_string_pretty(&graph)
@@ -101,23 +119,36 @@ pub async fn export_beliefbase(
     let total_bytes = json_string.len();
 
     if config.should_shard(total_bytes) {
-        tracing::info!(
+        tracing::debug!(
             "[export_beliefbase] Graph is {:.2} MB — using sharded export",
             estimate_size_mb(total_bytes),
         );
-        let manifest = export_sharded(graph, pathmap, output_dir, config, search_manifest).await?;
+        let manifest = export_sharded(
+            graph,
+            pathmap,
+            output_dir,
+            config,
+            search_manifest,
+            codec_manifest,
+        )
+        .await?;
         Ok(ExportMode::Sharded { manifest })
     } else {
         let size_mb = estimate_size_mb(total_bytes);
         tracing::debug!(
-            "[export_beliefbase] Graph is {:.2} MB — writing monolithic beliefbase.json",
+            "[export_beliefbase] Graph is {:.2} MB — writing monolithic beliefbase.msgpack",
             size_mb,
         );
-        let json_path = output_dir.join("beliefbase.json");
-        tokio::fs::write(&json_path, json_string).await?;
+        let msgpack_bytes = to_msgpack(&graph)?;
+        let msgpack_path = output_dir.join("beliefbase.msgpack");
+        tokio::fs::write(&msgpack_path, msgpack_bytes).await?;
+        // Write codec manifest alongside monolithic export.
+        let codec_json = serde_json::to_string_pretty(codec_manifest)
+            .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
+        tokio::fs::write(output_dir.join("codecs.json"), codec_json).await?;
         tracing::debug!(
             "Exported BeliefGraph to {} ({:.2} MB, {} states, {} relations)",
-            json_path.display(),
+            msgpack_path.display(),
             size_mb,
             graph.states.len(),
             graph.relations.as_graph().edge_count(),
@@ -137,10 +168,10 @@ pub async fn export_beliefbase(
 /// ```text
 /// beliefbase/
 /// ├── manifest.json
-/// ├── global.json
+/// ├── global.msgpack
 /// └── networks/
-///     ├── {bref_a}.json
-///     └── {bref_b}.json
+///     ├── {bref_a}.msgpack
+///     └── {bref_b}.msgpack
 /// ```
 async fn export_sharded(
     graph: BeliefGraph,
@@ -148,6 +179,7 @@ async fn export_sharded(
     output_dir: &Path,
     config: &ShardConfig,
     search_manifest: &SearchManifest,
+    codec_manifest: &CodecManifest,
 ) -> Result<ShardManifest, BuildonomyError> {
     let bb_dir = output_dir.join("beliefbase");
     let networks_dir = bb_dir.join("networks");
@@ -168,6 +200,16 @@ async fn export_sharded(
     let partition = partition_graph(&graph, pathmap);
 
     // ── Write global shard ────────────────────────────────────────────────
+    let bref_index: BTreeMap<String, String> = partition
+        .network_states
+        .iter()
+        .flat_map(|(net_bref, bids)| {
+            let net_bref_str = net_bref.to_string();
+            bids.iter()
+                .map(move |bid| (bid.bref().to_string(), net_bref_str.clone()))
+        })
+        .collect();
+
     let global_shard = GlobalShard {
         states: partition
             .global_states
@@ -175,24 +217,33 @@ async fn export_sharded(
             .filter_map(|bid| graph.states.get(bid).map(|n| (bid.to_string(), n.clone())))
             .collect(),
         relations: SerializableBidGraph::from_bid_graph(&partition.global_relations),
+        bref_index,
     };
 
-    let global_json = serde_json::to_string_pretty(&global_shard)
-        .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
-    let global_bytes = global_json.len();
-    tokio::fs::write(bb_dir.join("global.json"), global_json).await?;
+    let global_bytes = to_msgpack(&global_shard)?;
+    let global_byte_len = global_bytes.len();
+    tokio::fs::write(bb_dir.join("global.msgpack"), global_bytes).await?;
 
     shard_manifest.global = GlobalShardMeta {
         node_count: global_shard.states.len(),
-        estimated_size_mb: estimate_size_mb(global_bytes),
-        path: "global.json".to_string(),
+        estimated_size_mb: estimate_size_mb(global_byte_len),
+        path: "global.msgpack".to_string(),
     };
 
     tracing::debug!(
-        "[export_sharded] Wrote global.json: {} nodes, {:.2} MB",
+        "[export_sharded] Wrote global.msgpack: {} nodes, {:.2} MB",
         global_shard.states.len(),
-        estimate_size_mb(global_bytes),
+        estimate_size_mb(global_byte_len),
     );
+
+    // ── Build bref → BID lookup for owner-node halo resolution ────────────
+    // Cross-network {maps_to} edges carry a WEIGHT_OWNED_BY bref identifying
+    // the section that declared the mapping. That owner node typically lives
+    // in a different network shard. Without embedding it in each shard that
+    // contains the edge, the viewer's extract_node_context can't resolve the
+    // bref to a BID and silently drops the OwnedEdge.
+    let bref_to_bid: BTreeMap<Bref, Bid> =
+        graph.states.keys().map(|bid| (bid.bref(), *bid)).collect();
 
     // ── Write per-network shards ──────────────────────────────────────────
     let mut total_node_count = global_shard.states.len();
@@ -204,30 +255,137 @@ async fn export_sharded(
             .cloned()
             .unwrap_or_default();
 
-        // Build per-network relations: edges where both endpoints are in this network.
-        let net_relations = graph.relations.filter(
-            &crate::query::RelationPred::NodeIn(net_states.iter().copied().collect()),
-            false,
-        );
+        // Build per-network relations: edges where at least one endpoint is in
+        // this network's state set (source OR sink matches).
+        // This captures both intra-network edges and href/asset→content edges.
+        let net_relations_graph = {
+            let g = graph.relations.as_graph();
+            BidGraph::from_edges(g.edge_references().filter_map(|e| {
+                let source = g[e.source()];
+                let sink = g[e.target()];
+                if net_states.contains(&source) || net_states.contains(&sink) {
+                    Some((source, sink, e.weight().clone()))
+                } else {
+                    None
+                }
+            }))
+        };
+
+        // Collect the const-namespace nodes (href/asset stubs) that are
+        // referenced by this shard's edges but are not themselves in net_states.
+        // Embedding them here means the viewer can resolve links (e.g. render
+        // "links to https://..." tooltips) with only the global shard + this
+        // network shard loaded, without fetching the href or asset network shard.
+        let mut referenced_extern_states: BTreeMap<String, crate::properties::BeliefNode> =
+            BTreeMap::new();
+        {
+            let g = net_relations_graph.as_graph();
+            let net_edges: Vec<_> = g.edge_references().collect();
+            for edge in net_edges {
+                for &endpoint_bid in &[g[edge.source()], g[edge.target()]] {
+                    if !net_states.contains(&endpoint_bid) {
+                        if let Some(node) = graph.states.get(&endpoint_bid) {
+                            referenced_extern_states
+                                .entry(endpoint_bid.to_string())
+                                .or_insert_with(|| node.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect third-party owner nodes referenced by WEIGHT_OWNED_BY in
+        // this shard's edges. These are typically {maps_to} directive owners
+        // that live in a different network. Without them in the halo, the
+        // viewer can't resolve the bref → BID for OwnedEdge construction.
+        {
+            let g = net_relations_graph.as_graph();
+            for edge in g.edge_references() {
+                for weight in edge.weight().weights.values() {
+                    if let Some(owner_str) = weight.get::<String>(WEIGHT_OWNED_BY) {
+                        // Skip "source" / "sink" sentinels — only third-party brefs.
+                        if owner_str == "source" || owner_str == "sink" {
+                            continue;
+                        }
+                        if let Ok(owner_bref) = Bref::try_from(owner_str.as_str()) {
+                            if let Some(&owner_bid) = bref_to_bid.get(&owner_bref) {
+                                if !net_states.contains(&owner_bid) {
+                                    if let Some(node) = graph.states.get(&owner_bid) {
+                                        referenced_extern_states
+                                            .entry(owner_bid.to_string())
+                                            .or_insert_with(|| node.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // For each referenced extern node, also pull its Section edge to its
+        // namespace parent (e.g. href_node → href_namespace) and the parent
+        // node itself. Without this, get_context in the viewer cannot walk up
+        // to a known namespace root and reports "Node not found in any context".
+        let mut extra_edges: Vec<(Bid, Bid, crate::properties::WeightSet)> = Vec::new();
+        {
+            let full_g = graph.relations.as_graph();
+            for edge in full_g.edge_references() {
+                let source = full_g[edge.source()];
+                let sink = full_g[edge.target()];
+                // Only Section edges from extern nodes to their namespace parent.
+                if referenced_extern_states.contains_key(&source.to_string())
+                    && !net_states.contains(&sink)
+                    && edge
+                        .weight()
+                        .weights
+                        .contains_key(&crate::properties::WeightKind::Section)
+                {
+                    // Include the namespace parent node.
+                    if let Some(sink_node) = graph.states.get(&sink) {
+                        referenced_extern_states
+                            .entry(sink.to_string())
+                            .or_insert_with(|| sink_node.clone());
+                    }
+                    extra_edges.push((source, sink, edge.weight().clone()));
+                }
+            }
+        }
+
+        // Merge own states with referenced extern states for the shard payload.
+        let mut shard_states: BTreeMap<String, crate::properties::BeliefNode> = net_states
+            .iter()
+            .filter_map(|bid| graph.states.get(bid).map(|n| (bid.to_string(), n.clone())))
+            .collect();
+        shard_states.extend(referenced_extern_states);
+
+        // Rebuild the relations graph with the extra Section edges included.
+        let net_relations_graph = if extra_edges.is_empty() {
+            net_relations_graph
+        } else {
+            let existing: Vec<(Bid, Bid, crate::properties::WeightSet)> = {
+                let g = net_relations_graph.as_graph();
+                g.edge_references()
+                    .map(|e| (g[e.source()], g[e.target()], e.weight().clone()))
+                    .collect()
+            };
+            BidGraph::from_edges(existing.into_iter().chain(extra_edges))
+        };
 
         let net_shard = NetworkShard {
             network_bref: net_bref.to_string(),
             network_bid: net_bid.to_string(),
-            states: net_states
-                .iter()
-                .filter_map(|bid| graph.states.get(bid).map(|n| (bid.to_string(), n.clone())))
-                .collect(),
-            relations: SerializableBidGraph::from_bid_graph(&BidGraph::from(net_relations)),
+            states: shard_states,
+            relations: SerializableBidGraph::from_bid_graph(&net_relations_graph),
         };
 
-        let shard_json = serde_json::to_string_pretty(&net_shard)
-            .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
-        let shard_bytes = shard_json.len();
+        let shard_bytes = to_msgpack(&net_shard)?;
+        let shard_byte_len = shard_bytes.len();
 
         let bref_str = net_bref.to_string();
-        let shard_filename = format!("{}.json", bref_str);
+        let shard_filename = format!("{}.msgpack", bref_str);
         let shard_path = networks_dir.join(&shard_filename);
-        tokio::fs::write(&shard_path, shard_json).await?;
+        tokio::fs::write(&shard_path, shard_bytes).await?;
 
         let net_title = graph
             .states
@@ -246,7 +404,7 @@ async fn export_sharded(
             net_title,
             net_shard.states.len(),
             net_shard.relations.edges.len(),
-            shard_bytes,
+            shard_byte_len,
             (search_size_kb * 1024.0) as usize,
         );
 
@@ -266,7 +424,12 @@ async fn export_sharded(
         .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
     tokio::fs::write(bb_dir.join("manifest.json"), manifest_json).await?;
 
-    tracing::info!(
+    // ── Write codec manifest (sibling to beliefbase/) ─────────────────────
+    let codec_json = serde_json::to_string_pretty(codec_manifest)
+        .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
+    tokio::fs::write(output_dir.join("codecs.json"), codec_json).await?;
+
+    tracing::debug!(
         "[export_sharded] Wrote {} network shards + global ({} total nodes)",
         shard_manifest.networks.len(),
         total_node_count,
@@ -292,17 +455,21 @@ struct GraphPartition {
 /// Partition `graph` into global and per-network state sets using `pathmap`.
 ///
 /// A node is assigned to a network if its BID appears in that network's PathMap.
-/// A node is assigned to the global shard if:
-/// - It is the API node, or
-/// - It belongs to a system namespace (href, asset), or
-/// - It does not appear in any network's PathMap.
+/// A node is assigned to the global shard if it does not appear in any network's
+/// PathMap (e.g. the API node, bare namespace roots, unresolved trace refs).
 ///
-/// Trace nodes (added by `evaluate_expression` for referential integrity) are
-/// excluded from per-network shards — they are already represented in the
-/// global shard or in the shard of their home network.
+/// Edge assignment:
+/// - Both endpoints in the same network → that network's shard.
+/// - At least one endpoint has a network home → the network shard of the
+///   endpoint that has a home (content endpoint wins over href/asset).
+///   This keeps href→content edges out of global.json: they are already
+///   included in the per-network shard via a "NodeIn" edge filter, which
+///   matches edges where *either* endpoint is in the network's state set.
+/// - Neither endpoint has a network home → global shard's relations.
 ///
-/// Cross-network edges (source in network A, sink in network B) go into the
-/// global shard's relations so they are always available.
+/// This prevents content-namespace trace nodes (href stubs, asset stubs) from
+/// bloating global.json: previously all Trace nodes and all cross-network edges
+/// landed in global, inflating it to 17–31 MB and freezing the browser.
 fn partition_graph(graph: &BeliefGraph, pathmap: &PathMapMap) -> GraphPartition {
     // Build a BID → network Bref lookup from the PathMapMap.
     let mut bid_to_net: BTreeMap<Bid, Bref> = BTreeMap::new();
@@ -313,9 +480,14 @@ fn partition_graph(graph: &BeliefGraph, pathmap: &PathMapMap) -> GraphPartition 
         networks.push((net_bref, net_bid));
 
         if let Some(pm) = pathmap.get_map(&net_bref) {
-            let all_paths = pm.recursive_map(None, pathmap, &mut BTreeSet::new());
-            for (_path, bid, _order) in all_paths {
-                bid_to_net.entry(bid).or_insert(net_bref);
+            for (_path, bid, _order) in pm.map() {
+                // Use or_insert so that if this BID also appears in a sub-network's
+                // own PathMap (for its own content), the sub-network's claim wins
+                // (processed later in the loop, but or_insert means first-writer wins).
+                // Subnet root BIDs appearing in the parent's map are intentionally
+                // included here — they belong to the parent shard so they are available
+                // when the parent shard is loaded.
+                bid_to_net.entry(*bid).or_insert(net_bref);
             }
         }
     }
@@ -327,43 +499,46 @@ fn partition_graph(graph: &BeliefGraph, pathmap: &PathMapMap) -> GraphPartition 
     let mut global_states: BTreeSet<Bid> = BTreeSet::new();
     let mut network_states: BTreeMap<Bref, BTreeSet<Bid>> = BTreeMap::new();
 
-    for (&bid, node) in &graph.states {
-        // Trace nodes never go into per-network shards.
-        if node.kind.contains(BeliefKind::Trace) {
-            global_states.insert(bid);
-            continue;
-        }
-
+    for &bid in graph.states.keys() {
+        // Trace nodes: assign to their home network if they have a PathMap entry
+        // (e.g. href/asset nodes that live in a content-namespace shard), and only
+        // fall back to global if they have no home. The old rule "all Trace → global"
+        // bloated global.json with thousands of href/asset trace nodes, causing the
+        // browser to freeze while parsing a 17 MB payload on every page load.
         match bid_to_net.get(&bid) {
             Some(&net_bref) => {
                 network_states.entry(net_bref).or_default().insert(bid);
             }
             None => {
                 // Not found in any network's PathMap — goes to global shard.
+                // This correctly captures: API node, bare namespace roots, and
+                // any Trace node that has no registered path (unresolved refs, etc.).
                 global_states.insert(bid);
             }
         }
     }
 
-    // Partition edges: intra-network edges stay with the network shard.
-    // Cross-network edges go into the global shard's relations.
+    // Partition edges.
+    //
+    // An edge goes to global only if NEITHER endpoint has a network home.
+    // If at least one endpoint has a home, the edge is already included in
+    // that network's shard via the NodeIn edge filter in export_sharded
+    // (which keeps edges where source OR sink is in the set).
+    // Putting such edges in global too would duplicate them and bloat global.json
+    // with tens of thousands of href→content edges.
     let mut global_edge_sources: Vec<(Bid, Bid, crate::properties::WeightSet)> = Vec::new();
 
     let g = graph.relations.as_graph();
-    for edge in g.raw_edges() {
+    let partition_edges: Vec<_> = g.edge_references().collect();
+    for edge in partition_edges {
         let source_bid = g[edge.source()];
         let sink_bid = g[edge.target()];
         let source_net = bid_to_net.get(&source_bid);
         let sink_net = bid_to_net.get(&sink_bid);
 
-        let is_cross_network = match (source_net, sink_net) {
-            (Some(a), Some(b)) => a != b,
-            // One or both endpoints are in global → edge goes to global shard.
-            _ => true,
-        };
-
-        if is_cross_network {
-            global_edge_sources.push((source_bid, sink_bid, edge.weight.clone()));
+        // Only truly unowned edges (no network home on either side) go to global.
+        if source_net.is_none() && sink_net.is_none() {
+            global_edge_sources.push((source_bid, sink_bid, edge.weight().clone()));
         }
     }
 
@@ -387,8 +562,12 @@ fn partition_graph(graph: &BeliefGraph, pathmap: &PathMapMap) -> GraphPartition 
 mod tests {
     use super::*;
     use crate::{
-        properties::{BeliefKind, BeliefKindSet, BeliefNode},
-        shard::manifest::ShardConfig,
+        beliefbase::BeliefBase,
+        paths::PathMapMap,
+        properties::{
+            BeliefKind, BeliefKindSet, BeliefNode, NodeId, WeightKind, WeightSet, WEIGHT_OWNED_BY,
+        },
+        shard::manifest::{CodecManifest, SearchManifest, ShardConfig},
     };
 
     fn make_node(title: &str, kind: BeliefKind) -> BeliefNode {
@@ -398,7 +577,7 @@ mod tests {
             title: title.to_string(),
             schema: None,
             payload: toml::Table::new(),
-            id: None,
+            id: NodeId::default(),
             metadata: toml::Table::new(),
         }
     }
@@ -427,17 +606,14 @@ mod tests {
             states: [(bid.to_string(), node)].into_iter().collect(),
             relations: SerializableBidGraph::default(),
         };
-        let json = serde_json::to_string_pretty(&shard).unwrap();
-        let decoded: NetworkShard = serde_json::from_str(&json).unwrap();
+        let bytes = rmp_serde::to_vec_named(&shard).unwrap();
+        let decoded: NetworkShard = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.network_bref, "01abc");
         assert_eq!(decoded.states.len(), 1);
     }
 
     #[test]
     fn test_export_mode_monolithic_below_threshold() {
-        // Verify that a small graph produces ExportMode::Monolithic.
-        // We test the should_shard decision directly since we can't easily run
-        // the full async export in a unit test without disk I/O.
         let config = ShardConfig {
             shard_threshold: 1_000_000, // 1MB
             memory_budget_mb: 200.0,
@@ -457,7 +633,6 @@ mod tests {
 
     #[test]
     fn test_partition_assigns_unowned_to_global() {
-        // A graph with one node not in any PathMap should end up in global_states.
         let node = make_node("Orphan", BeliefKind::Document);
         let bid = node.bid;
         let graph = BeliefGraph {
@@ -472,7 +647,6 @@ mod tests {
 
     #[test]
     fn test_partition_excludes_trace_nodes_from_networks() {
-        // Trace nodes should always go to global, even if their BID appears in a PathMap.
         let mut node = make_node("Trace Node", BeliefKind::Document);
         node.kind.insert(BeliefKind::Trace);
         let bid = node.bid;
@@ -485,7 +659,7 @@ mod tests {
         assert!(partition.global_states.contains(&bid));
     }
 
-    /// Verify that a `NetworkShard` can be serialized to JSON, deserialized,
+    /// Verify that a `NetworkShard` can be serialized to MessagePack, deserialized,
     /// and used to reconstruct a `BeliefGraph` suitable for `BeliefBase::merge`.
     /// This mirrors the logic in `BeliefBaseWasm::load_shard`.
     #[test]
@@ -509,9 +683,9 @@ mod tests {
             relations: SerializableBidGraph::default(),
         };
 
-        // Round-trip through JSON (as load_shard does).
-        let json = serde_json::to_string_pretty(&shard).unwrap();
-        let decoded: NetworkShard = serde_json::from_str(&json).unwrap();
+        // Round-trip through MessagePack (as load_shard does).
+        let bytes = rmp_serde::to_vec_named(&shard).unwrap();
+        let decoded: NetworkShard = rmp_serde::from_slice(&bytes).unwrap();
 
         // Reconstruct a BeliefGraph from the decoded shard.
         let edges: Vec<(Bid, Bid, crate::properties::WeightSet)> = decoded
@@ -539,9 +713,8 @@ mod tests {
         assert!(graph.states.contains_key(&bid_b));
 
         // Merge into a fresh BeliefBase and verify node presence.
-        // BeliefBase::default() already contains 1 node (the built-in API node).
         let mut bb = BeliefBase::default();
-        let initial_count = bb.states().len(); // typically 1 (API node)
+        let initial_count = bb.states().len();
         bb.merge(&graph);
         assert_eq!(bb.states().len(), initial_count + 2);
         assert!(bb.states().contains_key(&bid_a));
@@ -564,10 +737,12 @@ mod tests {
         let shard = GlobalShard {
             states: [(bid.to_string(), node.clone())].into_iter().collect(),
             relations: SerializableBidGraph::default(),
+            bref_index: BTreeMap::new(),
         };
 
-        let json = serde_json::to_string_pretty(&shard).unwrap();
-        let decoded: GlobalShard = serde_json::from_str(&json).unwrap();
+        // Round-trip through MessagePack (as load_shard does).
+        let bytes = rmp_serde::to_vec_named(&shard).unwrap();
+        let decoded: GlobalShard = rmp_serde::from_slice(&bytes).unwrap();
 
         // Reconstruct graph and merge.
         let graph = BeliefGraph {
@@ -580,7 +755,7 @@ mod tests {
         };
 
         let mut bb = BeliefBase::default();
-        let initial_count = bb.states().len(); // typically 1 (API node)
+        let initial_count = bb.states().len();
         bb.merge(&graph);
         assert_eq!(
             bb.states().len(),
@@ -620,7 +795,7 @@ mod tests {
 
         // Build the full graph as if both shards were loaded.
         let mut bb = BeliefBase::default();
-        let initial_count = bb.states().len(); // typically 1 (API node)
+        let initial_count = bb.states().len();
         let graph = BeliefGraph {
             states: [
                 (shared_bid, shared_node.clone()),
@@ -644,5 +819,112 @@ mod tests {
         assert_eq!(to_remove.len(), 1);
         assert!(to_remove.contains(&net_only_bid));
         assert!(!to_remove.contains(&shared_bid));
+    }
+
+    /// Verify that cross-network WEIGHT_OWNED_BY owner nodes are embedded
+    /// in the shard halo so the viewer can resolve OwnedEdge bref → BID.
+    #[tokio::test]
+    async fn test_shard_halo_includes_owned_by_owner_nodes() {
+        // Create three nodes: net_root (network), doc_a (in net), owner (in a different net).
+        let mut net_root = make_node("Network", BeliefKind::Network);
+        net_root.bid = Bid::new(Bid::nil());
+        let net_root_bid = net_root.bid;
+
+        let mut doc_a = make_node("Doc A", BeliefKind::Document);
+        doc_a.bid = Bid::new(net_root_bid);
+        let doc_a_bid = doc_a.bid;
+
+        // The "owner" node lives in a different network — it declared a {maps_to}
+        // edge whose source or sink is doc_a.
+        let mut owner = make_node("Owner Section", BeliefKind::Document);
+        owner.bid = Bid::new(doc_a_bid);
+        let owner_bid = owner.bid;
+        let owner_bref = owner_bid.bref();
+
+        // A foreign node that is the other endpoint of the maps_to edge.
+        let mut foreign = make_node("Foreign Node", BeliefKind::Document);
+        foreign.bid = Bid::new(owner_bid);
+        let foreign_bid = foreign.bid;
+
+        // Build an edge from foreign → doc_a with WEIGHT_OWNED_BY = owner's bref.
+        let mut ws = WeightSet::from(WeightKind::Pragmatic);
+        ws.weights
+            .get_mut(&WeightKind::Pragmatic)
+            .unwrap()
+            .set(WEIGHT_OWNED_BY, owner_bref.to_string())
+            .unwrap();
+
+        // Section edge: doc_a is a child of net_root.
+        let section_ws = WeightSet::from(WeightKind::Section);
+
+        let relations = BidGraph::from_edges(vec![
+            (doc_a_bid, net_root_bid, section_ws),
+            (foreign_bid, doc_a_bid, ws),
+        ]);
+
+        let graph = BeliefGraph {
+            states: [
+                (net_root_bid, net_root),
+                (doc_a_bid, doc_a),
+                (owner_bid, owner),
+                (foreign_bid, foreign),
+            ]
+            .into_iter()
+            .collect(),
+            relations,
+        };
+
+        // Use the full export pipeline with a tiny threshold to force sharded mode.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let config = ShardConfig {
+            shard_threshold: 1,
+            memory_budget_mb: 200.0,
+        };
+
+        // Build a real PathMapMap using BeliefBase.
+        let mut bb = BeliefBase::default();
+        bb.merge(&graph);
+        let pathmap = bb.paths();
+
+        let result = export_beliefbase(
+            graph,
+            &pathmap,
+            tmp_dir.path(),
+            &config,
+            &SearchManifest::new(),
+            &CodecManifest::new(vec![], vec![]),
+        )
+        .await
+        .unwrap();
+
+        // Verify sharded mode was used.
+        assert!(
+            matches!(result, ExportMode::Sharded { .. }),
+            "expected sharded export"
+        );
+
+        // Read back all network shards and check that the owner node appears
+        // in the shard that contains doc_a (where the WEIGHT_OWNED_BY edge lives).
+        let networks_dir = tmp_dir.path().join("beliefbase/networks");
+        let mut found_owner_in_halo = false;
+        for entry in std::fs::read_dir(&networks_dir).unwrap() {
+            let entry = entry.unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            let shard: NetworkShard = rmp_serde::from_slice(&bytes).unwrap();
+
+            if shard.states.contains_key(&doc_a_bid.to_string()) {
+                // This is the shard containing doc_a — the owner should be in the halo.
+                if shard.states.contains_key(&owner_bid.to_string()) {
+                    found_owner_in_halo = true;
+                }
+            }
+        }
+
+        assert!(
+            found_owner_in_halo,
+            "Owner node (WEIGHT_OWNED_BY target) should be embedded in the shard halo \
+             of the network containing the edge endpoint. Owner BID: {}, owner bref: {}",
+            owner_bid, owner_bref
+        );
     }
 }

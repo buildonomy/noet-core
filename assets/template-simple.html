@@ -5,11 +5,19 @@
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{{TITLE}}</title>
         <link rel="canonical" href="{{CANONICAL}}" />
-        {{SCRIPT}}
+        {{SCRIPTS}}
     </head>
     <body data-document-bid="{{BID}}">
         <nav class="spa-upgrade">
             <a href="{{SPA_ROUTE}}">📱 View Interactive Version</a>
+            <a
+                id="noet-source-link"
+                href="{{SOURCE_LINK}}"
+                data-binary="{{SOURCE_BINARY}}"
+                target="_blank"
+                rel="noopener"
+                >📄 View Source</a
+            >
         </nav>
         <article>{{BODY}}</article>
     </body>

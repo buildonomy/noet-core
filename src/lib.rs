@@ -1,12 +1,12 @@
 //! # noet-core
 //!
-//! A Rust library for parsing interconnected documents into a queryable hypergraph with bidirectional synchronization.
+//! A Rust library for parsing interconnected documents into a queryable multigraph with bidirectional synchronization.
 //!
 //! The name "noet" comes from "noetic" - relating to knowledge and the intellect.
 //!
 //! ## Overview
 //!
-//! noet-core transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure
+//! noet-core transforms document networks (Markdown, TOML, etc.) into a queryable multigraph structure
 //! called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source
 //! files and a machine-queryable graph, automatically managing cross-document references and propagating
 //! changes.
@@ -18,7 +18,8 @@
 //! - **Bidirectional sync**: Changes flow from documents to graph *and* from graph back to documents
 //! - **Multi-format support**: Extensible codec system (Markdown, TOML, custom formats)
 //! - **Error tolerance**: Graceful handling of parse errors via diagnostic system
-//! - **Hypergraph relationships**: Rich semantic relationships with typed edges and custom payloads
+//! - **Three orthogonal edge types**: Section (structure), Epistemic (provenance), and Pragmatic (actionable claims) — each forming its own DAG sub-graph
+//! - **Third-party edge ownership**: Cross-document traceability claims via `{maps_to}` directives without modifying referenced documents
 //! - **Nested networks**: Hierarchical network dependencies similar to git submodules
 //! - **Event streaming**: Incremental cache updates via event-driven architecture
 //!
@@ -26,7 +27,7 @@
 //!
 //! The library is organized around several key components:
 //!
-//! - **[`beliefbase`]**: Core hypergraph data structures (`BeliefBase`, `BidGraph`)
+//! - **[`beliefbase`]**: Core multigraph data structures (`BeliefBase`, `BidGraph`)
 //! - **[`codec`]**: Document parsing (`DocumentCompiler`, `GraphBuilder`, `DocCodec` trait)
 //! - **[`properties`]**: Node/edge types, identifiers (`Bid`), relationship semantics
 //! - **[`event`]**: Event streaming for cache synchronization
@@ -174,11 +175,11 @@
 //! See `docs/architecture.md` § 5 for conceptual overview and `docs/design/link_format.md`
 //! for complete specification.
 //!
-//! ### Hypergraph Structure
+//! ### Multigraph Structure
 //!
-//! The BeliefBase is a typed, weighted, directed hypergraph where:
+//! The BeliefBase is a typed, weighted, directed multigraph where:
 //! - **Nodes** are `BeliefNode` instances (documents, sections, custom entities)
-//! - **Edges** are typed relationships (`WeightKind`: Subsection, Epistemic, Pragmatic)
+//! - **Edges** are typed relationships (`WeightKind`: Section, Epistemic, Pragmatic)
 //! - Each edge can carry custom metadata in its `payload`
 //!
 //! ### Diagnostic-Driven Resolution
@@ -211,7 +212,7 @@
 //! - **Knowledge graphs** (Neo4j, Docs2KG): Graph construction + bidirectional doc-graph sync
 //! - **Language servers** (rust-analyzer, tree-sitter): Error-tolerant parsing + multi-pass compilation
 //!
-//! **Unique combination**: Compiler techniques + knowledge management + hypergraph structures in a single library.
+//! **Unique combination**: Compiler techniques + knowledge management + multigraph structures in a single library.
 //!
 //! See `docs/architecture.md` for detailed comparisons.
 //!
@@ -234,6 +235,8 @@
 //! for graph operations. See [`properties`] for understanding node and edge types.
 
 pub mod beliefbase;
+#[cfg(all(feature = "bin", not(target_arch = "wasm32")))]
+pub mod cli;
 pub mod codec;
 #[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod commands;
@@ -241,8 +244,16 @@ pub mod commands;
 pub mod config;
 #[cfg(all(feature = "service", not(target_arch = "wasm32")))]
 pub mod db;
+#[cfg(all(feature = "service", not(target_arch = "wasm32")))]
+pub mod dev_server;
+#[cfg(all(feature = "bin", not(target_arch = "wasm32")))]
+pub mod distribute;
 pub mod error;
 pub mod event;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod layout;
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub mod mcp;
 pub mod nodekey;
 pub mod paths;
 pub mod properties;

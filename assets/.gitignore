@@ -11,6 +11,8 @@ package-lock.json
 
 # Keep vendored assets (these are committed)
 !open-props/
+!katex/
+!katex/fonts/
 !*.css
 !*.js
 !viewer.js

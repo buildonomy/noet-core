@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{TITLE}}</title>
+        <link rel="canonical" href="{{CANONICAL}}" />
+        {{SCRIPTS}}
+        <script src="{{ASSET_PREFIX}}assets/viewer/xlsx-tabs.js"></script>
+    </head>
+    <body data-document-bid="{{BID}}">
+        <nav class="spa-upgrade">
+            <a href="{{SPA_ROUTE}}">📱 View Interactive Version</a>
+            <a
+                id="noet-source-link"
+                href="{{SOURCE_LINK}}"
+                data-binary="{{SOURCE_BINARY}}"
+                target="_blank"
+                rel="noopener"
+                >📄 View Source</a
+            >
+        </nav>
+        <article>
+            <h1>{{WORKBOOK_TITLE}}</h1>
+            <nav class="xlsx-tab-nav" aria-label="Workbook tabs">
+                <ul>
+                    {{TABS_NAV}}
+                </ul>
+            </nav>
+            {{TAB_SECTIONS}}
+            <script type="application/json" id="noet-xlsx-data">
+                {{XLSX_DATA}}
+            </script>
+        </article>
+    </body>
+</html>

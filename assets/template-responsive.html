@@ -6,27 +6,169 @@
         <title>{{TITLE}}</title>
 
         <!-- Base URL for relative asset paths in SPA -->
-        <base href="/pages/" />
+        <base href="{{BASE_HREF}}" />
 
         <!-- Open Props Design Tokens -->
-        <link rel="stylesheet" href="/{{STYLESHEET_OPEN_PROPS}}" />
-        <link rel="stylesheet" href="/{{STYLESHEET_NORMALIZE}}" />
+        <link rel="stylesheet" href="{{STYLESHEET_OPEN_PROPS}}" />
+        <link rel="stylesheet" href="{{STYLESHEET_NORMALIZE}}" />
 
         <!-- Noet Themes -->
-        <link rel="stylesheet" href="/{{STYLESHEET_THEME_LIGHT}}" id="theme-light" />
-        <link rel="stylesheet" href="/{{STYLESHEET_THEME_DARK}}" id="theme-dark" disabled />
+        <link rel="stylesheet" href="{{STYLESHEET_THEME_LIGHT}}" id="theme-light" />
+        <link
+            rel="stylesheet"
+            href="{{STYLESHEET_THEME_DARK}}"
+            id="theme-dark"
+            disabled
+        />
 
-        <!-- Noet Layout -->
-        <link rel="stylesheet" href="/{{STYLESHEET_LAYOUT}}" />
+        <!-- Tabulator table library (vendored; MIT license) —
+             loaded BEFORE noet-layout so our theme overrides win by cascade order -->
+        <link rel="stylesheet" href="{{STYLESHEET_TABULATOR_CSS}}" />
+        <script defer src="{{SCRIPT_TABULATOR_JS}}"></script>
+
+        <!-- Noet Layout (must follow tabulator.min.css for theme overrides) -->
+        <link rel="stylesheet" href="{{STYLESHEET_LAYOUT}}" />
+
+        <!-- Mermaid diagram rendering (vendored; no external CDN dependency) -->
+        <!-- Mermaid is initialized in lazy mode so it does not auto-render on load.
+             noetRenderDiagrams() is called explicitly after each SPA document load
+             so that diagrams in dynamically injected content are also rendered. -->
+        <script defer src="{{SCRIPT_MERMAID_JS}}"></script>
+        <script>
+            function noetRenderDiagrams(root) {
+                if (typeof mermaid === "undefined") return;
+                var target = root || document;
+                // Select only unprocessed code blocks — mermaid sets data-processed="true"
+                // on elements it has already rendered, so re-running is safe.
+                var blocks = Array.from(
+                    target.querySelectorAll("code.language-mermaid"),
+                ).filter(function (el) {
+                    return el.closest("[data-processed]") === null;
+                });
+                if (blocks.length === 0) return;
+
+                // Promote each <code class="language-mermaid"> to a <div class="mermaid">
+                // that the mermaid runtime expects. The <pre><code> wrapper produced by
+                // pulldown-cmark is replaced with a plain <div> in-place.
+                blocks.forEach(function (code) {
+                    var pre = code.parentElement;
+                    var div = document.createElement("div");
+                    div.className = "mermaid";
+                    div.textContent = code.textContent;
+                    if (pre && pre.tagName === "PRE") {
+                        pre.parentNode.replaceChild(div, pre);
+                    } else {
+                        code.parentNode.replaceChild(div, code);
+                    }
+                });
+
+                mermaid.run({
+                    nodes: Array.from(
+                        target.querySelectorAll("div.mermaid:not([data-processed])"),
+                    ),
+                });
+            }
+            window.noetRenderDiagrams = noetRenderDiagrams;
+            document.addEventListener("DOMContentLoaded", function () {
+                if (typeof mermaid !== "undefined") {
+                    mermaid.initialize({ startOnLoad: false, theme: "neutral" });
+                }
+                noetRenderDiagrams(document.body);
+            });
+        </script>
+
+        <!-- Xlsx workbook tab switcher — loaded globally so it is available when
+             workbook pages are injected into the SPA via loadDocument(). -->
+        <script defer src="{{ASSET_PREFIX}}assets/viewer/xlsx-tabs.js"></script>
+
+        <!-- KaTeX math rendering (vendored; no external CDN dependency) -->
+        <!-- pulldown-cmark ENABLE_MATH emits pre-processed spans — auto-render
+             is not used. Instead we call katex.render() directly on each span. -->
+        <link rel="stylesheet" href="{{STYLESHEET_KATEX_CSS}}" />
+        <script defer src="{{SCRIPT_KATEX_JS}}"></script>
+        <script>
+            // Render all .math spans produced by pulldown-cmark's ENABLE_MATH output.
+            //
+            // pulldown-cmark converts:
+            //   $$...$$ → <span class="math math-display">raw LaTeX</span>
+            //   $...$   → <span class="math math-inline">raw LaTeX</span>
+            //
+            // katex.render() replaces the element's content in-place.
+            // Exposed as window.noetRenderMath so routing.js can re-run it
+            // after each SPA document load (new content injected into the DOM
+            // will contain unrendered .math spans).
+            function noetRenderMath(root) {
+                if (typeof katex === "undefined") return;
+                var target = root || document;
+                // Collect only unprocessed spans up front — KaTeX adds a .katex
+                // child when it renders, so this skip check is safe to do once.
+                var spans = Array.from(target.querySelectorAll("span.math")).filter(
+                    function (el) {
+                        return !el.querySelector(".katex");
+                    },
+                );
+                if (spans.length === 0) return;
+
+                // Render in chunks to avoid saturating the renderer process.
+                // A math-heavy page with 300+ spans expands the DOM by ~100x via
+                // katex.render() and can crash Chrome (renderer OOM / error 11).
+                // Yielding between chunks keeps the renderer alive and responsive.
+                // With server-side pre-rendering enabled (server-math feature), spans
+                // are already rendered by the build step and this function is a no-op.
+                var CHUNK_SIZE = 20;
+                var index = 0;
+
+                function renderChunk() {
+                    var end = Math.min(index + CHUNK_SIZE, spans.length);
+                    for (; index < end; index++) {
+                        var el = spans[index];
+                        var display = el.classList.contains("math-display");
+                        // Strip zero-width spaces (U+200B) — invisible copy-paste
+                        // artifacts that KaTeX cannot render and warns about.
+                        var tex = el.textContent.replace(/\u200b/g, "");
+                        try {
+                            katex.render(tex, el, {
+                                displayMode: display,
+                                // \begin{align}, \begin{matrix}, etc. are built into
+                                // KaTeX core — no separate amsmath extension file needed.
+                                throwOnError: false,
+                                trust: false,
+                            });
+                        } catch (e) {
+                            console.warn("[Noet] KaTeX render failed:", e.message, tex);
+                        }
+                    }
+                    if (index < spans.length) {
+                        if (typeof requestIdleCallback !== "undefined") {
+                            requestIdleCallback(renderChunk, { timeout: 500 });
+                        } else {
+                            setTimeout(renderChunk, 0);
+                        }
+                    }
+                }
+                renderChunk();
+            }
+            window.noetRenderMath = noetRenderMath;
+            document.addEventListener("DOMContentLoaded", function () {
+                noetRenderMath(document.body);
+            });
+        </script>
 
         <!-- Resize state: set CSS vars before first paint to avoid animated float on load -->
         <script>
             (function () {
-                var DEFAULTS = { navWidth: 280, metadataWidth: 320, contentMaxWidth: 720 };
+                var G = 16; // min gutter = --size-3 ≈ 16px
+                var DEFAULTS = {
+                    navWidth: 280,
+                    metadataWidth: 320,
+                    gutterLeft: G,
+                    gutterRight: G,
+                };
                 var LIMITS = {
                     navWidth: { min: 160, max: 520 },
                     metadataWidth: { min: 200, max: 560 },
-                    contentMaxWidth: { min: 320, max: 1200 },
+                    gutterLeft: { min: G, max: 600 },
+                    gutterRight: { min: G, max: 600 },
                 };
                 function clamp(v, l) {
                     return Math.max(l.min, Math.min(l.max, v));
@@ -35,17 +177,32 @@
                     var raw = localStorage.getItem("noet-resize-state");
                     var s = raw ? JSON.parse(raw) : {};
                     var nw = clamp(s.navWidth ?? DEFAULTS.navWidth, LIMITS.navWidth);
-                    var mw = clamp(s.metadataWidth ?? DEFAULTS.metadataWidth, LIMITS.metadataWidth);
-                    var cw = clamp(
-                        s.contentMaxWidth ?? DEFAULTS.contentMaxWidth,
-                        LIMITS.contentMaxWidth,
+                    var mw = clamp(
+                        s.metadataWidth ?? DEFAULTS.metadataWidth,
+                        LIMITS.metadataWidth,
+                    );
+                    var gl = clamp(
+                        s.gutterLeft ?? DEFAULTS.gutterLeft,
+                        LIMITS.gutterLeft,
+                    );
+                    var gr = clamp(
+                        s.gutterRight ?? DEFAULTS.gutterRight,
+                        LIMITS.gutterRight,
                     );
                     var root = document.documentElement;
                     root.style.setProperty("--noet-nav-width", nw + "px");
                     root.style.setProperty("--noet-metadata-width", mw + "px");
-                    root.style.setProperty("--noet-content-max-width", cw + "px");
+                    root.style.setProperty("--noet-gutter-left", gl + "px");
+                    root.style.setProperty("--noet-gutter-right", gr + "px");
                 } catch (e) {}
             })();
+        </script>
+
+        <!-- Base URL (for JS asset and page fetches).
+             Empty string means root-relative (default local serve).
+             Set to e.g. "https://example.github.io/repo" for subdirectory deployments. -->
+        <script type="application/json" id="noet-base-url">
+            "{{BASE_URL}}"
         </script>
 
         <!-- Document BID (for viewer.js entry point) -->
@@ -66,15 +223,8 @@
         <div class="noet-container">
             <!-- Left Navigation -->
             <nav class="noet-nav" id="nav-panel">
-                <button
-                    class="noet-resize-handle noet-resize-handle--nav"
-                    id="nav-resize"
-                    aria-label="Resize navigation panel"
-                    title="Drag to resize"
-                ></button>
                 <div class="noet-nav__content">
                     <div class="noet-nav-header">
-                        <h2>Navigation</h2>
                         <div class="noet-search-wrapper">
                             <input
                                 type="search"
@@ -97,9 +247,19 @@
                         <p class="noet-search-hint">Ctrl+K to focus</p>
                     </div>
                     <div id="nav-error" class="noet-error" hidden>
-                        <h3 class="noet-error__title">Navigation Error</h3>
-                        <p class="noet-error__message">Failed to load navigation data.</p>
-                        <button class="noet-error__action" onclick="window.location.reload()">
+                        <h3 class="noet-error__title" id="nav-error-title">
+                            Navigation Error
+                        </h3>
+                        <p class="noet-error__message" id="nav-error-message">
+                            Failed to load navigation data.
+                        </p>
+                        <!-- Populated by showNavError() when the cause is known.
+                             Stays hidden for causes we cannot explain. -->
+                        <p class="noet-error__detail" id="nav-error-detail" hidden></p>
+                        <button
+                            class="noet-error__action"
+                            onclick="window.location.reload()"
+                        >
                             Reload Page
                         </button>
                     </div>
@@ -112,27 +272,39 @@
 
             <!-- Main Content Area -->
             <main class="noet-content">
-                <div class="noet-content__inner">
-                    <article>{{CONTENT}}</article>
+                <div class="noet-content__layout">
+                    <div
+                        class="noet-gutter-handle noet-gutter-handle--left"
+                        aria-hidden="true"
+                        title="Drag to resize content"
+                    ></div>
+                    <div class="noet-content__inner">
+                        <nav
+                            class="noet-prev-next"
+                            id="prev-next-top"
+                            aria-label="Previous/next document"
+                            hidden
+                        ></nav>
+                        <article>{{CONTENT}}</article>
+                        <nav
+                            class="noet-prev-next"
+                            id="prev-next-bottom"
+                            aria-label="Previous/next document"
+                            hidden
+                        ></nav>
+                    </div>
+                    <div
+                        class="noet-gutter-handle noet-gutter-handle--right"
+                        aria-hidden="true"
+                        title="Drag to resize content"
+                    ></div>
                 </div>
-                <button
-                    class="noet-resize-handle noet-resize-handle--content"
-                    id="content-resize"
-                    aria-label="Resize content width"
-                    title="Drag to resize"
-                ></button>
             </main>
 
             <!-- Right Metadata Panel (collapsed by default) -->
             <div class="noet-metadata" id="metadata-panel">
-                <button
-                    class="noet-resize-handle noet-resize-handle--metadata"
-                    id="metadata-resize"
-                    aria-label="Resize metadata panel"
-                    title="Drag to resize"
-                ></button>
                 <div class="noet-metadata-header">
-                    <h2>Metadata</h2>
+                    <h2><span id="metadata-panel-title">Details</span></h2>
                 </div>
                 <div id="metadata-error" class="noet-error" hidden>
                     <h3 class="noet-error__title">Metadata Error</h3>
@@ -142,15 +314,32 @@
                     </button>
                 </div>
                 <div id="metadata-content" class="noet-metadata-content">
-                    <!-- Populated by viewer.js when node selected -->
+                    <p class="noet-placeholder">Loading…</p>
                 </div>
             </div>
+
+            <!-- Traceability side panel — slides in to the left of the metadata panel.
+                 Populated and shown/hidden by traceability.js.
+                 On desktop: fixed panel covering full viewport height, positioned
+                 immediately left of .noet-metadata.
+                 On mobile: moved inside .noet-metadata by JS and displayed as the
+                 bottom 70% of an expanded drawer. -->
+            <div
+                id="noet-focused-panel"
+                class="noet-focused-panel"
+                role="complementary"
+                aria-label="Focused view"
+            ></div>
 
             <!-- Graph Visualization Area (future: Step 4) -->
             <div class="noet-graph" id="graph-container" hidden>
                 <div class="noet-graph-header">
                     <h2>Graph View</h2>
-                    <button id="graph-close" class="noet-close-btn" aria-label="Close graph view">
+                    <button
+                        id="graph-close"
+                        class="noet-close-btn"
+                        aria-label="Close graph view"
+                    >
                         ×
                     </button>
                 </div>
@@ -172,7 +361,10 @@
                     >
                         <span class="noet-shard-tab__icon" aria-hidden="true">▲</span>
                         <span class="noet-shard-tab__label">Networks</span>
-                        <span class="noet-shard-tab__summary" id="shard-tab-summary"></span>
+                        <span
+                            class="noet-shard-tab__summary"
+                            id="shard-tab-summary"
+                        ></span>
                     </button>
                 </div>
                 <div class="noet-footer__theme">
@@ -183,14 +375,25 @@
                         <option value="dark">Dark</option>
                     </select>
                 </div>
+                <div class="noet-footer__banner">{{FOOTER_TEXT}}</div>
                 <p class="noet-footer__credit">
-                    Generated by <a href="https://github.com/buildonomy/noet-core">Noet</a>
+                    Generated by
+                    <a href="https://github.com/buildonomy/noet-core">Noet</a>
                 </p>
             </footer>
 
-            <!-- Mobile hamburger menu button -->
+            <!-- Mobile hamburger menu button (top-left) -->
             <button id="nav-toggle" class="noet-hamburger" aria-label="Toggle navigation">
                 ☰
+            </button>
+
+            <!-- Mobile metadata button (bottom-left) -->
+            <button
+                id="metadata-toggle"
+                class="noet-info-btn"
+                aria-label="Toggle metadata"
+            >
+                ⓘ
             </button>
 
             <!-- Collapse buttons (desktop only) - positioned outside panels -->
@@ -198,17 +401,41 @@
                 class="noet-nav__collapse"
                 id="nav-collapse"
                 aria-label="Collapse navigation panel"
+                title="Drag to resize, click to hide panel"
                 data-target="nav-panel"
             >
-                [
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="4"
+                    height="20"
+                    viewBox="0 0 4 20"
+                    aria-hidden="true"
+                    focusable="false"
+                >
+                    <circle cx="2" cy="4" r="1.5" fill="currentColor" />
+                    <circle cx="2" cy="10" r="1.5" fill="currentColor" />
+                    <circle cx="2" cy="16" r="1.5" fill="currentColor" />
+                </svg>
             </button>
             <button
                 class="noet-metadata__collapse"
                 id="metadata-collapse"
                 aria-label="Collapse metadata panel"
+                title="Drag to resize, click to hide panel"
                 data-target="metadata-panel"
             >
-                ]
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="4"
+                    height="20"
+                    viewBox="0 0 4 20"
+                    aria-hidden="true"
+                    focusable="false"
+                >
+                    <circle cx="2" cy="4" r="1.5" fill="currentColor" />
+                    <circle cx="2" cy="10" r="1.5" fill="currentColor" />
+                    <circle cx="2" cy="16" r="1.5" fill="currentColor" />
+                </svg>
             </button>
         </div>
 
@@ -227,20 +454,38 @@
             <!-- Populated by network-selector.js after WASM init -->
         </div>
 
-        <!-- Viewer Script -->
-        <script type="module" src="/assets/viewer.js"></script>
+        <!-- Viewer Script — ?v= busts the browser module-specifier cache when
+             beliefbase content (and thus the asset version token) changes.
+             Because viewer.js uses static ES module imports for viewer/*.js,
+             those submodules are also re-fetched when this URL changes. -->
+        <script
+            type="module"
+            src="{{ASSET_PREFIX}}assets/viewer.js?v={{ASSET_VERSION}}"
+        ></script>
 
         <!-- Toggle panel behavior for mobile/tablet -->
         <script>
             (function () {
                 const navPanel = document.getElementById("nav-panel");
+                const metadataPanel = document.getElementById("metadata-panel");
                 const backdrop = document.getElementById("backdrop");
                 const navToggle = document.getElementById("nav-toggle");
+                const metadataToggle = document.getElementById("metadata-toggle");
 
                 // Toggle navigation panel
                 if (navToggle) {
                     navToggle.addEventListener("click", function () {
+                        if (metadataPanel) metadataPanel.classList.remove("is-open");
                         navPanel.classList.toggle("is-open");
+                        backdrop.classList.toggle("is-visible");
+                    });
+                }
+
+                // Toggle metadata panel
+                if (metadataToggle && metadataPanel) {
+                    metadataToggle.addEventListener("click", function () {
+                        navPanel.classList.remove("is-open");
+                        metadataPanel.classList.toggle("is-open");
                         backdrop.classList.toggle("is-visible");
                     });
                 }
@@ -248,6 +493,7 @@
                 // Close panels when clicking backdrop
                 backdrop.addEventListener("click", function () {
                     navPanel.classList.remove("is-open");
+                    if (metadataPanel) metadataPanel.classList.remove("is-open");
                     backdrop.classList.remove("is-visible");
                 });
             })();

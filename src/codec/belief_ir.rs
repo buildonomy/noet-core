@@ -4,7 +4,7 @@ use crate::{
     error::BuildonomyError,
     nodekey::NodeKey,
     paths::to_anchor,
-    properties::{BeliefKindSet, BeliefNode, Bref, Weight, WeightKind},
+    properties::{BeliefKindSet, BeliefNode, Bid, Bref, NodeId, Weight, WeightKind},
 };
 
 use std::{mem::replace, ops::Deref, str::FromStr};
@@ -123,6 +123,31 @@ fn parse_yaml_to_document(yaml_str: &str) -> Result<DocumentMut, BuildonomyError
 }
 
 /// Convert JSON value to TOML string
+/// Convert a `toml::Value` to a `serde_json::Value`.
+///
+/// This is the canonical implementation shared by `wasm.rs::extract_node_context`
+/// and `mcp::tools`. The inverse direction is [`json_value_to_toml_value`].
+#[cfg(feature = "mcp")]
+pub(crate) fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
+    match v {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect())
+        }
+        toml::Value::Table(t) => serde_json::Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+                .collect(),
+        ),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+    }
+}
+
 fn json_to_toml_string(json: &serde_json::Value) -> Result<String, BuildonomyError> {
     // Convert JSON to TOML via toml::Value
     let toml_value = json_value_to_toml_value(json)?;
@@ -170,7 +195,7 @@ fn json_value_to_toml_value(json: &serde_json::Value) -> Result<toml::Value, Bui
 }
 
 /// Parse content with format preference and three-way fallback
-fn parse_with_fallback(
+pub(crate) fn parse_with_fallback(
     content: &str,
     primary: MetadataFormat,
 ) -> Result<DocumentMut, BuildonomyError> {
@@ -254,6 +279,11 @@ fn parse_with_fallback(
 pub struct IntermediateRelation {
     /// The key identifying the other node in this relation.
     pub key: NodeKey,
+    /// Additional keys to try if the primary key fails to resolve.
+    /// These are appended to the cache_fetch key list after the primary key
+    /// (and any proximity-narrowed variants). Used by wikilinks to add a
+    /// relative-path fallback alongside the primary Id key.
+    pub fallback_keys: Vec<NodeKey>,
     /// The weight kind (edge type) of this relation.
     pub kind: WeightKind,
     /// Optional weight payload (e.g., title text, sort data).
@@ -269,16 +299,46 @@ impl IntermediateRelation {
     pub fn new(key: NodeKey, kind: WeightKind, weight: Option<Weight>) -> Self {
         Self {
             key,
+            fallback_keys: Vec::new(),
             kind,
             weight,
             location: None,
         }
     }
 
+    pub fn with_fallback_keys(mut self, keys: Vec<NodeKey>) -> Self {
+        self.fallback_keys = keys;
+        self
+    }
+
     pub fn with_location(mut self, byte_offset: usize) -> Self {
         self.location = Some(byte_offset);
         self
     }
+}
+
+/// Represents a `{maps_to}` directive parsed from a section node.
+/// The owning section node will have `WEIGHT_OWNED_BY` set to its bref in each emitted edge.
+///
+/// Both `sources` and `sinks` accept either a single node key string or an array of node key
+/// strings in the directive body (field names are `source` and `sink` respectively). One edge
+/// is emitted for every element of the Cartesian product `sources × sinks`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntermediateMappingRelation {
+    /// The source endpoints of the mapping edges (resolved from "source" field in directive body,
+    /// which may be a single string or an array). In noet semantics, sources are the more
+    /// abstract/parent nodes (e.g. requirements).
+    pub sources: Vec<NodeKey>,
+    /// The sink endpoints of the mapping edges (resolved from "sink" field in directive body,
+    /// which may be a single string or an array). In noet semantics, sinks are the more
+    /// concrete/child nodes (e.g. implementors).
+    pub sinks: Vec<NodeKey>,
+    /// The weight kind for the edges (from info-string arg or "weight_kind" body field).
+    pub kind: WeightKind,
+    /// Extra payload fields from the directive body (all keys except source, sink, weight_kind).
+    pub weight: Option<Weight>,
+    /// Byte offset of the directive in the source document, for diagnostics.
+    pub location: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -298,6 +358,30 @@ pub struct IRNode {
     /// in the source file. Populated by MdCodec during parsing. Used to construct
     /// `#L<n>` source backlinks. `None` when the codec does not track line numbers.
     pub source_line: Option<usize>,
+    pub mappings: Vec<IntermediateMappingRelation>,
+    /// Additional paths under which this node should be registered in the
+    /// parent network's PathMap.  Each alias creates an additional PathMap
+    /// entry pointing to the same BID.  Used by codecs that need a node
+    /// to be findable under synthetic paths (e.g. C++ include-convention
+    /// paths, derived header filenames from YAML code generation).
+    ///
+    /// These are network-relative paths (same scope as `WEIGHT_DOC_PATHS`).
+    /// `push()` appends them to the Section edge's `doc_paths` weight.
+    pub path_aliases: Vec<String>,
+    /// Additional namespaces under which this node should be registered via
+    /// secondary index PathMaps. Each entry is `(namespace_bid, alias_path)`:
+    /// the codec-registered namespace's BID (from `Bid::codec_namespace(term)`)
+    /// and the path under which this node should be findable in that namespace.
+    ///
+    /// Unlike `path_aliases` (which register in the node's home network PathMap),
+    /// namespace paths register in a separate, cross-network PathMap identified
+    /// by the namespace BID.  This enables cross-network resolution — e.g. a
+    /// C++ `#include <target/Header.h>` edge can resolve against the "include"
+    /// namespace without knowing the target's home network.
+    ///
+    /// `push()` processes these by lazily creating the namespace network node
+    /// and emitting `RelationChange` events to populate the namespace's PathMap.
+    pub namespace_paths: Vec<(Bid, String)>,
 }
 
 impl PartialEq for IRNode {
@@ -309,28 +393,40 @@ impl PartialEq for IRNode {
             && self.kind.eq(&other.kind)
             && self.upstream.eq(&other.upstream)
             && self.downstream.eq(&other.downstream)
+            && self.mappings.eq(&other.mappings)
         // source_line intentionally excluded: positional parse-time info, not structural identity
     }
 }
-
-// impl Eq for BeliefBase {}
 
 impl IRNode {
     pub fn id(&self) -> Option<String> {
         // Mirror BeliefNode::id(): prefer explicit document["id"], fall back to to_anchor(title).
         // An empty string id is a sentinel meaning "collision detected — suppress title fallback".
         // We must check for the sentinel first to short-circuit before the title fallback runs.
-        match self.document.get("id").and_then(|v| v.as_str()) {
-            Some("") => None, // collision sentinel: suppress title fallback entirely
-            Some(explicit) => Some(explicit.to_string()),
-            None => {
-                let slug = to_anchor(self.title().as_deref().unwrap_or(""));
-                if slug.is_empty() {
-                    None
-                } else {
-                    Some(slug)
-                }
+        let raw = self.document.get("id");
+        // Check for empty-string sentinel first (collision suppression).
+        if raw.and_then(|v| v.as_str()) == Some("") {
+            return None;
+        }
+        // Coerce any non-string scalar to string before falling back to title slug.
+        if let Some(val) = raw {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_string());
             }
+            if let Some(n) = val.as_integer() {
+                return Some(n.to_string());
+            }
+            if let Some(f) = val.as_float() {
+                return Some(f.to_string());
+            }
+            return Some(format!("{val:?}"));
+        }
+        // No id field at all — fall back to title slug.
+        let slug = to_anchor(self.title().as_deref().unwrap_or(""));
+        if slug.is_empty() {
+            None
+        } else {
+            Some(slug)
         }
     }
 
@@ -400,6 +496,11 @@ impl IRNode {
             changed = true;
         }
 
+        if !other.namespace_paths.is_empty() {
+            self.namespace_paths.append(&mut other.namespace_paths);
+            changed = true;
+        }
+
         changed
     }
 
@@ -423,9 +524,13 @@ impl IRNode {
         &mut self,
         ctx: &BeliefContext<'_>,
     ) -> Result<Option<BeliefNode>, BuildonomyError> {
-        // `metadata` is runtime-only and must never enter IRNode.document (source files).
-        // The strip is handled unconditionally inside TryFrom<&BeliefNode> for IRNode.
-        let mut changed = self.merge(&mut IRNode::try_from(ctx.node)?);
+        // Compare BeliefNode fields directly against the proto's TOML document rather than
+        // going through IRNode::try_from(ctx.node) → to_string(BeliefNode) → from_str.
+        // That round-trip introduces TOML formatting artifacts (e.g. a leading space before
+        // string values: ` "Title"` vs `"Title"`) that cause spurious `changed = true` on
+        // every inject_context call, even when the field values are semantically identical.
+        // Direct field comparison is both correct and avoids the serialization cost.
+        let mut changed = self.merge_from_belief_node(ctx.node);
         // Only update path from context for section nodes (heading > 2)
         // Document nodes already have correct path from IRNode::new()
         // Section nodes need path from PathMap because they don't have independent file paths
@@ -441,6 +546,76 @@ impl IRNode {
         } else {
             Ok(None)
         }
+    }
+
+    /// Compare and update this IRNode's document fields against the canonical values from a
+    /// `BeliefNode`, without going through TOML string serialization. Returns `true` if any
+    /// field was updated.
+    ///
+    /// Only touches fields that are actually present on `BeliefNode` and relevant to source
+    /// files: `bid`, `title`, `id`, `kind`. `schema` and `payload` are left to the
+    /// existing per-file frontmatter — they are not part of the runtime `BeliefNode` state
+    /// that `inject_context` needs to propagate back.
+    fn merge_from_belief_node(&mut self, node: &BeliefNode) -> bool {
+        let mut changed = false;
+
+        // bid
+        let bid_str = node.bid.to_string();
+        let proto_bid = self
+            .document
+            .get("bid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if proto_bid.as_deref() != Some(&bid_str) {
+            self.document.insert("bid", value(bid_str));
+            changed = true;
+        }
+
+        // title — only update when ctx has a non-empty title that differs
+        if !node.title.is_empty() {
+            let proto_title = self
+                .document
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if proto_title.as_deref() != Some(&node.title) {
+                self.document.insert("title", value(node.title.clone()));
+                changed = true;
+            }
+        }
+
+        // id — only write when the proto has no id from source parsing.
+        //
+        // `update_from_context` (which calls this function) runs BEFORE inject_context's
+        // heading-specific id logic reads `proto.document["id"]` as the authoritative
+        // source-local id. If we wrote a stale cached bref here (e.g. from global_bb's
+        // first-one-wins collision record), inject_context would read that bref as the
+        // source-parsed id, producing a wrong [sections."id://bref"] key in finalize().
+        //
+        // Safe cases where we DO write:
+        //   - proto has no id at all (None) — id was just assigned, needs persisting.
+        //
+        // Cases where we must NOT write:
+        //   - proto already has an id from source parsing (Some) — leave it for inject_context.
+        if let NodeId::Explicit(ref node_id) = node.id {
+            let proto_id = self
+                .document
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if proto_id.is_none() {
+                self.document.insert("id", value(node_id.clone()));
+                changed = true;
+            }
+        }
+
+        // kind — compare as BeliefKindSet; only write when it differs
+        if self.kind != node.kind {
+            self.kind = self.kind.union(node.kind.0).into();
+            changed = true;
+        }
+
+        changed
     }
 
     /// Updates the schema-defined fields in the TOML document based on BeliefContext relationships.
@@ -641,6 +816,19 @@ impl IRNode {
                 }
             }
         }
+        // Extract url_aliases frontmatter field → populate namespace_paths
+        // as (href_namespace(), alias) per entry. These register the node in the
+        // href PathMap so that URL links to these aliases resolve to this node.
+        if let Some(aliases) = proto.document.get("url_aliases").and_then(|v| v.as_array()) {
+            for alias_val in aliases {
+                if let Some(alias) = alias_val.as_str() {
+                    proto
+                        .namespace_paths
+                        .push((crate::properties::href_namespace(), alias.to_string()));
+                }
+            }
+        }
+
         Ok(proto)
     }
 }
@@ -680,6 +868,49 @@ impl TryFrom<&BeliefNode> for IRNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_yaml_whitelist_array_survives_irnode_parse() {
+        // Verifies that YAML-format frontmatter with an array value (as commonly
+        // used in network index files) round-trips correctly through IRNode::from_str
+        // so that prepare_proto_relations and NetworkCodec::parse can read whitelist/blacklist.
+        let frontmatter = "id: vast-horizon\ntitle: \"Test\"\nwhitelist: [\"docs/**\", \"src/**\"]";
+        let node = IRNode::from_str(frontmatter).expect("YAML IRNode parse failed");
+        let wl = node.document.get("whitelist");
+        assert!(
+            wl.is_some(),
+            "whitelist key absent from document after YAML parse"
+        );
+        let arr = wl.unwrap().as_array();
+        assert!(
+            arr.is_some(),
+            "whitelist is not an array in DocumentMut: {:?}",
+            wl
+        );
+        let items: Vec<&str> = arr.unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            items,
+            vec!["docs/**", "src/**"],
+            "whitelist items incorrect after YAML→TOML round-trip: {:?}",
+            items
+        );
+    }
+
+    #[test]
+    fn test_yaml_blacklist_array_survives_irnode_parse() {
+        let frontmatter =
+            "id: test\ntitle: \"Test\"\nblacklist: [\"generated/**\", \"scratch/**\"]";
+        let node = IRNode::from_str(frontmatter).expect("YAML IRNode parse failed");
+        let bl = node.document.get("blacklist");
+        assert!(
+            bl.is_some(),
+            "blacklist key absent from document after YAML parse"
+        );
+        let arr = bl.unwrap().as_array();
+        assert!(arr.is_some(), "blacklist is not an array: {:?}", bl);
+        let items: Vec<&str> = arr.unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(items, vec!["generated/**", "scratch/**"]);
+    }
 
     #[test]
     fn test_parse_json_format() {
@@ -869,6 +1100,61 @@ title: "YAML First Test"
         assert_eq!(
             proto.document.get("bid").and_then(|v| v.as_str()),
             Some("yaml-test")
+        );
+    }
+
+    #[test]
+    fn test_url_aliases_populates_namespace_paths() {
+        let content = r#"title = "Test Node"
+url_aliases = ["https://example.com/browse/X-1", "/docs/some-page"]"#;
+        let node = IRNode::from_str(content).expect("parse failed");
+        assert_eq!(
+            node.namespace_paths.len(),
+            2,
+            "Should have 2 namespace_paths entries"
+        );
+        let href_ns = crate::properties::href_namespace();
+        for (ns_bid, _alias) in &node.namespace_paths {
+            assert_eq!(*ns_bid, href_ns, "All aliases should target href_namespace");
+        }
+        assert_eq!(node.namespace_paths[0].1, "https://example.com/browse/X-1");
+        assert_eq!(node.namespace_paths[1].1, "/docs/some-page");
+    }
+
+    #[test]
+    fn test_url_aliases_round_trips_in_frontmatter() {
+        let content = r#"title = "Test Node"
+url_aliases = ["https://example.com/browse/X-1"]"#;
+        let node = IRNode::from_str(content).expect("parse failed");
+        let frontmatter = node.as_frontmatter();
+        assert!(
+            frontmatter.contains("url_aliases"),
+            "url_aliases should survive in frontmatter output: {frontmatter}"
+        );
+        assert!(
+            frontmatter.contains("https://example.com/browse/X-1"),
+            "alias URL should survive in frontmatter output: {frontmatter}"
+        );
+    }
+
+    #[test]
+    fn test_url_aliases_empty_array() {
+        let content = r#"title = "Test Node"
+url_aliases = []"#;
+        let node = IRNode::from_str(content).expect("parse failed");
+        assert!(
+            node.namespace_paths.is_empty(),
+            "Empty url_aliases should produce no namespace_paths"
+        );
+    }
+
+    #[test]
+    fn test_url_aliases_absent() {
+        let content = r#"title = "Test Node""#;
+        let node = IRNode::from_str(content).expect("parse failed");
+        assert!(
+            node.namespace_paths.is_empty(),
+            "Missing url_aliases should produce no namespace_paths"
         );
     }
 }

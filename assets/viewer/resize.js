@@ -1,14 +1,17 @@
 /**
- * viewer/resize.js — Draggable resize handles for nav, metadata, and content panels
+ * viewer/resize.js — Resize/collapse handles for panels and content gutters
  *
- * Three handles (desktop only, min-width 1024px):
+ * Panel collapse buttons (#nav-collapse, #metadata-collapse):
+ *   Short click (< DRAG_THRESHOLD px) → toggles collapse.
+ *   Drag (≥ DRAG_THRESHOLD px) → resizes the panel width.
  *
- *   nav handle      (#nav-resize)      — drag horizontally to change --noet-nav-width
- *   metadata handle (#metadata-resize) — drag horizontally to change --noet-metadata-width
- *   content handle  (#content-resize)  — drag horizontally to change --noet-content-max-width
+ * Content gutter handles (.noet-content__inner ::before/::after):
+ *   Drag the left/right edge of the content paper to adjust the gutter
+ *   width between the panel and the content.
  *
- * Widths are applied as CSS custom properties on document.documentElement so that
- * all rules using var(--noet-nav-width, …) etc. pick them up automatically.
+ * Panel widths and gutter sizes are applied as CSS custom properties on
+ * document.documentElement. Content layout is driven by CSS calc() rules
+ * that consume these variables.
  *
  * State is persisted to localStorage under "noet-resize-state".
  */
@@ -19,23 +22,30 @@
 
 const STORAGE_KEY = "noet-resize-state";
 
+// Minimum gutter matches CSS --noet-panel-gutter (--size-3 ≈ 16px)
+const MIN_GUTTER = 16;
+
 const DEFAULTS = {
   navWidth: 280, // px
   metadataWidth: 320, // px
-  contentMaxWidth: 720, // px  (45rem at 16px base)
+  gutterLeft: MIN_GUTTER, // px
+  gutterRight: MIN_GUTTER, // px
 };
 
 const LIMITS = {
   navWidth: { min: 160, max: 520 },
   metadataWidth: { min: 200, max: 560 },
-  contentMaxWidth: { min: 320, max: 1200 },
+  gutterLeft: { min: MIN_GUTTER, max: 600 },
+  gutterRight: { min: MIN_GUTTER, max: 600 },
 };
+
+const DRAG_THRESHOLD = 4; // px — movement below this is treated as a click
 
 // =============================================================================
 // State
 // =============================================================================
 
-/** @type {{ navWidth: number, metadataWidth: number, contentMaxWidth: number }} */
+/** @type {{ navWidth: number, metadataWidth: number, gutterLeft: number, gutterRight: number }} */
 let sizes = { ...DEFAULTS };
 
 // =============================================================================
@@ -49,10 +59,14 @@ function loadSizes() {
       const parsed = JSON.parse(raw);
       sizes = {
         navWidth: clamp(parsed.navWidth ?? DEFAULTS.navWidth, LIMITS.navWidth),
-        metadataWidth: clamp(parsed.metadataWidth ?? DEFAULTS.metadataWidth, LIMITS.metadataWidth),
-        contentMaxWidth: clamp(
-          parsed.contentMaxWidth ?? DEFAULTS.contentMaxWidth,
-          LIMITS.contentMaxWidth,
+        metadataWidth: clamp(
+          parsed.metadataWidth ?? DEFAULTS.metadataWidth,
+          LIMITS.metadataWidth,
+        ),
+        gutterLeft: clamp(parsed.gutterLeft ?? DEFAULTS.gutterLeft, LIMITS.gutterLeft),
+        gutterRight: clamp(
+          parsed.gutterRight ?? DEFAULTS.gutterRight,
+          LIMITS.gutterRight,
         ),
       };
     }
@@ -77,7 +91,8 @@ function applySizes() {
   const root = document.documentElement;
   root.style.setProperty("--noet-nav-width", `${sizes.navWidth}px`);
   root.style.setProperty("--noet-metadata-width", `${sizes.metadataWidth}px`);
-  root.style.setProperty("--noet-content-max-width", `${sizes.contentMaxWidth}px`);
+  root.style.setProperty("--noet-gutter-left", `${sizes.gutterLeft}px`);
+  root.style.setProperty("--noet-gutter-right", `${sizes.gutterRight}px`);
 }
 
 // =============================================================================
@@ -98,40 +113,99 @@ function isDesktop() {
 // =============================================================================
 
 /**
- * Attach pointer-drag resize behaviour to a single handle element.
+ * Attach unified drag+click behaviour to a collapse button.
  *
- * @param {HTMLElement} handle      - The draggable button element
- * @param {"nav"|"metadata"|"content"} kind
+ * Short click (pointer moves < DRAG_THRESHOLD px): calls onShortClick().
+ * Drag (pointer moves >= DRAG_THRESHOLD px): resizes via panel width delta.
+ *
+ * @param {HTMLElement} handle
+ * @param {"nav"|"metadata"} kind
+ * @param {() => void} onShortClick  — called on short click
  */
-function attachDragHandler(handle, kind) {
+function attachCollapseResizeHandler(handle, kind, onShortClick) {
   let startX = 0;
   let startSize = 0;
+  let didDrag = false;
 
   function onPointerMove(e) {
     const dx = e.clientX - startX;
-    let next;
+    if (!didDrag && Math.abs(dx) < DRAG_THRESHOLD) return;
+    didDrag = true;
 
+    let next;
     if (kind === "nav") {
-      // Dragging right → wider nav
       next = clamp(startSize + dx, LIMITS.navWidth);
       sizes.navWidth = next;
-    } else if (kind === "metadata") {
-      // Dragging left → wider metadata (handle is on the left edge of the panel)
+    } else {
       next = clamp(startSize - dx, LIMITS.metadataWidth);
       sizes.metadataWidth = next;
-    } else {
-      // content: handle is on the right edge of content__inner
-      // dragging right → wider content area (increase max-width)
-      // We track viewport-relative position: wider when pointer moves right
-      next = clamp(startSize + dx, LIMITS.contentMaxWidth);
-      sizes.contentMaxWidth = next;
     }
-
     applySizes();
   }
 
   function onPointerUp(e) {
     handle.classList.remove("is-dragging");
+    document.documentElement.classList.remove("is-resizing");
+    handle.releasePointerCapture(e.pointerId);
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+
+    if (!didDrag) {
+      onShortClick();
+    } else {
+      saveSizes();
+    }
+  }
+
+  handle.addEventListener("pointerdown", (e) => {
+    if (!isDesktop()) return;
+    e.preventDefault();
+
+    startX = e.clientX;
+    startSize = kind === "nav" ? sizes.navWidth : sizes.metadataWidth;
+    didDrag = false;
+
+    handle.classList.add("is-dragging");
+    document.documentElement.classList.add("is-resizing");
+    handle.setPointerCapture(e.pointerId);
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+
+    // Suppress the synthetic click event so the existing click handler
+    // on this button doesn't double-fire on short press.
+    // (e.preventDefault() on pointerdown does NOT suppress click in browsers.)
+    handle.addEventListener(
+      "click",
+      function suppressClick(e) {
+        e.stopImmediatePropagation();
+        handle.removeEventListener("click", suppressClick);
+      },
+      { capture: true },
+    );
+  });
+}
+
+/**
+ * Attach drag behaviour to an existing gutter handle element.
+ *
+ * @param {HTMLElement} handle — the .noet-gutter-handle element
+ * @param {"left"|"right"} side
+ * @param {"gutterLeft"|"gutterRight"} sizeKey
+ */
+function attachGutterHandleDrag(handle, side, sizeKey) {
+  const limit = sizeKey === "gutterLeft" ? LIMITS.gutterLeft : LIMITS.gutterRight;
+
+  let startX = 0;
+  let startSize = 0;
+
+  function onPointerMove(e) {
+    const dx = e.clientX - startX;
+    const delta = side === "left" ? dx : -dx;
+    sizes[sizeKey] = clamp(startSize + delta, limit);
+    applySizes();
+  }
+
+  function onPointerUp(e) {
     document.documentElement.classList.remove("is-resizing");
     handle.releasePointerCapture(e.pointerId);
     document.removeEventListener("pointermove", onPointerMove);
@@ -144,19 +218,45 @@ function attachDragHandler(handle, kind) {
     e.preventDefault();
 
     startX = e.clientX;
-    startSize =
-      kind === "nav"
-        ? sizes.navWidth
-        : kind === "metadata"
-          ? sizes.metadataWidth
-          : sizes.contentMaxWidth;
+    startSize = sizes[sizeKey];
 
-    handle.classList.add("is-dragging");
     document.documentElement.classList.add("is-resizing");
     handle.setPointerCapture(e.pointerId);
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
     document.addEventListener("pointermove", onPointerMove);
     document.addEventListener("pointerup", onPointerUp);
   });
+}
+
+// =============================================================================
+// Gutter absorption on panel collapse/expand
+// =============================================================================
+
+/**
+ * Absorb a panel's width into the corresponding gutter so content doesn't
+ * reflow when the panel collapses. On expand, subtract the panel width back
+ * out (clamped to MIN_GUTTER).
+ *
+ * @param {"nav"|"metadata"} panel
+ * @param {boolean} collapsed — true if the panel is now collapsed
+ */
+export function adjustGutterForCollapse(panel, collapsed) {
+  if (panel === "nav") {
+    if (collapsed) {
+      sizes.gutterLeft = sizes.gutterLeft + sizes.navWidth;
+    } else {
+      sizes.gutterLeft = Math.max(MIN_GUTTER, sizes.gutterLeft - sizes.navWidth);
+    }
+  } else {
+    if (collapsed) {
+      sizes.gutterRight = sizes.gutterRight + sizes.metadataWidth;
+    } else {
+      sizes.gutterRight = Math.max(MIN_GUTTER, sizes.gutterRight - sizes.metadataWidth);
+    }
+  }
+  applySizes();
+  saveSizes();
 }
 
 // =============================================================================
@@ -164,18 +264,32 @@ function attachDragHandler(handle, kind) {
 // =============================================================================
 
 /**
- * Initialise all three resize handles.
- * Safe to call before the WASM/nav tree is loaded — only touches the DOM.
+ * Initialise all resize/collapse handles.
+ *
+ * Accepts toggle callbacks from viewer.js to avoid a circular import between
+ * resize.js and panels.js.
+ *
+ * @param {{ toggleNav: () => void, toggleMetadata: () => void }} toggles
  */
-export function initResizeHandles() {
-  const navHandle = document.getElementById("nav-resize");
-  const metadataHandle = document.getElementById("metadata-resize");
-  const contentHandle = document.getElementById("content-resize");
+export function initResizeHandles(toggles) {
+  const navCollapse = document.getElementById("nav-collapse");
+  const metadataCollapse = document.getElementById("metadata-collapse");
+  const gutterLeft = document.querySelector(".noet-gutter-handle--left");
+  const gutterRight = document.querySelector(".noet-gutter-handle--right");
 
   loadSizes();
   applySizes();
 
-  if (navHandle) attachDragHandler(navHandle, "nav");
-  if (metadataHandle) attachDragHandler(metadataHandle, "metadata");
-  if (contentHandle) attachDragHandler(contentHandle, "content");
+  if (navCollapse) {
+    attachCollapseResizeHandler(navCollapse, "nav", toggles.toggleNav);
+  }
+  if (metadataCollapse) {
+    attachCollapseResizeHandler(metadataCollapse, "metadata", toggles.toggleMetadata);
+  }
+  if (gutterLeft) {
+    attachGutterHandleDrag(gutterLeft, "left", "gutterLeft");
+  }
+  if (gutterRight) {
+    attachGutterHandleDrag(gutterRight, "right", "gutterRight");
+  }
 }

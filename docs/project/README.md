@@ -8,6 +8,7 @@ This directory contains issues, roadmaps, and planning documents for `noet-core`
 docs/project/
 ├── README.md                    # This file - workflow documentation
 ├── BACKLOG.md                   # Optional enhancements, extracted from completed issues
+├── LESSONS_LEARNED.md           # Durable failure modes and diagnostic patterns
 ├── ROADMAP*.md                  # Version-specific and feature-specific roadmaps
 ├── ISSUE_*.md                   # Active issues (in progress or planned)
 ├── completed/                   # Completed and resolved issues
@@ -15,6 +16,23 @@ docs/project/
 └── trades/                      # Trade studies (architectural alternatives analysis)
     └── *.md                     # Decision documents for complex choices
 ```
+
+## `LESSONS_LEARNED.md`
+
+A cross-cutting register of failure modes, diagnostic techniques, and design
+constraints that transfer beyond the issue that produced them. It records
+*mechanisms*, not events — "a CPU-bound task with no yield points starves a
+single-threaded runtime, and the symptom looks like lock contention" rather
+than "fixed the slowdown in commit abc123".
+
+**When closing an issue**, ask whether it produced a lesson that would save
+someone else time, and add it. Debugging sessions that took disproportionately
+long relative to the size of the fix are the usual source — the cost was in
+the diagnosis, and that is the part worth keeping.
+
+It is deliberately not a changelog: entries have no dates, no commit SHAs, and
+no status. They should read as advice to a future engineer who has not seen
+any of this history.
 
 ## Issue Resolution Process
 

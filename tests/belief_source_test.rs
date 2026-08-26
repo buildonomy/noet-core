@@ -18,17 +18,28 @@
 
 #![cfg(feature = "service")]
 
+use rustc_hash::FxHashMap;
 use sqlx::Row;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use tempfile::tempdir;
 use test_log::test;
 
 use noet_core::{
     beliefbase::{BeliefBase, BeliefGraph, BidGraph},
+    codec::DocumentCompiler,
     db::{db_init, DbConnection, Transaction},
+    event::BeliefEvent,
     properties::{buildonomy_namespace, BeliefNode, BeliefRelation, Bid, WeightKind, WeightSet},
-    query::{BeliefSource, Expression, RelationPred, StatePred},
+    query::{
+        spec::{QueryPackage, QuerySpec, TapeFn},
+        BeliefSource,
+    },
 };
+use tokio::sync::mpsc::unbounded_channel;
+
+#[path = "codec_test/common.rs"]
+mod common;
+use common::generate_test_root;
 
 /// Test that DbConnection and BeliefBase return identical results for the same queries
 ///
@@ -57,7 +68,7 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
     let section1_bid = Bid::new(doc1_bid);
     let section2_bid = Bid::new(doc1_bid);
 
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
 
     // Network node
     states.insert(
@@ -176,85 +187,204 @@ async fn test_belief_source_equivalence() -> Result<(), Box<dyn std::error::Erro
         "DB should contain same number of nodes as test_bb"
     );
 
-    // Now run equivalence tests on various query types
-    tracing::info!("Starting equivalence tests for various Expression types");
+    // Now run equivalence tests on various query types via evaluate()
+    tracing::info!("Starting equivalence tests for various query types");
 
-    // Test 1: Query all states
-    tracing::info!("Test 1: Expression::StateIn(StatePred::Any)");
-    let expr_all = Expression::StateIn(StatePred::Any);
-    let session_result = test_bb.eval_unbalanced(&expr_all).await?;
-    let db_result = db.eval_unbalanced(&expr_all).await?;
+    // Helper closure: run the same QuerySpec against both backends and return graphs
+    async fn eval_both(
+        bb: &BeliefBase,
+        db: &DbConnection,
+        spec: QuerySpec,
+    ) -> Result<(BeliefGraph, BeliefGraph), noet_core::BuildonomyError> {
+        let mut pkg_bb = QueryPackage::new(spec.clone());
+        bb.evaluate(&mut pkg_bb).await?;
+        let bb_graph = pkg_bb.into_graph();
 
-    assert_belief_graphs_equivalent(
-        &session_result,
-        &db_result,
-        "StateIn(Any) should return identical results",
-    );
+        let mut pkg_db = QueryPackage::new(spec);
+        db.evaluate(&mut pkg_db).await?;
+        let db_graph = pkg_db.into_graph();
 
-    // Test 2: Query specific BIDs
-    tracing::info!("Test 2: Expression::StateIn(StatePred::Bid(...))");
+        Ok((bb_graph, db_graph))
+    }
+
+    // Test 1: Query specific BIDs
+    tracing::info!("Test 1: TapeFn::Bids (specific BIDs)");
     let sample_bids = vec![doc1_bid, section1_bid, doc2_bid];
-    let expr_bids = Expression::StateIn(StatePred::Bid(sample_bids.clone()));
-    let session_result = test_bb.eval_unbalanced(&expr_bids).await?;
-    let db_result = db.eval_unbalanced(&expr_bids).await?;
-
+    let spec_bids = QuerySpec::seed(TapeFn::Bids(sample_bids.clone()));
+    let (session_result, db_result) = eval_both(&test_bb, &db, spec_bids).await?;
     assert_belief_graphs_equivalent(
         &session_result,
         &db_result,
-        &format!(
-            "StateIn(Bid({:?})) should return identical results",
-            sample_bids
-        ),
+        &format!("Bids({:?}) should return identical results", sample_bids),
     );
 
-    // Test 3: Query by schema
-    tracing::info!("Test 3: Expression::StateIn(StatePred::Schema(...))");
-    let doc_schema = "buildonomy.Document".to_string();
-    let expr_schema = Expression::StateIn(StatePred::Schema(doc_schema.clone()));
-    let session_result = test_bb.eval_unbalanced(&expr_schema).await?;
-    let db_result = db.eval_unbalanced(&expr_schema).await?;
-
+    // Test 2: Query all BIDs (export_beliefgraph equivalence)
+    tracing::info!("Test 2: export_beliefgraph");
+    let session_export = test_bb.export_beliefgraph().await?;
+    let db_export = db.export_beliefgraph().await?;
     assert_belief_graphs_equivalent(
-        &session_result,
-        &db_result,
-        &format!(
-            "StateIn(Schema({})) should return identical results",
-            doc_schema
-        ),
+        &session_export,
+        &db_export,
+        "export_beliefgraph should return identical results",
     );
 
-    // Test 4: Query relations
-    tracing::info!("Test 4: Expression::RelationIn(RelationPred::Any)");
-    let expr_relations = Expression::RelationIn(RelationPred::Any);
-    let session_result = test_bb.eval_unbalanced(&expr_relations).await?;
-    let db_result = db.eval_unbalanced(&expr_relations).await?;
-
-    assert_belief_graphs_equivalent(
-        &session_result,
-        &db_result,
-        "RelationIn(Any) should return identical results",
-    );
-
-    // Test 5: eval_trace
-    tracing::info!("Test 5: eval_trace with Subsection filter");
-    let session_trace = test_bb
-        .eval_trace(&expr_all, WeightSet::from(WeightKind::Section))
-        .await?;
-    let db_trace = db
-        .eval_trace(&expr_all, WeightSet::from(WeightKind::Section))
-        .await?;
-
-    assert_belief_graphs_equivalent(
-        &session_trace,
-        &db_trace,
-        "eval_trace should return identical results",
-    );
-
-    tracing::info!("All BeliefSource equivalence tests PASSED ✅");
+    tracing::info!("All BeliefSource equivalence tests PASSED \u{2705}");
     Ok(())
 }
 
-/// Helper function to assert two BeliefGraphs are equivalent
+/// Regression test: `DbConnection::submap_by_bid` must return a leaf document's
+/// own subtree (itself + its section children), matching `BeliefBase`'s behavior,
+/// when the entry BID is a leaf document nested inside a non-root network.
+///
+/// ## Background
+///
+/// `parse_epoch`'s per-document session pre-seeding (`compiler.rs`) calls
+/// `global_bb.submap_by_bid(net_bid, Some(doc_bid), 0, true)` before spawning each
+/// file's parse task, to warm `session_bb` with the document's own prior-epoch
+/// subtree and avoid expensive per-node `cache_fetch` fallbacks to `global_bb`
+/// during Phase 1. This only helps if the seed is non-empty.
+///
+/// `DbConnection::submap_by_bid` resolves the entry BID's own `(net, path)` via
+/// a `paths` table lookup, then re-feeds that leaf path into the free function
+/// `submap()`, which was written to walk a path that may descend through nested
+/// subnets (splitting on `/` and treating each segment as a child-network hop).
+/// For a leaf document whose own path contains no `/` (e.g. `"subnet1_file1.md"`),
+/// this walk treats the *whole filename* as a subnet-lookup key under the parent
+/// network, which — because a document's own bref never resolves as a `path`
+/// row under itself — resolves back to the *document's own BID* and recurses
+/// with `network_bid = doc_bid`. Ordinary (non-network) documents have no `paths`
+/// rows with `net = <their own bref>`, so the recursive `SELECT ... WHERE net = ?`
+/// silently returns zero rows, and `submap_by_bid` returns `Ok(vec![])` instead of
+/// the document's section subtree.
+///
+/// This is invisible for index.md / network-root documents (whose own BID *is*
+/// a legitimate network bref with real `paths` rows under it, so the buggy
+/// re-descent accidentally lands on real data) — which is why this bug went
+/// undetected: it only manifests for ordinary leaf documents nested one or more
+/// levels below the repo root.
+#[test(tokio::test)]
+async fn test_submap_by_bid_leaf_document_equivalence() -> Result<(), Box<dyn std::error::Error>> {
+    // `network_1` has `subnet1/subnet1_file1.md` — an ordinary leaf document
+    // (title "subnet1 file1") nested one level inside the `subnet1` subnet.
+    // This is exactly the shape that triggers the bug: a non-root, non-network
+    // document whose own path has no `/` segment.
+    let (_tmp, test_root) = generate_test_root("network_1")?;
+
+    // Parse into an in-memory BeliefBase (ground truth).
+    let mut bb_global = BeliefBase::empty();
+    let (tx_bb, mut rx_bb) = unbounded_channel::<BeliefEvent>();
+    let mut compiler_bb = DocumentCompiler::new(&test_root, Some(tx_bb), None, false)?;
+    compiler_bb
+        .parse_sequential(&mut bb_global, false, Some(&mut rx_bb))
+        .await?;
+    while let Ok(event) = rx_bb.try_recv() {
+        bb_global.process_event(&event)?;
+    }
+
+    // Parse the same fixture into a fresh file-backed DB (the buggy backend).
+    let test_tempdir = tempdir()?;
+    let db_path = test_tempdir.path().join("test_belief_cache.db");
+    let db_pool = db_init(db_path).await?;
+    let db = DbConnection(db_pool);
+    let (tx_db, mut rx_db) = unbounded_channel::<BeliefEvent>();
+    let mut compiler_db = DocumentCompiler::new(&test_root, Some(tx_db), None, false)?;
+    compiler_db
+        .parse_sequential(&mut db.clone(), false, Some(&mut rx_db))
+        .await?;
+    let mut transaction = Transaction::default();
+    while let Ok(event) = rx_db.try_recv() {
+        transaction.add_event(&event).ok();
+    }
+    transaction.execute(&db.0).await?;
+
+    // Locate the leaf document's BID and owning network's BID in each backend.
+    let leaf_bid_bb = bb_global
+        .states()
+        .values()
+        .find(|n| n.title == "subnet1 file1")
+        .map(|n| n.bid)
+        .expect("subnet1_file1.md should be parsed into bb_global");
+    let net_bid_bb = bb_global
+        .states()
+        .values()
+        .find(|n| matches!(&n.id, noet_core::properties::NodeId::Explicit(s) if s == "belief-network-test-1-subnet-1"))
+        .map(|n| n.bid)
+        .expect("subnet1 network node should be parsed into bb_global");
+
+    let leaf_bid_db: String = sqlx::query("SELECT bid FROM beliefs WHERE title = ?")
+        .bind("subnet1 file1")
+        .fetch_one(&db.0)
+        .await?
+        .get("bid");
+    let leaf_bid_db = Bid::try_from(leaf_bid_db.as_str())?;
+    let net_bid_db: String = sqlx::query("SELECT bid FROM beliefs WHERE id = ?")
+        .bind("belief-network-test-1-subnet-1")
+        .fetch_one(&db.0)
+        .await?
+        .get("bid");
+    let net_bid_db = Bid::try_from(net_bid_db.as_str())?;
+
+    // Note: BIDs are freshly generated per parse (the fixture sets no explicit
+    // `bid` on this document), so leaf_bid_bb/leaf_bid_db and net_bid_bb/net_bid_db
+    // are *not* expected to be equal across the two independent parses — each
+    // backend is queried with its own BIDs below.
+
+    // The ground-truth in-memory backend must return a non-empty subtree for
+    // the leaf document (itself, at minimum).
+    let bb_submap = bb_global
+        .submap_by_bid(net_bid_bb, Some(leaf_bid_bb), 0, true)
+        .await?;
+    assert!(
+        !bb_submap.is_empty(),
+        "BeliefBase::submap_by_bid should return a non-empty subtree for a leaf \
+         document; got {bb_submap:?}"
+    );
+
+    // The DB backend must match — this is the regression check. Prior to the
+    // fix, DbConnection::submap_by_bid returns Ok(vec![]) here because its
+    // path-segment walk misidentifies the leaf document's own BID as a
+    // subnet and finds no `paths` rows under it.
+    let db_submap = db
+        .submap_by_bid(net_bid_db, Some(leaf_bid_db), 0, true)
+        .await?;
+    assert!(
+        !db_submap.is_empty(),
+        "DbConnection::submap_by_bid returned an empty subtree for leaf document \
+         'subnet1 file1' (bid={leaf_bid_db}, net={net_bid_db}); expected at least \
+         the document's own entry, matching BeliefBase's {} entries: {:?}. \
+         This reproduces the per-doc session-seeding bug: parse_epoch's pre-spawn \
+         seed (compiler.rs) silently falls back to an empty BeliefGraph for every \
+         non-network leaf document, defeating session_bb pre-seeding and forcing \
+         Phase 1 to hit global_bb per-node on reparse.",
+        bb_submap.len(),
+        bb_submap
+    );
+
+    // BIDs are ephemeral across independent parse runs, so compare structural
+    // position (path strings and orderings) rather than raw BID values.
+    assert_eq!(
+        bb_submap.len(),
+        db_submap.len(),
+        "BeliefBase and DbConnection should return the same number of entries \
+         for submap_by_bid on a leaf document; bb={bb_submap:?}, db={db_submap:?}"
+    );
+    let bb_paths: BTreeSet<(String, Vec<u16>)> = bb_submap
+        .iter()
+        .map(|(p, _, order)| (p.clone(), order.clone()))
+        .collect();
+    let db_paths: BTreeSet<(String, Vec<u16>)> = db_submap
+        .iter()
+        .map(|(p, _, order)| (p.clone(), order.clone()))
+        .collect();
+    assert_eq!(
+        bb_paths, db_paths,
+        "BeliefBase and DbConnection should return the same (path, ordering) set \
+         for submap_by_bid on a leaf document"
+    );
+
+    Ok(())
+}
+
 fn assert_belief_graphs_equivalent(
     session_graph: &BeliefGraph,
     db_graph: &BeliefGraph,
@@ -329,11 +459,11 @@ fn assert_belief_graphs_equivalent(
     );
 
     // Compare specific edges (source -> sink pairs)
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
     let session_edges: BTreeSet<(Bid, Bid)> = session_graph
         .relations
         .as_graph()
-        .raw_edges()
-        .iter()
+        .edge_references()
         .map(|e| {
             let source = session_graph.relations.as_graph()[e.source()];
             let target = session_graph.relations.as_graph()[e.target()];
@@ -344,8 +474,7 @@ fn assert_belief_graphs_equivalent(
     let db_edges: BTreeSet<(Bid, Bid)> = db_graph
         .relations
         .as_graph()
-        .raw_edges()
-        .iter()
+        .edge_references()
         .map(|e| {
             let source = db_graph.relations.as_graph()[e.source()];
             let target = db_graph.relations.as_graph()[e.target()];

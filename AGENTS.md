@@ -17,9 +17,20 @@ Inspired by Kent Beck, Martin Fowler, Rich Hickey. These apply to code, document
 
 **When writing code:** Readable > terse. Tested > assumed. Refactored > first draft. Named well > commented heavily. Imports at module top > inline `use` inside function bodies.
 
+**Maintaining this document:** Update AGENTS.md when a new "lesson learned" pattern is identified. Propose changes to the user and get agreement before editing — treat changes with the same review rigor as Hard Rules.
+
 ## Hard Rules
 
 These are non-negotiable behavioral constraints.
+
+### No Inline Imports
+
+> [!IMPORTANT]
+> **Inline `use` statements inside function bodies are a code smell that must be fixed on sight.**
+> When you encounter `use` statements inside a function — whether in code you are writing or
+> code you are reading while working on a nearby task — move them to the module top. This is
+> not optional and is not scoped to the current task. Seeing an inline import is a trigger to
+> clean it up immediately, the same way a failing test is a trigger to fix it.
 
 ### No Destructive Git Operations
 
@@ -29,6 +40,40 @@ Agent must NEVER run `git commit`, `git push`, `git revert`, or `git reset --har
 
 > [!IMPORTANT]
 > **Do not increment `version` numbers.** Only humans may change the `version` field. New documents: set to `0.1`. Existing documents: leave unchanged unless explicitly told otherwise.
+
+### Application-Neutral Content
+
+noet-core is an application-agnostic open-source tool. All code, documentation,
+examples, and test fixtures must be domain-neutral. Do not embed references to
+specific customers, programs, organizations, or proprietary systems.
+
+**Violations include**: customer names, program codenames, internal project
+identifiers, organization-specific terminology, and data derived from real
+deployments.
+
+**In examples and tests**: use generic placeholder domains (e.g. "Widget Project",
+"Acme Corp", "sample-network") and generic column names ("Title", "Description",
+"Category") rather than names from any real program or customer context.
+
+**When writing about real corpora** (performance findings, bug reports,
+measurements): keep the numbers, drop the proper nouns. Describe data by its
+structural properties — "a ~7,600-line document linked from 13 parents",
+"deeply-included C++ headers" — not by filename, repository, or program. The
+mechanism is what transfers between corpora; the proper noun is what leaks.
+
+When reviewing existing content: flag any application-specific references
+encountered and propose neutral replacements before proceeding with other changes.
+
+> [!NOTE]
+> This rule cannot be enforced by a check inside this repository. An automated
+> denylist would have to enumerate the very names it protects, which would leak
+> more than the scattered references it finds. The audit tooling therefore lives
+> outside this repo and is run against it from there. If you are working in a
+> workspace that includes a private planning repo, use its audit script; if you
+> are not, apply the rule by reading.
+>
+> **In practice**: when you cannot verify, prefer the neutral phrasing. It costs
+> nothing to write "a large application corpus" instead of a repository name.
 
 ### No Deleting Documents
 
@@ -157,39 +202,6 @@ High-level approach (diagrams, data structures, key decisions)
 
 **Exclude from issues**: detailed code, implementation tutorials, exhaustive edge cases, alternative approaches (put those in trade studies or design docs).
 
-## Roadmaps
-
-### Template
-
-```markdown
-# [Feature] Roadmap
-
-**Status**: Planning | In Progress | Complete
-**Target**: vX.Y.Z
-
-## Summary
-What are we building and why?
-
-## Phases
-
-### Phase 1: [Name] (timeframe)
-- Goal, Deliverables, Dependencies
-
-### Phase 2: [Name] (timeframe)
-...
-
-## Critical Path
-Dependency chain
-
-## Decision Points
-- Key decisions (defer complex analysis to trade studies)
-
-## Success Metrics
-How do we know we're done?
-```
-
-**Exclude from roadmaps**: implementation details (belong in issues), exhaustive alternatives (create trade study), step-by-step instructions.
-
 ## When to Create Separate Documents
 
 **Trade Study**: evaluating 3+ alternatives with complex tradeoffs, analyzing performance/scalability, researching external tools, documenting rejected approaches.
@@ -207,6 +219,13 @@ How do we know we're done?
 3. Check design docs in `docs/design/`
 4. Reference existing code to extend rather than reinventing
 
+> **Implementing any new codec, integration point, or extension to the parse pipeline?**
+> Read `docs/design/beliefbase_architecture.md` §3.2 and §3.6 first — specifically the
+> "Two-Registry Codec Dispatch" subsection. The codec system has non-obvious ordering
+> constraints (`WALK_CODECS` for walk-time visibility, `CLAIM_MAP` for parse-time dispatch,
+> `DocCodec::parse` as the Phase 1 claim site). Getting these wrong produces silently
+> incorrect behaviour that is hard to debug.
+
 ### Debugging
 
 When symptoms appear in one subsystem but root cause may be elsewhere:
@@ -216,39 +235,49 @@ When symptoms appear in one subsystem but root cause may be elsewhere:
 4. Identify which system *owns* the problem vs. which *displays* it
 5. If stuck, say so — "I need more information about X" or "This requires human judgment"
 
-**BID ephemerality**: BIDs for nodes that have never been written to disk are
-time-based (they embed a timestamp). Running the compiler without `--write` (or
-without a parse result `rewritten_content` being flushed to disk) means those
-BIDs will differ across runs. Never compare raw BID values across separate test
-runs unless the BIDs were previously persisted in source files. When debugging
-BID mismatches, compare *counts* and *structural position* (parent bref suffix,
-sort order) rather than absolute BID values.
+**Test log capture**: Always pipe combined stdout+stderr to a file when running
+tests, then check the exit code explicitly. Tests can fail silently (non-zero exit)
+while producing output that looks superficially clean. If the exit code is non-zero,
+grep the log for failures before drawing any conclusions:
 
-**Network node dual-path representation**: a network node has two valid path
-forms — the directory path (e.g. `"subnet1"`, or `/abs/repo/subnet1`) and the
-index-file path (`"subnet1/index.md"`). These are not interchangeable in code:
+```sh
+cargo test test_name -- --nocapture > /tmp/test_out.log 2>&1; echo "exit: $?"
+grep -E "FAILED|panicked|error\[" /tmp/test_out.log
+grep "pattern" /tmp/test_out.log
+```
 
-- `proto.path` and `GraphBuilder.stack` always hold the **directory form**
-  (absolute, no trailing slash, no `index.md` suffix).
-- `PathMap` registers the network root under **both** `""` (directory form,
-  parent anchor for document children) and `"index.md"` (parent anchor for
-  heading/section children within the network's own index file).
-- `NodeKey::Path` for a document inside a subnet uses the **subnet-relative**
-  file path (e.g. `"doc.md"`) with `net = subnet_BID.bref()`. The path is
-  produced by stripping the network's absolute directory path from the
-  document's absolute file path.
+Do not assume a test passed based on log output alone — always verify the exit code.
+A non-zero exit code means at least one test failed; HALT and analyze the log before
+making further code changes.
 
-`AnchorPath::new(dir_path)` classifies extension-less paths as directories and
-`filepath()` returns `dir()`, which strips the last path component. Any call
-that constructs an `AnchorPath` from a known directory path and then calls
-`filepath()`, `dir()`, or `strip_prefix` on it **must** use
-`AnchorPath::new_dir(dir_path)` (or append a trailing slash) to prevent the
-last component from being silently dropped. Passing a bare directory path
-without this correction causes `strip_prefix` to strip the grandparent directory
-instead of the network directory — producing a repo-root-relative child path
-paired with the subnet's bref as `net`, an inconsistent `NodeKey::Path` that
-never resolves. See `docs/design/beliefbase_architecture.md` section 2.2 for
-the full specification.
+### Known Pitfalls
+
+**BID ephemerality**: Never compare raw BID values across separate test runs
+unless the BIDs were previously persisted in source files. Unpersisted BIDs
+embed a timestamp and will differ between runs. Compare *counts* and *structural
+position* instead. Use `noet bref [bid]` to look up a bref for cross-referencing.
+See `docs/design/beliefbase_architecture.md` §2.2 for the full mechanism.
+
+**Network node dual-path representation**: A network node has a directory path
+(`"subnet1"`) and an index-file path (`"subnet1/index.md"`) — these are not
+interchangeable. When constructing an `AnchorPath` from a known directory path,
+always use `AnchorPath::new_dir(dir_path)` (or append a trailing slash). Bare
+`AnchorPath::new` on a directory path silently drops the last component, producing
+unresolvable `NodeKey::Path` values. See `docs/design/beliefbase_architecture.md`
+§2.2 for the full specification.
+
+**Log output is ANSI-coloured even when redirected to a file**, and the tracing
+subscriber wraps span names, field names, and separators individually. So
+`grep -c 'parse_task{'` returns 0 on a log containing thousands of them. Always
+`sed 's/\x1b\[[0-9;]*m//g'` before hand-checking a log.
+
+**File-watcher tests need an unsandboxed terminal.** A sandboxed agent terminal
+blocks OS file-change notifications, so watch/notification tests fail 100% inside
+it and pass 100% outside. This looks exactly like flakiness — do not diagnose it
+as one.
+
+See `docs/project/LESSONS_LEARNED.md` for the full register of failure modes and
+diagnostic patterns.
 
 ## File Conventions
 
@@ -270,8 +299,10 @@ the full specification.
 - `CONTRIBUTING.md` — Development workflow, code standards, CI/CD
 - `docs/architecture.md` — High-level architecture and core concepts
 - `docs/design/beliefbase_architecture.md` — Detailed technical spec
+- `docs/design/network_authoring.md` — User-facing reference for authoring BeliefNetworks (`index.md`, whitelist/blacklist, subnets)
 - `docs/project/DOCUMENTATION_STRATEGY.md` — Documentation hierarchy
 - `docs/project/README.md` — Issue resolution workflow
+- `docs/project/LESSONS_LEARNED.md` — Durable failure modes and diagnostic patterns
 
 ## Agent Scratchpad
 

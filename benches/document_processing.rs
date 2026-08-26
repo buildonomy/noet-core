@@ -10,7 +10,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use noet_core::{beliefbase::BeliefBase, codec::DocumentCompiler};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -26,7 +26,10 @@ fn setup_network_1() -> Result<(TempDir, PathBuf), Box<dyn std::error::Error>> {
     Ok((test_tempdir, test_root))
 }
 
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+/// Copy a directory tree, preserving symlinks as symlinks rather than following them.
+/// This avoids infinite recursion on cyclic symlinks (e.g. `subnet1/loop_back -> ../subnet1`)
+/// and faithfully reproduces the fixture layout that the production code will encounter.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
     }
@@ -36,7 +39,23 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        // Use symlink_metadata so we inspect the link itself, not its target.
+        let meta = std::fs::symlink_metadata(&src_path)?;
+        if meta.file_type().is_symlink() {
+            // Re-create the symlink with the same target (relative or absolute).
+            let target = std::fs::read_link(&src_path)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst_path)?;
+            #[cfg(windows)]
+            {
+                // On Windows we need to know whether the target is a dir or file.
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst_path)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst_path)?;
+                }
+            }
+        } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path)?;
@@ -51,7 +70,7 @@ fn bench_parse_all_documents(c: &mut Criterion) {
 
     c.bench_function("parse_all_documents", |b| {
         b.to_async(&rt).iter(|| async {
-            let (_tempdir, test_root) = setup_network_1().unwrap();
+            let (_tempdir, test_root) = setup_network_1().unwrap(); // tempdir kept alive for bench duration
             let mut compiler = DocumentCompiler::simple(test_root).unwrap();
 
             // Parse all documents (multi-pass compilation)

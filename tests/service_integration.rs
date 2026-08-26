@@ -14,7 +14,7 @@ mod common;
 use noet_core::{
     config::NetworkRecord,
     event::Event,
-    properties::{BeliefNode, Bid},
+    properties::{BeliefNode, Bid, NodeId},
     watch::WatchService,
 };
 #[cfg(feature = "service")]
@@ -242,7 +242,7 @@ fn test_get_set_networks() {
     let node = BeliefNode {
         bid: Bid::new(Bid::nil()),
         title: "Test Network".to_string(),
-        id: Some("test-network".to_string()),
+        id: NodeId::Explicit("test-network".to_string()),
         ..Default::default()
     };
     let record = NetworkRecord {

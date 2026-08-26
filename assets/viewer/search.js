@@ -1,33 +1,28 @@
 /**
- * viewer/search.js — Full-text search over compile-time search indices
+ * viewer/search.js — Full-text search delegated to WASM
  *
- * Queries state.searchIndex (Map<bref, SearchIndex>) which is populated eagerly
- * during WASM init from the per-network search/*.idx.json files. No WASM calls
- * are needed for scoring; the indices are plain JS objects. Snippet extraction
- * does call into the loaded BeliefBase to get payload["text"] for loaded networks.
+ * Scoring is handled entirely by `beliefbase.search(query, limit)` in WASM.
+ * Search indices are loaded as msgpack binaries via
+ * `beliefbase.load_search_index(bref, bytes)` during WASM init (both sharded
+ * and monolithic modes). The JS layer is responsible only for:
+ *   - Tokenizing the query for snippet highlighting
+ *   - Extracting text snippets from loaded WASM data shards
+ *   - Rendering the results panel and handling keyboard navigation
  *
  * ## Architecture
  *
- * The compile-time SearchIndex (see src/shard/search.rs) contains:
- *   - docs:  { bid → { title, path, term_count } }   — always available
- *   - index: { term → [(bid, freq)] }                 — pre-built inverted index
- *   - stemmed: "English" | "None"                     — whether stemming was applied
- *   - network_bref: string
- *
  * Query pipeline:
- *   1. Tokenize query (same rules as compile time: split, lowercase, strip short/stop)
- *   2. For each loaded search index, look up each term and accumulate TF-IDF scores
- *      Exact matches score at full weight; fuzzy matches (Levenshtein ≤ 2, terms
- *      shorter than FUZZY_MAX_QUERY_LEN) score at a reduced weight (see FUZZY_PENALTY).
- *   3. Merge scores across all networks, take top MAX_RESULTS
- *   4. Enrich with snippet from loaded WASM data (best-effort, empty if unloaded)
- *   5. Render results panel
+ *   1. Delegate to `beliefbase.search(query, MAX_RESULTS)` → JSON string of
+ *      [{bid, network_bref, title, path, score}, ...]
+ *   2. Tokenize the raw query (for snippet term highlighting only)
+ *   3. Enrich each result with a snippet from the loaded data shard (best-effort)
+ *   4. Render results panel
  *
- * ## Migration path to WASM
+ * ## Migration path to WASM — COMPLETE
  *
- * When Issue 54 adds BeliefBaseWasm.load_search_index() / .search(query, limit),
- * replace the runQuery() body with a single WASM call. The UI layer (input,
- * results panel, keyboard nav) is unchanged.
+ * Issue 54 is resolved. `BeliefBaseWasm.load_search_index()` / `.search()` are
+ * live. The old JS TF-IDF engine (levenshtein, _fuzzyMatches, _accumulateTerm)
+ * has been removed. The UI layer (input, results panel, keyboard nav) is unchanged.
  *
  * ## Keyboard navigation
  *
@@ -40,12 +35,12 @@
  *
  * - docs/design/search_and_sharding.md §7 — Search index format and query model
  * - src/shard/search.rs — Compile-time index builder (tokenizer, stemmer, weights)
- * - assets/viewer/shard-manager.js — search index loading
- * - assets/viewer/wasm.js — state.searchIndex population
+ * - assets/viewer/shard-manager.js — search index loading (msgpack → WASM)
+ * - assets/viewer/wasm.js — WASM init and beliefbase construction
  */
 
-import { state } from "./state.js";
-import { escapeHtml } from "./utils.js";
+import { state, callbacks } from "./state.js";
+import { escapeHtml, brefFromBid } from "./utils.js";
 
 // =============================================================================
 // Constants
@@ -62,18 +57,6 @@ const MIN_QUERY_LENGTH = 2;
 
 /** Approximate characters to show around a match in a snippet. */
 const SNIPPET_WINDOW = 120;
-
-/**
- * Maximum query-term length for which fuzzy matching is attempted.
- * Levenshtein on long terms is both expensive and imprecise — skip it.
- */
-const FUZZY_MAX_QUERY_LEN = 20;
-
-/**
- * Score multiplier applied to fuzzy (non-exact) term matches.
- * Distance-1 matches receive 0.6×, distance-2 matches receive 0.3×.
- */
-const FUZZY_PENALTY = [0, 0.6, 0.3];
 
 // Stop-words for query tokenization (subset of compile-time list — short list
 // sufficient for query terms; compile-time list is authoritative for index terms).
@@ -182,91 +165,10 @@ export function initSearch() {
   _attachInputListeners();
   _attachGlobalListeners();
 
-  console.log(`[Search] Initialized. Indices loaded: ${state.searchIndex.size} network(s).`);
-}
-
-// =============================================================================
-// Fuzzy matching (Levenshtein distance)
-// =============================================================================
-
-/**
- * Compute the Levenshtein edit distance between two strings.
- *
- * Uses the standard Wagner-Fischer DP algorithm with a two-row rolling buffer.
- * Early-exits when the running minimum exceeds `maxDist` to avoid unnecessary
- * work for clearly non-matching index terms.
- *
- * @param {string} a
- * @param {string} b
- * @param {number} maxDist — Maximum distance to care about (default 2). Returns
- *   maxDist+1 immediately if the true distance exceeds this.
- * @returns {number} Edit distance, capped at maxDist+1.
- */
-function levenshtein(a, b, maxDist = 2) {
-  // Length difference alone rules out a match within maxDist.
-  if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
-
-  const m = a.length;
-  const n = b.length;
-
-  // prev[j] = cost of aligning a[0..i-1] with b[0..j-1]
-  let prev = new Uint16Array(n + 1);
-  let curr = new Uint16Array(n + 1);
-
-  for (let j = 0; j <= n; j++) prev[j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    curr[0] = i;
-    let rowMin = curr[0];
-
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      curr[j] = Math.min(
-        curr[j - 1] + 1, // insertion
-        prev[j] + 1, // deletion
-        prev[j - 1] + cost, // substitution
-      );
-      if (curr[j] < rowMin) rowMin = curr[j];
-    }
-
-    // Prune: if the best possible score for this row already exceeds maxDist,
-    // no further rows can bring it back within range.
-    if (rowMin > maxDist) return maxDist + 1;
-
-    // Swap buffers.
-    const tmp = prev;
-    prev = curr;
-    curr = tmp;
-  }
-
-  return prev[n];
-}
-
-/**
- * Find all terms in `indexTerms` that are within Levenshtein distance `maxDist`
- * of `queryTerm`, returning pairs of [indexTerm, distance].
- *
- * Only called when `queryTerm.length < FUZZY_MAX_QUERY_LEN`.  Iterates the
- * full term set of one index — acceptable because index term sets are small
- * (typically < 5 000 entries) and this runs at most once per query term per
- * network.
- *
- * @param {string} queryTerm
- * @param {string[]} indexTerms — All keys of idx.index for one network
- * @param {number} maxDist
- * @returns {Array<[string, number]>} Pairs of (matchedIndexTerm, editDistance)
- */
-function _fuzzyMatches(queryTerm, indexTerms, maxDist = 2) {
-  const results = [];
-  for (const term of indexTerms) {
-    // Quick length pre-filter (same as inside levenshtein, but avoids the call overhead).
-    if (Math.abs(term.length - queryTerm.length) > maxDist) continue;
-    const dist = levenshtein(queryTerm, term, maxDist);
-    if (dist > 0 && dist <= maxDist) {
-      results.push([term, dist]);
-    }
-  }
-  return results;
+  const loadedCount = state.beliefbase
+    ? state.beliefbase.loaded_search_indices().size
+    : 0;
+  console.log(`[Search] Initialized. Indices loaded: ${loadedCount} network(s).`);
 }
 
 // =============================================================================
@@ -283,11 +185,8 @@ function _fuzzyMatches(queryTerm, indexTerms, maxDist = 2) {
  *   - Drop pure-numeric tokens
  *   - Remove stop words
  *
- * No stemming on the query side in this JS implementation. Because the compile-time
- * index may be stemmed (StemMode::English), we also add the raw term alongside any
- * stem-approximation. For now we just use the raw lowercase term — recall is slightly
- * lower than the Rust path for inflected forms, which is acceptable for the MVP.
- * When Issue 54 moves search into WASM, identical stemming is applied automatically.
+ * Used on the query side for snippet term highlighting only — scoring is handled
+ * in WASM where identical stemming is applied automatically.
  *
  * @param {string} text
  * @returns {string[]} Deduplicated array of normalised terms
@@ -295,8 +194,20 @@ function _fuzzyMatches(queryTerm, indexTerms, maxDist = 2) {
 function tokenize(text) {
   if (!text) return [];
 
+  // Strip query syntax before tokenizing for highlighting:
+  // - Remove boolean operators (AND, OR, NOT)
+  // - Remove field prefixes (field:)
+  // - Remove id:// anchors
+  // - Remove traversal syntax (k-..., s(...))
+  let cleaned = text
+    .replace(/\b(AND|OR|NOT)\b/g, " ")
+    .replace(/id:\/\/\S+/g, " ")
+    .replace(/\b[a-z]+:/gi, " ")
+    .replace(/[ks]-[a-z]+-[a-z]+\([^)]*\)/gi, " ")
+    .replace(/[ks]-[a-z]+\([^)]*\)/gi, " ");
+
   // Split on anything that isn't a letter, digit, or apostrophe
-  const raw = text
+  const raw = cleaned
     .toLowerCase()
     .split(/[^a-z0-9']+/)
     .map((t) => t.replace(/^'+|'+$/g, "")); // strip leading/trailing apostrophes
@@ -317,7 +228,7 @@ function tokenize(text) {
 }
 
 // =============================================================================
-// TF-IDF query engine
+// Query engine
 // =============================================================================
 
 /**
@@ -327,112 +238,47 @@ function tokenize(text) {
  * @property {string} title
  * @property {string} path        — HTML-relative path (may be empty for network roots)
  * @property {string} snippet     — Content excerpt; empty string for unloaded networks
- * @property {number} score       — TF-IDF relevance score
+ * @property {number} score       — TF-IDF relevance score (computed in WASM)
  * @property {boolean} loaded     — Whether the network's data shard is currently loaded
  */
 
 /**
- * Run a TF-IDF query across all loaded search indices.
+ * Run a query across all loaded search indices via WASM.
  *
  * @param {string} query — Raw query string from the input
  * @returns {SearchResult[]} Top MAX_RESULTS results sorted descending by score
  */
 function runQuery(query) {
-  const terms = tokenize(query);
-  if (terms.length === 0) return [];
+  if (!state.beliefbase) return [];
 
-  // Collect total doc counts across all indices for IDF denominator.
-  let totalDocCount = 0;
-  for (const idx of state.searchIndex.values()) {
-    totalDocCount += idx.doc_count ?? 0;
-  }
-  if (totalDocCount === 0) return [];
-
-  // Per-bid score accumulator: bid → { score, networkBref, title, path }
-  const scores = new Map();
-
-  /**
-   * Accumulate a TF-IDF contribution for one (idx, term, postings) triple.
-   *
-   * @param {string} bref
-   * @param {object} idx
-   * @param {string} term — the index term that matched (may differ from query term for fuzzy)
-   * @param {number} penalty — score multiplier in (0, 1]; 1 for exact, <1 for fuzzy
-   */
-  function _accumulateTerm(bref, idx, term, penalty) {
-    const postings = idx.index[term];
-    if (!postings || postings.length === 0) return;
-
-    // IDF = log((totalDocCount + 1) / (df + 1)) + 1  (smoothed)
-    const df = postings.length;
-    const idf = Math.log((totalDocCount + 1) / (df + 1)) + 1;
-
-    for (const [bid, rawFreq] of postings) {
-      const docMeta = idx.docs[bid];
-      if (!docMeta) continue;
-
-      // TF = rawFreq / term_count  (normalised by document length)
-      const tf = rawFreq / (docMeta.term_count || 1);
-      const contribution = tf * idf * penalty;
-
-      if (scores.has(bid)) {
-        scores.get(bid).score += contribution;
-      } else {
-        scores.set(bid, {
-          score: contribution,
-          networkBref: bref,
-          title: docMeta.title,
-          path: docMeta.path,
-        });
-      }
-    }
+  // Delegate TF-IDF scoring to WASM (search indices loaded via load_search_index).
+  // Returns JSON string: [{bid, network_bref, title, path, score}, ...]
+  let rawResults;
+  try {
+    rawResults = JSON.parse(state.beliefbase.search(query, MAX_RESULTS));
+  } catch (e) {
+    console.warn("[search] WASM search failed:", e);
+    return [];
   }
 
-  for (const [bref, idx] of state.searchIndex.entries()) {
-    const netDocCount = idx.doc_count ?? 0;
-    if (netDocCount === 0) continue;
+  if (!rawResults || rawResults.length === 0) return [];
 
-    // Cache the index term list once per network for fuzzy scanning.
-    // Only materialised when at least one query term is short enough for fuzzy.
-    let indexTerms = null;
-
-    for (const term of terms) {
-      // ── Exact match (full weight) ──────────────────────────────────────
-      _accumulateTerm(bref, idx, term, 1.0);
-
-      // ── Fuzzy matches (penalised weight) ──────────────────────────────
-      // Skip fuzzy for long terms — too expensive and too noisy.
-      if (term.length >= FUZZY_MAX_QUERY_LEN) continue;
-
-      if (!indexTerms) indexTerms = Object.keys(idx.index);
-      const matches = _fuzzyMatches(term, indexTerms);
-      for (const [fuzzyTerm, dist] of matches) {
-        _accumulateTerm(bref, idx, fuzzyTerm, FUZZY_PENALTY[dist]);
-      }
-    }
-  }
-
-  if (scores.size === 0) return [];
-
-  // Sort descending by score, take top MAX_RESULTS
-  const ranked = Array.from(scores.entries())
-    .sort((a, b) => b[1].score - a[1].score)
-    .slice(0, MAX_RESULTS);
-
-  // Determine which networks have loaded data shards.
+  // Determine which networks have loaded data shards (for snippet extraction).
   const loadedBrefs = _getLoadedBrefs();
 
-  // Build result objects, enriching with snippets where data is available.
-  return ranked.map(([bid, meta]) => {
-    const loaded = loadedBrefs.has(meta.networkBref);
-    const snippet = loaded ? _extractSnippet(bid, terms) : "";
+  // Enrich with snippets where data shard is available.
+  // WASM returns network_bref; JS calls it networkBref — normalise.
+  const terms = tokenize(query);
+  return rawResults.map((r) => {
+    const loaded = loadedBrefs.has(r.network_bref);
+    const snippet = loaded ? _extractSnippet(r.bid, terms) : "";
     return {
-      bid,
-      networkBref: meta.networkBref,
-      title: meta.title,
-      path: meta.path,
+      bid: r.bid,
+      networkBref: r.network_bref,
+      title: r.title,
+      path: r.path,
       snippet,
-      score: meta.score,
+      score: r.score,
       loaded,
     };
   });
@@ -452,8 +298,8 @@ function _getLoadedBrefs() {
     return new Set(state.shardManager.getLoadedNetworks());
   }
 
-  // Monolithic mode: everything is loaded — return all brefs in the index.
-  return new Set(state.searchIndex.keys());
+  // Monolithic mode: everything is loaded — return all brefs from WASM.
+  return new Set(state.beliefbase.loaded_search_indices());
 }
 
 /**
@@ -488,7 +334,8 @@ function _extractSnippet(bid, terms) {
       }
     }
 
-    const start = bestPos === -1 ? 0 : Math.max(0, bestPos - Math.floor(SNIPPET_WINDOW / 2));
+    const start =
+      bestPos === -1 ? 0 : Math.max(0, bestPos - Math.floor(SNIPPET_WINDOW / 2));
     const end = Math.min(text.length, start + SNIPPET_WINDOW);
     let excerpt = text.slice(start, end).replace(/\s+/g, " ").trim();
 
@@ -589,6 +436,15 @@ function _renderResultItem(result, index, query) {
 
   const href = result.path ? `/#${result.path}` : "";
 
+  // Explore button opens the traceability panel anchored to this result.
+  const exploreBid = escapeHtml(result.bid);
+  const exploreNet = escapeHtml(result.networkBref || "");
+  const exploreBtn = `<button class="noet-search-result__explore"
+    data-bid="${exploreBid}" data-network-bref="${exploreNet}"
+    title="Explore in traceability panel (e)"
+    tabindex="-1" aria-label="Explore ${title} in traceability panel (press e)"
+    >&#x1F50D;</button>`;
+
   return `
     <li class="noet-search-result"
         role="option"
@@ -603,6 +459,7 @@ function _renderResultItem(result, index, query) {
         ${path ? `<span class="noet-search-result__path">${path}</span>` : ""}
         ${snippetHtml ? `<span class="noet-search-result__snippet">${snippetHtml}</span>` : ""}
       </a>
+      ${exploreBtn}
     </li>
   `;
 }
@@ -689,21 +546,9 @@ function _navigateToResult(result) {
   if (!result.path) return;
 
   if (!result.loaded && state.shardManager) {
-    // Network data not loaded — confirm with the user (showing estimated size)
-    // before fetching, so they aren't surprised by a large download.
-    const networkMeta = state.shardManager.manifest.networks.find(
-      (n) => n.bref === result.networkBref,
+    console.log(
+      `[Search] Loading network '${result.networkBref}' for result navigation…`,
     );
-    const sizeMb = networkMeta ? networkMeta.estimated_size_mb.toFixed(1) : "unknown";
-    const networkTitle = networkMeta ? networkMeta.title || result.networkBref : result.networkBref;
-
-    const confirmed = window.confirm(
-      `"${result.title}" is in the network "${networkTitle}", which is not yet loaded.\n\n` +
-        `Load it now? (~${sizeMb} MB)`,
-    );
-    if (!confirmed) return;
-
-    console.log(`[Search] Loading network '${result.networkBref}' for result navigation…`);
     state.shardManager
       .loadNetwork(result.networkBref)
       .then(() => {
@@ -716,6 +561,54 @@ function _navigateToResult(result) {
       });
   } else {
     window.location.hash = result.path;
+  }
+}
+
+/**
+ * Open the traceability panel in Submap mode anchored to a search result node.
+ * Resolves the network bref to a network BID via the nav tree, loads the
+ * network shard if needed, then opens the traceability modal.
+ *
+ * @param {string} bid - BID of the node to explore.
+ * @param {string} networkBref - Network bref of the node's home network.
+ */
+async function _openExplore(bid, networkBref) {
+  // Resolve network bref → network BID via the beliefbase index.
+  let homeNetBid = null;
+  if (state.beliefbase?.get_bid_from_bref) {
+    try {
+      homeNetBid = state.beliefbase.get_bid_from_bref(networkBref) || null;
+    } catch (_) {
+      /* bref not found */
+    }
+  }
+  // Fallback: scan nav tree roots (works for top-level networks).
+  if (!homeNetBid && state.navTree?.roots) {
+    for (const rootBid of state.navTree.roots) {
+      if (brefFromBid(rootBid) === networkBref) {
+        homeNetBid = rootBid;
+        break;
+      }
+    }
+  }
+
+  if (!homeNetBid) {
+    console.warn(`[Search] Cannot resolve network bref '${networkBref}' to a BID`);
+    return;
+  }
+
+  // Ensure the network shard is loaded before opening the panel.
+  if (state.shardManager) {
+    try {
+      await state.shardManager.loadNetwork(networkBref);
+    } catch (err) {
+      console.warn(`[Search] Failed to load network '${networkBref}':`, err);
+      // Continue anyway — the panel will show what it can.
+    }
+  }
+
+  if (callbacks.openTraceabilityModal) {
+    callbacks.openTraceabilityModal(bid, homeNetBid, bid);
   }
 }
 
@@ -763,8 +656,13 @@ function _attachInputListeners() {
     }
 
     _debounceTimer = setTimeout(() => {
-      if (state.searchIndex.size === 0) {
-        console.warn("[Search] No search indices loaded yet.");
+      const _loadedIndexCount = state.beliefbase
+        ? state.beliefbase.loaded_search_indices().size
+        : 0;
+      if (_loadedIndexCount === 0) {
+        // Indices are still loading (kicked off after first paint) —
+        // the user's next keystroke (after the debounce) will retry.
+        console.log("[Search] Search indices still loading...");
         return;
       }
       const results = runQuery(q);
@@ -799,6 +697,18 @@ function _attachInputListeners() {
         _closeResults();
         input.blur();
         break;
+      case "e":
+        // Explore: open traceability panel for the selected result.
+        if (_selectedIndex >= 0 && _selectedIndex < _currentResults.length) {
+          e.preventDefault();
+          const result = _currentResults[_selectedIndex];
+          if (result.bid && result.networkBref && callbacks.openTraceabilityModal) {
+            _closeResults();
+            input.blur();
+            _openExplore(result.bid, result.networkBref);
+          }
+        }
+        break;
     }
   });
 
@@ -828,6 +738,24 @@ function _attachGlobalListeners() {
   // Click on a result row
   document.addEventListener("click", (e) => {
     if (!_resultsPanel) return;
+
+    // Explore button: open traceability panel anchored to the result node.
+    // Must be checked before the general result-item click handler.
+    const exploreBtn = e.target.closest(".noet-search-result__explore");
+    if (exploreBtn && _resultsPanel.contains(exploreBtn)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const bid = exploreBtn.dataset.bid;
+      const networkBref = exploreBtn.dataset.networkBref;
+      if (bid && callbacks.openTraceabilityModal) {
+        _closeResults();
+        if (state.searchInput) state.searchInput.blur();
+        // Resolve the network BID from the bref so we can open the
+        // traceability panel anchored to this node's network.
+        _openExplore(bid, networkBref);
+      }
+      return;
+    }
 
     const item = e.target.closest(".noet-search-result");
     if (item && _resultsPanel.contains(item)) {

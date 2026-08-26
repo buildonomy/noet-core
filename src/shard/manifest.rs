@@ -12,11 +12,11 @@
 use crate::properties::{Bid, Bref};
 use serde::{Deserialize, Serialize};
 
-/// Default sharding threshold: 10MB of serialized BeliefGraph JSON.
+/// Default sharding threshold: 2MB of serialized BeliefGraph JSON.
 ///
 /// Repos below this threshold write a monolithic `beliefbase.json`.
 /// Repos at or above this threshold write `beliefbase/` with per-network shards.
-pub const SHARD_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB in bytes
+pub const SHARD_THRESHOLD: usize = 2 * 1024 * 1024; // 2MB in bytes
 
 /// Default browser memory budget for loaded BeliefBase data shards.
 pub const DEFAULT_MEMORY_BUDGET_MB: f64 = 200.0;
@@ -31,7 +31,7 @@ const SIZE_BUFFER_FACTOR: f64 = 1.1;
 #[derive(Debug, Clone)]
 pub struct ShardConfig {
     /// Byte threshold above which the export is split into per-network shards.
-    /// Default: [`SHARD_THRESHOLD`] (10MB).
+    /// Default: [`SHARD_THRESHOLD`] (2MB).
     pub shard_threshold: usize,
     /// Browser memory budget for loaded data shards (MB).
     /// Default: [`DEFAULT_MEMORY_BUDGET_MB`] (200MB).
@@ -71,17 +71,17 @@ pub struct NetworkShardMeta {
     pub relation_count: usize,
     /// Estimated in-memory size when loaded (MB), with 10% overhead buffer.
     pub estimated_size_mb: f64,
-    /// Path to the shard JSON file, relative to `beliefbase/`.
-    /// Always `networks/{bref}.json`.
+    /// Path to the shard file, relative to `beliefbase/`.
+    /// Always `networks/{bref}.msgpack`.
     pub path: String,
     /// Path to the search index for this network, relative to `beliefbase/`.
-    /// Always `../search/{bref}.idx.json`.
+    /// Always `../search/{bref}.idx.msgpack`.
     pub search_index_path: String,
     /// Approximate size of the search index in KB.
     pub search_index_size_kb: f64,
 }
 
-/// Metadata for the global shard (`beliefbase/global.json`).
+/// Metadata for the global shard (`beliefbase/global.msgpack`).
 ///
 /// The global shard contains the API node, system namespace nodes, and
 /// cross-network relations. It is always loaded in sharded mode because
@@ -92,8 +92,8 @@ pub struct GlobalShardMeta {
     pub node_count: usize,
     /// Estimated in-memory size (MB).
     pub estimated_size_mb: f64,
-    /// Path to the global shard JSON, relative to `beliefbase/`.
-    /// Always `global.json`.
+    /// Path to the global shard file, relative to `beliefbase/`.
+    /// Always `global.msgpack`.
     pub path: String,
 }
 
@@ -129,7 +129,7 @@ impl ShardManifest {
             global: GlobalShardMeta {
                 node_count: 0,
                 estimated_size_mb: 0.0,
-                path: "global.json".to_string(),
+                path: "global.msgpack".to_string(),
             },
         }
     }
@@ -142,8 +142,8 @@ pub struct NetworkSearchMeta {
     pub bref: String,
     /// Human-readable network title.
     pub title: String,
-    /// Filename of the `.idx.json`, relative to `search/`.
-    /// Always `{bref}.idx.json`.
+    /// Filename of the `.idx.msgpack`, relative to `search/`.
+    /// Always `{bref}.idx.msgpack`.
     pub path: String,
     /// Approximate size of the index file in KB.
     pub size_kb: f64,
@@ -152,7 +152,7 @@ pub struct NetworkSearchMeta {
 /// The search index manifest, written to `search/manifest.json`.
 ///
 /// Always generated, regardless of whether data is sharded or monolithic.
-/// The viewer fetches this first, then loads all `.idx.json` files listed here,
+/// The viewer fetches this first, then loads all `.idx.msgpack` files listed here,
 /// enabling full-corpus search before any data shard is loaded.
 ///
 /// See `docs/design/search_and_sharding.md` §4.1 for the JSON schema.
@@ -176,6 +176,49 @@ impl SearchManifest {
 impl Default for SearchManifest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Codec extension manifest, written to `codecs.json` in the output directory.
+///
+/// Lists all file extensions recognized as document sources (as opposed to binary
+/// assets) at build time. The WASM viewer loads this at startup so that
+/// `is_known_codec_extension` and `normalize_path_extension_impl` can correctly
+/// classify paths whose extensions were registered by application shims
+/// (e.g. `.yaml`, `.h`) — extensions not known to the compile-time
+/// `BUILTIN_EXTENSIONS` constant.
+///
+/// See `docs/design/beliefbase_architecture.md` §3.2 — WASM note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodecManifest {
+    /// Format version for forward compatibility.
+    pub version: String,
+    /// All file extensions that produce rendered HTML pages.
+    ///
+    /// Union of `CODECS.extensions()` and all extensions tracked by `WALK_CODECS`
+    /// at the time of export. Sorted and deduplicated.
+    pub document_extensions: Vec<String>,
+    /// All filenames recognized as network root files.
+    ///
+    /// Always includes `index.md`; may include additional names registered by
+    /// walk codecs (e.g. `Manifest.toml`). Sorted and deduplicated.
+    pub network_filenames: Vec<String>,
+}
+
+impl CodecManifest {
+    /// Construct a `CodecManifest` from lists of extensions and network filenames.
+    ///
+    /// Both lists are sorted and deduplicated.
+    pub fn new(mut extensions: Vec<String>, mut network_filenames: Vec<String>) -> Self {
+        extensions.sort();
+        extensions.dedup();
+        network_filenames.sort();
+        network_filenames.dedup();
+        Self {
+            version: "1".to_string(),
+            document_extensions: extensions,
+            network_filenames,
+        }
     }
 }
 
@@ -206,8 +249,8 @@ pub fn network_shard_meta(
         node_count,
         relation_count,
         estimated_size_mb: estimate_size_mb(shard_bytes),
-        path: format!("networks/{}.json", bref_str),
-        search_index_path: format!("../search/{}.idx.json", bref_str),
+        path: format!("networks/{}.msgpack", bref_str),
+        search_index_path: format!("../search/{}.idx.msgpack", bref_str),
         search_index_size_kb: search_index_bytes as f64 / 1024.0,
     }
 }
@@ -273,14 +316,14 @@ mod tests {
                 node_count: 10,
                 relation_count: 5,
                 estimated_size_mb: 0.5,
-                path: "networks/01abc.json".to_string(),
-                search_index_path: "../search/01abc.idx.json".to_string(),
+                path: "networks/01abc.msgpack".to_string(),
+                search_index_path: "../search/01abc.idx.msgpack".to_string(),
                 search_index_size_kb: 12.5,
             }],
             global: GlobalShardMeta {
                 node_count: 3,
                 estimated_size_mb: 0.01,
-                path: "global.json".to_string(),
+                path: "global.msgpack".to_string(),
             },
         };
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -298,13 +341,47 @@ mod tests {
             networks: vec![NetworkSearchMeta {
                 bref: "01abc".to_string(),
                 title: "Test Network".to_string(),
-                path: "01abc.idx.json".to_string(),
+                path: "01abc.idx.msgpack".to_string(),
                 size_kb: 42.0,
             }],
         };
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let roundtripped: SearchManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.networks.len(), 1);
-        assert_eq!(roundtripped.networks[0].path, "01abc.idx.json");
+        assert_eq!(roundtripped.networks[0].path, "01abc.idx.msgpack");
+    }
+
+    #[test]
+    fn test_codec_manifest_roundtrip() {
+        let manifest = CodecManifest::new(
+            vec![
+                "md".to_string(),
+                "xlsx".to_string(),
+                "yaml".to_string(),
+                "ods".to_string(),
+                "md".to_string(), // duplicate — should be deduped
+            ],
+            vec![
+                "index.md".to_string(),
+                "Manifest.toml".to_string(),
+                "index.md".to_string(), // duplicate — should be deduped
+            ],
+        );
+        assert_eq!(
+            manifest.document_extensions,
+            vec!["md", "ods", "xlsx", "yaml"]
+        );
+        assert_eq!(
+            manifest.network_filenames,
+            vec!["Manifest.toml", "index.md"]
+        );
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        let roundtripped: CodecManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.version, "1");
+        assert_eq!(
+            roundtripped.document_extensions,
+            manifest.document_extensions
+        );
+        assert_eq!(roundtripped.network_filenames, manifest.network_filenames);
     }
 }

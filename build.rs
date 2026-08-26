@@ -31,13 +31,15 @@
 //! We always run the inner `cargo build` (cargo's incremental compilation handles
 //! no-op cases efficiently). To avoid re-running wasm-bindgen unnecessarily, we
 //! write a fingerprint file (`target/wasm-build/pkg/wasm-bindgen.fingerprint`)
-//! containing the mtime of the compiled wasm at the time wasm-bindgen last ran.
-//! On subsequent builds we compare the current compiled wasm mtime against the
-//! stored fingerprint; if they match, wasm-bindgen is skipped.
+//! containing an FNV-1a hash of the **compiled input** wasm (the `deps/noet_core.wasm`
+//! artifact that wasm-bindgen reads). On subsequent builds we hash the same input
+//! file and compare; if the hash matches, wasm-bindgen output is still valid and
+//! we skip it. If the input changed (new exports, changed logic) the hash differs
+//! and wasm-bindgen reruns.
 //!
-//! This avoids the previous flawed approach of comparing pkg/ mtime against src/
-//! mtime, which broke when a native `cargo build --lib` touched target/ files
-//! without changing any sources.
+//! Hashing the input rather than the output means a changed `from_msgpack` export
+//! (or any other `#[wasm_bindgen]` function) is always detected, even when the
+//! compiled output WASM happens to hash to the same value as the old pkg artifact.
 //!
 //! ## Troubleshooting Build Issues
 //!
@@ -85,6 +87,27 @@ fn write_fingerprint(path: &PathBuf, hash: u64) {
 }
 
 fn main() {
+    // Create the cyclic symlink test fixture if it doesn't exist.
+    //
+    // `tests/network_1/subnet1/loop_back -> ../subnet1` is a deliberate symlink
+    // cycle used to exercise the compiler's cycle-detection logic during directory
+    // walking.  We create it at build time rather than committing it to the source
+    // tree so that `cargo doc` (which walks the filesystem looking for doc-test
+    // sources) does not emit a "File system loop found" warning on every invocation.
+    #[cfg(unix)]
+    {
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let link_path = manifest_dir
+            .join("tests")
+            .join("network_1")
+            .join("subnet1")
+            .join("loop_back");
+        if !link_path.exists() && !link_path.is_symlink() {
+            // Target is relative: ../subnet1 (points back to the containing subnet1 dir)
+            let _ = std::os::unix::fs::symlink("../subnet1", &link_path);
+        }
+    }
+
     println!("cargo:rerun-if-changed=src/wasm.rs");
     println!("cargo:rerun-if-changed=src/properties.rs");
     println!("cargo:rerun-if-changed=src/beliefbase.rs");
@@ -146,6 +169,8 @@ fn main() {
         .env_remove("CARGO_FEATURE_SERVICE")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
@@ -183,13 +208,20 @@ fn main() {
 
     // Step 2: Generate JavaScript bindings with wasm-bindgen.
     //
-    // Staleness check: we store the mtime of the compiled wasm at the time
-    // wasm-bindgen last ran in a fingerprint file. If the current compiled wasm
-    // mtime matches the stored fingerprint, wasm-bindgen output is still valid.
+    // Staleness check: hash the compiled input wasm (deps/noet_core.wasm) and
+    // compare against the stored fingerprint. If the hashes match, the input
+    // hasn't changed since wasm-bindgen last ran and we can skip it.
     //
-    // We cannot rely on comparing pkg/ mtime vs deps/ mtime directly because
-    // cargo updates the deps/ artifact mtime on every successful build (even
-    // no-ops), which would always make it appear newer than pkg/.
+    // We hash the INPUT (the file wasm-bindgen reads) rather than the output
+    // (pkg/noet_core_bg.wasm) because hashing the output only detects external
+    // modifications to pkg/ — it cannot detect that the compiled WASM changed,
+    // since the stored hash would always equal the current output hash right
+    // after a successful bindgen run.
+    //
+    // FNV-1a collisions between two semantically different multi-MB wasm files
+    // are astronomically unlikely; the debug-section concern in the old approach
+    // was about the 139 MB intermediate artifact, but we hash deps/noet_core.wasm
+    // which is the same input cargo already feeds to wasm-bindgen.
 
     // Create pkg directory if it doesn't exist
     std::fs::create_dir_all(&pkg_dir).expect("Failed to create pkg/ directory");
@@ -212,11 +244,11 @@ fn main() {
 
     let fingerprint_file = pkg_dir.join("wasm-bindgen.fingerprint");
     let skip_bindgen = if wasm_file.exists() && js_file.exists() && wasm_input.exists() {
-        // Compare stored hash against current compiled wasm hash.
-        // Cargo updates artifact mtimes on every build even when nothing recompiled,
-        // so mtime comparison is unreliable — content hash is the correct signal.
+        // Hash the INPUT wasm (deps/noet_core.wasm) — the file wasm-bindgen reads.
+        // If this hash matches what we stored after the last bindgen run, the input
+        // hasn't changed and we can skip re-running wasm-bindgen.
         let stored = read_fingerprint(&fingerprint_file);
-        let current = hash_file(&wasm_input);
+        let current = hash_file(&wasm_input); // wasm_input == deps/noet_core.wasm
         matches!((stored, current), (Some(s), Some(c)) if s == c)
     } else {
         false
@@ -238,8 +270,8 @@ fn main() {
 
     match bindgen_output {
         Ok(output) if output.status.success() => {
-            // Record the compiled wasm hash so we can skip wasm-bindgen next
-            // time if the wasm content hasn't changed.
+            // Record the INPUT wasm hash so future builds can detect whether
+            // the compiled wasm has changed since this bindgen run.
             if let Some(hash) = hash_file(&wasm_input) {
                 write_fingerprint(&fingerprint_file, hash);
             }

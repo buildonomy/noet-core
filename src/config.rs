@@ -1,4 +1,4 @@
-use crate::{error::BuildonomyError, properties::BeliefNode, query::Focus};
+use crate::{error::BuildonomyError, properties::BeliefNode};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -21,8 +21,6 @@ pub struct NetworkRecord {
 pub trait LatticeConfigProvider: Send + Sync {
     fn get_networks(&self) -> Result<Vec<NetworkRecord>, BuildonomyError>;
     fn set_networks(&self, nets: Vec<NetworkRecord>) -> Result<(), BuildonomyError>;
-    fn get_focus(&self) -> Result<Focus, BuildonomyError>;
-    fn set_focus(&self, focus: Focus) -> Result<(), BuildonomyError>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,23 +53,6 @@ impl LatticeConfigProvider for TomlConfigProvider {
         tracing::debug!("Attempting to write networks to: {:?}", &self.path);
         let mut config = BTreeMap::new();
         config.insert("networks".to_string(), nets);
-        let toml_string = toml::to_string(&config)?;
-        write(&self.path, toml_string)?;
-        Ok(())
-    }
-
-    fn get_focus(&self) -> Result<Focus, BuildonomyError> {
-        let content = read_to_string(&self.path)?;
-        let config: BTreeMap<String, Focus> = toml::from_str(&content)?;
-        config
-            .get("focus")
-            .cloned()
-            .ok_or_else(|| BuildonomyError::NotFound("focus not found in config".to_string()))
-    }
-
-    fn set_focus(&self, focus: Focus) -> Result<(), BuildonomyError> {
-        let mut config = BTreeMap::new();
-        config.insert("focus".to_string(), focus);
         let toml_string = toml::to_string(&config)?;
         write(&self.path, toml_string)?;
         Ok(())

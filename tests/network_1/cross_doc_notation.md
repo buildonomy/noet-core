@@ -17,3 +17,7 @@ corrupt the tokens PathMap during the tokens parse.
 This section references the tokens document.
 
 [tokens]: cross_doc_tokens.md
+
+# Inline notatation
+
+A link to [req-001] tests inter-document reference resolution to an inline-anchor node.

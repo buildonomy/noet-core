@@ -37,10 +37,12 @@ enumset = { version = "1.1", features = ["serde"] }
 futures = { version = "0.3", optional = true }
 futures-core = { version = "0.3", optional = true }
 getrandom = { version = "0.2", features = ["js"] }
+globset = "0.4"
 git2 = { version = "0.19", optional = true, default-features = false }
 hex = { version = "0.4", features = ["serde", "std"] }
 http = { version = "1.1.0" }
 include_dir = "0.7"
+indicatif = { version = "0.17", optional = true }
 log = "0.4"
 notify = { version = "6.1.1", optional = true }
 notify-debouncer-full = { version = "0.3.1", default-features = false, optional = true }
@@ -51,6 +53,13 @@ pulldown-cmark = { version = "0.13.0" }
 pulldown-cmark-to-cmark = { version = "22" }
 reactive_stores = { version = "0.1" }
 regex = "1.10.5"
+rmp-serde = "1.3.1"
+rustc-hash = "2.1"
+rmcp = { version = "1.5", features = ["macros", "server", "transport-io", "schemars"], optional = true }
+schemars = { version = "1.0", optional = true }
+calamine = { version = "0.34", optional = true }
+katex = { version = "0.4", default-features = false, features = ["quick-js"], optional = true }
+rust_xlsxwriter = { version = "0.94", optional = true }
 serde_json = "1.0.117"
 serde_yaml = "0.9"
 serde-wasm-bindgen = { version = "0.6", optional = true }
@@ -92,26 +101,38 @@ unicode-normalization = "0.1.25"
 async-trait = "0.1.77"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 filetime = "0.2"
+rustc-hash = "2.1"
 serde_json = "1.0.117"
+serial_test = "3"
 tempfile = "3.19"
 test-log = { version = "0.2", features = ["trace"] }
 tracing-subscriber = "0.3.20"
 trybuild = "1.0"
 
 [features]
-default = ["bin", "service", "git-tracking"]
-bin = ["clap", "dep:tracing-subscriber", "wasm", "stemming"]
+default = ["bin", "service", "git-tracking", "server-math"]
+bin = ["clap", "dep:tracing-subscriber", "wasm", "stemming", "dep:indicatif"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
-wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber"]
-# Compile-time English stemming for search index building. Native only — the
-# WASM query side must replicate the same stemming logic via the Issue 54
-# implementation (same Snowball English algorithm, applied to query terms).
-# Enabled by default for 'bin' builds. Can be disabled for minimal builds.
+wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber", "stemming", "dep:rust_xlsxwriter"]
+# Server-side KaTeX pre-rendering. Requires quick-js (a pure-Rust JS engine).
+# Must NOT be included in the wasm feature set — quick-js cannot target wasm32.
+server-math = ["dep:katex"]
+# Compile-time English stemming for search index building.
+# Enabled by default for 'bin' builds and included in 'wasm' builds. Can be disabled for minimal builds.
 stemming = ["dep:rust-stemmers"]
 # Git repository metadata injection into BeliefNetwork nodes.
 # Requires libgit2. When enabled, --git-tracking CLI flag and NOET_GIT_TRACKING
 # env var become available. Disabled by default (no performance impact when off).
 git-tracking = ["dep:git2"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:tracing-subscriber"]
+xlsx = ["dep:calamine", "dep:rust_xlsxwriter"]
+# Bundle a vendored miniserve binary for `noet distribute` (Windows distribution).
+# Run `./vendor/fetch.sh` before building with this feature.
+distribute = []
+# Batteries-included build: everything except the WASM target.
+# Equivalent to: bin + service + git-tracking + mcp + xlsx + distribute
+# Use this when you want the full CLI with all optional codecs and integrations.
+all = ["bin", "service", "git-tracking", "mcp", "xlsx", "server-math", "distribute"]
 
 # Feature Notes:
 # - 'wasm' is for browser WASM target (no filesystem, no native I/O)
@@ -119,16 +140,21 @@ git-tracking = ["dep:git2"]
 # - 'bin' is the CLI with parsing and HTML generation (includes embedded WASM)
 #   (build.rs compiles WASM separately with isolated target directory)
 # - 'git-tracking' enables --git-tracking CLI flag and NOET_GIT_TRACKING env var
+# - 'mcp' enables the Model Context Protocol server (rmcp)
+# - 'xlsx' enables XLSX/ODS spreadsheet ingestion via calamine (non-wasm only)
+# - 'all' is the batteries-included alias: bin + service + git-tracking + mcp + xlsx
 #
 # Default features (bin + service + git-tracking) give a fully functional CLI.
 # The wasm-pack profiles override this with `default-features = false` so WASM
 # builds are unaffected.
 #
 # Valid build commands:
-#   cargo build                         # Full CLI (default features)
-#   cargo build --no-default-features   # Library only (no features)
+#   cargo build                              # Full CLI (default features)
+#   cargo build --no-default-features        # Library only (no features)
+#   cargo build --features all               # Batteries-included: all native features
 #   cargo build --no-default-features --features service  # Library with daemon/watch
-#   cargo test                          # Full test suite (default features)
+#   cargo test                               # Full test suite (default features)
+#   cargo test --features all                # Full test suite + xlsx + mcp
 #
 # Note: The 'wasm' feature is for the WASM target build, not the native build.
 # When building with 'bin', build.rs automatically compiles a separate WASM module.
@@ -145,8 +171,10 @@ required-features = ["bin"]
 name = "document_processing"
 harness = false
 required-features = ["service"]
+test = false
 
 [[bench]]
 name = "macro_benchmarks"
 harness = false
 required-features = ["service"]
+test = false

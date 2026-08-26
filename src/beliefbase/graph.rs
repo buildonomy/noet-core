@@ -5,17 +5,36 @@
 //! - [`BidRefGraph`]: Borrowed graph with &WeightSet edges
 //! - [`BeliefGraph`]: Combined states and relations for serialization/queries
 
+use crate::query::spec::QueryPackage;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::query::{BeliefSource, BoxFuture, SubmapResult};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::BuildonomyError;
 use crate::{
     event::{BeliefEvent, EventOrigin},
-    nodekey::NodeKey,
-    properties::{
-        BeliefKind, BeliefNode, BeliefRefRelation, Bid, WeightKind, WeightSet, WEIGHT_SORT_KEY,
-    },
-    query::{Expression, RelationPred, ResultsPage, StatePred, DEFAULT_LIMIT},
+    properties::{BeliefKind, BeliefNode, Bid, WeightKind, WeightSet, WEIGHT_SORT_KEY},
 };
+use enumset::EnumSet;
 // ---------------------------------------------------------------------------
 // MergeOp — typed output of to_event_stream
 // ---------------------------------------------------------------------------
+
+/// Which side wins when both the merge target (`lhs`) and the incoming graph (`rhs`)
+/// hold a non-[`BeliefKind::Trace`] copy of the same node.
+///
+/// Applies to node states only — see [`BeliefGraph::to_event_stream_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePrecedence {
+    /// Keep `lhs`'s copy unless it is `Trace`. The historical default: `lhs` is the
+    /// accumulating base and `rhs` is a partial view whose non-seed nodes are
+    /// Trace-coloured scaffolding.
+    LhsWins,
+    /// Take `rhs`'s copy. For callers whose `rhs` is the more authoritative source —
+    /// e.g. a per-document seed queried fresh from `global_bb`, merged onto a shared
+    /// session base that accumulates across an epoch and is the likelier of the two
+    /// to hold a stale node.
+    RhsWins,
+}
 
 /// A single operation produced by [`BeliefGraph::to_event_stream`] for consumption
 /// by [`super::BeliefBase::merge_graph_mut`].
@@ -41,11 +60,9 @@ impl MergeOp {
     /// produced, so only those two conversions are needed.
     pub fn to_belief_event(&self) -> BeliefEvent {
         match self {
-            MergeOp::NodeUpsert(node) => BeliefEvent::NodeUpdate(
-                vec![NodeKey::Bid { bid: node.bid }],
-                node.toml(),
-                EventOrigin::Remote,
-            ),
+            MergeOp::NodeUpsert(node) => {
+                BeliefEvent::NodeUpsert(node.bid, node.clone(), EventOrigin::Remote)
+            }
             MergeOp::RelationUpdate(source, sink, weight_set) => {
                 BeliefEvent::RelationUpdate(*source, *sink, weight_set.clone(), EventOrigin::Remote)
             }
@@ -54,35 +71,42 @@ impl MergeOp {
 }
 use petgraph::{
     graphmap::GraphMap,
-    visit::{depth_first_search, Control, DfsEvent, EdgeRef},
+    visit::{depth_first_search, Control, DfsEvent, EdgeRef, IntoEdgeReferences},
     Directed, Direction, IntoWeightedEdge,
 };
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map::Entry as BTreeEntry, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry as HashEntry, BTreeMap, BTreeSet, HashSet},
     fmt,
     ops::{Deref, DerefMut},
 };
 
 use super::BeliefBase;
 
-pub type BidSubGraph = GraphMap<Bid, (u16, Vec<String>), Directed>;
+/// Edge weight carried by a [`BidSubGraph`]: `(sort_key, doc_paths)`.
+pub type SubGraphWeight = (u16, Vec<String>);
+
+/// An edge as consumed by [`BidSubGraph::from_edges`]: `(source, sink, weight)`.
+pub type SubGraphEdge = (Bid, Bid, SubGraphWeight);
+
+pub type BidSubGraph = GraphMap<Bid, SubGraphWeight, Directed>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BidGraph(pub petgraph::Graph<Bid, WeightSet>);
+pub struct BidGraph(pub petgraph::stable_graph::StableGraph<Bid, WeightSet>);
 
 impl Default for BidGraph {
     fn default() -> Self {
-        BidGraph(petgraph::Graph::new())
+        BidGraph(petgraph::stable_graph::StableGraph::new())
     }
 }
 
 impl BidGraph {
-    pub fn as_graph(&self) -> &petgraph::Graph<Bid, WeightSet> {
+    pub fn as_graph(&self) -> &petgraph::stable_graph::StableGraph<Bid, WeightSet> {
         &self.0
     }
 
-    pub fn as_graph_mut(&mut self) -> &mut petgraph::Graph<Bid, WeightSet> {
+    pub fn as_graph_mut(&mut self) -> &mut petgraph::stable_graph::StableGraph<Bid, WeightSet> {
         &mut self.0
     }
 
@@ -91,7 +115,7 @@ impl BidGraph {
         I: IntoIterator,
         I::Item: IntoWeightedEdge<WeightSet, NodeId = Bid>,
     {
-        let mut graph = petgraph::Graph::new();
+        let mut graph = petgraph::stable_graph::StableGraph::new();
         let mut bid_to_index = BTreeMap::new();
         let edges = iterable
             .into_iter()
@@ -116,28 +140,6 @@ impl BidGraph {
         BidGraph(graph)
     }
 
-    pub fn filter(&self, pred: &RelationPred, invert: bool) -> BidRefGraph<'_> {
-        let edges = self.as_graph().raw_edges().iter().filter(|edge| {
-            let source = self.as_graph()[edge.source()];
-            let sink = self.as_graph()[edge.target()];
-            let weights = &edge.weight;
-            let is_match = pred.match_ref(&BeliefRefRelation {
-                source: &source,
-                sink: &sink,
-                weights,
-            });
-            (is_match && !invert) || (!is_match && invert)
-        });
-
-        BidRefGraph::from_edges(edges.map(|edge| {
-            (
-                self.as_graph()[edge.source()],
-                self.as_graph()[edge.target()],
-                &edge.weight,
-            )
-        }))
-    }
-
     pub fn retain<F: FnMut(&Bid, &Bid, &WeightSet) -> bool>(&mut self, mut f: F) {
         let to_remove = self
             .as_graph()
@@ -160,10 +162,10 @@ impl BidGraph {
     }
 
     pub fn as_subgraph(&self, kind: WeightKind, reverse: bool) -> BidSubGraph {
-        let edges = self.as_graph().raw_edges().iter().filter_map(|edge| {
-            let source = self.as_graph()[edge.source()];
-            let sink = self.as_graph()[edge.target()];
-            let weight = edge.weight.get(&kind);
+        let edges = self.as_graph().edge_references().filter_map(|edge_ref| {
+            let source = self.as_graph()[edge_ref.source()];
+            let sink = self.as_graph()[edge_ref.target()];
+            let weight = edge_ref.weight().get(&kind);
             weight.map(|w| {
                 let paths: Vec<String> = w.get_doc_paths();
                 let sort_key: u16 = w.get(WEIGHT_SORT_KEY).unwrap_or(0);
@@ -188,21 +190,53 @@ impl BidGraph {
     /// reversed graph).
     ///
     /// Returns an empty subgraph when `seed` is not present in the graph.
+    ///
+    /// Prefer [`Self::as_subgraph_seeded_indexed`] when calling this in a loop over
+    /// many seeds against the same graph: this method resolves `seed` by scanning
+    /// every node, which is O(all nodes) *per call*.
     pub fn as_subgraph_seeded(&self, kind: WeightKind, reverse: bool, seed: Bid) -> BidSubGraph {
         let g = self.as_graph();
+        let seed_idx = match g.node_indices().find(|idx| g[*idx] == seed) {
+            Some(idx) => idx,
+            None => {
+                return BidSubGraph::from_edges(std::iter::empty::<(Bid, Bid, (u16, Vec<String>))>())
+            }
+        };
+        self.subgraph_from_seed_idx(kind, reverse, seed_idx)
+    }
 
-        // petgraph::Graph is NodeIndex-keyed, not Bid-keyed. Build a Bid→NodeIndex
-        // map so we can find the seed's NodeIndex, run DFS (which operates on
-        // NodeIndex), then translate back to Bid for the edge-filter pass.
-        let bid_to_idx: BTreeMap<Bid, petgraph::graph::NodeIndex> =
-            g.node_indices().map(|idx| (g[idx], idx)).collect();
-
+    /// [`Self::as_subgraph_seeded`] with the Bid→NodeIndex lookup supplied by the caller.
+    ///
+    /// `StableGraph` is NodeIndex-keyed, not Bid-keyed, so resolving a seed Bid requires
+    /// an index. Building that index costs O(all nodes), which is wasteful when the same
+    /// graph is seeded repeatedly — `PathMapMap::new` does exactly that, once per network.
+    /// Callers in that position should build the map once and pass it here.
+    ///
+    /// This was O(networks × graph size) and measured as 95.5% of per-task epoch
+    /// seeding cost on a large corpus.
+    pub fn as_subgraph_seeded_indexed(
+        &self,
+        kind: WeightKind,
+        reverse: bool,
+        seed: Bid,
+        bid_to_idx: &FxHashMap<Bid, petgraph::stable_graph::NodeIndex>,
+    ) -> BidSubGraph {
         let seed_idx = match bid_to_idx.get(&seed) {
             Some(idx) => *idx,
             None => {
                 return BidSubGraph::from_edges(std::iter::empty::<(Bid, Bid, (u16, Vec<String>))>())
             }
         };
+        self.subgraph_from_seed_idx(kind, reverse, seed_idx)
+    }
+
+    fn subgraph_from_seed_idx(
+        &self,
+        kind: WeightKind,
+        reverse: bool,
+        seed_idx: petgraph::stable_graph::NodeIndex,
+    ) -> BidSubGraph {
+        let g = self.as_graph();
 
         // Section edges in BidGraph go child → parent (source=child, sink=parent).
         // `as_subgraph_seeded(kind, reverse=true, seed=net)` is called from PathMap::new
@@ -220,8 +254,8 @@ impl BidGraph {
             Direction::Outgoing
         };
 
-        let mut reachable: BTreeSet<petgraph::graph::NodeIndex> = BTreeSet::new();
-        let mut stack_walk: Vec<petgraph::graph::NodeIndex> = vec![seed_idx];
+        let mut reachable: BTreeSet<petgraph::stable_graph::NodeIndex> = BTreeSet::new();
+        let mut stack_walk: Vec<petgraph::stable_graph::NodeIndex> = vec![seed_idx];
         reachable.insert(seed_idx);
         while let Some(current) = stack_walk.pop() {
             for neighbor in g.neighbors_directed(current, walk_direction) {
@@ -231,22 +265,62 @@ impl BidGraph {
             }
         }
 
-        // Now collect only `kind` edges between reachable nodes.
-        let edges = g.raw_edges().iter().filter_map(|edge| {
-            if !reachable.contains(&edge.source()) || !reachable.contains(&edge.target()) {
-                return None;
+        // Collect `kind` edges between reachable nodes by walking outward from the
+        // reachable set, rather than scanning every edge in the graph and filtering.
+        // Cost becomes O(reachable edges) instead of O(all edges) — the second half of
+        // the full-graph-scan fix.
+        //
+        // Edge *order* is load-bearing: `BidSubGraph` is a `GraphMap`, whose node and
+        // edge iteration order follows insertion, and `PathMap::new` runs a DFS over the
+        // result. The previous implementation inserted in `edge_references()` order,
+        // which for `StableGraph` is ascending edge index. `edges_directed` instead
+        // yields per-node in reverse insertion order, so we tag each edge with its index
+        // and sort to reproduce the original sequence exactly.
+        //
+        // On `Direction::Outgoing` (note: *not* `walk_direction`): this iteration is
+        // about enumerating each candidate edge exactly once, which is a separate
+        // concern from the direction the reachability walk took. Every edge has exactly
+        // one source, so visiting outgoing edges of every reachable node yields each
+        // edge with a reachable source once, and the `target` check below completes the
+        // old filter's `reachable.contains(source) && reachable.contains(target)`
+        // predicate.
+        //
+        // Using `walk_direction` here would in fact produce the same edge *set* —
+        // `reachable` is closed under `walk_direction`, so an edge touching a reachable
+        // node in that direction has both endpoints reachable either way — but it would
+        // then be `edge_ref.target()` that is trivially `node_idx` under `Incoming`,
+        // making the guard below a no-op and the pairing subtly wrong. Enumerating from
+        // the source keeps the guard meaningful in both modes.
+        //
+        // `reverse` is honoured in the two places it belongs: `walk_direction` above
+        // (which nodes are reachable) and the source/sink swap below (edge orientation).
+        //
+        // `test_subgraph_seeded_matches_reference_implementation` pins all of this
+        // against the pre-Issue-103 algorithm; hardcoding the opposite direction here
+        // makes it fail.
+        let mut indexed_edges: Vec<(usize, SubGraphEdge)> = Vec::new();
+        for node_idx in reachable.iter().copied() {
+            for edge_ref in g.edges_directed(node_idx, Direction::Outgoing) {
+                if !reachable.contains(&edge_ref.target()) {
+                    continue;
+                }
+                let Some(weight) = edge_ref.weight().get(&kind) else {
+                    continue;
+                };
+                let source = g[edge_ref.source()];
+                let sink = g[edge_ref.target()];
+                let paths: Vec<String> = weight.get_doc_paths();
+                let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                let entry = if reverse {
+                    (sink, source, (sort_key, paths))
+                } else {
+                    (source, sink, (sort_key, paths))
+                };
+                indexed_edges.push((edge_ref.id().index(), entry));
             }
-            let source = g[edge.source()];
-            let sink = g[edge.target()];
-            let weight = edge.weight.get(&kind)?;
-            let paths: Vec<String> = weight.get_doc_paths();
-            let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
-            if reverse {
-                Some((sink, source, (sort_key, paths)))
-            } else {
-                Some((source, sink, (sort_key, paths)))
-            }
-        });
+        }
+        indexed_edges.sort_by_key(|(edge_idx, _)| *edge_idx);
+        let edges = indexed_edges.into_iter().map(|(_, entry)| entry);
         BidSubGraph::from_edges(edges)
     }
 
@@ -329,27 +403,6 @@ impl<'a> BidRefGraph<'a> {
         &mut self.0
     }
 
-    pub fn filter(&self, pred: &RelationPred, invert: bool) -> BidRefGraph<'_> {
-        let edges = self.as_graph().raw_edges().iter().filter(|edge| {
-            let source = self.as_graph()[edge.source()];
-            let sink = self.as_graph()[edge.target()];
-            let weights = &edge.weight;
-            let is_match = pred.match_ref(&BeliefRefRelation {
-                source: &source,
-                sink: &sink,
-                weights,
-            });
-            (is_match && !invert) || (!is_match && invert)
-        });
-        BidRefGraph::from_edges(edges.map(|edge| {
-            (
-                self.as_graph()[edge.source()],
-                self.as_graph()[edge.target()],
-                &edge.weight,
-            )
-        }))
-    }
-
     pub fn retain<F: FnMut(&Bid, &Bid, &WeightSet) -> bool>(&mut self, mut f: F) {
         let to_remove = self
             .as_graph()
@@ -387,9 +440,15 @@ impl<'a> DerefMut for BidRefGraph<'a> {
 
 /// Used for Serialization/Deserialization of `BeliefBase`s as well as for returning `BeliefSource`
 /// query results.
+///
+/// `states` uses `FxHashMap` (not `BTreeMap`) — pure keyed lookup, no order dependency (see
+/// Issue 101). Note: `#[derive(Serialize)]` therefore no longer emits `states` keys in sorted
+/// order when this is written to `beliefbase.json`/msgpack — this is a cosmetic wire-format
+/// change only (JSON/msgpack map key order is not semantically meaningful, and these export
+/// artifacts are ephemeral/regenerated per build, not diffed byte-for-byte).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct BeliefGraph {
-    pub states: BTreeMap<Bid, BeliefNode>,
+    pub states: FxHashMap<Bid, BeliefNode>,
     pub relations: BidGraph,
 }
 
@@ -399,10 +458,8 @@ impl BeliefGraph {
     }
 
     pub fn display_contents(&self) -> String {
-        let edge_tuple = self
-            .relations
-            .as_graph()
-            .raw_edges()
+        let edge_refs: Vec<_> = self.relations.as_graph().edge_references().collect();
+        let edge_tuple = edge_refs
             .iter()
             .map(|e| {
                 let source_b = self.relations.as_graph()[e.source()];
@@ -431,7 +488,7 @@ impl BeliefGraph {
                     })
                     .unwrap_or(sink_b.bref().to_string());
                 let weights = e
-                    .weight
+                    .weight()
                     .weights
                     .iter()
                     .map(|(k, v)| {
@@ -439,7 +496,11 @@ impl BeliefGraph {
                             "{}[{}]",
                             k,
                             v.get(crate::properties::WEIGHT_OWNED_BY)
-                                .map(|owner: String| if &owner == "source" { "+" } else { "-" })
+                                .map(|owner: String| match owner.as_str() {
+                                    "source" => "+",
+                                    "sink" => "-",
+                                    _ => "o", // third-party bref owner
+                                })
                                 .unwrap_or("-")
                         )
                     })
@@ -541,10 +602,10 @@ impl BeliefGraph {
                             explored.insert(sink_idx);
                             let sink_bid = rhs_relations[sink_idx];
                             if let Some(sink_node) = rhs.states.get(&sink_bid) {
-                                if let BTreeEntry::Vacant(e) = self.states.entry(sink_bid) {
+                                if let HashEntry::Vacant(e) = self.states.entry(sink_bid) {
                                     e.insert(sink_node.clone());
                                 } else {
-                                    // This is expected for unbalanced sets, such as produced by eval_unbalanced.
+                                    // This is expected for partial graphs, such as Trace-marked halo results.
                                 }
                             }
                             Control::Continue
@@ -558,9 +619,11 @@ impl BeliefGraph {
         }
 
         // Now, union the relations, only adding nodes that exist in the final state map.
-        for edge in rhs.relations.as_graph().raw_edges() {
-            let source = rhs.relations.as_graph()[edge.source()];
-            let sink = rhs.relations.as_graph()[edge.target()];
+        let rhs_edges: Vec<_> = rhs.relations.as_graph().edge_references().collect();
+        for edge_ref in rhs_edges {
+            let source = rhs.relations.as_graph()[edge_ref.source()];
+            let sink = rhs.relations.as_graph()[edge_ref.target()];
+            let edge_weight = edge_ref.weight().clone();
 
             if source == sink {
                 tracing::warn!(
@@ -570,7 +633,7 @@ impl BeliefGraph {
                         .get(&source)
                         .map(|n| n.title.as_str())
                         .unwrap_or_default(),
-                    edge.weight
+                    edge_weight
                 );
                 continue;
             }
@@ -578,7 +641,7 @@ impl BeliefGraph {
             // Only add edges for nodes that have a state in the now-merged state map.
             // First, try to fill any missing endpoint from rhs.states.
             if self.states.contains_key(&source) || self.states.contains_key(&sink) {
-                if let BTreeEntry::Vacant(e) = self.states.entry(sink) {
+                if let HashEntry::Vacant(e) = self.states.entry(sink) {
                     if let Some(rhs_state) = rhs.states.get(&sink) {
                         // tracing::debug!(
                         //     "Adding sink {} {} to lhs",
@@ -588,7 +651,7 @@ impl BeliefGraph {
                         e.insert(rhs_state.clone());
                     }
                 }
-                if let BTreeEntry::Vacant(e) = self.states.entry(source) {
+                if let HashEntry::Vacant(e) = self.states.entry(source) {
                     if let Some(rhs_state) = rhs.states.get(&source) {
                         // tracing::debug!(
                         //     "Adding source {} {} to lhs",
@@ -612,11 +675,9 @@ impl BeliefGraph {
                     let sink_idx = *bid_to_index
                         .entry(sink)
                         .or_insert_with(|| self.relations.as_graph_mut().add_node(sink));
-                    self.relations.as_graph_mut().update_edge(
-                        source_idx,
-                        sink_idx,
-                        edge.weight.clone(),
-                    );
+                    self.relations
+                        .as_graph_mut()
+                        .update_edge(source_idx, sink_idx, edge_weight);
                 } else {
                     tracing::debug!(
                         "Skipping edge {} → {}: endpoint(s) absent from both lhs and rhs states \
@@ -678,10 +739,10 @@ impl BeliefGraph {
     pub fn union_mut_with_trace(&mut self, rhs: &BeliefGraph) {
         for node in rhs.states.values() {
             match self.states.entry(node.bid) {
-                BTreeEntry::Vacant(e) => {
+                HashEntry::Vacant(e) => {
                     e.insert(node.clone());
                 }
-                BTreeEntry::Occupied(mut e) => {
+                HashEntry::Occupied(mut e) => {
                     let existing = e.get();
                     // rhs wins unless rhs is Trace and lhs is already complete.
                     if !(node.kind.contains(BeliefKind::Trace) && existing.kind.is_complete()) {
@@ -708,7 +769,7 @@ impl BeliefGraph {
                 .map(|n| n.bid),
         );
         let mut beliefs = BeliefGraph {
-            states: BTreeMap::from_iter(
+            states: FxHashMap::from_iter(
                 lhs_states
                     .intersection(&rhs_states)
                     .filter_map(|bid| self.states.get(bid).map(|n| (n.bid, n.clone()))),
@@ -739,7 +800,7 @@ impl BeliefGraph {
                 .map(|n| n.bid),
         );
         let mut beliefs = BeliefGraph {
-            states: BTreeMap::from_iter(
+            states: FxHashMap::from_iter(
                 lhs_states
                     .difference(&rhs_states)
                     .filter_map(|bid| self.states.get(bid).map(|n| (n.bid, n.clone()))),
@@ -763,14 +824,10 @@ impl BeliefGraph {
         *self = self.symmetric_difference(rhs);
     }
 
-    /// In order to (attempt to) fullfill the balanced beliefbase invariants, this will keep building
-    /// queries so long as there are subsection relation sinks who's nodes are not loaded.
-    pub fn build_balance_expr(&self, with_orphans: bool) -> Option<Expression> {
-        self.build_downstream_expr(Some(WeightKind::Section.into()), with_orphans)
-    }
-
     /// Find BIDs referenced in relations but not present in states.
-    /// Returns a sorted, deduplicated list of orphaned BIDs.
+    /// Returns a deduplicated set of orphaned BIDs. Sortedness is an incidental
+    /// property of the current `BTreeSet` return type, not a documented
+    /// guarantee — no caller relies on iteration order, only membership/dedup.
     pub fn find_orphaned_edges(&self) -> BTreeSet<Bid> {
         let mut missing = BTreeSet::new();
         for node_idx in self.relations.as_graph().node_indices() {
@@ -782,168 +839,81 @@ impl BeliefGraph {
         missing
     }
 
-    /// Find nodes that are in our relations graph, but have no relations defined
-    pub fn find_orphaned_nodes(&self) -> BTreeSet<Bid> {
-        let in_set: BTreeSet<_> = self
-            .relations
-            .as_graph()
-            .externals(Direction::Incoming)
-            .collect();
-        let out_set: BTreeSet<_> = self
-            .relations
-            .as_graph()
-            .externals(Direction::Incoming)
-            .collect();
-        BTreeSet::from_iter(
-            in_set
-                .difference(&out_set)
-                .map(|node_idx| self.relations.as_graph()[*node_idx]),
-        )
-    }
-
-    /// Construct a query expression to access any missing relationships, optionally filtered
-    /// by WeightSet.
+    /// Find boundary nodes: nodes in the relation graph that have no edges of
+    /// the specified weight kinds in the given direction.
     ///
-    /// dir: Comes from petgraph::Graph::externals, which defines dir as: Return an iterator over
-    /// either the nodes without edges to them (Incoming) or from them (Outgoing).
+    /// `kinds`: which edge weight kinds to consider. If empty, no edges match
+    /// and every node is "external".
+    ///
+    /// `dir`: `Outgoing` finds nodes with no outgoing edges of the given kinds
+    /// (i.e. roots/sinks in that subgraph). `Incoming` finds nodes with no
+    /// incoming edges (i.e. leaves/sources).
+    ///
+    /// `with_orphans`: if true, also includes nodes present in the full relation
+    /// graph but absent from the kind-filtered subgraph (they trivially have no
+    /// edges of the specified kinds).
+    ///
+    /// Nodes already in `states` with `BeliefKind::External` are excluded —
+    /// External nodes are always partially loaded by design, so re-fetching
+    /// them would create an infinite balance loop.
+    #[allow(dead_code)] // Retained for potential future use; last caller was to_event_stream.
     fn find_externals(
         &self,
-        weights: Option<WeightSet>,
+        kinds: EnumSet<WeightKind>,
         dir: Direction,
         with_orphans: bool,
     ) -> BTreeSet<Bid> {
-        let filter_weights = weights.unwrap_or(WeightSet::full());
+        // Build a filtered subgraph containing only edges that have at least
+        // one weight kind in `kinds`.
+        let g = self.relations.as_graph();
+        let filtered_edges: Vec<_> = g
+            .edge_references()
+            .filter(|e| e.weight().weights.keys().any(|k| kinds.contains(*k)))
+            .map(|e| (g[e.source()], g[e.target()]))
+            .collect();
+        let filtered: GraphMap<Bid, (), Directed> =
+            GraphMap::from_edges(filtered_edges.iter().copied());
+
+        // Find external nodes: those with no edges in `dir`.
         let mut external_bids = BTreeSet::default();
-        let filtered_edge_graph = self
-            .relations
-            .filter(&RelationPred::Kind(filter_weights.clone()), false);
-        // relations.filter cannot return orphaned nodes by definition, since it only iterates
-        // through graph edges
-        let edge_externals = filtered_edge_graph
-            .as_graph()
-            .externals(dir)
-            .collect::<Vec<_>>();
-        for edge_idx in edge_externals.iter() {
-            let bid = filtered_edge_graph.as_graph()[*edge_idx];
-            external_bids.insert(bid);
+        for node in filtered.nodes() {
+            let has_edges = match dir {
+                Direction::Outgoing => filtered
+                    .edges_directed(node, Direction::Outgoing)
+                    .next()
+                    .is_some(),
+                Direction::Incoming => filtered
+                    .edges_directed(node, Direction::Incoming)
+                    .next()
+                    .is_some(),
+            };
+            if !has_edges {
+                external_bids.insert(node);
+            }
         }
+
+        // Orphan handling: nodes present in the full graph but absent from the
+        // filtered subgraph (they have no edges of the specified kinds at all).
         if with_orphans {
-            let initial_set = HashSet::<Bid>::from_iter(
-                self.relations
-                    .as_graph()
-                    .node_indices()
-                    .map(|idx| self.relations.as_graph()[idx]),
-            );
-            let filtered_set = HashSet::<Bid>::from_iter(
-                filtered_edge_graph
-                    .as_graph()
-                    .node_indices()
-                    .map(|idx| filtered_edge_graph.as_graph()[idx]),
-            );
-            for initial in initial_set {
-                if !filtered_set.contains(&initial) {
-                    external_bids.insert(initial);
+            let filtered_set: HashSet<Bid> = filtered.nodes().collect();
+            for idx in g.node_indices() {
+                let bid = g[idx];
+                if !filtered_set.contains(&bid) {
+                    external_bids.insert(bid);
                 }
             }
         }
+
+        // Skip nodes whose Trace status is final — External nodes (href leaf
+        // nodes, asset leaf nodes, API root) are always partially loaded by
+        // design; no deeper fetch will ever return a non-Trace version.
+        external_bids.retain(|bid| {
+            !self
+                .states
+                .get(bid)
+                .is_some_and(|n| n.kind.contains(BeliefKind::External))
+        });
         external_bids
-    }
-
-    /// Find the nodes in the relation graph filtered by `weights` EdgeWeights without edges TO them
-    /// which are either 1) not in our self.states or who's state.kind contains BeliefKind::Trace
-    /// (meaning not all their relationships are loaded)
-    pub fn build_upstream_expr(
-        &self,
-        weights: Option<WeightSet>,
-        with_orphans: bool,
-    ) -> Option<Expression> {
-        let external_bids = self.find_externals(weights, Direction::Incoming, with_orphans);
-        if external_bids.is_empty() {
-            None
-        } else {
-            Some(Expression::StateIn(StatePred::Bid(Vec::from_iter(
-                external_bids,
-            ))))
-        }
-    }
-
-    /// Find the nodes in the relation graph filtered by `weights` EdgeWeights without edges FROM them
-    /// which are either 1) not in our self.states or who's state.kind contains BeliefKind::Trace
-    /// (meaning not all their relationships are loaded)
-    pub fn build_downstream_expr(
-        &self,
-        weights: Option<WeightSet>,
-        with_orphans: bool,
-    ) -> Option<Expression> {
-        let external_bids = self.find_externals(weights, Direction::Outgoing, with_orphans);
-        if external_bids.is_empty() {
-            None
-        } else {
-            Some(Expression::StateIn(StatePred::Bid(Vec::from_iter(
-                external_bids,
-            ))))
-        }
-    }
-
-    pub fn paginate(
-        &self,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> ResultsPage<BeliefGraph> {
-        let count = self.states.len();
-        let start = offset.unwrap_or(0);
-        let mut page_limit = limit.unwrap_or(DEFAULT_LIMIT);
-        if page_limit > (count - start) {
-            page_limit = count;
-        }
-        let results = match count > page_limit || start > 0 {
-            true => {
-                let states = BTreeMap::from_iter(self.states.iter().enumerate().filter_map(
-                    |(idx, (bid, node))| {
-                        if idx < start {
-                            None
-                        } else if idx < (start + page_limit) {
-                            Some((*bid, node.clone()))
-                        } else {
-                            None
-                        }
-                    },
-                ));
-                let relations = BidGraph::from_edges(
-                    self.relations
-                        .as_graph()
-                        .raw_edges()
-                        .iter()
-                        .filter(|edge| {
-                            let source = self.relations.as_graph()[edge.source()];
-                            let sink = self.relations.as_graph()[edge.target()];
-                            states.contains_key(&source) && states.contains_key(&sink)
-                        })
-                        .map(|edge| {
-                            (
-                                self.relations.as_graph()[edge.source()],
-                                self.relations.as_graph()[edge.target()],
-                                edge.weight.clone(),
-                            )
-                        }),
-                );
-
-                // log::debug!(
-                //     "[paginate] self relation count: {}, self state count: {}, paginate state count {}, paginate relation count {}",
-                //     self.states().len(), self.relations().node_count(), states.len(), relations.node_count()
-                // );
-                BeliefGraph { states, relations }
-            }
-            false => BeliefGraph {
-                states: self.states.clone(),
-                relations: self.relations.clone(),
-            },
-        };
-        ResultsPage {
-            count,
-            start,
-            results,
-        }
     }
 
     /// Convert this `BeliefGraph` (rhs) into an ordered `Vec<BeliefEvent>` suitable for
@@ -977,200 +947,73 @@ impl BeliefGraph {
     ///
     /// Replaces the old `to_event_stream → Vec<BeliefEvent>` signature.  The
     /// per-node `index_sync` that the old path triggered (via `process_event →
-    /// insert_state → evaluate_expression`) is eliminated; the index is marked dirty
+    /// insert_state → evaluate_query`) is eliminated; the index is marked dirty
     /// once after the node pass and rebuilt once before the relation pass.
+    ///
+    /// Uses `QueryPackage::balanced` to compute the scoped graph (halo +
+    /// section ancestry with Trace coloring). The tape provides topological +
+    /// sibling ordering for edges; lhs-wins dedup filters both nodes and edges.
     pub fn to_event_stream(
         &self,
         lhs: &BeliefBase,
         seed_bids: Option<&BTreeSet<Bid>>,
     ) -> Vec<MergeOp> {
+        self.to_event_stream_with(lhs, seed_bids, MergePrecedence::LhsWins)
+    }
+
+    /// [`to_event_stream`] with an explicit collision policy for the node pass.
+    ///
+    /// Only node states are affected. Edges are unconditionally rhs-wins-on-difference
+    /// under both policies: the dedup below matches on the exact
+    /// `(source, sink, WeightSet)` triple, so an edge whose weight differs is always
+    /// emitted and applied by `update_relation`.
+    ///
+    /// [`to_event_stream`]: BeliefGraph::to_event_stream
+    pub fn to_event_stream_with(
+        &self,
+        lhs: &BeliefBase,
+        seed_bids: Option<&BTreeSet<Bid>>,
+        precedence: MergePrecedence,
+    ) -> Vec<MergeOp> {
         let mut ops = Vec::new();
 
         // ----------------------------------------------------------------
-        // Compute scoped_bids first — gates both passes to prevent orphaned nodes.
+        // Compute scoped graph: seed + halo + section ancestors, with
+        // Trace coloring for non-seed nodes. When seed_bids is None,
+        // the entire rhs is in scope.
         // ----------------------------------------------------------------
-
-        // Collect the full set of BIDs we care about: seed_bids + their immediate
-        // neighbours across all edge kinds (the "halo"), then walk the balance loop
-        // (build_balance_expr) to pull in network/API root ancestors from rhs itself.
-        let scoped_graph = match seed_bids {
-            None => self.clone(),
+        let (scoped_graph, tape) = match seed_bids {
+            None => (self.clone(), None),
             Some(seeds) => {
-                // Start with seeds + immediate neighbours in rhs.relations
-                let g = self.relations.as_graph();
-                let mut halo: BTreeSet<Bid> = seeds.clone();
-                for edge in g.raw_edges() {
-                    let source = g[edge.source()];
-                    let sink = g[edge.target()];
-                    if seeds.contains(&source) || seeds.contains(&sink) {
-                        halo.insert(source);
-                        halo.insert(sink);
-                    }
+                let bb = super::BeliefBase::from(self.clone());
+                let spec = crate::query::spec::QuerySpec::seed(crate::query::spec::TapeFn::Bids(
+                    seeds.iter().copied().collect(),
+                ));
+                let mut package = QueryPackage::balanced(spec);
+                if let Err(e) = bb.evaluate_query(&mut package) {
+                    tracing::warn!("[to_event_stream] evaluate_query failed: {e}");
+                    return ops;
                 }
-                // Balance: walk upstream via Section edges until all section-sinks
-                // are network/API roots (same logic as BeliefSource::balance, but
-                // purely in-memory against rhs — no async fetch needed).
-                let mut relations = BidGraph::from_edges(g.raw_edges().iter().filter_map(|e| {
-                    let source = g[e.source()];
-                    let sink = g[e.target()];
-                    if halo.contains(&source) && halo.contains(&sink) {
-                        Some((source, sink, e.weight.clone()))
-                    } else {
-                        None
-                    }
-                }));
-                // Build a Bid→NodeIndex map for `balanced.relations` that we keep
-                // up-to-date as we add nodes.  This is necessary because `balanced`
-                // has its own independent NodeIndex space — using NodeIndex values
-                // from `g` directly against `balanced.relations` would silently
-                // corrupt the graph.
-                let mut balanced_bid_to_index: HashMap<Bid, petgraph::graph::NodeIndex> = relations
-                    .as_graph()
-                    .node_indices()
-                    .map(|idx| (relations.as_graph()[idx], idx))
-                    .collect();
-                let self_bid_to_index: HashMap<Bid, petgraph::graph::NodeIndex> =
-                    g.node_indices().map(|idx| (g[idx], idx)).collect();
-                // Our halo may contain elements we don't have any relations for. We need to add
-                // them such that graph external checks within BeliefGraph::find_externals works
-                // correctly
-                for bid in halo.iter() {
-                    if !balanced_bid_to_index.contains_key(bid) {
-                        relations.as_graph_mut().add_node(*bid);
-                    }
-                }
-                let mut balanced = BeliefGraph {
-                    states: BTreeMap::from_iter(
-                        halo.iter()
-                            .filter_map(|b| self.states.get(b).map(|n| (*b, n.clone()))),
-                    ),
-                    relations,
-                };
-
-                let mut last_expr = Expression::StateIn(StatePred::Any);
-                let mut balance_depth = 0usize;
-                loop {
-                    if balance_depth >= crate::query::BALANCE_CUTOFF {
-                        tracing::warn!(
-                            "[to_event_stream] balance loop hit BALANCE_CUTOFF ({}) without \
-                             converging; aborting to prevent infinite loop",
-                            crate::query::BALANCE_CUTOFF,
-                        );
-                        break;
-                    }
-                    balance_depth += 1;
-                    let Some(expr) = balanced.build_balance_expr(true) else {
-                        break;
-                    };
-                    if expr == last_expr {
-                        tracing::trace!("aborting balance, reached steady state");
-                        break;
-                    }
-                    // Fetch missing Section-sink nodes from rhs (not from cache)
-                    let missing: Vec<Bid> = match &expr {
-                        Expression::StateIn(StatePred::Bid(bids)) => bids.clone(),
-                        _ => break,
-                    };
-                    last_expr = expr;
-                    for missing_bid in &missing {
-                        let Some(missing_node) = self.states.get(missing_bid) else {
-                            if !halo.contains(missing_bid) {
-                                tracing::warn!(
-                                    "[to_event_stream] build_balance_expr returned missing bid \
-                                    {missing_bid}, which does not appear in states."
-                                );
-                            }
-                            continue;
-                        };
-                        balanced.states.entry(*missing_bid).or_insert_with(|| {
-                            // Register this new source node in balanced.relations so its outgoing
-                            // edges can be wired up below.
-                            let idx = balanced.relations.as_graph_mut().add_node(*missing_bid);
-                            balanced_bid_to_index.insert(*missing_bid, idx);
-                            let mut node = missing_node.clone();
-                            // Ensure this node is colored Trace, as we're only linking it
-                            // to its section hierarchy
-                            node.kind.insert(BeliefKind::Trace);
-                            node
-                        });
-
-                        let Some(self_node_idx) = self_bid_to_index.get(missing_bid) else {
-                            if !halo.contains(missing_bid) {
-                                tracing::debug!(
-                                    "[to_event_stream] this BeliefGraph doesn't contain any \
-                                    relations for missing bid: {missing_bid}"
-                                );
-                            }
-                            continue;
-                        };
-                        for e in g.edges_directed(*self_node_idx, Direction::Outgoing) {
-                            let Some(section_weight) =
-                                e.weight().weights.get(&WeightKind::Section).cloned()
-                            else {
-                                // No section weight on this edge, therefore not relevant to this
-                                // balance operation.
-                                continue;
-                            };
-                            let mut trace_weightset = WeightSet::empty();
-                            trace_weightset.set(WeightKind::Section, section_weight);
-                            let source = g[e.source()];
-                            debug_assert!(*missing_bid == source);
-                            let sink = g[e.target()];
-                            let sink_idx = match balanced_bid_to_index.get(&sink) {
-                                Some(idx) => *idx,
-                                None => {
-                                    let Some(mut sink_node) = self.states.get(&sink).cloned()
-                                    else {
-                                        if !halo.contains(&sink) {
-                                            tracing::warn!(
-                                                "[to_event_stream] {source} has a section sink \
-                                                {sink}, which does not appear in states."
-                                            );
-                                        }
-                                        continue;
-                                    };
-                                    sink_node.kind.insert(BeliefKind::Trace);
-                                    let res = balanced.states.insert(sink, sink_node);
-                                    if res.is_some() {
-                                        tracing::warn!(
-                                            "Already had an entry in self.states for {sink}, this means balanced_bid_to_index is out of sync!"
-                                        );
-                                    }
-                                    let idx = balanced.relations.as_graph_mut().add_node(sink);
-                                    balanced_bid_to_index.insert(sink, idx);
-                                    idx
-                                }
-                            };
-                            let Some(&src_idx) = balanced_bid_to_index.get(&source) else {
-                                tracing::warn!(
-                                    "[to_event_stream] balanced doesn't contain source {source} \
-                                    in its relations?!",
-                                );
-                                continue;
-                            };
-                            balanced.relations.as_graph_mut().add_edge(
-                                src_idx,
-                                sink_idx,
-                                trace_weightset,
-                            );
-                        }
-                    }
-                }
-                balanced
+                let tape = package.tape().clone();
+                let graph = package.into_graph();
+                (graph, Some(tape))
             }
         };
 
         // ----------------------------------------------------------------
         // Pass 1: NodeUpdate events — lhs-wins with Trace downgrade.
-        // Gated on scoped_bids so we never emit nodes that have no relation
-        // context in this merge — those would land in self.states as orphans.
         // ----------------------------------------------------------------
         for node in scoped_graph.states.values() {
-            let should_emit = match lhs.states().get(&node.bid) {
-                // lhs has a complete copy — lhs wins, skip
-                Some(existing) if !existing.kind.contains(BeliefKind::Trace) => false,
-                // lhs has Trace copy or no copy — emit to overwrite/insert
-                _ => true,
+            let should_emit = match precedence {
+                MergePrecedence::LhsWins => match lhs.states().get(&node.bid) {
+                    // lhs has a complete copy — lhs wins, skip
+                    Some(existing) if !existing.kind.contains(BeliefKind::Trace) => false,
+                    // lhs has Trace copy or no copy — emit to overwrite/insert
+                    _ => true,
+                },
+                // rhs wins outright, Trace included. Skip only an exact match, which
+                // would be a no-op event.
+                MergePrecedence::RhsWins => lhs.states().get(&node.bid) != Some(node),
             };
             if should_emit {
                 ops.push(MergeOp::NodeUpsert(node.clone()));
@@ -1178,80 +1021,91 @@ impl BeliefGraph {
         }
 
         // ----------------------------------------------------------------
-        // Pass 2: RelationUpdate events — topological order via Section DFS,
-        // then non-Section edges.
+        // Pass 2: RelationUpdate events.
+        //
+        // When the tape is available, iterate edges in tape order — this
+        // gives topological + sibling ordering for Section edges (balance_map
+        // traversal records parent-before-child), followed by halo edges.
+        //
+        // When no tape (seed_bids was None), emit all edges directly.
+        //
+        // Performance: the lhs-wins dedup check below used to be a linear scan
+        // over ALL of lhs's edges per rhs edge (`edge_references().any(...)`),
+        // making this pass O(rhs_edges × lhs_edges). That is exactly the
+        // O(session_bb_size × rhs_edges) blowup documented on `BeliefBase::merge`
+        // (Issue 47 BN-1) — it was fixed there via `merge_from`'s seeded DFS, but
+        // this dedup scan runs regardless of whether a seed is supplied, so callers
+        // merging repeatedly into a growing lhs (e.g. WASM shard loading in
+        // `wasm::load_shard`, which always passes `seed_bids: None`) still pay it.
+        // Precomputing a hash set of lhs's (source, sink, weight) triples once
+        // turns each dedup check into an O(1) lookup, making the whole pass
+        // O(lhs_edges + rhs_edges) instead of O(rhs_edges × lhs_edges).
         // ----------------------------------------------------------------
+        let scoped_g = scoped_graph.relations.as_graph();
 
-        // Build Section subgraph over scoped_bids for topological traversal.
-        // as_subgraph(Section, false) → source=child, sink=parent in forward direction.
-        // We want parent-before-child emission, so use reversed=true: sink→source becomes
-        // parent→child in DFS TreeEdge events (petgraph traverses edge direction).
-        let section_subgraph = scoped_graph
-            .relations
-            .as_subgraph(WeightKind::Section, true);
-
-        // DFS seeds: network/API roots in the subgraph (nodes with no incoming edges
-        // in the reversed subgraph, i.e. no outgoing Section edges in the forward graph).
-        let seeds: Vec<Bid> = {
-            let all_nodes: BTreeSet<Bid> = section_subgraph.nodes().collect();
-            let has_incoming: BTreeSet<Bid> = section_subgraph
-                .all_edges()
-                .map(|(_src, tgt, _)| tgt)
-                .collect();
-            all_nodes.difference(&has_incoming).copied().collect()
+        let lhs_edge_set: HashSet<(Bid, Bid, WeightSet)> = {
+            let lhs_rel = lhs.relations();
+            let lhs_g = lhs_rel.as_graph();
+            lhs_g
+                .edge_references()
+                .map(|le| (lhs_g[le.source()], lhs_g[le.target()], le.weight().clone()))
+                .collect()
         };
 
-        let mut section_emitted: BTreeSet<(Bid, Bid)> = BTreeSet::new();
-        depth_first_search(&section_subgraph, seeds, |event| {
-            if let DfsEvent::TreeEdge(sink, source) = event {
-                // sink=parent, source=child in our reversed subgraph.
-                // Look up full WeightSet from rhs.relations for the original (source→sink) edge.
-                let rhs_g = self.relations.as_graph();
-                let full_weight: Option<WeightSet> = rhs_g.raw_edges().iter().find_map(|e| {
-                    let s = rhs_g[e.source()];
-                    let t = rhs_g[e.target()];
-                    if s == source && t == sink {
-                        Some(e.weight.clone())
-                    } else {
-                        None
+        // Dedup: track emitted (source, sink) pairs.
+        let mut emitted: BTreeSet<(Bid, Bid)> = BTreeSet::new();
+
+        if let Some(ref tape) = tape {
+            // Emit edges in tape order — topological + sibling ordered.
+            for entry in &tape.steps {
+                if let Some(edge_indices) = entry.content.edges() {
+                    for &eidx in edge_indices {
+                        let Some((src_idx, snk_idx)) = scoped_g.edge_endpoints(eidx) else {
+                            continue;
+                        };
+                        let source = scoped_g[src_idx];
+                        let sink = scoped_g[snk_idx];
+                        let Some(weight) = scoped_g.edge_weight(eidx) else {
+                            continue;
+                        };
+                        if emitted.contains(&(source, sink)) {
+                            continue;
+                        }
+                        // lhs-wins: skip if lhs already has identical edge.
+                        let already_present =
+                            lhs_edge_set.contains(&(source, sink, weight.clone()));
+                        if already_present {
+                            emitted.insert((source, sink));
+                            continue;
+                        }
+                        emitted.insert((source, sink));
+                        ops.push(MergeOp::RelationUpdate(source, sink, weight.clone()));
                     }
-                });
-                if let Some(weight) = full_weight {
-                    section_emitted.insert((source, sink));
-                    ops.push(MergeOp::RelationUpdate(source, sink, weight));
                 }
             }
-            Control::<()>::Continue
-        });
+        }
 
-        // Emit all remaining edges (non-Section, or Section edges not reached by DFS
-        // because both endpoints weren't in scoped_bids).
-        let rhs_g = self.relations.as_graph();
-        for edge in rhs_g.raw_edges() {
-            let source = rhs_g[edge.source()];
-            let sink = rhs_g[edge.target()];
+        // Emit any remaining edges not covered by the tape (non-tape path,
+        // or edges in scoped_graph not recorded in tape entries).
+        for edge_ref in scoped_g.edge_references() {
+            let source = scoped_g[edge_ref.source()];
+            let sink = scoped_g[edge_ref.target()];
+            if emitted.contains(&(source, sink)) {
+                continue;
+            }
+            // Both endpoints must be in scope.
             if !scoped_graph.states.contains_key(&source)
-                && !scoped_graph.states.contains_key(&sink)
+                || !scoped_graph.states.contains_key(&sink)
             {
                 continue;
             }
-            if section_emitted.contains(&(source, sink)) {
-                continue;
-            }
-            // Check lhs already has this edge with identical weight — skip if so.
-            let already_present = {
-                let lhs_rel = lhs.relations();
-                let lhs_g = lhs_rel.as_graph();
-                lhs_g.raw_edges().iter().any(|le| {
-                    lhs_g[le.source()] == source
-                        && lhs_g[le.target()] == sink
-                        && le.weight == edge.weight
-                })
-            };
+            let edge_weight = edge_ref.weight().clone();
+            let already_present = lhs_edge_set.contains(&(source, sink, edge_weight.clone()));
             if already_present {
                 continue;
             }
-            ops.push(MergeOp::RelationUpdate(source, sink, edge.weight.clone()));
+            emitted.insert((source, sink));
+            ops.push(MergeOp::RelationUpdate(source, sink, edge_weight));
         }
 
         ops
@@ -1274,6 +1128,108 @@ impl From<&BeliefBase> for BeliefGraph {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BeliefSource — query model API for BeliefGraph
+// ---------------------------------------------------------------------------
+//
+// Provides the `BeliefSource` API on a `BeliefGraph`, enabling callers to
+// run `QuerySpec` evaluations against a pre-materialized graph without manually
+// converting to `BeliefBase`.  `export_beliefgraph` operates directly on the
+// graph fields.  Expensive operations (`evaluate`, `submap`, `submap_by_bid`)
+// convert to a temporary `BeliefBase` — this is O(N+E) per call, so callers
+// with repeated query needs should convert once and query the `BeliefBase`
+// directly.  For single-node lookup or edge fetching, use the free functions
+// `lookup_node` and `lookup_edges` in `crate::query`.
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BeliefSource for BeliefGraph {
+    fn evaluate<'a>(
+        &'a self,
+        package: &'a mut QueryPackage,
+    ) -> BoxFuture<'a, Result<(), BuildonomyError>> {
+        Box::pin(async move {
+            let bb = BeliefBase::from(self.clone());
+            bb.evaluate_query(package)
+        })
+    }
+
+    fn submap<'a>(
+        &'a self,
+        network_bid: Bid,
+        path: &'a str,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            let bb = BeliefBase::from(self.clone());
+            Ok(bb
+                .paths()
+                .submap(&network_bid.bref(), path, depth, include_index))
+        })
+    }
+
+    fn submap_by_bid<'a>(
+        &'a self,
+        network_bid: Bid,
+        entry: Option<Bid>,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            let bb = BeliefBase::from(self.clone());
+            Ok(bb
+                .paths()
+                .submap_by_bid(&network_bid.bref(), entry, depth, include_index))
+        })
+    }
+
+    fn export_beliefgraph(&self) -> BoxFuture<'_, Result<BeliefGraph, BuildonomyError>> {
+        Box::pin(async move { Ok(self.clone()) })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BeliefSource for &BeliefGraph {
+    fn evaluate<'a>(
+        &'a self,
+        package: &'a mut QueryPackage,
+    ) -> BoxFuture<'a, Result<(), BuildonomyError>> {
+        Box::pin(async move { (*self).evaluate(package).await })
+    }
+
+    fn submap<'a>(
+        &'a self,
+        network_bid: Bid,
+        path: &'a str,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            (*self)
+                .submap(network_bid, path, depth, include_index)
+                .await
+        })
+    }
+
+    fn submap_by_bid<'a>(
+        &'a self,
+        network_bid: Bid,
+        entry: Option<Bid>,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            (*self)
+                .submap_by_bid(network_bid, entry, depth, include_index)
+                .await
+        })
+    }
+
+    fn export_beliefgraph(&self) -> BoxFuture<'_, Result<BeliefGraph, BuildonomyError>> {
+        Box::pin(async move { Ok((*self).clone()) })
+    }
+}
+
 impl fmt::Display for BeliefGraph {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.display_contents())
@@ -1286,6 +1242,8 @@ mod tests {
     use crate::properties::{
         BeliefKind, BeliefKindSet, BeliefNode, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
     };
+    use crate::query::spec::{leaves, roots, QueryPackage, QuerySpec, TapeFn};
+    use crate::query::BeliefSource;
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -1310,7 +1268,7 @@ mod tests {
 
     /// Build a BeliefGraph from a node list and an edge list (source, sink, sort_key).
     fn make_graph(nodes: Vec<BeliefNode>, edges: Vec<(Bid, Bid, u16)>) -> BeliefGraph {
-        let states: BTreeMap<Bid, BeliefNode> = nodes.iter().map(|n| (n.bid, n.clone())).collect();
+        let states: FxHashMap<Bid, BeliefNode> = nodes.iter().map(|n| (n.bid, n.clone())).collect();
         let relations = BidGraph::from_edges(
             edges
                 .into_iter()
@@ -1321,15 +1279,190 @@ mod tests {
 
     /// Extract the sort_key for the single edge (source→sink) in `g`, panicking if absent.
     fn edge_sort_key(g: &BeliefGraph, source: Bid, sink: Bid) -> Option<u16> {
-        g.relations.as_graph().raw_edges().iter().find_map(|e| {
+        g.relations.as_graph().edge_references().find_map(|e| {
             let s = g.relations.as_graph()[e.source()];
             let t = g.relations.as_graph()[e.target()];
             if s == source && t == sink {
-                e.weight.get(&WeightKind::Section)?.get(WEIGHT_SORT_KEY)
+                e.weight().get(&WeightKind::Section)?.get(WEIGHT_SORT_KEY)
             } else {
                 None
             }
         })
+    }
+
+    // -------------------------------------------------------------------------
+    // as_subgraph_seeded edge collection
+    // -------------------------------------------------------------------------
+
+    /// Reference implementation of the pre-subgraph_from_seed_idx algorithm: full-graph
+    /// index build, then a scan over *every* edge filtered to the reachable set. The
+    /// optimised version must agree with this exactly.
+    fn reference_subgraph_seeded(
+        bg: &BidGraph,
+        kind: WeightKind,
+        reverse: bool,
+        seed: Bid,
+    ) -> Vec<(Bid, Bid, (u16, Vec<String>))> {
+        let g = bg.as_graph();
+        let bid_to_idx: BTreeMap<Bid, petgraph::stable_graph::NodeIndex> =
+            g.node_indices().map(|idx| (g[idx], idx)).collect();
+        let Some(&seed_idx) = bid_to_idx.get(&seed) else {
+            return Vec::new();
+        };
+        let walk_direction = if reverse {
+            Direction::Incoming
+        } else {
+            Direction::Outgoing
+        };
+        let mut reachable: BTreeSet<petgraph::stable_graph::NodeIndex> = BTreeSet::new();
+        let mut stack = vec![seed_idx];
+        reachable.insert(seed_idx);
+        while let Some(current) = stack.pop() {
+            for neighbor in g.neighbors_directed(current, walk_direction) {
+                if reachable.insert(neighbor) {
+                    stack.push(neighbor);
+                }
+            }
+        }
+        g.edge_references()
+            .filter_map(|edge_ref| {
+                if !reachable.contains(&edge_ref.source())
+                    || !reachable.contains(&edge_ref.target())
+                {
+                    return None;
+                }
+                let source = g[edge_ref.source()];
+                let sink = g[edge_ref.target()];
+                let weight = edge_ref.weight().get(&kind)?;
+                let paths: Vec<String> = weight.get_doc_paths();
+                let sort_key: u16 = weight.get(WEIGHT_SORT_KEY).unwrap_or(0);
+                if reverse {
+                    Some((sink, source, (sort_key, paths)))
+                } else {
+                    Some((source, sink, (sort_key, paths)))
+                }
+            })
+            .collect()
+    }
+
+    /// Flatten a BidSubGraph into a comparable edge list, preserving iteration order
+    /// (GraphMap iterates in insertion order, and PathMap::new DFSes over the result,
+    /// so order is part of the contract — not just set equality).
+    fn subgraph_edges(sg: &BidSubGraph) -> Vec<(Bid, Bid, (u16, Vec<String>))> {
+        sg.all_edges().map(|(s, t, w)| (s, t, w.clone())).collect()
+    }
+
+    /// A graph with several networks, mixed edge kinds, a disjoint component, and a
+    /// cycle — the shapes that could break seeded subgraph extraction.
+    fn multi_net_fixture() -> (BidGraph, Vec<Bid>) {
+        let net_a = Bid::new(Bid::nil());
+        let net_b = Bid::new(Bid::nil());
+        let a1 = Bid::new(net_a);
+        let a2 = Bid::new(net_a);
+        let a3 = Bid::new(net_a);
+        let b1 = Bid::new(net_b);
+        let b2 = Bid::new(net_b);
+
+        let section = make_weights(0);
+        let mut epistemic = WeightSet::empty();
+        {
+            let mut w = Weight::default();
+            w.set(WEIGHT_SORT_KEY, 7).ok();
+            epistemic.set(WeightKind::Epistemic, w);
+        }
+
+        let bg = BidGraph::from_edges(vec![
+            // Network A subtree (Section)
+            (a1, net_a, make_weights(0)),
+            (a2, net_a, make_weights(1)),
+            (a3, a1, make_weights(0)),
+            // A non-Section edge between reachable nodes: must be excluded by kind
+            (a2, a1, epistemic.clone()),
+            // A cycle within A
+            (a1, a3, make_weights(2)),
+            // Disjoint network B
+            (b1, net_b, section.clone()),
+            (b2, net_b, make_weights(1)),
+        ]);
+        (bg, vec![net_a, net_b, a1, a2, a3, b1, b2])
+    }
+
+    #[test]
+    fn test_subgraph_seeded_matches_reference_implementation() {
+        let (bg, bids) = multi_net_fixture();
+        for &seed in &bids {
+            for kind in [WeightKind::Section, WeightKind::Epistemic] {
+                for reverse in [true, false] {
+                    let expected = reference_subgraph_seeded(&bg, kind, reverse, seed);
+                    let actual = subgraph_edges(&bg.as_subgraph_seeded(kind, reverse, seed));
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch for seed={seed} kind={kind:?} reverse={reverse}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_subgraph_seeded_indexed_matches_unindexed() {
+        let (bg, bids) = multi_net_fixture();
+        let g = bg.as_graph();
+        let bid_to_idx: FxHashMap<Bid, petgraph::stable_graph::NodeIndex> =
+            g.node_indices().map(|idx| (g[idx], idx)).collect();
+
+        for &seed in &bids {
+            for reverse in [true, false] {
+                let unindexed =
+                    subgraph_edges(&bg.as_subgraph_seeded(WeightKind::Section, reverse, seed));
+                let indexed = subgraph_edges(&bg.as_subgraph_seeded_indexed(
+                    WeightKind::Section,
+                    reverse,
+                    seed,
+                    &bid_to_idx,
+                ));
+                assert_eq!(
+                    indexed, unindexed,
+                    "indexed/unindexed mismatch for seed={seed} reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_subgraph_seeded_disjoint_network_excludes_other_component() {
+        let (bg, bids) = multi_net_fixture();
+        let (net_a, net_b) = (bids[0], bids[1]);
+        let (b1, b2) = (bids[5], bids[6]);
+
+        let a_edges = subgraph_edges(&bg.as_subgraph_seeded(WeightKind::Section, true, net_a));
+        for (s, t, _) in &a_edges {
+            assert!(
+                *s != b1 && *t != b1 && *s != b2 && *t != b2 && *s != net_b && *t != net_b,
+                "network A's subgraph leaked a node from disjoint network B"
+            );
+        }
+        assert!(!a_edges.is_empty(), "network A should have Section edges");
+    }
+
+    #[test]
+    fn test_subgraph_seeded_missing_seed_is_empty() {
+        let (bg, _) = multi_net_fixture();
+        let absent = Bid::new(Bid::nil());
+        assert!(bg
+            .as_subgraph_seeded(WeightKind::Section, true, absent)
+            .all_edges()
+            .next()
+            .is_none());
+
+        let g = bg.as_graph();
+        let bid_to_idx: FxHashMap<Bid, petgraph::stable_graph::NodeIndex> =
+            g.node_indices().map(|idx| (g[idx], idx)).collect();
+        assert!(bg
+            .as_subgraph_seeded_indexed(WeightKind::Section, true, absent, &bid_to_idx)
+            .all_edges()
+            .next()
+            .is_none());
     }
 
     // -------------------------------------------------------------------------
@@ -1385,10 +1518,9 @@ mod tests {
         r2.union_mut(&a);
 
         assert_eq!(r1.states.len(), r2.states.len());
-        assert_eq!(
-            r1.states.keys().collect::<Vec<_>>(),
-            r2.states.keys().collect::<Vec<_>>()
-        );
+        let r1_bids: BTreeSet<Bid> = r1.states.keys().copied().collect();
+        let r2_bids: BTreeSet<Bid> = r2.states.keys().copied().collect();
+        assert_eq!(r1_bids, r2_bids);
     }
 
     // -------------------------------------------------------------------------
@@ -1518,11 +1650,9 @@ mod tests {
         r2.union_mut(&a);
 
         // State sets must be identical.
-        assert_eq!(
-            r1.states.keys().collect::<Vec<_>>(),
-            r2.states.keys().collect::<Vec<_>>(),
-            "state sets equal under disjoint merge"
-        );
+        let r1_bids: BTreeSet<Bid> = r1.states.keys().copied().collect();
+        let r2_bids: BTreeSet<Bid> = r2.states.keys().copied().collect();
+        assert_eq!(r1_bids, r2_bids, "state sets equal under disjoint merge");
         // Edge counts must match.
         assert_eq!(
             r1.relations.as_graph().edge_count(),
@@ -1624,9 +1754,10 @@ mod tests {
         r2.union_mut(&b);
         r2.union_mut(&a);
 
+        let r1_bids: BTreeSet<Bid> = r1.states.keys().copied().collect();
+        let r2_bids: BTreeSet<Bid> = r2.states.keys().copied().collect();
         assert_eq!(
-            r1.states.keys().collect::<Vec<_>>(),
-            r2.states.keys().collect::<Vec<_>>(),
+            r1_bids, r2_bids,
             "three-way merge produces identical state sets under disjoint ownership"
         );
         assert_eq!(
@@ -1639,127 +1770,136 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T8: balance() with a subnet doc where eval_unbalanced returns the full
-    // neighbor set including both S→R and S→API.
-    //
-    // Scenario: document D inside subnet S inside repo R, all under API.
-    // eval_unbalanced(D) is modelled as returning ALL edges where D or its
-    // immediate neighbors appear (RelationPred::NodeIn semantics), so the
-    // initial set already contains:
-    //   D→S, S→R, S→API, R→API
-    // and states {D(Trace), S(Trace), R(Trace), API(Trace)}.
-    //
-    // R is already in the initial set. balance() must terminate cleanly
-    // (API is the only sink, eval_trace(API) adds nothing, loop breaks on
-    // same-expr) and R must remain in the final set.
-    //
-    // This test confirms that the "S→API shortcut omits R" concern does NOT
-    // apply when eval_unbalanced uses RelationPred::NodeIn, because S's full
-    // neighborhood (including S→R) is included in the initial set.
+    // BeliefSource impl tests
     // -------------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_balance_subnet_full_neighbor_set() {
-        use crate::{
-            error::BuildonomyError,
-            properties::{
-                BeliefKind, BeliefNode, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
-            },
-            query::{BeliefSource, Expression, StatePred},
-        };
-        use std::collections::BTreeMap;
+    async fn test_belief_source_evaluate_on_graph() {
+        let net = Bid::new(Bid::nil());
+        let doc = Bid::new(net);
+        let sec = Bid::new(doc);
 
-        let api_bid = BeliefNode::api_state().bid;
-        let r_bid = Bid::new(api_bid);
-        let s_bid = Bid::new(r_bid);
-        let d_bid = Bid::new(s_bid);
-
-        let make_section_ws = |sk: u16| -> WeightSet {
-            let mut w = Weight::default();
-            w.set(WEIGHT_SORT_KEY, sk).ok();
-            let mut ws = WeightSet::empty();
-            ws.set(WeightKind::Section, w);
-            ws
-        };
-
-        // Minimal mock: eval_trace(API) → {API} with no edges (API is a true
-        // sink). All other queries return empty — nothing new to fetch since
-        // the full chain is already in the initial set.
-        struct MockSource {
-            api: Bid,
-        }
-        impl BeliefSource for MockSource {
-            async fn eval_unbalanced(
-                &self,
-                _expr: &Expression,
-            ) -> Result<BeliefGraph, BuildonomyError> {
-                Ok(BeliefGraph::default())
-            }
-            async fn eval_trace(
-                &self,
-                expr: &Expression,
-                _filter: WeightSet,
-            ) -> Result<BeliefGraph, BuildonomyError> {
-                // Only API queries come in; return API state with no edges.
-                let Expression::StateIn(StatePred::Bid(bids)) = expr else {
-                    return Ok(BeliefGraph::default());
-                };
-                let mut states = BTreeMap::new();
-                for bid in bids {
-                    if *bid == self.api {
-                        states.insert(self.api, BeliefNode::api_state());
-                    }
-                }
-                Ok(BeliefGraph {
-                    states,
-                    relations: BidGraph::default(),
-                })
-            }
-        }
-
-        let source = MockSource { api: api_bid };
-
-        // Initial set: full neighbor expansion of D, as eval_unbalanced with
-        // RelationPred::NodeIn would produce. Includes S→R and S→API.
-        let mut set = {
-            let mut n_d = make_node(d_bid, "doc", BeliefKind::Document);
-            let mut n_s = make_node(s_bid, "subnet", BeliefKind::Network);
-            let mut n_r = make_node(r_bid, "repo", BeliefKind::Network);
-            let mut n_api = BeliefNode::api_state();
-            n_d.kind.0.insert(BeliefKind::Trace);
-            n_s.kind.0.insert(BeliefKind::Trace);
-            n_r.kind.0.insert(BeliefKind::Trace);
-            n_api.kind.0.insert(BeliefKind::Trace);
-            let states =
-                BTreeMap::from([(d_bid, n_d), (s_bid, n_s), (r_bid, n_r), (api_bid, n_api)]);
-            let relations = BidGraph::from_edges([
-                (d_bid, s_bid, make_section_ws(0)),
-                (s_bid, r_bid, make_section_ws(0)),
-                (s_bid, api_bid, make_section_ws(1)),
-                (r_bid, api_bid, make_section_ws(0)),
-            ]);
-            BeliefGraph { states, relations }
-        };
-
-        source
-            .balance(&mut set)
-            .await
-            .expect("balance should not error");
-
-        // R was in the initial set and must still be present after balance.
-        assert!(
-            set.states.contains_key(&r_bid),
-            "repo root R must be present in set after balance()"
+        let graph = make_graph(
+            vec![
+                make_node(net, "Net", BeliefKind::Network),
+                make_node(doc, "Doc", BeliefKind::Document),
+                make_node(sec, "Sec A", BeliefKind::Symbol),
+            ],
+            vec![(doc, net, 0), (sec, doc, 1)],
         );
-        // S→R edge must be present.
+
+        // Evaluate a simple BID-set query via the BeliefSource impl.
+        let spec = QuerySpec::seed(TapeFn::Bids(vec![doc]));
+        let mut package = QueryPackage::balanced(spec);
+        graph.evaluate(&mut package).await.unwrap();
+        let result = package.into_graph();
+
+        // The seed BID (doc) must be present and non-Trace.
         assert!(
-            set.relations.as_graph().raw_edges().iter().any(|e| {
-                set.relations.as_graph()[e.source()] == s_bid
-                    && set.relations.as_graph()[e.target()] == r_bid
-            }),
-            "S→R Section edge must be present in set after balance()"
+            result.states.contains_key(&doc),
+            "doc node should be in result"
         );
-        // balance() must have terminated (not hit BALANCE_CUTOFF) — verified
-        // implicitly by the mock only returning API with no edges, causing the
-        // same-expr break after one iteration.
+        assert!(
+            result.states[&doc].kind.is_complete(),
+            "doc node should be non-Trace (seed)"
+        );
+        // Balanced query adds halo + ancestry, so net and sec should appear as Trace.
+        assert!(
+            result.states.contains_key(&net),
+            "net (halo neighbor) should be in result"
+        );
+        assert!(
+            result.states.contains_key(&sec),
+            "sec (halo neighbor) should be in result"
+        );
+    }
+
+    /// Test `TapeFn::Terminal` via `roots()`.  Given a section tree:
+    ///
+    ///     root ← doc_a ← sec1
+    ///                   ← sec2
+    ///          ← doc_b ← sec3
+    ///
+    /// Starting from sec1, `roots()` should walk upstream Section edges and
+    /// return only `root` (the only node with no outgoing Section edges).
+    #[tokio::test]
+    async fn test_terminal_roles_roots() {
+        let root = Bid::new(Bid::nil());
+        let doc_a = Bid::new(root);
+        let doc_b = Bid::new(root);
+        let sec1 = Bid::new(doc_a);
+        let sec2 = Bid::new(doc_a);
+        let sec3 = Bid::new(doc_b);
+
+        let graph = make_graph(
+            vec![
+                make_node(root, "Root", BeliefKind::Network),
+                make_node(doc_a, "Doc A", BeliefKind::Document),
+                make_node(doc_b, "Doc B", BeliefKind::Document),
+                make_node(sec1, "Sec 1", BeliefKind::Symbol),
+                make_node(sec2, "Sec 2", BeliefKind::Symbol),
+                make_node(sec3, "Sec 3", BeliefKind::Symbol),
+            ],
+            vec![
+                (doc_a, root, 0),
+                (doc_b, root, 1),
+                (sec1, doc_a, 0),
+                (sec2, doc_a, 1),
+                (sec3, doc_b, 0),
+            ],
+        );
+
+        // Evaluate roots() starting from sec1.
+        let spec = QuerySpec::seed_then(TapeFn::Bids(vec![sec1]), roots());
+        let mut package = QueryPackage::new(spec);
+        graph.evaluate(&mut package).await.unwrap();
+        let result_bids: BTreeSet<Bid> = package
+            .tape()
+            .steps
+            .last()
+            .map(|e| e.content.output_bids().into_iter().collect())
+            .unwrap_or_default();
+
+        // Only `root` should survive the terminal filter.
+        assert_eq!(result_bids.len(), 1, "Expected exactly 1 root");
+        assert!(
+            result_bids.contains(&root),
+            "Root should be the only terminal node"
+        );
+    }
+
+    /// Test `TapeFn::Terminal` via `leaves()` — starting from root, should find
+    /// only leaf nodes (sec1, sec2).
+    #[tokio::test]
+    async fn test_terminal_roles_leaves() {
+        let root = Bid::new(Bid::nil());
+        let doc_a = Bid::new(root);
+        let sec1 = Bid::new(doc_a);
+        let sec2 = Bid::new(doc_a);
+
+        let graph = make_graph(
+            vec![
+                make_node(root, "Root", BeliefKind::Network),
+                make_node(doc_a, "Doc A", BeliefKind::Document),
+                make_node(sec1, "Sec 1", BeliefKind::Symbol),
+                make_node(sec2, "Sec 2", BeliefKind::Symbol),
+            ],
+            vec![(doc_a, root, 0), (sec1, doc_a, 0), (sec2, doc_a, 1)],
+        );
+
+        // leaves() from root should find sec1 and sec2.
+        let spec = QuerySpec::seed_then(TapeFn::Bids(vec![root]), leaves());
+        let mut package = QueryPackage::new(spec);
+        graph.evaluate(&mut package).await.unwrap();
+        let result_bids: BTreeSet<Bid> = package
+            .tape()
+            .steps
+            .last()
+            .map(|e| e.content.output_bids().into_iter().collect())
+            .unwrap_or_default();
+
+        assert_eq!(result_bids.len(), 2, "Expected 2 leaves");
+        assert!(result_bids.contains(&sec1), "sec1 should be a leaf");
+        assert!(result_bids.contains(&sec2), "sec2 should be a leaf");
     }
 }

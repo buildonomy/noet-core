@@ -1,5 +1,8 @@
 //! Cache invalidation integration tests
 //!
+//! Includes assertions on `CLAIM_MAP` state after file deletion to verify
+//! that `on_file_deleted` correctly unclaims files from the dispatch registry.
+//!
 //! These tests verify that file modification time tracking works correctly
 //! with the full WatchService setup including database synchronization.
 
@@ -9,6 +12,7 @@ mod common;
 use filetime::{set_file_mtime, FileTime};
 #[cfg(feature = "service")]
 use noet_core::{
+    codec::CLAIM_MAP,
     db::{db_init, DbConnection},
     event::Event,
     watch::WatchService,
@@ -83,7 +87,7 @@ fn test_stale_file_detection_and_reparse() {
     let doc_path = network_path.join("test.md");
     std::fs::write(
         &doc_path,
-        "+++\ntitle = \"Original Content\"\n+++\n\nSome body text.\n",
+        "---\ntitle = \"Original Content\"\n---\n\nSome body text.\n",
     )
     .unwrap();
 
@@ -133,7 +137,7 @@ fn test_stale_file_detection_and_reparse() {
     // Modify the file — frontmatter title change guarantees a distinct parsed doc node
     std::fs::write(
         &doc_path,
-        "+++\ntitle = \"Modified Content\"\n+++\n\nThis is new!\n",
+        "---\ntitle = \"Modified Content\"\n---\n\nThis is new!\n",
     )
     .unwrap();
 
@@ -294,6 +298,17 @@ fn test_deleted_file_handling() {
 
     // Service should handle this gracefully without panicking.
     // The test passes if we reach here without crashes.
+
+    // After on_file_deleted fires (via the debouncer), CLAIM_MAP must not retain
+    // a rejection sentinel or stale claim entry for the deleted path. A lingering
+    // None sentinel would permanently block re-creation of the file from being
+    // claimed on a future re-scan.
+    let canonical_doc_path =
+        noet_core::paths::canonicalize_path(&doc_path).unwrap_or(doc_path.clone());
+    assert!(
+        !CLAIM_MAP.is_rejected(&canonical_doc_path),
+        "on_file_deleted must clear any rejection sentinel from CLAIM_MAP"
+    );
 
     // Cleanup
     service.disable_network_syncer(&network_path).ok();

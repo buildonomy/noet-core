@@ -17,7 +17,7 @@
 use noet_core::{
     config::NetworkRecord,
     event::{BeliefEvent, Event},
-    properties::BeliefNode,
+    properties::{BeliefNode, NodeId},
     watch::WatchService,
 };
 #[cfg(feature = "service")]
@@ -59,9 +59,6 @@ fn example_basic_watch(workspace_root: PathBuf) -> Result<(), Box<dyn std::error
                 Ok(Event::Belief(belief_event)) => {
                     event_count += 1;
                     println!("  [{event_count}] Received belief event: {belief_event}");
-                }
-                Ok(Event::Focus(_)) => {
-                    println!("  Received focus event");
                 }
                 Ok(Event::Ping) => {
                     // Keepalive, ignore
@@ -112,7 +109,7 @@ fn example_multiple_networks(workspace_root: PathBuf) -> Result<(), Box<dyn std:
         path: new_network_path.to_string_lossy().to_string(),
         node: BeliefNode {
             title: "New Network Example".to_string(),
-            id: Some("new-network-example".to_string()),
+            id: NodeId::Explicit("new-network-example".to_string()),
             ..Default::default()
         },
     });
@@ -191,10 +188,6 @@ Some content here.
             Ok(Event::Belief(belief_event)) => {
                 process_belief_event(&belief_event, &mut stats);
             }
-            Ok(Event::Focus(focus_event)) => {
-                println!("  [Focus] {focus_event:?}");
-                stats.focus_events += 1;
-            }
             Ok(Event::Ping) => {
                 stats.ping_events += 1;
             }
@@ -214,7 +207,6 @@ Some content here.
     println!("Nodes removed: {}", stats.nodes_removed);
     println!("Paths added: {}", stats.paths_added);
     println!("Relations updated: {}", stats.relations_updated);
-    println!("Focus events: {}", stats.focus_events);
     println!("Ping events: {}", stats.ping_events);
     println!("Total events: {}", stats.total());
 
@@ -261,9 +253,6 @@ fn example_long_running(workspace_root: PathBuf) -> Result<(), Box<dyn std::erro
                 event_count += 1;
                 println!("[{event_count}] {belief_event}");
             }
-            Ok(Event::Focus(_)) => {
-                println!("[Focus event]");
-            }
             Ok(Event::Ping) => {
                 // Keepalive
             }
@@ -295,7 +284,6 @@ struct EventStats {
     nodes_removed: usize,
     paths_added: usize,
     relations_updated: usize,
-    focus_events: usize,
     ping_events: usize,
 }
 
@@ -306,7 +294,6 @@ impl EventStats {
             + self.nodes_removed
             + self.paths_added
             + self.relations_updated
-            + self.focus_events
             + self.ping_events
     }
 }
@@ -314,13 +301,17 @@ impl EventStats {
 #[cfg(feature = "service")]
 fn process_belief_event(event: &BeliefEvent, stats: &mut EventStats) {
     match event {
-        BeliefEvent::NodeUpdate(keys, _toml, origin) => {
+        BeliefEvent::NodeUpdate(keys, _node, origin) => {
             stats.node_updates += 1;
             println!(
                 "  [NodeUpdate] {} node(s), origin: {:?}",
                 keys.len(),
                 origin
             );
+        }
+        BeliefEvent::NodeUpsert(_bid, _node, origin) => {
+            stats.node_updates += 1;
+            println!("  [NodeUpsert] origin: {:?}", origin);
         }
         BeliefEvent::NodesRemoved(bids, origin) => {
             stats.nodes_removed += 1;

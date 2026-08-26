@@ -9,15 +9,26 @@ Thank you for your interest in contributing! This guide follows the principle of
 git clone https://github.com/yourusername/noet-core
 cd noet-core
 
-# Check your changes
-cargo fmt --check
-cargo clippy --all-features --all-targets -- -D warnings
+# One-time: install the task runner and the toolchain pieces CI expects
+cargo install just
+just deps
+
+# Check your changes (fmt + clippy + rustdoc, exactly as CI runs them)
+just check
 cargo test --all-features
 
 # Open PR on GitHub
 ```
 
-**CI will verify** everything automatically. See [`.github/workflows/test.yml`](.github/workflows/test.yml) for what's checked.
+**CI will verify** everything automatically. The commands it runs are defined in
+[`justfile`](justfile), and the workflow jobs call those recipes — so `just lint`
+locally *is* the `lint` job, not a copy of it. `just --list` shows every recipe;
+`just ci` runs the full gating set.
+
+Run `just check` before pushing. It is the cheap subset that catches most CI
+failures: `-D warnings` applies to both clippy and rustdoc in CI but not to a
+bare `cargo clippy` / `cargo doc`, which is the usual reason a green local run
+goes red in CI.
 
 ## Development Workflow
 
@@ -72,6 +83,29 @@ test-output/                   # Ad-hoc testing at project root
 **Documentation**: Document public items
 - See [DOCUMENTATION_STRATEGY.md](docs/project/DOCUMENTATION_STRATEGY.md) for organization
 - Brief in rustdoc, link to detailed docs when needed
+
+## Application-Neutral Content
+
+noet-core is a general-purpose tool. Code, docs, examples, and test fixtures
+must not reference specific customers, programs, organizations, or proprietary
+systems — including in comments and commit messages.
+
+Much of this project's development happens against private corpora, so this is
+easy to violate by accident when writing up a measurement or a bug report.
+
+**Writing about real data**: keep the numbers, drop the proper nouns. Describe
+data by its structural properties — "a ~7,600-line document linked from 13
+parents", "deeply-included C++ headers" — not by filename, repository, or
+program. The mechanism is what transfers to another corpus; the proper noun is
+what leaks.
+
+**In examples and fixtures**: use generic placeholders ("Widget Project",
+"Acme Corp", "sample-network") and generic column names ("Title",
+"Description", "Category").
+
+This is reviewed by hand rather than checked by CI: an automated denylist would
+have to enumerate the names it protects, which is itself a disclosure. Reviewers
+should flag any reference they do not recognise as generic.
 
 ## CI/CD
 

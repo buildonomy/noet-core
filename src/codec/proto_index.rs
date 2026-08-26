@@ -36,17 +36,21 @@
 //!   and `traverse_schema`.
 
 use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use walkdir::{DirEntry, WalkDir};
+use walkdir::{DirEntry, Error as WalkDirError, WalkDir};
+
+use toml_edit::value;
 
 use crate::{
     codec::{
+        is_network_index_file,
         network::{detect_network_file, NETWORK_NAME},
-        IRNode, CODECS,
+        IRNode, CODECS, WALK_CODECS,
     },
     error::BuildonomyError,
     paths::{os_path_to_string, string_to_os_path, AnchorPath},
@@ -54,12 +58,7 @@ use crate::{
 };
 
 #[cfg(feature = "git-tracking")]
-use crate::codec::git::{GitCache, NetworkGitStatus};
-
-/// Placeholder type used in `proto_for`'s return signature when the `git-tracking`
-/// feature is disabled.  Always `None` at runtime; zero cost.
-#[cfg(not(feature = "git-tracking"))]
-pub struct NetworkGitStatus;
+use crate::codec::git::GitCache;
 
 /// Filesystem-level index of every network directory in the repo.
 ///
@@ -77,10 +76,15 @@ pub struct ProtoIndex {
     /// `PathBuf` = absolute network directory
     /// `Vec<PathBuf>` = ordered direct children produced by the repo-wide scan
     inner: Arc<RwLock<HashMap<PathBuf, Vec<PathBuf>>>>,
-    /// Git status cache, populated during `build` when the `git-tracking` feature
-    /// is enabled and `git_tracking = true`.  `None` when git tracking is disabled.
-    #[cfg(feature = "git-tracking")]
-    git_cache: Arc<GitCache>,
+    /// Generic codec metadata cache.  Keyed by canonical network directory path,
+    /// namespaced by a string key (e.g. `"git"`, `"cmake"`).  Each entry is a
+    /// `serde_json::Value` that the producing codec serializes and the consuming
+    /// codec deserializes into its own typed struct.
+    ///
+    /// Populated during `build()` (e.g. git metadata) or during Phase 1 network
+    /// parsing via `set_meta()`.  Read-only after population; the `RwLock` guards
+    /// concurrent access during parallel epoch tasks.
+    codec_meta: Arc<RwLock<HashMap<PathBuf, HashMap<String, serde_json::Value>>>>,
 }
 
 /// Returns the direct children of a network directory: subnet directories (those containing
@@ -113,6 +117,19 @@ pub(crate) fn net_dir_children<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
 ///
 /// This allows `ProtoIndex::build` to build the complete index in O(files) rather than
 /// O(files × depth) by avoiding one `WalkDir` call per network directory.
+/// Log a `walkdir` error, distinguishing symlink cycles from plain I/O errors.
+/// Called from both `net_dir_partition` and `discover_network_dirs`.
+fn warn_walk_error(context: &str, e: &WalkDirError) {
+    if e.loop_ancestor().is_some() {
+        tracing::warn!(
+            "{context}: symlink cycle detected at {:?}, skipping",
+            e.path()
+        );
+    } else {
+        tracing::warn!("{context}: I/O error during walk: {e}");
+    }
+}
+
 pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     // Normalize through the round-trip so that on Windows a \\?\-prefixed path
     // (from canonicalize()) is reduced to the plain C:\... form that WalkDir yields.
@@ -132,25 +149,42 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
 
     // ── Pass 1: discover all subnet directories ───────────────────────────────
     //
-    // WalkDir does not guarantee that `index.md` is yielded before sibling files
-    // within the same directory — the order depends on the underlying `readdir(2)`
-    // call, which is filesystem- and OS-dependent.  A single-pass approach that
-    // populates `subnets` lazily as `index.md` files are encountered therefore
-    // misclassifies sibling files that are yielded *before* their directory's
-    // `index.md`: the `subnets.iter().any(|s| p.starts_with(s))` guard fires
-    // false, so those files are included in the root group instead of being
-    // excluded (and later assigned to their correct subnet group).
+    // WalkDir does not guarantee that network files are yielded before sibling
+    // files within the same directory — the order depends on the underlying
+    // `readdir(2)` call, which is filesystem- and OS-dependent.  A single-pass
+    // approach that populates `subnets` lazily as network files are encountered
+    // therefore misclassifies sibling files that are yielded *before* their
+    // directory's network file: the `subnets.iter().any(|s| p.starts_with(s))`
+    // guard fires false, so those files are included in the root group instead
+    // of being excluded (and later assigned to their correct subnet group).
     //
     // Pre-scanning for all subnet dirs in one pass makes Pass 2 order-independent.
+    //
+    // A file is a network file if WALK_CODECS.is_network_file(filename) returns
+    // true — this checks NETWORK_NAME ("index.md") first, then any filenames
+    // declared by registered WalkCodecs via network_filenames(). For non-
+    // NETWORK_NAME candidates, this is a tentative classification; false
+    // positives are culled later in ProtoIndex::build via DocCodec::proto().
     let subnet_dirs: std::collections::BTreeSet<PathBuf> = WalkDir::new(path)
+        .follow_links(true)
         .into_iter()
         .filter_entry(|e| !is_hidden(e) || e.path() == path)
-        .filter_map(|e| e.ok().map(|e| e.into_path()))
+        .filter_map(|e| match e {
+            Ok(e) => Some(e.into_path()),
+            Err(ref err) => {
+                warn_walk_error("net_dir_partition pass 1", err);
+                None
+            }
+        })
         .filter_map(|mut p| {
             if p.is_file() {
+                // Skip file-level symlinks (same rationale as Pass 2).
+                if p.is_symlink() {
+                    return None;
+                }
                 let p_str = os_path_to_string(&p);
                 let p_ap = AnchorPath::new(&p_str);
-                if NETWORK_NAME == p_ap.filename() {
+                if WALK_CODECS.is_network_file(p_ap.filename()) {
                     p.pop(); // file → its containing directory
                     if !p.eq(path) {
                         return Some(p); // subnet dir
@@ -167,35 +201,55 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
     // of the order WalkDir yields entries within a directory.
     //
     // Files yielded by Pass 2 filter_map:
-    //   • subnet `index.md`  → represented as the subnet directory path (is_dir());
+    //   • subnet network file → represented as the subnet directory path (is_dir());
     //     `group_of` routes it to its parent subnet (or root)
     //   • codec files owned by any subnet OR root → all included; `group_of` routes
     //     each file to its deepest owning subnet key in the by_group loop below.
     //     No per-file filtering is needed here because `group_of` uses the complete
     //     `subnet_dirs` set from Pass 1 and is therefore order-independent.
-    //   • root `index.md` → excluded entirely
+    //   • root's own network file → excluded entirely
     //   • non-codec files → excluded entirely
+    //   • file-level symlinks → excluded (parsed under their canonical location;
+    //     symlinks should produce epistemic/pragmatic edges, not duplicate section trees)
     let files = WalkDir::new(path)
+        .follow_links(true)
         .into_iter()
         .filter_entry(|e| !is_hidden(e) || e.path() == path)
-        .filter_map(|e| e.ok().map(|e| e.into_path()))
+        .filter_map(|e| match e {
+            Ok(e) => Some(e.into_path()),
+            Err(ref err) => {
+                warn_walk_error("net_dir_partition pass 2", err);
+                None
+            }
+        })
         .filter_map(|mut p| {
             if p.is_file() {
+                // Skip file-level symlinks.  A symlinked file (e.g.
+                // `component/design_links/spec.md` → `docs/spec.md`) would
+                // otherwise be parsed under BOTH the symlink's network and
+                // the canonical location's network, producing duplicate nodes
+                // with different BIDs that cause cache_fetch misses on
+                // reparse.  The canonical copy is always discovered at its
+                // real path; cross-tree references should use epistemic or
+                // pragmatic edges (e.g. `resolve_design_links`) instead.
+                if p.is_symlink() {
+                    return None;
+                }
                 let p_str = os_path_to_string(&p);
                 let p_ap = AnchorPath::new(&p_str);
-                if NETWORK_NAME == p_ap.filename() {
-                    // Subnet index.md — represent the subnet as its directory path.
+                if WALK_CODECS.is_network_file(p_ap.filename()) {
+                    // Subnet network file — represent the subnet as its directory path.
                     p.pop();
                     if !p.eq(path) {
                         return Some(p); // subnet dir entry (is_dir() in by_group loop)
                     } else {
-                        return None; // root's own index.md — exclude
+                        return None; // root's own network file — exclude
                     }
                 }
                 // Use new_file: p.is_file() is confirmed, prevents extensionless files
                 // (Gemfile, Makefile, …) from matching the (None, None) codec wildcard.
                 let p_ap_file = AnchorPath::new_file(&p_str);
-                if CODECS.get(&p_ap_file).is_some() {
+                if CODECS.get(&p_ap_file).is_some() || WALK_CODECS.should_track(&p) {
                     Some(p)
                 } else {
                     None
@@ -276,8 +330,7 @@ impl ProtoIndex {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "git-tracking")]
-            git_cache: Arc::new(GitCache::default()),
+            codec_meta: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -313,7 +366,69 @@ impl ProtoIndex {
         // the partition keys consistent with the canonicalized+round-tripped values we
         // store in the map below.
         let repo_root_buf = string_to_os_path(&os_path_to_string(repo_root));
-        let partition = net_dir_partition(&repo_root_buf);
+        let mut partition = net_dir_partition(&repo_root_buf);
+
+        // ── Cull false-positive subnet candidates ────────────────────────────
+        //
+        // net_dir_partition tentatively treats any directory containing a file
+        // matching WALK_CODECS.is_network_file() as a subnet. For non-NETWORK_NAME
+        // files this is a superset — some may not be real network roots.
+        //
+        // For each candidate subnet whose network file is not NETWORK_NAME, call
+        // DocCodec::proto(). If proto() returns None or a node without
+        // BeliefKind::Network, demote: remove the subnet key and merge its children
+        // back into the parent group.
+        let candidate_dirs: Vec<PathBuf> = partition
+            .keys()
+            .filter(|dir| {
+                // Skip the root — it's always valid (verified above).
+                if dir.as_path() == repo_root_buf.as_path() {
+                    return false;
+                }
+                // Skip NETWORK_NAME-based subnets — they are always valid.
+                !dir.join(NETWORK_NAME).exists()
+            })
+            .cloned()
+            .collect();
+
+        for candidate_dir in candidate_dirs {
+            // Find the network file in this directory.
+            let network_file = detect_network_file(&candidate_dir);
+            let is_valid_network = network_file.as_ref().is_some_and(|nf| {
+                CODECS.path_get(nf).is_some_and(|factory| {
+                    factory()
+                        .proto(nf)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|proto| proto.kind.contains(BeliefKind::Network))
+                })
+            });
+
+            if !is_valid_network {
+                tracing::debug!(
+                    "[ProtoIndex::build] Demoting false-positive subnet {:?} — \
+                     proto() did not return BeliefKind::Network",
+                    candidate_dir,
+                );
+                // Remove the subnet key and find its parent group.
+                if let Some(children) = partition.remove(&candidate_dir) {
+                    // Find the parent: deepest partition key that is a strict ancestor.
+                    let parent_key = partition
+                        .keys()
+                        .filter(|k| candidate_dir.starts_with(k.as_path()) && *k != &candidate_dir)
+                        .max_by_key(|k| k.components().count())
+                        .cloned()
+                        .unwrap_or_else(|| repo_root_buf.clone());
+                    partition.entry(parent_key).or_default().extend(children);
+                }
+            }
+        }
+
+        // Re-sort groups that may have received merged children from demoted subnets.
+        for entries in partition.values_mut() {
+            entries.sort();
+        }
+
         let map: HashMap<PathBuf, Vec<PathBuf>> = partition
             .into_iter()
             .map(|(net_dir, children)| {
@@ -326,21 +441,40 @@ impl ProtoIndex {
             })
             .collect();
 
+        let codec_meta: HashMap<PathBuf, HashMap<String, serde_json::Value>> = HashMap::new();
+
         #[cfg(feature = "git-tracking")]
-        let git_cache = if git_tracking {
-            // Collect all network dirs from the partition keys (already canonicalized).
+        let codec_meta = if git_tracking {
             let network_dirs: Vec<PathBuf> = map.keys().cloned().collect();
-            Arc::new(GitCache::populate(&network_dirs))
+            let git_cache = GitCache::populate(&network_dirs);
+            let mut codec_meta = codec_meta;
+            for (dir, status) in git_cache.iter_networks() {
+                match serde_json::to_value(status) {
+                    Ok(val) => {
+                        codec_meta
+                            .entry(dir.clone())
+                            .or_default()
+                            .insert("git".to_string(), val);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[ProtoIndex::build] Failed to serialize git status for {}: {}",
+                            dir.display(),
+                            e,
+                        );
+                    }
+                }
+            }
+            codec_meta
         } else {
-            Arc::new(GitCache::default())
+            codec_meta
         };
         // Suppress unused-variable warning when feature is disabled.
         let _ = git_tracking;
 
         Ok(Self {
             inner: Arc::new(RwLock::new(map)),
-            #[cfg(feature = "git-tracking")]
-            git_cache,
+            codec_meta: Arc::new(RwLock::new(codec_meta)),
         })
     }
 
@@ -360,6 +494,7 @@ impl ProtoIndex {
         let canonical_root =
             crate::paths::canonicalize_path(root).unwrap_or_else(|_| root.to_path_buf());
         let mut dirs: Vec<PathBuf> = WalkDir::new(root)
+            .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
                 // Allow the root entry unconditionally (it may live in a hidden temp dir).
@@ -375,16 +510,22 @@ impl ProtoIndex {
                         .map(|s| s.starts_with('.'))
                         .unwrap_or(false)
             })
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(e) => Some(e),
+                Err(ref err) => {
+                    warn_walk_error("discover_network_dirs", err);
+                    None
+                }
+            })
             .filter_map(|e| {
                 let p = e.into_path();
                 if p.is_file()
                     && p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| n == NETWORK_NAME)
+                        .map(|n| WALK_CODECS.is_network_file(n))
                         .unwrap_or(false)
                 {
-                    // Return the canonicalized parent directory, not the index.md file itself.
+                    // Return the canonicalized parent directory, not the network file itself.
                     p.parent().map(|d| {
                         crate::paths::canonicalize_path(d).unwrap_or_else(|_| d.to_path_buf())
                     })
@@ -431,6 +572,89 @@ impl ProtoIndex {
             "network_dirs: sort invariant violated — component counts not non-decreasing"
         );
         dirs
+    }
+
+    /// Returns network directories grouped by **subnet-tree depth**: the number of
+    /// subnet-to-subnet hops from the repo root, *not* the OS path-component count.
+    ///
+    /// Group `k` contains every network dir whose parent network is in group `k-1`;
+    /// group `0` holds the repo root (plus any dir with no indexed parent).
+    ///
+    /// # Why this differs from path-component depth
+    ///
+    /// `net_dir_partition` flattens plain (non-network) intervening directories: a
+    /// subnet at `A/docs/parts/B/index.md` is a *direct* child of `A` in
+    /// [`children_of`], exactly like a subnet at `A/B2/index.md`.  Grouping by
+    /// `components().count()` would place those two true siblings in different
+    /// groups — three apart, in that example — purely because one's path string is
+    /// longer.  Since `parse_all` runs one epoch per group and drains between them,
+    /// that spread serializes work that has no dependency relationship, and delays
+    /// the deeper-pathed sibling past the round where it could have run.
+    ///
+    /// Grouping by tree depth reconverges true siblings into the same epoch and
+    /// reduces the number of epochs to the real subnet-chain length.
+    ///
+    /// # Invariant relied on by callers
+    ///
+    /// Every dir in group `k` has its parent network in group `k-1`.  Callers that
+    /// commit each group before starting the next (`parse_all` phase 1) therefore
+    /// know a dir's ancestors are fully committed before it runs.  The converse is
+    /// what makes merging groups unsafe: *every* member of group `k+1` has a parent
+    /// in group `k`, so no member can be pulled forward.
+    ///
+    /// Within a group, dirs keep [`network_dirs`]'s ordering (component count, then
+    /// lexicographic) so batch composition is deterministic across runs.
+    ///
+    /// [`children_of`]: ProtoIndex::children_of
+    /// [`network_dirs`]: ProtoIndex::network_dirs
+    pub fn network_dirs_by_tree_depth(&self) -> Vec<Vec<PathBuf>> {
+        let dirs = self.network_dirs();
+        if dirs.is_empty() {
+            return Vec::new();
+        }
+
+        // Map each subnet dir to its parent network, read straight from the
+        // in-memory child lists.  A child entry that is a directory is a subnet;
+        // plain files are leaf documents and are not scheduled here.
+        //
+        // This deliberately does not use `owning_net_dir_for`, which walks the
+        // filesystem on every call.
+        let parent_of: HashMap<PathBuf, PathBuf> = {
+            let inner = self.inner.read();
+            inner
+                .iter()
+                .flat_map(|(net_dir, children)| {
+                    children
+                        .iter()
+                        .filter(|child| child.is_dir())
+                        .map(move |child| (child.clone(), net_dir.clone()))
+                })
+                .collect()
+        };
+
+        // Single left-to-right pass.  `dirs` is sorted by ascending component count,
+        // and a subnet's path strictly contains its parent's, so the parent always
+        // has a strictly smaller component count and has therefore already been
+        // assigned a depth by the time we reach the child.
+        let mut depth_of: HashMap<PathBuf, usize> = HashMap::with_capacity(dirs.len());
+        let mut groups: Vec<Vec<PathBuf>> = Vec::new();
+        for dir in dirs {
+            let depth = parent_of
+                .get(&dir)
+                .and_then(|parent| depth_of.get(parent))
+                .map(|parent_depth| parent_depth + 1)
+                .unwrap_or(0);
+            debug_assert!(
+                depth_of.get(&dir).is_none_or(|existing| *existing == depth),
+                "network_dirs_by_tree_depth: {dir:?} assigned two different depths"
+            );
+            depth_of.insert(dir.clone(), depth);
+            if groups.len() <= depth {
+                groups.resize_with(depth + 1, Vec::new);
+            }
+            groups[depth].push(dir);
+        }
+        groups
     }
 
     /// Returns the lexically-ordered direct children of `dir`, or `None` if `dir` is not a
@@ -497,52 +721,89 @@ impl ProtoIndex {
         }
     }
 
-    /// Returns the 0-based sort key for `abs_path` within its owning network directory.
+    /// Returns the absolute path of the network directory that owns `abs_path`.
     ///
-    /// This is the canonical, single source of truth used by **both** the fast path
-    /// (`try_initialize_stack_from_session_cache`) and the slow path (`initialize_stack`),
-    /// replacing the dual-source logic (session_bb Section edge scan + proto_cache fallback)
-    /// that caused the BN-DB sort-key churn instability.
+    /// The owning network is the nearest ancestor directory that is a known network
+    /// (i.e. present in the ProtoIndex) **and** whose `children_of` list contains
+    /// `abs_path` (or, for a network index file, its parent directory) as a direct
+    /// child entry.  This is a **membership** check — the file must appear in the
+    /// parent's child list, not merely be somewhere beneath a known network.
     ///
-    /// The owning network may not be the immediate parent directory.  For files in a
-    /// non-network subdirectory (e.g. `net1_dir1/hsml.md` where `net1_dir1/` has no
-    /// `index.md`), `net_dir_children` includes the file in the **ancestor** network's child
-    /// list (flattened).  `sort_key_for` walks up the directory tree until it finds a
-    /// network directory whose child list contains `abs_path`, then returns that position.
+    /// This differs from the walk-up in `try_initialize_stack_from_session_cache`,
+    /// which uses an **existence** check (`children_of(dir).is_some()`) to find the
+    /// nearest ancestor that IS a network at all.  The two checks agree for well-formed
+    /// repos with no symlinked subnets, but can diverge in edge cases — each is correct
+    /// for its own purpose:
+    ///
+    /// - `owning_net_dir_for` (membership): used to derive the submap path for the
+    ///   pre-seed loop in `parse_epoch` and to drive `sort_key_for`, where the exact
+    ///   PathMap child entry position is needed.
+    /// - `children_of(dir).is_some()` (existence): used in
+    ///   `try_initialize_stack_from_session_cache` to find the nearest network ancestor
+    ///   whose PathMap can be queried for the entry document.
     ///
     /// Returns `None` if:
     /// - `abs_path` has no parent directory, or
     /// - no ancestor directory in the ProtoIndex contains `abs_path` in its child list.
-    pub fn sort_key_for(&self, abs_path: &Path) -> Option<u16> {
-        // If abs_path is a network index file (ends with NETWORK_NAME / "index.md"), the
-        // ProtoIndex child lists record the *directory* path, not the index file itself.
-        // Use the parent directory as the canonical lookup target so that, e.g.,
-        // `subnet1/index.md` matches the `subnet1/` entry in the root network's child list.
-        let lookup_path: std::borrow::Cow<Path> =
-            if abs_path.file_name().and_then(|n| n.to_str()) == Some(NETWORK_NAME) {
-                std::borrow::Cow::Owned(abs_path.parent()?.to_path_buf())
-            } else {
-                std::borrow::Cow::Borrowed(abs_path)
-            };
+    pub fn owning_net_dir_for(&self, abs_path: &Path) -> Option<PathBuf> {
+        // For a network index file, the ProtoIndex child lists record the *directory*
+        // path, not the index file itself.  Use the parent directory as the lookup
+        // target so that `subnet1/index.md` matches the `subnet1/` entry in the root
+        // network's child list.
+        let lookup_path: std::borrow::Cow<Path> = if is_network_index_file(abs_path) {
+            std::borrow::Cow::Owned(abs_path.parent()?.to_path_buf())
+        } else {
+            std::borrow::Cow::Borrowed(abs_path)
+        };
 
         // Canonicalize once for all comparisons against canonicalized child entries.
         let canonical = crate::paths::canonicalize_path(lookup_path.as_ref())
             .unwrap_or_else(|_| lookup_path.to_path_buf());
 
-        // Walk up the directory tree, checking each ancestor directory that is a known
-        // network dir (i.e. present in the ProtoIndex).  The first hit that contains
-        // `canonical` in its child list is the owning network.
+        // Walk up the directory tree.  The first ancestor directory whose
+        // children_of list contains `canonical` is the owning network directory.
         let mut dir = lookup_path.parent()?;
         loop {
             if let Some(children) = self.children_of(dir) {
-                if let Some(idx) = children.iter().position(|child| child == &canonical) {
-                    return Some(idx as u16);
+                if children.iter().any(|child| child == &canonical) {
+                    return Some(dir.to_path_buf());
                 }
                 // This dir is a known network but doesn't contain abs_path — keep walking up.
-                // (Shouldn't happen in practice, but be safe.)
+                // (Shouldn't happen in practice for well-formed repos, but be safe.)
             }
             dir = dir.parent()?;
         }
+    }
+
+    /// Returns the 0-based sort key for `abs_path` within its owning network directory.
+    ///
+    /// Delegates the directory walk to [`ProtoIndex::owning_net_dir_for`], then returns
+    /// the position of `abs_path` (or its parent dir for network index files) within
+    /// that network's `children_of` list.
+    ///
+    /// The owning network may not be the immediate parent directory.  For files in a
+    /// non-network subdirectory (e.g. `net1_dir1/hsml.md` where `net1_dir1/` has no
+    /// `index.md`), `net_dir_children` includes the file in the **ancestor** network's
+    /// child list (flattened).
+    ///
+    /// Returns `None` if:
+    /// - `abs_path` has no parent directory, or
+    /// - no ancestor directory in the ProtoIndex contains `abs_path` in its child list.
+    pub fn sort_key_for(&self, abs_path: &Path) -> Option<u16> {
+        let lookup_path: std::borrow::Cow<Path> = if is_network_index_file(abs_path) {
+            std::borrow::Cow::Owned(abs_path.parent()?.to_path_buf())
+        } else {
+            std::borrow::Cow::Borrowed(abs_path)
+        };
+        let canonical = crate::paths::canonicalize_path(lookup_path.as_ref())
+            .unwrap_or_else(|_| lookup_path.to_path_buf());
+
+        let net_dir = self.owning_net_dir_for(abs_path)?;
+        let children = self.children_of(&net_dir)?;
+        children
+            .iter()
+            .position(|child| child == &canonical)
+            .map(|idx| idx as u16)
     }
 
     /// Build a complete network `IRNode` for `dir`.
@@ -563,14 +824,15 @@ impl ProtoIndex {
     /// Returns `Err` if the `index.md` frontmatter cannot be parsed, or if the network node
     /// has no semantic ID (same invariant enforced by `NetworkCodec::proto`).
     ///
-    /// Returns a tuple of `(IRNode, Option<NetworkGitStatus>)`.  The git status is `Some`
-    /// only when the `git-tracking` feature is enabled, `git_tracking` was `true` at
-    /// `build` time, and the network directory resides inside a git repository.
+    /// Returns a tuple of `(IRNode, Option<serde_json::Value>)`.  The second element is
+    /// the `"git"` namespace entry from `codec_meta` — `Some` when git tracking is
+    /// enabled, `git_tracking` was `true` at `build` time, and the network directory
+    /// resides inside a git repository.
     #[allow(clippy::type_complexity)]
     pub fn proto_for(
         &self,
         dir: &Path,
-    ) -> Result<Option<(IRNode, Option<NetworkGitStatus>)>, BuildonomyError> {
+    ) -> Result<Option<(IRNode, Option<serde_json::Value>)>, BuildonomyError> {
         let Some(network_filepath) = detect_network_file(dir) else {
             return Ok(None);
         };
@@ -583,7 +845,13 @@ impl ProtoIndex {
         // prepare_proto_relations fails because network_dir is still \\?\C:\... while
         // children are stored as C:/... after the round-trip.
         let network_dir_buf = string_to_os_path(&os_path_to_string(network_dir_raw));
-        let network_dir = network_dir_buf.as_path();
+        // Canonicalize so the path matches the canonicalized keys stored by ProtoIndex::build().
+        // Without this, children_of() returns None on macOS (where /var/... symlinks to
+        // /private/var/...) and the fallback net_dir_children() returns canonicalized children
+        // that strip_prefix fails against the non-canonical network_dir.
+        let network_dir_canonical =
+            crate::paths::canonicalize_path(&network_dir_buf).unwrap_or(network_dir_buf);
+        let network_dir = network_dir_canonical.as_path();
 
         // Read frontmatter via the registered codec for this file — honours any custom
         // network codec swapped in via CODECS rather than hardcoding MdCodec.
@@ -601,6 +869,17 @@ impl ProtoIndex {
 
         proto.path = os_path_to_string(network_dir);
         proto.kind.insert(BeliefKind::Network);
+        // Ensure every Network node carries payload["codec"] — the filename that
+        // round-trips through CODECS.get(AnchorPath::new(value)).  The upstream
+        // codec_factory().proto() call may have already set this (e.g. NetworkCodec
+        // always does); only fill it in when absent so custom codecs can override.
+        if !proto.document.contains_key("codec") {
+            let codec_filename = network_filepath
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(NETWORK_NAME);
+            proto.document.insert("codec", value(codec_filename));
+        }
         proto.heading = 1;
 
         // Populate upstream with Section child-path relations from the cached child list.
@@ -617,27 +896,101 @@ impl ProtoIndex {
         // implementations can express their own file-based child relations.
         codec_factory().prepare_proto_relations(&mut proto, network_dir, &children)?;
 
-        // Look up cached git status for this network directory (None when git tracking
+        // Look up cached git status from codec_meta (None when git tracking
         // is disabled or the directory is not inside any git repository).
-        #[cfg(feature = "git-tracking")]
-        let git_status: Option<NetworkGitStatus> = self.git_cache.get(network_dir).cloned();
-        #[cfg(not(feature = "git-tracking"))]
-        let git_status: Option<NetworkGitStatus> = None;
+        let git_status = self.get_meta(network_dir, "git");
 
         Ok(Some((proto, git_status)))
     }
 
-    /// Look up the cached git status for a network directory directly.
+    /// Store codec metadata for a network directory under a namespace key.
     ///
-    /// Used by `GraphBuilder::parse_content` to inject git metadata into the root
-    /// network node during Phase 1 (the ancestor push loop in `initialize_stack` only
-    /// covers networks *above* the entry point, not the entry network itself).
+    /// The value is serialized by the producing codec via `serde_json::to_value()`.
+    /// Consuming codecs read it back via [`Self::get_meta`] or [`Self::get_meta_as`].
     ///
-    /// Returns `None` when git tracking is disabled or the directory is not inside
-    /// any git repository.
-    #[cfg(feature = "git-tracking")]
-    pub fn git_status_for(&self, dir: &Path) -> Option<&NetworkGitStatus> {
-        self.git_cache.get(dir)
+    /// The path is canonicalized before insertion so lookups from different path
+    /// representations (symlinks, `\\?\` prefixes on Windows) all hit the same entry.
+    pub fn set_meta(&self, dir: &Path, namespace: &str, value: serde_json::Value) {
+        let canonical = crate::paths::canonicalize_path(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.codec_meta
+            .write()
+            .entry(canonical)
+            .or_default()
+            .insert(namespace.to_string(), value);
+    }
+
+    /// Read raw codec metadata for a network directory under a namespace key.
+    ///
+    /// Returns `None` if no metadata was stored for this `(dir, namespace)` pair.
+    pub fn get_meta(&self, dir: &Path, namespace: &str) -> Option<serde_json::Value> {
+        let canonical = crate::paths::canonicalize_path(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.codec_meta
+            .read()
+            .get(&canonical)
+            .and_then(|m| m.get(namespace))
+            .cloned()
+    }
+
+    /// Iterate all `(dir, value)` pairs for a given namespace.
+    ///
+    /// Returns a `Vec` rather than an iterator to avoid holding the read lock
+    /// across the caller's processing loop.  Values are cloned.
+    pub fn iter_meta_as<T: DeserializeOwned>(&self, namespace: &str) -> Vec<(PathBuf, T)> {
+        let guard = self.codec_meta.read();
+        guard
+            .iter()
+            .filter_map(|(dir, namespaces)| {
+                let val = namespaces.get(namespace)?;
+                let typed: T = serde_json::from_value(val.clone()).ok()?;
+                Some((dir.clone(), typed))
+            })
+            .collect()
+    }
+
+    /// Read and deserialize codec metadata into a typed struct.
+    ///
+    /// Convenience wrapper around [`Self::get_meta`] that calls
+    /// `serde_json::from_value::<T>()`.  Returns `None` if no metadata exists or
+    /// if deserialization fails (with a `tracing::warn` on failure).
+    pub fn get_meta_as<T: DeserializeOwned>(&self, dir: &Path, namespace: &str) -> Option<T> {
+        let val = self.get_meta(dir, namespace)?;
+        match serde_json::from_value::<T>(val) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    "[ProtoIndex::get_meta_as] Failed to deserialize namespace \"{namespace}\" \
+                     for {}: {e}",
+                    dir.display(),
+                );
+                None
+            }
+        }
+    }
+
+    /// Walk parent directories of `path` looking for codec metadata under `namespace`.
+    ///
+    /// Returns the first `(directory, deserialized_value)` pair found by walking up
+    /// from `path`'s parent directory, calling [`Self::get_meta_as`] at each level.
+    /// Stops at the first hit.  Returns `None` if no ancestor has metadata for this
+    /// namespace.
+    ///
+    /// This extracts the ancestor-walk pattern used by a downstream C++ codec and makes it
+    /// reusable for any codec that needs to inherit config from an ancestor network
+    /// (e.g. `alias-template` on a parent network applied to child documents).
+    pub fn ancestor_meta_as<T: DeserializeOwned>(
+        &self,
+        path: &Path,
+        namespace: &str,
+    ) -> Option<(PathBuf, T)> {
+        let mut candidate = path.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = candidate {
+            let canonical = crate::paths::canonicalize_path(&dir).unwrap_or_else(|_| dir.clone());
+            if let Some(value) = self.get_meta_as::<T>(&canonical, namespace) {
+                return Some((canonical, value));
+            }
+            candidate = dir.parent().map(|p| p.to_path_buf());
+        }
+        None
     }
 }
 
@@ -651,7 +1004,7 @@ impl Default for ProtoIndex {
 mod tests {
     use super::*;
     use crate::codec::network::NetworkCodec;
-    use crate::codec::DocCodec;
+    use crate::codec::{DocCodec, WalkCodec};
     use crate::nodekey::NodeKey;
     use std::fs;
     use tempfile::TempDir;
@@ -1190,7 +1543,149 @@ mod tests {
         );
     }
 
-    // ── net_dir_children sort order ───────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // network_dirs_by_tree_depth()
+    // -------------------------------------------------------------------------
+
+    /// Relative-path view of the grouping, for readable assertions.
+    fn tree_depth_names(idx: &ProtoIndex, root: &Path) -> Vec<Vec<String>> {
+        idx.network_dirs_by_tree_depth()
+            .into_iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|p| {
+                        p.strip_prefix(root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The motivating case: two subnets that are true tree-siblings (both direct
+    /// children of the root in `children_of`) but whose paths differ in component
+    /// count because one sits behind plain intervening directories.
+    ///
+    /// Component-count grouping put these in different epochs — serializing work
+    /// with no dependency between it — and delayed the deeper-pathed one.
+    #[test]
+    fn test_tree_depth_groups_siblings_split_by_path_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
+        write_index(&root, "root");
+
+        // Shallow sibling: root/near/
+        let near = root.join("near");
+        fs::create_dir_all(&near).unwrap();
+        write_index(&near, "near");
+
+        // Deep-pathed sibling: root/docs/parts/far/ — three extra components, but
+        // `docs` and `parts` hold no index.md, so `far` is still a direct child of
+        // root in the ProtoIndex.
+        let far = root.join("docs").join("parts").join("far");
+        fs::create_dir_all(&far).unwrap();
+        write_index(&far, "far");
+
+        let idx = ProtoIndex::build(&root, false).unwrap();
+
+        // Precondition: both really are direct children of root.
+        let root_children = idx.children_of(&root).unwrap();
+        assert!(
+            root_children.contains(&near) && root_children.contains(&far),
+            "fixture invalid — both subnets should be direct children of root: {root_children:?}"
+        );
+
+        // Within a group, dirs keep network_dirs()'s ordering — component count
+        // first, then lexicographic — so `near` precedes the deeper-pathed `far`.
+        assert_eq!(
+            tree_depth_names(&idx, &root),
+            vec![vec![""], vec!["near", "docs/parts/far"]],
+            "true siblings must share one group regardless of path length"
+        );
+    }
+
+    /// A real subnet chain still serializes: tree depth increases by one per subnet
+    /// hop, so no batching is manufactured where a genuine dependency exists.
+    #[test]
+    fn test_tree_depth_chain_stays_serial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
+        write_index(&root, "root");
+
+        let b = root.join("b");
+        let c = b.join("c");
+        let d = c.join("d");
+        for (dir, id) in [(&b, "b"), (&c, "c"), (&d, "d")] {
+            fs::create_dir_all(dir).unwrap();
+            write_index(dir, id);
+        }
+
+        let idx = ProtoIndex::build(&root, false).unwrap();
+        assert_eq!(
+            tree_depth_names(&idx, &root),
+            vec![vec![""], vec!["b"], vec!["b/c"], vec!["b/c/d"]],
+            "a genuine subnet chain must remain one dir per group"
+        );
+    }
+
+    /// The scheduling invariant `parse_all` phase 1 depends on: every dir in group
+    /// D has its parent network in group D-1, so draining each group before the
+    /// next guarantees ancestors are committed before their children parse.
+    #[test]
+    fn test_tree_depth_parent_is_always_in_previous_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::paths::canonicalize_path(tmp.path()).unwrap();
+        write_index(&root, "root");
+
+        // Mixed shapes: a branch point, plain-dir indirection at two levels, and
+        // branches of differing depth that would drift apart under component count.
+        for rel in ["b", "b/c", "b/wrapper/f", "b/c/deep/nested/g", "h", "h/i"] {
+            let dir = root.join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            write_index(&dir, &rel.replace('/', "-"));
+        }
+
+        let idx = ProtoIndex::build(&root, false).unwrap();
+        let groups = idx.network_dirs_by_tree_depth();
+
+        // Every indexed dir appears exactly once.
+        let scheduled: Vec<PathBuf> = groups.iter().flatten().cloned().collect();
+        let mut sorted = scheduled.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            scheduled.len(),
+            "a network dir was scheduled more than once"
+        );
+        assert_eq!(
+            sorted.len(),
+            idx.network_dirs().len(),
+            "grouping dropped or invented network dirs"
+        );
+
+        // Group 0 is exactly the repo root.
+        assert_eq!(groups[0], vec![root.clone()], "group 0 must be the root");
+
+        // Parent-in-previous-group holds for every non-root dir.
+        for (depth, group) in groups.iter().enumerate().skip(1) {
+            for dir in group {
+                let parent = idx
+                    .owning_net_dir_for(&dir.join(NETWORK_NAME))
+                    .unwrap_or_else(|| panic!("{dir:?} has no owning network"));
+                assert!(
+                    groups[depth - 1].contains(&parent),
+                    "{dir:?} is in group {depth} but its parent {parent:?} is not in group {}",
+                    depth - 1
+                );
+            }
+        }
+    }
+
+    // ── net_dir_children sort order ───────────────────────────────────
 
     /// Sort order for `net_dir_children`: subnet directories and plain files interleave
     /// lexicographically within each group.  The sort is hierarchical (DFS): all entries
@@ -1285,5 +1780,487 @@ mod tests {
             names, expected,
             "net_dir_children sort order mismatch\ngot:      {names:?}\nexpected: {expected:?}"
         );
+    }
+
+    // ── symlink support ───────────────────────────────────────────────────────
+
+    /// A symlinked directory that contains an `index.md` must be walked so its children
+    /// appear in the index.  Because `build()` canonicalizes all keys, a symlink resolves
+    /// to the same canonical path as the real directory — they share one index entry.
+    /// The important invariant is that the content is reachable, not that the symlink
+    /// gets a separate entry.
+    ///
+    /// Layout:
+    /// ```text
+    /// root/
+    ///   index.md          (id = "root")
+    ///   real_subnet/
+    ///     index.md        (id = "real")
+    ///     doc.md
+    ///   link_subnet  ->   real_subnet   (symlink)
+    /// ```
+    /// Expected: `real_subnet` is indexed and its children include `doc.md`.
+    /// `link_subnet` canonicalizes to the same path as `real_subnet`, so only one
+    /// network-dir entry exists for that canonical path.
+    #[test]
+    #[cfg(unix)] // std::os::unix::fs::symlink is unix-only
+    fn test_symlinked_subnet_is_discovered() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        write_index(root, "root");
+
+        let real_subnet = root.join("real_subnet");
+        fs::create_dir_all(&real_subnet).unwrap();
+        write_index(&real_subnet, "real");
+        fs::write(real_subnet.join("doc.md"), "# Doc\n").unwrap();
+
+        // Create a symlink: root/link_subnet -> root/real_subnet
+        let link_subnet = root.join("link_subnet");
+        symlink(&real_subnet, &link_subnet).unwrap();
+
+        let idx = ProtoIndex::build(root, false).unwrap();
+        let root_canon = crate::paths::canonicalize_path(root).unwrap();
+
+        // The real subnet must be present in the index.
+        let net_dirs = idx.network_dirs();
+        let names: Vec<String> = net_dirs
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root_canon)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "real_subnet"),
+            "real_subnet must appear as a network dir; got: {names:?}"
+        );
+
+        // link_subnet canonicalizes to the same path as real_subnet.  Lookup by
+        // canonical path must succeed and expose the subnet's children.
+        let real_canon = crate::paths::canonicalize_path(&real_subnet).unwrap();
+        let link_canon = crate::paths::canonicalize_path(&link_subnet).unwrap();
+        assert_eq!(
+            real_canon, link_canon,
+            "sanity: symlink and target must resolve to the same canonical path"
+        );
+
+        let children = idx.children_of(&real_canon);
+        assert!(
+            children.is_some(),
+            "children_of(real_subnet canonical) must return Some; network dirs: {names:?}"
+        );
+        let child_names: Vec<String> = children
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            child_names.iter().any(|n| n == "doc.md"),
+            "doc.md must appear as child of real_subnet; got: {child_names:?}"
+        );
+    }
+
+    /// A symlink cycle must not cause an infinite loop.  `WalkDir` with
+    /// `follow_links(true)` detects cycles and emits an error; our code must
+    /// handle that gracefully and continue building the rest of the index.
+    ///
+    /// Layout:
+    /// ```text
+    /// root/
+    ///   index.md          (id = "root")
+    ///   subnet/
+    ///     index.md        (id = "subnet")
+    ///     doc.md
+    ///     loop  ->  root/subnet   (symlink back to parent — a cycle)
+    /// ```
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_cycle_does_not_hang() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        write_index(root, "root");
+
+        let subnet = root.join("subnet");
+        fs::create_dir_all(&subnet).unwrap();
+        write_index(&subnet, "subnet");
+        fs::write(subnet.join("doc.md"), "# Doc\n").unwrap();
+
+        // Create a cycle: subnet/loop -> subnet (points back to itself)
+        let loop_link = subnet.join("loop");
+        symlink(&subnet, &loop_link).unwrap();
+
+        // Must complete without hanging or panicking.
+        let idx = ProtoIndex::build(root, false).unwrap();
+        let root_canon = crate::paths::canonicalize_path(root).unwrap();
+
+        // The non-cyclic parts of the tree must still be indexed correctly.
+        let net_dirs = idx.network_dirs();
+        let names: Vec<String> = net_dirs
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root_canon)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "subnet"),
+            "subnet must still be discovered despite cycle; got: {names:?}"
+        );
+
+        let subnet_canon = crate::paths::canonicalize_path(&subnet).unwrap();
+        let children = idx.children_of(&subnet_canon).unwrap_or_default();
+        let child_names: Vec<String> = children
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            child_names.iter().any(|n| n == "doc.md"),
+            "doc.md must appear despite cycle link; got: {child_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_net_dir_partition_includes_yaml_files() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // create a minimal network
+        fs::write(
+            root.join("index.md"),
+            "---\nid: test-net\ntitle: Test\n---\n",
+        )
+        .unwrap();
+        fs::write(root.join("data.yaml"), "key: value\n").unwrap();
+        fs::write(root.join("doc.md"), "# Doc\n").unwrap();
+
+        let partition = net_dir_partition(root);
+        let children = partition.get(root).unwrap();
+        let names: Vec<&str> = children
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert!(
+            names.contains(&"data.yaml"),
+            "yaml should be included: {names:?}"
+        );
+        assert!(
+            names.contains(&"doc.md"),
+            "md should still be included: {names:?}"
+        );
+    }
+
+    /// Walk codec for testing: declares "Manifest.test" as a network filename.
+    struct TestManifestWalkCodec;
+
+    impl WalkCodec for TestManifestWalkCodec {
+        fn should_track(&self, path: &Path) -> bool {
+            path.file_name().and_then(|n| n.to_str()) == Some("Manifest.test")
+        }
+
+        fn tracked_extensions(&self) -> Vec<&'static str> {
+            vec!["test"]
+        }
+
+        fn network_filenames(&self) -> Vec<&'static str> {
+            vec!["Manifest.test"]
+        }
+    }
+
+    /// Register the test walk codec (idempotent — duplicates are harmless).
+    fn register_test_walk_codec() {
+        WALK_CODECS.register(Box::new(TestManifestWalkCodec));
+    }
+
+    #[test]
+    fn test_net_dir_partition_custom_network_filename() {
+        register_test_walk_codec();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Root has index.md as usual.
+        write_index(root, "root");
+        fs::write(root.join("doc.md"), "# Doc\n").unwrap();
+
+        // Create a subdirectory with a Manifest.test file.
+        let component = root.join("component");
+        fs::create_dir_all(&component).unwrap();
+        fs::write(component.join("Manifest.test"), "name = \"comp\"\n").unwrap();
+        fs::write(component.join("data.yaml"), "key: value\n").unwrap();
+
+        let partition = net_dir_partition(root);
+
+        // The component directory should be a partition key (candidate subnet).
+        assert!(
+            partition.contains_key(&component),
+            "component dir should be a candidate subnet in the partition; keys: {:?}",
+            partition.keys().collect::<Vec<_>>()
+        );
+
+        // data.yaml should be a child of the component group, not the root.
+        let component_children = partition.get(&component).unwrap();
+        let child_names: Vec<&str> = component_children
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert!(
+            child_names.contains(&"data.yaml"),
+            "data.yaml should be child of component; got: {child_names:?}"
+        );
+
+        // Root should NOT contain data.yaml.
+        let root_children = partition.get(root).unwrap();
+        let root_child_names: Vec<&str> = root_children
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert!(
+            !root_child_names.contains(&"data.yaml"),
+            "data.yaml should NOT be in root group; got: {root_child_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_proto_index_build_culls_false_positive_subnet() {
+        register_test_walk_codec();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Root has index.md as usual.
+        write_index(root, "root");
+        fs::write(root.join("doc.md"), "# Doc\n").unwrap();
+
+        // Create a subdirectory with Manifest.test but no registered CODECS
+        // entry for it, so proto() will fail (no codec found → no
+        // BeliefKind::Network). This is a false positive.
+        let plumbing = root.join("plumbing");
+        fs::create_dir_all(&plumbing).unwrap();
+        fs::write(plumbing.join("Manifest.test"), "not a real network\n").unwrap();
+        fs::write(plumbing.join("helper.yaml"), "x: 1\n").unwrap();
+
+        // net_dir_partition should tentatively treat plumbing as a subnet.
+        let partition = net_dir_partition(root);
+        assert!(
+            partition.contains_key(&plumbing),
+            "plumbing should be a candidate subnet before culling"
+        );
+
+        // ProtoIndex::build should cull it (no codec registered for Manifest.test
+        // → CODECS.path_get returns None → not a valid network).
+        let idx = ProtoIndex::build(root, false).unwrap();
+        let root_canon = crate::paths::canonicalize_path(root).unwrap();
+        let plumbing_canon = crate::paths::canonicalize_path(&plumbing).unwrap();
+
+        // Plumbing should NOT be a network dir after culling.
+        let net_dirs = idx.network_dirs();
+        assert!(
+            !net_dirs.contains(&plumbing_canon),
+            "plumbing should be culled from network dirs; got: {net_dirs:?}"
+        );
+
+        // But its children (helper.yaml) should be merged into root's child list.
+        let root_children = idx.children_of(&root_canon).unwrap_or_default();
+        let child_names: Vec<String> = root_children
+            .iter()
+            .filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            child_names.contains(&"helper.yaml".to_string()),
+            "helper.yaml should be merged into root after culling; got: {child_names:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // codec_meta: set_meta / get_meta / get_meta_as
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_meta_get_meta_round_trip() {
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        let val = serde_json::json!({"include_dirs": ["include/", "src/"]});
+        idx.set_meta(&dir, "cmake", val.clone());
+
+        let retrieved = idx.get_meta(&dir, "cmake");
+        assert_eq!(retrieved, Some(val));
+    }
+
+    #[test]
+    fn test_get_meta_unknown_namespace_returns_none() {
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        idx.set_meta(&dir, "cmake", serde_json::json!({"x": 1}));
+
+        assert!(idx.get_meta(&dir, "git").is_none());
+    }
+
+    #[test]
+    fn test_get_meta_unknown_dir_returns_none() {
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        idx.set_meta(&dir, "cmake", serde_json::json!({"x": 1}));
+
+        let other = PathBuf::from("/tmp/other_net");
+        assert!(idx.get_meta(&other, "cmake").is_none());
+    }
+
+    #[test]
+    fn test_get_meta_as_deserializes_typed_struct() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct MockMeta {
+            include_dirs: Vec<String>,
+            target_name: String,
+        }
+
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        let original = MockMeta {
+            include_dirs: vec!["include/".to_string(), "src/".to_string()],
+            target_name: "my_component".to_string(),
+        };
+        idx.set_meta(&dir, "test", serde_json::to_value(&original).unwrap());
+
+        let retrieved: Option<MockMeta> = idx.get_meta_as(&dir, "test");
+        assert_eq!(retrieved, Some(original));
+    }
+
+    #[test]
+    fn test_get_meta_as_returns_none_on_type_mismatch() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct WrongShape {
+            nonexistent_field: u64,
+        }
+
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        idx.set_meta(&dir, "test", serde_json::json!({"x": "hello"}));
+
+        let retrieved: Option<WrongShape> = idx.get_meta_as(&dir, "test");
+        assert!(
+            retrieved.is_none(),
+            "Deserialization of mismatched type should return None"
+        );
+    }
+
+    #[test]
+    fn test_set_meta_multiple_namespaces() {
+        let idx = ProtoIndex::new();
+        let dir = PathBuf::from("/tmp/test_net");
+
+        idx.set_meta(&dir, "git", serde_json::json!({"branch": "main"}));
+        idx.set_meta(&dir, "cmake", serde_json::json!({"target": "lib"}));
+
+        assert_eq!(
+            idx.get_meta(&dir, "git"),
+            Some(serde_json::json!({"branch": "main"}))
+        );
+        assert_eq!(
+            idx.get_meta(&dir, "cmake"),
+            Some(serde_json::json!({"target": "lib"}))
+        );
+    }
+
+    #[test]
+    fn test_ancestor_meta_as_finds_parent() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct AliasConfig {
+            template: String,
+        }
+
+        let idx = ProtoIndex::new();
+        let parent_dir = PathBuf::from("/tmp/test_net");
+        let child_path = PathBuf::from("/tmp/test_net/child.md");
+
+        let config = AliasConfig {
+            template: "/docs/{{ slug }}".to_string(),
+        };
+        idx.set_meta(
+            &parent_dir,
+            "url_alias",
+            serde_json::to_value(&config).unwrap(),
+        );
+
+        let result = idx.ancestor_meta_as::<AliasConfig>(&child_path, "url_alias");
+        assert!(result.is_some(), "Should find parent's metadata");
+        let (found_dir, found_config) = result.unwrap();
+        assert_eq!(found_config.template, "/docs/{{ slug }}");
+        // The found_dir should be the canonical form of parent_dir
+        assert!(
+            found_dir.ends_with("test_net"),
+            "Found dir should end with test_net, got {:?}",
+            found_dir
+        );
+    }
+
+    #[test]
+    fn test_ancestor_meta_as_returns_none_when_absent() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct AliasConfig {
+            template: String,
+        }
+
+        let idx = ProtoIndex::new();
+        let child_path = PathBuf::from("/tmp/test_net/child.md");
+
+        let result = idx.ancestor_meta_as::<AliasConfig>(&child_path, "url_alias");
+        assert!(
+            result.is_none(),
+            "Should return None when no ancestor has metadata"
+        );
+    }
+
+    #[test]
+    fn test_ancestor_meta_as_finds_grandparent() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct AliasConfig {
+            template: String,
+        }
+
+        let idx = ProtoIndex::new();
+        let grandparent_dir = PathBuf::from("/tmp/test_net");
+        let child_path = PathBuf::from("/tmp/test_net/subdir/child.md");
+
+        let config = AliasConfig {
+            template: "/docs/{{ slug }}".to_string(),
+        };
+        idx.set_meta(
+            &grandparent_dir,
+            "url_alias",
+            serde_json::to_value(&config).unwrap(),
+        );
+
+        let result = idx.ancestor_meta_as::<AliasConfig>(&child_path, "url_alias");
+        assert!(result.is_some(), "Should find grandparent's metadata");
+        let (_found_dir, found_config) = result.unwrap();
+        assert_eq!(found_config.template, "/docs/{{ slug }}");
     }
 }

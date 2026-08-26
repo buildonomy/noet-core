@@ -115,6 +115,14 @@ export const state = {
    */
   searchIndex: new Map(),
 
+  /**
+   * Prefetched page HTML response for the initial navigation target.
+   * Set early in the bootstrap sequence (before WASM loads) so the page
+   * content is ready by the time `loadDocument` runs.
+   * Shape: `{ path: string, promise: Promise<Response> } | null`
+   */
+  prefetchedPage: null,
+
   /** Navigation tree data — NavTree { nodes: Map, roots: Array } from get_nav_tree() */
   navTree: null,
 
@@ -144,6 +152,35 @@ export const state = {
    * from the selectedNodeBid (metadata panel focus).
    */
   currentDocBid: null,
+
+  /**
+   * Network bref of the currently loaded document's home network.
+   * Derived from the document BID's parent_bref (last 12 hex chars of the UUID).
+   * Set alongside currentDocBid on successful loadDocument(); reset to null at
+   * the start of each load.
+   *
+   * Used by injectHeaderAnchors and section BID resolution in loadDocument to
+   * look up heading nodes in the correct network's PathMap rather than always
+   * using the entry point's network. Without this, heading lookups fail for any
+   * document that lives in a subnet other than the root entry network.
+   */
+  currentDocNetworkBref: null,
+
+  /**
+   * Source file URL for the currently loaded document, extracted from the
+   * #noet-source-link element in the fetched HTML fragment. Null when the
+   * document has no source link (e.g. network index nodes).
+   * @type {string|null}
+   */
+  currentDocSourceLink: null,
+
+  /**
+   * True when the current document's source file is a binary codec (e.g. xlsx).
+   * Derived from data-binary="true" on #noet-source-link. Controls whether
+   * the metadata panel renders the link as a download or a view-in-browser link.
+   * @type {boolean}
+   */
+  currentDocSourceBinary: false,
 
   /**
    * Asset/href node BID to highlight in content once the next document load
@@ -198,4 +235,22 @@ export const callbacks = {
    * @type {((assetPath: string) => void)|null}
    */
   highlightExternalInContent: null,
+
+  /**
+   * Open the traceability panel in search mode with a pre-populated query.
+   * Registered from traceability.js.
+   * @type {((query: string) => Promise<void>)|null}
+   */
+  openTraceabilitySearch: null,
+
+  /**
+   * Two-click navigation pattern for node links outside .noet-content
+   * (e.g. Tabulator relation cells in xlsx-tabs.js).
+   *
+   * First click on a given BID: show metadata panel, record selection.
+   * Second click on the same BID: navigate via navigateToLink, clear selection.
+   *
+   * @type {((bid: string, href: string|null, element: HTMLElement|null) => void)|null}
+   */
+  handleNodeLinkClick: null,
 };

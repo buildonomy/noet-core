@@ -3,13 +3,13 @@
 use super::*;
 use crate::nodekey::NodeKey;
 use crate::properties::{
-    BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind, WeightSet,
+    BeliefKind, BeliefKindSet, BeliefNode, Bid, NodeId, Weight, WeightKind, WeightSet,
 };
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 /// Test for Issue 34: Relations referencing nodes not in states
 ///
-/// This simulates what happens when DbConnection.eval_unbalanced returns
+/// This simulates what happens when a QueryPackage evaluation returns
 /// a BeliefGraph with incomplete data - the relations reference BIDs that
 /// aren't included in the states map.
 #[test]
@@ -30,7 +30,7 @@ fn test_beliefgraph_with_orphaned_edges() {
         bid: node_a_bid,
         title: "Doc A".to_string(),
         kind: BeliefKindSet(BeliefKind::Document.into()),
-        id: Some("doc-a".to_string()),
+        id: NodeId::Explicit("doc-a".to_string()),
         ..Default::default()
     };
 
@@ -38,19 +38,19 @@ fn test_beliefgraph_with_orphaned_edges() {
         bid: node_b_bid,
         title: "Doc B".to_string(),
         kind: BeliefKindSet(BeliefKind::Document.into()),
-        id: Some("doc-b".to_string()),
+        id: NodeId::Explicit("doc-b".to_string()),
         ..Default::default()
     };
 
     // Create a BeliefGraph with only node_a and node_b in states,
     // but with relations that reference node_c (which is missing)
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
     states.insert(net_bid, node_a.clone());
     states.insert(node_a_bid, node_b.clone());
     // node_c is NOT in states!
 
     // Create relations that include edges to the missing node_c
-    let mut relations = petgraph::Graph::new();
+    let mut relations = petgraph::stable_graph::StableGraph::new();
     let net_idx = relations.add_node(net_bid);
     let a_idx = relations.add_node(node_a_bid);
     let b_idx = relations.add_node(node_b_bid); // References missing node!
@@ -135,7 +135,7 @@ fn test_pathmap_with_incomplete_relations() {
         bid: doc_bid,
         title: "Test Doc".to_string(),
         kind: BeliefKindSet(BeliefKind::Document.into()),
-        id: Some("test-doc".to_string()),
+        id: NodeId::Explicit("test-doc".to_string()),
         ..Default::default()
     };
 
@@ -147,13 +147,13 @@ fn test_pathmap_with_incomplete_relations() {
     };
 
     // States includes network, doc, and section but NOT orphan
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
     states.insert(net_bid, network);
     states.insert(doc_bid, doc);
     states.insert(section_bid, section);
 
     // Relations includes an edge to the orphan node
-    let mut relations = petgraph::Graph::new();
+    let mut relations = petgraph::stable_graph::StableGraph::new();
     let net_idx = relations.add_node(net_bid);
     let doc_idx = relations.add_node(doc_bid);
     let section_idx = relations.add_node(section_bid);
@@ -223,7 +223,7 @@ fn test_detect_orphaned_edges() {
     let orphan = Bid::new(net_bid);
 
     // States only has net, node_a and node_b
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
     states.insert(
         net_bid,
         BeliefNode {
@@ -253,7 +253,7 @@ fn test_detect_orphaned_edges() {
     );
 
     // Relations includes edge to orphan
-    let mut relations = petgraph::Graph::new();
+    let mut relations = petgraph::stable_graph::StableGraph::new();
     let net_idx = relations.add_node(net_bid);
     let a_idx = relations.add_node(node_a);
     let b_idx = relations.add_node(node_b);
@@ -293,7 +293,7 @@ fn test_orphaned_edges_behavior() {
     let doc_bid = Bid::new(net_bid);
     let orphan_bid = Bid::new(net_bid);
 
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
     states.insert(
         net_bid,
         BeliefNode {
@@ -313,7 +313,7 @@ fn test_orphaned_edges_behavior() {
         },
     );
 
-    let mut relations = petgraph::Graph::new();
+    let mut relations = petgraph::stable_graph::StableGraph::new();
     let net_idx = relations.add_node(net_bid);
     let doc_idx = relations.add_node(doc_bid);
     let orphan_idx = relations.add_node(orphan_bid);
@@ -364,8 +364,8 @@ fn test_orphaned_edges_behavior() {
 /// Test for traversal with Trace nodes
 ///
 /// This verifies that union_mut_with_trace correctly accumulates Trace nodes
-/// during traversal operations, fixing the bug where eval_trace marked nodes
-/// as Trace and union_mut filtered them out, causing traversal to fail.
+/// during traversal operations, fixing the bug where balanced traversal marked
+/// nodes as Trace and union_mut filtered them out, causing traversal to fail.
 #[test]
 fn test_union_with_trace_nodes() {
     let net_bid = Bid::new(Bid::nil());
@@ -394,11 +394,11 @@ fn test_union_with_trace_nodes() {
         ..Default::default()
     };
 
-    // Mark doc_b as Trace (simulating eval_trace result)
+    // Mark doc_b as Trace (simulating balanced traversal result)
     doc_b.kind.insert(BeliefKind::Trace);
 
     // Create initial BeliefGraph with net and doc_a
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
     states.insert(net_bid, net_node.clone());
     states.insert(doc_a_bid, doc_a.clone());
 
@@ -407,8 +407,8 @@ fn test_union_with_trace_nodes() {
         relations: BidGraph::default(),
     };
 
-    // Create a second BeliefGraph with trace node (simulating eval_trace result)
-    let mut trace_states = BTreeMap::new();
+    // Create a second BeliefGraph with trace node (simulating balanced traversal result)
+    let mut trace_states = FxHashMap::default();
     trace_states.insert(doc_b_bid, doc_b.clone());
 
     let trace_bg = BeliefGraph {
@@ -451,7 +451,7 @@ fn test_union_with_trace_nodes() {
 
     // Test that complete nodes overwrite Trace nodes
     doc_a.kind.insert(BeliefKind::Trace);
-    let mut trace_doc_a = BTreeMap::new();
+    let mut trace_doc_a = FxHashMap::default();
     trace_doc_a.insert(doc_a_bid, doc_a.clone());
     let trace_bg_a = BeliefGraph {
         states: trace_doc_a,
@@ -478,7 +478,7 @@ fn test_union_with_trace_nodes() {
         .kind
         .insert(BeliefKind::Trace);
 
-    let mut complete_doc_a = BTreeMap::new();
+    let mut complete_doc_a = FxHashMap::default();
     doc_a.kind.remove(BeliefKind::Trace);
     complete_doc_a.insert(doc_a_bid, doc_a.clone());
     let complete_bg = BeliefGraph {

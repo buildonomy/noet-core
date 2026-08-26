@@ -24,6 +24,7 @@ pub use inner::*;
 #[cfg(feature = "git-tracking")]
 mod inner {
     use git2::{Repository, StatusOptions};
+    use serde::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
         path::{Path, PathBuf},
@@ -36,7 +37,7 @@ mod inner {
 
     /// Repo-level git status shared by every network that lives inside the same
     /// git repository.  Populated once per workdir root during [`GitCache::populate`].
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct RepoGitStatus {
         /// Full HEAD SHA.
         pub commit: String,
@@ -62,7 +63,7 @@ mod inner {
 
     /// Network-level git status: path-local dirty flags plus a reference to the
     /// shared [`RepoGitStatus`] for the containing repository.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct NetworkGitStatus {
         /// Path from the network directory to the `.git` directory (relative).
         pub repo_root: PathBuf,
@@ -185,6 +186,12 @@ mod inner {
             let canonical = crate::paths::canonicalize_path(network_dir)
                 .unwrap_or_else(|_| network_dir.to_path_buf());
             self.by_network.get(&canonical)
+        }
+
+        /// Iterate over all (network_dir, status) pairs.
+        /// Used by `ProtoIndex::build` to populate the generic `codec_meta` map.
+        pub fn iter_networks(&self) -> impl Iterator<Item = (&PathBuf, &NetworkGitStatus)> {
+            self.by_network.iter()
         }
 
         // ------------------------------------------------------------------

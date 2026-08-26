@@ -21,7 +21,7 @@
  *   Sharded mode  (state.shardManager !== null):
  *     - Shows the drawer tab in the footer
  *     - Populates the drawer body with the network list + memory bar
- *     - Keeps the tab summary ("3 loaded · 42 / 200 MB") up to date
+ *     - Keeps the tab summary ("3 loaded · 42 / 85 MB") up to date
  *     - Drawer starts collapsed; click the tab to expand
  *
  *   Monolithic mode (state.shardManager === null):
@@ -66,6 +66,12 @@ let _isOpen = false;
 
 /** Handle returned by setTimeout when closing, used to cancel on re-open. */
 let _closeTimer = null;
+
+/**
+ * Count of concurrent background shard loads in progress.
+ * The progress bar stays visible until this reaches zero.
+ */
+let _activeLoadCount = 0;
 
 // =============================================================================
 // Public API
@@ -132,6 +138,46 @@ export function initNetworkSelector() {
       }
     });
   }
+
+  // Progress bar: show on shard-loading, hide on shard-loaded or shard-load-failed.
+  document.addEventListener("noet:shard-loading", () => {
+    _activeLoadCount++;
+    _showProgressBar();
+  });
+  document.addEventListener("noet:shard-loaded", () => {
+    _activeLoadCount = Math.max(0, _activeLoadCount - 1);
+    if (_activeLoadCount === 0) _hideProgressBar();
+  });
+  document.addEventListener("noet:shard-load-failed", () => {
+    _activeLoadCount = Math.max(0, _activeLoadCount - 1);
+    if (_activeLoadCount === 0) _hideProgressBar();
+  });
+}
+
+// =============================================================================
+// Shard load progress bar
+// =============================================================================
+
+/**
+ * Insert the 2px shimmer progress bar at the top of the viewport.
+ * No-op if it already exists.
+ */
+function _showProgressBar() {
+  if (document.getElementById("noet-shard-progress")) return;
+  const bar = document.createElement("div");
+  bar.id = "noet-shard-progress";
+  bar.className = "noet-shard-progress";
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-label", "Loading network data…");
+  document.body.appendChild(bar);
+}
+
+/**
+ * Remove the progress bar from the DOM.
+ */
+function _hideProgressBar() {
+  const bar = document.getElementById("noet-shard-progress");
+  if (bar) bar.remove();
 }
 
 // =============================================================================
@@ -207,6 +253,7 @@ function _renderBody(body) {
 
   if (!manager) {
     // Monolithic mode — all data is loaded; no per-network controls.
+    const mb = state.beliefbase ? state.beliefbase.memory_usage_mb().toFixed(0) : "?";
     body.innerHTML = `
       <div class="noet-shard-drawer__header">
         <h2 class="noet-shard-drawer__title">Networks</h2>
@@ -214,9 +261,9 @@ function _renderBody(body) {
       </div>
       <div class="noet-shard-drawer__content">
         <p class="noet-shard-drawer__monolithic-note">
-          All network data is bundled into a single file and loaded at startup.
+          All network data (~${_escHtml(mb)} MB) is bundled into a single file and loaded at startup.
           Per-network memory management activates automatically when the export
-          exceeds 10 MB.
+          exceeds 2 MB.
         </p>
       </div>
     `;
@@ -225,6 +272,13 @@ function _renderBody(body) {
 
   const { networks } = manager.manifest;
   const usage = manager.getMemoryUsage();
+
+  const visibleNetworks = networks.filter((meta) => meta.node_count > 0);
+  const hiddenCount = networks.length - visibleNetworks.length;
+  const hiddenNote =
+    hiddenCount > 0
+      ? `<p class="noet-shard-drawer__hidden-note">(${hiddenCount} empty network${hiddenCount === 1 ? "" : "s"} hidden)</p>`
+      : "";
 
   body.innerHTML = `
     <div class="noet-shard-drawer__header">
@@ -235,8 +289,9 @@ function _renderBody(body) {
     </div>
     <div class="noet-shard-drawer__content">
       <ul class="noet-network-selector__list" role="list">
-        ${networks.map((meta) => _renderNetworkItem(meta, manager)).join("")}
+        ${visibleNetworks.map((meta) => _renderNetworkItem(meta, manager)).join("")}
       </ul>
+      ${hiddenNote}
     </div>
     <div class="noet-shard-drawer__footer">
       ${_renderMemoryBar(usage)}
@@ -343,15 +398,17 @@ function _renderTabSummary() {
 
   const manager = state.shardManager;
   if (!manager) {
-    summaryEl.textContent = "monolithic";
+    const mb = state.beliefbase ? state.beliefbase.memory_usage_mb().toFixed(0) : "?";
+    summaryEl.textContent = `monolithic · ${mb} MB`;
     toggleBtn.dataset.memoryWarning = "";
     return;
   }
 
   const loaded = manager.getLoadedNetworks();
   const usage = manager.getMemoryUsage();
+  const totalMb = manager.getTotalAvailableMb();
   const loadedCount = loaded.length;
-  const label = `${loadedCount} loaded · ${usage.usedMb.toFixed(0)} / ${usage.budgetMb.toFixed(0)} MB`;
+  const label = `${loadedCount} loaded · ${usage.usedMb.toFixed(0)} / ${totalMb.toFixed(0)} MB`;
 
   summaryEl.textContent = label;
   toggleBtn.dataset.memoryWarning = usage.warning ?? "";

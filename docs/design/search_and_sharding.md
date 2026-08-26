@@ -287,7 +287,7 @@ for each network_bref in pathmap.nets():
     serialize as search/{bref}.idx.json
 ```
 
-This runs during the same `finalize_html` pass that writes the BB export (monolithic or sharded). It queries `global_bb` per-network using `Expression::StateIn(StatePred::InNamespace(bref))`, the same pattern used elsewhere in the codebase.
+This runs during the same `finalize_html` pass that writes the BB export (monolithic or sharded). It queries `global_bb` per-network using a `QuerySpec` with `Subject::NetPathIn(network_bid)`, the same pattern used elsewhere in the codebase.
 
 There is no index building in WASM. The browser deserializes the `.idx.json` and queries it directly.
 
@@ -320,7 +320,7 @@ When the user searches, `BeliefBaseWasm` queries the compile-time indices:
 
 5. **Enrich results** — for each result, check if the network's data shard is loaded. If yes, extract a snippet from `payload["text"]` via string search. If no, leave the snippet empty and tag the result as `loaded: false`.
 
-6. **Field filtering** — the existing `evaluate_expression` API handles filtering by kind, schema, network before or after search.
+6. **Field filtering** — the existing `evaluate` API handles filtering by kind, schema, network before or after search.
 
 ### 7.6. Search Result Format
 

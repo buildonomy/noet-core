@@ -15,9 +15,34 @@
 :root {
     color-scheme: dark;
 
+    /* ── Normalize bridge ──────────────────────────────────────────────────
+       Override the custom properties that normalize.min.css defines on
+       :where(html) and uses for form elements, tables, details/summary,
+       code blocks, etc.  By mapping them to --noet-* equivalents we make
+       normalize a cooperative participant in our theming rather than
+       something we fight with per-element overrides.
+
+       normalize also has a @media (prefers-color-scheme:dark) block that
+       sets these *and* hardcodes some values (e.g. #171a1c for inputs).
+       Because our theme is toggled by swapping stylesheets, that media
+       query may not fire.  These explicit overrides ensure correctness
+       regardless of OS preference. */
+    --surface-1: var(--gray-9);
+    --surface-2: var(--gray-8);
+    --surface-3: var(--gray-7);
+    --surface-4: var(--gray-6);
+    --text-1: var(--gray-1);
+    --text-2: var(--gray-4);
+    --link: var(--blue-4);
+    --link-visited: var(--purple-4);
+    --scrollthumb-color: var(--gray-6);
+    --shadow-strength: 10%;
+    --shadow-color: 220 40% 2%;
+
     /* Typography */
     --noet-font-family:
-        "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+        sans-serif;
     --noet-font-weight-ui: 350;
     --noet-font-weight-body: 400;
     --noet-font-weight-medium: 500;

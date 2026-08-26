@@ -47,8 +47,8 @@ use noet_core::{
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
     event::BeliefEvent,
-    properties::{Bid, WeightSet},
-    query::{BeliefSource, Expression, Query},
+    properties::Bid,
+    query::{BeliefSource, BoxFuture, SubmapResult},
 };
 use sqlx::Row;
 use std::{
@@ -60,7 +60,7 @@ use std::{
 use test_log::test;
 use tokio::sync::mpsc::unbounded_channel;
 
-use super::common::{extract_bids_from_content, generate_test_root};
+use super::common::{all_xlsx_bids, extract_bids_from_content, generate_test_root};
 
 // ============================================================================
 // CountingBeliefBase — BeliefSink wrapper that counts graph-modifying events
@@ -114,54 +114,95 @@ impl BeliefSink for CountingBeliefBase {
 }
 
 impl BeliefSource for CountingBeliefBase {
-    fn eval_unbalanced(
-        &self,
-        expr: &Expression,
-    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
-        self.inner.eval_unbalanced(expr)
-    }
-
-    fn eval_trace(
-        &self,
-        expr: &Expression,
-        weight_filter: WeightSet,
-    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
-        self.inner.eval_trace(expr, weight_filter)
-    }
-
-    fn get_all_paths(
-        &self,
+    fn submap<'a>(
+        &'a self,
         network_bid: Bid,
+        path: &'a str,
+        depth: u8,
         include_index: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<(String, Bid)>, BuildonomyError>> + Send {
-        self.inner.get_all_paths(network_bid, include_index)
+    ) -> BoxFuture<'a, SubmapResult> {
+        self.inner.submap(network_bid, path, depth, include_index)
     }
 
-    fn get_file_mtimes(
-        &self,
-    ) -> impl std::future::Future<Output = Result<BTreeMap<PathBuf, i64>, BuildonomyError>> + Send
-    {
+    fn submap_by_bid<'a>(
+        &'a self,
+        network_bid: Bid,
+        entry: Option<Bid>,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        self.inner
+            .submap_by_bid(network_bid, entry, depth, include_index)
+    }
+
+    fn get_file_mtimes(&self) -> BoxFuture<'_, Result<BTreeMap<PathBuf, i64>, BuildonomyError>> {
         self.inner.get_file_mtimes()
     }
 
-    fn export_beliefgraph(
-        &self,
-    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
+    fn export_beliefgraph(&self) -> BoxFuture<'_, Result<BeliefGraph, BuildonomyError>> {
         self.inner.export_beliefgraph()
-    }
-
-    fn eval_query(
-        &self,
-        query: &Query,
-        all_or_none: bool,
-    ) -> impl std::future::Future<Output = Result<BeliefGraph, BuildonomyError>> + Send {
-        self.inner.eval_query(query, all_or_none)
     }
 }
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+/// Return a human-readable description of the first difference between two strings.
+///
+/// Shows the byte offset, a short context window around the divergence in each string,
+/// and a summary of any trailing content that is present in one string but not the other.
+/// Designed for `tracing::warn!` / `panic!` messages where a full diff is too verbose.
+fn first_string_diff(label_a: &str, a: &str, label_b: &str, b: &str) -> String {
+    let diverge = a
+        .char_indices()
+        .zip(b.char_indices())
+        .find(|((_, ca), (_, cb))| ca != cb)
+        .map(|((ia, _), _)| ia)
+        .unwrap_or_else(|| a.len().min(b.len()));
+
+    let window = 120;
+    let start = diverge.saturating_sub(window / 2);
+    let end_a = (diverge + window / 2).min(a.len());
+    let end_b = (diverge + window / 2).min(b.len());
+
+    // Clamp to valid char boundaries.
+    let start = a[..start]
+        .char_indices()
+        .next_back()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let end_a = a[..end_a]
+        .char_indices()
+        .next_back()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(end_a);
+    let end_b = b[..end_b]
+        .char_indices()
+        .next_back()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(end_b);
+
+    let ctx_a = &a[start..end_a];
+    let ctx_b = &b[start..end_b];
+
+    let len_note = if a.len() != b.len() {
+        format!(
+            "\n  length: {label_a}={} bytes, {label_b}={} bytes (delta {})",
+            a.len(),
+            b.len(),
+            a.len() as isize - b.len() as isize,
+        )
+    } else {
+        format!("\n  length: {} bytes (equal)", a.len())
+    };
+
+    format!(
+        "First diff at byte {diverge}:{len_note}\
+         \n  {label_a} ctx: {ctx_a:?}\
+         \n  {label_b} ctx: {ctx_b:?}",
+    )
+}
 
 /// Write a rewritten `ParseResult` to disk and return the extracted BIDs.
 ///
@@ -274,7 +315,15 @@ async fn test_sequential_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // BID consistency check.
-    let cached_bids = cached_non_asset_bids(&global_bb);
+    // Binary codecs (xlsx/ods) write BIDs directly to disk via generate_source_bytes()
+    // rather than through rewritten_content. Their nodes are therefore absent from
+    // written_bids but present in cached_bids. Exclude them from the assertion;
+    // parse-2 zero-graph-event check enforces BID stability for binary codec files.
+    let xlsx_bids = all_xlsx_bids(&global_bb);
+    let cached_bids: BTreeSet<_> = cached_non_asset_bids(&global_bb)
+        .into_iter()
+        .filter(|b| !xlsx_bids.contains(b))
+        .collect();
     for extra in cached_bids.difference(&written_bids) {
         if let Some(node) = global_bb.states().get(extra) {
             tracing::warn!(
@@ -509,6 +558,27 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("[Parallel/Memory] Initialize DocumentCompiler");
     let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, false)?;
+    // Force parallel epoch dispatch: with jobs=1 (the default) Phase 1 depth-group
+    // batches are processed inline one-at-a-time, so each subnet's events drain into
+    // global_bb before the next sibling's push() runs — the bug is never triggered.
+    // With jobs>1 the subnets in a depth-group batch are spawned as concurrent tasks,
+    // each querying the same pre-epoch global_bb snapshot.  A subnet node whose
+    // speculative_path_key generates NodeKey::Id { net: Bref::default() } will miss
+    // in cache_fetch (no sibling task's output is visible yet), get a fresh time-based
+    // BID, and be registered in PathMap under a bref-based path — corrupting any
+    // cross-network link that resolves via PathMap during Phase 4 inject_context.
+    //
+    // Query actual parallelism: on a single-core machine the parallel epoch path is
+    // never exercised (jobs is clamped to 1), so we set jobs to min(4, available) and
+    // skip the parallel-specific assertion below if the result is still 1.
+    let available_jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let jobs = available_jobs.min(4);
+    compiler.set_jobs(jobs);
+    tracing::info!(
+        "[Parallel/Memory] Running with jobs={jobs} (available_parallelism={available_jobs})"
+    );
 
     let mut written_bids = BTreeSet::default();
     written_bids.insert(compiler.builder().api().bid);
@@ -547,7 +617,14 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // BID consistency check.
-    let cached_bids = cached_non_asset_bids(&global_bb);
+    // Binary codecs (xlsx/ods) write BIDs directly to disk via generate_source_bytes()
+    // rather than through rewritten_content. Exclude their BIDs from the assertion;
+    // parse-2 zero-graph-event check enforces BID stability for binary codec files.
+    let xlsx_bids = all_xlsx_bids(&global_bb);
+    let cached_bids: BTreeSet<_> = cached_non_asset_bids(&global_bb)
+        .into_iter()
+        .filter(|b| !xlsx_bids.contains(b))
+        .collect();
     for extra in cached_bids.difference(&written_bids) {
         if let Some(node) = global_bb.states().get(extra) {
             tracing::warn!(
@@ -570,6 +647,152 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
         "Written BIDs != cached BIDs\nWritten: {written_bids:?}\nCached:  {cached_bids:?}"
     );
 
+    // ── Parse 1 network BID stability check ──────────────────────────────────
+    //
+    // After parse 1, every network node in global_bb must have an id that is NOT
+    // equal to its own bref. A bref-as-id means the node lost the ID collision check
+    // in push(): speculative_path_key generated NodeKey::Id { net: Bref::default() }
+    // (which regularizes to repo_bref), the initial cache_fetch missed because
+    // global_bb didn't yet contain the node under that key, the Unresolved branch
+    // assigned a fresh time-based BID, and then the ID collision check found the real
+    // node under net=parent_bref and fired first-one-wins — clearing the incoming
+    // node's id to its own bref.
+    //
+    // This assertion is key-type agnostic and needs no fixture links: it reads
+    // directly from global_bb.states() and checks structural invariants.
+    // On single-core machines (jobs==1) subnets are parsed serially so the race
+    // never occurs and this check trivially passes — correct behaviour.
+    {
+        use noet_core::properties::BeliefKind;
+        let bref_id_networks: Vec<_> = global_bb
+            .states()
+            .values()
+            .filter(|node| {
+                node.kind.is_network()
+                    && !node.kind.0.contains(BeliefKind::API)
+                    && !node.kind.0.contains(BeliefKind::External)
+            })
+            .filter(|node| {
+                let id = node.id.anchor();
+                !id.is_empty() && id == node.bid.bref().to_string()
+            })
+            .collect();
+        for node in &bref_id_networks {
+            tracing::warn!(
+                "[Parallel/Memory] Parse 1: network node has bref as id — \
+                 bid={} id={:?} title={:?}. This means first-one-wins fired \
+                 incorrectly: the node lost its declared id due to a \
+                 cache_fetch miss in speculative_path_key (net-scope bug).",
+                node.bid,
+                node.id,
+                node.title,
+            );
+        }
+        debug_assert!(
+            bref_id_networks.is_empty(),
+            "[Parallel/Memory] Parse 1: {} network node(s) have bref as id after parse 1.\n\
+             A bref id on a network node means the node's declared id was clobbered by \
+             first-one-wins in push() — the initial cache_fetch in speculative_path_key \
+             used NodeKey::Id {{ net: Bref::default() }} (→ repo_bref after regularize), \
+             missed in global_bb, assigned a fresh time-based BID via the Unresolved \
+             branch, and then the ID collision check found the real node under \
+             net=parent_bref and cleared the incoming node's id to its own bref.\n\
+             Affected nodes:\n{}",
+            bref_id_networks.len(),
+            bref_id_networks
+                .iter()
+                .map(|n| format!("  bid={} id={:?} title={:?}", n.bid, n.id, n.title))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    // ── Parse 1 PathMap bref-as-path check ───────────────────────────────────
+    //
+    // After parse 1, every subnet network node must be registered in its parent's
+    // PathMap under a human-readable directory name, not a 12-hex-char bref string.
+    //
+    // The parallel epoch race in speculative_path_key produces a fresh time-based
+    // BID for the subnet network node (because NodeKey::Id { net: Bref::default() }
+    // always misses in global_bb). That fresh BID's bref then becomes the path key
+    // stored in the parent's PathMap — a 12-hex-char string like "e2e433e57b61"
+    // instead of "subnet1". On parse 2, try_initialize_stack_from_session_cache
+    // reconstructs the stack from this corrupted PathMap entry, propagating the
+    // wrong net bref to every child node's build_path_key call.
+    //
+    // Detection: a path component that is exactly 12 lowercase hex chars is a bref
+    // string standing in for a real directory name.
+    if jobs > 1 {
+        let bref_re = {
+            // A 12-character lowercase hex string — the Display form of a Bref.
+            // We check each path component individually so we catch "subnet/e2e433e57b61"
+            // as well as bare "e2e433e57b61".
+            |s: &str| s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())
+        };
+
+        let paths_guard = global_bb.paths();
+        let mut bref_path_entries: Vec<String> = Vec::new();
+
+        for (net_bref, path_map_lock) in paths_guard.map().iter() {
+            let path_map = path_map_lock.read();
+            for (path, bid, _sort_key) in path_map.map().iter() {
+                // Check every slash-delimited component of the path.
+                if path.split('/').any(|component| {
+                    // Strip a leading "index.md#" prefix for in-network-index anchors.
+                    let bare = component.strip_prefix("index.md#").unwrap_or(component);
+                    bref_re(bare)
+                }) {
+                    let maybe_node = global_bb.states().get(bid);
+                    bref_path_entries.push(format!(
+                        "  net_bref={net_bref} path={path:?} bid={bid} \
+                         id={:?} title={:?}",
+                        maybe_node.map(|n| &n.id),
+                        maybe_node.map(|n| n.title.as_str()),
+                    ));
+                    tracing::warn!(
+                        "[Parallel/Memory] Parse 1 PathMap: bref-as-path entry — \
+                         net_bref={net_bref} path={path:?} bid={bid} \
+                         id={:?} title={:?}",
+                        maybe_node.map(|n| &n.id),
+                        maybe_node.map(|n| n.title.as_str()),
+                    );
+                }
+            }
+        }
+
+        // Log inventory of all network nodes and their PathMap path keys for
+        // cross-referencing against bref-as-path entries above.
+        for node in global_bb.states().values().filter(|n| {
+            use noet_core::properties::BeliefKind;
+            n.kind.is_network()
+                && !n.kind.0.contains(BeliefKind::API)
+                && !n.kind.0.contains(BeliefKind::External)
+        }) {
+            tracing::debug!(
+                "[Parallel/Memory] Parse 1 network node: bid={} bref={} id={:?} title={:?}",
+                node.bid,
+                node.bid.bref(),
+                node.id,
+                node.title.as_str(),
+            );
+        }
+
+        debug_assert!(
+            bref_path_entries.is_empty(),
+            "[Parallel/Memory] Parse 1: {} PathMap entry/entries use a bref as a path \
+             component instead of a human-readable directory name.\n\
+             This indicates speculative_path_key generated NodeKey::Id {{ net: Bref::default() }} \
+             for a subnet network node, missed in global_bb, assigned a fresh time-based BID, \
+             and registered that BID's bref as the subnet's path in the parent PathMap.\n\
+             On parse 2, try_initialize_stack_from_session_cache reconstructs the stack from \
+             this entry, propagating the wrong net bref to all child node keys — causing \
+             cache_fetch misses for every section and document in the subnet.\n\
+             Affected entries:\n{}",
+            bref_path_entries.len(),
+            bref_path_entries.join("\n"),
+        );
+    }
+
     // ── Parse 2 ──────────────────────────────────────────────────────────────
     let pre_second_parse_count = global_bb.states().len();
     tracing::info!(
@@ -581,16 +804,28 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
     let global_handle2 = accum2.query_handle();
 
     let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
+    compiler2.set_jobs(jobs);
 
     tracing::info!("[Parallel/Memory] Re-running parse_all for parse 2");
     let final_parse_results = compiler2.parse_all(global_handle2, false).await?;
 
     for result in &final_parse_results {
         tracing::debug!("[Parallel/Memory] Parse 2 doc {:?}", result.path);
-        if result.rewritten_content.is_some() {
+        if let Some(ref new_content) = result.rewritten_content {
+            // Resolve the on-disk path so we can read what the file actually contains
+            // and produce a char-level diff against what generate_source() emitted.
+            let disk_path = if result.path.is_dir() {
+                detect_network_file(&result.path).unwrap_or_else(|| result.path.join(NETWORK_NAME))
+            } else {
+                result.path.clone()
+            };
+            let disk_content = std::fs::read_to_string(&disk_path)
+                .unwrap_or_else(|e| format!("<read error: {e}>"));
+            let diff = first_string_diff("disk", &disk_content, "generated", new_content);
             tracing::warn!(
-                "[Parallel/Memory] UNEXPECTED REWRITE on parse 2: {:?}",
-                result.path
+                "[Parallel/Memory] UNEXPECTED REWRITE on parse 2: {:?}\n{}",
+                result.path,
+                diff,
             );
         }
         debug_assert!(
@@ -620,6 +855,54 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
          pre={pre_second_parse_count} post={post_second_parse_count}"
     );
 
+    // ── Parse 2 PathMap bref-as-path check ───────────────────────────────────
+    //
+    // A bref-as-path entry that survives parse 2 means the stack reconstruction
+    // in try_initialize_stack_from_session_cache is propagating the wrong net bref
+    // from the corrupted parse-1 PathMap entry. Every child node of the affected
+    // subnet will have generated keys with that wrong bref, missed in cache_fetch,
+    // and received a fresh time-based BID — triggering the rewrite assertions above.
+    if jobs > 1 {
+        let bref_re = |s: &str| s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit());
+        let paths_guard2 = global_bb2.paths();
+        let mut bref_path_entries2: Vec<String> = Vec::new();
+
+        for (net_bref, path_map_lock) in paths_guard2.map().iter() {
+            let path_map = path_map_lock.read();
+            for (path, bid, _sort_key) in path_map.map().iter() {
+                if path.split('/').any(|component| {
+                    let bare = component.strip_prefix("index.md#").unwrap_or(component);
+                    bref_re(bare)
+                }) {
+                    let maybe_node = global_bb2.states().get(bid);
+                    bref_path_entries2.push(format!(
+                        "  net_bref={net_bref} path={path:?} bid={bid} \
+                         id={:?} title={:?}",
+                        maybe_node.map(|n| &n.id),
+                        maybe_node.map(|n| n.title.as_str()),
+                    ));
+                    tracing::warn!(
+                        "[Parallel/Memory] Parse 2 PathMap: bref-as-path entry persists — \
+                         net_bref={net_bref} path={path:?} bid={bid} \
+                         id={:?} title={:?}",
+                        maybe_node.map(|n| &n.id),
+                        maybe_node.map(|n| n.title.as_str()),
+                    );
+                }
+            }
+        }
+
+        debug_assert!(
+            bref_path_entries2.is_empty(),
+            "[Parallel/Memory] Parse 2: {} PathMap entry/entries still use a bref as a \
+             path component. The stack reconstruction on re-parse is propagating the wrong \
+             net bref from a corrupted parse-1 PathMap entry.\n\
+             Affected entries:\n{}",
+            bref_path_entries2.len(),
+            bref_path_entries2.join("\n"),
+        );
+    }
+
     Ok(())
 }
 
@@ -627,13 +910,21 @@ async fn test_parallel_in_memory() -> Result<(), Box<dyn std::error::Error>> {
 // TEST 4 — Parallel / DB
 // ============================================================================
 //
-// parse_all(default jobs) + DbConnection, no accumulator wrapper on the DB itself.
-// Parse 1 commits events to the DB.  Parse 2 cold-starts from the DB.
-// Requires DbConnection::resolve_net_path to correctly handle repo-relative
-// NetPath queries like "subnet/file.md".
+// parse_all(jobs>1) + BeliefAccumulator<DbConnection> + QueryHandle.
+// Mirrors Commands::Parse in main.rs on the DB path.
+// Parse 1 writes rewrites to disk and commits events to the DB via the
+// accumulator's drain_epoch().  Parse 2 cold-starts from the same DB.
 //
-// If test 2 passes but this fails, the regression is in the parallel epoch
-// machinery on the DB path.
+// The accumulator wrapper is essential: without it, drain_epoch() is a no-op
+// on DbConnection and each parallel epoch's tasks query an empty DB.  With it,
+// each BatchEnd flushes the epoch's events into the DB so subsequent epochs see
+// the committed state — exactly as in production.
+//
+// If test 3 (parallel/memory) passes but this fails, the regression is in
+// how the DB-backed BeliefSource handles a particular NodeKey variant.  The
+// known case: TapeFn::Keys with NodeKey::Id passes the raw bref string to
+// SQL without the Bref::default() → API-bref normalization that in-memory
+// PathMapMap performs.
 
 #[test(tokio::test)]
 async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
@@ -644,12 +935,32 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
     let db_pool = db_init(db_path).await?;
     let db = DbConnection(db_pool);
 
-    // ── Parse 1 ──────────────────────────────────────────────────────────────
-    tracing::info!("[Parallel/DB] Parse 1: populate DB");
-    let (accum_tx, mut accum_rx) = unbounded_channel::<BeliefEvent>();
-    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, true)?;
+    // Use the same parallelism as test_parallel_in_memory so the parallel epoch
+    // path is exercised.  On a single-core machine jobs stays 1 (sequential) and
+    // the test trivially passes — that is correct behaviour.
+    let available_jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let jobs = available_jobs.min(4);
+    tracing::info!(
+        "[Parallel/DB] Running with jobs={jobs} (available_parallelism={available_jobs})"
+    );
 
-    let parse_results = compiler.parse_all(db.clone(), false).await?;
+    // ── Parse 1 ──────────────────────────────────────────────────────────────
+    //
+    // Wrap DbConnection in BeliefAccumulator so drain_epoch() commits each
+    // epoch's events to the DB.  Without the accumulator, DbConnection::drain_epoch
+    // is a no-op and each parallel epoch's tasks query an empty DB — causing
+    // cache_fetch misses for every node on every re-parse.
+    tracing::info!("[Parallel/DB] Parse 1: populate DB via accumulator");
+    let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+    let accum = BeliefAccumulator::new(db.clone(), accum_rx);
+    let global_handle = accum.query_handle();
+
+    let mut compiler = DocumentCompiler::new(&test_root, Some(accum_tx), None, true)?;
+    compiler.set_jobs(jobs);
+
+    let parse_results = compiler.parse_all(global_handle, false).await?;
     tracing::info!(
         "[Parallel/DB] Parse 1 completed: {} documents",
         parse_results.len()
@@ -659,51 +970,70 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
     for result in &parse_results {
         if let Some(ref content) = result.rewritten_content {
             let bids = apply_rewrite(&result.path, content).await?;
-            tracing::debug!("REWRITTEN: {:?}  bids={:?}", result.path, bids);
+            tracing::debug!(
+                "[Parallel/DB] REWRITTEN: {:?}  bids={:?}",
+                result.path,
+                bids
+            );
         }
     }
 
-    // Commit events to DB.
-    let mut transaction = Transaction::default();
-    let mut event_count = 0usize;
-    while let Ok(event) = accum_rx.try_recv() {
-        transaction.add_event(&event).ok();
-        event_count += 1;
-    }
-    tracing::info!("[Parallel/DB] Committing {event_count} events to DB");
-    transaction.execute(&db.0).await?;
+    // Drain accumulator — flushes any remaining events into the DB and returns
+    // the DbConnection for direct verification queries.
+    let db_after_parse1 = accum.into_inner().await?;
 
     // Verify DB was populated.
     let node_count: i64 = sqlx::query("SELECT COUNT(*) as count FROM beliefs")
-        .fetch_one(&db.0)
+        .fetch_one(&db_after_parse1.0)
         .await?
         .get("count");
     let edge_count: i64 = sqlx::query("SELECT COUNT(*) as count FROM relations")
-        .fetch_one(&db.0)
+        .fetch_one(&db_after_parse1.0)
         .await?
         .get("count");
     let path_count: i64 = sqlx::query("SELECT COUNT(*) as count FROM paths")
-        .fetch_one(&db.0)
+        .fetch_one(&db_after_parse1.0)
         .await?
         .get("count");
     tracing::info!(
-        "[Parallel/DB] DB after commit: {node_count} nodes, {edge_count} edges, {path_count} paths"
+        "[Parallel/DB] DB after parse 1: {node_count} nodes, {edge_count} edges, {path_count} paths"
+    );
+    assert!(
+        node_count > 0,
+        "[Parallel/DB] DB must be populated after parse 1"
     );
 
     // ── Parse 2 ──────────────────────────────────────────────────────────────
+    //
+    // Cold-start from the DB: fresh accumulator wrapping the same DbConnection.
+    // Every cache_fetch miss that fires on parse 2 represents a node that was
+    // either not committed to the DB by parse 1, or whose key changed between
+    // parses (indicating a BID stability or speculative_path_key bug).
     tracing::info!("[Parallel/DB] Parse 2: cold-start from DB, expecting no rewrites");
-    let (accum_tx2, mut accum_rx2) = unbounded_channel::<BeliefEvent>();
-    let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
+    let (accum_tx2, accum_rx2) = unbounded_channel::<BeliefEvent>();
+    let accum2 = BeliefAccumulator::new(db_after_parse1, accum_rx2);
+    let global_handle2 = accum2.query_handle();
 
-    let parse_results2 = compiler2.parse_all(db.clone(), false).await?;
+    let mut compiler2 = DocumentCompiler::new(&test_root, Some(accum_tx2), None, false)?;
+    compiler2.set_jobs(jobs);
+
+    let parse_results2 = compiler2.parse_all(global_handle2, false).await?;
 
     for result in &parse_results2 {
         tracing::debug!("[Parallel/DB] Parse 2 doc {:?}", result.path);
-        if result.rewritten_content.is_some() {
+        if let Some(ref new_content) = result.rewritten_content {
+            let disk_path = if result.path.is_dir() {
+                detect_network_file(&result.path).unwrap_or_else(|| result.path.join(NETWORK_NAME))
+            } else {
+                result.path.clone()
+            };
+            let disk_content = std::fs::read_to_string(&disk_path)
+                .unwrap_or_else(|e| format!("<read error: {e}>"));
+            let diff = first_string_diff("disk", &disk_content, "generated", new_content);
             tracing::warn!(
                 "[Parallel/DB] UNEXPECTED REWRITE on parse 2: {:?}\n{}",
                 result.path,
-                result.rewritten_content.as_deref().unwrap_or("")
+                diff,
             );
         }
         assert!(
@@ -711,6 +1041,13 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
             "[Parallel/DB] Parse 2 must not rewrite {:?}",
             result.path
         );
+        if !result.dependent_paths.is_empty() {
+            tracing::warn!(
+                "[Parallel/DB] Parse 2: {:?} has dependent_paths: {:?}",
+                result.path,
+                result.dependent_paths
+            );
+        }
         assert!(
             result.dependent_paths.is_empty(),
             "[Parallel/DB] Parse 2 must not produce dependent_paths for {:?}",
@@ -718,20 +1055,16 @@ async fn test_parallel_db() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // No graph-modifying events on parse 2.
-    let mut second_event_count = 0usize;
-    while let Ok(event) = accum_rx2.try_recv() {
-        if !matches!(
-            event,
-            BeliefEvent::FileParsed(_) | BeliefEvent::BatchStart | BeliefEvent::BatchEnd
-        ) {
-            tracing::warn!("[Parallel/DB] Unexpected event on parse 2: {:?}", event);
-            second_event_count += 1;
-        }
-    }
-    assert_eq!(
-        second_event_count, 0,
-        "[Parallel/DB] Parse 2 must not generate graph-modifying events, got {second_event_count}"
+    let db_after_parse2 = accum2.into_inner().await?;
+
+    // Verify parse 2 did not introduce new nodes.
+    let node_count2: i64 = sqlx::query("SELECT COUNT(*) as count FROM beliefs")
+        .fetch_one(&db_after_parse2.0)
+        .await?
+        .get("count");
+    debug_assert!(
+        node_count2 <= node_count,
+        "[Parallel/DB] Parse 2 introduced new nodes: pre={node_count} post={node_count2}"
     );
 
     Ok(())

@@ -807,6 +807,20 @@ def report_stalls(
         print(f"  (--jobs {jobs}: gaps may reflect concurrent tasks, not true stalls)")
     print(f"{'=' * 70}")
 
+    # Patterns that explain a gap as global infrastructure work rather than
+    # a stall in the surrounding parse task.
+    _DRAIN_LABELS = ("drain_epoch", "into_inner", "drain_into_inner")
+
+    def _drain_tag(lines: list[LogLine], lo: int, hi: int) -> str:
+        """Return a descriptive tag if lines[lo:hi] contains an accumulator drain."""
+        for line in lines[lo:hi]:
+            if "accumulator drain complete" in line.body:
+                for label in _DRAIN_LABELS:
+                    if f'label="{label}"' in line.body:
+                        return f" [epoch-drain/{label}]"
+                return " [epoch-drain]"
+        return ""
+
     stalls_found = 0
     for i in range(1, len(lines)):
         gap = (lines[i].ts - lines[i - 1].ts).total_seconds()
@@ -822,8 +836,16 @@ def report_stalls(
             and next_task is not None
             and prev_task != next_task
         )
+        # Check whether the gap is explained by an accumulator epoch drain.
+        # Search a wider window (±10 lines) for drain lines near the boundary.
+        drain_lo = max(0, i - 10)
+        drain_hi = min(len(lines), i + 10)
+        drain_label = _drain_tag(lines, drain_lo, drain_hi)
+
         stalls_found += 1
-        tag = " [task-switch]" if is_task_switch else ""
+        tag = (
+            drain_label if drain_label else (" [task-switch]" if is_task_switch else "")
+        )
         print(f"\n  --- GAP {gap:.2f}s{tag} ---")
         start = max(0, i - context)
         end = min(len(lines), i + context + 1)
@@ -859,6 +881,14 @@ _WARN_CLASSIFIER = [
     ("No Codec for extension", "Unknown file extension in codec map"),
     ("BatchStart received with", "BatchStart with non-empty pending (compiler bug)"),
     ("parse task panicked", "Spawned parse task panic"),
+    (
+        "evicting External|Trace stub",
+        "Stub evicted by content-node claim (expected; one-path-one-BID enforced)",
+    ),
+    (
+        "two entries share one path",
+        "Duplicate path survived to PathMap construction (write-path guard missed one)",
+    ),
 ]
 
 
@@ -966,6 +996,115 @@ def report_phase_detail(records: list[FileRecord], fragment: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def report_corpus_breakdown(records: list[FileRecord]) -> None:
+    """Classify file records by corpus region and file type, showing time spent."""
+
+    def _classify(path: str) -> tuple[str, str]:
+        """Return (region, file_type) for a file path."""
+        p = path.lower()
+        # Determine region
+        if "repo" in p:
+            region = "repo"
+        else:
+            region = "other"
+
+        # Determine file type
+        if p.endswith(".xlsx"):
+            file_type = "xlsx"
+        elif p.endswith(".md") and ".media/" in p:
+            # Markdown inside a .media/ directory = pandoc-converted slides/docs
+            file_type = "md (converted)"
+        elif p.endswith(".md"):
+            file_type = "md"
+        elif ".media/" in p:
+            file_type = "media asset"
+        elif any(p.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif",
+                ".bmp", ".svg", ".pdf", ".mp4", ".mov", ".webp", ".tiff",
+                ".tif", ".ico", ".webm")):
+            file_type = "media asset"
+        elif any(p.endswith(ext) for ext in (".yaml", ".yml")):
+            file_type = "yaml"
+        elif any(p.endswith(ext) for ext in (".h", ".hpp", ".c", ".cpp",
+                ".cc", ".rs", ".py", ".cmake", ".txt")):
+            file_type = "code/build"
+        else:
+            file_type = "other"
+
+        return region, file_type
+
+    # Accumulate stats per (region, file_type)
+    from collections import defaultdict
+    buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
+    no_timing: dict[tuple[str, str], int] = defaultdict(int)
+
+    for rec in records:
+        region, ftype = _classify(rec.path)
+        dur = rec.total_duration()
+        if dur is not None:
+            buckets[(region, ftype)].append(dur)
+        else:
+            no_timing[(region, ftype)] += 1
+
+    # Sort by total time descending
+    rows = []
+    for key, durations in buckets.items():
+        total = sum(durations)
+        count = len(durations)
+        mean = total / count if count else 0
+        untimed = no_timing.get(key, 0)
+        rows.append((total, count, mean, untimed, key))
+    rows.sort(reverse=True)
+
+    grand_total = sum(t for t, _, _, _, _ in rows)
+    grand_count = sum(c for _, c, _, _, _ in rows)
+    grand_untimed = sum(u for _, _, _, u, _ in rows) + sum(no_timing[k] for k in no_timing if k not in buckets)
+
+    print(f"\n{'=' * 90}")
+    print(f"  Corpus breakdown by region and file type")
+    print(f"{'=' * 90}")
+    print(f"  Total timed records : {grand_count}")
+    print(f"  Total untimed       : {grand_untimed}")
+    print(f"  Total parse time    : {grand_total:.0f}s  ({grand_total / 3600:.2f}h)")
+    print()
+    print(f"  {'Region':<20} {'Type':<16} {'Count':>7} {'Untimed':>8} {'Total':>10} {'Mean':>8} {'% Time':>7}")
+    print(f"  {'-'*20} {'-'*16} {'-'*7} {'-'*8} {'-'*10} {'-'*8} {'-'*7}")
+    for total, count, mean, untimed, (region, ftype) in rows:
+        pct = (total / grand_total * 100) if grand_total > 0 else 0
+        print(f"  {region:<20} {ftype:<16} {count:>7} {untimed:>8} {total:>9.1f}s {mean:>7.3f}s {pct:>6.1f}%")
+
+    # Repo sub-breakdown: by release directory depth
+    repo_records = [(rec, rec.total_duration()) for rec in records
+                  if "repo" in rec.path.lower() and rec.total_duration() is not None]
+    if repo_records:
+        print(f"\n  --- Repo detail ---")
+        # Count unique release directories (3rd path component after repo)
+        release_times: dict[str, list[float]] = defaultdict(list)
+        for rec, dur in repo_records:
+            # Extract release slug from path: .../repo/{slug}/...
+            parts = rec.path.replace("\\", "/").split("/")
+            try:
+                repo_idx = next(i for i, p in enumerate(parts) if p == "repo")
+                # repo/{release}/{system}/{subsystem}/file
+                # Use up to 2 levels deep for grouping
+                depth = min(repo_idx + 3, len(parts) - 1)
+                repo_key = "/".join(parts[repo_idx:depth])
+            except StopIteration:
+                repo_key = "repo/unknown"
+            release_times[repo_key].append(dur)
+
+        release_rows = [(sum(ds), len(ds), k) for k, ds in release_times.items()]
+        release_rows.sort(reverse=True)
+        repo_total = sum(t for t, _, _ in release_rows)
+        print(f"  Unique release groups: {len(release_rows)}")
+        print(f"  Total repo time: {repo_total:.0f}s ({repo_total / 3600:.2f}h)")
+        print(f"\n  Top 20 release groups by parse time:")
+        print(f"  {'Total':>10} {'Count':>7} {'Mean':>8}  Release group")
+        print(f"  {'-'*10} {'-'*7} {'-'*8}  {'-'*50}")
+        for total, count, key in release_rows[:20]:
+            mean = total / count
+            print(f"  {total:>9.1f}s {count:>7} {mean:>7.3f}s  {key}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Analyse a noet corpus-run debug log.",
@@ -1014,9 +1153,14 @@ def main() -> None:
         help="Bucket size in milliseconds for --concurrency histogram (default 100)",
     )
     ap.add_argument(
+        "--corpus-breakdown",
+        action="store_true",
+        help="Classify files by corpus region (repo vs other) and type (md, xlsx, media, etc.)",
+    )
+    ap.add_argument(
         "--all",
         action="store_true",
-        help="Run all analyses (phase-summary + stalls + warnings + file-times + concurrency)",
+        help="Run all analyses (phase-summary + stalls + warnings + file-times + concurrency + corpus-breakdown)",
     )
     ap.add_argument(
         "--top",
@@ -1064,6 +1208,7 @@ def main() -> None:
         or args.phase_detail
         or args.file_times
         or args.concurrency
+        or args.corpus_breakdown
         or args.all
     )
 
@@ -1082,6 +1227,9 @@ def main() -> None:
 
     if args.warnings or args.all:
         report_warnings(lines, top_n=args.top)
+
+    if args.corpus_breakdown or args.all:
+        report_corpus_breakdown(records)
 
     if args.phase_detail:
         report_phase_detail(records, args.phase_detail)

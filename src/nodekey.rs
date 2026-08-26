@@ -16,12 +16,28 @@ uniffi::custom_type!(Url, String, {
 
 use crate::{
     beliefbase::BeliefBase,
-    codec::CODECS,
     paths::{to_anchor, AnchorPath, AnchorPathBuf},
-    properties::{asset_namespace, content_namespaces, href_namespace, Bid, Bref},
-    query::{BeliefSource, Expression, StatePred},
+    properties::{asset_namespace, content_namespaces, href_namespace, Bid, Bref, NodeId},
+    query::{
+        spec::{QueryPackage, QuerySpec, TapeFn},
+        BeliefSource,
+    },
     BuildonomyError,
 };
+
+/// Return true if any registered codec or walk-codec recognises this path extension.
+///
+/// On native builds, consults both `CODECS` (extension/stem registry) and `WALK_CODECS`
+/// (walk-time visibility registry). On WASM, `WALK_CODECS` is unavailable so only `CODECS`
+/// is consulted — the WASM `CodecMap::get` already checks `BUILTIN_EXTENSIONS` internally,
+/// so `.md` is covered there.
+///
+/// This is the correct extensibility point for `NodeKey` path classification: it honours
+/// any extension registered by application shims via either registry, rather than relying
+/// on a hardcoded list.
+fn is_known_codec_extension(ap: &AnchorPath) -> bool {
+    crate::codec::is_known_codec_extension(ap)
+}
 
 /// Used to specify the join logic between two (sets of) BeliefNodes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -349,8 +365,10 @@ impl NodeKey {
     ) -> Result<NodeKey, BuildonomyError> {
         // Query for the relative_to node to get its path
         let keys = vec![key_owner, root_net];
-        let query_expr = Expression::StateIn(StatePred::Bid(keys));
-        let cache = BeliefBase::from(cache.eval(&query_expr).await?);
+        let spec = QuerySpec::seed(TapeFn::Bids(keys));
+        let mut package = QueryPackage::balanced(spec);
+        cache.evaluate(&mut package).await?;
+        let cache = BeliefBase::from(package.into_graph());
         self.regularize(&cache, key_owner, root_net, root_abs_path)
     }
 
@@ -425,8 +443,10 @@ impl NodeKey {
 
         // Try finding by ID
         for node in cache.states().values() {
-            if node.id.as_deref() == Some(network_ref) {
-                return Ok(node.bid);
+            if let NodeId::Explicit(ref id) = node.id {
+                if id == network_ref {
+                    return Ok(node.bid);
+                }
             }
         }
 
@@ -443,10 +463,12 @@ impl NodeKey {
         // Try parsing as Bref first
         if let Ok(bref) = Bref::try_from(network_ref) {
             // Query for nodes with this bref
-            let query_expr = Expression::StateIn(StatePred::Bref(vec![bref]));
-            let result = cache.eval_unbalanced(&query_expr).await?;
+            let spec = QuerySpec::seed(TapeFn::Keys(vec![NodeKey::Bref { bref }]));
+            let mut package = QueryPackage::new(spec);
+            cache.evaluate(&mut package).await?;
+            let graph = package.into_graph();
 
-            if let Some(node) = result.states.values().next() {
+            if let Some(node) = graph.states.values().find(|n| n.bid.bref() == bref) {
                 return Ok(node.bid);
             }
         }
@@ -584,6 +606,18 @@ impl FromStr for NodeKey {
                     });
                 }
 
+                // Host-absolute path (starts with '/') → treat as href_namespace.
+                // In HTTP semantics, '/en-US/docs/...' is relative to the host root,
+                // not the current document.  Joining with the document path produces
+                // garbage ('doc_dir/en-US/docs/...').  Route to href_namespace where
+                // alias-template entries live, preserving the full path for exact match.
+                if s.starts_with('/') {
+                    return Ok(NodeKey::Path {
+                        net: href_namespace().bref(),
+                        path: s.to_string(),
+                    });
+                }
+
                 // Path-like bare string — probe first component for Bid/Bref network
                 let remainder = ap.path_after_schema(); // == s for bare strings
                 let first_slash = remainder.find('/');
@@ -616,9 +650,9 @@ impl FromStr for NodeKey {
                 }
                 let mut path_net = net;
                 // Only reclassify as asset when the path has a file extension that
-                // no codec recognises. Anchor-only paths (#section) and extensionless
+                // no registry recognises. Anchor-only paths (#section) and extensionless
                 // paths (directories, Gemfile-style names) stay in the document net.
-                if !norm_ap.ext().is_empty() && CODECS.get(&norm_ap).is_none() {
+                if !norm_ap.ext().is_empty() && !is_known_codec_extension(&norm_ap) {
                     path_net = asset_namespace().bref();
                 }
                 Ok(NodeKey::Path {
@@ -652,9 +686,9 @@ impl FromStr for NodeKey {
                 let norm_ap = AnchorPath::new(norm_input);
                 let norm_path: String = norm_ap.normalize().into();
                 // Only reclassify as asset when the path has a file extension that
-                // no codec recognises. Anchor-only paths (#section) and extensionless
+                // no registry recognises. Anchor-only paths (#section) and extensionless
                 // paths (directories, Gemfile-style names) stay in the document net.
-                if !norm_ap.ext().is_empty() && CODECS.get(&norm_ap).is_none() {
+                if !norm_ap.ext().is_empty() && !is_known_codec_extension(&norm_ap) {
                     path_net = asset_namespace().bref();
                 }
                 Ok(NodeKey::Path {
@@ -890,10 +924,10 @@ mod tests {
             asset_namespace().bref()
         );
 
-        // Absolute paths
+        // Absolute paths → href_namespace (host-absolute semantics)
         let key: NodeKey = "/docs/council/README.md".parse().unwrap();
         assert!(matches!(key, NodeKey::Path { net, path }
-        if net == Bref::default() && path == "docs/council/README.md"));
+        if net == href_namespace().bref() && path == "/docs/council/README.md"));
 
         // Plain text without slashes defaults to Id (normalized)
         let plain_text = " My Node Title";

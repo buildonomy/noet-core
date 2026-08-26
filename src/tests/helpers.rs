@@ -4,10 +4,11 @@ use crate::{
     beliefbase::{BeliefBase, BidGraph},
     paths::to_anchor,
     properties::{
-        BeliefKind, BeliefKindSet, BeliefNode, Bid, Weight, WeightKind, WeightSet, WEIGHT_SORT_KEY,
+        BeliefKind, BeliefKindSet, BeliefNode, Bid, NodeId, Weight, WeightKind, WeightSet,
+        WEIGHT_SORT_KEY,
     },
 };
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 /// Initialize logging for tests
 pub fn init_logging() {
@@ -23,17 +24,18 @@ pub fn create_test_node(title: &str, kind: BeliefKind) -> BeliefNode {
     BeliefNode {
         title: title.to_string(),
         kind: BeliefKindSet(kind.into()),
-        id: Some(to_anchor(title)),
+        id: NodeId::Explicit(to_anchor(title)),
         bid: Bid::new(Bid::nil()),
         ..Default::default()
     }
 }
 
 /// Helper function to create a test BeliefBase with some nodes and relations
+#[allow(dead_code)]
 pub fn create_test_beliefbase() -> BeliefBase {
     init_logging();
 
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
 
     // Create a few test nodes
     let node1 = create_test_node("Node 1", BeliefKind::Document);
@@ -78,7 +80,7 @@ pub fn create_test_beliefbase() -> BeliefBase {
 pub fn create_balanced_test_beliefbase() -> BeliefBase {
     init_logging();
 
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
 
     // Create API node
     let api = BeliefNode::api_state();

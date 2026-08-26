@@ -36,12 +36,15 @@
 
 name: Comprehensive Testing
 
+# NOTE: push/PR triggers disabled while GitHub-hosted runners are unavailable.
+# Self-hosted CI runs via test-selfhosted.yml instead.
+# Re-enable these triggers when hosted runners are restored.
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-  workflow_dispatch: # Allow manual triggering
+  # push:
+  #   branches: [main, develop]
+  # pull_request:
+  #   branches: [main, develop]
+  workflow_dispatch: # Manual trigger only while hosted runners are down
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,16 +57,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest] #, macos-latest, windows-latest]
         rust: [stable, beta]
         features: ["no-default", "bin,service", "default"]
         include:
           - features: "no-default"
             cargo_flags: "--no-default-features"
+            cache_key: "no-default"
           - features: "bin,service"
             cargo_flags: "--no-default-features --features bin,service"
+            cache_key: "bin-service"
           - features: "default"
             cargo_flags: ""
+            cache_key: "default"
         exclude:
           # Reduce matrix: only test beta on Linux
           - os: macos-latest
@@ -80,35 +86,40 @@ jobs:
       - name: Free disk space (Linux only)
         if: runner.os == 'Linux'
         run: |
-          # Clean up pre-installed tools to save space
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           df -h
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.features }}
-          cache-on-failure: false
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-${{ matrix.cache_key }}-${{ runner.os }}-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-v1-${{ matrix.cache_key }}-${{ runner.os }}-${{ matrix.rust }}-
+            cargo-v1-${{ matrix.cache_key }}-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.rust }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          rustup component add rustfmt clippy
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
+
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Build
         run: cargo build --verbose ${{ matrix.cargo_flags }}
@@ -126,27 +137,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88"
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-msrv-${{ runner.os }}-1.88-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-v1-msrv-${{ runner.os }}-1.88-
+            cargo-v1-msrv-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: msrv
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Check MSRV
         run: |
@@ -160,26 +177,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-examples-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-examples-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: examples
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Build examples
         run: cargo build --examples
@@ -194,31 +216,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-wasm-test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-wasm-test-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: wasm-test
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Build WASM module
         run: cargo build --features bin
@@ -234,15 +261,18 @@ jobs:
       - name: Run WASM interface test (nav tree subnet placement)
         run: node tests/browser/test_nav_tree.js
 
-      - name: Upload test artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-test-artifacts
-          path: |
-            tests/browser/test-output/
-            pkg/
-          retention-days: 7
+      - name: Run WASM interface test (codec manifest)
+        run: node tests/browser/test_codec_manifest.js
+
+      # - name: Upload test artifacts on failure
+      #   if: failure()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: wasm-test-artifacts
+      #     path: |
+      #       tests/browser/test-output/
+      #       pkg/
+      #     retention-days: 7
 
   # Linting
   lint:
@@ -251,27 +281,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-lint-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          rustup component add rustfmt clippy
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: lint
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -286,68 +321,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-docs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-docs-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: docs
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Generate documentation
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - name: Upload docs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: documentation
-          path: target/doc
-          retention-days: 7
-
-  # Security audit
-  # Configuration in audit.toml ignores acceptable advisories (e.g., unmaintained but not vulnerable crates)
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
-        uses: actions/cache@v4
-        id: cache-wasm-bindgen
-        with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
-
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        run: cargo audit
+      # - name: Upload docs artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: documentation
+      #     path: target/doc
+      #     retention-days: 7
 
   # Code coverage
   coverage:
@@ -356,37 +366,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-coverage-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
+          if ! command -v cargo-tarpaulin > /dev/null 2>&1; then
+            cargo install cargo-tarpaulin --version 0.31.2
+          else
+            echo "✓ cargo-tarpaulin already present"
+          fi
 
-      - name: Cache cargo-tarpaulin
-        uses: actions/cache@v4
-        id: cache-tarpaulin
-        with:
-          path: ~/.cargo/bin/cargo-tarpaulin
-          key: tarpaulin-0.31.2-${{ runner.os }}
-
-      - name: Install cargo-tarpaulin
-        if: steps.cache-tarpaulin.outputs.cache-hit != 'true'
-        run: cargo install cargo-tarpaulin --version 0.31.2 --locked
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: coverage
+      - name: Fetch vendored binaries
+        run: ./vendor/fetch.sh
 
       - name: Run coverage with tarpaulin
         run: cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
@@ -398,12 +407,12 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: cobertura.xml
-          retention-days: 7
+      # - name: Upload coverage artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: coverage-report
+      #     path: cobertura.xml
+      #     retention-days: 7
 
   # Benchmark baseline (informational only)
   benchmark:
@@ -413,50 +422,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
-
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: bench
-
-      - name: Cache benchmark corpora
-        uses: actions/cache@v4
-        id: cache-corpora
-        with:
-          path: .bench_corpora
-          key: bench-corpora-05d114287b7d-c49e89cc8c7c
-
-      - name: Fetch benchmark corpora
-        if: steps.cache-corpora.outputs.cache-hit != 'true'
-        run: bash benches/fetch_corpora.sh
-
-      - name: Run micro-benchmarks
-        run: |
-          cargo bench --bench document_processing --features service --no-fail-fast
-
-      - name: Upload benchmark results
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
           path: |
-            target/criterion/
-          retention-days: 30
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-bench-${{ runner.os }}-
+
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
+
+      # - name: Cache benchmark corpora
+      #   uses: actions/cache@v4
+      #   id: cache-corpora
+      #   with:
+      #     path: .bench_corpora
+      #     key: bench-corpora-05d114287b7d-c49e89cc8c7c
+
+      # - name: Fetch benchmark corpora
+      #   if: steps.cache-corpora.outputs.cache-hit != 'true'
+      #   run: bash benches/fetch_corpora.sh
+
+      # - name: Run micro-benchmarks
+      #   run: |
+      #     cargo bench --bench document_processing --features service --no-fail-fast
+
+      # - name: Upload benchmark results
+      #   if: success()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: benchmark-results
+      #     path: |
+      #       target/criterion/
+      #     retention-days: 30
 
   # Corpus pages: compile real-world corpora to HTML and publish to GitHub Pages.
   # Serves two purposes:
@@ -477,26 +488,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-corpus-pages-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-corpus-pages-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: corpus-pages
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
 
       - name: Cache benchmark corpora
         uses: actions/cache@v4
@@ -543,17 +556,17 @@ jobs:
           </html>
           EOF
 
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v4
+      # - name: Setup GitHub Pages
+      #   uses: actions/configure-pages@v4
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site/
+      # - name: Upload Pages artifact
+      #   uses: actions/upload-pages-artifact@v3
+      #   with:
+      #     path: site/
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      # - name: Deploy to GitHub Pages
+      #   id: deployment
+      #   uses: actions/deploy-pages@v4
 
   # Standalone crate test (Issue 7 requirement)
   standalone:
@@ -564,21 +577,33 @@ jobs:
         with:
           path: noet-core
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache wasm-bindgen-cli
+      - name: Cache cargo
+        id: cargo-cache
         uses: actions/cache@v4
-        id: cache-wasm-bindgen
         with:
-          path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-0.2.108-${{ runner.os }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-v1-standalone-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-v1-standalone-${{ runner.os }}-
 
-      - name: Install wasm-bindgen-cli
-        if: steps.cache-wasm-bindgen.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Install Rust toolchain and tools
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          else
+            echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
+          fi
+
+      - name: Fetch vendored binaries
+        run: |
+          cd noet-core
+          ./vendor/fetch.sh
 
       - name: Build noet-core with default features
         run: |
@@ -618,7 +643,7 @@ jobs:
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [test-matrix, msrv, examples, wasm-interface, lint, docs, security, standalone]
+    needs: [test-matrix, msrv, examples, wasm-interface, lint, docs, standalone]
     if: always()
     steps:
       - name: Check test results
@@ -647,31 +672,29 @@ jobs:
             echo "❌ Documentation failed"
             exit 1
           fi
-          if [ "${{ needs.security.result }}" != "success" ]; then
-            echo "⚠️  Security audit failed (non-blocking)"
-          fi
+
           if [ "${{ needs.standalone.result }}" != "success" ]; then
             echo "❌ Standalone crate test failed"
             exit 1
           fi
           echo "✅ All required tests passed"
 
-  # Mirror to GitLab (namespace reservation and backup)
-  mirror-to-gitlab:
-    name: Mirror to GitLab
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    needs: [test-summary]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Full history for mirror
+  # # Mirror to GitLab (namespace reservation and backup)
+  # mirror-to-gitlab:
+  #   name: Mirror to GitLab
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+  #   needs: [test-summary]
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0 # Full history for mirror
 
-      - name: Mirror to GitLab
-        env:
-          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
-        run: |
-          git remote add gitlab https://oauth2:${GITLAB_TOKEN}@gitlab.com/buildonomy/noet-core.git || true
-          git push --force gitlab --all
-          git push --force gitlab --tags
+  #     - name: Mirror to GitLab
+  #       env:
+  #         GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+  #       run: |
+  #         git remote add gitlab https://oauth2:${GITLAB_TOKEN}@gitlab.com/buildonomy/noet-core.git || true
+  #         git push --force gitlab --all
+  #         git push --force gitlab --tags

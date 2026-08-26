@@ -2,89 +2,219 @@
 
 This file tracks optional enhancements and future work extracted from completed issues.
 
-## Documentation Enhancements (from Issue 05)
+## Remaining full-map scans in `PathMap` (measured, from Issue 102)
 
-**Priority**: LOW - Optional improvements to existing documentation
+**Priority**: LOW — measured and deliberately deferred. Recorded so the next
+audit starts from measurement rather than rediscovery.
 
-### Architecture Deep Dive
-- Extract and expand multi-pass compilation explanation from `lib.rs`
-- Extract compilation model details from `beliefbase_architecture.md`
-- Add beginner-friendly examples beyond existing doctests
-- **Current Status**: Basic architecture documented, comprehensive details available in rustdoc
+Two rounds of this defect class have already been fixed: `indexed_get` gained a
+path index (422,582,888 → 76,433 entries scanned), and
+`generate_path_name_with_collision_check` was converted to use it
+(1,684,103 → 10 entries examined). Neither moved wall clock — the scans were
+real but not on the critical path. What remains:
 
-### Codec Implementation Tutorial
-- Step-by-step guide: Build custom codec (JSON example)
-- Document DocCodec trait integration
-- Best practices for error handling
-- **Current Status**: DocCodec trait documented in rustdoc, basic usage shown in examples
+- `rebuild_node_to_nets_for` scans all of `node_to_nets` then `retain`s, once
+  per network — O(networks × nodes). Measured at **7.1%** of `PathMapMap::new`.
+  The same pattern appears in `process_event_queue`, `process_nodes_removed`,
+  and `process_node_renamed`.
+- `PathMap::home_path` and `PathMap::all_paths` scan `self.map`, but run on
+  export/finalize paths rather than per-edge. `home_path` could use `bid_map`
+  if it ever measures hot.
 
-### BID Deep Dive Guide
-- BID lifecycle (generation, injection, resolution)
-- Why BIDs matter (forward refs, cross-doc links)
-- Usage patterns and best practices
-- **Current Status**: BIDs explained in architecture.md and rustdoc
+## Nest the const-namespaces by URL segment (from Issue 102 Part 2)
 
-### Additional Tutorial Content
-- `querying.md` - Graph query patterns
-- `custom_codec.md` - Full codec implementation walkthrough
-- **Current Status**: Query examples in rustdoc, WatchService tutorial covers file watching and DB sync
+**Priority**: LOW — deferred; the cost that motivated it was removed by other
+means. Do not start without a fresh measurement.
 
-### FAQ and Troubleshooting
-- Common questions about multi-pass compilation
-- Performance characteristics
-- Troubleshooting guide for common issues
-- **Current Status**: Basic usage covered in README and rustdoc
+`href_namespace` and `asset_namespace` are **flat**: every URL or asset is a
+direct Section child of one namespace root, reaching ~78k children on a large
+corpus. The proposal was to decompose each into `host / seg1 / seg2 / …`,
+cutting max degree from ~78k to ~340 hosts. Depth 2 is the first level that
+breaks the skew (one host is 59% of URLs); depth 3 leaves a 139-entry max.
 
-### Documentation Navigation Improvements
-- Cross-link tutorial docs with headers/footers
-- Comprehensive "Documentation" section in README
-- **Current Status**: Rustdoc provides good navigation, manual docs reference rustdoc
+### Why it is deferred
 
-## Service Testing Infrastructure (from Issue 10)
+Nesting reduces **degree**, which defends against halo fan-out. It was carried
+as active work on the theory that degree was also inflating epoch seeding cost.
+It was not:
 
-**Status**: MOVED TO ISSUE 07 (Section 8)
+- Seeding pulled the *whole* namespace regardless of shape —
+  `epoch_session_snapshot` BFSes the entire subgraph from each root, and
+  `initialize_stack`'s fallback issues a `leaf_anchored` query that walks to
+  every leaf. Re-parenting 78k leaves under 340 intermediates leaves the
+  reachable set the same size, or slightly larger.
+- The actual seeding cost was **redundant rebuilding**, not breadth: every
+  epoch task rebuilt an identical index over the shared namespace. Sharing one
+  prebuilt base per epoch (`GraphBuilder::seed_session_from_base`) took seeding
+  2,533s → 524s and the parse phase 1.79x, without touching namespace shape.
+- Part 1's path index already removed the read-path scan cost
+  (422,582,888 → 76,433 entries scanned), and *that* produced no wall-clock
+  change either — the scan was real but not on the critical path.
 
-**Context**: Service layer testing was backlogged but is now integrated into comprehensive testing for v0.1.0 release.
+What remains genuinely gated on nesting is **demand-driven seeding** (pulling
+only the namespace branches a document references). Nesting makes that
+expressible, because a branch becomes addressable as a unit. But that is a
+separate change, and with seeding now ~4.8x cheaper the payoff is much smaller
+than when this was filed.
 
-**See**: `docs/project/ISSUE_07_COMPREHENSIVE_TESTING.md` Section 8 for:
-- WatchService API Testing
-- FileUpdateSyncer Integration Tests
-- File Watching Integration Tests
-- Database Synchronization Tests
-- Integration test expansion at `tests/service_integration.rs`
+### The const-namespace workaround cleanup is gated on this
 
-## Anchor Injection Enhancement (from Issue 03)
+Roughly 50 commits accumulated defensive code against unbounded namespace
+breadth. These become removable *in principle* once degree drops, each needing
+its own measurement first:
 
-**Priority**: LOW - Optional UX improvement
+| workaround | site | defends against |
+|---|---|---|
+| const-ns frontier filter (in-memory) | `base.rs::apply_traversal` | halo fan-out |
+| const-ns frontier filter (SQL) | `db.rs::apply_traversal_sql` | halo fan-out |
+| `anchored()` for const-ns keys | `builder.rs::cache_fetch` | halo fan-out |
+| `leaf_anchored` vs `balanced` | `initialize_stack`, `sync_asset_snapshot` | halo fan-out |
+| `content_namespaces()` hot-seed guard | `initialize_stack` | cost of pulling flat namespace |
+| bulk asset registration | `compiler.rs::process_asset_batch` | per-event PathMap flush |
 
-**Context**: Currently, IDs are only injected into headings when collisions occur (Bref-based IDs). Consider always injecting IDs for explicit anchors.
+They are cheap and currently load-bearing, so this is not itself a reason to
+pursue nesting. Bulk asset registration is orthogonal (setup overhead, not
+breadth) — keep it regardless. One further entry, the `union_graphs` const-ns
+union in `seed_session`, was already retired by the shared epoch base.
 
-### Always-Inject-IDs Mode
-- Inject calculated IDs into all headings (even without collisions)
-- Makes it easier for users to reference sections explicitly
-- Format: `# Title {#calculated-id}` or `# Title {#bref-value}` for collisions
-- Use `update_or_insert_frontmatter()` pattern to inject anchor into heading events
-- pulldown_cmark will serialize it correctly when generating source
-- **Current Status**: IDs are only injected for collision resolution
+### If it is ever picked up
 
-## Network Configuration Features (from Issue 21)
+href BIDs are UUID v5 over the URL string, so intermediates are *computable*:
+`buildonomy_href_bid("https://host/seg1")` is that intermediate's BID.
+Ancestors need no lookups, a URL that is both leaf and prefix unifies into one
+node automatically (8 such cases in the corpus), and identity is invariant
+under depth changes, so the depth policy stays reversible. Asset BIDs are v6
+time-based and **not** computable; asset intermediates would need a
+generated-and-stored BID, or a path-derived v5 migration (see "Should asset
+bids really be derived from their hash?" below).
 
-**Priority**: LOW - Optional configuration system extensions
+Sketch: a pure URL/path → segments + leaf-key function, then
+`ensure_href_namespace` / `ensure_asset_namespace` ensuring a *chain* rather
+than a single edge.
 
-**Context**: Issue 21 implemented JSON/TOML dual-format support. Network configuration schema exists but these features are not yet implemented.
+**Done when**: max const-namespace node degree < 1k; resolved/unresolved link
+counts unchanged; `map_insert` shift for both namespaces remains 0.
 
-### Network-Level Format Preferences
-- Parse network file and extract `config` object
-- Store network config in `IRNode` for network nodes
-- Pass network config down to child document parsing
-- Respect `default_metadata_format` preference
-- Implement `strict_format` validation (if enabled, reject non-default format)
-- **Current Status**: JSON-first parsing works, TOML fallback works, but network config not yet propagated
+**Known risks**:
+- *Stored path form breaks subnet descent.* `indexed_get`'s subnet fallback
+  does `path.starts_with(subnet_path)` then `strip_prefix`, but leaves store
+  full URLs and `AnchorPath::join` passes schemes through unchanged. Deciding
+  between URL-relative leaf segments (with reassembly in `PathMap::path`) and
+  scheme-aware stripping *is* the real work here — settle it before writing
+  code.
+- *Rendering-visible path changes.* Nesting changes the PathMap path for every
+  href node; audit `get_nav_tree`, SPA nav, and href reconstruction first.
+- *Intermediates polluting nav/search.* Mark them `Trace`; assert in tests.
 
-### Format Preference API
-- Add `from_str_with_format()` method for explicit format preference
-- Update call sites to pass network config when available
-- Support NetworkConfig fields: `default_metadata_format`, `strict_format`, `validate_on_parse`, `auto_normalize`
+**Rejected alternatives**: hostname-only nesting (leaves a 6,521-entry
+container where depth 2 leaves 734, same implementation cost); dropping PathMap
+for href and resolving purely by computed BID (assets carry 23x the entries and
+their BIDs are not computable).
+
+**Testing**: URL→node resolution identical flat vs nested; BID stability across
+the change; a URL that is both leaf and prefix resolves to one node;
+idempotence (second parse creates no new intermediates, no re-parenting).
+
+## Unexplained `GlobalCache` rise after shared epoch session base
+
+**Priority**: LOW — no known correctness or cost impact, but unexplained
+
+Sharing one prebuilt `BeliefBase` across epoch tasks (`seed_session_from_base`)
+moved the `cache_fetch` source mix on a full corpus run:
+
+| source | before | after | Δ |
+|---|---:|---:|---:|
+| Generated | 227,464 | 228,655 | +1,191 |
+| StackCache | 220,284 | 220,285 | +1 |
+| GlobalCache | 4,250 | 5,223 | **+973 (+23%)** |
+| SourceFile | 4,066 | 4,066 | 0 |
+
+GlobalCache is 0.9% of fetches, so the cost is immaterial, and parse output was
+verified identical against a baseline build (real paths, node kind/title/id/slug,
+relations-by-title, at both `-j1` and `-j8`). But a 23% rise with the other three
+flat is a real behaviour change, not noise.
+
+Prime suspect is the `MergePrecedence::RhsWins` introduced for the doc-seed merge:
+the previous `union_graphs` path let `doc_seed` win node collisions, and `RhsWins`
+preserves that, but the surrounding node population differs — the shared base is
+never replaced, so more nodes are present to collide with.
+
+**Next step**: log the `NodeKey` variants driving GlobalCache fetches on both
+paths and diff them. Cheap; the volume is small.
+
+## Verify shared epoch session base under the `--db` backend
+
+**Priority**: LOW
+
+The shared-base change was validated on the in-memory path (chosen for
+comparability with the recorded baseline). Nothing in the design is
+backend-specific — the sharing is over derived in-memory structures, and
+`PathMapMap` copy-on-write is backend-agnostic — but that is reasoning, not
+measurement.
+
+Note the warm-cache regression (Issue 97 Bottleneck 5: 94s cold vs 28m warm on
+the same corpus) lives on the `--db` path and would dominate any timing taken
+there, so this is a correctness check, not a performance one.
+
+## QueryPackage as Topological Pagination (from Issue 83)
+
+**Priority**: LOW — exploratory, no current consumer
+
+`QueryPackage` already supports partial evaluation: the tape records
+per-step intermediate state, `PackageStage` tracks progress, and the
+evaluator resumes from wherever the tape left off. This is structurally
+close to a **lazy pagination** mechanism:
+
+1. Client sends a `QuerySpec` + pagination window (e.g. "evaluate steps
+   0–3, return that tape slice + subgraph")
+2. Server evaluates up to the window boundary, caches the package keyed
+   by spec hash, returns the partial result
+3. Client requests the next window (same spec hash, steps 4–7) — server
+   resumes from cached tape position, no prefix re-evaluation
+
+This gives topological pagination (ordered by projection steps) rather
+than flat offset/limit pagination. The graph returned per window is the
+subgraph materialized from that tape slice, so memory scales with the
+window size, not the full result.
+
+**Key design questions**:
+- Cache eviction policy for partially-evaluated packages
+- Whether the spec hash alone is sufficient for identity (it should be —
+  the spec is immutable after construction)
+- How to express the pagination window in the MCP/WASM surface
+- Whether materialization should be deferred to the final window or
+  incremental per-window
+
+**Affected types**: `QueryPackage`, `Tape`, `PackageStage`, MCP tool
+handlers, `BeliefAccumulator` cache.
+
+
+## Recursive CTE for `DepthCount::Max` in `apply_traversal_sql` (from Issue 83)
+
+**Priority**: LOW — performance optimization, not correctness
+
+Replace the per-hop SQL loop in `DbConnection::apply_traversal_sql`
+with `WITH RECURSIVE` when `DepthCount::Max`. Currently `max_hops()`
+clamps `Max` to `MAX_TRAVERSAL` (10), so the loop is bounded at 10 SQL
+roundtrips. Real-world section depth is typically 3–5. Three input roles
+(Source, Sink, Owner) would each need a separate CTE branch. The CTE
+must carry a `depth` column for per-hop tape entry partitioning and a
+visited-set guard for cycle prevention.
+
+Complexity vs. payoff is unfavorable unless profiling shows the per-hop
+loop is a measurable bottleneck on large corpora.
+
+
+## Traceability View Polish (from Issue 63)
+
+**Priority**: LOW — not needed for current use cases
+
+- **Column sort on header click**: clicking a column header sorts the table rows
+  by that column's edge count ascending/descending. Pure JS, no WASM call needed.
+- **Loading indicator for large submaps**: show a spinner or progress hint while
+  `get_submap` + `get_context_bulk` are executing for high-depth or large networks.
+- **Empty-state messaging**: when no rows have any edges for the visible WeightKind
+  columns, display a friendly message instead of an empty table body.
 
 ## Link Format Enhancements (from Issue 04)
 
@@ -108,47 +238,6 @@ This file tracks optional enhancements and future work extracted from completed 
 - `noet-core import --from obsidian ./vault/`
 - `noet-core import --from roam ./export/`
 - `noet-core import --from logseq ./graphs/`
-
-## Migration Guides (from Issue 14)
-
-**Priority**: LOW - Documentation for users migrating from pre-1.0 versions
-
-**Context**: Issue 14 renamed core types (`BeliefSet` → `BeliefBase`, etc.). Migration guide would help users update.
-
-### Type Rename Migration Guide
-- Document all renamed types and rationale
-- Provide search-and-replace patterns
-- Note breaking changes vs backward compatibility
-- Consider type aliases for gradual migration
-- **Current Status**: Renames complete, but no migration guide written
-
-## PathMap Multi-Path Query Issue (from Issue 29)
-
-**Priority**: MEDIUM - PathMap queries should work for all asset paths
-
-**Context**: Issue 29 implemented static asset tracking with multi-path support (same content at multiple file paths gets same BID). The WEIGHT_DOC_PATHS relation correctly stores multiple paths, but PathMap queries via `asset_map().get(path)` fail to find the paths.
-
-### Current Behavior
-- Assets with same content correctly get same BID (content-addressed) ✓
-- Multiple paths accumulate in WEIGHT_DOC_PATHS relation ✓
-- Warning: "Setting 2 paths for single relation (expected 1)" appears
-- PathMap construction creates separate entries for each path (lines 854-859 in `paths.rs`) ✓
-- But `asset_map().get("assets/test.png")` returns `None` even when path exists ✗
-
-### Investigation Needed
-1. Verify PathMapMap is being rebuilt after asset events processed into global_bb
-2. Check if asset_namespace node itself is in states (required for PathMap construction)
-3. Verify relations with WEIGHT_DOC_PATHS are correctly indexed into PathMap
-4. Test if issue is specific to asset_namespace or affects all multi-path relations
-5. Consider if PathMap construction needs special handling for multi-path weights
-
-### Workaround
-`asset_manifest` (populated during compilation) provides reliable path→BID queries and is sufficient for Issue 29's requirements (HTML output hardlinking).
-
-### Test Case
-`tests/codec_test.rs::test_multi_path_asset_tracking` currently uses asset_manifest instead of PathMap queries. Update test to use PathMap queries once fixed.
-
-**Status**: Discovered during Issue 29 implementation, deferred as non-blocking for asset tracking functionality.
 
 ## Should asset bids really be derived from their hash?
 
@@ -178,7 +267,7 @@ pub trait HasBeliefData {
     // Default implementations for shared methods
     fn find_orphaned_edges(&self) -> Vec<Bid> { /* ... */ }
     fn is_empty(&self) -> bool { /* ... */ }
-    fn build_balance_expr(&self) -> Option<Expression> { /* ... */ }
+    fn build_balance_spec(&self) -> Option<QuerySpec> { /* ... */ }
     // etc.
 }
 
@@ -200,64 +289,6 @@ impl HasBeliefData for BeliefBase { /* ... */ }
 **Alternative Considered**: `BeliefGraphRef<'a>` wrapper type with borrowed data - rejected as more complex with limited benefit over trait approach.
 
 **Related**: Used in `built_in_test()` to check for orphaned edges without cloning entire graph.
-
-
-## BeliefBase Sharding and Built-In Search (from Issues 50/54) ✅ Complete
-
-**Status**: Issues 50 and 54 are complete (`docs/project/completed/`).
-
-**Context**: Issue 50 implemented per-network BeliefBase sharding (JSON export/loading with memory budget) and always generates compile-time `search/*.idx.json` files alongside the data export. Issue 54 added full-text search by deserializing those pre-built indices in `BeliefBaseWasm` — no Tantivy, no runtime index construction, no WASM binary size increase. Search covers the entire corpus from init, including networks whose data shards haven't been loaded. See `docs/design/search_and_sharding.md` for the architecture. See `docs/project/ISSUE_49_FULL_TEXT_SEARCH_PRODUCTION.md` for post-MVP search enhancement ideas (stemming, boolean queries, phrase search, ranking boosts).
-
-**Deferred item**: Cross-network navigation load prompt moved to `ISSUE_07_COMPREHENSIVE_TESTING.md` §10.2.
-
-### Future Enhancements
-- Per-document sharding for very large networks (1000+ documents)
-- IndexedDB caching for loaded shards
-- Compression for shard JSON (gzip, brotli)
-- Network dependency resolution (auto-load referenced networks)
-- Shard preloading based on navigation patterns
-- Federated shard access: remote `BeliefSource` for data not loaded locally (see `federated_belief_network.md` §3.6)
-
-**Related Files**:
-- Export: `src/codec/compiler.rs` `finalize_html` (search index generation, sharding decision)
-- Search index output: `search/manifest.json`, `search/{bref}.idx.json` (generated at compile time)
-- Loading: `assets/viewer/wasm.js::initializeWasm()`, `assets/viewer/shard-manager.js`
-- Search query: `src/wasm.rs::BeliefBaseWasm` (deserializes `.idx.json`, runs TF-IDF queries)
-- Sharding: `src/shard/`
-
-## Windows WatchService mtime Tracking Failure
-
-**Priority**: MEDIUM - CI reliability on Windows
-
-**Context**: `cache_invalidation_test.rs` tests (`test_mtime_tracking`, `test_stale_file_detection_and_reparse`, `test_multiple_files_mtime_tracking`, `test_unchanged_files_keep_same_mtime`, `test_deleted_file_handling`) consistently fail on `windows-latest` CI with the `service` feature. The symptom is that `test.md` is never tracked — only `index.md` appears in the DB mtime table after initial parse.
-
-### Observed Symptom
-```
-test.md should have mtime tracked.
-Found mtimes: {
-  "C:\\\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpXXX\\test_network\\index.md": ...,
-  "C:\\\\Users\\runneradmin\\AppData\\Local\\Temp\\.tmpXXX\\test_network\\index.md": ...
-}
-```
-Two issues visible: (1) `test.md` never emits `FileParsed`, (2) `index.md` is stored twice under both the 8.3 short name (`RUNNER~1`) and the full name (`runneradmin`).
-
-### Suspected Root Causes
-1. **`WatchService` initial parse ordering**: On Windows, the filesystem watcher may not deliver events for files added before the watcher starts, or event delivery is racy. `test.md` is created before `WatchService::enable_network_syncer` is called, so the initial scan may not reliably pick it up.
-2. **Windows 8.3 short names**: `os_path_to_string` is called with short-name paths in some cases (e.g. from the watcher callback), producing duplicate DB entries that fail lookup. Fix: canonicalize in `Transaction::track_file_mtime` via `fs::canonicalize(path).unwrap_or(path)` before `os_path_to_string`.
-
-### Investigation Steps
-1. Add tracing to `WatchService::enable_network_syncer` initial scan to confirm whether `test.md` is being enqueued for parse on Windows.
-2. Check `FileParsed` event emission path — does the compiler emit it for all files or only modified ones on restart?
-3. Apply `fs::canonicalize` in `track_file_mtime` (`src/db.rs`) and verify it resolves the duplicate-entry symptom.
-4. Consider adding a `std::thread::sleep` or explicit flush barrier in the test to rule out timing issues.
-
-### Related
-- Prior fix: commit `1a7f3fb` ("Fix mtime resolution on windows") addressed separator handling in `os_path_to_string` but did not resolve the underlying parse-ordering issue.
-- `src/db.rs` `Transaction::track_file_mtime`
-- `src/codec/compiler.rs` `DocumentCompiler::parse_next` (emits `FileParsed`)
-- `tests/cache_invalidation_test.rs`
-
-**Status**: Pre-existing, non-blocking for Linux/macOS. Needs Windows-native debugging.
 
 ## `check_for_link_and_push` Bail-Out Refactor
 
@@ -286,68 +317,6 @@ All three bail-out paths call this helper, then `continue` the loop.
 - Introduced during cross-platform path normalization fixes (session adding `strip_ext`/`drop_index_suffix`)
 
 **Status**: Low risk, purely mechanical refactor. No behaviour change intended.
-
-## Site-Root-Relative Slug Resolution via Slug Namespace
-
-**Priority**: MEDIUM - Improves cross-reference fidelity for common corpus types
-
-**Context**: Many static site generators (MDN, Jekyll, Hugo, Docusaurus, Sphinx) use
-absolute-path cross-references relative to a site root rather than the filesystem root
-(e.g. MDN's `/en-US/docs/Web/JavaScript/Reference/Global_Objects/Iterator`). These are
-distinguishable from external `http://` hrefs by the signature `is_absolute() &&
-!has_schema()` on `AnchorPath`. Currently `regularize_unchecked` correctly classifies
-these as `href_namespace` externals (fix landed in Issue 34 session), but they could be
-resolved to real in-graph nodes if the document registers its slug in a dedicated
-`slug_namespace` PathMap.
-
-### Design
-
-**Slug registration**: When a document's frontmatter contains a `slug:` field (or
-equivalent site-root-relative path declaration), the codec emits an additional
-`RelationUpdate` placing the document's BID into the `slug_namespace` PathMap under the
-slug string. Same BID as the file-derived node — the slug is just an alternate path alias.
-
-**Slug lookup**: In `regularize_unchecked`, paths matching `is_absolute() &&
-!has_schema()` are returned as `NodeKey::Path { net: slug_namespace().bref(), path }` (as
-they are today for `href_namespace`, but using `slug_namespace` instead). `cache_fetch`
-checks the `slug_namespace` PathMap after the normal filesystem PathMap miss. On a hit,
-returns `GetOrCreateResult::Resolved` with the real node — full graph edge established, no
-`External` node created. On a miss, falls back to `href_namespace` external as today.
-
-**Parse ordering**: If document B's slug is not yet registered when document A references
-it, `cache_fetch` misses and returns `UnresolvedReference` as normal. B is parsed later,
-registers its slug. A is re-queued via the standard reparse loop and resolves on the
-second pass. No special handling needed — the existing multi-pass convergence loop covers
-this.
-
-**Corpus scoping**: If the referenced slug is outside the parsed corpus subtree (e.g.
-running against `javascript/` when the slug points to `web/css/`), the slug PathMap will
-never contain it and the reference correctly degrades to `href_namespace` external. No
-prefix-stripping or site-root configuration required — the slug PathMap either has the
-entry or it doesn't.
-
-### Implementation Sketch
-
-1. Add `slug_namespace()` Bid in `properties.rs` (parallel to `href_namespace()`).
-2. In `regularize_unchecked`: `is_absolute() && !has_schema()` → return
-   `NodeKey::Path { net: slug_namespace().bref(), path }` instead of `href_namespace`.
-3. In `cache_fetch`: after filesystem PathMap miss, check slug PathMap; on hit return
-   resolved node.
-4. In `md.rs` (or a generic frontmatter hook): when `slug:` key present in frontmatter,
-   emit `RelationUpdate` adding the slug path to `slug_namespace` PathMap for this node's
-   BID.
-5. `push_relation` fallback: if slug lookup misses, re-classify as `href_namespace`
-   external (existing behaviour).
-
-### Notes
-- No "site root URL prefix" configuration needed — the PathMap match is purely by slug
-  string against registered slugs.
-- Works across any corpus that registers slugs, not just MDN.
-- Running against a full corpus root (e.g. `files/en-us/`) vs a subtree
-  (`files/en-us/web/javascript/`) naturally determines how many slugs resolve vs degrade
-  to externals — no code change required for either mode.
-
-**Status**: Design complete. Blocked on nothing. Low implementation risk.
 
 ## Flattened Subnet Cache for `resolve_net_path` (from Issue 57)
 
@@ -435,123 +404,329 @@ Profile after the PathMapMap reverse-index fix (P0 in Issue 57). If per-epoch dr
 below ~200ms, the clone overhead makes streaming overlap a net loss except for pathological
 large final batches. If drain remains dominant, implement as described above.
 
-## Directory Link Integration Test (from Issue 59)
+## `NodeKey` `Bref::default()` Sentinel Type-Safety
 
-**Moved to `docs/project/ISSUE_07_COMPREHENSIVE_TESTING.md` §10.1.**
+`NodeKey::Id { net: Bref::default(), .. }` and `NodeKey::Path { net: Bref::default(), .. }`
+use the nil-bref as a sentinel meaning “net scope unknown — must be resolved via
+`regularize_unchecked` before lookup.” This convention works but is invisible to the type
+system and has caused two production bugs (speculative_path_key, Issue 57) where a call path
+accidentally skipped regularization and passed the sentinel directly to `cache_fetch` /
+`evaluate`, producing silent DB misses.
 
-## `initialize_stack` Asset-Loading Performance
+The in-memory `PathMapMap` silently normalizes `Bref::default()` → API root bref on all
+lookups, masking violations. The DB `evaluate` pipeline passes the raw sentinel to SQL,
+exposing them.
 
-**Priority**: HIGH
-**Context**: Identified during parallel-jobs (Issue 57) corpus run analysis
-(`/tmp/jobs-8-refix.log`, MDN JS corpus, `--jobs 8`).
+### Options
 
-During Phase 0 (`initialize_stack`), attempt-2+ (remainder-epoch) tasks independently
-load the full asset set for their parent network(s) by querying `global_bb` via
-`eval_unbalanced`. Subtrees with large asset counts — `intl/*` and `temporal/*` each
-load ~366 assets — cost ~10.9 ms/asset, producing Phase 0 outliers of 9–15s on reparse.
+**Option A — `Option<Bref>` in NodeKey** (correct long-term fix): Replace `net: Bref` with
+`net: Option<Bref>` in `NodeKey::Id` and `NodeKey::Path`. `None` = unresolved scope.
+The `evaluate` pipeline can `expect`/error on `None`; `PathMapMap` methods require callers to
+resolve before calling. Large mechanical change — every construction site and match arm is
+affected.
 
-### Observed Data
+**Option B — Debug-mode assertions in evaluator** (cheap near-term): Panic in debug builds
+if `net == Bref::default()` reaches the `evaluate` pipeline's subject-resolution phase.
+Surfaces future violations immediately without a large refactor. Doesn't help in-memory callers.
 
-From corpus run analysis (`/tmp/jobs-8-refix.log`):
-- OLS: **+10.9 ms / loaded_asset** (n=933 records with asset counts, all attempt-2+)
-- Asset range per file: 106–403
-- Worst offenders: `intl/collator/collator/index.md` (366 assets, 9.25s Phase 0),
-  `array/copywithin/index.md` (366 assets, 15.17s Phase 0 on attempt 2)
-- **Epoch-0 (leaf batch) tasks load zero assets** — correct behaviour. Assets don't
-  exist in `global_bb` during epoch-0 (they haven't been parsed yet), so
-  `initialize_stack` correctly gets misses and those files connect to assets later
-  in epoch 1+. The asset-loading cost is entirely on remainder-epoch reparsing.
+**Option C — Normalize in evaluator** (smallest change): Add the same `Bref::default()` →
+API-bref guard to the `evaluate` pipeline that `PathMapMap` already has. Makes DB behavior
+match in-memory. Perpetuates the hidden sentinel rather than eliminating it.
 
-### Root Cause
+### Recommendation
 
-Two compounding issues:
-
-**Issue A — epoch-0 tasks should never touch `global_bb` at all.**
-`epoch_session_snapshot` is designed to give each task everything it needs in
-`session_bb` so `global_bb` is never consulted. If epoch-0 tasks are hitting
-`global_bb.eval_unbalanced` for assets, that is a gap in snapshot coverage — the
-namespace nodes are present but the const-namespace guard still falls through.
-By definition, epoch-0 tasks should receive a stubbed empty `global_bb`; any miss
-would then be immediately visible rather than silently falling through to the live
-(but logically-empty-for-this-epoch) DB connection. This also eliminates the Bug 2
-class of DB errors for epoch-0 tasks entirely.
-
-**Issue B — remainder-epoch snapshot has an empty asset subgraph.**
-`epoch_session_snapshot` Part 2 walks `self.builder.session_bb` for const-namespace
-nodes and assets. But `self.builder.session_bb` is only updated by events through
-`self.builder.tx()`. Parallel task events flow `shared_tx → BeliefAccumulator →
-global_bb` — never replayed into `self.builder.session_bb`. This is the same
-structural gap as Bug 1 (Issue 57). Assets discovered in epoch-0 tasks exist in
-`global_bb` after `drain_epoch`, but `epoch_session_snapshot` for the remainder
-epoch still has zero asset children, so every remainder task loads assets from
-`global_bb` individually.
-
-### Fix Direction
-
-Two independent fixes, one per issue:
-
-**Fix A — stub `global_bb` for epoch-0 parallel tasks.**
-Inside `parse_epoch`'s parallel branch, pass `BeliefBase::empty()` to spawned tasks
-instead of `cached_global_bb` when dispatching epoch-0 batches (network-dir groups
-and the leaf batch). `BeliefBase` already satisfies `BeliefSource + EpochDrain +
-Clone + Send + 'static`. Any `global_bb` miss in an epoch-0 task becomes an explicit
-miss rather than a live DB call, surfacing snapshot coverage gaps immediately.
-Requires threading a separate `epoch0_global_bb` parameter into `parse_epoch`, or
-detecting epoch-0 inside the spawned task closure.
-
-**Fix B — post-drain asset pull into `self.builder.session_bb`.**
-After each `drain_epoch` call in `parse_all`, query `global_bb` for the
-const-namespace subgraph and merge it into `self.builder.session_bb` directly —
-the same logic as `initialize_stack`'s const-namespace guard, but executed once on
-the compiler's own builder. The next `epoch_session_snapshot` then includes the full
-asset set. Cost: one `eval` call per epoch boundary; no task-level changes required.
-
-Fix B alone is sufficient to eliminate the asset-loading cost on remainder epochs.
-Fix A is a correctness/observability improvement; see note below on type-system
-constraints.
-
-### Implementation State
-
-**Fix B — IMPLEMENTED** (`src/codec/compiler.rs`).
-`DocumentCompiler::sync_asset_snapshot` is called after every `drain_epoch` in
-`parse_all` (pre-epoch root parse, depth-group loop, leaf batch, remainder loop).
-It queries `global_bb` for each `content_namespaces()` BID, emits a `NodeUpdate`
-into `self.builder.session_bb_mut()`, then evals the full namespace subgraph and
-merges it via `merge_from` with a namespace-seeded BFS. The next
-`epoch_session_snapshot` then includes the full asset subgraph, and every
-remainder-epoch task's `initialize_stack` hits the `content_namespaces()` guard
-and short-circuits before touching `global_bb`.
-
-**Fix A — DEFERRED.** `parse_epoch<B: BeliefSource + ...>` uses a single concrete
-`B` throughout; substituting `BeliefBase::empty()` (a different type) for epoch-0
-tasks requires a second type parameter or a trait-object indirection. Since
-epoch-0 tasks already get empty misses in practice (assets don't exist in
-`global_bb` at epoch-0), this is a polish item. Verify necessity via
-`parse_log.py --warnings` after Fix B; if no epoch-0 `eval_unbalanced` hits appear,
-Fix A is unnecessary.
-
-### Future Optimization — Scope-Narrowed Asset Query
-
-`sync_asset_snapshot` currently issues one `global_bb.eval` per namespace per epoch
-boundary — O(1) per epoch vs. the previous O(tasks) per epoch, which is the
-meaningful win. A further optimization: scope the query to assets reachable from
-the current epoch's parent network node rather than the full namespace subgraph.
-The query shape would be:
-`Expression(StatePred::Bid(epoch_parent ∪ const_nodes), traverse: upstream: depth=1)`.
-This avoids pulling the entire ~366-asset namespace graph when only a subset is
-relevant to the current epoch's batch. Not blocking; revisit if `sync_asset_snapshot`
-shows up in profiles on very large corpora.
-
-### When to Verify
-
-Run `--jobs 8` on the MDN JS corpus and check `parse_log.py --phase-summary`:
-- Phase 0 mean for attempt-2+ should drop significantly (target: <1s vs. prior 4–9s)
-- `[initialize_stack] Loaded N assets` log lines should show 0 for all remainder tasks
-- `snapshot_states` count in task seeding logs should increase by ~400 (asset count)
-- `snapshot_edges` still ≥ 1 on all tasks (Bug 1 regression check)
-- Zero `no such table: beliefs` errors (Bug 2 regression check)
+Option B as an immediate safety net; Option A as the eventual correct fix when a large
+mechanical refactor is otherwise warranted (e.g. a NodeKey redesign).
 
 ---
+
+## MDN Corpus Macro-Benchmark Script (from Issue 47)
+
+**Priority**: LOW — corpus now parses in ~60 s; ad-hoc runs are fast enough for human validation
+
+**Context**: The full MDN JavaScript corpus (1,363 files) previously took ~19.7 hours; it now
+parses in ~60 seconds wall time on a debug build. At this speed a thin automated timed script
+is viable where a full Criterion macro-benchmark never was.
+
+**Proposed**: A shell script (e.g. `benches/run_mdn_benchmark.sh`) that:
+1. Runs `noet parse .bench_corpora/mdn-content/files/en-us/web/javascript` with `RUST_LOG=warn`
+2. Captures wall time, file count, and warning counts
+3. Appends a one-line JSON record to a local `benches/mdn_benchmark_history.jsonl` file
+4. Prints a human-readable summary comparing to the previous run
+
+This gives before/after comparisons for performance-sensitive changes without requiring CI
+integration or Criterion infrastructure. Keep it local-only (add `benches/mdn_benchmark_history.jsonl`
+to `.gitignore`).
+
+**Not needed**: Full Criterion Tier 2/3 macro-benchmark infrastructure — the corpus runs are
+fast enough that wall-clock comparison is sufficient signal.
+
+## Memory Profiling (from Issue 47)
+
+**Priority**: LOW — no evidence of memory problems at current scale
+
+**Context**: Peak heap usage during a full MDN JS corpus parse has never been measured. At
+1,363 files in 60 s the system is clearly not memory-bound, but a baseline would be useful
+before targeting GB-scale corpora.
+
+**Proposed**: Use `heaptrack` (Linux) or `Instruments` (macOS) on a single full corpus run;
+record peak RSS and allocation hotspots. No code changes needed — purely a profiling exercise.
+Document results in `docs/design/` or as a note in `BACKLOG.md`.
+
+**When**: Only relevant if targeting corpora significantly larger than MDN JS (~50 MB source).
+
+## `rari` Cross-Project Benchmark Comparison (from Issue 47)
+
+**Priority**: LOW — informational only
+
+**Context**: `github.com/mdn/rari` is the Rust-based MDN build tool (replaced Yari's Node.js
+pipeline in 2024). It processes the same MDN corpus used for benchmarking. Rari uses flat macro
+resolution — no belief graph, no multi-pass convergence — so it represents a lower bound on
+what a single-pass Rust renderer can achieve on identical input.
+
+Wall-clock time is now in the seconds range (the original deferral condition was "minutes"),
+so this comparison is now a valid target.
+
+**Proposed**: Clone `rari`, run it against `.bench_corpora/mdn-content`, record wall time and
+peak memory, document the delta. The gap quantifies the cost of noet-core's belief graph model
+vs. a simpler rendering pipeline.
+
+## `typeof` Path-Mismatch Warning (from Issue 47)
+
+**Priority**: LOW — correctness gap, no user-visible breakage confirmed
+
+**Context**: Run 12 (2025-07-10) shows 546 `check_for_link_and_push Path mismatch` warnings,
+all from a single file (`reference/operators/typeof`). The mismatch is:
+- proto abs path: `.../reference/operators/typeof`
+- ctx repo-relative path: `reference/expressions-and-operators/typeof/index.md`
+
+This is a **different** variant from the original `symbol.*` ID-collision bug (which is fixed).
+This one is caused by an MDN directory reorganization where `operators/` was renamed to
+`expressions-and-operators/` — the proto index picks up the old path, the ctx has the new one.
+Links from `typeof` to cross-corpus targets are silently left unchanged.
+
+**Investigation needed**: Confirm whether this fires only on MDN (due to the rename) or also
+on other corpora. If MDN-specific, low priority. If it can fire on any corpus with directory
+renames, it warrants a dedicated issue.
+
+**Related**: `check_for_link_and_push` bail-out refactor (already in BACKLOG) would make the
+warning sites easier to audit.
+
+## External URL Content-Hashing (from Issue 30)
+
+External URL tracking as first-class `BeliefNode`s is functionally complete in the sense
+that URLs are recorded and traversable in the belief graph. The remaining unimplemented
+piece — fetching URL content, computing a SHA256 of the response body, and using that hash
+as the BID input — was intentionally deferred. It is not planned in the near term.
+
+**Proposed design when revisited:**
+- Opt-in per-network via config (e.g. `fetch_external_urls = true` in a network's
+  `index.md` frontmatter), not a global CLI flag. Global opt-in is too blunt for mixed
+  corpora (some networks reference internal-only URLs that should never be fetched).
+- `reqwest` (async, pure Rust) for HTTP GET; SHA256 of response *text* (not headers/bytes)
+  as the BID seed in `UUID_NAMESPACE_HREF`.
+- `.url-manifest.toml` written as a peer file to each BeliefNode metadata file, recording
+  URL, content hash, status code, `fetched_at`, and `last_modified` from HTTP headers.
+- Broken links (404, timeout) tracked as nodes with error status rather than failing
+  compilation.
+- Default behavior: **no network requests** without explicit opt-in. GDPR / privacy
+  concern is explicit in the original design.
+
+**References:** `properties.rs:href_namespace()`, `builder.rs:push_relation()`,
+`md.rs:LinkAccumulator`. Full design preserved in
+`docs/project/completed/ISSUE_30_EXTERNAL_URL_TRACKING.md`.
+
+## SPA Viewer Performance — Remaining Items
+
+**Priority**: LOW  
+**Discovered during**: 2025-04-30 session on a large systems-engineering corpus
+
+First round of profiling and fixes completed 2025-04-30.  Chrome
+Performance traces on that corpus (~32k nodes, 50 networks, 47 MB shards)
+identified and resolved the main bottlenecks:
+
+**Completed:**
+- ✅ Deferred search index loading (~20 MB) to after first paint
+- ✅ Early page HTML render (prefetch + render before WASM init)
+- ✅ Metadata panel "Loading…" placeholder during WASM init
+- ✅ Target-network shard resolution from URL hash (load the user's
+  destination network first, entry network in background)
+
+**Remaining (~853ms WASM microtask is the dominant cost):**
+
+- **WASM deserialization cost (~850ms)**: The dominant remaining cost is
+  a single synchronous WASM call (`load_shard` → msgpack deserialize →
+  PathMap rebuild).  Tested `setTimeout(0)` between `load_shard` and
+  `get_nav_tree` — no perceptible improvement because the early page
+  prefetch already paints content, and the user is waiting for
+  scroll-to-anchor + metadata which require the full `loadDocument`
+  flow after WASM init.  Real gains require WASM-side changes:
+  streaming deserialization, incremental PathMap construction, or
+  deferred PathMap build (build on first query, not on load).
+- **Shard-load transitions**: Clicking into a new network triggers a
+  shard fetch + merge.  Is the merge O(N) in total graph size or
+  O(shard)?  Does the nav-tree rebuild unnecessarily re-render the
+  entire tree?
+- **DOM weight**: Does the traceability table or nav tree emit excessive
+  DOM nodes for large networks?  Virtualisation (only rendering visible
+  rows) would help.
+
+## Codec API Footguns (from downstream codec implementations)
+
+Discovered while implementing custom `DocCodec` / `WalkCodec` extensions in
+downstream application shims. Each item represents a gap in documentation,
+default behavior, or diagnostics that tripped up codec authors.
+
+### Child IRNodes must set `proto.path` to the parent document path
+
+**Severity**: panic at runtime (silent during unit tests, crashes on full compile)
+
+Child nodes (heading > document root heading) returned from `codec.nodes()` must
+have their `path` field set to the same value as the parent document's path.
+Without this, `GraphBuilder::get_parent_from_stack()` cannot match the child to
+its parent via `proto_filepath == stack_filepath`, and the node never gets a
+PathMap entry. This causes a panic in Phase 4 (`inject_context`) with the message
+`"Set should be balanced here: in_pathmap=false"`.
+
+`MdCodec` sections work because the markdown parser sets `proto.path` on all
+section IRNodes during parsing. Custom codecs must do this manually.
+
+**Suggestion**: `GraphBuilder::push()` could default child node paths to the
+parent's path when `proto.path` is empty and `proto.heading > 1`. Or the
+`DocCodec` trait docs could explicitly state this requirement.
+
+### Child IRNodes should set explicit `document["id"]` for uniqueness
+
+**Severity**: silent incorrect behavior (slug collisions)
+
+The builder derives node identity from `IRNode::id()`, which falls back to
+`to_anchor(title)` when no explicit `id` is set. If multiple children have the
+same title (e.g. two structs with a `count` field, or two subsystems with an
+`io.x` port), their slugs collide.
+
+The fix for codec authors is to set `document["id"]` explicitly with a qualified
+name (e.g. `"parent_name.child_name"`).
+
+**Suggestion**: Document this in the `DocCodec` trait. Consider a builder
+diagnostic that warns when multiple sibling nodes produce the same slug.
+
+### Top-level symbols in multi-declaration documents must be heading=3, not heading=2
+
+**Severity**: panic at runtime
+
+A document (heading=2) that produces multiple top-level symbols (e.g. a header
+file with two class declarations) cannot use heading=2 for the symbols — they'd
+be siblings of the document node in the stack, not children. The symbols must
+be heading=3 (children of the heading=2 document root).
+
+This is non-obvious because for a single-declaration file, heading=2 works fine
+— the symbol IS the document. The crash only manifests with multi-declaration
+files.
+
+**Suggestion**: Document the heading hierarchy contract: heading=1 is network,
+heading=2 is document, heading≥3 is document-internal structure.
+
+### `CLAIM_MAP.reject()` on a directory does not affect files inside it
+
+**Severity**: confusion, not a crash
+
+Rejecting a directory via `CLAIM_MAP.reject(dir)` prevents the directory from
+being parsed as a sub-network, but files inside the directory are still
+individually tracked and parsed if they match `WALK_CODECS.should_track()` or
+`CODECS`. This is correct behavior but non-obvious — one might expect rejecting
+a directory to transitively reject its contents.
+
+**Suggestion**: Document this in the `CLAIM_MAP` API docs.
+
+## Codec API Ergonomic Improvements (from downstream codec implementations)
+
+### Boilerplate in `DocCodec` implementations
+
+Every custom codec requires ~40 lines of identical boilerplate for
+`inject_context`, `finalize`, `generate_source` — all returning `None` / empty.
+A `SimpleDocCodec` trait with default implementations (or a derive macro) would
+reduce noise.
+
+### `CodecFactory` is `fn()` not `Fn` — cannot capture state
+
+The factory type is a bare function pointer, not a closure. This means you can't
+capture state in a factory. For codecs with variants (e.g. a YAML codec that
+handles multiple schema kinds), the workaround is separate factory functions
+per variant. A `Box<dyn Fn>` factory would be more flexible.
+
+### No codec-level diagnostic for "file parsed but produced no BeliefBase impact"
+
+When a file is tracked by `WALK_CODECS` and appears in `ProtoIndex` children
+but is never claimed by any codec's `parse()`, it silently becomes an
+`UnclaimedDataCodec` node. A codec-level diagnostic ("file X is walk-visible but
+no network claimed it") would help during development.
+
+This already exists as `ParseDiagnostic::info` in `parse_one_path` branch 3, but
+it's not surfaced prominently during development iterations.
+
+### ~~HTML pages from custom codecs get nil BID (`00000000-...`)~~ ✅ Resolved
+
+Custom codecs must implement `inject_context` and call
+`proto.update_from_context(ctx)` to write the push()-assigned BID back into
+`proto.document["bid"]`. Codecs that return `Ok(None)` from `inject_context`
+skip this write-back, producing nil BIDs in generated HTML.
+
+Fixed in a downstream C++ codec crate by implementing `inject_context`
+properly in all 6 codecs. The `DocCodec` trait docs should state this
+requirement explicitly (see footgun #1 above re: documenting codec contracts).
+
+### Symlinks need repo-relative path resolution for cross-network edges
+
+**Severity**: broken cross-network edges
+
+Filesystem symlinks used as cross-references resolve via `std::fs::canonicalize`
+to absolute paths. The `NodeKey::Path` emitted in `prepare_proto_relations`
+carries this absolute path. `regularize_unchecked` should strip the repo root to
+get a repo-relative path, but this may fail if the canonicalized path doesn't
+start with the expected repo root prefix (e.g. macOS `/private/var` vs `/var`
+symlink divergence).
+
+Needs investigation: trace the `regularize_unchecked` call for symlink-based
+edges and verify the path matches a registered node.
+
+## DbConnection Query Evaluation Optimizations (from Issue 83)
+
+The SQL-native `DbConnection::evaluate` pipeline (Issue 83 Phase 6b)
+issues one SQL query per traversal hop. Several optimizations can
+reduce the query count. See `docs/design/beliefbase_architecture.md`
+§3.8 "Optimization Opportunities" for full details and example SQL.
+
+**Priority: LOW** — correctness is established; optimize when profiling
+shows DB query latency is a bottleneck (likely when watch-service
+queries move to the `evaluate` pipeline).
+
+- **Recursive CTE for unbounded traversals**: Collapse `s-section-k {max}`
+  (balance_map) from N round-trips to one `WITH RECURSIVE` query.
+  Applies to any fixed-kind unbounded traversal. Highest-impact single
+  optimization.
+
+- **Batched halo query**: The halo (`sko-[*]-sko {1}`) issues up to 3
+  queries (one per input role). Combine into a single `OR`-based query.
+
+- **Path-table acceleration for Section traversals**: When the QuerySpec
+  shape matches (subject within a known network, Section-only traversal),
+  rewrite as a `paths` table prefix scan — O(1) index lookup vs O(depth)
+  iterative edge walking.
+
+- **States cache across evaluate call**: `apply_filter_sql` fetches states
+  per filter step; the final bulk materialization re-fetches the same
+  states. A shared `BTreeMap<Bid, BeliefNode>` cache eliminates redundant
+  fetches.
+
+- **Temp table for large frontier sets**: When frontier exceeds hundreds
+  of BIDs, `CREATE TEMP TABLE frontier(bid TEXT)` + `JOIN` is more
+  efficient than large `IN (...)` clauses.
+
+- **BeliefBase in-memory evaluation.** The in-memory `evaluate`
+  pipeline has its own optimization surface (`apply_traversal`,
+  graph materialization, index lookups). Profile against large corpora
+  (30k+ nodes) to identify hot paths. See §3.8 in
+  `beliefbase_architecture.md`.
 
 ## Notes
 

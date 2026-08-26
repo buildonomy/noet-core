@@ -177,7 +177,7 @@ pub fn init_tracing() {
     use tracing_subscriber::prelude::*;
 
     #[cfg(debug_assertions)]
-    let default_level = tracing_subscriber::filter::LevelFilter::DEBUG;
+    let default_level = tracing_subscriber::filter::LevelFilter::INFO;
     #[cfg(not(debug_assertions))]
     let default_level = tracing_subscriber::filter::LevelFilter::WARN;
 
@@ -202,15 +202,20 @@ pub fn init_tracing() {
 
 #[cfg(feature = "wasm")]
 use crate::{
-    beliefbase::{BeliefBase, BeliefGraph},
+    beliefbase::{BeliefBase, BeliefGraph, BidGraph},
     codec::normalize_path_extension_impl,
     nodekey::NodeKey,
     paths::AnchorPath,
     properties::{
         asset_namespace, buildonomy_namespace, content_namespaces, href_namespace, BeliefKind,
-        BeliefNode, Bid, Bref, WeightKind, WEIGHT_SORT_KEY,
+        BeliefNode, Bid, Bref, WeightKind, WEIGHT_DOC_PATHS, WEIGHT_SORT_KEY,
     },
-    query::{Expression, StatePred},
+    query::{
+        spec::TextSearchProvider,
+        view::{ViewOutput, VIEWS},
+        QueryPackage, QuerySpec,
+    },
+    shard::search::{query_search_index, SearchIndex},
 };
 
 #[cfg(feature = "wasm")]
@@ -220,9 +225,6 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 #[cfg(feature = "wasm")]
-use enumset::EnumSet;
-
-#[cfg(feature = "wasm")]
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -230,7 +232,30 @@ use std::{
 };
 
 #[cfg(feature = "wasm")]
-use js_sys::{Object, Reflect};
+use js_sys::{Object, Reflect, Uint8Array};
+
+#[cfg(feature = "wasm")]
+use rust_xlsxwriter::{Format, Workbook, XlsxError};
+
+#[cfg(feature = "wasm")]
+/// Result of a query evaluation, returned to JavaScript as `{ graph, tape_indices }`.
+///
+/// `graph` is the `BeliefGraph` containing matching nodes and their relations.
+/// `tape_indices` maps each result BID to the tape entry index where it was
+/// first discovered — enabling the viewer to show traversal depth.
+///
+/// # JavaScript Example
+/// ```javascript,ignore
+/// const result = bb.query(spec);
+/// const graph = result.graph;            // BeliefGraph
+/// const indices = result.tape_indices;   // Map<bid_string, number>
+/// ```
+#[cfg(feature = "wasm")]
+#[derive(Serialize)]
+struct QueryResult {
+    graph: BeliefGraph,
+    tape_indices: BTreeMap<Bid, usize>,
+}
 
 /// Plain serialisable result returned as a JS object `{ bid, bref }`.
 ///
@@ -322,6 +347,29 @@ pub struct RelatedNode {
     pub link_title: Option<String>,
 }
 
+/// An edge endpoint entry in the `NodeContext.graph`, optionally annotated with the
+/// BID of a third-party owner node (a section containing a `{maps_to}` directive).
+///
+/// When `owner_bid` is `Some`, the edge is owned by a section node rather than by the
+/// source or sink endpoint. The viewer renders "via <section title>" in that case.
+/// When `owner_bid` is `None`, the edge uses the standard source/sink ownership model.
+#[cfg(feature = "wasm")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EdgeEntry {
+    /// The BID of the source or sink node at the other end of this edge.
+    pub bid: Bid,
+    /// The BID of the section node that owns this edge via a `{maps_to}` directive,
+    /// if any. `None` for standard source-owned or sink-owned edges.
+    pub owner_bid: Option<Bid>,
+}
+
+#[cfg(feature = "wasm")]
+impl EdgeEntry {
+    pub fn new(bid: Bid, owner_bid: Option<Bid>) -> Self {
+        Self { bid, owner_bid }
+    }
+}
+
 /// See `docs/design/interactive_viewer.md` § WASM Integration for specification.
 #[cfg(feature = "wasm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,11 +395,20 @@ pub struct NodeContext {
     /// ⚠️ JavaScript: This is a Map object! Use `.get(bid)`, `.size`, `.entries()`
     pub related_nodes: BTreeMap<Bid, RelatedNode>,
     /// Relations by weight kind: Map<WeightKind, (sources, sinks)>
-    /// Sources: BIDs of nodes linking TO this one
-    /// Sinks: BIDs of nodes this one links TO
+    /// Sources: EdgeEntries for nodes linking TO this one
+    /// Sinks: EdgeEntries for nodes this one links TO
     /// Both vectors are sorted by WEIGHT_SORT_KEY edge payload value
     /// ⚠️ JavaScript: This is a Map object! Use `.get(weightKind)`, `.size`, `.entries()`
-    pub graph: HashMap<WeightKind, (Vec<Bid>, Vec<Bid>)>,
+    pub graph: HashMap<WeightKind, (Vec<EdgeEntry>, Vec<EdgeEntry>)>,
+    /// All edges owned by a third-party section node (a `{maps_to}` directive).
+    /// Each entry identifies the owning section BID, source BID, sink BID, and weight kind.
+    /// ✅ JavaScript: This is an Array. Use `[index]`, `.length`, `.forEach()`
+    pub owned_edges: Vec<crate::beliefbase::OwnedEdge>,
+    /// External alias URLs for this node (from `url_aliases` or `alias-template`).
+    /// Collected from the `WEIGHT_DOC_PATHS` payload on Section edges to
+    /// `href_namespace`. Empty for nodes without aliases.
+    /// ✅ JavaScript: This is an Array of strings.
+    pub alias_urls: Vec<String>,
 }
 
 /// WASM-compatible path context
@@ -427,6 +484,14 @@ pub struct BeliefBaseWasm {
     /// Used by `unload_shard` to know which nodes to remove.
     /// The special key `"global"` is used for the global shard.
     loaded_shards: RefCell<HashMap<String, BTreeSet<Bid>>>,
+    /// Loaded search indices keyed by network bref string.
+    /// Populated by `load_search_index`; queried by `search`.
+    search_indices: RefCell<HashMap<String, SearchIndex>>,
+    /// Maps every node's bref (12 hex chars) to its home network's bref.
+    /// Populated from the global shard's `bref_index` during `load_shard("global", ...)`.
+    /// Queried by `network_bref_for_bref` to resolve which shard to load for
+    /// an arbitrary node.
+    bref_index: RefCell<BTreeMap<String, String>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -595,12 +660,10 @@ impl BeliefBaseWasm {
         let node_count = graph.states.len();
         let relation_count = graph.relations.0.edge_count();
 
-        console::log_1(
-            &format!(
-                "✅ Loaded BeliefGraph: {} nodes, {} relations",
-                node_count, relation_count
-            )
-            .into(),
+        tracing::debug!(
+            "Loaded BeliefGraph: {} nodes, {} relations",
+            node_count,
+            relation_count
         );
 
         // Parse entry point BID string directly
@@ -610,7 +673,7 @@ impl BeliefBaseWasm {
             JsValue::from_str(&msg)
         })?;
 
-        console::log_1(&format!("✅ Entry point Bid: {}", entry_point_bid).into());
+        tracing::debug!("Entry point BID: {}", entry_point_bid);
 
         // Convert BeliefGraph to BeliefBase
         let inner = BeliefBase::from(graph);
@@ -619,6 +682,52 @@ impl BeliefBaseWasm {
             inner: RefCell::new(inner),
             entry_point_bid,
             loaded_shards: RefCell::new(HashMap::new()),
+            search_indices: RefCell::new(HashMap::new()),
+            bref_index: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn from_msgpack(
+        data: Uint8Array,
+        entry_bid_str: String,
+    ) -> Result<BeliefBaseWasm, JsValue> {
+        let bytes = data.to_vec();
+
+        // Deserialize MessagePack bytes into BeliefGraph
+        let graph: BeliefGraph = rmp_serde::from_slice(&bytes).map_err(|e| {
+            let msg = format!("❌ Failed to parse BeliefGraph msgpack: {}", e);
+            console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
+
+        let node_count = graph.states.len();
+        let relation_count = graph.relations.0.edge_count();
+
+        tracing::debug!(
+            "Loaded BeliefGraph (msgpack): {} nodes, {} relations",
+            node_count,
+            relation_count
+        );
+
+        // Parse entry point BID string directly
+        let entry_point_bid = Bid::try_from(entry_bid_str.as_str()).map_err(|e| {
+            let msg = format!("❌ Failed to parse entry point BID: {}", e);
+            console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
+
+        tracing::debug!("Entry point BID: {}", entry_point_bid);
+
+        // Convert BeliefGraph to BeliefBase
+        let inner = BeliefBase::from(graph);
+
+        Ok(BeliefBaseWasm {
+            inner: RefCell::new(inner),
+            entry_point_bid,
+            loaded_shards: RefCell::new(HashMap::new()),
+            search_indices: RefCell::new(HashMap::new()),
+            bref_index: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -644,10 +753,10 @@ impl BeliefBaseWasm {
     /// const manifestJson = await manifestResp.text();
     /// const bb = BeliefBaseWasm.from_manifest(manifestJson, entryBidStr);
     /// // Now load the global shard and entry network shard:
-    /// const globalResp = await fetch("/beliefbase/global.json");
-    /// await bb.load_shard("global", await globalResp.text());
-    /// const entryResp = await fetch(`/beliefbase/networks/${entryBref}.json`);
-    /// await bb.load_shard(entryBref, await entryResp.text());
+    /// const globalResp = await fetch("/beliefbase/global.msgpack");
+    /// await bb.load_shard("global", await globalResp.arrayBuffer());
+    /// const entryResp = await fetch(`/beliefbase/networks/${entryBref}.msgpack`);
+    /// await bb.load_shard(entryBref, await entryResp.arrayBuffer());
     /// ```
     #[wasm_bindgen]
     pub fn from_manifest(
@@ -668,18 +777,17 @@ impl BeliefBaseWasm {
             JsValue::from_str(&msg)
         })?;
 
-        console::log_1(
-            &format!(
-                "✅ Shard manifest parsed. Entry point: {}. Call load_shard() to populate.",
-                entry_point_bid
-            )
-            .into(),
+        tracing::debug!(
+            "Shard manifest parsed. Entry point: {}. Call load_shard() to populate.",
+            entry_point_bid
         );
 
         Ok(BeliefBaseWasm {
             inner: RefCell::new(BeliefBase::default()),
             entry_point_bid,
             loaded_shards: RefCell::new(HashMap::new()),
+            search_indices: RefCell::new(HashMap::new()),
+            bref_index: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -704,11 +812,11 @@ impl BeliefBaseWasm {
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
-    /// const count = await bb.load_shard("global", globalJson);
+    /// const count = await bb.load_shard("global", globalBytes);
     /// console.log(`BeliefBase now has ${count} nodes`);
     /// ```
     #[wasm_bindgen]
-    pub fn load_shard(&self, bref_key: String, shard_json: String) -> Result<usize, JsValue> {
+    pub fn load_shard(&self, bref_key: String, data: Uint8Array) -> Result<usize, JsValue> {
         // If already loaded, unload first (idempotent reload).
         {
             let loaded = self.loaded_shards.borrow();
@@ -718,18 +826,20 @@ impl BeliefBaseWasm {
             }
         }
 
+        // Convert Uint8Array → Vec<u8> for rmp_serde deserialization.
+        let bytes = data.to_vec();
+
         // Deserialize: global shard and network shards have different schemas.
         #[allow(clippy::type_complexity)]
         let (states, edges): (
             BTreeMap<String, BeliefNode>,
             Vec<(Bid, Bid, crate::properties::WeightSet)>,
         ) = if bref_key == "global" {
-            let shard: crate::shard::GlobalShard =
-                serde_json::from_str(&shard_json).map_err(|e| {
-                    let msg = format!("❌ Failed to parse global shard: {}", e);
-                    console::error_1(&msg.clone().into());
-                    JsValue::from_str(&msg)
-                })?;
+            let shard: crate::shard::GlobalShard = rmp_serde::from_slice(&bytes).map_err(|e| {
+                let msg = format!("❌ Failed to parse global shard: {}", e);
+                console::error_1(&msg.clone().into());
+                JsValue::from_str(&msg)
+            })?;
             let edges = shard
                 .relations
                 .edges
@@ -740,14 +850,21 @@ impl BeliefBaseWasm {
                     Some((src, snk, e.weights))
                 })
                 .collect();
+
+            // Store the bref→network_bref index for shard resolution queries.
+            *self.bref_index.borrow_mut() = shard.bref_index;
+            tracing::debug!(
+                "Loaded bref_index with {} entries",
+                self.bref_index.borrow().len()
+            );
+
             (shard.states, edges)
         } else {
-            let shard: crate::shard::NetworkShard =
-                serde_json::from_str(&shard_json).map_err(|e| {
-                    let msg = format!("❌ Failed to parse network shard '{}': {}", bref_key, e);
-                    console::error_1(&msg.clone().into());
-                    JsValue::from_str(&msg)
-                })?;
+            let shard: crate::shard::NetworkShard = rmp_serde::from_slice(&bytes).map_err(|e| {
+                let msg = format!("❌ Failed to parse network shard '{}': {}", bref_key, e);
+                console::error_1(&msg.clone().into());
+                JsValue::from_str(&msg)
+            })?;
             let edges = shard
                 .relations
                 .edges
@@ -769,7 +886,6 @@ impl BeliefBaseWasm {
 
         // Build a BeliefGraph from the shard data and merge it into the inner BeliefBase.
         let graph = {
-            use crate::beliefbase::BidGraph;
             let relations = BidGraph::from_edges(edges);
             BeliefGraph {
                 states: states
@@ -791,12 +907,12 @@ impl BeliefBaseWasm {
             .insert(bref_key.clone(), shard_bids);
 
         let total = self.inner.borrow().states().len();
-        console::log_1(
-            &format!(
-                "✅ Loaded shard '{}': +{} nodes, {} edges → {} total nodes",
-                bref_key, added_count, edge_count, total
-            )
-            .into(),
+        tracing::debug!(
+            "Loaded shard '{}': +{} nodes, {} edges → {} total nodes",
+            bref_key,
+            added_count,
+            edge_count,
+            total
         );
         Ok(total)
     }
@@ -859,15 +975,19 @@ impl BeliefBaseWasm {
                 console::error_1(&msg.clone().into());
                 return Err(JsValue::from_str(&msg));
             }
+
+            // Clear the bref_index when the global shard is unloaded.
+            if bref_key == "global" {
+                self.bref_index.borrow_mut().clear();
+            }
         }
 
         let total = self.inner.borrow().states().len();
-        console::log_1(
-            &format!(
-                "✅ Unloaded shard '{}': -{} nodes → {} total nodes",
-                bref_key, remove_count, total
-            )
-            .into(),
+        tracing::debug!(
+            "Unloaded shard '{}': -{} nodes → {} total nodes",
+            bref_key,
+            remove_count,
+            total
         );
         Ok(total)
     }
@@ -886,6 +1006,65 @@ impl BeliefBaseWasm {
         let loaded = self.loaded_shards.borrow();
         let keys: Vec<&str> = loaded.keys().map(|s| s.as_str()).collect();
         serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Load a pre-built search index for one network from msgpack bytes.
+    ///
+    /// Call this once per network after fetching `search/{bref}.idx.msgpack`.
+    /// The index is held in memory and queried by `search()`.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const resp = await fetch(`search/${bref}.idx.msgpack`);
+    /// const buf  = await resp.arrayBuffer();
+    /// beliefbase.load_search_index(bref, new Uint8Array(buf));
+    /// ```
+    ///
+    /// # Arguments
+    /// * `bref` — 5-hex-char network bref (the key used to store and retrieve the index)
+    /// * `data` — Raw msgpack bytes of the serialized [`SearchIndex`]
+    ///
+    /// # Returns
+    /// The number of indexed documents in the loaded index.
+    #[wasm_bindgen]
+    pub fn load_search_index(&self, bref: String, data: &[u8]) -> Result<usize, JsValue> {
+        let index: SearchIndex = rmp_serde::from_slice(data).map_err(|e| {
+            JsValue::from_str(&format!(
+                "load_search_index: failed to deserialize msgpack for bref '{}': {}",
+                bref, e
+            ))
+        })?;
+        let doc_count = index.doc_count;
+        self.search_indices.borrow_mut().insert(bref, index);
+        Ok(doc_count)
+    }
+
+    /// Unload the search index for a network, freeing its memory.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// beliefbase.unload_search_index(bref);
+    /// ```
+    #[wasm_bindgen]
+    pub fn unload_search_index(&self, bref: String) {
+        self.search_indices.borrow_mut().remove(&bref);
+    }
+
+    /// Returns the set of brefs for which a search index is currently loaded.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const loaded = beliefbase.loaded_search_indices();
+    /// // loaded is a JS Set<string>
+    /// ```
+    #[wasm_bindgen]
+    pub fn loaded_search_indices(&self) -> JsValue {
+        let indices = self.search_indices.borrow();
+        let arr = js_sys::Array::new();
+        for key in indices.keys() {
+            arr.push(&JsValue::from_str(key));
+        }
+        js_sys::Set::new(&arr.into()).into()
     }
 
     /// Return whether a BID is currently present in the loaded belief base.
@@ -924,49 +1103,205 @@ impl BeliefBaseWasm {
         (node_count * AVG_NODE_BYTES) / (1024.0 * 1024.0)
     }
 
-    /// Query nodes using Expression syntax
+    /// Query nodes using QuerySpec syntax.
     ///
-    /// This exposes the full query API to JavaScript.
-    /// Returns a BeliefGraph with matching nodes and their relations.
+    /// Returns `{ graph, tape_indices }` where `graph` is a `BeliefGraph`
+    /// and `tape_indices` maps each result BID to the tape entry index
+    /// where it was first discovered (for traversal depth display).
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
-    /// // Query by BID
-    /// const expr = { StateIn: { Bid: ["01234567-89ab-cdef-0123-456789abcdef"] } };
-    /// const graph = await bb.query(expr);
-    ///
-    /// // Query by title regex
-    /// const expr = { StateIn: { Title: "documentation.*" } };
-    /// const graph = await bb.query(expr);
-    ///
-    /// // Query documents only
-    /// const expr = { StateIn: { Kind: "Document" } };
-    /// const graph = await bb.query(expr);
+    /// const result = bb.query(spec);
+    /// const graph = result.graph;          // BeliefGraph
+    /// const indices = result.tape_indices; // Map<bid, tape_index>
     /// ```
     #[wasm_bindgen]
-    pub async fn query(&self, expr_js: JsValue) -> Result<JsValue, JsValue> {
-        // Deserialize Expression from JavaScript
-        let expr: Expression = serde_wasm_bindgen::from_value(expr_js).map_err(|e| {
-            let msg = format!("❌ Failed to parse Expression: {}", e);
+    pub fn query(&self, spec_js: JsValue) -> Result<JsValue, JsValue> {
+        // Deserialize QuerySpec from JavaScript
+        let spec: QuerySpec = serde_wasm_bindgen::from_value(spec_js).map_err(|e| {
+            let msg = format!("❌ Failed to parse QuerySpec: {}", e);
             console::error_1(&msg.clone().into());
             JsValue::from_str(&msg)
         })?;
 
-        console::log_1(&format!("🔍 Query: {:?}", expr).into());
+        tracing::debug!("Query: {:?}", spec);
 
-        // Evaluate expression directly (BeliefSource trait not available in WASM)
+        // Evaluate synchronously — WASM has no async runtime.
+        // Provide a TextSearchProvider backed by the loaded search indices
+        // so that TextMatch filter steps can be evaluated.
+        let indices = self.search_indices.borrow();
+        let search_provider = WasmTextSearchProvider { indices: &indices };
         let inner = self.inner.borrow();
-        let graph = inner.evaluate_expression(&expr);
+        let mut package = QueryPackage::new(spec);
+        inner
+            .evaluate_query_with_search(&mut package, Some(&search_provider))
+            .map_err(|e| {
+                let msg = format!("❌ Query evaluation failed: {}", e);
+                console::error_1(&msg.clone().into());
+                JsValue::from_str(&msg)
+            })?;
 
+        // Build tape index before consuming the package.
+        let tape_indices = package.tape().bid_tape_indices();
+        let graph = package.into_graph();
         let result_count = graph.states.len();
-        console::log_1(&format!("✅ Query returned {} nodes", result_count).into());
+        tracing::debug!("Query returned {} nodes", result_count);
 
-        // Serialize result back to JavaScript
-        serde_wasm_bindgen::to_value(&graph).map_err(|e| {
-            let msg = format!("❌ Failed to serialize result: {}", e);
+        // Return { graph, tape_indices } so the viewer can show traversal depth.
+        let result = QueryResult {
+            graph,
+            tape_indices,
+        };
+        serde_wasm_bindgen::to_value(&result).map_err(|e| {
+            let msg = format!("\u{274c} Failed to serialize result: {}", e);
             console::error_1(&msg.clone().into());
             JsValue::from_str(&msg)
         })
+    }
+
+    /// Evaluate a query and render the result through a view as JSON.
+    ///
+    /// `spec_js` — the `QuerySpec` (from `parseQuery` or manual construction).
+    /// `view_key` — registered view key (`"depth0"`, `"connectivity"`,
+    ///              `"maps_to"`, `"columns"`, `"raw_tape"`).
+    /// `view_params_js` — optional view configuration table (JS object).
+    ///                    Pass `null` or `undefined` for defaults.
+    ///
+    /// Returns the view's JSON output. Shape is view-specific.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const spec = BeliefBaseWasm.parseQuery("bref:abc composed_of(1)");
+    /// const json = bb.queryView(spec, "connectivity", null);
+    /// // json = { display: "Connectivity", headers: [...], rows: [...] }
+    /// ```
+    #[wasm_bindgen(js_name = queryView)]
+    pub fn query_view(
+        &self,
+        spec_js: JsValue,
+        view_key: &str,
+        view_params_js: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let spec: QuerySpec = serde_wasm_bindgen::from_value(spec_js)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse QuerySpec: {}", e)))?;
+
+        // Build view params from JS object (or empty table).
+        let params: toml::Table = if view_params_js.is_null() || view_params_js.is_undefined() {
+            toml::Table::new()
+        } else {
+            serde_wasm_bindgen::from_value(view_params_js).unwrap_or_default()
+        };
+
+        // Look up the view factory.
+        let factory = VIEWS
+            .get(view_key)
+            .ok_or_else(|| JsValue::from_str(&format!("Unknown view key: {view_key}")))?;
+        let renderer =
+            factory(&params).map_err(|e| JsValue::from_str(&format!("View factory error: {e}")))?;
+
+        // Evaluate the query.
+        let indices = self.search_indices.borrow();
+        let search_provider = WasmTextSearchProvider { indices: &indices };
+        let inner = self.inner.borrow();
+        let mut package = QueryPackage::balanced(spec);
+        inner
+            .evaluate_query_with_search(&mut package, Some(&search_provider))
+            .map_err(|e| JsValue::from_str(&format!("Query evaluation failed: {e}")))?;
+
+        // Render as JSON.
+        let output = renderer
+            .render_json(&package)
+            .map_err(|e| JsValue::from_str(&format!("View render error: {e}")))?;
+
+        match output {
+            ViewOutput::Json(mut json) => {
+                // Inject pathmap order and tape depth for connectivity gutter.
+                if let Some(obj) = json.as_object_mut() {
+                    let mut order_map = serde_json::Map::new();
+                    let tape_indices = package.tape().bid_tape_indices();
+                    let mut depth_map = serde_json::Map::new();
+
+                    // Anchor pathmap lookups to the SPA entry-point network
+                    // so that cross-network queries produce contiguous orders.
+                    let entry_bref = self.entry_point_bid.bref();
+
+                    if let Some(nodes) = obj.get("nodes").and_then(|n| n.as_object()) {
+                        for bid_str in nodes.keys() {
+                            if let Ok(bid) = Bid::try_from(bid_str.as_str()) {
+                                if let Some((_net, _path, order)) =
+                                    inner.paths().net_indexed_path(&entry_bref, &bid)
+                                {
+                                    let order_str = order
+                                        .iter()
+                                        .map(|i| {
+                                            if *i == crate::paths::NETWORK_SECTION_SORT_KEY {
+                                                "\u{b7}".to_string() // middle dot: gateway index slot
+                                            } else {
+                                                i.to_string()
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(".");
+                                    order_map.insert(
+                                        bid_str.clone(),
+                                        serde_json::Value::String(order_str),
+                                    );
+                                }
+                                if let Some(&depth) = tape_indices.get(&bid) {
+                                    depth_map.insert(bid_str.clone(), serde_json::json!(depth));
+                                }
+                            }
+                        }
+                    }
+
+                    obj.insert("order".to_string(), serde_json::Value::Object(order_map));
+                    obj.insert(
+                        "tape_depth".to_string(),
+                        serde_json::Value::Object(depth_map),
+                    );
+                }
+
+                // Use serialize_maps_as_objects so JSON objects become plain
+                // JS objects (not Map instances), enabling dot-notation access.
+                let serializer =
+                    serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+                json.serialize(&serializer)
+                    .map_err(|e| JsValue::from_str(&format!("JSON serialization error: {e}")))
+            }
+            _ => Err(JsValue::from_str("View did not return JSON output")),
+        }
+    }
+
+    /// Parse a query grammar string into a `QuerySpec` JS value.
+    ///
+    /// Returns the `QuerySpec` as a JS value (via `serde_wasm_bindgen`),
+    /// directly compatible with `query()`. Throws on parse failure.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const spec = BeliefBaseWasm.parseQuery("bref:abc123 composed_of(1)");
+    /// const graph = bb.query(spec);
+    /// ```
+    #[wasm_bindgen(js_name = parseQuery)]
+    pub fn parse_query(input: &str) -> Result<JsValue, JsValue> {
+        let spec = crate::query::parser::parse(input)
+            .map_err(|e| JsValue::from_str(&format!("Query parse error: {}", e)))?;
+        serde_wasm_bindgen::to_value(&spec)
+            .map_err(|e| JsValue::from_str(&format!("Query serialization error: {}", e)))
+    }
+
+    /// Serialize a `QuerySpec` JSON object back to the textual query grammar.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const queryText = BeliefBaseWasm.serializeQuery(spec);
+    /// // queryText = "id://my-node k-pragmatic-s(1)"
+    /// ```
+    #[wasm_bindgen(js_name = serializeQuery)]
+    pub fn serialize_query(spec_js: JsValue) -> Result<String, JsValue> {
+        let spec: QuerySpec = serde_wasm_bindgen::from_value(spec_js)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse QuerySpec: {}", e)))?;
+        Ok(crate::query::parser::serialize(&spec))
     }
 
     /// Get a node by BID (convenience wrapper around query)
@@ -994,7 +1329,7 @@ impl BeliefBaseWasm {
         let node_key = NodeKey::Bid { bid };
         match inner.get(&node_key) {
             Some(node) => {
-                console::log_1(&format!("✅ Found node: {}", node.title).into());
+                tracing::debug!("Found node: {}", node.title);
                 let js_val = serde_wasm_bindgen::to_value(&node).unwrap_or(JsValue::NULL);
                 // Patch payload: toml::value::Table serializes as a JS Map via
                 // serde_wasm_bindgen; JSON roundtrip produces a plain object so that
@@ -1016,41 +1351,39 @@ impl BeliefBaseWasm {
         }
     }
 
-    /// Search for nodes by title substring
+    /// Full-text TF-IDF search across all loaded search indices.
     ///
-    /// Returns array of matching nodes. Uses case-insensitive substring matching.
-    /// For more advanced queries, use `query()` with Expression syntax.
+    /// Tokenizes the query using the same rules as the compile-time index builder
+    /// (split on non-alphanumeric, lowercase, stop-word filter, Snowball English
+    /// stemming). Returns up to `limit` results sorted by descending TF-IDF score.
+    ///
+    /// Requires search indices to be loaded via `load_search_index` first. If no
+    /// indices are loaded, returns an empty array.
+    ///
+    /// Snippet extraction is not performed here — call `get_by_bid` on results
+    /// whose network is loaded to access `payload["text"]` for snippet rendering.
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
-    /// const results = bb.search("documentation");
-    /// results.forEach(node => console.log(node.title));
+    /// const results = JSON.parse(beliefbase.search("installation guide", 20));
+    /// results.forEach(r => console.log(r.score, r.title, r.bid));
     /// ```
+    ///
+    /// # Arguments
+    /// * `query` — Raw query string (tokenized internally)
+    /// * `limit` — Maximum results to return (0 = no limit)
+    ///
+    /// # Returns
+    /// JSON string: `[{ bid, network_bref, title, path, score }, ...]`
     #[wasm_bindgen]
-    pub fn search(&self, query: String) -> JsValue {
-        console::log_1(&format!("🔍 Search query: '{}'", query).into());
-
-        let query_lower = query.to_lowercase();
-        let inner = self.inner.borrow();
-
-        let results: Vec<&BeliefNode> = inner
-            .states()
-            .values()
-            .filter(|node| {
-                // Search in title
-                node.title.to_lowercase().contains(&query_lower)
-                    // Search in node ID if present
-                    || node.payload
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(|id| id.to_lowercase().contains(&query_lower))
-                        .unwrap_or(false)
-            })
-            .collect();
-
-        console::log_1(&format!("✅ Found {} matching nodes", results.len()).into());
-
-        serde_wasm_bindgen::to_value(&results).unwrap_or(JsValue::NULL)
+    pub fn search(&self, query: String, limit: usize) -> String {
+        let indices = self.search_indices.borrow();
+        let idx_refs: Vec<&SearchIndex> = indices.values().collect();
+        if idx_refs.is_empty() {
+            return "[]".to_string();
+        }
+        let results = query_search_index(&idx_refs, &query, limit);
+        serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// Get total number of nodes in the belief base
@@ -1089,7 +1422,7 @@ impl BeliefBaseWasm {
         let inner = self.inner.borrow();
         match inner.brefs().get(&bref) {
             Some(bid) => {
-                console::log_1(&format!("✅ Resolved bref to BID: {}", bid).into());
+                tracing::debug!("Resolved bref to BID: {}", bid);
                 JsValue::from_str(&bid.to_string())
             }
             None => {
@@ -1122,7 +1455,7 @@ impl BeliefBaseWasm {
 
         // Use Bid.bref() method directly
         let bref = bid.bref();
-        console::log_1(&format!("✅ Converted BID to bref: {}", bref).into());
+        tracing::debug!("Converted BID to bref: {}", bref);
         JsValue::from_str(&bref.to_string())
     }
 
@@ -1156,20 +1489,18 @@ impl BeliefBaseWasm {
         match paths.net_get_from_id(&bref, &id) {
             Some((net_bid, node_bid)) => {
                 let node_bref = node_bid.bref();
-                console::log_1(
-                    &format!(
-                        "✅ Resolved id '{}' to BID: {} (bref: {}, net: {})",
-                        id, node_bid, node_bref, net_bid
-                    )
-                    .into(),
+                tracing::debug!(
+                    "Resolved id '{}' to BID: {} (bref: {}, net: {})",
+                    id,
+                    node_bid,
+                    node_bref,
+                    net_bid
                 );
 
                 BidBrefResult::from_bid(node_bid).to_js()
             }
             None => {
-                console::warn_1(
-                    &format!("⚠️ No node found with id '{}' in network {}", id, bref).into(),
-                );
+                tracing::debug!("No node found with id '{}' in network {}", id, bref);
                 JsValue::NULL
             }
         }
@@ -1186,15 +1517,13 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn get_networks(&self) -> JsValue {
-        let mut kind_set = EnumSet::new();
-        kind_set.insert(BeliefKind::Network);
-        let expr = Expression::StateIn(StatePred::Kind(kind_set));
         let inner = self.inner.borrow();
-
-        let graph = inner.evaluate_expression(&expr);
-
-        let networks: Vec<&BeliefNode> = graph.states.values().collect();
-        console::log_1(&format!("✅ Found {} networks", networks.len()).into());
+        let networks: Vec<&BeliefNode> = inner
+            .states()
+            .values()
+            .filter(|n| n.kind.contains(BeliefKind::Network))
+            .collect();
+        tracing::debug!("Found {} networks", networks.len());
 
         serde_wasm_bindgen::to_value(&networks).unwrap_or(JsValue::NULL)
     }
@@ -1210,15 +1539,13 @@ impl BeliefBaseWasm {
     /// ```
     #[wasm_bindgen]
     pub fn get_documents(&self) -> JsValue {
-        let mut kind_set = EnumSet::new();
-        kind_set.insert(BeliefKind::Document);
-        let expr = Expression::StateIn(StatePred::Kind(kind_set));
         let inner = self.inner.borrow();
-
-        let graph = inner.evaluate_expression(&expr);
-
-        let documents: Vec<&BeliefNode> = graph.states.values().collect();
-        console::log_1(&format!("✅ Found {} documents", documents.len()).into());
+        let documents: Vec<&BeliefNode> = inner
+            .states()
+            .values()
+            .filter(|n| n.kind.contains(BeliefKind::Document))
+            .collect();
+        tracing::debug!("Found {} documents", documents.len());
 
         serde_wasm_bindgen::to_value(&documents).unwrap_or(JsValue::NULL)
     }
@@ -1250,14 +1577,10 @@ impl BeliefBaseWasm {
     fn extract_node_context(&self, ns: &Bid, bid: &Bid) -> Option<NodeContext> {
         /// Convert a `toml::value::Table` to a `serde_json::Value::Object` so it
         /// serializes as a plain JS object (not a Map) via `serde_wasm_bindgen`.
-        fn toml_table_to_json(table: &toml::value::Table) -> serde_json::Value {
-            let mut map = serde_json::Map::new();
-            for (k, v) in table {
-                map.insert(k.clone(), toml_value_to_json(v));
-            }
-            serde_json::Value::Object(map)
-        }
-
+        ///
+        /// On wasm32, `crate::codec::belief_ir` is not compiled, so this is a local
+        /// copy. The canonical native implementation lives in
+        /// `crate::codec::belief_ir::toml_value_to_json`.
         fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
             match v {
                 toml::Value::String(s) => serde_json::Value::String(s.clone()),
@@ -1269,106 +1592,275 @@ impl BeliefBaseWasm {
                 toml::Value::Array(arr) => {
                     serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect())
                 }
-                toml::Value::Table(t) => toml_table_to_json(t),
+                toml::Value::Table(t) => serde_json::Value::Object(
+                    t.iter()
+                        .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+                        .collect(),
+                ),
                 toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
             }
         }
 
-        let mut inner = self.inner.borrow_mut();
+        // Single shared borrow: get_context now takes &self, so we can hold
+        // the BeliefContext and bref_index simultaneously.
+        let inner = self.inner.borrow();
+        let ctx = inner.get_context(ns, bid)?;
+        let bref_idx = self.bref_index.borrow();
 
-        inner.get_context(ns, bid).map(|ctx| {
-            // Collect all related nodes (other end of all edges)
-            let mut related_nodes = BTreeMap::new();
-            type GraphMap = HashMap<WeightKind, (Vec<(Bid, u16)>, Vec<(Bid, u16)>)>;
-            let mut graph: GraphMap = HashMap::new();
+        // Owned edges (endpoint + declared perspectives, deduplicated).
+        let owned_edges = ctx.all_owned_edges();
 
-            // Process sources (nodes linking TO this one)
-            for ext_rel in ctx.sources() {
-                // Collect all related nodes with their path information
-                let related_node = RelatedNode {
-                    node: ext_rel.other.clone(),
-                    home_net: ext_rel.home_net,
-                    // Asset-namespace paths are opaque repo-relative identifiers (e.g.
-                    // "net1_dir1", "assets/img.png") — not navigable HTML paths.
-                    // normalize_path_extension_impl would incorrectly convert "net1_dir1"
-                    // to "net1_dir1/index.html", treating it as a network directory.
-                    root_path: if ext_rel.home_net == asset_namespace() {
-                        ext_rel.root_path.clone()
-                    } else {
-                        normalize_path_extension_impl(&ext_rel.root_path)
-                    },
-                    link_title: ext_rel.link_title.clone(),
-                };
-                related_nodes.insert(ext_rel.other.bid, related_node);
+        // Build a lookup index: (source_bid, sink_bid, weight_kind) → owner_bid
+        // for O(1) lookup during the sources/sinks graph-building loops below.
+        let owned_edge_index: HashMap<(Bid, Bid, WeightKind), Bid> = owned_edges
+            .iter()
+            .map(|oe| ((oe.source_bid, oe.sink_bid, oe.weight_kind), oe.owner_bid))
+            .collect();
 
-                // Group by weight kind and collect with sort_key
-                for (kind, weight) in ext_rel.weight.weights.iter() {
-                    let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
-                    graph
-                        .entry(*kind)
-                        .or_insert_with(|| (Vec::new(), Vec::new()))
-                        .0
-                        .push((ext_rel.other.bid, sort_key));
+        // Collect all related nodes (other end of all edges)
+        let mut related_nodes = BTreeMap::new();
+        type GraphMap = HashMap<WeightKind, (Vec<(EdgeEntry, u16)>, Vec<(EdgeEntry, u16)>)>;
+        let mut graph: GraphMap = HashMap::new();
+
+        // Process sources (nodes linking TO this one).
+        // Resolve home_net and root_path using the bref_index as the
+        // authoritative source.  The bref_index maps every node's bref to its
+        // true home network bref, preventing PathMap pollution from extern
+        // Section edges.
+        for ext_rel in ctx.sources() {
+            let (home_net, root_path) = Self::resolve_related_path(
+                ext_rel.other.bid,
+                ext_rel.home_net,
+                &ext_rel.root_path,
+                &bref_idx,
+                &inner,
+            );
+
+            let related_node = RelatedNode {
+                node: ext_rel.other.clone(),
+                home_net,
+                root_path,
+                link_title: ext_rel.link_title.clone(),
+            };
+            related_nodes.insert(ext_rel.other.bid, related_node);
+
+            // Group by weight kind and collect with sort_key
+            for (kind, weight) in ext_rel.weight.weights.iter() {
+                let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
+                let owner_bid = owned_edge_index
+                    .get(&(ext_rel.other.bid, *bid, *kind))
+                    .copied();
+                let entry = EdgeEntry::new(ext_rel.other.bid, owner_bid);
+                graph
+                    .entry(*kind)
+                    .or_insert_with(|| (Vec::new(), Vec::new()))
+                    .0
+                    .push((entry, sort_key));
+            }
+        }
+
+        // Process sinks (nodes this one links TO)
+        let mut alias_urls: Vec<String> = Vec::new();
+        for ext_rel in ctx.sinks() {
+            let (home_net, root_path) = Self::resolve_related_path(
+                ext_rel.other.bid,
+                ext_rel.home_net,
+                &ext_rel.root_path,
+                &bref_idx,
+                &inner,
+            );
+
+            let related_node = RelatedNode {
+                node: ext_rel.other.clone(),
+                home_net,
+                root_path,
+                link_title: ext_rel.link_title.clone(),
+            };
+            related_nodes.insert(ext_rel.other.bid, related_node);
+
+            // Collect alias URLs from Section sinks to href_namespace.
+            // The alias URL is stored in WEIGHT_DOC_PATHS on the edge weight.
+            if ext_rel.other.bid == href_namespace() {
+                if let Some(section_weight) = ext_rel.weight.weights.get(&WeightKind::Section) {
+                    if let Some(paths) = section_weight.get::<Vec<String>>(WEIGHT_DOC_PATHS) {
+                        alias_urls.extend(paths);
+                    }
                 }
             }
 
-            // Process sinks (nodes this one links TO)
-            for ext_rel in ctx.sinks() {
-                // Collect all related nodes with their path information
-                let related_node = RelatedNode {
-                    node: ext_rel.other.clone(),
-                    home_net: ext_rel.home_net,
-                    root_path: if ext_rel.home_net == asset_namespace() {
-                        ext_rel.root_path.clone()
-                    } else {
-                        normalize_path_extension_impl(&ext_rel.root_path)
-                    },
-                    link_title: ext_rel.link_title.clone(),
-                };
-                related_nodes.insert(ext_rel.other.bid, related_node);
-
-                // Group by weight kind and collect with sort_key
-                for (kind, weight) in ext_rel.weight.weights.iter() {
-                    let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
-                    graph
-                        .entry(*kind)
-                        .or_insert_with(|| (Vec::new(), Vec::new()))
-                        .1
-                        .push((ext_rel.other.bid, sort_key));
-                }
+            // Group by weight kind and collect with sort_key
+            for (kind, weight) in ext_rel.weight.weights.iter() {
+                let sort_key: u16 = weight.get::<u16>(WEIGHT_SORT_KEY).unwrap_or(0);
+                let owner_bid = owned_edge_index
+                    .get(&(*bid, ext_rel.other.bid, *kind))
+                    .copied();
+                let entry = EdgeEntry::new(ext_rel.other.bid, owner_bid);
+                graph
+                    .entry(*kind)
+                    .or_insert_with(|| (Vec::new(), Vec::new()))
+                    .1
+                    .push((entry, sort_key));
             }
+        }
 
-            // Sort all vectors by sort_key and extract just the BIDs
-            let sorted_graph: HashMap<WeightKind, (Vec<Bid>, Vec<Bid>)> = graph
-                .into_iter()
-                .map(|(kind, (mut sources, mut sinks))| {
-                    sources.sort_by_key(|(_, sort_key)| *sort_key);
-                    sinks.sort_by_key(|(_, sort_key)| *sort_key);
+        // Sort all vectors by sort_key and extract just the EdgeEntries
+        let sorted_graph: HashMap<WeightKind, (Vec<EdgeEntry>, Vec<EdgeEntry>)> = graph
+            .into_iter()
+            .map(|(kind, (mut sources, mut sinks))| {
+                sources.sort_by_key(|(_, sort_key)| *sort_key);
+                sinks.sort_by_key(|(_, sort_key)| *sort_key);
+                (
+                    kind,
                     (
-                        kind,
-                        (
-                            sources.into_iter().map(|(bid, _)| bid).collect(),
-                            sinks.into_iter().map(|(bid, _)| bid).collect(),
-                        ),
-                    )
-                })
-                .collect();
+                        sources.into_iter().map(|(entry, _)| entry).collect(),
+                        sinks.into_iter().map(|(entry, _)| entry).collect(),
+                    ),
+                )
+            })
+            .collect();
 
-            NodeContext {
-                node: ctx.node.clone(),
-                root_path: if *bid == asset_namespace()
-                    || bid.parent_bref() == asset_namespace().bref()
-                {
-                    ctx.root_path.clone()
-                } else {
-                    normalize_path_extension_impl(&ctx.root_path)
-                },
-                home_net: ctx.home_net,
-                metadata: toml_table_to_json(&ctx.node.metadata),
-                related_nodes,
-                graph: sorted_graph,
-            }
+        Some(NodeContext {
+            node: ctx.node.clone(),
+            root_path: if *bid == asset_namespace() || bid.parent_bref() == asset_namespace().bref()
+            {
+                ctx.root_path.clone()
+            } else {
+                normalize_path_extension_impl(&ctx.root_path)
+            },
+            home_net: ctx.home_net,
+            metadata: serde_json::Value::Object(
+                ctx.node
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+                    .collect(),
+            ),
+            related_nodes,
+            graph: sorted_graph,
+            owned_edges,
+            alias_urls,
         })
+    }
+
+    /// Patch a serialized `NodeContext` `JsValue` so that `metadata` and `node.payload`
+    /// are plain JS objects rather than `Map` instances.
+    ///
+    /// `serde_wasm_bindgen` serializes map-like types (including `serde_json::Value::Object`
+    /// nested inside a struct) as JS `Map` objects. This helper re-serializes those two
+    /// fields through `js_sys::JSON::parse` so callers get plain objects instead.
+    fn patch_node_context_js(js_val: &JsValue, node_context: &NodeContext) {
+        if !js_val.is_object() {
+            return;
+        }
+        // Patch metadata: serde_json::Value::Object → plain JS object.
+        if let Ok(metadata_json) = serde_json::to_string(&node_context.metadata) {
+            if let Ok(metadata_js) = js_sys::JSON::parse(&metadata_json) {
+                let _ = Reflect::set(js_val, &JsValue::from_str("metadata"), &metadata_js);
+            }
+        }
+        // Patch node.payload: toml::value::Table → plain JS object.
+        // Without this, payload?.listing returns undefined (it's a Map entry, not a
+        // plain property) and the directory listing panel never renders.
+        if let Ok(payload_json) = serde_json::to_string(&node_context.node.payload) {
+            if let Ok(payload_js) = js_sys::JSON::parse(&payload_json) {
+                if let Ok(node_js) = Reflect::get(js_val, &JsValue::from_str("node")) {
+                    if node_js.is_object() {
+                        let _ = Reflect::set(&node_js, &JsValue::from_str("payload"), &payload_js);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve the authoritative home_net and root_path for a related node.
+    ///
+    /// Uses the `bref_index` to find the node's true home network, then looks
+    /// up the path directly from that network's PathMap.  Falls back to the
+    /// caller-provided values when the bref_index is empty (monolithic mode)
+    /// or when the node is not in the index (global-only nodes like namespace
+    /// roots).
+    ///
+    /// This prevents the PathMap pollution problem where extern Section edges
+    /// cause a node to appear in the wrong network's PathMap, producing
+    /// incorrect root_path values (e.g. "/index.html" instead of the correct
+    /// cross-network path).
+    fn resolve_related_path(
+        other_bid: Bid,
+        fallback_home_net: Bid,
+        fallback_root_path: &str,
+        bref_idx: &BTreeMap<String, String>,
+        inner: &BeliefBase,
+    ) -> (Bid, String) {
+        // Asset-namespace paths are opaque repo-relative identifiers (e.g.
+        // "net1_dir1", "assets/img.png") — not navigable HTML paths.
+        if fallback_home_net == asset_namespace() {
+            return (fallback_home_net, fallback_root_path.to_string());
+        }
+
+        // If the bref_index is available, use it as the authoritative source.
+        if !bref_idx.is_empty() {
+            let node_bref_str = other_bid.bref().to_string();
+            if let Some(authoritative_net_bref) = bref_idx.get(&node_bref_str) {
+                // Convert the network bref string to a Bref and use it directly
+                // as the PathMap key.  This avoids the brefs→BID→bref() round-trip
+                // that fails when the network node's shard isn't loaded (its BID
+                // wouldn't be in inner.brefs()).
+                if let Ok(net_bref) = Bref::try_from(authoritative_net_bref.as_str()) {
+                    let paths = inner.paths();
+                    let root_path = paths
+                        .get_map(&net_bref)
+                        .and_then(|pm| pm.path(&other_bid, &paths))
+                        .map(|(_home, path, _order)| normalize_path_extension_impl(&path))
+                        .unwrap_or_default();
+
+                    // Resolve the network BID if available (for home_net field);
+                    // fall back to ext_rel.home_net when the network node itself
+                    // isn't loaded.
+                    let home_net = inner
+                        .brefs()
+                        .get(&net_bref)
+                        .copied()
+                        .unwrap_or(fallback_home_net);
+
+                    return (home_net, root_path);
+                }
+            }
+        }
+
+        // Fallback: use the caller-provided values (monolithic mode or
+        // global-only nodes not in the bref_index).
+        (
+            fallback_home_net,
+            normalize_path_extension_impl(fallback_root_path),
+        )
+    }
+
+    /// Look up the home network bref for a given node BID.
+    ///
+    /// Computes the node's bref from the BID, then consults the `bref_index`
+    /// (populated from the global shard) to resolve which network shard
+    /// contains the node. Returns `JsValue::NULL` if the BID is invalid or
+    /// the node is not in the index (e.g. global-only nodes).
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const netBref = bb.network_bref_for_bid("1f1401ac-a462-67c0-b3ff-34a7b264ac4f");
+    /// if (netBref) {
+    ///     await shardManager.loadNetwork(netBref);
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub fn network_bref_for_bid(&self, bid: String) -> JsValue {
+        let bid = match Bid::try_from(bid.as_str()) {
+            Ok(b) => b,
+            Err(_) => return JsValue::NULL,
+        };
+        let bref_str = bid.bref().to_string();
+        let index = self.bref_index.borrow();
+        match index.get(&bref_str) {
+            Some(net_bref) => JsValue::from_str(net_bref),
+            None => JsValue::NULL,
+        }
     }
 
     #[wasm_bindgen]
@@ -1389,16 +1881,14 @@ impl BeliefBaseWasm {
         else {
             // Not found in any namespace
             console::warn_1(&format!("⚠️ Node not found in any context: {}", bid).into());
-            console::log_1(&format!("   Entry point: {}", self.entry_point_bid).into());
-            console::log_1(
-                &"   Tried namespaces: href, asset, buildonomy"
-                    .to_string()
-                    .into(),
+            tracing::debug!(
+                "Entry point: {}; tried namespaces: href, asset, buildonomy",
+                self.entry_point_bid
             );
             return JsValue::NULL;
         };
 
-        console::log_1(&format!("✅ Got context for node: {}", node_context.node.title).into());
+        tracing::debug!("Got context for node: {}", node_context.node.title);
 
         // serde_wasm_bindgen v0.6 serializes any map-like Serde type (including
         // serde_json::Value::Object) as a JS Map rather than a plain object.
@@ -1411,33 +1901,270 @@ impl BeliefBaseWasm {
         //      js_sys::JSON::parse — the JS JSON parser always produces plain objects.
         //   3. Patch both properties on the returned JS object.
         let js_val = serde_wasm_bindgen::to_value(&node_context).unwrap_or(JsValue::NULL);
+        Self::patch_node_context_js(&js_val, &node_context);
+        js_val
+    }
 
-        if js_val.is_object() {
-            // Patch metadata: toml::value::Table → plain JS object.
-            if let Ok(metadata_json) = serde_json::to_string(&node_context.metadata) {
-                if let Ok(metadata_js) = js_sys::JSON::parse(&metadata_json) {
-                    let _ = Reflect::set(&js_val, &JsValue::from_str("metadata"), &metadata_js);
+    /// Get all paths in a network as an Array of `{ path, bid, order, is_network }` objects.
+    ///
+    /// - `network_bid`: BID string of the network to query.
+    /// - `entry_bid`: BID string of the node to scope the submap from (empty string = entire network).
+    /// - `depth`: subnet expansion depth. `0` = no subnet expansion, `255` = fully recursive.
+    /// - `include_index`: if `false`, index-file headings/sections are filtered out.
+    ///
+    /// Returns a JS Array of plain objects:
+    /// ```javascript,ignore
+    /// [{ path: "docs/guide.md", bid: "...", order: [1, 2], is_network: false }, ...]
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_submap(
+        &self,
+        network_bid: String,
+        entry_bid: String,
+        depth: u8,
+        include_index: bool,
+    ) -> JsValue {
+        let net_bid = match Bid::try_from(network_bid.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                console::warn_1(
+                    &format!("⚠️ get_submap: invalid network BID: {}", network_bid).into(),
+                );
+                return JsValue::NULL;
+            }
+        };
+
+        let entry: Option<Bid> = if entry_bid.is_empty() {
+            None
+        } else {
+            match Bid::try_from(entry_bid.as_str()) {
+                Ok(b) => Some(b),
+                Err(_) => {
+                    console::warn_1(
+                        &format!("⚠️ get_submap: invalid entry BID: {}", entry_bid).into(),
+                    );
+                    return JsValue::NULL;
                 }
             }
+        };
 
-            // Patch node.payload: toml::value::Table → plain JS object.
-            // Without this, payload?.listing returns undefined (it's a Map entry, not a
-            // plain property) and the directory listing panel never renders.
-            if let Ok(payload_json) = serde_json::to_string(&node_context.node.payload) {
-                if let Ok(payload_js) = js_sys::JSON::parse(&payload_json) {
-                    // js_val.node is itself a plain JS object (BeliefNode struct fields
-                    // serialize correctly except for the toml::value::Table payload field).
-                    if let Ok(node_js) = Reflect::get(&js_val, &JsValue::from_str("node")) {
-                        if node_js.is_object() {
-                            let _ =
-                                Reflect::set(&node_js, &JsValue::from_str("payload"), &payload_js);
-                        }
-                    }
+        let inner = self.inner.borrow();
+        let paths = inner.paths();
+        let entries = paths.submap_by_bid(&net_bid.bref(), entry, depth, include_index);
+
+        let arr = js_sys::Array::new();
+        for (entry_path, entry_bid, order) in entries {
+            let is_network = paths.get_map(&entry_bid.bref()).is_some();
+            let obj = Object::new();
+            let _ = Reflect::set(
+                &obj,
+                &JsValue::from_str("path"),
+                &JsValue::from_str(&entry_path),
+            );
+            let _ = Reflect::set(
+                &obj,
+                &JsValue::from_str("bid"),
+                &JsValue::from_str(&entry_bid.to_string()),
+            );
+            // Serialize order as a JS Array of numbers
+            let order_arr = js_sys::Array::new();
+            for v in &order {
+                order_arr.push(&JsValue::from_f64(*v as f64));
+            }
+            let _ = Reflect::set(&obj, &JsValue::from_str("order"), &order_arr);
+            let _ = Reflect::set(
+                &obj,
+                &JsValue::from_str("is_network"),
+                &JsValue::from_bool(is_network),
+            );
+            arr.push(&obj);
+        }
+        arr.into()
+    }
+
+    /// Get context for multiple BIDs in a single call.
+    ///
+    /// Accepts a list of BID strings. Invalid BIDs are warned and skipped.
+    /// Returns a JS `Map` keyed by BID string, valued by serialized `NodeContext`
+    /// (same shape as `get_context`).
+    ///
+    /// ```javascript,ignore
+    /// const map = beliefbase.get_context_bulk(["bid1", "bid2"]);
+    /// const ctx = map.get("bid1");  // same shape as get_context()
+    /// ```
+    #[wasm_bindgen]
+    pub fn get_context_bulk(&self, bids: Vec<String>) -> JsValue {
+        let result = js_sys::Map::new();
+
+        for bid_str in bids {
+            let bid = match Bid::try_from(bid_str.as_str()) {
+                Ok(b) => b,
+                Err(_) => {
+                    console::warn_1(
+                        &format!("⚠️ get_context_bulk: invalid BID: {}", bid_str).into(),
+                    );
+                    continue;
+                }
+            };
+
+            let node_context = self
+                .extract_node_context(&self.entry_point_bid, &bid)
+                .or_else(|| self.extract_node_context(&href_namespace(), &bid))
+                .or_else(|| self.extract_node_context(&asset_namespace(), &bid));
+
+            if let Some(nc) = node_context {
+                let js_val = serde_wasm_bindgen::to_value(&nc).unwrap_or(JsValue::NULL);
+                Self::patch_node_context_js(&js_val, &nc);
+                result.set(&JsValue::from_str(&bid_str), &js_val);
+            }
+        }
+
+        result.into()
+    }
+
+    /// Export an XLSX spreadsheet from a pre-built export row array.
+    ///
+    /// `headers` is a JS `Array<string>` giving the ordered column keys.
+    /// `rows` is a JS `Array<Object>` where each object maps column key → cell
+    /// value (string). This mirrors what `buildExportRows()` in `traceability.js`
+    /// already produces for the CSV path.
+    ///
+    /// Returns a `Uint8Array` containing the raw `.xlsx` bytes, ready to be
+    /// wrapped in a `Blob` and triggered as a download.
+    ///
+    /// # JavaScript Example
+    /// ```javascript,ignore
+    /// const rows  = buildExportRows();          // [{path:"...", section_in:"..."}, ...]
+    /// const keys  = Object.keys(rows[0]);       // ["path", "section_in", ...]
+    /// const hdrs  = js_sys::Array::from(&keys); // already a JS Array
+    /// const bytes = bb.export_xlsx(hdrs, rows_array);
+    /// const blob  = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    /// const url   = URL.createObjectURL(blob);
+    /// ```
+    ///
+    /// Returns an empty `Uint8Array` on error (errors are logged to console).
+    #[cfg(feature = "wasm")]
+    #[wasm_bindgen]
+    pub fn export_xlsx(headers: js_sys::Array, rows: js_sys::Array) -> Uint8Array {
+        match Self::build_xlsx_bytes(headers, rows) {
+            Ok(bytes) => {
+                let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                arr.copy_from(&bytes);
+                arr
+            }
+            Err(e) => {
+                console::error_1(&format!("export_xlsx error: {e}").into());
+                Uint8Array::new_with_length(0)
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm")]
+    fn build_xlsx_bytes(headers: js_sys::Array, rows: js_sys::Array) -> Result<Vec<u8>, XlsxError> {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+
+        let bold = Format::new().set_bold();
+
+        // Collect header key order
+        let keys: Vec<String> = headers
+            .iter()
+            .map(|v| v.as_string().unwrap_or_default())
+            .collect();
+
+        // Write header row
+        for (col_idx, key) in keys.iter().enumerate() {
+            worksheet.write_with_format(0, col_idx as u16, key.as_str(), &bold)?;
+        }
+
+        // Write data rows
+        for (row_idx, row_val) in rows.iter().enumerate() {
+            let row_obj = js_sys::Object::from(row_val);
+            for (col_idx, key) in keys.iter().enumerate() {
+                let cell_val = Reflect::get(&row_obj, &JsValue::from_str(key))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                worksheet.write(1 + row_idx as u32, col_idx as u16, cell_val.as_str())?;
+            }
+        }
+
+        workbook.save_to_buffer()
+    }
+
+    /// Export multiple sheets as a single `.xlsx` workbook.
+    ///
+    /// `sheets` is a JS Array of objects, each with `{ name, headers, rows }`.
+    /// Each sheet gets a bold header row and plain data rows.
+    /// Returns a `Uint8Array` containing the raw `.xlsx` bytes.
+    #[cfg(feature = "wasm")]
+    #[wasm_bindgen]
+    pub fn export_xlsx_multi(sheets: js_sys::Array) -> Uint8Array {
+        match Self::build_xlsx_multi_bytes(sheets) {
+            Ok(bytes) => {
+                let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                arr.copy_from(&bytes);
+                arr
+            }
+            Err(e) => {
+                console::error_1(&format!("export_xlsx_multi error: {e}").into());
+                Uint8Array::new_with_length(0)
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm")]
+    fn build_xlsx_multi_bytes(sheets: js_sys::Array) -> Result<Vec<u8>, XlsxError> {
+        let mut workbook = Workbook::new();
+        let bold = Format::new().set_bold();
+
+        for sheet_val in sheets.iter() {
+            let sheet_obj = js_sys::Object::from(sheet_val);
+            let name = Reflect::get(&sheet_obj, &JsValue::from_str("name"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "Sheet".to_string());
+            let headers = Reflect::get(&sheet_obj, &JsValue::from_str("headers"))
+                .ok()
+                .map(|v| js_sys::Array::from(&v))
+                .unwrap_or_default();
+            let rows = Reflect::get(&sheet_obj, &JsValue::from_str("rows"))
+                .ok()
+                .map(|v| js_sys::Array::from(&v))
+                .unwrap_or_default();
+
+            // Truncate sheet name to 31 chars (Excel limit).
+            let sheet_name = if name.len() > 31 {
+                name[..31].to_string()
+            } else {
+                name
+            };
+
+            let worksheet = workbook.add_worksheet();
+            worksheet.set_name(&sheet_name)?;
+
+            let keys: Vec<String> = headers
+                .iter()
+                .map(|v| v.as_string().unwrap_or_default())
+                .collect();
+
+            for (col_idx, key) in keys.iter().enumerate() {
+                worksheet.write_with_format(0, col_idx as u16, key.as_str(), &bold)?;
+            }
+
+            for (row_idx, row_val) in rows.iter().enumerate() {
+                let row_obj = js_sys::Object::from(row_val);
+                for (col_idx, key) in keys.iter().enumerate() {
+                    let cell_val = Reflect::get(&row_obj, &JsValue::from_str(key))
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_default();
+                    worksheet.write(1 + row_idx as u32, col_idx as u16, cell_val.as_str())?;
                 }
             }
         }
 
-        js_val
+        workbook.save_to_buffer()
     }
 
     /// Get href namespace BID (external HTTP/HTTPS links tracking network)
@@ -1651,10 +2378,14 @@ impl BeliefBaseWasm {
             .map(|bid| (*bid, String::new()))
             .collect();
 
-        // Two-pass fixpoint: iterate until no mount path changes.  In practice one pass
-        // suffices for the vast majority of corpora; two passes handle edge cases where
-        // BTreeMap iteration order puts a child before its parent.
-        for _fixpoint_pass in 0..2 {
+        // Fixpoint: iterate until no mount path changes.  Each pass can propagate
+        // mount paths one level deeper through the subnet hierarchy.  For a corpus
+        // with N nesting levels, up to N passes may be needed when BTreeMap iteration
+        // order processes a child network before its parent.  The loop is bounded by
+        // the number of networks (each pass must make progress or terminate).
+        let max_passes = all_net_bids.len().max(1);
+        for _fixpoint_pass in 0..max_passes {
+            let mut changed = false;
             for (net_bref, pm_lock) in paths.map().iter() {
                 let net_bid = match brefs.get(net_bref) {
                     Some(bid) => *bid,
@@ -1685,10 +2416,17 @@ impl BeliefBaseWasm {
                             // multiple routes to the same subnet.
                             if subnet_mount.len() > existing.len() {
                                 *existing = subnet_mount.clone();
+                                changed = true;
                             }
                         })
-                        .or_insert(subnet_mount);
+                        .or_insert_with(|| {
+                            changed = true;
+                            subnet_mount
+                        });
                 }
+            }
+            if !changed {
+                break;
             }
         }
 
@@ -1885,20 +2623,6 @@ impl BeliefBaseWasm {
             }
         }
 
-        // Determine root networks (those not claimed as subnets by any parent).
-        for (net_bref, _) in paths.map().iter() {
-            let net_bid = match brefs.get(net_bref) {
-                Some(bid) => *bid,
-                None => continue,
-            };
-            if net_bid.is_reserved() {
-                continue;
-            }
-            if !subnet_parent_edges.contains_key(&net_bid) {
-                root_net_bids.push(net_bid);
-            }
-        }
-
         // Pass 2 — wire cross-network parent/child edges.
         for (subnet_bid, parent_bid) in &subnet_parent_edges {
             let subnet_bid_str = subnet_bid.to_string();
@@ -1913,6 +2637,72 @@ impl BeliefBaseWasm {
             }
         }
 
+        // Determine root networks.
+        //
+        // When the entry point network is loaded, it is the sole root.  In sharded
+        // mode, partially-loaded corpora can produce orphan network nodes (networks
+        // whose parent network shard hasn't loaded yet).  These orphans have PathMap
+        // entries — typically from cross-network edges in the global shard (e.g.
+        // codec namespace registrations) — but no subnet_parent_edge claiming them
+        // as children of a loaded parent.  Without this filter they appear as
+        // spurious top-level roots in the nav tree (e.g. "algorithm", "math",
+        // "fsw_solution" appearing as peers of "Haven Systems" on a deep-URL
+        // refresh).
+        //
+        // The nav tree is a DAG rooted at the entry point; we only show paths
+        // reachable from that root through loaded parent chains.  Orphan networks
+        // will appear naturally once their parent network's shard loads and the nav
+        // tree is rebuilt.
+        //
+        // If the entry point hasn't loaded yet (e.g. the target network shard loaded
+        // first), fall back to showing all unclaimed networks as roots.  The entry
+        // network loads in the background and triggers a nav tree rebuild via
+        // noet:shard-loaded, at which point this function runs again with the entry
+        // point present and the orphans get pruned.
+        let entry_bid_str = self.entry_point_bid.to_string();
+        let entry_is_loaded = root_nodes_map.contains_key(&entry_bid_str);
+
+        if entry_is_loaded {
+            root_net_bids.push(self.entry_point_bid);
+        } else {
+            // Fallback: show all unclaimed networks as roots (pre-fix behavior).
+            for (net_bref, _) in paths.map().iter() {
+                let net_bid = match brefs.get(net_bref) {
+                    Some(bid) => *bid,
+                    None => continue,
+                };
+                if net_bid.is_reserved() {
+                    continue;
+                }
+                if !subnet_parent_edges.contains_key(&net_bid) {
+                    root_net_bids.push(net_bid);
+                }
+            }
+        }
+
+        // When we have the entry point as root, prune orphan networks and their
+        // exclusive descendants from the node map.  Walk from each root downward
+        // to collect reachable BID strings, then remove everything else.  This
+        // keeps the serialized tree lean and prevents the JS renderer from showing
+        // disconnected subtrees.
+        if entry_is_loaded {
+            let reachable: BTreeSet<String> = {
+                let mut visited = BTreeSet::new();
+                let mut queue: Vec<String> =
+                    root_net_bids.iter().map(|bid| bid.to_string()).collect();
+                while let Some(bid_str) = queue.pop() {
+                    if !visited.insert(bid_str.clone()) {
+                        continue;
+                    }
+                    if let Some(node) = root_nodes_map.get(&bid_str) {
+                        queue.extend(node.children.iter().cloned());
+                    }
+                }
+                visited
+            };
+            root_nodes_map.retain(|bid_str, _| reachable.contains(bid_str));
+        }
+
         let root_nodes: Vec<String> = root_net_bids.iter().map(|bid| bid.to_string()).collect();
 
         let tree = NavTree {
@@ -1924,6 +2714,67 @@ impl BeliefBaseWasm {
             console::error_1(&format!("Failed to serialize nav tree: {}", e).into());
             JsValue::NULL
         })
+    }
+
+    /// Render a markdown string to HTML using the same parser options as the compiler.
+    ///
+    /// Uses the same extension set as `buildonomy_md_options()`: GFM, tables, footnotes,
+    /// math, strikethrough, subscript, superscript, task lists, wiki links, heading
+    /// attributes, definition lists, and YAML-style metadata blocks.
+    /// Render a markdown string to HTML using the canonical Buildonomy parser options.
+    ///
+    /// Delegates to `crate::codec::render_markdown_snippet` — the shared utility
+    /// that uses canonical parser options and a broken-link callback.
+    ///
+    /// # Arguments
+    /// * `text` - Raw markdown source string
+    ///
+    /// # Returns
+    /// HTML string ready for innerHTML injection. Returns empty string on parse/render error.
+    #[wasm_bindgen]
+    pub fn render_markdown(text: &str) -> String {
+        crate::codec::render_markdown_snippet(text)
+    }
+
+    /// Load the codec extension manifest from `codecs.json`.
+    ///
+    /// Replaces the default `BUILTIN_EXTENSIONS` set with the full list of
+    /// document extensions that were registered at build time (including
+    /// extensions from application shims like `.yaml`, `.h`). This must be
+    /// called before any `normalize_path_extension` or link-resolution calls
+    /// to ensure custom extensions are correctly rewritten to `.html`.
+    ///
+    /// Treat a missing or unparseable manifest as fatal rather than falling
+    /// back to `BUILTIN_EXTENSIONS`: with only the built-ins, links to
+    /// shim-extension documents normalise to directory URLs that 404, which
+    /// fails silently and per-link instead of once at startup. `codecs.json`
+    /// is written on every export, so its absence means a broken deployment.
+    ///
+    /// # Arguments
+    /// * `json` — The raw JSON string from `codecs.json`
+    ///
+    /// # Example
+    /// ```javascript,ignore
+    /// const resp = await fetch('codecs.json');
+    /// if (!resp.ok) {
+    ///     throw new Error(`codec manifest missing (${resp.status})`);
+    /// }
+    /// BeliefBaseWasm.set_known_extensions(await resp.text());
+    /// ```
+    #[wasm_bindgen(js_name = "setKnownExtensions")]
+    pub fn set_known_extensions(json: &str) -> Result<(), JsValue> {
+        #[derive(Deserialize)]
+        struct CodecManifest {
+            document_extensions: Vec<String>,
+        }
+        let manifest: CodecManifest = serde_json::from_str(json)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse codecs.json: {}", e)))?;
+        crate::codec::CODECS.set_known_extensions(manifest.document_extensions);
+        tracing::info!(
+            "[WASM] Loaded codec manifest: {} extensions",
+            crate::codec::CODECS.extensions().len(),
+        );
+        Ok(())
     }
 
     /// Normalize path extension to .html for fetching rendered documents
@@ -1945,6 +2796,72 @@ impl BeliefBaseWasm {
     #[wasm_bindgen]
     pub fn normalize_path_extension(path: &str) -> String {
         normalize_path_extension_impl(path)
+    }
+
+    /// Convert a string to an anchor/id slug using the same algorithm as Rust's `to_anchor()`:
+    /// NFKC lowercase, whitespace → "-", strip non-`[a-z0-9-._()[\]@]`, collapse consecutive "-".
+    ///
+    /// Exposed so that JS clients (e.g. xlsx-tabs.js relation formatter) can derive
+    /// canonical NodeKey id strings from raw cell text without duplicating the logic.
+    ///
+    /// # Example
+    /// ```javascript
+    /// BeliefBaseWasm.toAnchor("Load Switch Controller") // → "load-switch-controller"
+    /// BeliefBaseWasm.toAnchor("Source/Rationale")       // → "sourcerationale"
+    /// ```
+    #[wasm_bindgen(js_name = toAnchor)]
+    pub fn to_anchor(s: &str) -> String {
+        crate::paths::path::to_anchor(s)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TextSearchProvider implementation for WASM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bridges the loaded search indices to the `TextSearchProvider` trait
+/// so that `BeliefBase::apply_filter` can evaluate `TextMatch` filter steps.
+///
+/// Uses a default limit of 1000 results to prevent pathological performance
+/// on very common query terms. TF-IDF scoring naturally filters to documents
+/// containing at least one query term, so the limit only applies when the
+/// corpus has many partial matches.
+#[cfg(feature = "wasm")]
+struct WasmTextSearchProvider<'a> {
+    indices: &'a HashMap<String, SearchIndex>,
+}
+
+/// Maximum results returned by the WASM text search provider.
+/// Prevents pathological memory/CPU usage on common single-term queries.
+#[cfg(feature = "wasm")]
+const TEXT_SEARCH_LIMIT: usize = 1000;
+
+#[cfg(feature = "wasm")]
+impl TextSearchProvider for WasmTextSearchProvider<'_> {
+    fn text_search(&self, query: &str) -> Vec<(Bid, f64)> {
+        let idx_refs: Vec<&SearchIndex> = self.indices.values().collect();
+        if idx_refs.is_empty() {
+            return Vec::new();
+        }
+        // Request one extra result so we can detect truncation.
+        let results = query_search_index(&idx_refs, query, TEXT_SEARCH_LIMIT + 1);
+        if results.len() > TEXT_SEARCH_LIMIT {
+            console::warn_1(
+                &format!(
+                    "⚠️ TextMatch query '{}' matched {} results, truncated to {}. \
+                     Results may be incomplete.",
+                    query,
+                    results.len(),
+                    TEXT_SEARCH_LIMIT,
+                )
+                .into(),
+            );
+        }
+        results
+            .into_iter()
+            .take(TEXT_SEARCH_LIMIT)
+            .filter_map(|r| Bid::try_from(r.bid.as_str()).ok().map(|bid| (bid, r.score)))
+            .collect()
     }
 }
 

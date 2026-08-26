@@ -15,9 +15,30 @@
 :root {
     color-scheme: light;
 
+    /* ── Normalize bridge ──────────────────────────────────────────────────
+       Override the custom properties that normalize.min.css defines on
+       :where(html) and uses for form elements, tables, details/summary,
+       code blocks, etc.  This keeps normalize's zero-specificity rules
+       aligned with our theme tokens so we don't need per-element
+       "Beat normalize" overrides.
+
+       Light-mode values happen to match normalize's defaults, but we
+       set them explicitly so the contract is clear and survives upstream
+       normalize updates. */
+    --surface-1: var(--gray-0);
+    --surface-2: var(--gray-2);
+    --surface-3: var(--gray-3);
+    --surface-4: var(--gray-4);
+    --text-1: var(--gray-9);
+    --text-2: var(--gray-7);
+    --link: var(--blue-6);
+    --link-visited: var(--purple-6);
+    --scrollthumb-color: var(--gray-7);
+
     /* Typography */
     --noet-font-family:
-        "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+        sans-serif;
     --noet-font-weight-ui: 350;
     --noet-font-weight-body: 400;
     --noet-font-weight-medium: 500;
@@ -73,9 +94,12 @@
     --noet-shadow-large: var(--shadow-4);
 
     /* Collapse button shadows (manila folder tab effect) */
-    --noet-collapse-shadow-nav: 2px 0 8px rgba(0, 0, 0, 0.1), 2px 0 4px rgba(0, 0, 0, 0.06);
-    --noet-collapse-shadow-nav-hover: 3px 0 12px rgba(0, 0, 0, 0.15), 3px 0 6px rgba(0, 0, 0, 0.1);
-    --noet-collapse-shadow-metadata: -2px 0 8px rgba(0, 0, 0, 0.1), -2px 0 4px rgba(0, 0, 0, 0.06);
+    --noet-collapse-shadow-nav:
+        2px 0 8px rgba(0, 0, 0, 0.1), 2px 0 4px rgba(0, 0, 0, 0.06);
+    --noet-collapse-shadow-nav-hover:
+        3px 0 12px rgba(0, 0, 0, 0.15), 3px 0 6px rgba(0, 0, 0, 0.1);
+    --noet-collapse-shadow-metadata:
+        -2px 0 8px rgba(0, 0, 0, 0.1), -2px 0 4px rgba(0, 0, 0, 0.06);
     --noet-collapse-shadow-metadata-hover:
         -3px 0 12px rgba(0, 0, 0, 0.15), -3px 0 6px rgba(0, 0, 0, 0.1);
 

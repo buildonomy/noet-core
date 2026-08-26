@@ -2,178 +2,185 @@
 
 A living document recording where noet-core has been, where it is now, and where it's headed.
 
-**Last Updated**: 2026-03-02
+**Last Updated**: 2026-04-23
 
 ## What noet-core Is
 
-noet-core transforms document networks (Markdown, TOML) into a queryable hypergraph called a BeliefBase. It maintains bidirectional synchronization between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes. The output is an interactive HTML viewer that lets users navigate, inspect, and (soon) search their document graph in the browser.
+noet-core is a compiler for document networks. It transforms interconnected source
+files (Markdown, TOML, XLSX) into a queryable, typed directed acyclic graph (DAG)
+called a BeliefBase, with three orthogonal edge dimensions — Section (structure),
+Epistemic (provenance), and Pragmatic (actionable claims). It maintains bidirectional
+synchronization between human-readable source files and the machine-queryable graph,
+automatically managing cross-document references and propagating changes.
+
+The output is an interactive HTML viewer for navigating, searching, and inspecting the
+document graph in the browser, plus an MCP server for AI-agent-driven graph queries.
+
+See [Documentation as a Dependency Graph](../design/dag_model.md) for the conceptual
+introduction.
+
+## Strategic Direction
+
+noet-core is an application-agnostic open-source tool, but its development is driven
+by a specific class of problem: **knowledge management for safety-critical engineered
+systems with complex, cross-discipline traceability requirements**.
+
+In these domains — aerospace, automotive, medical devices, nuclear — documentation is
+not incidental to the product. It *is* the product's compliance posture. Requirements
+trace to hazard analyses. Test results trace to requirements. Design rationale traces
+to both. These relationships span organizational boundaries, file formats, and
+toolchains. When the traceability is wrong, the system is unsafe — and you cannot tell
+whether it is wrong by reading the documents individually.
+
+noet-core treats this traceability the same way a build system treats code
+dependencies: as an explicit, queryable, validatable graph. The goal is a tool that
+makes structural review — coverage gaps, orphaned claims, missing rationale — a
+graph query rather than a manual document audit.
 
 ## Project History
 
-### Foundation (2024 — early 2025)
+### Foundation (2024 — early 2026)
 
-The core compilation model: multi-pass parsing, BID injection, BeliefBase graph operations, event streaming, and the codec system. Originally developed as part of a larger workspace, then extracted as a standalone library.
+The core compilation model: multi-pass parsing, BID injection, BeliefBase graph
+operations, event streaming, and the codec system. Originally developed as part of a
+larger workspace, then extracted as a standalone library.
 
 - **Compilation model**: Multi-pass diagnostic-driven resolution of forward references
 - **Identity system**: BID (Belief ID) injection for stable cross-document linking
-- **Graph operations**: BeliefBase with typed edges (Subsection, Epistemic, Pragmatic)
+- **Graph operations**: BeliefBase with typed edges (Section, Epistemic, Pragmatic)
 - **Event architecture**: Async event streaming for incremental cache updates
 - **Codec system**: Extensible parser framework (Markdown, TOML)
 
-### Soft Open Source (January 2025)
+**Completed issues**: 1 (Schema Registry), 2 (Multi-Node TOML), 3 (Heading Anchors),
+4 (Link Manipulation), 5 (Documentation), 10 (Daemon/CLI), 14 (Naming Improvements),
+20 (CLI Write-Back), 21 (JSON/TOML Dual-Format), 22 (Duplicate Node Dedup),
+23 (Integration Test Convergence)
 
-Repository made public. Core documentation written. CLI tool (`noet parse`, `noet watch`) and daemon created.
+### HTML Viewer (January — March 2026)
 
-**Completed issues**: 1 (Schema Registry), 2 (Multi-Node TOML), 3 (Heading Anchors), 4 (Link Manipulation), 5 (Documentation), 10 (Daemon/CLI), 14 (Naming Improvements), 20 (CLI Write-Back), 21 (JSON/TOML Dual-Format), 22 (Duplicate Node Dedup), 23 (Integration Test Convergence)
+Full HTML generation with an interactive single-page application viewer. Navigation
+tree, metadata panel, theme switching, deferred cross-document content generation.
 
-**Key decisions**:
-- Title-based anchors in markdown, BIDs only in HTML data attributes — universal renderer compatibility
-- JSON as default metadata format (TOML fallback) — cross-platform consistency
-- Event loop synchronization (Option G pattern) — correct BeliefBase export timing
+**Completed issues**: 6 (HTML Generation), 13 (HTML CLI Integration),
+24 (API Node Architecture), 29 (Static Asset Tracking), 33 (Weight Doc Paths),
+34 (Cache Instability), 35 (Cache Invalidation), 37 (Heading Anchor Bugs),
+38 (Interactive SPA Foundation), 39 (Advanced Interactive Features),
+40 (Network Index DocCodec), 43 (Codec HTML Refactor), 44 (UI Cleanup),
+45 (WASM Threading Fix), 48 (Path Consolidation), 51 (Author Diagnostics),
+52 (Network Index Content Merge), 53 (Cache Invalidation Test Sync)
 
-### HTML Rendering (January — March 2025)
+### Search, Sharding, and Performance (March — May 2026)
 
-The migration from YAML block BID injection to clean frontmatter + title anchors, followed by full HTML generation with an interactive single-page application viewer.
+The viewer scaled to production-sized corpora. Per-network JSON sharding with
+on-demand WASM loading. Compile-time TF-IDF search indices. Performance profiling
+yielding up to 27× speedup on hotpath operations.
 
-**Completed issues**: 6 (HTML Generation), 24 (API Node Architecture), 29 (Static Asset Tracking), 33 (Weight Doc Paths), 34 (Cache Instability), 35 (Cache Invalidation), 37 (Heading Anchor Bugs), 38 (Interactive SPA Foundation), 39 (Advanced Interactive Features), 40 (Network Index DocCodec), 43 (Codec HTML Refactor), 44 (UI Cleanup), 45 (WASM Threading Fix), 48 (Path Manipulation Consolidation), 51 (Author Diagnostics), 52 (Network Index Content Merge), 53 (Cache Invalidation Test Sync)
+**Completed issues**: 47 (Performance Profiling — 27× hotpath speedup),
+50 (BeliefBase Sharding — per-network JSON export, ShardManager, memory budget),
+54 (Full-Text Search MVP — compile-time inverted indices, fuzzy matching)
 
-**Key decisions**:
-- Single-page application with client-side document fetching — no server required
-- WASM-compiled BeliefBase for in-browser graph queries — `BeliefBaseWasm`
-- Two-click navigation pattern — preview metadata, then navigate
-- PathMapMap-based navigation tree — stack-based construction matching document hierarchy
-- Deferred HTML generation — cross-document content (backlinks, related nodes) generated after all documents parsed
+**Superseded issues**: 46 (Full-Text Search — split into 50+54),
+49 (Search Production — absorbed into Issue 70)
 
-### Current State (March 2025)
+### Traceability and Relations (May — July 2026)
 
-The interactive HTML viewer is functional: SPA navigation, metadata panel, navigation tree, theme switching, link detection, image modals, header anchors. The compiler produces complete static HTML output via `noet parse` and live-reloading output via `noet watch`.
+The system became a traceability tool. MyST directive syntax established `{maps_to}`
+and the relation directive framework. The traceability view gave structured tabular
+inspection of coverage claims. Parallel compilation achieved 7.8× speedup. The XLSX
+codec enabled spreadsheet ingestion. Git-aware networks surfaced source URLs.
 
-**What works well**: Compilation model, BID stability, interactive viewer, daemon with file watching, event-driven cache updates, cross-network references.
+**Completed issues**: 26 (Git-Aware Networks), 30 (External URL Tracking — OBE),
+41 (Query Builder — superseded by Issue 70), 42 (Graph Visualization — superseded by
+Issue 70), 55 (MyST Directive Syntax), 57 (Parallel Epoch Compilation — 7.8× at
+`--jobs 8`), 59 (Git Metadata Export), 60 (href/Anchor Cache Fixes),
+61 (Mapping Node — `{maps_to}` directive), 62 (Compiler Re-queue Regression),
+63 (Traceability View), 69 (XLSX Codec)
 
-**What's missing for internal MVP**: Full-text search, BeliefBase sharding for large repositories, performance characterization at scale.
+## Current State (April 2026)
 
-## Current Focus: Internal MVP
+**What works well**: Multi-pass compilation with parallel epochs, BID stability,
+interactive HTML viewer with search and traceability tables, `{maps_to}` cross-document
+edge ownership, XLSX ingestion, per-network sharding, git metadata, MCP server for
+agent queries, daemon with file watching, event-driven cache updates.
 
-The immediate goal is an internal MVP for use at Buildonomy. This means the viewer needs to handle real-world documentation repositories — which means search and scaling.
+**What's actively being built**: Generalized relation directives (all six
+WeightKind × Direction verbs), unified search/query/graph UI, codec architecture for
+structured data formats, MCP server hardening.
 
-### Active Work
+**What's missing for the systems engineering use case**: Composed multi-axis queries
+(the query model is designed but not implemented), source code ingestion, incremental
+re-parse across invocations, inline relation syntax, and a collaboration overlay for
+human attestation.
 
-**Issue 50: BeliefBase Sharding** — Per-network JSON export and on-demand loading in the viewer. Establishes the `ShardManager`, network selector UI, and memory budget infrastructure that search layers onto.
+## Active Work
 
-### Planned Sequence
-
-```
-Issue 50: BeliefBase Sharding (4–6 days)
-    Establishes: finalize_html export hooks, ShardManager,
-    network selector UI, memory budget display,
-    search/*.idx.json generation (always, both modes)
-    ▼
-Issue 47: Performance Profiling (3–4 days)
-    Establishes: realistic corpus generator, scale-sized
-    test fixtures (10KB → 100MB+), macro-benchmarks
-    ▼
-Issue 54: Full-Text Search MVP (4–5 days)
-    Adds: compile-time per-network search indices (.idx.json),
-    TF-IDF ranking, fuzzy matching, viewer search UI
-    No external dependencies — zero WASM binary increase
-    Search covers entire corpus at init (including unloaded shards)
-```
-
-**Design document**: `docs/design/search_and_sharding.md` — unified architecture for sharding and search.
-
-### Release Gating
-
-After the internal MVP is validated, the path to public release (v0.1.0):
-
-- **Issue 7**: Comprehensive testing — full test suite, CI matrix, browser compatibility
-- **Issue 8**: Repository setup — CI/CD pipelines, issue templates, documentation hosting
-- **Issue 9**: Crates.io release — dependency audit, package validation, publication, announcements
-
-These are deliberately deferred until the product is proven internally. Quality pass happens once, not iteratively.
-
-## Vision: Where We're Headed
-
-The following are aspirational directions, roughly ordered by how likely they are to happen. No timelines — they'll be planned when the time comes.
-
-### IDE Integration
-
-Language Server Protocol support for real-time diagnostics, navigation, and editing in IDEs.
-
-- **Issue 11**: Basic LSP — diagnostics, hover, document sync
-- **Issue 12**: Advanced LSP — go-to-definition, find references, autocomplete, rename
-- **Issue 15**: Filtered event streaming — query-based subscriptions for real-time UI updates
-
-### Graph Visualization and Querying
-
-Interactive graph views embedded in the HTML viewer. Query builder UI for exploring the BeliefBase.
-
-- **Issue 42**: Graph visualization
-- **Issue 41**: Query builder UI
-- **Issue 41 (Stream)**: Stream events to SPA for live updates
-
-### Multi-Device Sync and Collaboration
-
-Distributed state synchronization using Automerge CRDTs. Peer-to-peer sync, collaborative presence, offline-first workflow.
-
-- **Issue 16**: Automerge integration for activity logs and distributed state
-
-### Per-Network Theming and Git-Aware Networks
-
-Custom themes per network. Git integration for tracking changes and displaying version history.
-
-- **Issue 25**: Per-network theming
-- **Issue 26**: Git-aware networks
-
-### Procedural Extensions
-
-Extract procedure execution to a separate crate. "As-run" tracking, redline system, observable actions, interactive prompts.
-
-- **Issue 17**: Extract noet-procedures crate
-- **Issue 18**: Extended procedure schemas (observables, prompts)
-
-### Further Out
-
-These are ideas, not plans:
-
-- **Authorization**: Keyhive distributed authorization, capability-based access control
-- **Language features**: Syntax extensions, template system, macro system
-- **Tooling**: `noet fmt`, `noet check`, `noet migrate`, `noet serve`
-- **Performance**: Parallel parsing, incremental compilation cache, memory-mapped files
-- **Integrations**: Database backends (PostgreSQL), plugin system for custom codecs
-- **AI/ML**: Semantic search, related document suggestions, auto-tagging
-
-## Active Issues
+### Near-Term (in progress or next)
 
 | Issue | Title | Priority | Status |
 |-------|-------|----------|--------|
-| 50 | BeliefBase Sharding | HIGH | Planned (next) |
-| 47 | Performance Profiling | MEDIUM | Planned |
-| 54 | Full-Text Search MVP | HIGH | Planned |
-| 49 | Full-Text Search Production | MEDIUM | Planned |
-| 7 | Comprehensive Testing | MEDIUM | Planned (release gate) |
-| 8 | Repository Setup | MEDIUM | Planned (release gate) |
-| 9 | Crates.io Release | MEDIUM | Planned (release gate) |
-| 11 | Basic LSP | MEDIUM | Planned (post-release) |
-| 13 | HTML CLI Integration | MEDIUM | Partially complete |
-| 25 | Per-Network Theming | LOW | Backlog |
-| 26 | Git-Aware Networks | LOW | Backlog |
-| 27 | Rustdoc Integration | LOW | Backlog |
-| 28 | Code Quality | LOW | Backlog |
-| 30 | External URL Tracking | LOW | Backlog |
-| 31 | Watch Service Asset Integration | LOW | Backlog |
-| 32 | Schema Registry Production | LOW | Backlog |
-| 36 | Section BID Migration | LOW | Backlog |
-| 41 | Query Builder / Stream Events | LOW | Backlog |
-| 42 | Graph Visualization | LOW | Backlog |
-| 46 | Full-Text Search (superseded) | — | Superseded by 50/54/49 |
+| 71 | Generalize Relation Block Directives | HIGH | Active |
+| 68 | Two-Registry Codec Architecture | HIGH | Active |
+| 64 | MCP BeliefBase Server | HIGH | Active (hardening) |
+| 60 | Parallel Compilation Follow-On | HIGH | Active (test fixes) |
+| 70 | Unified Search, Query, and Graph UI | MEDIUM | Planned (next) |
+| 58 | Inline `{implements}` Role | MEDIUM | Planned |
+| 66 | Incremental Parse via Shard Hydration | MEDIUM | Planned |
 
-See `BACKLOG.md` for optional enhancements extracted from completed issues.
+### Medium-Term (enables the systems engineering workflow)
+
+| Issue | Title | Priority | Notes |
+|-------|-------|----------|-------|
+| 67 | Source Code Codec | MEDIUM | Structured data ingestion from codegen artifacts |
+| 56 | PathMap Protocol Invariants | MEDIUM | Formal protocol-level testing for the graph builder |
+| 65 | Collaboration Overlay | LOW | Human attestation (comments, sign-offs) on static sites |
+| 32 | Schema Registry Production | MEDIUM | Auto-generate edges from structured payload fields |
+
+### Deferred (valuable but not blocking)
+
+| Issue | Title | Notes |
+|-------|-------|-------|
+| 7 | Comprehensive Testing | Release gate — deferred until product proven in use |
+| 8 | Repository Setup | Release gate — CI/CD, issue templates, docs hosting |
+| 9 | Crates.io Release | Release gate — final publication step |
+| 28 | Code Quality & API Review | Release gate — public API cleanup |
+| 11 | Basic LSP | IDE integration — diagnostics, hover, document sync |
+| 12 | Advanced LSP | Go-to-definition, autocomplete, find-references |
+| 15 | Filtered Event Streaming | Query-filtered subscriptions for real-time UI updates |
+| 36 | Section BID Migration | Content-based section identity for stable moves |
+| 31 | Watch Service Asset Integration | Auto-reparse on asset changes |
+| 25 | Per-Network Theming | Distinct visual styling per network |
+| 27 | Rustdoc Integration | Cross-link cargo doc with noet design docs |
+
+### Aspirational (ideas, not plans)
+
+- **Automerge Integration** (Issue 16): Distributed CRDT-based sync, peer-to-peer
+  collaboration, offline-first workflow
+- **Procedures Extraction** (Issues 17, 18): `noet-procedures` crate for execution
+  tracking, redline system, observable actions
+- **Authorization**: Capability-based access control (Keyhive)
+- **Language features**: Template system, macro system, syntax extensions
+- **Tooling**: `noet fmt`, `noet check`, `noet migrate`, `noet serve`
+- **Performance**: Memory-mapped files, compilation caching
+- **Integrations**: Database backends (PostgreSQL), plugin system
+
+## Design Documents
+
+The query model and DAG model documents define the architectural direction for the
+query system and the conceptual framework. Implementation will follow these specs:
+
+- **[DAG Model](../design/dag_model.md)** — Conceptual introduction to the multigraph
+  model: nodes, three edge types, the video camera query metaphor
+- **[Query Model](../design/query_model.md)** — Formal query algebra: subject,
+  projection, instrument, score semiring, textual syntax
+- **[BeliefBase Architecture](../design/beliefbase_architecture.md)** — Core data model,
+  compilation pipeline, identity management
+- **[MCP Server](../mcp.md)** — Agent-facing query interface documentation
 
 ## References
 
-- `docs/design/beliefbase_architecture.md` — Core data model and compilation architecture
-- `docs/design/interactive_viewer.md` — HTML viewer design
-- `docs/design/search_and_sharding.md` — Search and sharding architecture
+- `docs/project/UX_AUDIT.md` — UX depth model audit: depth levels, current violations, subtraction candidates
 - `docs/project/README.md` — Issue resolution workflow
 - `docs/project/BACKLOG.md` — Optional enhancements
+- `docs/project/DOCUMENTATION_STRATEGY.md` — Documentation hierarchy
 - `AGENTS.md` — Collaboration guidelines
+- `CONTRIBUTING.md` — Development workflow

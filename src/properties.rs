@@ -19,10 +19,7 @@ pub use uuid::Uuid;
 uniffi::custom_type!(Uuid, String, {
     remote,
     try_lift: |val| Ok(Uuid::try_from(val)?),
-    lower: |obj| format!(
-        "{}",
-        obj.hyphenated().encode_lower(&mut Uuid::encode_buffer())
-    )
+    lower: |obj| obj.hyphenated().encode_lower(&mut Uuid::encode_buffer()).to_string()
 });
 
 uniffi::custom_type!(Table, String, {
@@ -106,6 +103,14 @@ pub const UUID_NAMESPACE_ASSET: Uuid = Uuid::from_bytes([
     0x4b, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
 ]);
 
+/// The 'codec' namespace UUID. Used by codec-registered secondary index namespaces
+/// (e.g. C++ include paths, slug resolution). First byte is `0xff` so codec namespace
+/// BIDs sort after all content network BIDs in BTreeSet iteration order — this ensures
+/// `partition_graph`'s `or_insert` semantics always assign nodes to content networks first.
+pub const UUID_NAMESPACE_CODEC: Uuid = Uuid::from_bytes([
+    0xff, 0x3d, 0x21, 0x54, 0xc0, 0xa9, 0x43, 0x7b, 0x93, 0x24, 0x5f, 0x62, 0xad, 0xeb, 0x9a, 0x44,
+]);
+
 #[uniffi::export]
 pub fn buildonomy_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_BUILDONOMY)
@@ -121,10 +126,20 @@ pub fn asset_namespace() -> Bid {
     Bid::from(UUID_NAMESPACE_ASSET)
 }
 
+/// Root BID for all codec-registered secondary index namespaces.
+pub fn codec_namespace_root() -> Bid {
+    Bid::from(UUID_NAMESPACE_CODEC)
+}
+
 /// All reserved/const namespaces. Used by `is_reserved()` and anywhere
 /// the full set of system namespaces is needed.
-pub fn const_namespaces() -> [Bid; 3] {
-    [buildonomy_namespace(), href_namespace(), asset_namespace()]
+pub fn const_namespaces() -> [Bid; 4] {
+    [
+        buildonomy_namespace(),
+        href_namespace(),
+        asset_namespace(),
+        codec_namespace_root(),
+    ]
 }
 
 /// Namespaces that track external content anchored to the parsed repo (hrefs, assets).
@@ -307,6 +322,26 @@ impl Bid {
         let namespace = self.bref();
         move |id: &U| id.as_ref().parent_bref() == namespace
     }
+
+    /// Derive a deterministic BID for a codec-registered secondary index namespace.
+    ///
+    /// The term is normalized via `to_anchor()` before hashing to prevent whitespace,
+    /// casing, or separator differences from producing different BIDs for the same
+    /// logical namespace.
+    ///
+    /// This is a pure function — callable anywhere with no state. Codec instances
+    /// (which are ephemeral, created fresh per file) use a hardcoded string constant
+    /// and call this to derive the namespace bref for annotating IRNode fields and
+    /// edge keys.
+    pub fn codec_namespace(term: &str) -> Bid {
+        let normalized = to_anchor(term);
+        let uuid = Uuid::new_v5(&UUID_NAMESPACE_CODEC, normalized.as_bytes());
+        // Stamp octets 10-15 with the codec namespace root's bref so that
+        // is_reserved() detects these BIDs as reserved.
+        let mut bytes = *uuid.as_bytes();
+        bytes[10..16].copy_from_slice(codec_namespace_root().bref().bytes());
+        Bid(Uuid::from_bytes(bytes))
+    }
 }
 
 impl Default for Bid {
@@ -483,7 +518,7 @@ pub enum BeliefKind {
     /// Denotes that the Bid wraps an external reference -- it is a link to a source we don't have
     /// native parsing capability for (no read/write access, binary format, external api, etc.).
     External,
-    /// Marks a node whose relations are partially loaded, enabling partial hypergraph loading while
+    /// Marks a node whose relations are partially loaded, enabling partial multigraph loading while
     /// maintaining structural integrity. When a node has BeliefKind::Trace, it signals that the
     /// node exists and can be referenced, but its relations may be incomplete for the current query
     /// scope. This allows query results to include referenced nodes (e.g., as edge targets) without
@@ -491,7 +526,7 @@ pub enum BeliefKind {
     /// avoiding loading the entire graph. The balance mechanism uses Trace to identify nodes
     /// needing additional queries. During union operations, Trace is removed when a complete
     /// relation set for that node is merged in. Trace nodes enable querying subgraphs while
-    /// maintaining valid connections to the unloaded portions of the hypergraph.
+    /// maintaining valid connections to the unloaded portions of the multigraph.
     Trace,
 }
 
@@ -583,9 +618,11 @@ pub struct Weight {
     pub payload: Table,
 }
 
-/// Key for marking edge ownership in Weight payload.
-/// When "owned_by" is "source", the source node owns the edge (e.g., parent_connections).
-/// When "owned_by" is "sink" or absent, the sink node owns the edge (default behavior).
+/// Ownership marker for edge weights.
+/// - `"source"`: the source node owns this edge (e.g., parent_connections).
+/// - `"sink"` or absent: the sink node owns this edge (default behavior).
+/// - Any other string: a bref identifying a third-party owner node (e.g., a section with a
+///   `{maps_to}` directive). Used by `compute_diff` to scope GC to the owning section.
 pub const WEIGHT_OWNED_BY: &str = "owned_by";
 
 /// Key for storing sort/index value in Weight payload (typically for Subsection relationships)
@@ -654,15 +691,9 @@ impl Weight {
     }
 
     /// Set document paths (always uses new WEIGHT_DOC_PATHS format).
-    /// Warns if setting more than 1 path (unusual case).
+    /// Multiple paths are supported for path aliases (e.g. include-convention
+    /// paths alongside filesystem paths, or derived header filenames).
     pub fn set_doc_paths(&mut self, paths: Vec<String>) -> Result<(), toml::ser::Error> {
-        if paths.len() > 1 {
-            tracing::warn!(
-                "Setting {} paths for single relation (expected 1). Paths: {:?}",
-                paths.len(),
-                paths
-            );
-        }
         self.set(WEIGHT_DOC_PATHS, paths)
     }
 }
@@ -700,7 +731,7 @@ impl Ord for Weight {
 }
 
 /// [WeightKind] identifies what type of node to node relationship an edge represents. Each
-/// [crate::beliefbase::BidGraph] represents a hypergraph of these relationship types.
+/// [crate::beliefbase::BidGraph] represents a multigraph of these relationship types.
 ///
 /// **Architecture Note (Advisory Council 2025-11-19):** WeightKind is infrastructure-only,
 /// carrying NO semantic payload. All semantic information is stored in the Weight.payload field:
@@ -709,50 +740,20 @@ impl Ord for Weight {
 /// - For Subsection edges: section numbering, heading text
 ///
 /// This separation enables clean separation of graph algorithms from domain semantics.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, uniffi::Enum,
-)]
+#[derive(Debug, Serialize, Deserialize, PartialOrd, Ord, Hash, EnumSetType, uniffi::Enum)]
+#[enumset(repr = "u8")]
 pub enum WeightKind {
-    Epistemic, // Knowledge dependencies
-    Section,   // Document structure
-    Pragmatic, // Action/being relationships
-}
-
-/// [PragmaticKind] defines semantic kinds for Pragmatic edges in the intention lattice.
-/// Multiple kinds can be true simultaneously (stored as EnumSet in Weight.payload).
-///
-/// These are inferred from procedure structure during schema parsing or explicitly declared
-/// in parent_connections. See design/intention_lattice.md for full semantics.
-#[derive(EnumSetType, Debug, Serialize, Deserialize)]
-#[enumset(serialize_repr = "list")]
-pub enum PragmaticKind {
-    Constitutive, // Identity-maintaining: action IS the aspiration embodied
-    Instrumental, // Goal-achieving: action serves the aspiration as a means
-    Expressive,   // Value-expressing: action manifests the aspiration symbolically
-    Exploratory,  // Uncertainty-reducing: investigating the meaning of this relationship
-}
-
-/// [MotivationDimension] defines which Self-Determination Theory (SDT) dimensions to track
-/// for a practice. This is configuration only—actual predicted/observed values are stored
-/// privately in practice_statistics (see procedure_engine.md).
-///
-/// Multiple dimensions can be tracked simultaneously (stored as EnumSet in Weight.payload).
-#[derive(EnumSetType, Debug, Serialize, Deserialize)]
-#[enumset(serialize_repr = "list")]
-pub enum MotivationDimension {
-    IntrinsicReward, // Track intrinsic enjoyment/interest
-    Autonomous,      // Track sense of choice/volition (vs. external pressure)
-    ShouldPressure,  // Track internalized obligation ('should' energy)
-    Efficacy,        // Track perceived competence/effectiveness
-    Relatedness,     // Track social connection/belonging dimension
+    Section,   // Structural containment (S content)
+    Pragmatic, // Procedural/operational relationships (P content)
+    Epistemic, // Normative coupling and knowledge dependencies (N content)
 }
 
 impl WeightKind {
     pub fn all() -> &'static [WeightKind] {
         &[
-            WeightKind::Epistemic,
             WeightKind::Section,
             WeightKind::Pragmatic,
+            WeightKind::Epistemic,
         ]
     }
 }
@@ -766,9 +767,9 @@ impl Display for WeightKind {
 impl From<WeightKind> for u32 {
     fn from(src: WeightKind) -> u32 {
         match src {
-            WeightKind::Epistemic => 0u32,
-            WeightKind::Section => u32::from(u16::MAX),
-            WeightKind::Pragmatic => 2 * u32::from(u16::MAX),
+            WeightKind::Section => 0u32,
+            WeightKind::Pragmatic => u32::from(u16::MAX),
+            WeightKind::Epistemic => 2 * u32::from(u16::MAX),
         }
     }
 }
@@ -776,9 +777,9 @@ impl From<WeightKind> for u32 {
 impl From<&WeightKind> for u32 {
     fn from(src: &WeightKind) -> u32 {
         match src {
-            WeightKind::Epistemic => 0u32,
-            WeightKind::Section => u32::from(u16::MAX),
-            WeightKind::Pragmatic => 2 * u32::from(u16::MAX),
+            WeightKind::Section => 0u32,
+            WeightKind::Pragmatic => u32::from(u16::MAX),
+            WeightKind::Epistemic => 2 * u32::from(u16::MAX),
         }
     }
 }
@@ -803,9 +804,9 @@ impl TryFrom<u32> for WeightKind {
 
     fn try_from(src: u32) -> Result<WeightKind, BuildonomyError> {
         match src {
-            0..=255 => Ok(WeightKind::Epistemic),
-            256..=511 => Ok(WeightKind::Section),
-            512..=767 => Ok(WeightKind::Pragmatic),
+            0..=255 => Ok(WeightKind::Section),
+            256..=511 => Ok(WeightKind::Pragmatic),
+            512..=767 => Ok(WeightKind::Epistemic),
             _ => Err(BuildonomyError::Custom(format!(
                 "Invalid u32 for WeightKind. Max allowed value is 767. Received {src}"
             ))),
@@ -816,7 +817,7 @@ impl TryFrom<u32> for WeightKind {
 use std::collections::BTreeMap;
 
 /// [WeightSet] is the edge data structure used within a [crate::beliefbase::BidGraph] to represent the full
-/// [crate::beliefbase::BeliefBase] hypergraph within a single graph structure.
+/// [crate::beliefbase::BeliefBase] multigraph within a single graph structure.
 ///
 /// WeightSet methods provide convenience functions for extracting and comparing [WeightKind]
 /// specific measures.
@@ -895,10 +896,31 @@ impl WeightSet {
 
     pub fn full() -> Self {
         let mut weights = BTreeMap::new();
-        weights.insert(WeightKind::Epistemic, Weight::full());
         weights.insert(WeightKind::Section, Weight::full());
         weights.insert(WeightKind::Pragmatic, Weight::full());
+        weights.insert(WeightKind::Epistemic, Weight::full());
         Self { weights }
+    }
+
+    /// Extract a deterministic sort key for ordering edges.
+    ///
+    /// Checks each `WeightKind` in `kind_filter` by enum ordinal
+    /// (Section, Pragmatic, Epistemic) and returns the first
+    /// `WEIGHT_SORT_KEY` found. Returns `u16::MAX` if no matching
+    /// kind carries a sort key.
+    ///
+    /// The enum ordinal reflects structural importance: Section
+    /// (document hierarchy) first, then Pragmatic (action/traceability),
+    /// then Epistemic (knowledge dependencies).
+    pub fn sort_key(&self, kind_filter: &enumset::EnumSet<WeightKind>) -> u16 {
+        kind_filter
+            .iter()
+            .find_map(|kind| {
+                self.weights
+                    .get(&kind)
+                    .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
+            })
+            .unwrap_or(u16::MAX)
     }
 }
 
@@ -933,6 +955,104 @@ impl<'a> IntoIterator for &'a WeightSet {
     }
 }
 
+/// The identity state of a node's anchor/ID.
+///
+/// Separates the HTML anchor (document-scoped, derived from heading text) from the
+/// network-scoped ID (must be unique within a network).  See ISSUE_75 for motivation.
+///
+/// Serialized as `Option<String>` for backward compatibility with existing msgpack
+/// shards: `Slug` and `Collision` both serialize as absent (`None`), `Explicit`
+/// serializes as the string value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum NodeId {
+    /// No explicit ID.  Title-derived slug is used for both anchor and network ID.
+    /// This is the initial state for headings without `{#id}`.
+    #[default]
+    Slug,
+    /// An explicit ID used for both the HTML anchor and network-scoped ID.
+    /// Sources: user-authored `{#intro}`, intra-document collision resolution
+    /// (slug-N suffix from `md.rs`), or system-assigned bref fallback.
+    /// Already normalized via `to_anchor()`.
+    Explicit(String),
+    /// Inter-doc network-level ID collision detected by FIRST-ONE-WINS.  The
+    /// title-derived slug is still used for the HTML anchor and PathMap path
+    /// fragment (it is document-unique).  Network-scoped disambiguation uses
+    /// `node.bid.bref()` (already on the node; no inner value stored here).
+    ///
+    /// The inner `String` is the original title-derived slug that caused the
+    /// collision, stored so that on reparse we can detect when the collision
+    /// has been resolved (e.g. user renamed the heading or added `{#explicit-id}`).
+    Collision(String),
+}
+
+impl NodeId {
+    /// The value to use for the HTML `id` attribute and PathMap path fragment.
+    /// Returns the explicit ID string for `Explicit`, or empty for `Slug`/`Collision`
+    /// (callers fall through to `to_anchor(title)`).
+    pub fn anchor(&self) -> &str {
+        match self {
+            NodeId::Explicit(s) => s.as_str(),
+            NodeId::Slug | NodeId::Collision(_) => "",
+        }
+    }
+
+    /// Whether this node underwent a network-level inter-doc ID collision.
+    pub fn is_collision(&self) -> bool {
+        matches!(self, NodeId::Collision(_))
+    }
+
+    /// Whether this node has an explicit (user-authored) ID.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, NodeId::Explicit(_))
+    }
+}
+
+/// Prefix used to distinguish `Collision` from `Explicit` in serialized form.
+/// IDs are always slugified (lowercase + dashes), so this prefix is unambiguous.
+pub(crate) const COLLISION_PREFIX: &str = "@@collision:";
+
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            NodeId::Slug => serializer.serialize_none(),
+            NodeId::Collision(slug) => {
+                serializer.serialize_some(&format!("{COLLISION_PREFIX}{slug}"))
+            }
+            NodeId::Explicit(s) => serializer.serialize_some(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        Ok(match opt {
+            None => NodeId::Slug,
+            Some(s) if s.is_empty() => NodeId::Slug,
+            Some(s) if s.starts_with(COLLISION_PREFIX) => {
+                NodeId::Collision(s[COLLISION_PREFIX.len()..].to_string())
+            }
+            Some(s) => NodeId::Explicit(s),
+        })
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeId::Slug => write!(f, "<slug>"),
+            NodeId::Explicit(s) => write!(f, "{}", s),
+            NodeId::Collision(slug) => write!(f, "<collision:{slug}>"),
+        }
+    }
+}
+
+/// Serde skip predicate for `BeliefNode.id`: skip serialization when Slug
+/// (Collision is now serialized with a prefix so it round-trips correctly).
+fn skip_node_id(id: &NodeId) -> bool {
+    matches!(id, NodeId::Slug)
+}
+
 /// Acts as a reference-to and configuration-of an actionable element within a
 /// [crate::beliefbase::BeliefBase]. [BeliefNode]s are the nodes (duh) of a Network.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, uniffi::Record)]
@@ -945,9 +1065,11 @@ pub struct BeliefNode {
     #[serde(default)]
     #[serde(skip_serializing_if = "Table::is_empty")]
     pub payload: Table,
-    /// Optional semantic identifier from TOML schema (e.g., "asp_sarah_embodiment_rest")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    /// Node identity: explicit user-authored ID, slug-derived (no explicit ID), or
+    /// collision (inter-doc slug collision resolved by FIRST-ONE-WINS).
+    /// Serialized as `Option<String>` for shard backward compatibility.
+    #[serde(skip_serializing_if = "skip_node_id")]
+    pub id: NodeId,
     /// Runtime metadata: per-parse annotations such as git status and source backlinks.
     /// Serialized via `toml()` (carried in `BeliefEvent::NodeUpdate`) and persisted in the
     /// DB `metadata` column so it survives the full parse → DB → export → browser round-trip.
@@ -1011,9 +1133,11 @@ impl BeliefNode {
             title: format!("Buildonomy API v{}", env!("CARGO_PKG_VERSION")),
             schema: Some("api".to_string()),
             payload: table,
-            // API node is _always_ also a Trace, as we never can assume we have all api relations
-            kind: BeliefKindSet(BeliefKind::API | BeliefKind::Trace),
-            id: Some("buildonomy_api".to_string()),
+            // API node is _always_ also a Trace, as we never can assume we have all api relations.
+            // External marks it as permanently Trace — no deeper cache fetch will yield a non-Trace
+            // version, so cache_fetch accepts it as a valid hit without falling through.
+            kind: BeliefKindSet(BeliefKind::API | BeliefKind::External | BeliefKind::Trace),
+            id: NodeId::Explicit("buildonomy_api".to_string()),
             metadata: Table::new(),
         }
     }
@@ -1035,9 +1159,11 @@ impl BeliefNode {
             ),
             schema: Some("api".to_string()),
             payload: table,
-            // API node is _always_ also a Trace, as we never can assume we have all api relations
-            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
-            id: Some("buildonomy_href_network".to_string()),
+            // Href network is always Trace — it tracks external URLs, never fully parsed.
+            // External marks it as permanently Trace so cache_fetch accepts it without
+            // falling through to a deeper (always-empty) global_bb fetch.
+            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::External | BeliefKind::Trace),
+            id: NodeId::Explicit("buildonomy_href_network".to_string()),
             metadata: Table::new(),
         }
     }
@@ -1057,9 +1183,34 @@ impl BeliefNode {
             ),
             schema: Some("api".to_string()),
             payload: table,
-            // Asset network is always a Trace as we track external resources
-            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::Trace),
-            id: Some("buildonomy_asset_network".to_string()),
+            // Asset network is always Trace — it tracks external file references, never fully
+            // parsed. External marks it as permanently Trace so cache_fetch accepts it without
+            // falling through to a deeper (always-empty) global_bb fetch.
+            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::External | BeliefKind::Trace),
+            id: NodeId::Explicit("buildonomy_asset_network".to_string()),
+            metadata: Table::new(),
+        }
+    }
+
+    /// Creates a BeliefNode for a codec-registered secondary index namespace network.
+    ///
+    /// The BID is derived from the term via `Bid::codec_namespace(term)`.
+    /// These nodes are structural — they serve as PathMap roots for cross-network
+    /// lookup indices (e.g. C++ include paths).
+    pub fn codec_network(term: &str) -> BeliefNode {
+        let bid = Bid::codec_namespace(term);
+        let mut table = Table::new();
+        table.insert(
+            "api".to_string(),
+            Value::String(buildonomy_namespace().to_string()),
+        );
+        BeliefNode {
+            bid,
+            title: format!("Codec namespace: {term}"),
+            schema: Some("api".to_string()),
+            payload: table,
+            kind: BeliefKindSet(BeliefKind::Network | BeliefKind::External | BeliefKind::Trace),
+            id: NodeId::Explicit(format!("buildonomy_codec_{}", to_anchor(term))),
             metadata: Table::new(),
         }
     }
@@ -1078,24 +1229,38 @@ impl BeliefNode {
         }
     }
 
+    /// Returns the effective ID string for this node.  Fallback chain:
+    /// 1. Explicit ID string (for `NodeId::Explicit`)
+    /// 2. Title-derived slug via `to_anchor(title)` (for `Slug` and `Collision`)
+    /// 3. Bref string (if title is empty)
+    /// 4. Empty string (nil BID, no title)
+    ///
+    /// Note: `Collision` returns the title slug (same as `Slug`) for consistency
+    /// with `insert_state`'s key-matching. Use `collision_aware_id()` when you
+    /// need the bref-based disambiguated ID for cache lookups.
     pub fn id(&self) -> String {
-        self.id
-            .clone()
-            .filter(|id| !id.is_empty())
-            .or_else(|| {
+        match &self.id {
+            NodeId::Explicit(s) if !s.is_empty() => s.clone(),
+            _ => {
                 if !self.title.is_empty() {
-                    Some(to_anchor(&self.title))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                if !self.bid.is_nil() {
+                    to_anchor(&self.title)
+                } else if !self.bid.is_nil() {
                     self.bid.bref().to_string()
                 } else {
                     String::default()
                 }
-            })
+            }
+        }
+    }
+
+    /// Returns the ID to use for network-scoped cache lookups.
+    /// For `Collision` nodes, returns the bref (disambiguated ID) instead of
+    /// the colliding slug.  For all other variants, delegates to `id()`.
+    pub fn collision_aware_id(&self) -> String {
+        match &self.id {
+            NodeId::Collision(_) => self.bid.bref().to_string(),
+            _ => self.id(),
+        }
     }
 
     /// Generate all valid hrefs per NodeKey::from_str parsing definition with optional namespace
@@ -1186,11 +1351,9 @@ impl BeliefNode {
         );
         for key in keys.into_iter() {
             match (self.payload.get(&key), rhs.payload.get(&key)) {
-                (Some(lhs_value), Some(rhs_value)) => {
-                    if lhs_value != rhs_value {
-                        changed = true;
-                        self.payload.insert(key.clone(), rhs_value.clone());
-                    }
+                (Some(lhs_value), Some(rhs_value)) if lhs_value != rhs_value => {
+                    changed = true;
+                    self.payload.insert(key.clone(), rhs_value.clone());
                 }
                 (None, Some(rhs_value)) => {
                     changed = true;
@@ -1204,6 +1367,19 @@ impl BeliefNode {
 
     pub fn toml(&self) -> String {
         to_string(self).expect("Serialization of BeliefNodes cannot fail")
+    }
+
+    /// Render this node's `payload.text` field as HTML.
+    ///
+    /// Uses `render_markdown_snippet` (canonical parser options + broken
+    /// link callback). Returns empty string if no text payload exists.
+    pub fn render_text_html(&self) -> String {
+        self.payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(crate::codec::render_markdown_snippet)
+            .unwrap_or_default()
     }
 
     /// Apply source-file-derived fields from `ir` into `self`, leaving runtime-only
@@ -1293,7 +1469,13 @@ impl FromRow<'_, SqliteRow> for BeliefNode {
             title: title_str.to_string(),
             schema: schema_str.map(|schema| schema.to_string()),
             payload: table,
-            id: maybe_id_str.map(|id_str| id_str.to_string()),
+            id: match maybe_id_str {
+                Some(s) if s.starts_with(COLLISION_PREFIX) => {
+                    NodeId::Collision(s[COLLISION_PREFIX.len()..].to_string())
+                }
+                Some(s) if !s.is_empty() => NodeId::Explicit(s.to_string()),
+                _ => NodeId::Slug,
+            },
             metadata,
         })
     }
@@ -1334,7 +1516,15 @@ impl TryFrom<&IRNode> for BeliefNode {
                 .and_then(|val| val.as_str().map(|s| s.to_string())),
             id: doc
                 .remove("id")
-                .and_then(|val| val.as_str().map(|s| s.to_string())),
+                .and_then(|val| {
+                    val.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| val.as_integer().map(|n| n.to_string()))
+                        .or_else(|| val.as_float().map(|f| f.to_string()))
+                        .or_else(|| Some(format!("{val:?}")))
+                })
+                .map(NodeId::Explicit)
+                .unwrap_or_default(),
             payload: from_str(&doc.to_string())?,
             kind: proto.kind.clone(),
             metadata: Table::new(),
@@ -1740,6 +1930,55 @@ mod tests {
     }
 
     #[test]
+    fn test_weight_owned_by_survives_msgpack_roundtrip() {
+        // Regression test: WEIGHT_OWNED_BY with a third-party bref must survive
+        // rmp_serde serialization/deserialization. This value is used by
+        // BeliefContext::declared_edges() and the get_maps_to* MCP tools to
+        // identify edges owned by a {maps_to} directive section node.
+        let mut ws = WeightSet::from(WeightKind::Pragmatic);
+        {
+            let weight = ws.weights.get_mut(&WeightKind::Pragmatic).unwrap();
+            weight.set(WEIGHT_OWNED_BY, "abc12def3456").unwrap();
+            weight.set(WEIGHT_SORT_KEY, 7u16).unwrap();
+        }
+
+        // Verify pre-round-trip value is readable.
+        let pre: Option<String> = ws
+            .weights
+            .get(&WeightKind::Pragmatic)
+            .unwrap()
+            .get(WEIGHT_OWNED_BY);
+        assert_eq!(
+            pre.as_deref(),
+            Some("abc12def3456"),
+            "owned_by not set correctly before round-trip"
+        );
+
+        // Round-trip through rmp_serde (the same codec used for shard files).
+        let encoded = rmp_serde::to_vec_named(&ws).expect("msgpack encode failed");
+        let decoded: WeightSet = rmp_serde::from_slice(&encoded).expect("msgpack decode failed");
+
+        let post: Option<String> = decoded
+            .weights
+            .get(&WeightKind::Pragmatic)
+            .unwrap()
+            .get(WEIGHT_OWNED_BY);
+        assert_eq!(
+            post.as_deref(),
+            Some("abc12def3456"),
+            "WEIGHT_OWNED_BY lost during rmp_serde round-trip — Weight#[serde(flatten)] incompatibility"
+        );
+
+        // Also verify sort_key survived.
+        let sort_key: Option<u16> = decoded
+            .weights
+            .get(&WeightKind::Pragmatic)
+            .unwrap()
+            .get(WEIGHT_SORT_KEY);
+        assert_eq!(sort_key, Some(7u16), "sort_key lost during round-trip");
+    }
+
+    #[test]
     fn test_weight_doc_paths_multiple() {
         // Test setting multiple paths (e.g., for assets referenced from multiple locations)
         let mut weight = Weight::default();
@@ -1803,7 +2042,7 @@ mod tests {
             title: "Guide".to_string(),
             schema: None,
             payload: Table::new(),
-            id: Some("guide".to_string()),
+            id: NodeId::Explicit("guide".to_string()),
             metadata,
         };
 
@@ -1837,7 +2076,7 @@ mod tests {
             title: "Lib".to_string(),
             schema: None,
             payload: Table::new(),
-            id: None,
+            id: NodeId::default(),
             metadata,
         };
 
@@ -1871,7 +2110,7 @@ mod tests {
             title: "Doc".to_string(),
             schema: None,
             payload: Table::new(),
-            id: Some("doc".to_string()),
+            id: NodeId::Explicit("doc".to_string()),
             metadata: Table::new(),
         };
         let toml = node.toml();
@@ -1879,5 +2118,59 @@ mod tests {
             !toml.contains("metadata"),
             "empty metadata must be omitted from serialization; got:\n{toml}"
         );
+    }
+
+    #[test]
+    fn test_codec_namespace_determinism() {
+        let bid1 = Bid::codec_namespace("include");
+        let bid2 = Bid::codec_namespace("include");
+        assert_eq!(bid1, bid2, "Same term must produce same BID");
+    }
+
+    #[test]
+    fn test_codec_namespace_is_reserved() {
+        let bid = Bid::codec_namespace("include");
+        assert!(bid.is_reserved(), "Codec namespace BIDs must be reserved");
+    }
+
+    #[test]
+    fn test_codec_namespace_distinct_from_const_namespaces() {
+        let include_bid = Bid::codec_namespace("include");
+        assert_ne!(include_bid, href_namespace());
+        assert_ne!(include_bid, asset_namespace());
+        assert_ne!(include_bid, buildonomy_namespace());
+    }
+
+    #[test]
+    fn test_codec_namespace_different_terms_produce_different_bids() {
+        let include = Bid::codec_namespace("include");
+        let slug = Bid::codec_namespace("slug");
+        assert_ne!(include, slug);
+    }
+
+    #[test]
+    fn test_codec_namespace_normalization() {
+        // to_anchor normalizes casing and whitespace
+        let bid1 = Bid::codec_namespace("Include");
+        let bid2 = Bid::codec_namespace("include");
+        assert_eq!(bid1, bid2, "Terms should be normalized via to_anchor");
+    }
+
+    #[test]
+    fn test_codec_network_factory() {
+        let node = BeliefNode::codec_network("include");
+        assert_eq!(node.bid, Bid::codec_namespace("include"));
+        assert!(node.kind.contains(BeliefKind::Network));
+        assert!(node.kind.contains(BeliefKind::External));
+        assert!(node.kind.contains(BeliefKind::Trace));
+    }
+
+    #[test]
+    fn test_codec_namespace_sort_order() {
+        // Codec namespace root should sort after all other const namespaces
+        let codec = codec_namespace_root();
+        assert!(codec > buildonomy_namespace());
+        assert!(codec > href_namespace());
+        assert!(codec > asset_namespace());
     }
 }

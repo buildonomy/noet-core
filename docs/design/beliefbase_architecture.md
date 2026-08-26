@@ -1,7 +1,7 @@
 ---
 title = "BeliefBase Architecture: The Compiler IR for Document Graphs"
 authors = "Andrew Lyjak, Claude Code"
-last_updated = "2025-03-16"
+last_updated = "2025-04-28"
 status = "Draft"
 version = "0.3"
 ---
@@ -68,7 +68,6 @@ pub enum NodeKey {
     Bid { bid: Bid },                    // Globally unique UUID (primary key)
     Bref { bref: Bref },                 // 12-char hex compact reference
     Id { net: Bid, id: String },         // User-defined semantic ID
-    Title { net: Bid, title: String },   // Auto-generated from heading text
     Path { net: Bid, path: String },     // Filesystem location
 }
 ```
@@ -160,18 +159,6 @@ Second occurrence - collision! Gets Bref: {#a1b2c3d4e5f6}
 1. **Document-level**: During parse, track IDs within single file
 2. **Network-level**: During enrichment, check PathMap for cross-file collisions
 
-##### 4. Title - Auto-Generated Anchor
-
-**Purpose**: Automatic anchor generation from heading text
-
-**Properties**:
-- Always present: `title = "Introduction"`
-- Normalized via `to_anchor()` for HTML anchor compatibility
-- Used when no explicit ID provided
-- Can change (breaking references unless BID/Bref used)
-
-**Generation**: Automatic from heading text or TOML `title` field
-
 ##### 5. Path - Filesystem Location
 
 **Purpose**: File system operations and initial discovery
@@ -252,11 +239,38 @@ This hierarchy enables **progressive enhancement**: start with simple title refe
 
 **Problem**: Multiple headings in a document or network may normalize to the same ID.
 
-**Solution**: Two-level collision detection with Bref fallback.
+**Solution**: Two-level collision detection using the `NodeId` enum to distinguish
+anchor identity (document-scoped) from network-scoped identity.
+
+##### The `NodeId` Enum
+
+**Implementation**: `src/properties.rs`
+
+`BeliefNode.id` is a `NodeId` enum (not `Option<String>`) that captures the
+identity state of a node's anchor:
+
+```rust
+pub enum NodeId {
+    Slug,              // Title-derived slug; no explicit ID
+    Explicit(String),  // User-authored {#id}, intra-doc collision suffix, or bref fallback
+    Collision,         // Inter-doc network-level collision (ephemeral, not persisted)
+}
+```
+
+**Key semantic split**:
+- `anchor()` → the value for the HTML `id` attribute and PathMap path fragment.
+  Returns the explicit string for `Explicit`, empty for `Slug`/`Collision` (callers
+  fall through to `to_anchor(title)`).
+- `id()` → backward-compatible effective ID. Falls through: `Explicit` string →
+  `to_anchor(title)` → bref string.
+
+**Serialization**: `Slug` and `Collision` serialize as absent (`None`);
+`Explicit(s)` serializes as `Some(s)`. Backward-compatible with existing msgpack
+shards.
 
 ##### Document-Level Collision Detection
 
-**Implementation**: `src/codec/md.rs:1027-1054` (End(Heading) handler)
+**Implementation**: `src/codec/md.rs` (End(Heading) handler)
 
 **Algorithm**:
 ```rust
@@ -266,76 +280,81 @@ fn determine_node_id(
     bref: &str,                      // Node's Bref
     existing_ids: &HashSet<String>,  // Already seen IDs in document
 ) -> String {
-    // Priority: explicit ID > title-derived ID
     let candidate = if let Some(id) = explicit_id {
-        to_anchor(id)  // Normalize user ID
+        to_anchor(id)
     } else {
-        to_anchor(title)  // Derive from title
+        to_anchor(title)
     };
-    
-    // Fallback to Bref if collision detected
     if existing_ids.contains(&candidate) {
-        bref.to_string()
+        bref.to_string()  // Fallback to Bref
     } else {
         candidate
     }
 }
 ```
 
+Intra-document collisions produce `NodeId::Explicit` with a bref or slug-N suffix.
+The anchor and network ID are the same value — no ambiguity.
+
 **Example**:
 ```markdown
 ## Details
-<!-- First occurrence: gets ID "details" -->
+<!-- First occurrence: NodeId::Slug, anchor="details" -->
 
 ## Details
-<!-- Collision detected: gets Bref {#a1b2c3d4e5f6} -->
-
-## Getting Started {#getting-started}
-<!-- Explicit ID: gets "getting-started" -->
-
-## Getting Started
-<!-- Collision with explicit ID: gets Bref {#b2c3d4e5f6a1} -->
+<!-- Collision: NodeId::Explicit("a1b2c3d4e5f6"), anchor="a1b2c3d4e5f6" -->
 ```
 
 ##### Network-Level Collision Detection
 
-**Implementation**: `src/codec/md.rs:700-723` (inject_context function)
+**Implementation**: `src/codec/builder.rs` (push, FIRST-ONE-WINS) and
+`src/beliefbase/base.rs` (insert_state)
 
-**Purpose**: Detect when an ID is already used by a different node in the network
+**Purpose**: Detect when an ID is already used by a different node in the network.
+Two documents with `## Data Sharing` produce the same slug `data-sharing`; the
+network-scoped `NodeKey::Id` collides even though the PathMap paths are distinct
+(`a.md#data-sharing` vs `b.md#data-sharing`).
 
-**Algorithm**:
+**Algorithm**: FIRST-ONE-WINS. The first node to claim an ID keeps it; the
+loser is marked `NodeId::Collision`:
+
 ```rust
-// After document-level collision detection
-if let Some(current_id) = proto.id {
-    // Query PathMap for network-level collision
-    if let Some((doc_bid, node_bid)) = paths.net_get_from_id(&net, &current_id) {
-        if node_bid != ctx.node.bid {
-            // Different node already owns this ID - remove it
-            tracing::info!("Network collision: '{}' already used", current_id);
-            proto.id = None;
-        }
-    }
-}
+// In push() when network-level ID collision is detected:
+node.id = NodeId::Collision;
+// NodeKey::Id key is still updated to use bref for collision avoidance:
+keys[id_key_idx] = NodeKey::Id { net, id: node.bid.bref().to_string() };
 ```
 
-**Why separate levels?**
-- Document-level catches `##Details` / `##Details` in same file
-- Network-level catches `docs/a.md#intro` and `docs/b.md#intro` collision
+**Why `Collision` instead of setting `id = bref`**: The anchor and the network-scoped
+ID serve different purposes. The anchor (`doc.md#data-sharing`) is document-unique
+and should remain the title slug for PathMap paths and HTML rendering. Only the
+network-scoped `NodeKey::Id` needs disambiguation (via bref). Setting `node.id` to
+the bref conflated these roles, corrupting PathMap paths and causing `cache_fetch`
+misses on re-parse when `--write` is off (the source heading text doesn't change,
+so `speculative_path_key` generates the slug-based path, but the PathMap stored
+the bref-based path). See Issue 75 for the full investigation.
+
+**`Collision` is ephemeral**: re-derived each parse from the dynamic collision check.
+Not persisted to shards (serializes as absent, same as `Slug`). If the conflicting
+document is removed, the next parse no longer detects the collision and the node
+returns to `Slug` state automatically.
 
 ##### Selective ID Injection
 
 **Policy**: Only inject anchors when necessary (normalized or collision-resolved)
 
-**Implementation**: `src/codec/md.rs:725-751` (inject_context function)
+**Implementation**: `src/codec/md.rs` (inject_context function)
 
 **Rules**:
 1. **Explicit ID matches normalized form**: No injection (keep source clean)
    - User writes `{#intro}` → already normalized → no rewrite
 2. **Explicit ID normalized differently**: Inject normalized form
    - User writes `{#Intro!}` → normalized to `{#intro}` → inject `{#intro}`
-3. **Collision detected**: Inject Bref
+3. **Intra-doc collision detected**: Inject Bref
    - Second "Details" → collision → inject `{#a1b2c3d4e5f6}`
-4. **Title-derived, no collision**: No injection (implicit anchor)
+4. **Inter-doc collision (`NodeId::Collision`)**: No injection
+   - Treated same as `Slug` — title slug used for HTML anchor
+5. **Title-derived, no collision**: No injection (implicit anchor)
    - `## Introduction` → generates `#introduction` implicitly → no rewrite
 
 **Write-back**: Uses pulldown_cmark_to_cmark which writes event's `id` field as `{ #id }` syntax
@@ -450,7 +469,7 @@ BeliefNode {
 Infrastructure asks: "Is this external? Does it have a file? Can I access its contents? Do I have a comprehensive map of its relationships?"
 Domain asks: "What schema defines this node's structure?"
 
-### 2.7. The API Node and System Network Namespaces
+### 2.4. The API Node and System Network Namespaces
 
 Every `BeliefBase` contains a special **API node** and uses **three system-defined network namespaces** for tracking special categories of references. Understanding these reserved namespaces is critical for distributed synchronization, schema evolution, and preventing BID collisions.
 
@@ -699,7 +718,7 @@ Multiple devices can detect API version mismatches:
 - Device A: noet-core v0.1.0 → creates API v0.1.0 node
 - Device B: noet-core v0.2.0 → detects older schema, prompts upgrade
 
-### 2.4. Graph Structure and Invariants
+### 2.5. Graph Structure and Invariants
 
 The BeliefBase maintains a **typed, weighted, directed acyclic graph (DAG)** where:
 
@@ -744,85 +763,132 @@ This design separates **graph infrastructure concerns** (WeightKind) from **doma
    - `Network` nodes represent repository roots (BeliefNetwork.toml files)
    - `Document` nodes represent individual source files
 
-### 2.5. Multi-Component Architecture: Compiler → Builder → Set
+3. **Network `payload["codec"]` contract**: Every `BeliefKind::Network` node carries
+   `payload["codec"]` — a string identifying the filename that defines the network
+   (e.g. `"index.md"`, `"CMakeLists.txt"`). This is set by `DocCodec::proto()` (e.g.
+   `NetworkCodec` sets it to `NETWORK_NAME`); `ProtoIndex::build` fills it in from the
+   detected network filepath when the codec omits it. `PathMap` reads this value at
+   construction time (stored as `network_filename`) to correctly prefix anchor paths
+   and resolve bare-anchor references (e.g. `"#slug"` → `"CMakeLists.txt#slug"`) for
+   networks whose index file is not `index.md`. Custom codecs that declare
+   `WalkCodec::network_filenames()` must ensure their `DocCodec::proto()` sets
+   `document["codec"]` to the network filename so downstream path resolution is correct.
 
-**DocumentCompiler** (codec/compiler.rs):
+### 2.6. Multi-Component Architecture: Compiler → Builder → Set
+
+**DocumentCompiler** (`codec/compiler.rs`):
 - Orchestrates multi-pass compilation across multiple files
-- Manages work queue with priority ordering
-- Handles file watching and incremental updates
-- Coordinates which files get parsed when
-- Drives the compilation process to convergence
+- Owns the `ProtoIndex` (filesystem index built once at startup), the work queue
+  (`remainder_queue`), and the main `GraphBuilder`
+- Exposes `parse_sequential` (single-threaded) and `parse_all` (parallel, epoch-based)
+- Drives compilation to convergence via depth-grouped network epochs, a leaf-document
+  epoch, and a remainder loop for assets and re-parses
 
-**GraphBuilder** (codec/mod.rs):
-- Stateful builder for constructing a BeliefBase
-- Parses files via DocCodec implementations
-- Maintains parsing state across multiple files
-- Implements a **document stack** for tracking nested structure during parsing
-- Resolves relative references to absolute BIDs (linking)
-- Publishes `BeliefEvent` updates via an async channel
+**GraphBuilder** (`codec/builder.rs`):
+- Stateful parser-linker for a single session; one instance per `DocumentCompiler`
+- In parallel mode, each epoch task gets a **fresh task-local `GraphBuilder`** seeded
+  from `epoch_session_snapshot`; events flow via isolated per-task channels
+- Maintains `doc_bb` (current-parse scratch space) and `session_bb` (accumulated
+  session state / proxy for `global_bb`)
+- Implements a **document stack** for tracking the ancestor-network/heading hierarchy
+- Resolves references via `cache_fetch` (`doc_bb` → `session_bb` → `global_bb`)
+- Publishes `BeliefEvent` updates via an async channel to `BeliefAccumulator`
 
-**BeliefBase** (beliefbase.rs):
-- Immutable (logically) snapshot of the graph
-- Optimized for queries and graph traversals
-- Thread-safe via `Arc<RwLock<BidGraph>>` for concurrent reads
-- Provides graph operations (union, intersection, difference, filtering)
+**BeliefAccumulator** (`beliefbase/accumulator.rs`):
+- Receives `BeliefEvent`s from the shared channel between epochs
+- Applies events to its backing `BeliefBase` in `BatchStart`/`BatchEnd`-delimited
+  batches; `drain_epoch()` commits one epoch and returns query access via `QueryHandle`
+- `QueryHandle` is the `global_bb` clone each task builder queries during parsing
+
+**BeliefBase** (`beliefbase/base.rs`):
+- The compiled, indexed graph — nodes + typed edges + multiple lookup indices
+- Thread-safe via `Arc<RwLock<BidGraph>>`; identity lookups via `PathMapMap`, `brefs`
+- Mutated by `process_event`; queried by `evaluate` / `get_context`
 
 The architecture maps to traditional compilers as:
-- **DocCodec** → Lexer/Parser (syntax-level)
-- **GraphBuilder** → Semantic analyzer + Linker (parsing + reference resolution)
-- **DocumentCompiler** → Build system/Compiler driver (orchestration, multi-pass)
-- **BeliefBase** → Compiled IR/Executable (queryable result)
+- **DocCodec** → Lexer/Parser (syntax analysis, produces IRNodes)
+- **GraphBuilder** → Semantic analyser + Linker (reference resolution, BID assignment)
+- **DocumentCompiler** → Build-system driver (orchestration, multi-pass)
+- **BeliefAccumulator** → Assembler/Linker output buffer (event serialisation, epoch commit)
+- **BeliefBase** → Compiled IR (queryable, indexed result)
 
 ## 3. Architecture
 
-### 3.0. System Overview
+### 3.0. System Overview and Data Flow
 
 The complete compilation system consists of multiple cooperating layers:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  Application Layer                          │
-│  (Domain-specific services, UI, query interfaces)           │
-└────────────┬────────────────────────────────────────────────┘
-             │
-             ├── Uses ──────────────────────────────────┐
-             │                                          │
-             ▼                                          ▼
-┌────────────────────────┐              ┌────────────────────────────┐
-│   File Watcher         │              │   DbConnection             │
-│   (notify-debouncer)   │◄───── ──────►│   (Persistent Cache)       │
-└───────┬────────────────┘              └────────────────────────────┘
-        │
-        │ File system events
+Source Files (*.md, *.yaml, *.xlsx, …)
+        │ read
         ▼
-┌────────────────────────────────────────────────────────────┐
-│              GraphBuilder                                  │
-│  (Parser/Linker - Converts files → graph)                  │
-└──────────┬─────────────────────────────────────────────────┘
-           │
-           ├── Uses ────────────────────────────────┐
-           │                                        │
-           ▼                                        ▼
-┌────────────────────┐              ┌────────────────────────────────┐
-│   DocCodec         │              │      BeliefBase                │
-│   (TomlCodec,      │              │   (Compiled Graph IR)          │
-│    MdCodec)        │              │                                │
-└────────────────────┘              └────────────────────────────────┘
-           │                                        │
-           │ Parses                                 │ Queries
-           ▼                                        ▼
-┌────────────────────┐              ┌────────────────────────────────┐
-│  Source Files      │              │   Application Logic            │
-│  (*.md, *.toml)    │              │   (Domain-specific processing) │
-└────────────────────┘              └────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│  DocumentCompiler                                         │
+│  - owns ProtoIndex, remainder_queue, main GraphBuilder    │
+│  - drives epoch batches: Phase1 nets → Phase2 leaves      │
+│  - remainder loop for assets and re-parses                │
+└────┬──────────────────────────────────────────────────────┘
+     │ per-file / per-epoch
+     ▼
+┌───────────────────────────────────────────────────────────┐
+│  GraphBuilder  (one per task in parallel mode)            │
+│  - doc_bb: current-parse scratch (rebuilt per file)       │
+│  - session_bb: accumulated session state                  │
+│  - stack: ancestor network + heading hierarchy            │
+│  - DocCodec: parse → IRNode → push/push_relation          │
+│  - cache_fetch: doc_bb → session_bb → global_bb           │
+│  - terminate_stack: compute_diff → BeliefEvents → tx      │
+└────┬──────────────────────────────────────────────────────┘
+     │ BeliefEvent stream (BatchStart/BatchEnd bracketed)
+     ▼
+┌───────────────────────────────────────────────────────────┐
+│  BeliefAccumulator                                        │
+│  - collects events inside batch boundaries                │
+│  - drain_epoch() commits one epoch's events               │
+│  - QueryHandle cloned by each parallel task as global_bb  │
+└────┬──────────────────────────────────────────────────────┘
+     │ committed state
+     ▼
+┌───────────────────────────────────────────────────────────┐
+│  BeliefBase  (global_bb)                                  │
+│  - indexed graph: states, relations, PathMapMap, brefs    │
+│  - queried by task builders via QueryHandle               │
+│  - final output for application queries                   │
+└───────────────────────────────────────────────────────────┘
 ```
 
-**Data Flow:**
-1. File watcher detects changes → triggers parsing
-2. Parser uses DocCodec → produces IRNodes
-3. Builder resolves references → emits BeliefEvents
-4. Events update database and application state
-5. Applications query BeliefBase for graph traversal
+**Walk-time visibility and parse-time dispatch** are handled by two complementary registries
+(implemented in Issue 68):
+
+- **`WALK_CODECS`**: a global registry of [`WalkCodec`] implementations that determine walk-time
+  file visibility. Pre-populated with `MdWalkCodec` (`.md`) and `YamlWalkCodec` (`.yaml`/`.yml`).
+  Application shims register additional codecs before `DocumentCompiler::new`. The
+  `net_dir_partition` filter includes any file matched by `CODECS ∪ WALK_CODECS`.
+  Walk codecs that define network boundaries implement `network_filenames()` — returning the
+  filenames (e.g. `"CMakeLists.txt"`) that mark a directory as a network root. These filenames
+  feed into `WalkCodecMap::is_network_file()` (subnet detection in `net_dir_partition`),
+  `detect_network_file()` (index-file resolution), and `CodecManifest` (WASM viewer setup).
+
+- **`CLAIM_MAP`**: a global path→codec registry populated during Phase 1 by network codecs
+  calling `CLAIM_MAP.claim(path, factory)` inside `DocCodec::parse`. `CLAIM_MAP.get(path)` is
+  the single dispatch entry point — it checks the claim registry first, then falls back to
+  `CODECS.path_get()` internally. This gives per-file dispatch precision that extension matching
+  alone cannot provide. Files explicitly excluded by a network's whitelist/blacklist are stored as
+  `None` sentinels (`CLAIM_MAP.reject(path)`) so they route to `UnclaimedDataCodec` rather than
+  being re-dispatched via `CODECS`.
+
+**Data Flow (parse_all parallel path):**
+1. `DocumentCompiler` builds `ProtoIndex` (one O(files) WalkDir pass at startup)
+2. Phase 1: network dirs processed depth-group by depth-group; each group is one
+   `parse_epoch` batch, drained before the next depth level begins
+3. Phase 2: all leaf documents in one `parse_epoch` batch
+4. Each `parse_epoch` task gets a fresh `GraphBuilder` seeded from
+   `epoch_session_snapshot` and a clone of the `QueryHandle` (`global_bb`)
+5. Tasks emit `BeliefEvent`s to per-task isolated channels; after all tasks finish,
+   events are forwarded to the shared channel in deterministic path-index order
+6. `drain_epoch()` commits the batch to `global_bb`; the next epoch sees the result
+7. Remainder loop handles assets and re-parses, split into asset sub-epoch then
+   reparse sub-epoch so asset BIDs are visible when referencing documents re-run
 
 **Multi-Pass Reference Resolution:**
 
@@ -923,53 +989,90 @@ This enables parsing files in any order while maintaining referential integrity.
 
 ### 3.1. GraphBuilder: Parsing and Linking
 
-The accumulator is responsible for parsing individual files and linking references across the document network. It is driven by `DocumentCompiler`, which orchestrates the multi-pass compilation process.
+`GraphBuilder` is the parser-linker. `DocumentCompiler` drives it by calling
+`parse_content` for each file. In `parse_all`'s parallel path, each epoch task
+constructs a **fresh task-local `GraphBuilder`** with `epoch_session_snapshot` as
+its initial `session_bb` state and a `QueryHandle` clone as its `global_bb`.
 
-**Key Data Structures:**
+**Key State:**
 
 ```rust
 pub struct GraphBuilder {
-    pub parsed_content: BTreeSet<Bid>,    // Nodes parsed from content
-    pub parsed_structure: BTreeSet<Bid>,  // Nodes generated from structure (headings)
-    pub set: BeliefBase,                  // The compiled graph
-    repo: Bid,                            // Root network BID
-    repo_root: PathBuf,                   // File system anchor
-    pub stack: Vec<(Bid, String, usize)>, // Document parsing stack (bid, heading, level)
-    pub session_bb: BeliefBase,          // Temporary cache during parsing
-    tx: UnboundedSender<BeliefEvent>,     // Event publication channel
+    // Per-parse scratch: rebuilt from scratch by initialize_stack for every file.
+    doc_bb: BeliefBase,
+
+    // Accumulated session state. In the main compiler builder this grows across
+    // all files. In parallel task builders it starts from epoch_session_snapshot
+    // (networks + const-namespace assets + index.md anchor nodes).
+    // Acts as the task's local proxy for global_bb: cache_fetch checks here before
+    // querying global_bb, avoiding a mutex round-trip on re-parses.
+    session_bb: BeliefBase,
+
+    // Root network BID (Bid::nil() until the repo-root index.md is parsed).
+    repo: Bid,
+    repo_root: PathBuf,
+
+    // Ancestor-network + in-document heading stack.
+    // Each entry: (bid, absolute_path, heading_level)
+    // heading_level: 1=Network, 2=Document, 3=H1-anchor, 4=H2-anchor, …
+    stack: Vec<(Bid, String, usize)>,
+
+    // Event publication channel. In parallel tasks this is an isolated per-task
+    // channel; events are forwarded to the shared channel in path-index order
+    // after all tasks complete.
+    tx: UnboundedSender<BeliefEvent>,
 }
 ```
 
-**Parsing Algorithm (codec/mod.rs:733-1057):**
+**Five-Phase `parse_content` Algorithm:**
 
-1. **Initialization** (`initialize_network`): 
-   - Parse BeliefNetwork.toml to establish repository root node
-   - Set up identity mappings for the network
+1. **Phase 0 — `initialize_stack`**:
+   - Clears `doc_bb` and rebuilds it from the ancestor-network subgraph
+   - Fast path (`try_initialize_stack_from_session_cache`): looks up the parent
+     network via StackCache in `session_bb`, avoiding a `global_bb` mutex call
+   - Slow path: queries `global_bb` for the ancestor chain and merges into
+     `session_bb` for subsequent sibling file fast-paths
 
-2. **Document Iteration** (`parse_content`):
-   - Discover all matching files via `iter_docs()`
-   - For each file:
-     - Detect schema type from file path
-     - Select appropriate `DocCodec` (TomlCodec, MdCodec)
-     - Parse into `IRNode` instances
+2. **Phase 1 — `push` loop (node creation)**:
+   - `DocCodec::parse` produces `IRNode`s for the document and each heading section
+   - For each `IRNode`, `push()` calls `cache_fetch` to resolve or create the node:
+     - **StackCache** hit (`session_bb`): node exists, no missing_structure populated
+     - **GlobalCache** hit (`global_bb`): node fetched, neighborhood merged into
+       `session_bb` via `missing_structure`
+     - **Generated**: brand-new node — fresh time-based BID assigned, inserted into
+       `doc_bb` via `doc_bb.process_event(NodeUpdate)`; `session_bb` does NOT get it
+       (it will arrive via `compute_diff` in Phase 5)
+   - Stack is maintained: network/doc/heading entries pushed for nested resolution
 
-3. **Stack-Based Structural Parsing**:
-   - Markdown headings create a nested structure
-   - `initialize_stack()`: Push nodes onto stack as headings are encountered
-   - `terminate_stack()`: Pop nodes and create subsection relationships
-   - Stack depth corresponds to heading level (H1, H2, H3, etc.)
+3. **Phase 2 — `push_relation` loop (edge creation)**:
+   - For each relation in `proto.upstream` / `proto.downstream`, calls `push_relation`
+   - `push_relation` resolves the other endpoint via `cache_fetch`, populates
+     `missing_structure`, emits a `RelationChange` into `relation_event_queue`
+   - After all push_relation calls: `session_bb.merge_from(&missing_structure,
+     &relation_seeds)` and `doc_bb.merge_from(&missing_structure, &relation_seeds)`
+     seeded by `relation_seeds` (the resolved endpoint BIDs), bounding the DFS to
+     nodes reachable from those endpoints
+   - `doc_bb.apply_events_batch(&relation_event_queue)` applies all relation events
+     in a single three-pass flush (nodes → edges → PathMapMap)
 
-4. **Reference Resolution** (`push_relation`):
-   - Convert `NodeKey` references to `Bid` using identity maps
-   - Handle cross-file references via path resolution
-   - Create typed edges in the graph
+4. **Phase 4 — `inject_context` (BID + metadata back-injection)**:
+   - For each parsed node, calls `codec.inject_context(proto, &ctx)` where `ctx`
+     comes from `doc_bb.get_context()`
+   - `inject_context` calls `update_from_context` which compares the node's current
+     field values (bid, title, id, kind) directly against `ctx.node` and updates the
+     proto's TOML document where they differ — no TOML string round-trip
+   - If `frontmatter_changed`, `sections_metadata_merged`, `id_changed`, or
+     `link_changed` is true, `events_to_text` regenerates the markdown text for that
+     node; `generate_source()` is called if `is_changed || has_new_bids`
+   - `rewritten_content` is set when `generate_source()` produces content that
+     differs from the on-disk file (or when new BIDs were assigned)
 
-5. **Node Insertion** (`cache_fetch`):
-   - Check if node already exists (by BID, ID, or path)
-   - Merge new content with existing node
-   - Update indices (`IdMap`, `PathMapMap`, `brefs`)
-
-**Key Insight**: The stack-based approach enables **streaming parsing** of large document trees without loading entire files into memory first.
+5. **Phase 5 — `terminate_stack`**:
+   - Emits deferred collision removals (`NodesRemoved` for stale BIDs)
+   - Calls `compute_diff(old=session_bb, new=doc_bb, parsed_nodes)` to produce
+     `NodeUpdate`, `RelationUpdate`, and `NodesRemoved` events for the delta
+   - Applies diff events to `session_bb` (so subsequent files in this task see them)
+   - Sends all events via `tx` to the `BeliefAccumulator`
 
 ### 3.2. The Codec System: Three Sources of Truth
 
@@ -1003,26 +1106,45 @@ This synchronization enables cross-document and cross-project coordination. For 
 
 The `GraphBuilder` maintains two separate `BeliefBase` instances during parsing:
 
-- **`self.doc_bb`**: The NEW state (what documents currently contain after parsing)
-- **`session_bb`**: The OLD state (what existed in the global cache before this parse)
+- **`doc_bb`**: Per-file scratch space. Rebuilt from scratch by `initialize_stack` for
+  every file. Receives the fully-merged node state from `push()` via
+  `doc_bb.process_event(NodeUpdate)`. Represents "what this file contains after parsing."
+- **`session_bb`**: Accumulated session state. NOT cleared per file. Grows across all
+  files parsed in the session. In parallel task builders it starts from
+  `epoch_session_snapshot` (networks + const-namespace assets + index.md anchor nodes).
+  Acts as the task's local proxy for `global_bb`: `cache_fetch` checks `session_bb`
+  before querying `global_bb`, avoiding a mutex round-trip on cache hits.
 
-**Parsing Lifecycle**:
+**`cache_fetch` resolution chain** (checked in order):
 
-1. **`initialize_stack`**: Clears `session_bb` to start fresh for this parse operation
+1. **`doc_bb`** (when `check_local = true`): node already parsed in this file — fastest
+2. **`session_bb`** (StackCache): node in accumulated session state — no `missing_structure`
+   populated; does not trigger `missing_structure` merge to avoid corrupting `doc_bb`
+3. **`global_bb`** (GlobalCache): node fetched from accumulator; full neighborhood
+   returned in `missing_structure`, merged into `session_bb` for future StackCache hits
+4. **Generated**: no cache hit — fresh time-based BID assigned. Inserted into `doc_bb`
+   only; `session_bb` does NOT receive it at push-time (arrives later via `compute_diff`)
 
-2. **During parsing (`push`)**:
-   - `cache_fetch` queries the global cache and populates `session_bb` via `merge()`
-   - This includes both nodes and their relationships, building a snapshot of the old state
-   - Remote events are processed into `self.doc_bb` only
-   - `self.doc_bb` and `session_bb` intentionally diverge during this phase
+`cache_fetch` returns a `NodeSource` enum (`StackCache`, `GlobalCache`, `SourceFile`,
+`Generated`, `Merged`) that governs downstream behavior in `push()`.
 
-3. **`terminate_stack`**: Reconciles the two caches:
-   - Compares `self.doc_bb` (new parsed state) against `session_bb` (old cached state)
-   - Identifies nodes that existed before but are no longer referenced
-   - Generates `NodesRemoved` events for the differences
-   - Sends reconciliation events to both `session_bb` and the transmitter (for global cache)
+**`terminate_stack` and `compute_diff`:**
 
-**Key Insight**: This two-cache architecture enables the builder to detect what was removed from a document by comparing old and new manifolds, then propagating those removals to other caches.
+After all `push` and `push_relation` calls complete, `terminate_stack` calls
+`compute_diff(old_set=session_bb, new_set=doc_bb, parsed_nodes)`:
+
+- **`NodeUpdate`**: node is in `doc_bb` (new) but absent from `session_bb` (old), or its
+  state differs. Generated nodes (not in `session_bb`) are correctly picked up here.
+- **`RelationUpdate`**: edge is in `doc_bb` scoped to `parsed_nodes` but not in `session_bb`
+- **`NodesRemoved`**: node was reachable from `parsed_nodes` in `session_bb` (old) but is
+  absent from `doc_bb` (new) — i.e., a node was deleted from this document
+
+`compute_diff` events are sent via `tx` to the `BeliefAccumulator`, then applied to
+`session_bb` in `terminate_stack` so subsequent files in the same task see the result.
+
+**Key Insight**: `doc_bb` and `session_bb` intentionally diverge during Phase 1 and 2.
+The delta between them is precisely the set of changes this file's parse introduces,
+which `compute_diff` turns into `BeliefEvent`s for `global_bb`.
 
 #### Link Rewriting and Bi-Directional References
 
@@ -1099,6 +1221,56 @@ We cannot assume all relations are immediately accessible during parsing. Unreso
 
 This handles multi-pass resolution efficiently without polluting the cache with incomplete nodes.
 
+#### Two-Registry Codec Dispatch (`parse_one_path`)
+
+`parse_one_path` uses a three-branch dispatch to route each file to the correct codec.
+`CLAIM_MAP.get(path)` is the single entry point — it checks the claim registry first,
+then falls back to `CODECS.path_get()` internally, so callers do not need to consult
+`CODECS` directly for dispatch.
+
+1. **`CLAIM_MAP.get(path)` returns `Some`** — a codec factory was found, either from an
+   explicit claim registered by a network codec during Phase 1, or from the `CODECS`
+   extension/stem registry (e.g. `index.md` → `NetworkCodec`, `.xlsx` → `XlsxCodec`).
+   Plain `.md` files are claimed by `NetworkCodec::parse()` during Phase 1; the bare `.md`
+   extension entry was removed from `CODECS` so they always go through the claim path.
+
+2. **`CLAIM_MAP.is_rejected(path)`** — path was explicitly rejected by a network's
+   whitelist/blacklist filter (`CLAIM_MAP.reject()` stores a `None` sentinel).
+   `CLAIM_MAP.get()` returns `None` for rejected paths; `is_rejected()` distinguishes
+   "rejected" from "never seen". Routes to `UnclaimedDataCodec` + `ParseDiagnostic::info`.
+
+3. **`WALK_CODECS.should_track(path)` but no claim** — file is walk-visible but no codec
+   claimed it and `CODECS` has no entry for it (e.g. a stray `.yaml` in a corpus without
+   a YAML-owning network codec). Routes to `UnclaimedDataCodec` + `ParseDiagnostic::info`.
+   Does NOT reach `process_asset`.
+
+4. **Neither** — genuine binary asset (image, PDF, etc.). Routes to `process_asset`
+   (existing behavior, unchanged).
+
+**Claiming pattern for structured data codecs**: A codec that owns structured data files
+calls `CLAIM_MAP.claim(path, factory)` inside its `DocCodec::parse()` implementation,
+using `proto_index.children_of()` to discover candidate files. `DocCodec::parse()` receives
+a `proto_index: &ProtoIndex` parameter for this purpose (added in Issue 68).
+
+**WASM note**: `WALK_CODECS` and `CLAIM_MAP` are native-only (`#[cfg(not(target_arch = "wasm32"))]`).
+The WASM viewer uses a runtime extension set initialized from `BUILTIN_EXTENSIONS` and
+updated at startup from `codecs.json` — a codec manifest written by `export_beliefbase`
+that lists all extensions known at build time (`CODECS` + `WALK_CODECS`). The viewer
+fetches `codecs.json` and calls `BeliefBaseWasm.setKnownExtensions()` before any link
+resolution, ensuring custom extensions from application shims (e.g. `.yaml`, `.h`) are
+correctly rewritten to `.html`. See `CodecManifest` in `shard/manifest.rs`.
+
+`codecs.json` is a **required asset**, and the viewer treats a missing, unreachable
+or malformed manifest as a fatal init error rather than falling back to
+`BUILTIN_EXTENSIONS`. The fallback is worse than the failure: with only the
+built-ins, a link to any walk-codec or shim-extension document normalises to a
+directory URL that 404s, so the site appears healthy until a reader clicks the
+wrong link. Failing at startup converts a broad, silent, per-link fault into one
+loud one. Both export paths write the manifest unconditionally, and the viewer
+has already fetched the shell and the WASM binary from the same origin by this
+point — so absence indicates an incomplete deployment, not a transient condition,
+and is not retried.
+
 ### 3.3. DocumentCompiler: Orchestration and Work Queue
 
 `DocumentCompiler` is the build-system driver. It owns the `ProtoIndex`, the work
@@ -1158,6 +1330,18 @@ pub struct DocumentCompiler {
     /// Paths whose HTML generation was deferred (contain MyST directives that need
     /// a graph query pass). Processed by `generate_deferred_html` after parse_all.
     deferred_html: Vec<PathBuf>,
+
+    /// Paths being processed in the current epoch batch. Used to detect same-batch
+    /// siblings: a file with an unresolved Id-keyed ref to a sibling re-queues itself
+    /// so the link gets another chance once the sibling's output is in session_bb.
+    /// Cleared after each batch's results are processed.
+    current_batch: HashSet<PathBuf>,
+
+    /// NodeKeys confirmed permanently unresolvable — failed on a prior pass with no
+    /// possibility of resolution (broken wikilinks, dead asset paths, etc.).
+    /// When every unresolved ref in a file's diagnostic list has its primary key here,
+    /// the file is not re-queued. Prevents re-parse storms from broken links.
+    permanently_unresolved: BTreeSet<NodeKey>,
 }
 ```
 
@@ -1197,8 +1381,20 @@ Phase 2 — all leaf documents (non-dir children of every network dir):
 Phase 3 — remainder loop (assets + re-parses):
   while remainder_queue is non-empty:
     candidates = remainder_queue.drain(), sorted by (processed_count, DFS_order)
+    increment processed counts for all candidates before dispatch
+
+    Sub-epoch A — assets only (processed_count == 1, i.e. first-time items):
     [parse_sequential]: run each individually, drain rx after each
-    [parse_all]:        BatchStart → parse_epoch(candidates) → BatchEnd → drain_epoch()
+    [parse_all]:        BatchStart → parse_epoch(assets) → BatchEnd → drain_epoch()
+                        sync_asset_snapshot()  // pull asset nodes into session_bb
+
+    Sub-epoch B — document re-parses (processed_count >= 2):
+    [parse_sequential]: run each individually, drain rx after each
+    [parse_all]:        BatchStart → parse_epoch(reparsed) → BatchEnd → drain_epoch()
+
+  // Splitting into two sub-epochs is required for parallel correctness: asset BIDs
+  // must be committed to global_bb (drain_epoch) before document tasks that reference
+  // them run, otherwise those tasks see the asset as unresolved and re-queue again.
 ```
 
 **Why depth-grouping matters**: `try_initialize_stack_from_session_cache` needs the
@@ -1221,7 +1417,60 @@ and pushes to the front of `remainder_queue`. `on_file_deleted(path)` removes fr
 `Transaction::add_event`, so the epoch machinery is inert and the watch path is
 unchanged by the parallel compilation work.
 
-### 3.4. BeliefBase vs BeliefGraph: Full API vs Transport Layer
+### 3.4. BeliefAccumulator: Epoch Commit and Query Access
+
+`BeliefAccumulator` sits between the `GraphBuilder` event stream and `global_bb`. It
+is the mechanism that makes parallel epoch correctness possible.
+
+**Responsibilities:**
+
+- Receives `BeliefEvent`s from the shared channel in `BatchStart`/`BatchEnd`-delimited
+  batches
+- Buffers events inside a batch; applies them atomically on `BatchEnd`
+- `drain_epoch()` is called by `DocumentCompiler` after each epoch to commit the batch
+  and invalidate the query cache
+- Provides a `QueryHandle` — an `Arc`-backed, cheaply cloneable handle that task
+  builders use as their `global_bb` during `parse_epoch`
+
+**`QueryHandle` as `global_bb`:**
+
+Each parallel task's `GraphBuilder` receives a `QueryHandle` clone at task creation.
+When `cache_fetch` reaches the GlobalCache branch, it queries this handle. Because
+`QueryHandle` is a snapshot of `global_bb` at the start of the epoch, all tasks in
+the same epoch see the same consistent baseline. Tasks cannot see each other's
+outputs until `drain_epoch()` runs.
+
+**Inter-epoch correctness invariant:**
+
+```
+epoch N tasks all query global_bb snapshot S(N)
+    ↓ all tasks finish
+drain_epoch() commits all epoch-N events to global_bb → S(N+1)
+    ↓
+epoch N+1 tasks all query global_bb snapshot S(N+1)
+```
+
+This guarantees that every depth-D network node is committed to `global_bb` before
+any depth-(D+1) parallel task starts, and that asset BIDs committed in remainder
+sub-epoch A are visible to document re-parses in sub-epoch B.
+
+**`BatchStart` / `BatchEnd` semantics:**
+
+- Events arriving outside a batch (before `BatchStart` or after `BatchEnd`) are
+  applied immediately — used by the pre-epoch sequential root parse.
+- Events inside a batch are buffered and applied together on `BatchEnd`. The
+  accumulator's query cache is invalidated at that point.
+- `drain_epoch()` blocks until the channel drains; it is always called after
+  `BatchEnd` has been sent.
+
+**`EpochDrain` trait:**
+
+`parse_all` requires its `global_bb` parameter to implement `EpochDrain`
+(providing `drain_epoch()`). `BeliefAccumulator` implements this trait.
+`BeliefBase`'s implementation is a no-op, correct only in unit-test contexts
+where no inter-epoch state sharing is expected.
+
+### 3.5. BeliefBase vs BeliefGraph: Full API vs Transport Layer
 
 The codebase maintains two distinct but related structures for representing compiled graphs:
 
@@ -1235,10 +1484,10 @@ pub struct BeliefGraph {
 ```
 
 `BeliefGraph` is a minimal structure optimized for:
-- **Query results**: Database queries return `BeliefGraph` (see query.rs:735-739, `ResultsPage<BeliefGraph>`)
-- **Network transport**: Serialization between services
-- **Set operations**: Union, intersection, difference operations (beliefbase.rs:313-455)
-- **Pagination**: Breaking large graphs into pages (beliefbase.rs:546-601)
+- **Query results**: `QueryPackage` evaluation produces a `BeliefGraph` as its output graph
+- **Network transport**: Serialization between services (shard export, WASM boundary)
+- **Set operations**: Union, intersection, difference operations
+- **Conversion**: `From<BeliefGraph> for BeliefBase` enables full API access on query results
 
 It contains only the essential graph data (states + relations) without the indexing overhead.
 
@@ -1247,49 +1496,53 @@ It contains only the essential graph data (states + relations) without the index
 ```rust
 pub struct BeliefBase {
     states: BTreeMap<Bid, BeliefNode>,              // Node storage
-    relations: Arc<RwLock<BidGraph>>,               // Edge storage (petgraph)
-    bid_to_index: RwLock<BTreeMap<Bid, NodeIndex>>, // BID → graph index
-    index_dirty: AtomicBool,                        // Lazy reindexing flag
+    relations: Arc<RwLock<BidGraph>>,               // Edge storage (petgraph StableGraph)
+    bid_to_index: RwLock<BTreeMap<Bid, NodeIndex>>, // BID → graph NodeIndex (kept current
+                                                    // incrementally — no lazy rebuild)
     brefs: BTreeMap<Bref, Bid>,                     // Short ref → BID
-    ids: IdMap,                                      // ID ↔ BID mapping
-    paths: PathMapMap,                               // Path ↔ BID mapping
-    errors: Option<Vec<String>>,                     // Validation errors
-    api: BeliefNode,                                 // Special API root node
+    paths: PathMapMap,                               // Path/ID/Title ↔ BID (per-network)
+    label: &'static str,                            // Diagnostic label ("doc_bb", "session_bb", …)
 }
 ```
 
 `BeliefBase` is the full-featured structure providing:
-- **Identity resolution**: Multiple lookup indices (BID, Bref, ID, Path)
-- **Graph operations**: Context queries, traversals, filtering
-- **Validation**: Invariant checking via `built_in_test()`
-- **Incremental updates**: Event processing and diff computation
-- **Thread-safe access**: Arc/RwLock for concurrent reads
+- **Identity resolution**: Multiple lookup indices (BID, Bref, ID, Path, Title) via
+  `PathMapMap` and `brefs`
+- **Graph operations**: Context queries, traversals, `evaluate` (via `QueryPackage`), `get_context`
+- **Validation**: Invariant checking via `is_balanced()` / `diagnostics()`
+- **Incremental updates**: `process_event`, `merge_from`, `compute_diff`
+- **Thread-safe access**: `Arc<RwLock<BidGraph>>` for concurrent reads; `RwLock` on
+  `bid_to_index` updated incrementally on every node insert/remove
 
 **Conversion Pattern:**
 
 ```rust
 impl From<BeliefGraph> for BeliefBase {
     fn from(beliefs: BeliefGraph) -> Self {
-        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, true)
+        BeliefBase::new_unbalanced(beliefs.states, beliefs.relations, false)
+            .with_label("bg_bb")
     }
 }
 ```
 
-Query results come back as `BeliefGraph`, which can be converted to `BeliefBase` when full API access is needed. This separation enables:
-- Efficient pagination without building full indices for every page
-- Lightweight serialization over network boundaries
+`QueryPackage` evaluation produces a `BeliefGraph` as output, which can be converted to `BeliefBase` when full API access is needed. This separation enables:
+- Lightweight serialization over network boundaries (shard export, WASM)
 - Fast set operations on query results before materializing as BeliefBase
+- Clean `From<BeliefGraph>` conversion when identity resolution is needed
 
 **Usage Pattern:**
 
 ```rust
-// Query returns lightweight BeliefGraph
-let page: ResultsPage<BeliefGraph> = service.get_states(paginated_query).await?;
+// Build a query and evaluate via BeliefSource
+let spec = QuerySpec { subject, projection };
+let mut package = QueryPackage::balanced(spec);
+source.evaluate(&mut package).await?;
 
-// Convert to BeliefBase for full API access
-let belief_set: BeliefBase = page.results.into();
+// Extract the output BeliefGraph
+let graph: BeliefGraph = package.take_graph().unwrap();
 
-// Now can use full API
+// Convert to BeliefBase for full API access (identity resolution, get_context)
+let belief_set: BeliefBase = graph.into();
 let context = belief_set.get_context(some_bid)?;
 ```
 
@@ -1303,18 +1556,21 @@ let context = belief_set.get_context(some_bid)?;
    - Extract subgraphs by node properties or path patterns
    - Enable scoped queries (e.g., "all documents under /docs")
 
-3. **Graph Traversal** (`get_context`, `evaluate_expression`):
+3. **Graph Traversal** (`get_context`, `evaluate` via `QueryPackage`):
    - Compute sources/sinks for a node
-   - Walk parent/child relationships by WeightKind
+   - Walk parent/child relationships via `TraversalSpec`
 
 4. **Incremental Updates** (`process_event`):
    - Handle add/remove/update events from builder
    - Maintain invariants during mutations
 
-**Lazy Indexing:**
-The `bid_to_index` mapping is rebuilt only when `index_dirty` is set, enabling batched updates without per-operation overhead. This is analogous to incremental compilation in modern compilers.
+**Incremental Indexing:**
+`bid_to_index` is maintained incrementally via `graph_insert_node` / `graph_remove_node`,
+which update both the `StableGraph` and the `bid_to_index` map atomically. There is no
+lazy rebuild — the index is always current, enabling O(log N) BID → NodeIndex lookups
+for `update_relation` in `merge_graph_mut` without a full graph scan.
 
-### 3.5. DocCodec: The Frontend Interface
+### 3.6. DocCodec: The Frontend Interface
 
 > **Note**: The HTML generation API shown in this section reflects an earlier design.
 > The `generate_deferred_html` trait method has been removed. The deferred phase is now
@@ -1329,15 +1585,23 @@ The `DocCodec` trait defines the contract for file format parsers:
 
 ```rust
 pub trait DocCodec {
-    fn parse(&mut self, content: &str, current: IRNode,
-        diagnostics: &mut Vec<ParseDiagnostic>) -> Result<(), BuildonomyError>;
+    fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError>;
+    fn parse(&mut self, content: &str, current: IRNode, diagnostics: &mut Vec<ParseDiagnostic>)
+        -> Result<(), BuildonomyError>;
     fn nodes(&self) -> Vec<IRNode>;
     fn inject_context(&mut self, node: &IRNode, ctx: &BeliefContext,
         diagnostics: &mut Vec<ParseDiagnostic>) -> Result<Option<BeliefNode>, BuildonomyError>;
+    fn finalize(&mut self, diagnostics: &mut Vec<ParseDiagnostic>)
+        -> Result<HashMap<Bid, IRNode>, BuildonomyError>;
     fn generate_source(&self) -> Option<String>;
 
-    // HTML Generation API
-    fn should_defer(&self) -> bool { false }  // true if document contains deferred directives
+    // Content mode: Text (default) or Binary. Binary codecs re-open the file from
+    // current.path and use generate_source_bytes() for write-back instead of generate_source().
+    fn content_mode(&self) -> CodecContentMode { CodecContentMode::Text }
+    fn generate_source_bytes(&self) -> Option<Vec<u8>> { None }
+
+    // HTML Generation API (two-phase)
+    fn should_defer(&self) -> bool { false }
     fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> { Ok(vec![]) }
     // Note: generate_deferred_html has been removed from this trait.
     // The deferred phase is now handled by DocumentCompiler::generate_html_for_path
@@ -1350,21 +1614,26 @@ pub trait DocCodec {
 Codecs are created via **factory functions** (`type CodecFactory = fn() -> Box<dyn DocCodec>`), not singletons:
 
 ```rust
-pub struct CodecMap(Arc<RwLock<Vec<(String, CodecFactory)>>>);
+// CodecMap stores entries as (Option<stem>, Option<extension>, CodecFactory).
+// Lookup priority: stem+extension match → extension-only match → (None,None) wildcard.
+pub struct CodecMap(Arc<RwLock<Vec<(Option<String>, Option<String>, CodecFactory)>>>);
 
 impl CodecMap {
     pub fn create() -> Self {
-        let map = CodecMap(Arc::new(RwLock::new(vec![
-            ("md".to_string(), || Box::new(md::MdCodec::new())),
-            ("toml".to_string(), || Box::new(IRNode::default())),
-            // ... other codecs
-        ])));
-        map
+        // Built-in registrations (non-WASM):
+        //   (Some("index"), Some("md")) → NetworkCodec  (index.md by name)
+        //   (None, None)                → NetworkCodec  (bare directory paths)
+        //   (None, Some("xlsx"))        → XlsxCodec     (xlsx feature only)
+        //
+        // Note: plain .md files are NOT registered here by bare extension.
+        // They are claimed per-network by NetworkCodec::parse() via CLAIM_MAP.
+        // CLAIM_MAP.get() falls back to CODECS.path_get() internally, so callers
+        // use CLAIM_MAP.get() as the single dispatch entry point.
     }
-    
-    pub fn get(&self, ext: &str) -> Option<CodecFactory> {
-        // Returns factory function, not codec instance
-    }
+
+    pub fn path_get(&self, path: &Path) -> Option<CodecFactory> { ... }
+    pub fn get(&self, ap: &AnchorPath) -> Option<CodecFactory> { ... }
+    pub fn insert_codec(&self, stem: Option<String>, ext: Option<String>, factory: CodecFactory) { ... }
 }
 ```
 
@@ -1408,21 +1677,30 @@ extension point.
 
 **Current Implementations:**
 
-- **MdCodec** (md.rs): Immediate generation only
+- **MdCodec** (`md.rs`): `CodecContentMode::Text` (default)
   - Parses Markdown with TOML frontmatter
   - Generates HTML from pulldown-cmark AST
   - Rewrites internal links to `.html` extension
   - Extracts headings for structural hierarchy
 
-- **IRNode** (belief_ir.rs): Deferred generation for networks
-  - Parses TOML/JSON/YAML files
-  - Schema-aware: detects schema from path or frontmatter
-  - Networks defer to query child documents from context
-  - Generates index pages listing subsections
+- **NetworkCodec** (`network.rs`): wraps `MdCodec` for network index files
+  - Always outputs `index.html`
+  - Handles `{network_children}` sentinel injection
+
+- **XlsxCodec** (`xlsx/codec.rs`, `xlsx` feature, non-wasm): `CodecContentMode::Binary`
+  - Reads `.xlsx` and `.ods` files via `calamine`
+  - Reserved `index` tab carries YAML/TOML/JSON schema declaration
+  - Emits workbook (Document, h=2) → tab (Symbol, h=3) → row (Symbol, h=4) hierarchy
+  - BID write-back via `__noet_bid__` annotation column using `rust_xlsxwriter`
+  - `parse()` ignores `content: &str`; re-opens file from `current.path`
 
 **Key Responsibility**: Codecs are **syntax-only** for parsing. They produce IRNodes with unresolved references (NodeKey instances). The builder handles semantic analysis and linking. For HTML generation, codecs are **presentation-only** — they return body content, compiler wraps with templates.
 
-### 3.6. The Document Stack: Nested Structure Parsing
+For binary codecs, `generate_source_bytes() -> Option<Vec<u8>>` is called instead.
+The compiler checks `content_mode()` (via a cheap probe instantiation) and routes
+write-back accordingly.
+
+### 3.7. The Document Stack: Nested Structure Parsing
 
 The `GraphBuilder` maintains a single stack (`self.stack: Vec<(Bid, String, usize)>`)
 that serves as both the ancestor-network context and the in-document heading
@@ -1443,7 +1721,7 @@ strip prefix to compute the subnet-relative path for the `NodeKey::Path`. See
 the "Network Node Dual-Path Representation" note in section 2.2 for the
 `AnchorPath::new_dir` requirement at this call site.
 
-The stack mechanism (codec/mod.rs:1160-1402) is a critical innovation enabling hierarchical document parsing:
+The stack mechanism (`codec/builder.rs`) enables hierarchical document parsing:
 
 **Stack Entry**: `(Bid, String, usize)` = (node BID, heading text, heading level)
 
@@ -1475,10 +1753,134 @@ After "Section B":   [(top_bid, "Top Level", 1), (b_bid, "Section B", 2)]
 
 This creates the **Structural Hierarchy** of Subsection relationships, enabling table-of-contents generation and scoped queries.
 
+### 3.8. Query Evaluation: BeliefSource and the QueryPackage Pipeline
+
+`BeliefSource` is the trait that all query backends implement. The primary
+entry point is `evaluate(&mut QueryPackage)`, which drives a `QuerySpec`
+through a three-stage lifecycle:
+
+```
+Constructed → Anchored → Projected
+```
+
+1. **Anchor**: Resolve `Subject` to `Vec<Bid>` (the seed set).
+2. **Graph context**: When the caller uses `QueryPackage::balanced(spec)`,
+   halo and section-roots projection steps are appended to the effective
+   spec before evaluation. These use `StepInput::Cumulative` so the
+   traversal operates on `seed ∪ all prior tape BIDs`.
+3. **Project**: Walk each `ProjectionStep` (Filter, Traverse, Compose),
+   building a `Tape` of intermediate BID sets. The package graph is
+   populated incrementally during projection — discovered edges and
+   endpoint nodes are added at each hop. After evaluation, the package
+   graph + tape together ARE the evaluation output.
+
+#### Backend Implementations
+
+**BeliefBase (in-memory):** All four stages operate on the in-memory graph.
+`eval_subject` resolves via `PathMapMap` lookups. `apply_traversal` walks
+`petgraph` edges using `bid_to_index` for O(log N) BID → NodeIndex
+lookup. `apply_filter` evaluates `PropertyPredicate` against node states.
+`materialize_graph` extracts the subgraph for all accumulated BIDs with
+Trace coloring: BIDs in the primary set (pre-halo/section-roots) are full
+nodes; BIDs discovered by halo/section-roots steps are marked `BeliefKind::Trace`.
+
+**DbConnection (SQL):** Subject resolution issues SQL against the `beliefs`
+and `paths` tables (reusing `resolve_net_path` / `resolve_net_id` for
+`NodeKey::Path` and `NodeKey::Id` variants). Each traversal hop issues one
+SQL query per active input role against the `relations` table:
+
+- **Source input:** `WHERE source IN (frontier) AND {kind_col} IS NOT NULL`
+- **Sink input:** `WHERE sink IN (frontier) AND {kind_col} IS NOT NULL`
+- **Owner input:** `WHERE owned_by IN (frontier_brefs) AND {kind_col} IS NOT NULL`
+
+The frontier advances by collecting output-role endpoints from matched
+edges. Filters fetch states via SQL, then apply `NodeFilter` predicates
+in memory. After all projection steps complete, a single bulk fetch
+retrieves states and relations for all accumulated BIDs and populates
+the package graph. Seed nodes are marked as complete; discovered
+endpoints from halo/section-roots steps are marked `BeliefKind::Trace`.
+
+#### Query Cost Model
+
+For a typical balanced `QueryPackage` evaluation on a single node, the DB backend issues:
+
+| Phase | Queries | Description |
+|-------|---------|-------------|
+| Subject | 1 | Bref/BID/path/id resolution |
+| Halo (1 hop) | 1–3 | Source + Sink + Owner input roles |
+| Section roots | 3–8 | One per ancestor level to root |
+| Bulk states | 1 | `SELECT * FROM beliefs WHERE bid IN (...)` |
+| Bulk relations | 1 | `SELECT * FROM relations WHERE sink/source IN (...)` |
+| Orphaned endpoints | 0–1 | Missing edge-endpoint states |
+| **Total** | **~7–15** | |
+
+#### Optimization Opportunities
+
+The current implementation issues one SQL query per traversal hop. Several
+optimizations can reduce this:
+
+**Recursive CTE for unbounded traversals.** SQLite’s `WITH RECURSIVE`
+can collapse an unbounded section roots walk (`k-section-s {max}`)
+into a single query:
+
+```sql
+WITH RECURSIVE ancestors(bid) AS (
+    SELECT sink FROM relations
+    WHERE source IN (seed_bids) AND section IS NOT NULL
+  UNION
+    SELECT r.sink FROM relations r
+    JOIN ancestors a ON r.source = a.bid
+    WHERE r.section IS NOT NULL
+) SELECT bid FROM ancestors;
+```
+
+This eliminates the per-level round-trips for the most common traversal
+pattern (Section roots walk). The same pattern applies to any fixed-kind
+unbounded traversal.
+
+**Batched halo query.** The halo (`sko-[*]-sko {1}`) currently issues
+separate queries per input role. Since it queries all three roles, a single
+query with `OR` conditions on `source IN`, `sink IN`, and `owned_by IN`
+would reduce three round-trips to one.
+
+**Path-table acceleration for Section traversals.** A Section traversal
+with an `EdgePredicate` on `doc_paths` is structurally equivalent to a
+`paths` table walk. The `paths` table already stores the
+network → document → section hierarchy with ordering. When the
+`QuerySpec` shape matches (subject within a known network, Section-only
+traversal, deterministic path prefix), the traversal can be rewritten as
+a `paths` table prefix scan:
+
+```sql
+SELECT target FROM paths WHERE net = ? AND path LIKE ? || '%'
+```
+
+This is O(1) index lookup vs O(depth) iterative edge walking.
+
+**States cache across the evaluate call.** `apply_filter_sql` fetches
+states into a temporary `BeliefBase` per filter step. A shared
+`BTreeMap<Bid, BeliefNode>` cache across the entire `evaluate` call
+would avoid redundant fetches when multiple filter steps or the final
+bulk materialization re-request the same states.
+
+**Temp table for large frontier sets.** When frontier sets exceed
+hundreds of BIDs, `IN (...)` clause parsing becomes expensive. A
+SQLite temp table (`CREATE TEMP TABLE frontier(bid TEXT)`) with a
+`JOIN` is more efficient for large sets.
+
+**BeliefBase in-memory evaluation.** The in-memory backend has its own
+optimization surface — `apply_traversal` walks `petgraph` edges
+per-hop, `materialize_graph` clones nodes into a new `BeliefGraph`,
+and `QueryPackage::balanced()` / `append_graph_context` appends halo/section-roots
+steps unconditionally. Profiling
+against large corpora (30k+ nodes) will identify whether traversal
+hot paths, graph materialization copies, or index lookups dominate.
+See BACKLOG for the placeholder.
+
 ## 4. Integration Points
 
 ### 4.1. Upstream: Source Files
-- Reads: `*.md`, `*.toml` files via `iter_docs()`
+- Reads: `*.md`, `*.toml` files discovered via `ProtoIndex` (built at startup)
 - Writes: Updates BIDs and titles via `inject_context()` and `generate_source()`
 - Watches: File system monitoring via `notify-debouncer`
 
@@ -1499,7 +1901,7 @@ This creates the **Structural Hierarchy** of Subsection relationships, enabling 
 - **Network Files**: `BeliefNetwork.toml` per repository root
 - **Query Cache**: In-memory pagination cache with automatic invalidation
 
-### 3.8. Shard Export and Compile-Time Search Indices
+### 4.5. Shard Export and Compile-Time Search Indices
 
 `finalize_html` (called after `parse_all`) writes two categories of output to the HTML directory: compile-time search indices (always) and BeliefBase data (monolithic or sharded depending on size). The implementation lives in `src/shard/`.
 
@@ -1588,7 +1990,7 @@ The `"global"` key is reserved for the global shard. Network shards use their 5-
 
 See `docs/design/search_and_sharding.md` for the complete specification including manifest JSON schemas, memory budget model (§6), and WASM integration (§8).
 
-### 4.5. UI Layer
+### 4.6. UI Layer
 - Query interfaces for filtered graph views
 - Content access for file editing
 - Event subscription for reactive rendering
@@ -1663,70 +2065,45 @@ After "Advanced Topics": [(guide_bid, "User Guide", 1), (adv_bid, "Advanced Topi
 - Getting Started → Installation (Subsection)
 - User Guide → Advanced Topics (Subsection)
 
-### 3.7. Event Synchronization and BeliefBase Export
+### 5.3. Event Synchronization and BeliefBase Export
 
-When the compiler finishes parsing, it must ensure all `BeliefEvent`s have been processed before exporting the beliefbase. This is critical for the `parse` command which uses an in-memory `BeliefBase` with asynchronous event processing.
+When the compiler finishes parsing, all `BeliefEvent`s must be committed to `global_bb`
+before the result is exported. `BeliefAccumulator` handles this via its `into_inner()`
+method, which drains the channel and returns the fully-populated `BeliefBase`.
 
-#### The Problem
-
-```
-Compiler (tx) → [events in channel] → rx → BeliefBase (processes events)
-                                             ↓
-                                        export_beliefgraph() ← Called too early!
-```
-
-If `export_beliefgraph()` is called before all events are processed, the export will be incomplete.
-
-#### Solution: Event Loop Synchronization (Option G Pattern)
-
-The `parse` command manages the event loop explicitly:
+#### Pattern: BeliefAccumulator
 
 ```rust
-// In main.rs parse command
-runtime.block_on(async {
-    // 1. Create event channel
-    let (tx, mut rx) = unbounded_channel::<BeliefEvent>();
-    
-    // 2. Spawn background task to process events
-    let mut global_bb = BeliefBase::empty();
-    let processor = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let _ = global_bb.process_event(&event);
-        }
-        global_bb  // Return synchronized BeliefBase when channel closes
-    });
-    
-    // 3. Create compiler with event transmitter
-    let mut compiler = DocumentCompiler::with_html_output(
-        &path, Some(tx), None, write, Some(html_dir), None, cdn
-    )?;
-    
-    // 4. Parse all documents (sends events to processor)
-    compiler.parse_all(cache, force).await?;
-    
-    // 5. Drop compiler to close tx channel
-    drop(compiler);
-    
-    // 6. Wait for event processor to finish (drains all events)
-    let final_bb = processor.await?;
-    
-    // 7. Now safe to export from synchronized BeliefBase
-    let graph = final_bb.clone().consume();
-    export_beliefbase_json(graph, html_dir).await?;
-});
+// 1. Create accumulator wrapping an empty (or pre-populated) BeliefBase
+let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+let accum = BeliefAccumulator::new(BeliefBase::empty(), accum_rx);
+let global_handle = accum.query_handle(); // QueryHandle cloned by each parse task
+
+// 2. Create compiler with the shared tx channel
+let mut compiler = DocumentCompiler::new(&repo_root, Some(accum_tx), None, write)?;
+
+// 3. Parse all documents; each epoch is drained via drain_epoch()
+compiler.parse_all(global_handle, force).await?;
+
+// 4. Drain any remaining channel events and recover the BeliefBase
+let global_bb = accum.into_inner().await?;
+
+// 5. Now safe to export — all events committed
+let graph = global_bb.clone().consume();
+export_beliefbase_json(graph, html_dir).await?;
 ```
 
-**Key Points**:
-- Background task processes events asynchronously
-- Dropping compiler closes `tx`, signaling processor to finish
-- `processor.await` blocks until all events processed
-- Export happens from synchronized `final_bb`
+**Key points:**
+- `accum.query_handle()` returns the `QueryHandle` that tasks query as `global_bb`
+- `drain_epoch()` inside `parse_all` commits each epoch batch incrementally
+- `into_inner()` performs a final drain and returns ownership of the `BeliefBase`
+- Export always happens from a fully-committed `BeliefBase`
 
-**Watch Service vs Parse Command**:
-- **Watch service**: Uses `DbConnection` which processes events in its own loop → `finalize()` exports from database
-- **Parse command**: Uses in-memory `BeliefBase` with explicit event loop → exports after synchronization
-
-This pattern ensures `beliefbase.json` always contains complete graph data for the interactive viewer.
+**Watch Service vs Parse Command:**
+- **Watch service**: passes a live `DbConnection` as `global_bb`; `BatchStart`/`BatchEnd`
+  are no-ops in `Transaction::add_event`; export is from the database after commit
+- **Parse command**: uses `BeliefAccumulator` as above; export is from the in-memory
+  `BeliefBase` returned by `into_inner()`
 
 ## 6. Architectural Concerns and Future Enhancements
 
@@ -1765,15 +2142,7 @@ BeliefBase Infrastructure (beliefbase.rs)
 3. **No manual changes required** - Schema logic stays in application layer
 4. **Query by type** - Can filter `schema` without BeliefBase knowing domain semantics
 
-### 6.2. Reference Resolution Timing
-
-**Status**: ✅ **Already Resolved**
-
-The system already implements multi-pass reference resolution via the DocumentCompiler and UnresolvedReference System. See Section 3.0 for details on the multi-pass algorithm.
-
-**Key mechanism**: `ParseDiagnostic::UnresolvedReference` diagnostics track unresolved references, and the `parse_content` return signature (`ParseContentResult` with `diagnostics: Vec<ParseDiagnostic>`) drives automatic convergence through iterative reparsing.
-
-### 6.3. Error Recovery and Partial Compilation
+### 6.2. Error Recovery and Partial Compilation
 
 **Current State**: The compiler continues processing files even when individual files fail to parse, logging errors and continuing with other files.
 
@@ -1786,41 +2155,29 @@ When needed, fine-grained error recovery within documents could be implemented b
 - Allowing partial node construction (e.g., node created but some relationships failed)
 - Marking invalid nodes with `BeliefKind::Invalid` flag for UI feedback
 
-### 6.4. Intermediate Representation Optimization
+### 6.3. Intermediate Representation Optimization
 
 **Current State**: BeliefBase directly represents parsed structure without optimization passes.
 
 **Assessment**: Current architecture is already quite efficient:
-- Lazy indexing (`index_dirty` flag) - Rebuilds only when needed
-- Arc-based structural sharing - Clone is cheap
-- Multi-pass compilation - Natural convergence without explicit optimization
+- `bid_to_index` is maintained incrementally (no lazy rebuild) — O(log N) BID → NodeIndex
+- Arc-based structural sharing — `BeliefGraph` clone is cheap
+- Multi-pass compilation — natural convergence without explicit optimization passes
 
 **Decision**: **Defer to Database Layer**
 
-Optimization is better suited for the **DbConnection** persistent cache (db.rs) rather than the in-memory BeliefBase. The database serves as the "global cache" and can maintain optimized views:
+Optimization is better suited for the **DbConnection** persistent cache rather than
+the in-memory BeliefBase. The database can maintain pre-computed traversals,
+materialized views, and deduplicated data. It can also surface suggestions back to
+authors (unreachable nodes, duplicate content, unused references) without
+auto-applying changes.
 
-**Proposed Approach:**
+### 6.4. Concurrent Parsing
 
-1. **Database maintains optimized projections**:
-   - Pre-computed traversals
-   - Materialized views for common queries
-   - Deduplicated data with references
+**Current State**: Fully implemented. See §3.4 (BeliefAccumulator) and §3.3
+(DocumentCompiler) for the complete parallel architecture. Key points repeated here
+for the concerns log:
 
-2. **DbConnection suggests optimizations back to source**:
-   - Detect unreachable nodes → suggest pruning
-   - Find duplicate content → suggest refactoring
-   - Identify unused references → suggest cleanup
-
-**Benefits:**
-
-1. **Separation of concerns** - BeliefBase stays simple, database handles optimization
-2. **Persistent optimization** - Computed once, cached across sessions
-3. **User-driven** - Suggestions reviewed by human, not auto-applied
-4. **Analytics-friendly** - Database can track usage patterns for better suggestions
-
-### 6.5. Concurrent Parsing
-
-**Current State**: Intra-epoch parallelism is fully implemented (Issue 57 complete).
 `parse_epoch` spawns one `tokio::task` per path, gated by `Arc<Semaphore>` of size
 `jobs`. `--jobs 1` uses a sequential inline loop as a deterministic baseline.
 
@@ -1887,7 +2244,7 @@ incremental update must run regardless of whether the PathMap required a sort �
 skipping it when `already_sorted=true` causes section nodes at depth ≥ 2 to be
 silently dropped from the PathMap.
 
-### 6.6. Formal Grammar Specification
+### 6.5. Formal Grammar Specification
 
 **Status**: For future consideration
 

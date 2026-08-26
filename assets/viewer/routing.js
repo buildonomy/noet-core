@@ -18,14 +18,65 @@
  *   clearSelectedLinkHighlight lives in content.js → imported directly
  */
 
+import { updatePrevNext } from "./navigation.js";
+import { ensureNetworkLoaded } from "./shard-manager.js";
 import { state, callbacks } from "./state.js";
+import { readBaseUrl, getBidFromPath } from "./wasm.js";
 import { escapeHtml } from "./utils.js";
 import {
   processLoadedContent,
   clearSelectedLinkHighlight,
   highlightElementById,
 } from "./content.js";
-import { getBidFromPath } from "./wasm.js";
+import { closeTraceabilityModal } from "./traceability.js";
+
+/**
+ * Close any open fullscreen / focused panels (xlsx workbook, traceability
+ * matrix).  Called from navigateToLink before navigating so the user
+ * lands on the destination without stale panels covering the view.
+ */
+function closeFocusedPanels() {
+  // Close traceability modal if open.
+  closeTraceabilityModal();
+
+  // Close xlsx fullscreen panel if open.
+  // xlsx-tabs.js doesn't export closeFullscreen, but the panel uses the
+  // same #noet-focused-panel element — just remove is-open and restore it.
+  var panelEl = document.getElementById("noet-focused-panel");
+  if (panelEl && panelEl.classList.contains("is-open")) {
+    panelEl.classList.remove("is-open");
+    if (panelEl.parentElement !== document.body) {
+      document.body.appendChild(panelEl);
+    }
+    var metadataEl = document.getElementById("metadata-panel");
+    if (metadataEl) {
+      metadataEl.classList.remove("has-focused-panel");
+    }
+  }
+}
+
+/**
+ * Extract the network bref from a document BID string.
+ * Per BID construction, the last 6 bytes (12 hex chars) of the UUID are the
+ * parent_bref — which for document nodes is their owning network's bref.
+ * e.g. "1f1381da-64c1-606e-a659-c153733ea4e4" → "c153733ea4e4"
+ *
+ * @param {string} bid - Full UUID string
+ * @returns {string|null}
+ */
+function networkBrefFromDocBid(bid) {
+  if (!bid) return null;
+  const hex = bid.replace(/-/g, "");
+  if (hex.length !== 32) return null;
+  return hex.slice(-12);
+}
+
+// =============================================================================
+// Module-level base URL (read once from the injected script tag)
+// =============================================================================
+
+/** Base URL for all page and asset fetches. Empty string = root-relative. */
+const BASE_URL = readBaseUrl();
 
 // =============================================================================
 // Public API — URL / path helpers
@@ -141,8 +192,23 @@ export async function handleHashChange() {
     normalizedPath = state.wasmModule.BeliefBaseWasm.normalize_path_extension(path);
   }
 
-  // If the path contains no ".html" treat it as a section anchor in the current doc
+  // If the path contains no ".html" it is either a section anchor in the current
+  // doc, or a directory path that was never normalised because WASM is
+  // unavailable (init failed — see the catch in viewer.js).
+  //
+  // Dotted directory names no longer reach here when WASM is loaded:
+  // normalize_path_extension resolves them itself ("Case 4"). This branch is
+  // the no-WASM fallback for the same shape.
+  //
+  // HTML element IDs never contain '/', so a path with directory separators is
+  // always a document path — try loading it as a directory with /index.html.
   if (!normalizedPath.includes(".html")) {
+    if (path.includes("/")) {
+      const dirPath = path.replace(/\/$/, "") + "/index.html";
+      await loadDocument(dirPath, sectionAnchor, state.pendingMetadataBid);
+      state.pendingMetadataBid = null;
+      return;
+    }
     navigateToSection("#" + path, state.pendingMetadataBid);
     state.pendingMetadataBid = null;
     return;
@@ -153,7 +219,9 @@ export async function handleHashChange() {
   // Guard: only short-circuit if a real document has been fetched —
   // on a force-refresh the hash already contains the full doc#anchor form but
   // loadDocument() hasn't run yet (the shell's placeholder <article> is not enough).
-  const normalizedNew = docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath));
+  const normalizedNew = docPathKey(
+    state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath),
+  );
   const normalizedCurrent = state.currentDocPath;
   if (normalizedCurrent && normalizedCurrent === normalizedNew && sectionAnchor) {
     navigateToSection(sectionAnchor, state.pendingMetadataBid);
@@ -197,6 +265,9 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
 
   state.currentDocPath = null;
   state.currentDocBid = null;
+  state.currentDocNetworkBref = null;
+  state.currentDocSourceLink = null;
+  state.currentDocSourceBinary = false;
 
   try {
     // --- 1. Normalise path ---
@@ -212,11 +283,28 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
       normalizedPath = "/" + normalizedPath;
     }
 
-    // --- 2. Fetch ---
-    const fetchPath = `/pages${normalizedPath}`;
-    console.log(`[Noet] Fetching document: ${fetchPath}`);
+    // --- 2. Fetch (use prefetch if available) ---
+    const fetchPath = `${BASE_URL}/pages${normalizedPath}`;
+    let response;
 
-    const response = await fetch(fetchPath);
+    // Check for a prefetched response from the early bootstrap phase.
+    // The prefetch is keyed by the un-normalized path (best-effort .md→.html
+    // before WASM was available), so compare against normalizedPath.
+    if (state.prefetchedPage && normalizedPath === state.prefetchedPage.path) {
+      console.log(`[Noet] Using prefetched page: ${fetchPath}`);
+      response = await state.prefetchedPage.promise;
+      state.prefetchedPage = null; // consume — one-shot
+    }
+
+    if (!response || !response.ok) {
+      // Prefetch missed, was consumed, or failed — fetch normally.
+      if (response && !response.ok) {
+        console.warn(`[Noet] Prefetch response not ok (${response.status}), re-fetching`);
+      }
+      console.log(`[Noet] Fetching document: ${fetchPath}`);
+      response = await fetch(fetchPath);
+    }
+
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
@@ -257,7 +345,77 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
       console.warn("[Noet] No data-document-bid found in loaded document");
     }
 
-    const metadataScript = doc.querySelector('script[type="application/json"]#noet-metadata');
+    // Extract source link from #noet-source-link (present in template-simple.html
+    // fragments). Stored on state so the metadata panel can render a View Source
+    // or Download Source link without re-parsing the DOM.
+    const sourceLinkEl = doc.querySelector("#noet-source-link");
+    if (sourceLinkEl) {
+      const href = sourceLinkEl.getAttribute("href");
+      if (href && href.length > 0) {
+        state.currentDocSourceLink = href;
+        state.currentDocSourceBinary =
+          sourceLinkEl.getAttribute("data-binary") === "true";
+      }
+    }
+
+    // --- 4b. Ensure the document's network shard is loaded before injecting content ---
+    // Without this, nodes embedded in the document (links, headings) can't resolve
+    // their brefs via get_bid_from_bref because the shard hasn't been loaded yet.
+    //
+    // We also store the network bref on state so that injectHeaderAnchors and the
+    // section BID lookup below can use it instead of the entry point bref.
+    // Heading nodes live in the document's home network PathMap, not the root's.
+    //
+    // Strategy (in priority order):
+    //   1. bref_index via WASM — authoritative, works for all node types
+    //   2. parent_bref derivation — works for document-level nodes whose
+    //      parent bref IS the network bref
+    //   3. get_context — only useful when the shard is already loaded
+    //
+    // We intentionally avoid using get_context as the primary strategy because
+    // extern Section edges can pollute PathMaps, causing get_context to resolve
+    // a document into the wrong network (e.g. the entry network instead of its
+    // true home network).  The bref_index is immune to this problem.
+    if (documentBid) {
+      let networkBref = null;
+
+      // Attempt 1: bref_index lookup via WASM — authoritative source.
+      if (!networkBref && state.beliefbase) {
+        const indexResult = state.beliefbase.network_bref_for_bid(documentBid);
+        if (indexResult) {
+          networkBref = indexResult;
+        }
+      }
+
+      // Attempt 2: derive from BID parent bref (last 12 hex chars). Works for
+      // top-level document nodes whose parent bref IS the network bref.
+      // May be wrong for section nodes, but serves as a best-effort fallback.
+      if (!networkBref) {
+        networkBref = networkBrefFromDocBid(documentBid);
+      }
+
+      if (networkBref) {
+        state.currentDocNetworkBref = networkBref;
+        if (state.shardManager && !state.shardManager.isNetworkLoaded(networkBref)) {
+          console.log(`[Noet] Awaiting network shard load for document: ${networkBref}`);
+          try {
+            await state.shardManager.loadNetwork(networkBref);
+            console.log(`[Noet] Network shard loaded: ${networkBref}`);
+            document.dispatchEvent(
+              new CustomEvent("noet:shard-loaded", { detail: { bref: networkBref } }),
+            );
+          } catch (err) {
+            console.warn(
+              `[Noet] Failed to load network shard ${networkBref}: ${err.message}`,
+            );
+          }
+        }
+      }
+    }
+
+    const metadataScript = doc.querySelector(
+      'script[type="application/json"]#noet-metadata',
+    );
     if (metadataScript) {
       try {
         state.documentMetadata = JSON.parse(metadataScript.textContent);
@@ -273,17 +431,46 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     }
 
     // --- 5. Replace content ---
+    // Only replace the <article> element's content, preserving sibling
+    // elements (gutter handles, prev/next navs) inside __inner.
     const contentInner = state.contentElement.querySelector(".noet-content__inner");
     if (contentInner) {
-      contentInner.innerHTML = `<article>${bodyContent}</article>`;
+      let article = contentInner.querySelector("article");
+      if (!article) {
+        article = document.createElement("article");
+        contentInner.appendChild(article);
+      }
+      article.innerHTML = bodyContent;
     } else {
       state.contentElement.innerHTML = bodyContent;
     }
 
     // --- 6. Post-process ---
-    processLoadedContent(contentInner || state.contentElement);
+    // Pass sectionAnchor so xlsx-tabs.js can activate the correct tab and
+    // scroll to the target row during initialization (before the 100ms
+    // navigateToSection timer fires).
+    processLoadedContent(contentInner || state.contentElement, sectionAnchor);
 
-    state.currentDocPath = docPathKey(state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath));
+    // Render math spans produced by pulldown-cmark ENABLE_MATH.
+    // noetRenderMath is defined in the HTML template (inline script) and
+    // targets <span class="math math-display"> and <span class="math math-inline">
+    // elements, calling katex.render() on each. Safe to call when KaTeX is
+    // absent (the function guards on typeof katex).
+    if (typeof window.noetRenderMath === "function") {
+      window.noetRenderMath(contentInner || state.contentElement);
+    }
+
+    // Render mermaid diagrams in fenced ```mermaid blocks.
+    // noetRenderDiagrams is defined in the HTML template (inline script) and
+    // promotes <code class="language-mermaid"> elements to <div class="mermaid">
+    // before calling mermaid.run(). Safe to call when Mermaid is absent.
+    if (typeof window.noetRenderDiagrams === "function") {
+      window.noetRenderDiagrams(contentInner || state.contentElement);
+    }
+
+    state.currentDocPath = docPathKey(
+      state.wasmModule.BeliefBaseWasm.pathParts(normalizedPath),
+    );
     state.currentDocBid = documentBid;
     console.log(`[Noet] Document loaded: ${path}`);
 
@@ -291,9 +478,10 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
     if (callbacks.updateNavTreeHighlight) {
       callbacks.updateNavTreeHighlight();
     }
+    updatePrevNext();
 
     if (!sectionAnchor) {
-      state.contentElement.scrollTo({ top: 0, behavior: "smooth" });
+      (contentInner || state.contentElement).scrollTo({ top: 0, behavior: "instant" });
 
       const bidToShow = targetBid || documentBid || getBidFromPath(path);
       if (bidToShow && callbacks.showMetadataPanel) {
@@ -318,15 +506,31 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
       let sectionBid = targetBid;
       if (!sectionBid && state.beliefbase) {
         const sectionId = sectionAnchor.substring(1); // strip leading "#"
-        const entryPoint = state.beliefbase.entryPoint();
-        const result = state.beliefbase.get_bid_from_id(entryPoint.bref, sectionId);
+        // Use the document's home network bref, not the entry point bref.
+        // Section nodes live in the document's network PathMap; looking them up
+        // via the root entry network bref silently misses them for subnet pages.
+        const lookupBref =
+          state.currentDocNetworkBref ?? state.beliefbase.entryPoint().bref;
+        const result = state.beliefbase.get_bid_from_id(lookupBref, sectionId);
         if (result) {
           sectionBid = result.bid;
         }
       }
-      setTimeout(() => {
-        navigateToSection(sectionAnchor, sectionBid);
-      }, 100); // brief delay to ensure content is rendered
+      // xlsx-tabs.js handles its own anchor navigation (tab activation +
+      // deferred scrollToRow).  Skip the generic navigateToSection call
+      // which would fail because Tabulator row elements don't exist as
+      // DOM IDs until after tableBuilt fires.
+      if (window.__xlsxHandledAnchor) {
+        window.__xlsxHandledAnchor = false;
+        // Still show metadata panel for the section BID if available.
+        if (sectionBid && callbacks.showMetadataPanel) {
+          callbacks.showMetadataPanel(sectionBid);
+        }
+      } else {
+        setTimeout(() => {
+          navigateToSection(sectionAnchor, sectionBid);
+        }, 100); // brief delay to ensure content is rendered
+      }
     }
 
     // Fire pending highlight after content and section navigation have settled.
@@ -348,9 +552,13 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
 
     const contentInner = state.contentElement.querySelector(".noet-content__inner");
     const target = contentInner || state.contentElement;
+    let errorArticle = target.querySelector("article");
+    if (!errorArticle) {
+      errorArticle = document.createElement("article");
+      target.appendChild(errorArticle);
+    }
 
-    target.innerHTML = `
-      <article>
+    errorArticle.innerHTML = `
         <div class="noet-error">
           <h3 class="noet-error__title">Document Not Found</h3>
           <p class="noet-error__message">Failed to load: ${escapeHtml(path)}</p>
@@ -359,7 +567,6 @@ export async function loadDocument(path, sectionAnchor = null, targetBid = null)
             Back to Home
           </button>
         </div>
-      </article>
     `;
   }
 }
@@ -392,7 +599,7 @@ export function navigateToSection(anchor, targetBid = null) {
   const targetElement = document.getElementById(sectionId);
 
   if (targetElement) {
-    targetElement.scrollIntoView({ behavior: "smooth", block: "start" });
+    targetElement.scrollIntoView({ behavior: "instant", block: "start" });
     highlightElementById(sectionId);
 
     // Reconstruct hash as "<docPath>#<sectionId>" to preserve the document path
@@ -415,7 +622,7 @@ export function navigateToSection(anchor, targetBid = null) {
     // A bare hash like "#doc#section" is a relative URL — the browser resolves
     // it against the current fetch URL (/pages/doc.html), producing
     // /pages/#doc#section instead of /#doc#section.
-    history.replaceState(null, "", "/" + newHash);
+    history.replaceState(null, "", BASE_URL + "/" + newHash);
 
     if (targetBid && callbacks.showMetadataPanel) {
       callbacks.showMetadataPanel(targetBid);
@@ -441,6 +648,10 @@ export function navigateToSection(anchor, targetBid = null) {
  * @param {string|null} targetBid - BID of the target node (may be null)
  */
 export function navigateToLink(href, link, targetBid = null) {
+  // Close any open fullscreen panels (xlsx workbook, traceability matrix)
+  // before navigating to a different node.
+  closeFocusedPanels();
+
   // 1. In-page section anchor
   if (href.startsWith("#")) {
     navigateToSection(href, targetBid);
@@ -474,8 +685,8 @@ export function navigateToLink(href, link, targetBid = null) {
       }
       return;
     }
-    console.log(`[Noet] Opening asset: /pages/${href}`);
-    window.open(`/pages/${href}`, "_blank");
+    console.log(`[Noet] Opening asset: ${BASE_URL}/pages/${href}`);
+    window.open(`${BASE_URL}/pages/${href}`, "_blank");
     return;
   }
 
@@ -485,6 +696,14 @@ export function navigateToLink(href, link, targetBid = null) {
   let resolvedPath = href;
   if (state.wasmModule) {
     const hrefParts = state.wasmModule.BeliefBaseWasm.pathParts(href);
+    // 2b. Schema URL that wasn't caught by the href_namespace BID check above
+    // (e.g. a Jira link whose node BID doesn't carry the href_namespace suffix).
+    // Open in a new tab rather than falling through to internal document nav.
+    if (hrefParts.hasSchema) {
+      console.log(`[Noet] Opening external URL (schema detected): ${href}`);
+      window.open(href, "_blank", "noopener,noreferrer");
+      return;
+    }
     if (!hrefParts.hasSchema && !href.startsWith("/")) {
       const currentHash = window.location.hash.substring(1);
       if (currentHash) {
@@ -508,9 +727,12 @@ export function navigateToLink(href, link, targetBid = null) {
     if (targetBid) {
       state.pendingMetadataBid = targetBid;
     }
+    ensureNetworkLoaded(targetBid, state);
     window.location.hash = hashPath;
     return;
   }
 
+  // If the target is an unloaded network shard, begin loading it in background.
+  ensureNetworkLoaded(targetBid, state);
   navigateToDocument(resolvedPath, targetBid);
 }

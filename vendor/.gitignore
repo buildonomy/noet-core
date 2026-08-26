@@ -1,0 +1,2 @@
+# Vendored binaries are fetched on demand via fetch.sh — not committed.
+*.exe

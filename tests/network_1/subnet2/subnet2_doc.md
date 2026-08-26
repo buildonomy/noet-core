@@ -16,6 +16,9 @@ visited and silently dropped their contents. The result was that documents like
 this one either vanished from the tree entirely or were stranded as direct
 children of the root network instead of being properly nested under `subnet2`.
 
+This subnet links to [[belief-network-test-1-subnet-1]] to create a cross-subnet
+reference that triggers the parallel epoch cache-fetch race.
+
 With the fix in place:
 - This document must appear under `subnet2` in the tree, not under root.
 - `subnet2` must appear as a child of the root network node.

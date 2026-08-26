@@ -10,7 +10,6 @@
 
 use crate::{
     nodekey::NodeKey,
-    paths::AnchorPath,
     properties::{Bid, Bref, WeightKind},
 };
 use petgraph::Direction;
@@ -147,7 +146,12 @@ impl UnresolvedReference {
                 .iter()
                 .find(|k| matches!(k, NodeKey::Path { .. }))
             {
-                Some((AnchorPath::from(&path).filepath().to_string(), *net))
+                // Use the raw path string rather than filepath() so that schema-prefixed
+                // URLs (mailto:, https:, etc.) are preserved intact. filepath() strips the
+                // schema for non-hierarchical URLs (e.g. "mailto:user@host" → "user@host"),
+                // which would cause the PathMap lookup in process_unresolved_reference to
+                // miss — the PathMap key is always the full URL including schema.
+                Some((path.to_string(), *net))
             } else {
                 None
             }

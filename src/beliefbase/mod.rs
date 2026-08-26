@@ -21,7 +21,7 @@
 pub(crate) mod accumulator;
 mod base;
 
-mod context;
+pub(crate) mod context;
 mod graph;
 #[cfg(not(target_arch = "wasm32"))]
 mod sink;
@@ -34,7 +34,7 @@ mod tests;
 pub use accumulator::{BeliefAccumulator, EpochDrain, QueryHandle};
 pub use base::BeliefBase;
 
-pub use context::{BeliefContext, ExtendedRelation};
-pub use graph::{BeliefGraph, BidGraph, BidRefGraph, BidSubGraph};
+pub use context::{BeliefContext, ExtendedRelation, OwnedEdge};
+pub use graph::{BeliefGraph, BidGraph, BidRefGraph, BidSubGraph, MergePrecedence};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sink::BeliefSink;

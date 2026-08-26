@@ -12,16 +12,24 @@ use crate::{
     nodekey::NodeKey,
     paths::{pathmap::pathmap_order, PathMapMap},
     properties::{
-        asset_namespace, BeliefKind, BeliefNode, BeliefRefRelation, BeliefRelation, Bid, Bref,
-        WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
+        asset_namespace, const_namespaces, BeliefKind, BeliefNode, BeliefRelation, Bid, Bref,
+        NodeId, WeightKind, WeightSet, WEIGHT_DOC_PATHS, WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
     },
     BuildonomyError,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::query::BeliefSource;
+use crate::query::spec::QuerySpec;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::query::{BeliefSource, BoxFuture, SubmapResult};
 
-use crate::query::{Expression, RelationPred, SetOp, StatePred};
+use crate::query::spec::{
+    Composition, CompositionOp, EdgePredicate, NodeFilter, PackageStage, ProjectionStep,
+    QueryPackage, Role, SortPayload, StepOperation, TapeContent, TapeEntry, TapeFn, TapePayload,
+    TextSearchProvider, TraversalSpec,
+};
+
+use enumset::EnumSet;
 #[cfg(not(target_arch = "wasm32"))]
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 
@@ -29,11 +37,21 @@ use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 use parking_lot::RwLock;
 use petgraph::{
     algo::kosaraju_scc,
-    visit::{depth_first_search, Control, DfsEvent, EdgeRef},
+    visit::{depth_first_search, Control, DfsEvent, EdgeRef, IntoEdgeReferences},
     Direction,
 };
+
+/// Local alias so all `bid_to_index` maps use a consistent type that matches
+/// `StableGraph`'s node-index type.  Changing `BidGraph` from `Graph` to
+/// `StableGraph` requires this to be `stable_graph::NodeIndex` everywhere.
+type NodeIndex = petgraph::stable_graph::NodeIndex;
+type EdgeIndex = petgraph::stable_graph::EdgeIndex;
+
+use rustc_hash::FxHashMap;
 use std::{
-    collections::{btree_map::Entry as BTreeEntry, BTreeMap, BTreeSet},
+    collections::{
+        btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, BTreeSet,
+    },
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -41,7 +59,11 @@ use std::{
     },
 };
 
-use super::{context::BeliefContext, graph::MergeOp, BeliefGraph, BidGraph};
+use super::{
+    context::BeliefContext,
+    graph::{MergeOp, MergePrecedence},
+    BeliefGraph, BidGraph,
+};
 
 // Conditional type alias for thread-safe shared locks
 // WASM uses Rc<RefCell<T>> (single-threaded)
@@ -61,19 +83,50 @@ pub struct BeliefBase {
     /// (e.g. `"doc_bb"`, `"session_bb"`, `"global_bb"`).  Printed in every
     /// tracing macro so log lines can be attributed without ambiguity.
     pub label: &'static str,
-    states: BTreeMap<Bid, BeliefNode>,
+    // FxHashMap (not BTreeMap): pure keyed lookup with no order dependency — see
+    // Issue 101 (BTree→HashMap investigation). Bid is already high-entropy (UUID-backed),
+    // so a non-cryptographic hasher is a safe, intentional choice for this embedded-library
+    // hot path (no untrusted-input DoS surface). Deterministic *output* order, when needed
+    // (e.g. diagnostic messages, JSON export), is produced by sorting a `Vec` collected from
+    // this map at the point of use — never by relying on the map's own iteration order.
+    states: FxHashMap<Bid, BeliefNode>,
     relations: SharedLock<BidGraph>,
     #[cfg(not(target_arch = "wasm32"))]
-    bid_to_index: RwLock<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
+    bid_to_index: RwLock<FxHashMap<Bid, NodeIndex>>,
     #[cfg(target_arch = "wasm32")]
-    bid_to_index: RefCell<BTreeMap<Bid, petgraph::graph::NodeIndex>>,
-    index_dirty: AtomicBool,
+    bid_to_index: RefCell<FxHashMap<Bid, NodeIndex>>,
+
     /// True when the last `built_in_test` run found no invariant violations.
     balanced: AtomicBool,
     brefs: BTreeMap<Bref, Bid>,
     paths: SharedLock<PathMapMap>,
     diagnostics: SharedLock<Vec<ParseDiagnostic>>,
     api: BeliefNode,
+
+    /// Owner-edge memo: indexes edges by their `WEIGHT_OWNED_BY` third-party bref.
+    ///
+    /// Only third-party owners are indexed (not `"source"`, `"sink"`, or absent).
+    /// Each entry maps an owner bref to the set of `EdgeIndex` values in `self.relations`
+    /// whose `WeightSet` contains at least one weight with that bref as `WEIGHT_OWNED_BY`.
+    ///
+    /// Maintained incrementally by `update_relation`, `replace_bid`, `remove_nodes`,
+    /// and `trim`. Built from scratch in `new_unbalanced`.
+    /// Cloned on `Clone` (mirrors `brefs` — correctness index, not performance counter).
+    ///
+    /// Enables O(1) owned-edge lookup for the Owner input role in `apply_traversal`,
+    /// replacing the previous O(E) full-graph scan.
+    owner_edges: BTreeMap<Bref, BTreeSet<EdgeIndex>>,
+
+    /// Memoized "next sort key" per `(sink, WeightKind)` pair.
+    ///
+    /// Seeded lazily from the current max incoming sort index on a sink the first time a
+    /// new edge is added to it.  Avoids the O(K) `max()` scan inside
+    /// `generate_edge_update` for every new edge, turning an O(K²) batch into O(K).
+    ///
+    /// **Invariant**: must be invalidated (entry removed) whenever an edge is removed from
+    /// a sink so the counter is re-seeded from the compacted post-removal state.
+    /// Cleared entirely on `Clone` — clones are short-lived and don't inherit the counter.
+    next_sort_key: BTreeMap<(Bid, WeightKind), u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,14 +175,13 @@ impl fmt::Display for BeliefBase {
 /// properties.
 impl Default for BeliefBase {
     fn default() -> BeliefBase {
-        BeliefBase::new(BTreeMap::default(), BidGraph::default())
+        BeliefBase::new(FxHashMap::default(), BidGraph::default())
             .expect("Single state set with no relations to pass the BeliefBase built in test")
     }
 }
 
 impl Clone for BeliefBase {
     fn clone(&self) -> BeliefBase {
-        self.index_sync(false);
         #[cfg(not(target_arch = "wasm32"))]
         {
             BeliefBase {
@@ -137,12 +189,18 @@ impl Clone for BeliefBase {
                 states: self.states.clone(),
                 relations: Arc::new(RwLock::new(self.read_relations().clone())),
                 bid_to_index: RwLock::new(self.read_bid_index().clone()),
-                index_dirty: AtomicBool::new(false),
+
                 balanced: AtomicBool::new(self.balanced.load(Ordering::SeqCst)),
                 brefs: self.brefs.clone(),
                 paths: Arc::new(RwLock::new(self.read_paths().clone())),
                 diagnostics: Arc::new(RwLock::new(self.read_diagnostics().clone())),
                 api: self.api.clone(),
+
+                owner_edges: self.owner_edges.clone(),
+                // Clones start with an empty sort-key memo — the counter must not be
+                // inherited across clone boundaries (stale edge counts on the clone's
+                // independent graph copy would produce duplicate sort indices).
+                next_sort_key: BTreeMap::new(),
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -152,81 +210,94 @@ impl Clone for BeliefBase {
                 states: self.states.clone(),
                 relations: Rc::new(RefCell::new(self.read_relations().clone())),
                 bid_to_index: RefCell::new(self.read_bid_index().clone()),
-                index_dirty: AtomicBool::new(false),
+
                 balanced: AtomicBool::new(self.balanced.load(Ordering::SeqCst)),
                 brefs: self.brefs.clone(),
                 paths: Rc::new(RefCell::new(self.read_paths().clone())),
                 diagnostics: Rc::new(RefCell::new(self.read_diagnostics().clone())),
                 api: self.api.clone(),
+                owner_edges: self.owner_edges.clone(),
+                // Clones start with an empty sort-key memo (see native comment above).
+                next_sort_key: BTreeMap::new(),
             }
         }
     }
 }
 
-/// BeliefBase: A structured collection of `BeliefState`s and their relations that can be queried and
-/// manipulated while preserving a global graph structure.
-///
-/// - Creates a cache that maps belief IDs and belief paths to quick lookup information such as:
-///   local path, title, bid, content summary, version control state, belief type
-/// - Creates typed belief-to-belief directional relationships between belief objects
-///
-/// Static Invariants for a balanced BeliefBase (checked by [BeliefBase::built_in_test] and
-/// BeliefBase::check_path_invariants):
-///
-/// 0. Each BeliefRelationKind sub-graph forms a directed acyclic graph. sub-graph cycles are not
-///    supported.
-///
-/// 1. All nodes within the relation hyper-graph have:
-///
-///    0. A corresponding state ([crate::properties::BeliefNode]) and,
-///
-///    1. A corresponding API path.
-///
-/// 2. Each Belief relation is ordered by BeliefRelationKind weights. Each weight specifies a
-///    different graph type. The relation graph is therefore something like a hypergraph. Because of
-///    the weights, each sub-graph has a deterministic ordering. In this manner, the relation graph
-///    can produce deterministically serialized results, necessary for things like creating table of
-///    contents, or serialized procedural outcomes.
-///
-/// Operational rules:
-///
-/// 1. The holder of a link is a 'sink' whereas the resource its accessing is the source. Parent ==
-///    sink, child == source. In non-parent-child relationships this is intuitive, but it also makes
-///    sense for subsections. In as the child contains its self state (source), and the parent is
-///    indexing its child relationships, so 'sinking'/consuming data from the child nodes. Think
-///    about the direction the information is flowing.
-///
-/// 2. PathMaps identify how to acquire the source starting from known network locations.
+// BeliefBase: A structured collection of `BeliefState`s and their relations that can be queried and
+// manipulated while preserving a global graph structure.
+//
+// - Creates a cache that maps belief IDs and belief paths to quick lookup information such as:
+//   local path, title, bid, content summary, version control state, belief type
+// - Creates typed belief-to-belief directional relationships between belief objects
+//
+// Static Invariants for a balanced BeliefBase (checked by [BeliefBase::built_in_test] and
+// BeliefBase::check_path_invariants):
+//
+// 0. Each BeliefRelationKind sub-graph forms a directed acyclic graph. sub-graph cycles are not
+//    supported.
+//
+// 1. All nodes within the relation hyper-graph have:
+//
+//    0. A corresponding state ([crate::properties::BeliefNode]) and,
+//
+//    1. A corresponding API path.
+//
+// 2. Each Belief relation is ordered by BeliefRelationKind weights. Each weight specifies a
+//    different graph type. The relation graph is therefore something like a multigraph. Because of
+//    the weights, each sub-graph has a deterministic ordering. In this manner, the relation graph
+//    can produce deterministically serialized results, necessary for things like creating table of
+//    contents, or serialized procedural outcomes.
+//
+// Operational rules:
+//
+// 1. The holder of a link is a 'sink' whereas the resource its accessing is the source. Parent ==
+//    sink, child == source. In non-parent-child relationships this is intuitive, but it also makes
+//    sense for subsections. In as the child contains its self state (source), and the parent is
+//    indexing its child relationships, so 'sinking'/consuming data from the child nodes. Think
+//    about the direction the information is flowing.
+//
+// 2. PathMaps identify how to acquire the source starting from known network locations.
+
 impl BeliefBase {
     pub fn empty() -> BeliefBase {
         #[cfg(not(target_arch = "wasm32"))]
         {
             BeliefBase {
                 label: "bb",
-                states: BTreeMap::default(),
-                relations: Arc::new(RwLock::new(BidGraph(petgraph::Graph::new()))),
-                bid_to_index: RwLock::new(BTreeMap::default()),
-                index_dirty: AtomicBool::new(false),
+                states: FxHashMap::default(),
+                relations: Arc::new(RwLock::new(BidGraph(
+                    petgraph::stable_graph::StableGraph::new(),
+                ))),
+                bid_to_index: RwLock::new(FxHashMap::default()),
+
                 balanced: AtomicBool::new(true),
                 brefs: BTreeMap::default(),
                 paths: Arc::new(RwLock::new(PathMapMap::default())),
                 diagnostics: Arc::new(RwLock::new(Vec::new())),
                 api: BeliefNode::api_state(),
+
+                owner_edges: BTreeMap::new(),
+                next_sort_key: BTreeMap::new(),
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             BeliefBase {
                 label: "bb",
-                states: BTreeMap::default(),
-                relations: Rc::new(RefCell::new(BidGraph(petgraph::Graph::new()))),
-                bid_to_index: RefCell::new(BTreeMap::default()),
-                index_dirty: AtomicBool::new(false),
+                states: FxHashMap::default(),
+                relations: Rc::new(RefCell::new(BidGraph(
+                    petgraph::stable_graph::StableGraph::new(),
+                ))),
+                bid_to_index: RefCell::new(FxHashMap::default()),
+
                 balanced: AtomicBool::new(true),
                 brefs: BTreeMap::default(),
                 paths: Rc::new(RefCell::new(PathMapMap::default())),
                 diagnostics: Rc::new(RefCell::new(Vec::new())),
                 api: BeliefNode::api_state(),
+                owner_edges: BTreeMap::new(),
+                next_sort_key: BTreeMap::new(),
             }
         }
     }
@@ -319,31 +390,27 @@ impl BeliefBase {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_bid_index(
-        &self,
-    ) -> parking_lot::RwLockReadGuard<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+    fn read_bid_index(&self) -> parking_lot::RwLockReadGuard<'_, FxHashMap<Bid, NodeIndex>> {
         self.bid_to_index.read()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read_bid_index(&self) -> std::cell::Ref<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+    fn read_bid_index(&self) -> std::cell::Ref<'_, FxHashMap<Bid, NodeIndex>> {
         self.bid_to_index.borrow()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_bid_index(
-        &self,
-    ) -> parking_lot::RwLockWriteGuard<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+    fn write_bid_index(&self) -> parking_lot::RwLockWriteGuard<'_, FxHashMap<Bid, NodeIndex>> {
         self.bid_to_index.write()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn write_bid_index(&self) -> std::cell::RefMut<'_, BTreeMap<Bid, petgraph::graph::NodeIndex>> {
+    fn write_bid_index(&self) -> std::cell::RefMut<'_, FxHashMap<Bid, NodeIndex>> {
         self.bid_to_index.borrow_mut()
     }
 
     pub fn new_unbalanced(
-        states: BTreeMap<Bid, BeliefNode>,
+        states: FxHashMap<Bid, BeliefNode>,
         relations: BidGraph,
         inject_api: bool,
     ) -> BeliefBase {
@@ -357,8 +424,33 @@ impl BeliefBase {
         if inject_api {
             bs.insert_state(bs.api.clone(), &[]);
         }
-        bs.index_dirty.store(true, Ordering::SeqCst);
-        bs.index_sync(false);
+        // Build bid_to_index once inline from the loaded graph — O(N), no dirty flag needed.
+        {
+            let relations = bs.write_relations();
+            let mut index = bs.write_bid_index();
+            *index = FxHashMap::from_iter(
+                relations
+                    .as_graph()
+                    .node_indices()
+                    .map(|idx| (relations.as_graph()[idx], idx)),
+            );
+            // Ensure all states nodes are in the relations graph.
+            drop(index);
+            drop(relations);
+        }
+        // Any states node not yet in the graph must be registered now.
+        let missing_bids: Vec<Bid> = bs
+            .states
+            .keys()
+            .filter(|bid| !bs.read_bid_index().contains_key(bid))
+            .copied()
+            .collect();
+        for bid in missing_bids {
+            bs.graph_insert_node(bid);
+        }
+
+        // Build owner_edges memo from the loaded graph — O(E), single pass.
+        bs.build_owner_edges();
 
         // Build PathMapMap - for WASM, need to convert to Arc<RwLock<>> temporarily
         #[cfg(not(target_arch = "wasm32"))]
@@ -374,7 +466,7 @@ impl BeliefBase {
     }
 
     pub fn new(
-        states: BTreeMap<Bid, BeliefNode>,
+        states: FxHashMap<Bid, BeliefNode>,
         relations: BidGraph,
     ) -> Result<BeliefBase, BuildonomyError> {
         let set = BeliefBase::new_unbalanced(states, relations, true);
@@ -385,15 +477,14 @@ impl BeliefBase {
         &self.api
     }
 
-    pub fn states(&self) -> &BTreeMap<Bid, BeliefNode> {
+    pub fn states(&self) -> &FxHashMap<Bid, BeliefNode> {
         &self.states
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn paths(&self) -> ArcRwLockReadGuard<RawRwLock, PathMapMap> {
-        self.index_sync(false);
         while self.paths.is_locked_exclusive() {
-            tracing::info!(
+            tracing::debug!(
                 label = self.label,
                 "[BeliefBase] Waiting for read access to paths"
             );
@@ -404,7 +495,6 @@ impl BeliefBase {
 
     #[cfg(target_arch = "wasm32")]
     pub fn paths(&self) -> std::cell::Ref<'_, PathMapMap> {
-        self.index_sync(false);
         self.read_paths()
     }
 
@@ -412,100 +502,91 @@ impl BeliefBase {
         &self.brefs
     }
 
-    /// Synchronize our indices (namely the self.paths object and our bid_to_index object), if the
-    /// index_dirty flag is set. If bit is true, then run built in test as well.
-    fn index_sync(&self, bit: bool) {
-        if !self.index_dirty.load(Ordering::SeqCst) {
-            return;
-        }
-        // This block ensures we drop relations and index
-        {
-            let mut relations = self.write_relations();
-            let mut index = self.write_bid_index();
-            *index = BTreeMap::from_iter(
-                relations
-                    .as_graph()
-                    .node_indices()
-                    .map(|idx| (relations.as_graph()[idx], idx)),
-            );
-            // Ensure all nodes in states are also in the relations graph
-            // This handles nodes that were added to states but have no edges
-            for bid in self.states.keys() {
-                index
-                    .entry(*bid)
-                    .or_insert_with(|| relations.as_graph_mut().add_node(*bid));
-            }
-        }
-        self.index_dirty.store(false, Ordering::SeqCst);
+    pub fn owner_edges(&self) -> &BTreeMap<Bref, BTreeSet<EdgeIndex>> {
+        &self.owner_edges
+    }
 
-        if bit {
-            // Rebuild paths
-            #[cfg(not(target_arch = "wasm32"))]
-            let constructor_paths_map = PathMapMap::new(self.states(), self.relations.clone());
-            #[cfg(target_arch = "wasm32")]
-            let constructor_paths_map = {
-                let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
-                PathMapMap::new(self.states(), relations_arc)
+    /// Build a [`BeliefGraph`] containing all edges owned by `owner_bref`
+    /// (where `WEIGHT_OWNED_BY` matches the bref) and their endpoint nodes.
+    ///
+    /// Endpoint nodes are marked with [`BeliefKind::Trace`] because the
+    /// returned graph is a partial view — it does not contain the full
+    /// relation set for each node.
+    ///
+    /// Uses the `owner_edges` memo for O(K) lookup where K is the number
+    /// of edges owned by this bref. Returns an empty graph if no edges
+    /// are indexed under `owner_bref`.
+    pub fn graph_for_owner(&self, owner_bref: &Bref) -> BeliefGraph {
+        let Some(edge_indices) = self.owner_edges.get(owner_bref) else {
+            return BeliefGraph::default();
+        };
+
+        let mut states = FxHashMap::default();
+        let mut edges = Vec::new();
+        let relations = self.read_relations();
+        let graph = relations.as_graph();
+
+        for &edge_idx in edge_indices {
+            let Some((src_idx, snk_idx)) = graph.edge_endpoints(edge_idx) else {
+                continue;
             };
-            let constructor_all_paths = constructor_paths_map.all_paths();
-            let constructor_paths: BTreeSet<String> = constructor_all_paths
-                .values()
-                .flatten()
-                .map(|(path, _, _)| path.clone())
-                .collect();
-            // Update the paths field with the new PathMapMap
-            let event_all_paths = self.paths().all_paths();
-            let event_paths: BTreeSet<String> = event_all_paths
-                .values()
-                .flatten()
-                .map(|(path, _, _)| path.clone())
-                .collect();
-            let mut new_diagnostics = self.built_in_test(bit);
-            if event_paths != constructor_paths {
-                new_diagnostics.push(format!(
-                    "[BeliefBase::index_sync] Event-driven and constructor PathMapMaps should \
-                        have identical paths.\n \
-                        \tevent_paths:\n \
-                        \t- {} \n \
-                        \tconstructor_paths:\n \
-                        \t- {} \n",
-                    event_paths
-                        .into_iter()
-                        .collect::<Vec<String>>()
-                        .join("\n\t- "),
-                    constructor_paths
-                        .into_iter()
-                        .collect::<Vec<String>>()
-                        .join("\n\t- ")
-                ));
+            let Some(ws) = graph.edge_weight(edge_idx) else {
+                continue;
+            };
+            let source = graph[src_idx];
+            let sink = graph[snk_idx];
+
+            if let HashEntry::Vacant(e) = states.entry(source) {
+                if let Some(state) = self.states().get(&source) {
+                    let mut source_state = state.clone();
+                    source_state.kind.insert(BeliefKind::Trace);
+                    e.insert(source_state);
+                }
             }
-            let has_errors = !new_diagnostics.is_empty();
-            if has_errors {
-                tracing::debug!(
-                    label = self.label,
-                    "Set isn't balanced. Diagnostics:\n{}",
-                    new_diagnostics.join("\n- ")
-                );
+            if let HashEntry::Vacant(e) = states.entry(sink) {
+                if let Some(state) = self.states().get(&sink) {
+                    let mut sink_state = state.clone();
+                    sink_state.kind.insert(BeliefKind::Trace);
+                    e.insert(sink_state);
+                }
             }
-            self.balanced.store(!has_errors, Ordering::SeqCst);
-            self.write_diagnostics().extend(
-                new_diagnostics
-                    .into_iter()
-                    .map(|msg| ParseDiagnostic::parse_error(msg, 0)),
-            );
+
+            edges.push(BeliefRelation {
+                source,
+                sink,
+                weights: ws.clone(),
+            });
+        }
+
+        BeliefGraph {
+            states,
+            relations: BidGraph::from_edges(edges),
         }
     }
 
-    pub fn bid_to_index(&self, bid: &Bid) -> Option<petgraph::graph::NodeIndex> {
-        self.index_sync(false);
+    /// Insert a node into the relations graph and update bid_to_index atomically.
+    /// Must NOT be called while holding any lock on relations or bid_to_index.
+    fn graph_insert_node(&self, bid: Bid) -> NodeIndex {
+        let idx = self.write_relations().as_graph_mut().add_node(bid);
+        self.write_bid_index().insert(bid, idx);
+        idx
+    }
+
+    /// Remove a node from the relations graph and update bid_to_index atomically.
+    /// Must NOT be called while holding any lock on relations or bid_to_index.
+    fn graph_remove_node(&self, idx: NodeIndex, bid: &Bid) {
+        self.write_relations().as_graph_mut().remove_node(idx);
+        self.write_bid_index().remove(bid);
+    }
+
+    pub fn bid_to_index(&self, bid: &Bid) -> Option<NodeIndex> {
         self.read_bid_index().get(bid).copied()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn relations(&self) -> ArcRwLockReadGuard<RawRwLock, BidGraph> {
-        self.index_sync(false);
         while self.relations.is_locked_exclusive() {
-            tracing::info!(
+            tracing::debug!(
                 label = self.label,
                 "[BeliefBase] Waiting for read access to relations"
             );
@@ -516,12 +597,10 @@ impl BeliefBase {
 
     #[cfg(target_arch = "wasm32")]
     pub fn relations(&self) -> std::cell::Ref<'_, BidGraph> {
-        self.index_sync(false);
         self.read_relations()
     }
 
     pub fn get(&self, key: &NodeKey) -> Option<BeliefNode> {
-        self.index_sync(false);
         match key {
             NodeKey::Bid { bid } => self.states.get(bid).cloned(),
             NodeKey::Bref { bref } => self
@@ -539,9 +618,7 @@ impl BeliefBase {
         }
     }
 
-    // FIXME: This could introduce index issues, as BeliefContext has mutable access to self.
-    pub fn get_context(&mut self, root_net: &Bid, bid: &Bid) -> Option<BeliefContext<'_>> {
-        self.index_sync(false);
+    pub fn get_context(&self, root_net: &Bid, bid: &Bid) -> Option<BeliefContext<'_>> {
         assert!(
             self.is_balanced().is_ok(),
             "get_context called on an unbalanced BeliefBase. diagnostics: {:?}",
@@ -570,7 +647,7 @@ impl BeliefBase {
         let mut old_self = std::mem::take(self);
         let states = std::mem::take(&mut old_self.states);
         while self.relations.is_locked() {
-            tracing::info!(
+            tracing::debug!(
                 label = self.label,
                 "[BeliefBase::consume] Waiting for write access to relations"
             );
@@ -578,7 +655,7 @@ impl BeliefBase {
         }
         let relations = std::mem::replace(
             old_self.write_relations().as_graph_mut(),
-            petgraph::Graph::new(),
+            petgraph::stable_graph::StableGraph::new(),
         );
         BeliefGraph {
             states,
@@ -593,7 +670,7 @@ impl BeliefBase {
         // No lock checking needed in WASM (single-threaded)
         let relations = std::mem::replace(
             old_self.write_relations().as_graph_mut(),
-            petgraph::Graph::new(),
+            petgraph::stable_graph::StableGraph::new(),
         );
         BeliefGraph {
             states,
@@ -636,10 +713,34 @@ impl BeliefBase {
         let new_relations_arc = new_set.relations();
         let new_relations: BidGraph = {
             let new_relations_graph = new_relations_arc.as_graph();
-            BidGraph::from_edges(new_relations_graph.raw_edges().iter().filter_map(|edge| {
+            use petgraph::visit::EdgeRef;
+            BidGraph::from_edges(new_relations_graph.edge_references().filter_map(|edge| {
                 let source = new_relations_graph[edge.source()];
                 let sink = new_relations_graph[edge.target()];
-                if !(parsed_content.contains(&source) || parsed_content.contains(&sink)) {
+                // Initial scope guard: include edges where source, sink, OR a bref-identified
+                // third-party owner is in parsed_content.  Mapping edges (owned by a section
+                // node via WEIGHT_OWNED_BY = bref_str) have source/sink from foreign documents
+                // and would otherwise be filtered out even though the owning section IS parsed.
+                let owner_in_parsed = || {
+                    edge.weight().weights.values().any(|weight| {
+                        matches!(
+                            weight.get::<String>(WEIGHT_OWNED_BY).as_deref(),
+                            Some(s) if s != "source" && s != "sink"
+                        ) && {
+                            let bref_str =
+                                weight.get::<String>(WEIGHT_OWNED_BY).unwrap_or_default();
+                            Bref::try_from(bref_str.as_str())
+                                .ok()
+                                .and_then(|bref| new_set.brefs().get(&bref).copied())
+                                .map(|owner_bid| parsed_content.contains(&owner_bid))
+                                .unwrap_or(false)
+                        }
+                    })
+                };
+                if !(parsed_content.contains(&source)
+                    || parsed_content.contains(&sink)
+                    || owner_in_parsed())
+                {
                     return None;
                 }
 
@@ -653,17 +754,25 @@ impl BeliefBase {
                 // correctly for those kinds, so leaked edges from other docs have an owner
                 // not in parsed_content).
                 let source_is_parsed = parsed_content.contains(&source);
-                for (kind, weight) in edge.weight.weights.iter() {
-                    let (owner, _sign) = weight
-                        .get(WEIGHT_OWNED_BY)
-                        .map(|val: String| {
-                            if &val == "source" {
-                                (&source, "+")
-                            } else {
-                                (&sink, "-")
+                for (kind, weight) in edge.weight().weights.iter() {
+                    let owner_bid_buf: Option<Bid>;
+                    let (owner, _sign): (&Bid, &str) =
+                        match weight.get::<String>(WEIGHT_OWNED_BY).as_deref() {
+                            Some("source") => (&source, "+"),
+                            Some("sink") | None => (&sink, "-"),
+                            Some(bref_str) => {
+                                // Third-party bref owner: resolve via new_set's bref map.
+                                // If unresolvable (owner deleted), fall back to sink-owned behavior.
+                                // The edge will be GC'd by owner_index in terminate_stack anyway.
+                                owner_bid_buf = Bref::try_from(bref_str)
+                                    .ok()
+                                    .and_then(|bref| new_set.brefs().get(&bref).copied());
+                                owner_bid_buf
+                                    .as_ref()
+                                    .map(|b| (b, "o"))
+                                    .unwrap_or((&sink, "-"))
                             }
-                        })
-                        .unwrap_or((&sink, "-"));
+                        };
                     // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
                     if (*kind == WeightKind::Section && source_is_parsed)
                         || (*kind != WeightKind::Section && parsed_content.contains(owner))
@@ -745,7 +854,7 @@ impl BeliefBase {
                 if should_update {
                     events.push(BeliefEvent::NodeUpdate(
                         vec![NodeKey::Bid { bid: *node_bid }],
-                        new_node.toml(),
+                        new_node.clone(),
                         EventOrigin::Remote,
                     ));
                 }
@@ -758,18 +867,20 @@ impl BeliefBase {
         // Prepare data structures for phase 3 and 4
         let parsed_edges = {
             let new_relations_graph = new_relations.as_graph();
-            BTreeMap::<(Bid, Bid), WeightSet>::from_iter(
-                new_relations_graph.raw_edges().iter().map(|edge| {
+            use petgraph::visit::EdgeRef;
+            BTreeMap::<(Bid, Bid), WeightSet>::from_iter(new_relations_graph.edge_references().map(
+                |edge| {
                     let source = new_relations_graph[edge.source()];
                     let sink = new_relations_graph[edge.target()];
-                    ((source, sink), edge.weight.clone())
-                }),
-            )
+                    ((source, sink), edge.weight().clone())
+                },
+            ))
         };
         let old_relations = old_set.relations();
         let old_relations_graph = old_relations.as_graph();
+        use petgraph::visit::EdgeRef;
         let old_parsed_edges = BTreeMap::<(Bid, Bid), WeightSet>::from_iter(
-            old_relations_graph.raw_edges().iter().filter_map(|edge| {
+            old_relations_graph.edge_references().filter_map(|edge| {
                 let source = old_relations_graph[edge.source()];
                 let sink = old_relations_graph[edge.target()];
                 if !(parsed_content.contains(&source)
@@ -784,17 +895,25 @@ impl BeliefBase {
                 // source∈parsed_content; Epistemic/Pragmatic use the ownership check.
                 let source_is_parsed =
                     parsed_content.contains(&source) || removed_nodes.contains(&source);
-                for (kind, weight) in edge.weight.weights.iter() {
-                    let (owner, _sign) = weight
-                        .get(WEIGHT_OWNED_BY)
-                        .map(|val: String| {
-                            if &val == "source" {
-                                (&source, "+")
-                            } else {
-                                (&sink, "-")
+                for (kind, weight) in edge.weight().weights.iter() {
+                    let owner_bid_buf: Option<Bid>;
+                    let (owner, _sign): (&Bid, &str) =
+                        match weight.get::<String>(WEIGHT_OWNED_BY).as_deref() {
+                            Some("source") => (&source, "+"),
+                            Some("sink") | None => (&sink, "-"),
+                            Some(bref_str) => {
+                                // Third-party bref owner: resolve via old_set's bref map.
+                                // If unresolvable (owner deleted), fall back to sink-owned behavior.
+                                // The edge will be GC'd by owner_index in terminate_stack anyway.
+                                owner_bid_buf = Bref::try_from(bref_str)
+                                    .ok()
+                                    .and_then(|bref| old_set.brefs().get(&bref).copied());
+                                owner_bid_buf
+                                    .as_ref()
+                                    .map(|b| (b, "o"))
+                                    .unwrap_or((&sink, "-"))
                             }
-                        })
-                        .unwrap_or((&sink, "-"));
+                        };
                     // tracing::debug!("{}--[{}{}]-->{}", source, kind, _sign, sink);
                     if (*kind == WeightKind::Section && source_is_parsed)
                         || (*kind != WeightKind::Section
@@ -832,16 +951,31 @@ impl BeliefBase {
 
         // Phase 4: New edges
         let mut new_edges = Vec::new();
+        // Memo of sink BIDs that are absent from both new_set and old_set pathmaps, to
+        // suppress duplicate warnings when the same unresolvable sink appears in many
+        // mapping rows of the same document.
+        let mut missing_sink_warned: std::collections::BTreeSet<Bid> = Default::default();
         for ((source, sink), weight) in parsed_edges
             .iter()
             .filter(|(k, _v)| !old_parsed_edges.contains_key(k))
         {
+            // Primary lookup: new_set (doc_bb) pathmap.
+            // Fallback: old_set (session_bb) pathmap — authoritative for external nodes
+            // (e.g. mapping sinks in a different document) whose pathmap entries were
+            // never merged into doc_bb because cache_fetch found them via StackCache
+            // rather than GlobalCache and therefore did not populate missing_structure.
             let sink_order = new_set
                 .paths()
                 .indexed_path(sink)
+                .or_else(|| old_set.paths().indexed_path(sink))
                 .map(|(_a, _b, order)| order)
                 .unwrap_or_else(|| {
-                    tracing::warn!(label = new_set.label, "No entry in pathmap for sink {sink}");
+                    if missing_sink_warned.insert(*sink) {
+                        tracing::warn!(
+                            label = new_set.label,
+                            "No entry in pathmap for sink {sink} (checked doc_bb and session_bb)"
+                        );
+                    }
                     Vec::default()
                 });
             new_edges.push((
@@ -942,22 +1076,36 @@ impl BeliefBase {
                     }
                 }
             }
-            BeliefEvent::NodeUpdate(_keys, toml_str, _) => {
+            BeliefEvent::NodeUpdate(_keys, node, _) => {
                 // Validate that the node exists with matching state
-                if let Ok(node) = BeliefNode::try_from(&toml_str[..]) {
-                    if let Some(existing) = self.states().get(&node.bid) {
-                        if existing != &node {
-                            return Err(format!(
-                                "NodeUpdate mismatch for {}: expected {:?}, found {:?}",
-                                node.bid, node, existing
-                            ));
-                        }
-                    } else {
+                if let Some(existing) = self.states().get(&node.bid) {
+                    if existing != node {
                         return Err(format!(
-                            "NodeUpdate claims {} exists but it's not in states",
-                            node.bid
+                            "NodeUpdate mismatch for {}: expected {:?}, found {:?}",
+                            node.bid, node, existing
                         ));
                     }
+                } else {
+                    return Err(format!(
+                        "NodeUpdate claims {} exists but it's not in states",
+                        node.bid
+                    ));
+                }
+            }
+            BeliefEvent::NodeUpsert(bid, node, _) => {
+                // Validate that the node exists with matching state
+                if let Some(existing) = self.states().get(bid) {
+                    if existing != node {
+                        return Err(format!(
+                            "NodeUpsert mismatch for {}: expected {:?}, found {:?}",
+                            bid, node, existing
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "NodeUpsert claims {} exists but it's not in states",
+                        bid
+                    ));
                 }
             }
             // For other event types, we could add validation but they're less critical
@@ -966,7 +1114,7 @@ impl BeliefBase {
         Ok(())
     }
 
-    fn check_path_invariants(&self) -> Vec<String> {
+    pub fn check_path_invariants(&self) -> Vec<String> {
         let mut errors = Vec::<String>::new();
         let relations = self.relations();
 
@@ -1037,16 +1185,18 @@ impl BeliefBase {
     ///
     /// The operational rules must be checked with test cases.
     ///
+    /// Runs the full structural validation: graph invariants, edge sort-key checks,
+    /// and a PathMapMap consistency diff (event-driven vs. freshly constructed).
+    /// Updates `self.balanced` and appends to `self.diagnostics`. Also returns all
+    /// errors found so callers (e.g. `GraphBuilder::built_in_test`) can aggregate them.
+    ///
     /// Caution! This is not cheap in terms of computation or memory.
-    pub fn built_in_test(&self, full: bool) -> Vec<String> {
+    pub fn built_in_test(&self) -> Vec<String> {
         // tracing::debug!(
         //     "Invariant #1 is checked in check_path_invariants"
         // );
         let mut errors = self.check_path_invariants();
 
-        if !full {
-            return errors;
-        }
         // tracing::debug!("Check invariant #0");
         let relations = self.relations();
         for scc in kosaraju_scc(&relations.as_subgraph(WeightKind::Epistemic, false)).iter() {
@@ -1157,6 +1307,61 @@ impl BeliefBase {
                 }
             }
         }
+        // Diff event-driven PathMapMap against a freshly constructed one.
+        #[cfg(not(target_arch = "wasm32"))]
+        let constructor_paths_map = PathMapMap::new(self.states(), self.relations.clone());
+        #[cfg(target_arch = "wasm32")]
+        let constructor_paths_map = {
+            let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
+            PathMapMap::new(self.states(), relations_arc)
+        };
+        let constructor_paths: BTreeSet<String> = constructor_paths_map
+            .all_paths()
+            .values()
+            .flatten()
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        let event_paths: BTreeSet<String> = self
+            .paths()
+            .all_paths()
+            .values()
+            .flatten()
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        if event_paths != constructor_paths {
+            errors.push(format!(
+                "[BeliefBase::built_in_test] Event-driven and constructor PathMapMaps should \
+                    have identical paths.\n \
+                    \tevent_paths:\n \
+                    \t- {} \n \
+                    \tconstructor_paths:\n \
+                    \t- {} \n",
+                event_paths
+                    .into_iter()
+                    .collect::<Vec<String>>()
+                    .join("\n\t- "),
+                constructor_paths
+                    .into_iter()
+                    .collect::<Vec<String>>()
+                    .join("\n\t- ")
+            ));
+        }
+
+        let has_errors = !errors.is_empty();
+        if has_errors {
+            tracing::debug!(
+                label = self.label,
+                "Set isn't balanced. Diagnostics:\n{}",
+                errors.join("\n- ")
+            );
+        }
+        self.balanced.store(!has_errors, Ordering::SeqCst);
+        self.write_diagnostics().extend(
+            errors
+                .iter()
+                .map(|msg| ParseDiagnostic::parse_error(msg.clone(), 0)),
+        );
+
         errors
     }
 
@@ -1189,9 +1394,27 @@ impl BeliefBase {
         // Handle Remote events: apply changes and generate derivatives
         let mut derivative_events = vec![];
         match event {
-            BeliefEvent::NodeUpdate(keys, toml_str, _) => {
-                let node = BeliefNode::try_from(&toml_str[..])?;
+            BeliefEvent::NodeUpdate(keys, node, _) => {
                 derivative_events.append(&mut self.insert_state(node.clone(), keys));
+            }
+            BeliefEvent::NodeUpsert(bid, node, _) => {
+                // No merge/replace semantics — BID is already canonical. Call insert_state
+                // with only the BID key so to_replace can never fire (a BID key always
+                // self-resolves). Debug-assert that insert_state produces no removal
+                // derivatives, which would indicate an unexpected BID collision.
+                let derivatives = self.insert_state(node.clone(), &[NodeKey::Bid { bid: *bid }]);
+                #[cfg(debug_assertions)]
+                for d in &derivatives {
+                    debug_assert!(
+                        !matches!(
+                            d,
+                            BeliefEvent::NodesRemoved(..) | BeliefEvent::NodeRenamed(..)
+                        ),
+                        "NodeUpsert triggered unexpected removal derivative: {d:?}. \
+                         BID {bid} was expected to be canonical."
+                    );
+                }
+                derivative_events.extend(derivatives);
             }
 
             BeliefEvent::NodesRemoved(bids, _) => {
@@ -1225,8 +1448,55 @@ impl BeliefBase {
                 let mut reindex_events = self.update_relation(*source, *sink, weight_set.clone());
                 derivative_events.append(&mut reindex_events);
             }
-            BeliefEvent::RelationChange(..) => {
-                if let Some(relation_mutated_event) = self.generate_edge_update(event) {
+            BeliefEvent::RelationChange(source, sink, kind, maybe_weight, origin) => {
+                // Pre-assign a sort key from the memo for new edges so that
+                // `generate_edge_update` skips its O(K) max() scan over incoming edges.
+                // Only applies when the incoming weight lacks a sort key (new edge) and
+                // the edge does not already exist in the graph (existing edges already
+                // carry a sort key so the scan branch is never taken).
+                let needs_sort_key = maybe_weight
+                    .as_ref()
+                    .map(|w| w.payload.get(WEIGHT_SORT_KEY).is_none())
+                    .unwrap_or(false);
+
+                let patched: Option<BeliefEvent> = if needs_sort_key {
+                    let edge_has_sort_key = self
+                        .bid_to_index(source)
+                        .zip(self.bid_to_index(sink))
+                        .and_then(|(src_idx, snk_idx)| {
+                            self.relations().as_graph().find_edge(src_idx, snk_idx)
+                        })
+                        .and_then(|edge_idx| {
+                            self.relations()
+                                .as_graph()
+                                .edge_weight(edge_idx)
+                                .and_then(|ws| ws.get(kind))
+                                .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
+                        })
+                        .is_some();
+
+                    if edge_has_sort_key {
+                        None // Existing edge — generate_edge_update uses the stored sort key.
+                    } else {
+                        let assigned = self.assign_sort_key(sink, kind);
+                        let mut patched_weight = maybe_weight.clone().unwrap_or_default();
+                        patched_weight
+                            .set(WEIGHT_SORT_KEY, assigned)
+                            .expect("failed to set u16 sort key in Weight payload");
+                        Some(BeliefEvent::RelationChange(
+                            *source,
+                            *sink,
+                            *kind,
+                            Some(patched_weight),
+                            *origin,
+                        ))
+                    }
+                } else {
+                    None
+                };
+
+                let event_to_resolve: &BeliefEvent = patched.as_ref().unwrap_or(event);
+                if let Some(relation_mutated_event) = self.generate_edge_update(event_to_resolve) {
                     let &BeliefEvent::RelationUpdate(source, sink, ref weight_set, _) =
                         &relation_mutated_event
                     else {
@@ -1258,6 +1528,9 @@ impl BeliefBase {
                     );
                     return Ok(vec![]);
                 }
+                // Evict the memo so the counter is re-seeded from the post-reindex state
+                // on the next edge addition to this sink.
+                self.invalidate_sort_key_memo_for_sink(sink);
                 let mut reindex_events = self.update_relation(*source, *sink, WeightSet::default());
                 derivative_events.append(&mut reindex_events);
             }
@@ -1271,8 +1544,8 @@ impl BeliefBase {
                 // after BatchEnd has been processed by the accumulator.
             }
             BeliefEvent::BuiltInTest => {
-                // Run a full built_in_test check
-                self.index_sync(true);
+                // Run a full built_in_test check (validates PathMapMap consistency).
+                self.built_in_test();
             }
         };
 
@@ -1300,6 +1573,300 @@ impl BeliefBase {
         // Append path events to derivatives for DbConnection and other subscribers
         derivative_events.append(&mut path_events);
         Ok(derivative_events)
+    }
+
+    /// Apply a batch of `NodeUpdate` and `NodeUpsert` / `RelationChange` / `RelationUpdate`
+    /// events to the graph **without** triggering a `PathMapMap` update per event.
+    ///
+    /// This is the three-pass pattern used by `merge_graph_mut`:
+    /// - Pass 1: all node upserts — registers BIDs in the graph so Pass 2 can look them up.
+    /// - Pass 2: all relation upserts — `update_relation` called, reindex derivatives discarded.
+    ///   `RelationChange` is resolved to `RelationUpdate` here so the returned vec contains
+    ///   concrete events for `flush_paths_for_events`.
+    ///
+    /// Caller **must** call `flush_paths_for_events` on the returned events afterward to
+    /// synchronize the `PathMapMap` in a single pass.
+    ///
+    /// # Safety contract
+    /// Only `NodeUpdate`, `NodeUpsert`, `RelationChange`, and `RelationUpdate` events are
+    /// accepted. `RelationRemoved` and `NodesRemoved` events must be processed via
+    /// `process_event` individually *before* calling this method, while sort indices are
+    /// still contiguous. Passing removal events here will trigger a `debug_assert` panic
+    /// in debug builds and be silently skipped in release builds.
+    pub fn apply_events_batch(
+        &mut self,
+        events: &[BeliefEvent],
+    ) -> Result<Vec<BeliefEvent>, BuildonomyError> {
+        let mut resolved: Vec<BeliefEvent> = Vec::with_capacity(events.len());
+
+        // Pass 1: node upserts — register all BIDs in the graph before touching relations.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mut pass1_insert_us, mut pass1_n_node_update, mut pass1_n_node_upsert) =
+            (0u128, 0u32, 0u32);
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_pass1 = std::time::Instant::now();
+
+        for event in events {
+            match event {
+                BeliefEvent::NodeUpdate(keys, node, _) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        pass1_n_node_update += 1;
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let t_ins = std::time::Instant::now();
+
+                    let _derivatives = self.insert_state(node.clone(), keys);
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        pass1_insert_us += t_ins.elapsed().as_micros();
+                    }
+                    #[cfg(debug_assertions)]
+                    for d in &_derivatives {
+                        debug_assert!(
+                            !matches!(
+                                d,
+                                BeliefEvent::NodesRemoved(..) | BeliefEvent::NodeRenamed(..)
+                            ),
+                            "apply_events_batch: NodeUpdate triggered unexpected removal \
+                             derivative {d:?}. Removal events must be processed via \
+                             process_event before calling apply_events_batch."
+                        );
+                    }
+                    resolved.push(event.clone());
+                }
+                BeliefEvent::NodeUpsert(bid, node, _) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        pass1_n_node_upsert += 1;
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let t_ins = std::time::Instant::now();
+
+                    let _derivatives =
+                        self.insert_state(node.clone(), &[NodeKey::Bid { bid: *bid }]);
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        pass1_insert_us += t_ins.elapsed().as_micros();
+                    }
+                    #[cfg(debug_assertions)]
+                    for d in &_derivatives {
+                        debug_assert!(
+                            !matches!(
+                                d,
+                                BeliefEvent::NodesRemoved(..) | BeliefEvent::NodeRenamed(..)
+                            ),
+                            "apply_events_batch: NodeUpsert triggered unexpected removal \
+                             derivative {d:?}. BID {bid} was expected to be canonical."
+                        );
+                    }
+                    resolved.push(event.clone());
+                }
+                BeliefEvent::RelationRemoved(..) | BeliefEvent::NodesRemoved(..) => {
+                    debug_assert!(
+                        false,
+                        "apply_events_batch received removal event {event:?}. \
+                         Process removals via process_event before calling apply_events_batch."
+                    );
+                }
+                _ => {} // RelationChange and RelationUpdate handled in Pass 2.
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let pass1_total_us = t_pass1.elapsed().as_micros();
+
+        // Pass 2: relation upserts — reindex derivatives discarded; PathMapMap untouched.
+        // RelationChange is resolved to RelationUpdate so flush_paths_for_events sees
+        // concrete final-weight events.
+        //
+        // Sort-key pre-assignment: `generate_edge_update` assigns sort keys by scanning all
+        // incoming edges on the sink (an O(K) max() scan). When K edges are added to the same
+        // sink in one batch this becomes O(K²). We avoid that by pre-assigning sort keys via
+        // `assign_sort_key`, which uses `self.next_sort_key` (a memo shared with
+        // `process_event`) and seeds from the current graph max on first use per (sink, kind).
+
+        // Fine-grained timing accumulators for Pass 2.
+        // Each measures a distinct work unit per RelationChange event:
+        //   sort_key_us  — bid_to_index lookups + edge_has_sort_key check + assign_sort_key
+        //   gen_edge_us  — generate_edge_update (merge logic, find_edge, payload scan)
+        //   update_rel_us — update_relation (write_relations lock, edge insert, reindex)
+        // RelationUpdate events (already resolved) only hit update_rel_us.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mut sort_key_us, mut gen_edge_us, mut update_rel_us) = (0u128, 0u128, 0u128);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mut n_relation_change, mut n_relation_update, mut n_skipped, mut n_no_change) =
+            (0u32, 0u32, 0u32, 0u32);
+
+        for event in events {
+            match event {
+                BeliefEvent::RelationChange(source, sink, kind, maybe_weight, origin) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        n_relation_change += 1;
+                    }
+
+                    // Only new edges without an existing sort key need pre-assignment.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let t_sort = std::time::Instant::now();
+
+                    let needs_sort_key = maybe_weight
+                        .as_ref()
+                        .map(|w| w.payload.get(WEIGHT_SORT_KEY).is_none())
+                        .unwrap_or(false);
+
+                    let event_to_resolve: std::borrow::Cow<BeliefEvent> = if needs_sort_key {
+                        // Skip pre-assignment for edges that already exist in the graph:
+                        // generate_edge_update will find WEIGHT_SORT_KEY in the stored weight.
+                        let edge_has_sort_key = self
+                            .bid_to_index(source)
+                            .zip(self.bid_to_index(sink))
+                            .and_then(|(src_idx, snk_idx)| {
+                                self.relations().as_graph().find_edge(src_idx, snk_idx)
+                            })
+                            .and_then(|edge_idx| {
+                                self.relations()
+                                    .as_graph()
+                                    .edge_weight(edge_idx)
+                                    .and_then(|ws| ws.get(kind))
+                                    .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
+                            })
+                            .is_some();
+
+                        if edge_has_sort_key {
+                            std::borrow::Cow::Borrowed(event)
+                        } else {
+                            // New edge — assign from the shared memo counter.
+                            let assigned = self.assign_sort_key(sink, kind);
+                            let mut patched_weight = maybe_weight.clone().unwrap_or_default();
+                            patched_weight
+                                .set(WEIGHT_SORT_KEY, assigned)
+                                .expect("failed to set u16 sort key in Weight payload");
+                            std::borrow::Cow::Owned(BeliefEvent::RelationChange(
+                                *source,
+                                *sink,
+                                *kind,
+                                Some(patched_weight),
+                                *origin,
+                            ))
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(event)
+                    };
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        sort_key_us += t_sort.elapsed().as_micros();
+                    }
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let t_gen = std::time::Instant::now();
+
+                    let maybe_resolved = self.generate_edge_update(&event_to_resolve);
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        gen_edge_us += t_gen.elapsed().as_micros();
+                    }
+
+                    if let Some(resolved_event) = maybe_resolved {
+                        if let BeliefEvent::RelationUpdate(src, snk, ref ws, _) = resolved_event {
+                            if self.bid_to_index(&src).is_some()
+                                && self.bid_to_index(&snk).is_some()
+                            {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let t_upd = std::time::Instant::now();
+
+                                let _ = self.update_relation(src, snk, ws.clone());
+
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    update_rel_us += t_upd.elapsed().as_micros();
+                                }
+                            } else {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    n_skipped += 1;
+                                }
+                            }
+                        }
+                        resolved.push(resolved_event);
+                    } else {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            n_no_change += 1;
+                        }
+                    }
+                }
+                BeliefEvent::RelationUpdate(src, snk, ws, _) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        n_relation_update += 1;
+                    }
+                    if self.bid_to_index(src).is_some() && self.bid_to_index(snk).is_some() {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let t_upd = std::time::Instant::now();
+
+                        let _ = self.update_relation(*src, *snk, ws.clone());
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            update_rel_us += t_upd.elapsed().as_micros();
+                        }
+                    } else {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            n_skipped += 1;
+                        }
+                    }
+                    resolved.push(event.clone());
+                }
+                _ => {} // Nodes already handled in Pass 1; removals guarded above.
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tracing::debug!(
+                target: "noet_core::codec::perf",
+                label = self.label,
+                pass1_n_node_update,
+                pass1_n_node_upsert,
+                pass1_insert_ms = pass1_insert_us / 1000,
+                pass1_total_ms = pass1_total_us / 1000,
+                n_relation_change,
+                n_relation_update,
+                n_skipped,
+                n_no_change,
+                sort_key_ms = sort_key_us / 1000,
+                gen_edge_ms = gen_edge_us / 1000,
+                update_rel_ms = update_rel_us / 1000,
+                "[apply_events_batch] timing breakdown"
+            );
+        }
+
+        Ok(resolved)
+    }
+
+    /// Flush the `PathMapMap` for a set of already-applied events (the output of
+    /// `apply_events_batch`). Calls `process_event_queue` exactly once with the full
+    /// event slice. Returns path derivative events for subscribers (e.g. `DbConnection`).
+    pub fn flush_paths_for_events(&self, events: &[BeliefEvent]) -> Vec<BeliefEvent> {
+        let event_refs: Vec<&BeliefEvent> = events.iter().collect();
+        let mut pmm = self.write_paths();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pmm.process_event_queue(&event_refs, &self.relations)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use parking_lot::RwLock;
+            use std::sync::Arc;
+            let relations_arc = Arc::new(RwLock::new(self.read_relations().clone()));
+            pmm.process_event_queue(&event_refs, &relations_arc)
+        }
     }
 
     /// Insert or update a node, enforcing first-one-wins collision policy for `NodeKey::Id`.
@@ -1354,13 +1921,44 @@ impl BeliefBase {
         if is_new_node_for_collision || id_is_changing {
             for key in merge.iter() {
                 if let NodeKey::Id { .. } = key {
-                    let results = self.evaluate_expression(&Expression::from(key));
-                    if let Some(existing) = BeliefBase::from(results).get(key) {
+                    if let Some(existing) = self.get(key) {
                         if existing.bid != node.bid {
                             let incoming_is_document = node.kind.0.contains(BeliefKind::Document);
+                            let incoming_is_network = node.kind.0.contains(BeliefKind::Network);
                             let existing_is_anchor = existing.kind.is_anchor();
+                            let _existing_is_network =
+                                existing.kind.0.contains(BeliefKind::Network);
 
-                            if incoming_is_document && existing_is_anchor {
+                            if incoming_is_network && existing_is_anchor {
+                                // Network beats anchor: a network node owns its directory name
+                                // by definition.  A heading in the network's own index.md that
+                                // matches the directory name (e.g. `# Power` in `power/index.md`)
+                                // loses — clobber the anchor's id to its bref so the Id key is
+                                // freed before we insert the network node.
+                                let anchor_bref = existing.bid.bref().to_string();
+                                let msg = format!(
+                                    "ID collision on {:?}: incoming network node {} beats existing \
+                                     anchor {}; anchor id reset to bref '{}'. \
+                                     Add an explicit id to the heading to resolve.",
+                                    key, node.bid, existing.bid, anchor_bref,
+                                );
+                                tracing::debug!(label = self.label, "insert_state: {}", msg);
+                                self.write_diagnostics().push(ParseDiagnostic::warning(msg));
+                                if let Some(stored) = self.states.get_mut(&existing.bid) {
+                                    stored.id = NodeId::Explicit(anchor_bref);
+                                    let clobber_event = BeliefEvent::NodeUpdate(
+                                        vec![
+                                            NodeKey::Bid { bid: stored.bid },
+                                            NodeKey::Bref {
+                                                bref: stored.bid.bref(),
+                                            },
+                                        ],
+                                        stored.clone(),
+                                        EventOrigin::Local,
+                                    );
+                                    events.push(clobber_event);
+                                }
+                            } else if incoming_is_document && existing_is_anchor {
                                 // Document beats anchor: clobber the existing anchor's id to its
                                 // bref in-place so the Id key is freed before we insert the
                                 // document.  The winner (document) keeps its id; the anchor loses.
@@ -1378,7 +1976,7 @@ impl BeliefBase {
                                 // sees the id change and calls update_path_segment on the
                                 // affected PathMaps to regenerate the stale path string.
                                 if let Some(stored) = self.states.get_mut(&existing.bid) {
-                                    stored.id = Some(anchor_bref);
+                                    stored.id = NodeId::Explicit(anchor_bref);
                                     // Serialize after mutation so the event carries the new id.
                                     // Use minimal Bid+Bref keys — PathMapMap only needs the BID
                                     // to detect the id change; full path keys require a &BeliefBase
@@ -1390,7 +1988,7 @@ impl BeliefBase {
                                                 bref: stored.bid.bref(),
                                             },
                                         ],
-                                        stored.toml(),
+                                        stored.clone(),
                                         EventOrigin::Local,
                                     );
                                     events.push(clobber_event);
@@ -1413,7 +2011,12 @@ impl BeliefBase {
                                 tracing::debug!(label = self.label, "insert_state: {}", msg);
                                 self.write_diagnostics().push(ParseDiagnostic::warning(msg));
                                 collision_winner_bids.insert(existing.bid);
-                                node.id = Some(node_bref.clone());
+                                let colliding_slug = if let NodeKey::Id { id, .. } = key {
+                                    id.clone()
+                                } else {
+                                    node.id()
+                                };
+                                node.id = NodeId::Collision(colliding_slug);
                                 // If this node was previously stored, emit a NodeUpdate so
                                 // PathMapMap sees the id change and regenerates stale path
                                 // entries — mirrors the clobber event emitted in the
@@ -1426,7 +2029,7 @@ impl BeliefBase {
                                                 bref: node.bid.bref(),
                                             },
                                         ],
-                                        node.toml(),
+                                        node.clone(),
                                         EventOrigin::Local,
                                     );
                                     events.push(clobber_event);
@@ -1442,8 +2045,23 @@ impl BeliefBase {
 
         let mut to_replace = BTreeSet::<Bid>::new();
         for key in merge.iter() {
-            let results = self.evaluate_expression(&Expression::from(key));
-            if let Some(existing) = BeliefBase::from(results).get(key) {
+            // Fast path for NodeKey::Bid: self.get() for a Bid key is a direct
+            // O(log N) lookup. If the key's BID matches node.bid it would be
+            // stripped by to_replace.remove(&node.bid) anyway, so skip. If the
+            // BID differs, use the full path so the existing node is correctly
+            // absorbed.
+            if let NodeKey::Bid { bid } = key {
+                if *bid != node.bid {
+                    if let Some(existing) = self.states.get(bid) {
+                        if !collision_winner_bids.contains(&existing.bid) {
+                            to_replace.insert(existing.bid);
+                        }
+                    }
+                }
+                // If bid == node.bid: would be stripped by to_replace.remove below; skip.
+                continue;
+            }
+            if let Some(existing) = self.get(key) {
                 // Skip collision winners — they keep their own BID and must not be
                 // absorbed into the incoming (losing) node.
                 if !collision_winner_bids.contains(&existing.bid) {
@@ -1474,8 +2092,33 @@ impl BeliefBase {
         if updated {
             self.states.insert(bid, node);
             self.brefs.insert(bid.bref(), bid);
+            // For new nodes: register in the relations graph and bid_to_index now
+            // so that subsequent relation lookups find this node without a full rebuild.
+            if is_new_node && !self.read_bid_index().contains_key(&bid) {
+                self.graph_insert_node(bid);
+            }
         }
 
+        // The NodeRenamed/NodesRemoved events emitted below are LOCAL bookkeeping,
+        // not the authoritative record of this absorption.
+        //
+        // They exist to drive *this* base's own PathMapMap: `process_event` folds
+        // them into its `event_queue`, which is what re-points index entries off
+        // the absorbed BID. They carry `EventOrigin::Local` precisely because the
+        // state is already applied here.
+        //
+        // The authoritative derivatives — the ones every `BeliefSink` applies — are
+        // produced by `resolve_merge_keys` in `beliefbase/accumulator.rs` at
+        // `BatchEnd`. Only it can see the pending batch and carry absorptions
+        // across batches, which a deterministic (UUID v5) stub BID requires. Do not
+        // forward these to `tx`; that would race the accumulator's version.
+        //
+        // The absorption must nonetheless happen *here*. `GraphBuilder` drives
+        // `doc_bb` and `session_bb` through `process_event` directly, never through
+        // an accumulator, and a single-file parse can mint a stub and then claim it
+        // later in the same file. Without local absorption those bases would carry
+        // the duplicate for the rest of the parse, and everything computed from
+        // them — `compute_diff` output above all — would inherit it.
         for replaced in to_replace.iter() {
             // Call replace_bid BEFORE removing from states, because replace_bid
             // needs to transfer edges from the replaced node to the new node
@@ -1486,10 +2129,8 @@ impl BeliefBase {
             self.states.remove(replaced);
             self.brefs.remove(&replaced.bref());
         }
-        // Our bid_to_indexes must be regenerated
-        if updated || !to_replace.is_empty() {
-            self.index_dirty.store(true, Ordering::SeqCst);
-        }
+        // index_dirty is no longer used; bid_to_index is updated incrementally above
+        // and in replace_bid / remove_nodes.
         if !to_replace.is_empty() {
             events.push(BeliefEvent::NodesRemoved(
                 to_replace.into_iter().collect(),
@@ -1504,16 +2145,15 @@ impl BeliefBase {
             return vec![];
         }
 
-        // Ensure index is rebuilt before acquiring locks to avoid deadlock
-        self.index_sync(false);
-
         let mut sink_kinds: BTreeMap<Bid, BTreeSet<WeightKind>> = BTreeMap::new();
+        // Collect owner_edges entries to deindex before nodes (and their edges) are removed.
+        let mut owner_edges_to_deindex: Vec<(EdgeIndex, WeightSet)> = Vec::new();
         {
             let relations = self.read_relations();
             let bid_to_index = self.read_bid_index();
             for bid in bids {
                 if let Some(&node_idx) = bid_to_index.get(bid) {
-                    // Find all sinks that this node has edges to, and what WeightKinds
+                    // Outgoing edges (this node as source)
                     for edge in relations.as_graph().edges(node_idx) {
                         let sink = relations.as_graph()[edge.target()];
                         let kinds = edge
@@ -1523,9 +2163,22 @@ impl BeliefBase {
                             .copied()
                             .collect::<BTreeSet<_>>();
                         sink_kinds.entry(sink).or_default().extend(kinds);
+                        owner_edges_to_deindex.push((edge.id(), edge.weight().clone()));
+                    }
+                    // Incoming edges (this node as sink) — also removed by remove_node.
+                    for edge in relations
+                        .as_graph()
+                        .edges_directed(node_idx, Direction::Incoming)
+                    {
+                        owner_edges_to_deindex.push((edge.id(), edge.weight().clone()));
                     }
                 }
             }
+        }
+
+        // Deindex owner_edges before the graph nodes are removed.
+        for (edge_idx, ws) in &owner_edges_to_deindex {
+            self.deindex_owner_edge(*edge_idx, ws);
         }
 
         // Remove nodes from states
@@ -1535,19 +2188,27 @@ impl BeliefBase {
             }
         }
 
-        // Remove nodes from graph
-        let mut relations = self.write_relations();
-        relations
-            .as_graph_mut()
-            .retain_nodes(|g, idx| !bids.contains(&g[idx]));
-        drop(relations);
-        // Regenerate our bid_to_index cache
-        if !bids.is_empty() {
-            self.index_dirty.store(true, Ordering::SeqCst);
+        // Remove nodes from graph and update bid_to_index incrementally.
+        // StableGraph indices are stable across removals, so we can remove one-by-one safely.
+        {
+            let mut relations = self.write_relations();
+            let mut index = self.write_bid_index();
+            for bid in bids {
+                if let Some(&idx) = index.get(bid) {
+                    relations.as_graph_mut().remove_node(idx);
+                    index.remove(bid);
+                }
+            }
         }
-        // Reindex edges for affected sinks using the centralized reindex_sink_edges
+        // Reindex edges for affected sinks using the centralized reindex_sink_edges.
+        // Also evict sort-key memo entries for each affected sink so that the counter
+        // is re-seeded from the compacted post-removal state on the next edge addition.
         let mut derivative_events = vec![];
         for (sink, kinds) in sink_kinds {
+            if bids.contains(&sink) {
+                continue; // Already removed — no edges left to reindex.
+            }
+            self.invalidate_sort_key_memo_for_sink(&sink);
             let mut reindex_events = self.reindex_sink_edges(&sink, &kinds);
             derivative_events.append(&mut reindex_events);
         }
@@ -1555,8 +2216,114 @@ impl BeliefBase {
         derivative_events
     }
 
+    /// Pre-assign a sort key for a new `(sink, kind)` edge from the memoized counter,
+    /// seeding the counter from the current graph max on first use.
+    ///
+    /// Returns the sort key to use and advances the counter.  Callers must only invoke
+    /// this for **new** edges (i.e. the `(source, sink, kind)` triple does not yet exist
+    /// in the graph), because the counter is not aware of existing sort indices on the edge.
+    ///
+    /// The memo must be invalidated (entry removed) whenever an edge is removed from a
+    /// sink so the counter is re-seeded from the compacted post-reindex state.
+    fn assign_sort_key(&mut self, sink: &Bid, kind: &WeightKind) -> u16 {
+        // Pre-compute the seed before touching next_sort_key to avoid a double-borrow:
+        // `or_insert_with` takes `&mut self.next_sort_key` while the closure would also
+        // need `&self` to call `bid_to_index` / `relations`.
+        let seed: Option<u16> = if self.next_sort_key.contains_key(&(*sink, *kind)) {
+            None // Already seeded — seed computation not needed.
+        } else {
+            Some(
+                self.bid_to_index(sink)
+                    .map(|sink_idx| {
+                        self.relations()
+                            .as_graph()
+                            .edges_directed(sink_idx, Direction::Incoming)
+                            .filter_map(|edge| {
+                                edge.weight()
+                                    .get(kind)
+                                    .and_then(|w| w.get::<u16>(WEIGHT_SORT_KEY))
+                            })
+                            .max()
+                            .map(|m| m + 1)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0),
+            )
+        };
+        let counter = self
+            .next_sort_key
+            .entry((*sink, *kind))
+            .or_insert_with(|| seed.unwrap_or(0));
+        let key = *counter;
+        *counter += 1;
+        key
+    }
+
+    /// Evict all memoized sort-key counters for the given `sink`.
+    ///
+    /// Must be called whenever edges are removed from `sink` so that the next addition
+    /// re-seeds the counter from the compacted post-`reindex_sink_edges` state.
+    fn invalidate_sort_key_memo_for_sink(&mut self, sink: &Bid) {
+        self.next_sort_key.retain(|(s, _), _| s != sink);
+    }
+
+    /// Extract third-party owner brefs from a `WeightSet`.
+    ///
+    /// Returns brefs for `WEIGHT_OWNED_BY` values that are neither `"source"`,
+    /// `"sink"`, nor absent — i.e. only third-party bref owners that need indexing.
+    fn third_party_owner_brefs(ws: &WeightSet) -> impl Iterator<Item = Bref> + '_ {
+        ws.weights.values().filter_map(|weight| {
+            match weight.get::<String>(WEIGHT_OWNED_BY).as_deref() {
+                Some("source") | Some("sink") | None => None,
+                Some(bref_str) => Bref::try_from(bref_str).ok(),
+            }
+        })
+    }
+
+    /// Add an edge index to `owner_edges` for all third-party owner brefs in `ws`.
+    fn index_owner_edge(&mut self, edge_idx: EdgeIndex, ws: &WeightSet) {
+        for bref in Self::third_party_owner_brefs(ws) {
+            self.owner_edges.entry(bref).or_default().insert(edge_idx);
+        }
+    }
+
+    /// Remove an edge index from `owner_edges` for all third-party owner brefs in `ws`.
+    /// Cleans up empty entries.
+    fn deindex_owner_edge(&mut self, edge_idx: EdgeIndex, ws: &WeightSet) {
+        for bref in Self::third_party_owner_brefs(ws) {
+            if let BTreeEntry::Occupied(mut entry) = self.owner_edges.entry(bref) {
+                entry.get_mut().remove(&edge_idx);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
+    /// Build `owner_edges` from scratch by scanning all edges in the relations graph.
+    /// Called by `new_unbalanced` during construction.
+    fn build_owner_edges(&mut self) {
+        self.owner_edges.clear();
+        // Collect (edge_idx, bref) pairs while holding the relations read lock,
+        // then populate owner_edges after the lock is dropped.
+        let entries: Vec<(EdgeIndex, Bref)> = {
+            let relations = self.read_relations();
+            relations
+                .as_graph()
+                .edge_references()
+                .flat_map(|edge_ref| {
+                    let edge_idx = edge_ref.id();
+                    Self::third_party_owner_brefs(edge_ref.weight())
+                        .map(move |bref| (edge_idx, bref))
+                })
+                .collect()
+        };
+        for (edge_idx, bref) in entries {
+            self.owner_edges.entry(bref).or_default().insert(edge_idx);
+        }
+    }
+
     fn generate_edge_update(&self, event: &BeliefEvent) -> Option<BeliefEvent> {
-        self.index_sync(false);
         let BeliefEvent::RelationChange(source, sink, kind, maybe_weight, origin) = event else {
             return None;
         };
@@ -1701,7 +2468,7 @@ impl BeliefBase {
     ) -> Vec<BeliefEvent> {
         #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
-            tracing::info!(
+            tracing::debug!(
                 label = self.label,
                 "[BeliefBase::update_relation] Waiting for write access to relations"
             );
@@ -1714,57 +2481,121 @@ impl BeliefBase {
             // Skip if either node has been removed
             tracing::warn!(
                 label = self.label,
-                "Skipping update_relation({} -[{}]-> {}), source is missing: {}, sink is missing: {}, index_dirty: {}",
+                "Skipping update_relation({} -[{}]-> {}), source is missing: {}, sink is missing: {}",
                 self.states().get(&source).map(|n| n.display_title()).unwrap_or(source.to_string()),
                 new_weight_set.weights.keys().map(|k| k.to_string()).collect::<Vec<String>>().join(", "),
                 self.states().get(&sink).map(|n| n.display_title()).unwrap_or(sink.to_string()),
                 maybe_source_idx.is_none(),
                 maybe_sink_idx.is_none(),
-                self.index_dirty.load(Ordering::SeqCst)
             );
             return vec![];
         }
 
         let source_idx = maybe_source_idx.unwrap();
         let sink_idx = maybe_sink_idx.unwrap();
-        let mut relations = self.write_relations();
-        let old_weight_set = {
-            if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
-                relations
-                    .as_graph()
-                    .edge_weight(edge_idx)
-                    .expect("We got this edge index from the graph so it should be valid.")
-                    .clone()
-            } else {
-                WeightSet::default()
-            }
-        };
-        // If we used to have more WeightKinds in this edge than the new_weights, we need to reindex
-        // the sink's edges.
-        let affected_kinds = old_weight_set
-            .difference(&new_weight_set)
-            .weights
-            .keys()
-            .copied()
-            .collect();
 
-        // Update or add/remove the edge
-        if new_weight_set.is_empty() {
-            if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
-                relations.as_graph_mut().remove_edge(edge_idx);
-            }
-        } else if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
-            let edge_weight = relations
-                .as_graph_mut()
-                .edge_weight_mut(edge_idx)
-                .expect("We got this edge index from the graph, why can't we access it?");
-            *edge_weight = new_weight_set;
-        } else {
-            relations
-                .as_graph_mut()
-                .add_edge(source_idx, sink_idx, new_weight_set);
+        // Tracks what changed for owner_edges memo maintenance (applied after lock drop).
+        enum OwnerEdgeDelta {
+            Removed {
+                edge_idx: EdgeIndex,
+                old_ws: WeightSet,
+            },
+            Updated {
+                edge_idx: EdgeIndex,
+                old_ws: WeightSet,
+                new_ws: WeightSet,
+            },
+            Added {
+                edge_idx: EdgeIndex,
+                new_ws: WeightSet,
+            },
         }
-        drop(relations);
+
+        let (affected_kinds, owner_delta) = {
+            let mut relations = self.write_relations();
+            let old_weight_set = {
+                if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
+                    relations
+                        .as_graph()
+                        .edge_weight(edge_idx)
+                        .expect("We got this edge index from the graph so it should be valid.")
+                        .clone()
+                } else {
+                    WeightSet::default()
+                }
+            };
+            // If we used to have more WeightKinds in this edge than the new_weights, we need to reindex
+            // the sink's edges.
+            let affected_kinds: BTreeSet<WeightKind> = old_weight_set
+                .difference(&new_weight_set)
+                .weights
+                .keys()
+                .copied()
+                .collect();
+
+            // Update or add/remove the edge.
+            let delta = if new_weight_set.is_empty() {
+                // Remove edge
+                if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
+                    relations.as_graph_mut().remove_edge(edge_idx);
+                    Some(OwnerEdgeDelta::Removed {
+                        edge_idx,
+                        old_ws: old_weight_set,
+                    })
+                } else {
+                    None
+                }
+            } else if let Some(edge_idx) = relations.as_graph().find_edge(source_idx, sink_idx) {
+                // Update existing edge
+                let edge_weight = relations
+                    .as_graph_mut()
+                    .edge_weight_mut(edge_idx)
+                    .expect("We got this edge index from the graph, why can't we access it?");
+                *edge_weight = new_weight_set.clone();
+                Some(OwnerEdgeDelta::Updated {
+                    edge_idx,
+                    old_ws: old_weight_set,
+                    new_ws: new_weight_set,
+                })
+            } else {
+                // Add new edge
+                let edge_idx =
+                    relations
+                        .as_graph_mut()
+                        .add_edge(source_idx, sink_idx, new_weight_set.clone());
+                Some(OwnerEdgeDelta::Added {
+                    edge_idx,
+                    new_ws: new_weight_set,
+                })
+            };
+
+            (affected_kinds, delta)
+        }; // relations lock dropped here
+
+        // Maintain owner_edges memo outside the relations lock.
+        match owner_delta {
+            Some(OwnerEdgeDelta::Removed {
+                edge_idx,
+                ref old_ws,
+            }) => {
+                self.deindex_owner_edge(edge_idx, old_ws);
+            }
+            Some(OwnerEdgeDelta::Updated {
+                edge_idx,
+                ref old_ws,
+                ref new_ws,
+            }) => {
+                self.deindex_owner_edge(edge_idx, old_ws);
+                self.index_owner_edge(edge_idx, new_ws);
+            }
+            Some(OwnerEdgeDelta::Added {
+                edge_idx,
+                ref new_ws,
+            }) => {
+                self.index_owner_edge(edge_idx, new_ws);
+            }
+            None => {}
+        }
 
         // Reindex all edges for each affected WeightKind on this sink
         // Path events will be generated later by process_event_queue
@@ -1812,15 +2643,15 @@ impl BeliefBase {
                 .iter()
                 .filter_map(
                     |(source_idx, sink_idx, ks): &(
-                        petgraph::graph::NodeIndex,
-                        petgraph::graph::NodeIndex,
+                        NodeIndex,
+                        NodeIndex,
                         BTreeMap<WeightKind, u16>,
                     )| {
                         ks.get(kind)
                             .map(|weight_idx| (*source_idx, *sink_idx, *weight_idx))
                     },
                 )
-                .collect::<Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex, u16)>>();
+                .collect::<Vec<(NodeIndex, NodeIndex, u16)>>();
             kind_set.sort_by_key(|(_, _, old_idx)| *old_idx);
             for (new_idx, (source_idx, sink_idx, old_idx)) in kind_set.into_iter().enumerate() {
                 if new_idx as u16 != old_idx {
@@ -1869,70 +2700,118 @@ impl BeliefBase {
         );
         let mut derivative_events = vec![];
 
-        self.index_sync(false);
-
         if let Some(replaced_idx) = self.bid_to_index(&replaced_bid) {
-            let new_idx_opt = self.bid_to_index(&new_bid);
+            // Ensure new_bid has a graph node before we acquire the relations write lock.
+            // graph_insert_node is a no-op if the node already exists in bid_to_index.
+            if !self.read_bid_index().contains_key(&new_bid) {
+                self.graph_insert_node(new_bid);
+            }
+            let new_idx = self
+                .bid_to_index(&new_bid)
+                .expect("new_bid must be in graph after graph_insert_node");
 
-            let mut relations = self.write_relations();
-            let new_idx = new_idx_opt.unwrap_or_else(|| relations.as_graph_mut().add_node(new_bid));
+            // Collect owner_edges deltas while holding the relations lock.
+            // Each entry: (edge_idx_to_deindex, ws) for removals, or (edge_idx_to_index, ws) for additions.
+            let mut to_deindex: Vec<(EdgeIndex, WeightSet)> = Vec::new();
+            let mut to_index: Vec<(EdgeIndex, WeightSet)> = Vec::new();
 
-            let mut outgoing = relations
-                .as_graph()
-                .neighbors_directed(replaced_idx, petgraph::Direction::Outgoing)
-                .detach();
-            while let Some((edge_idx, sink_idx)) = outgoing.next(relations.as_graph()) {
-                let sink = relations.as_graph()[sink_idx];
-                let mut from_weight = relations
-                    .as_graph_mut()
-                    .remove_edge(edge_idx)
-                    .expect("Edge should exist");
-                from_weight.weights.remove(&WeightKind::Section);
-                derivative_events.push(BeliefEvent::RelationRemoved(
-                    replaced_bid,
-                    sink,
-                    EventOrigin::Local,
-                ));
+            {
+                let mut relations = self.write_relations();
 
-                if let Some(existing_edge_idx) = relations.as_graph().find_edge(new_idx, sink_idx) {
-                    let existing_weight = &mut relations.as_graph_mut()[existing_edge_idx];
-                    *existing_weight = existing_weight.union(&from_weight);
-                } else if !from_weight.is_empty() {
-                    relations
+                let mut outgoing = relations
+                    .as_graph()
+                    .neighbors_directed(replaced_idx, petgraph::Direction::Outgoing)
+                    .detach();
+                while let Some((edge_idx, sink_idx)) = outgoing.next(relations.as_graph()) {
+                    let sink = relations.as_graph()[sink_idx];
+                    let old_ws = relations
+                        .as_graph()
+                        .edge_weight(edge_idx)
+                        .expect("Edge should exist")
+                        .clone();
+                    to_deindex.push((edge_idx, old_ws));
+                    let mut from_weight = relations
                         .as_graph_mut()
-                        .add_edge(new_idx, sink_idx, from_weight);
+                        .remove_edge(edge_idx)
+                        .expect("Edge should exist");
+                    from_weight.weights.remove(&WeightKind::Section);
+                    derivative_events.push(BeliefEvent::RelationRemoved(
+                        replaced_bid,
+                        sink,
+                        EventOrigin::Local,
+                    ));
+
+                    if let Some(existing_edge_idx) =
+                        relations.as_graph().find_edge(new_idx, sink_idx)
+                    {
+                        let existing_ws = relations.as_graph()[existing_edge_idx].clone();
+                        to_deindex.push((existing_edge_idx, existing_ws));
+                        let existing_weight = &mut relations.as_graph_mut()[existing_edge_idx];
+                        *existing_weight = existing_weight.union(&from_weight);
+                        let merged_ws = relations.as_graph()[existing_edge_idx].clone();
+                        to_index.push((existing_edge_idx, merged_ws));
+                    } else if !from_weight.is_empty() {
+                        let new_edge_idx = relations.as_graph_mut().add_edge(
+                            new_idx,
+                            sink_idx,
+                            from_weight.clone(),
+                        );
+                        to_index.push((new_edge_idx, from_weight));
+                    }
                 }
+
+                let mut incoming = relations
+                    .as_graph()
+                    .neighbors_directed(replaced_idx, petgraph::Direction::Incoming)
+                    .detach();
+                while let Some((edge_idx, source_idx)) = incoming.next(relations.as_graph()) {
+                    let source = relations.as_graph()[source_idx];
+                    let old_ws = relations
+                        .as_graph()
+                        .edge_weight(edge_idx)
+                        .expect("Edge should exist")
+                        .clone();
+                    to_deindex.push((edge_idx, old_ws));
+                    let mut from_weight = relations
+                        .as_graph_mut()
+                        .remove_edge(edge_idx)
+                        .expect("Edge should exist");
+                    from_weight.weights.remove(&WeightKind::Section);
+                    derivative_events.push(BeliefEvent::RelationRemoved(
+                        source,
+                        replaced_bid,
+                        EventOrigin::Local,
+                    ));
+
+                    if let Some(existing_edge_idx) =
+                        relations.as_graph().find_edge(source_idx, new_idx)
+                    {
+                        let existing_ws = relations.as_graph()[existing_edge_idx].clone();
+                        to_deindex.push((existing_edge_idx, existing_ws));
+                        let existing_weight = &mut relations.as_graph_mut()[existing_edge_idx];
+                        *existing_weight = existing_weight.union(&from_weight);
+                        let merged_ws = relations.as_graph()[existing_edge_idx].clone();
+                        to_index.push((existing_edge_idx, merged_ws));
+                    } else if !from_weight.is_empty() {
+                        let new_edge_idx = relations.as_graph_mut().add_edge(
+                            source_idx,
+                            new_idx,
+                            from_weight.clone(),
+                        );
+                        to_index.push((new_edge_idx, from_weight));
+                    }
+                }
+            } // relations lock dropped here
+
+            // Apply owner_edges deltas outside the relations lock.
+            for (edge_idx, ws) in &to_deindex {
+                self.deindex_owner_edge(*edge_idx, ws);
+            }
+            for (edge_idx, ws) in &to_index {
+                self.index_owner_edge(*edge_idx, ws);
             }
 
-            let mut incoming = relations
-                .as_graph()
-                .neighbors_directed(replaced_idx, petgraph::Direction::Incoming)
-                .detach();
-            while let Some((edge_idx, source_idx)) = incoming.next(relations.as_graph()) {
-                let source = relations.as_graph()[source_idx];
-                let mut from_weight = relations
-                    .as_graph_mut()
-                    .remove_edge(edge_idx)
-                    .expect("Edge should exist");
-                from_weight.weights.remove(&WeightKind::Section);
-                derivative_events.push(BeliefEvent::RelationRemoved(
-                    source,
-                    replaced_bid,
-                    EventOrigin::Local,
-                ));
-
-                if let Some(existing_edge_idx) = relations.as_graph().find_edge(source_idx, new_idx)
-                {
-                    let existing_weight = &mut relations.as_graph_mut()[existing_edge_idx];
-                    *existing_weight = existing_weight.union(&from_weight);
-                } else if !from_weight.is_empty() {
-                    relations
-                        .as_graph_mut()
-                        .add_edge(source_idx, new_idx, from_weight);
-                }
-            }
-            relations.as_graph_mut().remove_node(replaced_idx);
-            self.index_dirty.store(true, Ordering::SeqCst);
+            self.graph_remove_node(replaced_idx, &replaced_bid);
         }
         derivative_events
     }
@@ -1941,13 +2820,14 @@ impl BeliefBase {
     /// state. Otherwise None
     pub fn into_state(&mut self) -> Option<BeliefNode> {
         let BeliefGraph { mut states, .. } = self.consume();
-        let mut maybe_node = None;
-        while let Some((_, a_state)) = states.pop_first() {
-            if a_state.bid != self.api.bid {
-                maybe_node = Some(a_state);
-                break;
-            }
-        }
+        // Remove the API node first (it's not "content" for this method's purpose),
+        // then take whatever single content node remains, if any.
+        states.remove(&self.api.bid);
+        let maybe_node = states
+            .keys()
+            .next()
+            .copied()
+            .and_then(|bid| states.remove(&bid));
         if !states.is_empty() {
             tracing::warn!(
                 label = self.label,
@@ -1970,7 +2850,7 @@ impl BeliefBase {
     /// the lhs is small enough that the unbounded seed is harmless.
     #[allow(dead_code)] // used by shard/export.rs and wasm.rs under feature flags
     pub(crate) fn merge(&mut self, rhs: &BeliefGraph) {
-        self.merge_graph_mut(rhs, None);
+        self.merge_graph_mut(rhs, None, MergePrecedence::LhsWins);
     }
 
     /// Like `merge`, but restricts the DFS seed set in the relation merge to `seed_bids`.
@@ -1980,7 +2860,24 @@ impl BeliefBase {
     /// seeding from all of `self.states`, keeping the cost O(rhs_size) rather than
     /// O(session_bb_size × rhs_edges).
     pub fn merge_from(&mut self, rhs: &BeliefGraph, seed_bids: &BTreeSet<Bid>) {
-        self.merge_graph_mut(rhs, Some(seed_bids));
+        self.merge_graph_mut(rhs, Some(seed_bids), MergePrecedence::LhsWins);
+    }
+
+    /// [`merge_from`] with an explicit node-collision policy.
+    ///
+    /// Use [`MergePrecedence::RhsWins`] when `rhs` is more authoritative than `self` —
+    /// e.g. seeding a parallel parse task, where `self` is a shared epoch base that
+    /// accumulates across the epoch and `rhs` is a per-document seed queried fresh from
+    /// `global_bb`.
+    ///
+    /// [`merge_from`]: BeliefBase::merge_from
+    pub fn merge_from_with(
+        &mut self,
+        rhs: &BeliefGraph,
+        seed_bids: &BTreeSet<Bid>,
+        precedence: MergePrecedence,
+    ) {
+        self.merge_graph_mut(rhs, Some(seed_bids), precedence);
     }
 
     /// Core implementation for `merge` and `merge_from`.
@@ -1988,37 +2885,43 @@ impl BeliefBase {
     /// Merges `rhs` into `self` using [`MergeOp`]s produced by
     /// [`BeliefGraph::to_event_stream`].
     ///
-    /// **Performance contract — O(rhs_size), single `index_sync`:**
+    /// **Performance contract — O(rhs_size):**
     ///
     /// 1. **Node pass**: Apply every [`MergeOp::NodeUpsert`] directly via
-    ///    `self.states.insert` — no TOML serialisation, no `evaluate_expression`,
-    ///    no per-node `index_sync`.  After the pass, stamp `index_dirty = true` once
-    ///    and rebuild the index via `index_sync(false)` once.
+    ///    `self.states.insert` — no TOML serialisation.
+    ///    New nodes are registered in the relations graph and `bid_to_index`
+    ///    incrementally via `graph_insert_node` so Pass 2 can look up `NodeIndex`
+    ///    immediately without any rebuild.
     ///
     /// 2. **Relation pass**: Apply every [`MergeOp::RelationUpdate`] via
-    ///    `update_relation`, which uses the freshly-rebuilt `bid_to_index` and never
-    ///    triggers another `index_sync`.
+    ///    `update_relation`, which uses the always-current `bid_to_index`.
     ///
     /// 3. **PathMapMap pass**: Drive `process_event_queue` once with the full op list
     ///    converted to `BeliefEvent` refs, keeping PathMap metadata consistent.
     ///
     /// This eliminates the O(N²) behaviour of the previous per-event `process_event`
-    /// loop (each call triggered `insert_state → evaluate_expression → index_sync`
-    /// over the entire growing `session_bb`).
+    /// loop (each call triggered `insert_state` over the entire
+    /// growing `session_bb`, with a full `bid_to_index` rebuild after each mutation).
     ///
     /// `seed_bids`: when `Some`, scopes the ops to the halo around those seeds
     /// (seeds + neighbours + balanced Section ancestors). When `None`, all rhs nodes
     /// and relations are emitted.
-    fn merge_graph_mut(&mut self, rhs: &BeliefGraph, seed_bids: Option<&BTreeSet<Bid>>) {
-        let ops = rhs.to_event_stream(self, seed_bids);
+    fn merge_graph_mut(
+        &mut self,
+        rhs: &BeliefGraph,
+        seed_bids: Option<&BTreeSet<Bid>>,
+        precedence: MergePrecedence,
+    ) {
+        let ops = rhs.to_event_stream_with(self, seed_bids, precedence);
         if ops.is_empty() {
             return;
         }
 
         // ------------------------------------------------------------------
-        // Pass 1: apply node upserts directly — no index_sync, no TOML round-trip.
+        // Pass 1: apply node upserts directly — no TOML round-trip.
+        // New nodes are registered in the relations graph and bid_to_index
+        // incrementally so Pass 2's update_relation can look up NodeIndex immediately.
         // ------------------------------------------------------------------
-        let mut any_node_change = false;
         for op in &ops {
             if let MergeOp::NodeUpsert(node) = op {
                 let is_new = !self.states.contains_key(&node.bid);
@@ -2026,18 +2929,12 @@ impl BeliefBase {
                 if changed {
                     self.states.insert(node.bid, node.clone());
                     self.brefs.insert(node.bid.bref(), node.bid);
-                    any_node_change = true;
+                    if is_new && !self.read_bid_index().contains_key(&node.bid) {
+                        self.graph_insert_node(node.bid);
+                    }
                 }
             }
         }
-
-        // Rebuild bid_to_index once so that update_relation can look up NodeIndex
-        // for every edge in the relation pass.
-        if any_node_change {
-            self.index_dirty.store(true, Ordering::SeqCst);
-        }
-        // index_sync(false) is a no-op when index is already clean.
-        self.index_sync(false);
 
         // ------------------------------------------------------------------
         // Pass 2: apply relation updates using the freshly rebuilt index.
@@ -2085,454 +2982,1211 @@ impl BeliefBase {
     pub fn trim(&mut self, to_retain: Option<BTreeSet<Bid>>) {
         #[cfg(not(target_arch = "wasm32"))]
         while self.relations.is_locked() {
-            tracing::info!(
+            tracing::debug!(
                 label = self.label,
                 "[BeliefBase::trim] Waiting for write access to relations"
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let mut write_relations = self.write_relations();
-        let retainable_set =
-            to_retain.unwrap_or_else(|| BTreeSet::from_iter(self.states().keys().copied()));
-        let to_remove = write_relations
-            .as_graph()
-            .edge_indices()
-            .filter_map(|edge_idx| {
-                if let Some((source_idx, sink_idx)) =
-                    write_relations.as_graph().edge_endpoints(edge_idx)
-                {
-                    let source = write_relations.as_graph()[source_idx];
-                    let sink = write_relations.as_graph()[sink_idx];
-                    if !retainable_set.contains(&source) || !retainable_set.contains(&sink) {
-                        Some((edge_idx, source, sink))
+
+        // Collect edges to remove and their owner weight sets (for memo deindexing),
+        // then remove edges and drop the lock before updating owner_edges.
+        let mut owner_deindex: Vec<(EdgeIndex, WeightSet)> = Vec::new();
+        let mut remove_events = Vec::new();
+        {
+            let mut write_relations = self.write_relations();
+            let retainable_set =
+                to_retain.unwrap_or_else(|| BTreeSet::from_iter(self.states().keys().copied()));
+            let to_remove = write_relations
+                .as_graph()
+                .edge_indices()
+                .filter_map(|edge_idx| {
+                    if let Some((source_idx, sink_idx)) =
+                        write_relations.as_graph().edge_endpoints(edge_idx)
+                    {
+                        let source = write_relations.as_graph()[source_idx];
+                        let sink = write_relations.as_graph()[sink_idx];
+                        if !retainable_set.contains(&source) || !retainable_set.contains(&sink) {
+                            Some((edge_idx, source, sink))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
+                })
+                .collect::<Vec<_>>();
+
+            for (edge_idx, source, sink) in to_remove.into_iter().rev() {
+                if let Some(ws) = write_relations.as_graph().edge_weight(edge_idx) {
+                    owner_deindex.push((edge_idx, ws.clone()));
+                }
+                write_relations.as_graph_mut().remove_edge(edge_idx);
+                remove_events.push(BeliefEvent::RelationRemoved(
+                    source,
+                    sink,
+                    EventOrigin::Local,
+                ));
+            }
+        } // write_relations lock dropped
+
+        for (edge_idx, ws) in &owner_deindex {
+            self.deindex_owner_edge(*edge_idx, ws);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QuerySpec evaluation
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Evaluate a [`QueryPackage`] directly against in-memory state.
+    ///
+    /// Inspects [`QueryPackage::stage`] and resumes from wherever the
+    /// package left off:
+    ///
+    /// - **Constructed** → resolve seed `TapeFn` to `TapeFn::Bids`, then
+    ///   fall through to projection and output.
+    /// - **Anchored** → apply projection steps, then fall through
+    ///   to output.
+    /// - **Projecting** → resume projection from where the tape left
+    ///   off, then fall through to output.
+    /// - **Projected** → materialize graph from tape (if not already done).
+    pub fn evaluate_query(&self, package: &mut QueryPackage) -> Result<(), BuildonomyError> {
+        self.evaluate_query_with_search(package, None)
+    }
+
+    /// Evaluate a query package with an optional text search provider.
+    ///
+    /// When `text_search` is `Some`, `TextMatch` filter steps are evaluated
+    /// by delegating to the provider. This is the entry point for WASM
+    /// evaluation where search indices are available.
+    pub fn evaluate_query_with_search(
+        &self,
+        package: &mut QueryPackage,
+        text_search: Option<&dyn TextSearchProvider>,
+    ) -> Result<(), BuildonomyError> {
+        // ── Anchor: resolve seed TapeFn to Bids ─────────────────
+        // For Keys seeds, record which key resolved to which BID so
+        // the seed payload can link output BIDs back to their anchor keys.
+        let mut anchor_map: Option<Vec<(usize, Bid)>> = None;
+        if package.stage() == PackageStage::Constructed {
+            let original_tapefn = package
+                .spec()
+                .steps
+                .first()
+                .map(|s| s.input.clone())
+                .unwrap_or(TapeFn::Bids(vec![]));
+
+            // If the first step is a Compose with no top-level seed (branches
+            // carry their own seeds), use an empty Bids set so downstream code
+            // doesn't error on Then(None).
+            let needs_top_level_seed = original_tapefn.is_seed();
+
+            if needs_top_level_seed {
+                let seed = self.eval_seed(&original_tapefn)?;
+                if let TapeFn::Keys(keys) = &original_tapefn {
+                    let mapping: Vec<(usize, Bid)> = keys
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, key)| {
+                            self.resolve_key_to_bid(key)
+                                .filter(|bid| seed.contains(bid))
+                                .map(|bid| (i, bid))
+                        })
+                        .collect();
+                    if !mapping.is_empty() {
+                        anchor_map = Some(mapping);
+                    }
+                }
+                if let Some(first_step) = package.spec_mut().steps.first_mut() {
+                    first_step.input = TapeFn::Bids(seed.iter().copied().collect());
+                }
+            } else {
+                // No top-level seed — set empty Bids so the tape-based
+                // evaluator can proceed. Compose branches provide their
+                // own seeds internally.
+                if let Some(first_step) = package.spec_mut().steps.first_mut() {
+                    first_step.input = TapeFn::Bids(vec![]);
+                }
+            }
+        }
+
+        // ── Store anchor map for the first step's payload ───────────────
+        // The anchor map records which seed key resolved to which BID.
+        // It will be attached to the first step's tape entry as payload.
+        if let Some(map) = anchor_map {
+            package.set_anchor_map(map);
+        }
+
+        // ── Project: apply projection steps into tape ───────────────
+        if package.stage() < PackageStage::Projected {
+            self.apply_projection_steps_to_package(package, text_search)?;
+        }
+
+        // ── Materialize graph from tape ─────────────────────────
+        if package.stage() == PackageStage::Projected && package.graph().is_none() {
+            self.materialize_graph(package)?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply projection steps directly into the package's tape.
+    ///
+    /// Recovers the current BID set from the package state:
+    /// - If the tape has entries (resuming from `Projecting`), the current
+    ///   set is the last tape entry's result.
+    /// - Otherwise, the seed comes from the first step's `TapeFn::Bids`
+    ///   input (which must already be resolved at this point).
+    ///
+    /// For steps with `TapeFn::Fold { op: Union, range: None }`, the input
+    /// is `seed ∪ all prior tape BIDs` instead of the chain output.
+    ///
+    /// Skips steps already recorded in the tape, then applies remaining
+    /// steps, pushing a [`TapeEntry`] for each.
+    fn apply_projection_steps_to_package(
+        &self,
+        package: &mut QueryPackage,
+        text_search: Option<&dyn TextSearchProvider>,
+    ) -> Result<(), BuildonomyError> {
+        let steps = package.spec().steps.clone();
+        let seed_tapefn = steps
+            .first()
+            .map(|s| s.input.clone())
+            .unwrap_or(TapeFn::Bids(vec![]));
+        // Count completed projection steps.
+        let completed = package.tape().steps.len();
+
+        let seed: BTreeSet<Bid> = match &seed_tapefn {
+            TapeFn::Bids(bids) => bids.iter().copied().collect(),
+            _ => {
+                return Err(BuildonomyError::Command(
+                    "apply_projection_steps_to_package called with unresolved seed".to_string(),
+                ));
+            }
+        };
+
+        // Recover the chain set from the last tape entry, or use seed.
+        let mut current: BTreeSet<Bid> = if let Some(last) = package.tape().steps.last() {
+            last.content.output_bids().into_iter().collect()
+        } else {
+            seed.clone()
+        };
+
+        for (step_idx, step) in steps.iter().enumerate().skip(completed) {
+            let label = if step.label.is_empty() {
+                step_idx.to_string()
+            } else {
+                step.label.clone()
+            };
+
+            // Compute the label of the previous step (for Terminal/Orphan range resolution).
+            let prev_label: Option<String> = if step_idx > 0 {
+                let prev = &steps[step_idx - 1];
+                Some(if prev.label.is_empty() {
+                    (step_idx - 1).to_string()
+                } else {
+                    prev.label.clone()
+                })
+            } else {
+                None
+            };
+            let input =
+                package
+                    .tape()
+                    .eval_input(&step.input, &seed, &current, prev_label.as_deref());
+
+            // If this is the first step, consume the pending anchor map.
+            let step_payload = if step_idx == 0 {
+                package.take_anchor_map().map(TapePayload::AnchorMap)
+            } else {
+                None
+            };
+
+            match &step.operation {
+                StepOperation::Identity => {
+                    // Pass-through: output = input, no edges.
+                    current = input;
+                    package.tape_mut().steps.push(TapeEntry {
+                        label,
+                        content: TapeContent::Nodes(current.iter().copied().collect()),
+                        payload: step_payload,
+                    });
+                }
+                StepOperation::Filter(filter) => {
+                    let (filtered, mut payload) = self.apply_filter(&input, filter, text_search)?;
+                    current = filtered;
+                    // Prefer filter payload (scores), but attach anchor map if no filter payload.
+                    if payload.is_none() {
+                        payload = step_payload;
+                    }
+                    package.tape_mut().steps.push(TapeEntry {
+                        label,
+                        content: TapeContent::Nodes(current.iter().copied().collect()),
+                        payload,
+                    });
+                }
+                StepOperation::Traverse(trav) => {
+                    current = self.apply_traversal_to_tape(&input, trav, &label, package)?;
+                }
+                StepOperation::Compose(comp) => {
+                    // Each branch carries its own seed in its first step.
+                    // If the compose step itself has a seed, use it as the
+                    // initial set; otherwise start empty.
+                    let comp_seed_tapefn = &step.input;
+                    let seed_set = if comp_seed_tapefn.is_seed() {
+                        self.eval_seed(comp_seed_tapefn)?
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let left_result = self.apply_projection_steps(
+                        comp_seed_tapefn,
+                        &comp.left,
+                        seed_set.clone(),
+                        text_search,
+                    )?;
+                    let right_result = self.apply_projection_steps(
+                        comp_seed_tapefn,
+                        &comp.right,
+                        seed_set,
+                        text_search,
+                    )?;
+
+                    let left_start = package.tape().len();
+                    package.tape_mut().steps.push(TapeEntry {
+                        label: format!("{label}.L"),
+                        content: TapeContent::Nodes(left_result.iter().copied().collect()),
+                        payload: None,
+                    });
+                    let right_start = package.tape().len();
+                    package.tape_mut().steps.push(TapeEntry {
+                        label: format!("{label}.R"),
+                        content: TapeContent::Nodes(right_result.iter().copied().collect()),
+                        payload: None,
+                    });
+                    let right_end = package.tape().len();
+
+                    let intersection: Vec<Bid> =
+                        left_result.intersection(&right_result).copied().collect();
+                    let combined: BTreeSet<Bid> = match comp.op {
+                        CompositionOp::And => intersection.iter().copied().collect(),
+                        CompositionOp::Or => left_result.union(&right_result).copied().collect(),
+                        CompositionOp::Not => {
+                            left_result.difference(&right_result).copied().collect()
+                        }
+                    };
+                    current = combined.clone();
+                    package.tape_mut().steps.push(TapeEntry {
+                        label,
+                        content: TapeContent::Compose {
+                            op: comp.op,
+                            left: left_start..right_start,
+                            right: right_start..right_end,
+                            result: combined.into_iter().collect(),
+                            intersection,
+                        },
+                        payload: None,
+                    });
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// Materialize a [`BeliefGraph`] from a `Projected` package's tape.
+    ///
+    /// Pure tape-to-graph transformation. Uses
+    /// `tape.graph_context_boundary()` to find where halo/ancestry
+    /// steps begin in the tape, then distinguishes primary from Trace:
+    ///
+    /// - **Primary** = seed ∪ `tape.fold_bids(0..boundary)`
+    /// - **All** = seed ∪ `tape.cumulative_bids()`
+    /// - **Trace** = all - primary
+    ///
+    /// No traversals — halo/ancestry are already in the tape as
+    /// `TapeFn::Fold` projection steps.
+    /// Apply Trace coloring and (if needed) materialize edges into
+    /// the package graph.
+    ///
+    /// Uses `tape.graph_context_boundary()` to distinguish primary from
+    /// Trace BIDs:
+    /// - **Primary** = tape entries before the boundary
+    /// - **Trace** = tape entries at/after the boundary (halo, balance)
+    ///
+    /// When the package already has a graph (DB path, edges built during
+    /// traversal), this mutates states in-place. When no graph exists
+    /// (sync path), constructs a new graph from `self`.
+    pub(crate) fn materialize_graph(
+        &self,
+        package: &mut QueryPackage,
+    ) -> Result<(), BuildonomyError> {
+        let boundary = package.tape().graph_context_boundary();
+
+        // primary = union of all user-step tape entries (everything
+        // before the graph context boundary). This includes all hops
+        // of multi-hop traversals, not just the final frontier.
+        let primary: BTreeSet<Bid> = package.tape().fold_bids(0..boundary);
+
+        // all = seed ∪ primary ∪ graph context BIDs (halo + ancestry)
+        let mut all_bids = primary.clone();
+        // Include seed BIDs so edges connecting seed to first-hop results
+        // are present in the package graph.
+        if let Some(first_step) = package.spec().steps.first() {
+            if let TapeFn::Bids(bids) = &first_step.input {
+                all_bids.extend(bids.iter().copied());
+            }
+        }
+        all_bids.extend(package.tape().fold_bids(boundary..package.tape().len()));
+
+        if package.graph().is_some() {
+            // ── Mutate existing graph: Trace-color states in-place ─────
+            let states_guard = self.states();
+            let graph = package.graph_mut().as_mut().unwrap();
+            for &bid in &all_bids {
+                if let Some(node) = states_guard.get(&bid) {
+                    let mut node = node.clone();
+                    if !primary.contains(&bid) {
+                        node.kind.insert(BeliefKind::Trace);
+                    }
+                    graph.states.insert(bid, node);
+                }
+            }
+        } else {
+            // ── Build graph from tape (sync path) ─────────────────
+            // Tape edge indices reference self.relations(). Copy the
+            // referenced edges into a new package graph.
+            let states_guard = self.states();
+            let mut states: FxHashMap<Bid, BeliefNode> = FxHashMap::default();
+            for &bid in &all_bids {
+                if let Some(node) = states_guard.get(&bid) {
+                    let mut node = node.clone();
+                    if !primary.contains(&bid) {
+                        node.kind.insert(BeliefKind::Trace);
+                    }
+                    states.insert(bid, node);
+                }
+            }
+
+            let rel_guard = self.relations();
+            let src_graph = rel_guard.as_graph();
+
+            let mut graph = petgraph::stable_graph::StableGraph::<Bid, WeightSet>::new();
+            let mut idx_map: BTreeMap<Bid, petgraph::graph::NodeIndex> = BTreeMap::new();
+
+            // Ensure all result BIDs have nodes in the package graph.
+            for &bid in &all_bids {
+                idx_map.entry(bid).or_insert_with(|| graph.add_node(bid));
+            }
+
+            // Copy edges from the source graph where both endpoints are
+            // in the result set. Build a remap from source EdgeIndex to
+            // package EdgeIndex so tape entries can be rewritten.
+            let bid_index = self.read_bid_index();
+            let mut copied_edges: BTreeSet<EdgeIndex> = BTreeSet::new();
+            let mut edge_remap: BTreeMap<EdgeIndex, EdgeIndex> = BTreeMap::new();
+            for &bid in &all_bids {
+                let Some(&node_idx) = bid_index.get(&bid) else {
+                    continue;
+                };
+                for edge_ref in src_graph.edges_directed(node_idx, petgraph::Direction::Outgoing) {
+                    let src_eidx = edge_ref.id();
+                    if !copied_edges.insert(src_eidx) {
+                        continue;
+                    }
+                    let target_bid = src_graph[edge_ref.target()];
+                    if !all_bids.contains(&target_bid) {
+                        continue;
+                    }
+                    let Some(weight) = src_graph.edge_weight(src_eidx) else {
+                        continue;
+                    };
+                    let pkg_src = *idx_map.entry(bid).or_insert_with(|| graph.add_node(bid));
+                    let pkg_snk = *idx_map
+                        .entry(target_bid)
+                        .or_insert_with(|| graph.add_node(target_bid));
+                    let pkg_eidx = graph.add_edge(pkg_src, pkg_snk, weight.clone());
+                    edge_remap.insert(src_eidx, pkg_eidx);
+                }
+            }
+
+            drop(rel_guard);
+
+            package.set_graph(BeliefGraph {
+                states,
+                relations: crate::beliefbase::BidGraph(graph),
+            });
+
+            // Rewrite tape edge indices to reference the package graph.
+            for entry in &mut package.tape_mut().steps {
+                if let TapeContent::Edges { edges, .. } = &mut entry.content {
+                    for eidx in edges.iter_mut() {
+                        if let Some(&new_idx) = edge_remap.get(eidx) {
+                            *eidx = new_idx;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a single [`NodeKey`] to its BID, if present in this BeliefBase.
+    fn resolve_key_to_bid(&self, key: &NodeKey) -> Option<Bid> {
+        match key {
+            NodeKey::Bid { bid } => {
+                if self.states().contains_key(bid) {
+                    Some(*bid)
                 } else {
                     None
                 }
-            })
-            .collect::<Vec<_>>();
-
-        let mut remove_events = Vec::new();
-        for (edge_idx, source, sink) in to_remove.into_iter().rev() {
-            write_relations.as_graph_mut().remove_edge(edge_idx);
-            remove_events.push(BeliefEvent::RelationRemoved(
-                source,
-                sink,
-                EventOrigin::Local,
-            ));
+            }
+            NodeKey::Bref { bref } => self
+                .brefs()
+                .get(bref)
+                .filter(|bid| self.states().contains_key(bid))
+                .copied(),
+            NodeKey::Path { net, path } => self
+                .paths()
+                .net_get_from_path(net, path)
+                .map(|(_, bid)| bid)
+                .filter(|bid| self.states().contains_key(bid)),
+            NodeKey::Id { net, id } => self
+                .paths()
+                .net_get_from_id(net, id)
+                .map(|(_, bid)| bid)
+                .filter(|bid| self.states().contains_key(bid)),
         }
     }
 
-    // TODO this can be more efficient for some StatePreds (Bid and Bref) by using map.get instead
-    // of filter operations.
-    pub fn filter_states(
-        &self,
-        pred: &StatePred,
-        rhs: Option<&BTreeMap<Bid, BeliefNode>>,
-        invert: bool,
-    ) -> BTreeMap<Bid, BeliefNode> {
-        match pred {
-            StatePred::Path(path_vec) => {
-                let paths_guard = self.paths();
-                let bids = BTreeSet::from_iter(path_vec.iter().filter_map(|pth| {
-                    paths_guard
-                        .api_map()
-                        .get(pth, &paths_guard)
-                        .map(|(_net, bid)| bid)
-                }));
-                BTreeMap::from_iter(
-                    bids.iter()
-                        .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
-                )
+    /// Resolve a seed [`TapeFn`] to its initial BID set.
+    fn eval_seed(&self, seed: &TapeFn) -> Result<BTreeSet<Bid>, BuildonomyError> {
+        match seed {
+            TapeFn::Bids(bids) => Ok(bids
+                .iter()
+                .filter(|bid| self.states().contains_key(bid))
+                .copied()
+                .collect()),
+            TapeFn::Keys(keys) => {
+                let mut set = BTreeSet::new();
+                for key in keys {
+                    match key {
+                        NodeKey::Bid { bid } => {
+                            if self.states().contains_key(bid) {
+                                set.insert(*bid);
+                            }
+                        }
+                        NodeKey::Bref { bref } => {
+                            if let Some(&bid) = self.brefs().get(bref) {
+                                if self.states().contains_key(&bid) {
+                                    set.insert(bid);
+                                }
+                            }
+                        }
+                        NodeKey::Path { net, path } => {
+                            if let Some((_, bid)) = self.paths().net_get_from_path(net, path) {
+                                if self.states().contains_key(&bid) {
+                                    set.insert(bid);
+                                }
+                            }
+                        }
+                        NodeKey::Id { net, id } => {
+                            if let Some((_, bid)) = self.paths().net_get_from_id(net, id) {
+                                if self.states().contains_key(&bid) {
+                                    set.insert(bid);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(set)
             }
-            StatePred::NetPath(net, path) => {
+            TapeFn::Corpus => Ok(self
+                .states()
+                .iter()
+                .filter(|(_, node)| !node.kind.0.is_empty())
+                .map(|(bid, _)| *bid)
+                .collect()),
+            TapeFn::DocumentNodes(net, doc_path) => {
                 let paths_guard = self.paths();
-                let maybe_bid = paths_guard
+                let prefix = format!("{}#", doc_path);
+                let bids: BTreeSet<Bid> = paths_guard
                     .get_map(net)
-                    .and_then(|pm| pm.get(path, &paths_guard).map(|(_net, bid)| bid));
-                BTreeMap::from_iter(
-                    maybe_bid
-                        .iter()
-                        .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
-                )
-            }
-            StatePred::NetPathIn(net) => {
-                let paths_guard = self.paths();
-                let path_bid_tuples = paths_guard
-                    .get_map(&net.bref())
                     .map(|pm| {
-                        pm.recursive_map(None, &paths_guard, &mut std::collections::BTreeSet::new())
+                        pm.map()
+                            .iter()
+                            .filter_map(|(path, bid, _order)| {
+                                if path == doc_path || path.starts_with(&prefix) {
+                                    Some(*bid)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
                     })
                     .unwrap_or_default();
-                // Extract just the bids from (path, bid) tuples
-                let bids: Vec<Bid> = path_bid_tuples
-                    .iter()
-                    .map(|(_path, bid, _order)| *bid)
-                    .collect();
-                BTreeMap::from_iter(
-                    bids.iter()
-                        .filter_map(|bid| self.states().get(bid).map(|node| (*bid, node.clone()))),
-                )
+                Ok(bids
+                    .into_iter()
+                    .filter(|bid| self.states().contains_key(bid))
+                    .collect())
             }
-            StatePred::NetId(net, id) => {
-                let paths_guard = self.paths();
-                let maybe_match = paths_guard.net_get_from_id(net, id).and_then(|(_, bid)| {
-                    self.states.get(&bid).map(|node| (node.bid, node.clone()))
-                });
-                BTreeMap::from_iter(maybe_match)
-            }
-            StatePred::Bid(bid_vec) => BTreeMap::from_iter(
-                bid_vec
-                    .iter()
-                    .filter_map(|bid| self.states.get(bid).map(|node| (node.bid, node.clone()))),
-            ),
-            _ => {
-                let res = BTreeMap::from_iter(
-                    self.states
-                        .iter()
-                        .chain(rhs.unwrap_or(&BTreeMap::default()).iter())
-                        .filter_map(|(bid, state)| {
-                            let is_match = pred.match_state(state);
-                            if (is_match && !invert) || (!is_match && invert) {
-                                Some((*bid, state.clone()))
-                            } else {
-                                None
-                            }
-                        }),
-                );
-                res
-            }
+            TapeFn::Then(None) => Err(BuildonomyError::Command(
+                "Context-dependent seed must be resolved before evaluation".to_string(),
+            )),
+            _ => Err(BuildonomyError::Command(format!(
+                "TapeFn variant {:?} cannot be used as a seed",
+                seed
+            ))),
         }
     }
 
-    pub fn filter_states_mut(
-        &mut self,
-        pred: &StatePred,
-        rhs: Option<&BTreeMap<Bid, BeliefNode>>,
-        invert: bool,
-    ) {
-        self.states = self.filter_states(pred, rhs, invert);
-    }
-
-    /// Evaluate an expression and mark all resulting nodes as Trace, returning only
-    /// Subsection relations. This is used during balance operations to prevent pulling
-    /// in the entire graph when traversing upstream.
-    pub fn evaluate_expression_as_trace(
+    /// Apply a sequence of projection steps, transforming the BID set at each step.
+    ///
+    /// Used by `apply_composition` for evaluating Compose sub-branches.
+    /// The canonical package-level evaluation path is
+    /// `apply_projection_steps_to_package`, which records a full Tape.
+    fn apply_projection_steps(
         &self,
-        expr: &Expression,
-        weight_set: WeightSet,
-    ) -> BeliefGraph {
-        self.index_sync(false);
-        match expr {
-            Expression::StateIn(state_pred) => {
-                let mut states = self.filter_states(state_pred, None, false);
-                // Mark all states as Trace
-                for node in states.values_mut() {
-                    node.kind.insert(BeliefKind::Trace);
-                }
-                let state_set = states.keys().copied().collect::<Vec<Bid>>();
-                // Only return relations matching the weight filter
-                let relations = BidGraph::from(
-                    self.relations()
-                        .filter(&RelationPred::SourceIn(state_set.clone()), false)
-                        .filter(&RelationPred::Kind(weight_set), false),
-                );
-                // Add sink nodes to states (marked as Trace) so union_mut doesn't filter out the relations
-                for edge in relations.as_graph().raw_edges() {
-                    let sink = relations.as_graph()[edge.target()];
-                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                        if let Some(sink_state) = self.states().get(&sink) {
-                            let mut trace_sink = sink_state.clone();
-                            trace_sink.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_sink);
-                        }
-                    }
-                }
-                BeliefGraph { states, relations }
+        seed_tapefn: &TapeFn,
+        steps: &[ProjectionStep],
+        mut current: BTreeSet<Bid>,
+        text_search: Option<&dyn TextSearchProvider>,
+    ) -> Result<BTreeSet<Bid>, BuildonomyError> {
+        for step in steps {
+            // If the step has its own seed (Keys, Bids, Corpus), evaluate it
+            // to produce the starting set instead of chaining from `current`.
+            // This is essential for Compose branches where each side has an
+            // independently-seeded pipeline.
+            if step.input.is_seed() {
+                current = self.eval_seed(&step.input)?;
             }
-            Expression::StateNotIn(state_pred) => {
-                let mut states = self.filter_states(state_pred, None, true);
-                for node in states.values_mut() {
-                    node.kind.insert(BeliefKind::Trace);
+            current = match &step.operation {
+                StepOperation::Identity => current,
+                StepOperation::Filter(filter) => {
+                    self.apply_filter(&current, filter, text_search)?.0
                 }
-                let state_set = states.keys().copied().collect::<Vec<Bid>>();
-                let relations = BidGraph::from(
-                    self.relations()
-                        .filter(&RelationPred::SourceIn(state_set.clone()), false)
-                        .filter(&RelationPred::Kind(weight_set), false),
-                );
-                // Add sink nodes to states (marked as Trace) so union_mut doesn't filter out the relations
-                for edge in relations.as_graph().raw_edges() {
-                    let sink = relations.as_graph()[edge.target()];
-                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                        if let Some(sink_state) = self.states().get(&sink) {
-                            let mut trace_sink = sink_state.clone();
-                            trace_sink.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_sink);
-                        }
-                    }
+                StepOperation::Traverse(trav) => self.apply_traversal(&current, trav)?,
+                StepOperation::Compose(comp) => {
+                    self.apply_composition(seed_tapefn, &current, comp, text_search)?
                 }
-                BeliefGraph { states, relations }
-            }
-            // Relation expression's use the standard evaluate_expression logic
-            Expression::RelationIn(..) | Expression::RelationNotIn(..) => {
-                self.evaluate_expression(expr)
-            }
-            Expression::Dyad(lhs_p, op, rhs_p) => {
-                let mut lhs = self.evaluate_expression_as_trace(lhs_p, weight_set.clone());
-                let rhs = self.evaluate_expression_as_trace(rhs_p, weight_set);
-                match op {
-                    SetOp::Union => lhs.union_mut(&rhs),
-                    SetOp::Intersection => lhs.intersection_mut(&rhs),
-                    SetOp::Difference => lhs.difference_mut(&rhs),
-                    SetOp::SymmetricDifference => lhs.symmetric_difference_mut(&rhs),
-                }
-                lhs
+            };
+        }
+        Ok(current)
+    }
+
+    /// Apply a [`NodeFilter`] to retain only matching BIDs.
+    ///
+    /// Returns the filtered BID set and an optional [`TapePayload`] carrying
+    /// per-BID scores (for `TextMatch` filters). The caller is responsible
+    /// for attaching the payload to the corresponding [`TapeEntry`].
+    ///
+    /// When a [`TextSearchProvider`] is supplied, `TextMatch` filters are
+    /// evaluated by delegating to the provider's search index and intersecting
+    /// results with the current BID set. Without a provider, `TextMatch`
+    /// returns an error.
+    pub(crate) fn apply_filter(
+        &self,
+        current: &BTreeSet<Bid>,
+        filter: &NodeFilter,
+        text_search: Option<&dyn TextSearchProvider>,
+    ) -> Result<(BTreeSet<Bid>, Option<TapePayload>), BuildonomyError> {
+        match filter {
+            NodeFilter::Predicate(pred) => Ok((
+                current
+                    .iter()
+                    .filter(|bid| {
+                        self.states()
+                            .get(bid)
+                            .map(|node| pred.evaluate(node).matched)
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect(),
+                None,
+            )),
+            NodeFilter::TextMatch { path: _, query } => {
+                let Some(provider) = text_search else {
+                    return Err(BuildonomyError::Command(format!(
+                        "TextMatch('{query}') requires a TextSearchProvider; \
+                         not available in this evaluation context"
+                    )));
+                };
+                let results = provider.text_search(query);
+                let scored: std::collections::BTreeMap<Bid, f64> = results.into_iter().collect();
+                // Intersect with current pipeline set, preserving scores.
+                let matched: Vec<Bid> = current
+                    .iter()
+                    .filter(|bid| scored.contains_key(bid))
+                    .copied()
+                    .collect();
+                let scores: Vec<SortPayload> = matched
+                    .iter()
+                    .map(|bid| SortPayload {
+                        score: scored.get(bid).map(|s| *s as f32),
+                    })
+                    .collect();
+                let bid_set: BTreeSet<Bid> = matched.into_iter().collect();
+                Ok((bid_set, Some(TapePayload::Scores(scores))))
             }
         }
     }
 
-    pub fn evaluate_expression(&self, expr: &Expression) -> BeliefGraph {
-        self.index_sync(false);
-        match expr {
-            Expression::StateIn(state_pred) => {
-                let mut states = self.filter_states(state_pred, None, false);
-                let state_set = states.keys().copied().collect::<Vec<Bid>>();
-                let relations = BidGraph::from(
-                    self.relations()
-                        .filter(&RelationPred::NodeIn(state_set), false),
-                );
-                // Add sink nodes to maintain referential integrity
-                // Mark them as Trace since we haven't loaded their full relation set
-                for edge in relations.as_graph().raw_edges() {
-                    let sink = relations.as_graph()[edge.target()];
-                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                        if let Some(sink_state) = self.states().get(&sink) {
-                            let mut trace_sink = sink_state.clone();
-                            trace_sink.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_sink);
+    /// Apply a [`TraversalSpec`] to walk edges from the current BID set.
+    ///
+    /// Returns only the **discovered** BIDs — the resolved endpoints from
+    /// matched edges. The input set is used for cycle prevention but is NOT
+    /// included in the output. This matches the query model spec (§5.2):
+    /// "a Traversal maps the current node set to a new node set."
+    fn apply_traversal(
+        &self,
+        current: &BTreeSet<Bid>,
+        trav: &TraversalSpec,
+    ) -> Result<BTreeSet<Bid>, BuildonomyError> {
+        // Inverted traversal: return input nodes that produce NO output.
+        if trav.inverted {
+            let non_inverted = TraversalSpec {
+                inverted: false,
+                ..trav.clone()
+            };
+            let mut orphans = BTreeSet::new();
+            for &bid in current {
+                let single = BTreeSet::from([bid]);
+                let output = self.apply_traversal(&single, &non_inverted)?;
+                if output.is_empty() {
+                    orphans.insert(bid);
+                }
+            }
+            return Ok(orphans);
+        }
+
+        let mut result: BTreeSet<Bid> = BTreeSet::new();
+        // Filter const namespace BIDs (href, asset, buildonomy, codec) from
+        // the traversal frontier.  These are hub nodes whose halo fans out
+        // to every document in the corpus.  No traversal ever needs to walk
+        // FROM a const namespace BID — their children are looked up
+        // individually by key, never enumerated via graph traversal.
+        let const_ns_brefs: BTreeSet<Bref> =
+            const_namespaces().iter().map(|bid| bid.bref()).collect();
+        let mut frontier: BTreeSet<Bid> = current
+            .iter()
+            .filter(|bid| !const_ns_brefs.contains(&bid.bref()))
+            .copied()
+            .collect();
+        let mut visited = current.clone();
+
+        let rel_guard = self.relations();
+        let graph = rel_guard.as_graph();
+
+        let has_owner_input = trav.input_roles.contains(Role::Owner);
+        let edge_filter = trav.depth.edge_filter.as_ref();
+
+        for _depth in 0..trav.depth.max_hops() {
+            let mut next_frontier: BTreeSet<Bid> = BTreeSet::new();
+
+            // ── Source/Sink input roles: per-node directed edge iteration ──
+            for &bid in &frontier {
+                let Some(&idx) = self.read_bid_index().get(&bid) else {
+                    continue;
+                };
+
+                if trav.input_roles.contains(Role::Source) {
+                    // This node is source → outgoing edges → target is sink
+                    for edge_ref in graph.edges_directed(idx, petgraph::Direction::Outgoing) {
+                        let ws = edge_ref.weight();
+                        if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                            continue;
                         }
+                        self.collect_output_bids(
+                            graph,
+                            &edge_ref,
+                            &trav.output_roles,
+                            &mut next_frontier,
+                        );
                     }
-                    let source = relations.as_graph()[edge.source()];
-                    if let BTreeEntry::Vacant(e) = states.entry(source) {
-                        if let Some(source_state) = self.states().get(&source) {
-                            let mut trace_source = source_state.clone();
-                            trace_source.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_source);
+                }
+
+                if trav.input_roles.contains(Role::Sink) {
+                    // This node is sink → incoming edges → source is the other end
+                    for edge_ref in graph.edges_directed(idx, petgraph::Direction::Incoming) {
+                        let ws = edge_ref.weight();
+                        if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                            continue;
+                        }
+                        self.collect_output_bids(
+                            graph,
+                            &edge_ref,
+                            &trav.output_roles,
+                            &mut next_frontier,
+                        );
+                    }
+                }
+            }
+
+            // ── Owner input role: use owner_edges memo for O(1) lookup ─────
+            if has_owner_input {
+                for &bid in &frontier {
+                    let bref = bid.bref();
+                    if let Some(edge_indices) = self.owner_edges.get(&bref) {
+                        for &edge_idx in edge_indices {
+                            let Some(ws) = graph.edge_weight(edge_idx) else {
+                                continue;
+                            };
+                            if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                                continue;
+                            }
+                            let Some((src_idx, snk_idx)) = graph.edge_endpoints(edge_idx) else {
+                                continue;
+                            };
+                            if trav.output_roles.contains(Role::Source) {
+                                next_frontier.insert(graph[src_idx]);
+                            }
+                            if trav.output_roles.contains(Role::Sink) {
+                                next_frontier.insert(graph[snk_idx]);
+                            }
                         }
                     }
                 }
-                BeliefGraph { states, relations }
             }
-            Expression::StateNotIn(state_pred) => {
-                let mut states = self.filter_states(state_pred, None, true);
-                let state_set = states.keys().copied().collect::<Vec<Bid>>();
-                let relations = BidGraph::from(
-                    self.relations()
-                        .filter(&RelationPred::NodeIn(state_set), false),
-                );
-                // Add sink nodes to maintain referential integrity
-                // Mark them as Trace since we haven't loaded their full relation set
-                for edge in relations.as_graph().raw_edges() {
-                    let sink = relations.as_graph()[edge.target()];
-                    if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                        if let Some(sink_state) = self.states().get(&sink) {
-                            let mut trace_sink = sink_state.clone();
-                            trace_sink.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_sink);
+
+            // Remove already-visited BIDs from next frontier.
+            next_frontier.retain(|bid| !visited.contains(bid));
+
+            if next_frontier.is_empty() {
+                break;
+            }
+
+            result.extend(next_frontier.iter());
+            visited.extend(next_frontier.iter());
+            frontier = next_frontier;
+        }
+
+        Ok(result)
+    }
+
+    /// Apply a traversal with per-hop tape recording. Each hop pushes a
+    /// [`TapeEntry`] with [`TapeContent::Edges`] containing the edge indices
+    /// discovered at that depth. Returns the combined output BIDs.
+    ///
+    /// This is the tape-recording counterpart of [`Self::apply_traversal`].
+    /// The non-recording variant is still used by composition branch
+    /// evaluation via [`Self::apply_projection_steps`].
+    fn apply_traversal_to_tape(
+        &self,
+        current: &BTreeSet<Bid>,
+        trav: &TraversalSpec,
+        label: &str,
+        package: &mut QueryPackage,
+    ) -> Result<BTreeSet<Bid>, BuildonomyError> {
+        // Inverted traversal: return input nodes that produce NO output.
+        // Record a single Nodes tape entry (no per-hop edges).
+        if trav.inverted {
+            let non_inverted = TraversalSpec {
+                inverted: false,
+                ..trav.clone()
+            };
+            let mut orphans = BTreeSet::new();
+            for &bid in current {
+                let single = BTreeSet::from([bid]);
+                let output = self.apply_traversal(&single, &non_inverted)?;
+                if output.is_empty() {
+                    orphans.insert(bid);
+                }
+            }
+            package
+                .tape_mut()
+                .steps
+                .push(crate::query::spec::TapeEntry {
+                    label: label.to_string(),
+                    content: crate::query::spec::TapeContent::Nodes(
+                        orphans.iter().copied().collect(),
+                    ),
+                    payload: None,
+                });
+            return Ok(orphans);
+        }
+
+        let mut result: BTreeSet<Bid> = BTreeSet::new();
+        let mut frontier = current.clone();
+        let mut visited = current.clone();
+        let tape_start = package.tape().len();
+
+        let rel_guard = self.relations();
+        let graph = rel_guard.as_graph();
+
+        let has_owner_input = trav.input_roles.contains(Role::Owner);
+        let edge_filter = trav.depth.edge_filter.as_ref();
+
+        for _depth in 0..trav.depth.max_hops() {
+            let mut next_frontier = BTreeSet::new();
+            let mut hop_edges: Vec<EdgeIndex> = Vec::new();
+
+            // ── Source/Sink input roles: per-node directed edge iteration ──
+            for &bid in &frontier {
+                let Some(&idx) = self.read_bid_index().get(&bid) else {
+                    continue;
+                };
+
+                if trav.input_roles.contains(Role::Source) {
+                    for edge_ref in graph.edges_directed(idx, petgraph::Direction::Outgoing) {
+                        let ws = edge_ref.weight();
+                        if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                            continue;
                         }
+                        hop_edges.push(edge_ref.id());
+                        self.collect_output_bids(
+                            graph,
+                            &edge_ref,
+                            &trav.output_roles,
+                            &mut next_frontier,
+                        );
                     }
-                    let source = relations.as_graph()[edge.source()];
-                    if let BTreeEntry::Vacant(e) = states.entry(source) {
-                        if let Some(source_state) = self.states().get(&source) {
-                            let mut trace_source = source_state.clone();
-                            trace_source.kind.insert(BeliefKind::Trace);
-                            e.insert(trace_source);
+                }
+
+                if trav.input_roles.contains(Role::Sink) {
+                    for edge_ref in graph.edges_directed(idx, petgraph::Direction::Incoming) {
+                        let ws = edge_ref.weight();
+                        if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                            continue;
+                        }
+                        hop_edges.push(edge_ref.id());
+                        self.collect_output_bids(
+                            graph,
+                            &edge_ref,
+                            &trav.output_roles,
+                            &mut next_frontier,
+                        );
+                    }
+                }
+            }
+
+            // ── Owner input role: use owner_edges memo for O(1) lookup ─────
+            if has_owner_input {
+                for &bid in &frontier {
+                    let bref = bid.bref();
+                    if let Some(edge_indices) = self.owner_edges.get(&bref) {
+                        for &edge_idx in edge_indices {
+                            let Some(ws) = graph.edge_weight(edge_idx) else {
+                                continue;
+                            };
+                            if !edge_matches_with_filter(ws, &trav.kind_filter, edge_filter) {
+                                continue;
+                            }
+                            hop_edges.push(edge_idx);
+                            let Some((src_idx, snk_idx)) = graph.edge_endpoints(edge_idx) else {
+                                continue;
+                            };
+                            if trav.output_roles.contains(Role::Source) {
+                                next_frontier.insert(graph[src_idx]);
+                            }
+                            if trav.output_roles.contains(Role::Sink) {
+                                next_frontier.insert(graph[snk_idx]);
+                            }
                         }
                     }
                 }
-                BeliefGraph { states, relations }
             }
-            Expression::RelationIn(relation_pred) => {
-                let mut states = BTreeMap::new();
-                let mut edges = Vec::new();
-                for edge in self.relations().as_graph().raw_edges() {
-                    let source = self.relations().as_graph()[edge.source()];
-                    let sink = self.relations().as_graph()[edge.target()];
-                    let rel = BeliefRefRelation {
-                        source: &source,
-                        sink: &sink,
-                        weights: &edge.weight,
+
+            // Remove already-visited BIDs from next frontier.
+            next_frontier.retain(|bid| !visited.contains(bid));
+
+            // Record this hop in the tape, sorted by WEIGHT_SORT_KEY.
+            if !hop_edges.is_empty() {
+                // Sort edges by (sort_key, source_bid, sink_bid) so tape entries
+                // reflect structural document order rather than petgraph insertion order.
+                hop_edges.sort_by(|a, b| {
+                    let key_of = |eidx: &EdgeIndex| -> (u16, Bid, Bid) {
+                        let sort_key = graph
+                            .edge_weight(*eidx)
+                            .map(|ws| ws.sort_key(&trav.kind_filter))
+                            .unwrap_or(u16::MAX);
+                        let (src, snk) = graph
+                            .edge_endpoints(*eidx)
+                            .map(|(s, k)| (graph[s], graph[k]))
+                            .unwrap_or((Bid::nil(), Bid::nil()));
+                        (sort_key, src, snk)
                     };
-                    if relation_pred.match_ref(&rel) {
-                        if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                            if let Some(state) = self.states().get(&sink) {
-                                let mut sink_state = state.clone();
-                                // We don't have the entirety of the node relation set, so insert
-                                // the trace nodekind graph color
-                                sink_state.kind.insert(BeliefKind::Trace);
-                                e.insert(sink_state.clone());
-                            }
-                        }
-                        if let BTreeEntry::Vacant(e) = states.entry(source) {
-                            if let Some(state) = self.states().get(&source) {
-                                let mut source_state = state.clone();
-                                // We don't have the entirety of the node relation set, so insert
-                                // the trace nodekind graph color
-                                source_state.kind.insert(BeliefKind::Trace);
-                                e.insert(source_state.clone());
-                            }
-                        }
-                        edges.push(BeliefRelation::from(&rel));
-                    }
-                }
-                BeliefGraph {
-                    states,
-                    relations: BidGraph::from_edges(edges),
-                }
-            }
-            Expression::RelationNotIn(relation_pred) => {
-                let mut states = BTreeMap::new();
-                let mut edges = Vec::new();
-                for edge in self.relations().as_graph().raw_edges() {
-                    let source = self.relations().as_graph()[edge.source()];
-                    let sink = self.relations().as_graph()[edge.target()];
-                    let rel = BeliefRefRelation {
-                        source: &source,
-                        sink: &sink,
-                        weights: &edge.weight,
+                    key_of(a).cmp(&key_of(b))
+                });
+
+                // Derive output BIDs from the sorted edge order so they
+                // inherit structural ordering.
+                let mut ordered_output = Vec::new();
+                let mut seen_output = std::collections::HashSet::new();
+                for &eidx in &hop_edges {
+                    let Some((src_idx, snk_idx)) = graph.edge_endpoints(eidx) else {
+                        continue;
                     };
-                    if !relation_pred.match_ref(&rel) {
-                        if let BTreeEntry::Vacant(e) = states.entry(sink) {
-                            if let Some(state) = self.states().get(&sink) {
-                                let mut sink_state = state.clone();
-                                // We don't have the entirety of the node relation set, so insert
-                                // the trace nodekind graph color
-                                sink_state.kind.insert(BeliefKind::Trace);
-                                e.insert(sink_state.clone());
+                    if trav.output_roles.contains(Role::Source) {
+                        let bid = graph[src_idx];
+                        if next_frontier.contains(&bid) && seen_output.insert(bid) {
+                            ordered_output.push(bid);
+                        }
+                    }
+                    if trav.output_roles.contains(Role::Sink) {
+                        let bid = graph[snk_idx];
+                        if next_frontier.contains(&bid) && seen_output.insert(bid) {
+                            ordered_output.push(bid);
+                        }
+                    }
+                    if trav.output_roles.contains(Role::Owner) {
+                        if let Some(ws) = graph.edge_weight(eidx) {
+                            let brefs = self.brefs();
+                            for weight in ws.weights.values() {
+                                if let Some(owner_str) = weight.get::<String>(WEIGHT_OWNED_BY) {
+                                    if let Ok(bref) = Bref::try_from(owner_str.as_str()) {
+                                        if let Some(&bid) = brefs.get(&bref) {
+                                            if next_frontier.contains(&bid)
+                                                && seen_output.insert(bid)
+                                            {
+                                                ordered_output.push(bid);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        if let BTreeEntry::Vacant(e) = states.entry(source) {
-                            if let Some(state) = self.states().get(&source) {
-                                let mut source_state = state.clone();
-                                // We don't have the entirety of the node relation set, so insert
-                                // the trace nodekind graph color
-                                source_state.kind.insert(BeliefKind::Trace);
-                                e.insert(source_state.clone());
-                            }
-                        }
-                        edges.push(BeliefRelation::from(&rel));
                     }
                 }
-                BeliefGraph {
-                    states,
-                    relations: BidGraph::from_edges(edges),
-                }
+
+                package.tape_mut().steps.push(TapeEntry {
+                    label: label.to_string(),
+                    content: TapeContent::Edges {
+                        edges: hop_edges,
+                        output_bids: ordered_output,
+                    },
+                    payload: None,
+                });
             }
-            Expression::Dyad(lhs_p, op, rhs_p) => {
-                let mut lhs = self.evaluate_expression(lhs_p);
-                let rhs = self.evaluate_expression(rhs_p);
-                match op {
-                    SetOp::Union => lhs.union_mut(&rhs),
-                    SetOp::Intersection => lhs.intersection_mut(&rhs),
-                    SetOp::Difference => lhs.difference_mut(&rhs),
-                    SetOp::SymmetricDifference => lhs.symmetric_difference_mut(&rhs),
+
+            if next_frontier.is_empty() {
+                break;
+            }
+
+            result.extend(next_frontier.iter());
+            visited.extend(next_frontier.iter());
+            frontier = next_frontier;
+        }
+
+        // Ensure at least one tape entry per step so stage() can detect completion.
+        if package.tape().len() == tape_start {
+            tracing::trace!(
+                label = label,
+                input_count = current.len(),
+                "traversal produced no edges — pushing empty tape entry"
+            );
+            package.tape_mut().steps.push(TapeEntry {
+                label: label.to_string(),
+                content: TapeContent::Edges {
+                    edges: vec![],
+                    output_bids: vec![],
+                },
+                payload: None,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Collect output BIDs from an edge based on the requested output roles.
+    ///
+    /// For `Source`/`Sink`: the structural endpoints of the edge.
+    /// For `Owner`: resolves each weight's `WEIGHT_OWNED_BY` bref to a BID
+    /// via the bref index.
+    fn collect_output_bids(
+        &self,
+        graph: &petgraph::stable_graph::StableGraph<Bid, WeightSet>,
+        edge_ref: &petgraph::stable_graph::EdgeReference<'_, WeightSet>,
+        output_roles: &EnumSet<Role>,
+        result: &mut BTreeSet<Bid>,
+    ) {
+        if output_roles.contains(Role::Source) {
+            result.insert(graph[edge_ref.source()]);
+        }
+        if output_roles.contains(Role::Sink) {
+            result.insert(graph[edge_ref.target()]);
+        }
+        if output_roles.contains(Role::Owner) {
+            let brefs = self.brefs();
+            for weight in edge_ref.weight().weights.values() {
+                if let Some(owner_str) = weight.get::<String>(WEIGHT_OWNED_BY) {
+                    if let Ok(bref) = Bref::try_from(owner_str.as_str()) {
+                        if let Some(&bid) = brefs.get(&bref) {
+                            result.insert(bid);
+                        }
+                    }
                 }
-                lhs
             }
         }
     }
+
+    /// Apply a [`Composition`] by evaluating left and right branches and
+    /// combining them with the specified set operation.
+    ///
+    /// Each branch is an independently-seeded pipeline: the first step of
+    /// each branch carries its own seed (Keys/Bids/Corpus) via
+    /// `inject_seed_into_branch`. If the parent compose step has a seed,
+    /// it is used as the initial set; otherwise branches start empty and
+    /// rely on their own first-step seeds.
+    fn apply_composition(
+        &self,
+        seed_tapefn: &TapeFn,
+        _current: &BTreeSet<Bid>,
+        comp: &Composition,
+        text_search: Option<&dyn TextSearchProvider>,
+    ) -> Result<BTreeSet<Bid>, BuildonomyError> {
+        // If the compose step itself has a seed, evaluate it as the initial
+        // set. Otherwise start empty — each branch's first step provides
+        // its own seed via the is_seed() check in apply_projection_steps.
+        let seed = if seed_tapefn.is_seed() {
+            self.eval_seed(seed_tapefn)?
+        } else {
+            BTreeSet::new()
+        };
+        let left =
+            self.apply_projection_steps(seed_tapefn, &comp.left, seed.clone(), text_search)?;
+        let right = self.apply_projection_steps(seed_tapefn, &comp.right, seed, text_search)?;
+
+        let result = match comp.op {
+            CompositionOp::And => left.intersection(&right).copied().collect(),
+            CompositionOp::Or => left.union(&right).copied().collect(),
+            CompositionOp::Not => left.difference(&right).copied().collect(),
+        };
+        Ok(result)
+    }
+}
+
+/// Check whether a [`WeightSet`] matches the kind filter AND the optional edge predicate.
+///
+/// An edge matches if at least one of its `(kind, weight)` entries satisfies:
+/// 1. The kind is in the `kind_filter`
+/// 2. The optional `edge_filter` predicate matches the weight's payload
+fn edge_matches_with_filter(
+    ws: &WeightSet,
+    kind_filter: &EnumSet<WeightKind>,
+    edge_filter: Option<&EdgePredicate>,
+) -> bool {
+    ws.weights.iter().any(|(kind, weight)| {
+        if !kind_filter.contains(*kind) {
+            return false;
+        }
+        match edge_filter {
+            None => true,
+            Some(pred) => pred.matches_weight(weight),
+        }
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl BeliefSource for BeliefBase {
-    async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
-        Ok(self.evaluate_expression(expr))
+    /// Direct in-memory evaluation via the QueryPackage lifecycle.
+    fn evaluate<'a>(
+        &'a self,
+        package: &'a mut QueryPackage,
+    ) -> BoxFuture<'a, Result<(), BuildonomyError>> {
+        Box::pin(async move { self.evaluate_query(package) })
     }
 
     /// Get all paths for a network as (path, target_bid) pairs.
     /// Useful for querying asset manifests or all documents in a network.
     /// Default implementation returns empty (in-memory BeliefBase doesn't cache paths).
-    async fn get_all_paths(
-        &self,
+    fn submap<'a>(
+        &'a self,
         network_bid: Bid,
+        path: &'a str,
+        depth: u8,
         include_index: bool,
-    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
-        Ok(self
-            .paths()
-            .get_map(&network_bid.bref())
-            .map(|pm| {
-                pm.recursive_map(None, &self.paths(), &mut BTreeSet::default())
-                    .into_iter()
-                    .filter_map(|(path, bid, order)| {
-                        // Filter out network index files and subsections
-                        if !include_index && order.contains(&u16::MAX) {
-                            None
-                        } else {
-                            Some((path, bid))
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            Ok(self
+                .paths()
+                .submap(&network_bid.bref(), path, depth, include_index))
+        })
     }
 
-    async fn eval_trace(
-        &self,
-        expr: &Expression,
-        weight_filter: WeightSet,
-    ) -> Result<BeliefGraph, BuildonomyError> {
-        Ok(self.evaluate_expression_as_trace(expr, weight_filter))
+    fn submap_by_bid<'a>(
+        &'a self,
+        network_bid: Bid,
+        entry: Option<Bid>,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            Ok(self
+                .paths()
+                .submap_by_bid(&network_bid.bref(), entry, depth, include_index))
+        })
     }
 
-    async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {
-        // Clone and consume the entire BeliefBase to get complete BeliefGraph
-        Ok(self.clone().consume())
+    /// Export the full graph without halo expansion or Trace coloring.
+    ///
+    /// Uses `QueryPackage::new` (not `balanced`) with all BIDs as a seed
+    /// and an Identity operation. This produces the raw node+edge set —
+    /// equivalent to `SELECT * FROM beliefs; SELECT * FROM relations`
+    /// on the DB path.
+    ///
+    /// Avoids the `consume()` spin-wait that would block a tokio
+    /// `current_thread` executor (e.g. the MCP server).
+    fn export_beliefgraph(&self) -> BoxFuture<'_, Result<BeliefGraph, BuildonomyError>> {
+        Box::pin(async move {
+            let all_bids: Vec<Bid> = self.states().keys().copied().collect();
+            let mut package = QueryPackage::new(QuerySpec::seed(TapeFn::Bids(all_bids)));
+            self.evaluate_query(&mut package)?;
+            Ok(package.into_graph())
+        })
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl BeliefSource for &BeliefBase {
-    async fn eval_unbalanced(&self, expr: &Expression) -> Result<BeliefGraph, BuildonomyError> {
-        Ok(self.evaluate_expression(expr))
+    fn evaluate<'a>(
+        &'a self,
+        package: &'a mut QueryPackage,
+    ) -> BoxFuture<'a, Result<(), BuildonomyError>> {
+        Box::pin(async move { self.evaluate_query(package) })
     }
 
-    async fn get_all_paths(
-        &self,
+    fn submap<'a>(
+        &'a self,
         network_bid: Bid,
+        path: &'a str,
+        depth: u8,
         include_index: bool,
-    ) -> Result<Vec<(String, Bid)>, BuildonomyError> {
-        Ok(self
-            .paths()
-            .get_map(&network_bid.bref())
-            .map(|pm| {
-                pm.recursive_map(None, &self.paths(), &mut BTreeSet::default())
-                    .into_iter()
-                    .filter_map(|(path, bid, order)| {
-                        // Filter out network index files and subsections
-                        if path.is_empty() || !include_index && order.contains(&u16::MAX) {
-                            None
-                        } else {
-                            Some((path, bid))
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            Ok(self
+                .paths()
+                .submap(&network_bid.bref(), path, depth, include_index)
+                .into_iter()
+                .filter(|(p, _bid, _order)| !p.is_empty())
+                .collect())
+        })
     }
 
-    async fn eval_trace(
-        &self,
-        expr: &Expression,
-        weight_filter: WeightSet,
-    ) -> Result<BeliefGraph, BuildonomyError> {
-        Ok(self.evaluate_expression_as_trace(expr, weight_filter))
+    fn submap_by_bid<'a>(
+        &'a self,
+        network_bid: Bid,
+        entry: Option<Bid>,
+        depth: u8,
+        include_index: bool,
+    ) -> BoxFuture<'a, SubmapResult> {
+        Box::pin(async move {
+            Ok(self
+                .paths()
+                .submap_by_bid(&network_bid.bref(), entry, depth, include_index)
+                .into_iter()
+                .filter(|(p, _bid, _order)| !p.is_empty())
+                .collect())
+        })
     }
 
-    async fn export_beliefgraph(&self) -> Result<BeliefGraph, BuildonomyError> {
-        // Clone and consume the entire BeliefBase to get complete BeliefGraph
-        Ok((*self).clone().consume())
+    /// Export the full graph without halo expansion or Trace coloring.
+    /// See [`BeliefSource::export_beliefgraph`] on `BeliefBase` for rationale.
+    fn export_beliefgraph(&self) -> BoxFuture<'_, Result<BeliefGraph, BuildonomyError>> {
+        Box::pin(async move {
+            let all_bids: Vec<Bid> = self.states().keys().copied().collect();
+            let mut package = QueryPackage::new(QuerySpec::seed(TapeFn::Bids(all_bids)));
+            self.evaluate_query(&mut package)?;
+            Ok(package.into_graph())
+        })
     }
 }

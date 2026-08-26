@@ -5,15 +5,59 @@ use crate::{
     beliefbase::{BeliefBase, BidGraph},
     event::BeliefEvent,
     nodekey::NodeKey,
-    paths::{to_anchor, PathMapMap, NETWORK_SECTION_SORT_KEY},
+    paths::{serialize_order, to_anchor, PathMap, PathMapMap, NETWORK_SECTION_SORT_KEY},
     properties::{
-        BeliefKind, BeliefKindSet, BeliefNode, Bid, Bref, Weight, WeightKind, WeightSet,
+        BeliefKind, BeliefKindSet, BeliefNode, Bid, Bref, NodeId, Weight, WeightKind, WeightSet,
         WEIGHT_SORT_KEY,
     },
 };
 use parking_lot::RwLock;
-use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
+use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+use rustc_hash::FxHashMap;
+use std::{collections::BTreeSet, sync::Arc};
 use test_log::test;
+
+/// Assert that `pm`'s `bid_map`/`order_map`/`path_map` exactly match what a
+/// from-scratch scan of `pm.map()` would produce.
+///
+/// This is the safety net for the `map_insert`/`map_remove`/`patch_order_in_place`
+/// helpers in `PathMap::process_relation_update`, which patch indices in place
+/// instead of clearing and rebuilding all index maps after every mutation.
+/// A bug in any of those helpers (an off-by-one shift, a stale key left behind,
+/// etc.) would show up here as a mismatch against the ground-truth scan, even if
+/// the resulting `path` strings all happen to be correct (which is all the
+/// existing `test_event_driven_pathmap_matches_constructor` checks).
+///
+/// `path_map` is covered here as well: a desynchronised path index does not
+/// crash, it silently fails to resolve a link, so it needs a ground-truth check
+/// that runs in the default test suite.
+fn assert_pathmap_indices_consistent(pm: &PathMap, label: &str) {
+    let mut expected_bid_map: FxHashMap<Bid, Vec<usize>> = FxHashMap::default();
+    let mut expected_order_map: FxHashMap<String, usize> = FxHashMap::default();
+    // `path_map` is scalar: one path resolves to one entry. Last writer wins,
+    // matching `rebuild_indices`.
+    let mut expected_path_map: FxHashMap<String, usize> = FxHashMap::default();
+    for (idx, (path, bid, order)) in pm.map().iter().enumerate() {
+        expected_bid_map.entry(*bid).or_default().push(idx);
+        expected_order_map.insert(serialize_order(order), idx);
+        expected_path_map.insert(path.clone(), idx);
+    }
+    assert_eq!(
+        pm.bid_map(),
+        &expected_bid_map,
+        "{label}: bid_map diverged from a from-scratch scan of pm.map()"
+    );
+    assert_eq!(
+        pm.order_map(),
+        &expected_order_map,
+        "{label}: order_map diverged from a from-scratch scan of pm.map()"
+    );
+    assert_eq!(
+        pm.path_map(),
+        &expected_path_map,
+        "{label}: path_map diverged from a from-scratch scan of pm.map()"
+    );
+}
 
 #[test]
 fn test_relation_removal_triggers_reindexing() {
@@ -35,7 +79,7 @@ fn test_relation_removal_triggers_reindexing() {
         .unwrap();
 
     // Verify initial state is balanced
-    let errors = set.built_in_test(true);
+    let errors = set.built_in_test();
     assert!(
         errors.is_empty(),
         "Initial state should be balanced:\n{}",
@@ -76,7 +120,7 @@ fn test_relation_removal_triggers_reindexing() {
     );
 
     // Verify set is still balanced after removal
-    let final_errors = set.built_in_test(false);
+    let final_errors = set.check_path_invariants();
     assert!(
         final_errors.is_empty(),
         "Final state should be balanced: {final_errors:?}"
@@ -108,7 +152,7 @@ fn test_parent_reindex_updates_child_order_vectors() {
 
     let insert_event = BeliefEvent::NodeUpdate(
         vec![],
-        toml::to_string(&grandchild).unwrap(),
+        grandchild.clone(),
         crate::event::EventOrigin::Remote,
     );
     set.process_event(&insert_event).unwrap();
@@ -216,6 +260,23 @@ fn test_event_driven_pathmap_matches_constructor() {
         crate::event::EventOrigin::Remote,
     );
     set.process_event(&update_event).unwrap();
+
+    // The incremental map_insert/map_remove/patch_order_in_place helpers in
+    // process_relation_update must keep bid_map/order_map exactly in
+    // sync with pm.map() -- not just "the path strings happen to match", which
+    // is all the paths_eq assertion below actually checks.
+    {
+        let paths_event = set.paths();
+        let net_bref = paths_event
+            .nets()
+            .iter()
+            .find(|bid| **bid != set.api().bid)
+            .cloned()
+            .unwrap()
+            .bref();
+        let pm = paths_event.get_map(&net_bref).unwrap();
+        assert_pathmap_indices_consistent(&pm, "after child1 reorder");
+    }
 
     // Get event-driven paths
     let paths_event = set.paths();
@@ -374,6 +435,370 @@ fn test_pathmap_multiple_paths_per_relation() {
     );
 }
 
+/// Repeatedly append new children under the same sink, simulating how a
+/// const-namespace PathMap (e.g. href_namespace/asset_namespace) grows across
+/// the whole session as more documents are parsed/merged — always adding new
+/// entries at (or near) the tail rather than replacing existing ones.
+///
+/// This exercises `map_insert`'s common-case path (append) directly and checks
+/// that `bid_map`/`order_map` stay exactly consistent with `pm.map()`
+/// after every single insertion, not just at the end.
+#[test]
+fn test_incremental_append_keeps_indices_consistent() {
+    let mut set = create_balanced_test_beliefbase();
+
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+
+    let net_bref = network.bid.bref();
+
+    // Append 10 new document children under the network root, one event at a
+    // time, each with a strictly increasing sort key so every insertion lands
+    // at the tail — the common case for ever-growing namespace PathMaps.
+    for i in 0..10u16 {
+        let new_doc = create_test_node(&format!("Appended Doc {i}"), BeliefKind::Document);
+        let insert_event =
+            BeliefEvent::NodeUpdate(vec![], new_doc.clone(), crate::event::EventOrigin::Remote);
+        set.process_event(&insert_event).unwrap();
+
+        // Existing children (Parent Document at 0) occupy index 0, so start
+        // appended docs at sort key 1 and up.
+        let mut w = Weight::default();
+        w.set(WEIGHT_SORT_KEY, 1u16 + i).ok();
+        let relation_event = BeliefEvent::RelationChange(
+            new_doc.bid,
+            network.bid,
+            WeightKind::Section,
+            Some(w),
+            crate::event::EventOrigin::Remote,
+        );
+        set.process_event(&relation_event).unwrap();
+
+        let paths = set.paths();
+        let pm = paths.get_map(&net_bref).unwrap();
+        assert_pathmap_indices_consistent(&pm, &format!("after appending doc {i}"));
+    }
+
+    // Final sanity check: all 10 appended docs plus the original parent doc
+    // are present with distinct paths.
+    let paths = set.paths();
+    let pm = paths.get_map(&net_bref).unwrap();
+    let doc_count = pm
+        .map()
+        .iter()
+        .filter(|(_, bid, _)| {
+            set.states()
+                .get(bid)
+                .is_some_and(|n| n.title.starts_with("Appended Doc"))
+        })
+        .count();
+    assert_eq!(doc_count, 10, "all 10 appended docs should be present");
+}
+
+/// The collision check in `generate_path_name_with_collision_check`
+/// resolves candidates through the `path_map` index instead of scanning the whole
+/// map. The index must return exactly the entries a scan would have matched, for
+/// every path present *and* absent, or a collision is silently missed (producing a
+/// duplicate path) or falsely reported (producing a spurious bref fallback).
+///
+/// This asserts that equivalence directly against a ground-truth scan, rather than
+/// inferring it from the absence of downstream symptoms.
+#[test]
+fn test_path_index_lookup_matches_full_scan() {
+    let mut set = create_balanced_test_beliefbase();
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+    let net_bref = network.bid.bref();
+
+    // Build up a map with several siblings, including two that will produce the
+    // same title-derived path segment (a real collision) so the duplicate-path
+    // branch is exercised, not just the unique-path one.
+    for (i, title) in ["Alpha", "Beta", "Alpha", "Gamma", "Beta"]
+        .iter()
+        .enumerate()
+    {
+        let doc = create_test_node(title, BeliefKind::Document);
+        set.process_event(&BeliefEvent::NodeUpdate(
+            vec![],
+            doc.clone(),
+            crate::event::EventOrigin::Remote,
+        ))
+        .unwrap();
+        let mut w = Weight::default();
+        w.set(WEIGHT_SORT_KEY, 1u16 + i as u16).ok();
+        set.process_event(&BeliefEvent::RelationChange(
+            doc.bid,
+            network.bid,
+            WeightKind::Section,
+            Some(w),
+            crate::event::EventOrigin::Remote,
+        ))
+        .unwrap();
+    }
+
+    let paths = set.paths();
+    let pm = paths.get_map(&net_bref).unwrap();
+    assert_pathmap_indices_consistent(&pm, "after building collision fixture");
+
+    // Every path present in the map must resolve, via the index, to exactly the
+    // set of entries a linear scan would find.
+    let map = pm.map();
+    assert!(map.len() >= 5, "fixture should have produced entries");
+    for (path, _, _) in map.iter() {
+        let by_scan: Vec<(usize, Bid)> = map
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _, _))| p == path)
+            .map(|(i, (_, bid, _))| (i, *bid))
+            .collect();
+        let by_index: Vec<(usize, Bid)> = {
+            let mut v: Vec<(usize, Bid)> = pm
+                .path_map()
+                .get(path)
+                .map(|&i| vec![(i, map[i].1)])
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            by_index, by_scan,
+            "path_map lookup for {path:?} disagrees with a full scan of pm.map()"
+        );
+    }
+
+    // A path that is absent must yield no candidates — the no-collision fast path.
+    assert!(
+        pm.path_map().get("definitely/not/present.md").is_none(),
+        "absent path should have no index entry"
+    );
+
+    // Paths must be unique per BID: the collision check is what guarantees this,
+    // so a regression in it shows up here as two different BIDs sharing a path.
+    let mut seen: std::collections::HashMap<&String, Bid> = std::collections::HashMap::new();
+    for (path, bid, _) in map.iter() {
+        if let Some(prev) = seen.insert(path, *bid) {
+            assert_eq!(
+                prev, *bid,
+                "two distinct BIDs share path {path:?} — collision check failed to disambiguate"
+            );
+        }
+    }
+}
+
+/// Insert a new child in the *middle* of an existing sibling range (not at the
+/// tail), forcing `map_insert` to shift every entry after the insertion point.
+/// Verifies the shift correctly patches `bid_map`/`order_map` for
+/// every shifted entry, not just the newly inserted one.
+#[test]
+fn test_incremental_mid_insert_shifts_indices_consistently() {
+    let mut set = create_balanced_test_beliefbase();
+
+    let parent_doc = set
+        .states()
+        .values()
+        .find(|n| n.title == "Parent Document")
+        .unwrap()
+        .clone();
+
+    // Force a genuine mid-map insert into `parent_doc`'s children (initially
+    // Child 1/2/3 at sort keys 0/1/2) WITHOUT ever passing through an invalid
+    // intermediate state where two edges into the same sink share a sort key.
+    // Real production code (assign_sort_key + reindex_sink_edges) never
+    // produces duplicate sort keys on one sink, and order_map — a
+    // BTreeMap<String, usize> keyed by the order vector — cannot represent
+    // two *different* sources sharing one order key, so testing that
+    // (invalid) state would exercise behavior nothing in the codebase
+    // actually relies on.
+    //
+    // Valid sequence to insert a new child at position 1 (between Child 1 and
+    // Child 2), vacating key 1 without ever colliding:
+    //   1. Move Child 3 from 2 -> 3 (3 is free)
+    //   2. Move Child 2 from 1 -> 2 (now free, vacated by step 1)
+    //   3. Insert the new child at 1 (now free, vacated by step 2)
+    let child2 = set
+        .states()
+        .values()
+        .find(|n| n.title == "Child 2")
+        .unwrap()
+        .clone();
+    let child3 = set
+        .states()
+        .values()
+        .find(|n| n.title == "Child 3")
+        .unwrap()
+        .clone();
+
+    let bump = |set: &mut BeliefBase, bid: Bid, sink: Bid, new_key: u16| {
+        let mut w = Weight::default();
+        w.set(WEIGHT_SORT_KEY, new_key).ok();
+        let mut ws = WeightSet::empty();
+        ws.set(WeightKind::Section, w);
+        set.process_event(&BeliefEvent::RelationUpdate(
+            bid,
+            sink,
+            ws,
+            crate::event::EventOrigin::Remote,
+        ))
+        .unwrap();
+    };
+    bump(&mut set, child3.bid, parent_doc.bid, 3);
+    bump(&mut set, child2.bid, parent_doc.bid, 2);
+
+    let new_child = create_test_node("Inserted Between", BeliefKind::Document);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        new_child.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut w = Weight::default();
+    w.set(WEIGHT_SORT_KEY, 1u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        new_child.bid,
+        parent_doc.bid,
+        WeightKind::Section,
+        Some(w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let paths = set.paths();
+    let net_bref = paths
+        .nets()
+        .iter()
+        .find(|bid| **bid != set.api().bid)
+        .cloned()
+        .unwrap()
+        .bref();
+    let pm = paths.get_map(&net_bref).unwrap();
+    assert_pathmap_indices_consistent(&pm, "after mid-map insert + reorder");
+
+    // Child 1, the new child, Child 2, and Child 3 must all still be reachable
+    // at distinct paths, in that relative order — i.e. the shift correctly
+    // repositioned every sibling, not just the ones adjacent to the insertion.
+    let ordered_titles: Vec<String> = pm
+        .map()
+        .iter()
+        .filter(|(_, bid, _)| {
+            set.states().get(bid).is_some_and(|n| {
+                n.kind.contains(BeliefKind::Document) && n.title != "Parent Document"
+            })
+        })
+        .map(|(_, bid, _)| set.states().get(bid).unwrap().title.clone())
+        .collect();
+    assert_eq!(
+        ordered_titles,
+        vec!["Child 1", "Inserted Between", "Child 2", "Child 3"],
+        "children should be positioned in sort-key order after the mid-map insert"
+    );
+}
+
+/// Remove a child, then add more children under the same sink. Exercises
+/// `map_remove` followed by further `map_insert` calls in the same PathMap,
+/// checking that removal's index patch-up doesn't leave stale entries behind
+/// for insertions that come after it.
+#[test]
+fn test_incremental_remove_then_insert_keeps_indices_consistent() {
+    let mut set = create_balanced_test_beliefbase();
+
+    let child2 = set
+        .states()
+        .values()
+        .find(|n| n.title == "Child 2")
+        .unwrap()
+        .clone();
+    let parent_doc = set
+        .states()
+        .values()
+        .find(|n| n.title == "Parent Document")
+        .unwrap()
+        .clone();
+
+    // Remove Child 2 (middle element) — triggers reindexing of Child 3.
+    set.process_event(&BeliefEvent::NodesRemoved(
+        vec![child2.bid],
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    {
+        let paths = set.paths();
+        let net_bref = paths
+            .nets()
+            .iter()
+            .find(|bid| **bid != set.api().bid)
+            .cloned()
+            .unwrap()
+            .bref();
+        let pm = paths.get_map(&net_bref).unwrap();
+        assert_pathmap_indices_consistent(&pm, "after removing Child 2");
+    }
+
+    // Now add a brand new child under Parent Document, appended after the
+    // reindexed Child 3.
+    let new_child = create_test_node("Child 4", BeliefKind::Document);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        new_child.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut w = Weight::default();
+    w.set(WEIGHT_SORT_KEY, 2u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        new_child.bid,
+        parent_doc.bid,
+        WeightKind::Section,
+        Some(w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let paths = set.paths();
+    let net_bref = paths
+        .nets()
+        .iter()
+        .find(|bid| **bid != set.api().bid)
+        .cloned()
+        .unwrap()
+        .bref();
+    let pm = paths.get_map(&net_bref).unwrap();
+    assert_pathmap_indices_consistent(&pm, "after remove then insert");
+
+    // Compare against a from-scratch constructor PathMapMap to double check
+    // path strings are also correct, not just internally self-consistent.
+    drop(pm);
+    drop(paths);
+    let relations_guard = set.relations();
+    let relations_arc = Arc::new(RwLock::new(relations_guard.clone()));
+    let paths_constructor = PathMapMap::new(set.states(), relations_arc);
+    let constructor_paths: BTreeSet<String> = paths_constructor
+        .all_paths()
+        .values()
+        .flatten()
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    let event_paths: BTreeSet<String> = set
+        .paths()
+        .all_paths()
+        .values()
+        .flatten()
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    assert_eq!(
+        event_paths, constructor_paths,
+        "Event-driven and constructor PathMaps must agree after remove+insert"
+    );
+}
+
 /// Build a BeliefBase containing a network node, two document children, and two anchor
 /// (heading/section) children — the minimal structure needed to test sort-space separation.
 ///
@@ -390,7 +815,7 @@ fn test_pathmap_multiple_paths_per_relation() {
 fn create_network_with_docs_and_anchors() -> BeliefBase {
     init_logging();
 
-    let mut states = BTreeMap::new();
+    let mut states = FxHashMap::default();
 
     let api = BeliefNode::api_state();
     states.insert(api.bid, api.clone());
@@ -400,7 +825,7 @@ fn create_network_with_docs_and_anchors() -> BeliefBase {
         bid: Bid::new(api.bid),
         title: "Test Network".to_string(),
         kind: BeliefKindSet(BeliefKind::Network.into()),
-        id: Some(to_anchor("test-network")),
+        id: NodeId::Explicit(to_anchor("test-network")),
         ..Default::default()
     };
     states.insert(net.bid, net.clone());
@@ -410,14 +835,14 @@ fn create_network_with_docs_and_anchors() -> BeliefBase {
         bid: Bid::new(net.bid),
         title: "Doc A".to_string(),
         kind: BeliefKindSet(BeliefKind::Document.into()),
-        id: Some(to_anchor("doc-a")),
+        id: NodeId::Explicit(to_anchor("doc-a")),
         ..Default::default()
     };
     let doc_b = BeliefNode {
         bid: Bid::new(net.bid),
         title: "Doc B".to_string(),
         kind: BeliefKindSet(BeliefKind::Document.into()),
-        id: Some(to_anchor("doc-b")),
+        id: NodeId::Explicit(to_anchor("doc-b")),
         ..Default::default()
     };
     states.insert(doc_a.bid, doc_a.clone());
@@ -428,14 +853,14 @@ fn create_network_with_docs_and_anchors() -> BeliefBase {
         bid: Bid::new(net.bid),
         title: "Heading X".to_string(),
         kind: BeliefKindSet(BeliefKind::Symbol.into()),
-        id: Some(to_anchor("heading-x")),
+        id: NodeId::Explicit(to_anchor("heading-x")),
         ..Default::default()
     };
     let anchor_y = BeliefNode {
         bid: Bid::new(net.bid),
         title: "Heading Y".to_string(),
         kind: BeliefKindSet(BeliefKind::Symbol.into()),
-        id: Some(to_anchor("heading-y")),
+        id: NodeId::Explicit(to_anchor("heading-y")),
         ..Default::default()
     };
     states.insert(anchor_x.bid, anchor_x.clone());
@@ -568,10 +993,10 @@ fn test_network_section_sort_key_reservation() {
     assert_network_sort_space_invariant(&set, net_bid, "constructor");
 
     // ── 2. BeliefBase invariant ───────────────────────────────────────────────
-    // built_in_test(true) checks edge sort keys. For network nodes it verifies
+    // built_in_test() checks edge sort keys. For network nodes it verifies
     // docs and anchors are each independently contiguous (not globally contiguous),
     // so the [0, 1] doc keys and [0, 1] anchor keys both satisfy the invariant.
-    let errors = set.built_in_test(true);
+    let errors = set.built_in_test();
     assert!(
         errors.is_empty(),
         "BeliefBase invariants must hold after network section sort key setup:\n{}",
@@ -625,6 +1050,12 @@ fn test_network_section_sort_key_reservation() {
 
     assert_network_sort_space_invariant(&set, net_bid, "event-driven");
 
+    {
+        let paths = set.paths();
+        let pm = paths.get_map(&net_bid.bref()).unwrap();
+        assert_pathmap_indices_consistent(&pm, "after doc_a/anchor_x re-issue");
+    }
+
     // Verify event-driven PathMap still matches a fresh constructor PathMap
     let relations_guard = set.relations();
     let relations_arc = Arc::new(RwLock::new(relations_guard.clone()));
@@ -656,5 +1087,810 @@ fn test_network_section_sort_key_reservation() {
         constructor_paths
             .difference(&event_paths)
             .collect::<Vec<_>>(),
+    );
+}
+
+/// `indexed_path` narrows its candidate networks through the `node_to_nets`
+/// reverse index instead of probing every `PathMap`. The narrowed lookup must
+/// return *exactly* what the exhaustive scan returns, for every BID in the
+/// graph and for BIDs that are absent — otherwise a node silently resolves to
+/// the wrong home network, or to none at all.
+///
+/// The subtle case this guards: `node_to_nets` records only *direct*
+/// containment, while `PathMap::path` also resolves a BID held by a subnet by
+/// recursing into it. If the narrowing dropped subnet-holding parents, a node
+/// reachable only through a subnet would regress to `None`. The fixture below
+/// includes a subnet for that reason.
+///
+/// Asserted against ground truth rather than inferred from downstream symptoms,
+/// mirroring `test_path_index_lookup_matches_full_scan`.
+#[test]
+fn test_indexed_path_narrowing_matches_full_scan() {
+    let set = create_balanced_test_beliefbase();
+    let paths = set.paths();
+
+    // The balanced fixture must actually contain a subnet, or the case this
+    // test exists to cover would be vacuous.
+    let has_subnet = paths
+        .map()
+        .values()
+        .any(|pm| !pm.read().subnets().is_empty());
+    assert!(
+        has_subnet,
+        "fixture must contain a subnet for the recursion case to be covered"
+    );
+
+    // Every BID the graph knows about must resolve identically both ways.
+    for bid in set.states().keys() {
+        assert_eq!(
+            paths.indexed_path(bid),
+            paths.scan_indexed_path(bid),
+            "narrowed indexed_path disagreed with full scan for {bid}"
+        );
+    }
+
+    // An unknown BID has no reverse-index entry and must take the fallback
+    // path, still agreeing with the scan (both should be None).
+    let unknown = Bid::new(Bid::nil());
+    assert_eq!(
+        paths.indexed_path(&unknown),
+        paths.scan_indexed_path(&unknown),
+        "narrowed indexed_path disagreed with full scan for an unknown BID"
+    );
+}
+
+/// The subnet-holder set consulted by `indexed_path` is a *cache*, so the
+/// failure mode is staleness: a network that gains a subnet after the cache is
+/// warmed would be skipped as a candidate, and nodes reachable only through
+/// that subnet would silently resolve to `None`.
+///
+/// This warms the cache, then mutates the graph so a network gains a subnet,
+/// and re-checks equivalence against the exhaustive scan. Without invalidation
+/// this fails; the narrowing test above would not catch it, because it never
+/// mutates after reading.
+#[test]
+fn test_indexed_path_narrowing_survives_subnet_mutation() {
+    let mut set = create_balanced_test_beliefbase();
+
+    // Warm the cache in the *live* PathMapMap (not a temporary), so the
+    // memoized subnet-holder set is the one the mutation below must invalidate.
+    let warmed_holders = {
+        let paths = set.paths();
+        for bid in set.states().keys() {
+            let _ = paths.indexed_path(bid);
+        }
+        paths.subnet_ancestors_for_test()
+    };
+
+    // Introduce a new network and nest it under an existing one, so the parent
+    // gains a subnet it did not have when the cache was warmed.
+    let parent = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+    let child_net = create_test_node("Nested Network", BeliefKind::Network);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        child_net.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        child_net.bid,
+        parent.bid,
+        WeightKind::Section,
+        Some(Weight::default()),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    // Add a document inside the nested network: reachable from the parent only
+    // by recursing into the subnet, which is precisely the case the cache
+    // controls.
+    let nested_doc = create_test_node("Nested Doc", BeliefKind::Document);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        nested_doc.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        nested_doc.bid,
+        child_net.bid,
+        WeightKind::Section,
+        Some(Weight::default()),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let paths = set.paths();
+
+    // The parent must actually have gained a subnet, or the mutation did not
+    // exercise the case and the assertions below would be vacuous.
+    let holders_now = paths.subnet_ancestors_for_test();
+    let child_bref = child_net.bid.bref();
+    assert!(
+        holders_now
+            .get(&child_bref)
+            .is_some_and(|a| a.contains(&parent.bid.bref())),
+        "fixture did not nest the child under the parent — test would be vacuous"
+    );
+    assert!(
+        !warmed_holders.contains_key(&child_bref),
+        "child was already a subnet before mutation — test would be vacuous"
+    );
+
+    for bid in set.states().keys() {
+        assert_eq!(
+            paths.indexed_path(bid),
+            paths.scan_indexed_path(bid),
+            "narrowed indexed_path disagreed with full scan after subnet mutation \
+             for {bid} — subnet-holder cache is likely stale"
+        );
+    }
+}
+
+/// `indexed_path`'s fallback exists for BIDs absent from `node_to_nets`, and
+/// it costs a probe of *every* network. That is only acceptable if the index
+/// is genuinely incomplete; if `node_to_nets` covers every BID any `PathMap`
+/// can resolve, a miss is proof of absence and the scan is pure waste.
+///
+/// This asserts that completeness invariant directly: for every BID in the
+/// graph, a `node_to_nets` miss implies the exhaustive scan also finds nothing.
+#[test]
+fn test_node_to_nets_miss_implies_no_path() {
+    let set = create_balanced_test_beliefbase();
+    let paths = set.paths();
+
+    let mut checked_misses = 0usize;
+    for bid in set.states().keys() {
+        if paths.node_to_nets_contains_for_test(bid) {
+            continue;
+        }
+        checked_misses += 1;
+        assert_eq!(
+            paths.scan_indexed_path(bid),
+            None,
+            "BID {bid} is absent from node_to_nets yet the exhaustive scan \
+             resolves it — the index is incomplete and the fallback is load-bearing"
+        );
+    }
+
+    // Also check a BID the map has never seen, which must miss both ways.
+    let unknown = Bid::new(Bid::nil());
+    assert!(!paths.node_to_nets_contains_for_test(&unknown));
+    assert_eq!(paths.scan_indexed_path(&unknown), None);
+    checked_misses += 1;
+
+    assert!(
+        checked_misses > 0,
+        "fixture produced no index misses — invariant untested"
+    );
+}
+
+/// The `indexed_path` counters exist to say *which* of its two routes costs
+/// the time. A counter that never moves, or that attributes to the wrong
+/// route, is worse than none — it produces confident wrong conclusions.
+///
+/// Asserts both routes are actually reached and increment their own counters:
+/// a known BID takes the narrowed route, an unknown BID takes the fallback.
+///
+/// The counters are process-global statics and other tests in this binary also
+/// call `indexed_path`, so this is `#[serial]` and asserts *lower bounds on
+/// deltas* rather than exact equality — an exact-match version would pass or
+/// fail depending on thread scheduling.
+#[test]
+#[serial_test::serial]
+fn test_indexed_path_counters_attribute_to_the_right_route() {
+    let set = create_balanced_test_beliefbase();
+    let paths = set.paths();
+
+    let known = *set.states().keys().next().unwrap();
+    let unknown = Bid::new(Bid::nil());
+
+    let before = crate::paths::pathmap::indexed_path_stats();
+    let _ = paths.indexed_path(&known);
+    let after_known = crate::paths::pathmap::indexed_path_stats();
+
+    assert!(
+        after_known.0 > before.0,
+        "a known BID must increment the indexed-route call counter"
+    );
+    assert_eq!(
+        after_known.1, before.1,
+        "a known BID must not touch the fallback counter"
+    );
+    assert!(
+        after_known.2 > before.2,
+        "the indexed route must record at least one probe"
+    );
+
+    let _ = paths.indexed_path(&unknown);
+    let after_unknown = crate::paths::pathmap::indexed_path_stats();
+
+    assert!(
+        after_unknown.1 > after_known.1,
+        "an unknown BID must increment the no-index call counter"
+    );
+    // An index miss short-circuits to `None` instead of scanning every network,
+    // so it must record *no* probes. This is the assertion that would catch a
+    // reintroduced exhaustive fallback.
+    assert_eq!(
+        after_unknown.2, after_known.2,
+        "an index miss must probe nothing — a nonzero probe count means the \
+         exhaustive scan is back on the hot path"
+    );
+}
+
+/// Regression: the malformed `index.md<dir>/<slug>` path.
+///
+/// A corpus run produced 51,591 distinct paths of the form
+/// `index.md<repo-dir>/<heading-slug>` — the network filename concatenated
+/// to `<repo-dir-name>/<slug>` with no separator. Every one had exactly one
+/// slash and the repo directory name as its first segment, and the slug was an
+/// ordinary heading anchor.
+///
+/// The shape that produces it: heading anchors parented **directly to the
+/// network root**, which is the `sink == net && is_anchor(source)` branch in
+/// `PathMap::new`. That branch prepends `network_filename` on the assumption
+/// that `anchorize` returned a leading `#`.
+///
+/// This test asserts the *correct* behaviour, so it fails while the defect is
+/// live and documents the fix when it lands.
+#[test]
+fn test_network_index_anchor_path_is_well_formed() {
+    let mut set = create_balanced_test_beliefbase();
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+    let net_bref = network.bid.bref();
+
+    // A heading anchor hanging directly off the network root — what an
+    // `index.md` containing `## Slide 1` produces.
+    let anchor = create_test_node("Slide 1", BeliefKind::Core);
+    assert!(
+        anchor.kind.is_anchor(),
+        "fixture node must classify as an anchor"
+    );
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        anchor.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let mut w = Weight::default();
+    w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        anchor.bid,
+        network.bid,
+        WeightKind::Section,
+        Some(w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let entry_for = |pmm: &PathMapMap| -> String {
+        pmm.get_map(&net_bref)
+            .unwrap()
+            .map()
+            .iter()
+            .find(|(_, bid, _)| *bid == anchor.bid)
+            .map(|(path, _, _)| path.clone())
+            .expect("anchor should have a PathMap entry")
+    };
+
+    // Both construction paths must agree and both must be well-formed. The
+    // event-driven path (process_event) and the from-scratch constructor
+    // (PathMapMap::new, which runs the DFS in PathMap::new) reach the
+    // NETWORK_SECTION_SORT_KEY branch by different routes.
+    let event_entry = entry_for(&set.paths());
+
+    let relations_arc = Arc::new(RwLock::new(set.relations().clone()));
+    let constructed = PathMapMap::new(set.states(), relations_arc);
+    let ctor_entry = entry_for(&constructed);
+
+    for (label, entry) in [("event-driven", &event_entry), ("constructor", &ctor_entry)] {
+        assert!(
+            entry.contains('#'),
+            "{label}: network-index anchor path must contain '#', got {entry:?}"
+        );
+        assert!(
+            !entry.contains("index.md") || entry.contains("index.md#"),
+            "{label}: network filename must be followed by '#', got {entry:?}"
+        );
+    }
+    assert_eq!(
+        event_entry, ctor_entry,
+        "event-driven and constructor paths diverged"
+    );
+}
+
+/// Regression: an explicit `doc_path` on an anchor parented directly to a
+/// network must not be prefixed with the network filename.
+///
+/// This is the shape an `alias-template` registration produces: the node is an
+/// anchor (a heading), its Section sink *is* a network (the href namespace), and
+/// its `doc_paths` weight carries a complete path that never passed through
+/// `anchorize`. The NETWORK_SECTION_SORT_KEY branch used to prepend the network
+/// filename unconditionally, yielding `index.md<path>` — unreachable, and shared
+/// by every alias in that namespace. Measured on one corpus: 51,591 such paths.
+///
+/// Bare `#anchor` subpaths must still be qualified, so both cases are asserted.
+#[test]
+fn test_explicit_doc_path_on_network_anchor_is_not_prefixed() {
+    let mut set = create_balanced_test_beliefbase();
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+    let net_bref = network.bid.bref();
+
+    // An anchor carrying an explicit alias-style doc_path, hung off the network.
+    let aliased = create_test_node("Aliased Section", BeliefKind::Core);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        aliased.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let mut w = Weight::default();
+    w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    w.set_doc_paths(vec!["catalog/some-product".to_string()])
+        .unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        aliased.bid,
+        network.bid,
+        WeightKind::Section,
+        Some(w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let relations_arc = Arc::new(RwLock::new(set.relations().clone()));
+    let constructed = PathMapMap::new(set.states(), relations_arc);
+    let entry = constructed
+        .get_map(&net_bref)
+        .unwrap()
+        .map()
+        .iter()
+        .find(|(_, bid, _)| *bid == aliased.bid)
+        .map(|(path, _, _)| path.clone())
+        .expect("aliased anchor should have a PathMap entry");
+
+    assert_eq!(
+        entry, "catalog/some-product",
+        "an explicit doc_path must be stored verbatim, not prefixed with the \
+         network filename"
+    );
+    assert!(
+        !entry.starts_with("index.md"),
+        "network filename must not be glued onto a complete path, got {entry:?}"
+    );
+}
+
+/// Regression: `anchorize` returns a subpath unmodified for URLs and
+/// absolute paths, but `PathMap::new`'s NETWORK_SECTION_SORT_KEY branch prepends
+/// the network filename assuming a leading '#'. Confirm the two probes that
+/// detect that mismatch are reachable, so a zero-hit corpus run means "did not
+/// occur" rather than "cannot fire".
+#[test]
+fn test_anchorize_carveout_probe_is_reachable() {
+    let set = create_balanced_test_beliefbase();
+    let paths = set.paths();
+    // `PathMapMap::is_anchor` is `!docs.contains(bid)`, so any BID the map has
+    // never seen is treated as an anchor — which is exactly the classification
+    // the carve-out below operates under.
+    let anchor_bid = Bid::new(Bid::nil());
+    assert!(
+        paths.is_anchor(&anchor_bid),
+        "an unknown BID should classify as an anchor"
+    );
+
+    // Normal slug: gets a '#'.
+    let normal = paths.anchorize(&anchor_bid, "some-heading");
+    assert!(
+        normal.starts_with('#'),
+        "plain slug should be anchorized, got {normal:?}"
+    );
+
+    // URL: hits the carve-out and comes back unprefixed -- the shape that
+    // produces `index.md<subpath>` downstream.
+    let url = paths.anchorize(&anchor_bid, "https://example.com/browse/X-1");
+    assert!(
+        !url.starts_with('#'),
+        "URL should bypass anchorization, got {url:?}"
+    );
+
+    // Absolute path: same carve-out.
+    let abs = paths.anchorize(&anchor_bid, "/some-dir/cdr-slide-2");
+    assert!(
+        !abs.starts_with('#'),
+        "absolute path should bypass anchorization, got {abs:?}"
+    );
+}
+
+/// Issue 102 Part 3 / Step 1: can a stub and a content node actually co-exist
+/// on one path?
+///
+/// `path_map`'s value is a `Vec` because two entries were believed able to share
+/// a path: an `External|Trace` stub created for an unresolved URL, later claimed
+/// by a content node declaring the same URL as an alias. `indexed_get` carries a
+/// preference loop to pick the content node when that happens.
+///
+/// A corpus run measured up to 34 claimants on one path, which looked like
+/// confirmation. It was not — those were `alias-template` registrations flattened
+/// onto one malformed string by two unrelated defects (both fixed in 85c631a);
+/// after the fix, 1.29M lookups produced **zero** multi-candidate results. Since
+/// there is only ever one stub per URL, the tolerated case can produce at most
+/// two claimants and could never have explained 34.
+///
+/// This asserts what the stub-claim path actually does, so the `Vec` is either
+/// justified by a reachable state or shown to be scaffolding around a fixed bug.
+#[test]
+fn test_stub_and_content_claim_do_not_share_a_path() {
+    let url = "https://example.com/browse/THING-1";
+
+    let mut set = create_balanced_test_beliefbase();
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+
+    // 0. The href namespace network node itself, as `ensure_href_namespace` does.
+    //    Children cannot register under a namespace that has no PathMap.
+    let href_net = BeliefNode::href_network();
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        href_net.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    // 1. The stub, as `ensure_href_entry` builds it: External|Trace, BID derived
+    //    from the URL, Section edge into href_namespace with the URL as doc_path.
+    let stub = BeliefNode {
+        bid: crate::properties::buildonomy_href_bid(url),
+        kind: BeliefKindSet::from(BeliefKind::External | BeliefKind::Trace),
+        title: url.to_string(),
+        id: NodeId::Explicit(url.to_string()),
+        ..Default::default()
+    };
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        stub.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut stub_w = Weight::default();
+    stub_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    stub_w.set_doc_paths(vec![url.to_string()]).unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        stub.bid,
+        crate::properties::href_namespace(),
+        WeightKind::Section,
+        Some(stub_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    // Precondition: the stub really is registered. Without this the test could
+    // report "one entry" simply because the stub never existed.
+    let href_bref = crate::properties::href_namespace().bref();
+    {
+        let paths = set.paths();
+        let hm = paths.get_map(&href_bref).expect("href PathMap must exist");
+        assert!(
+            hm.map().iter().any(|(_, bid, _)| *bid == stub.bid),
+            "stub was not registered in the href namespace; test would be vacuous"
+        );
+    }
+
+    // 2. A content node claims the same URL, as an `alias-template` registration
+    //    does: an ordinary node with a Section edge into href_namespace carrying
+    //    the same doc_path.
+    // The claim must carry the merge keys the real pipeline supplies.
+    // `insert_state`'s absorb path (`to_replace` -> NodeRenamed -> replace_bid)
+    // is driven entirely by the `keys` argument; passing an empty vec bypasses
+    // it, so the stub would survive for reasons that have nothing to do with
+    // whether the mechanism works.
+    let content = create_test_node("Real Document", BeliefKind::Document);
+    let claim_keys = vec![NodeKey::Path {
+        net: crate::properties::href_namespace().bref(),
+        path: url.to_string(),
+    }];
+    set.process_event(&BeliefEvent::NodeUpdate(
+        claim_keys,
+        content.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut doc_w = Weight::default();
+    doc_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        content.bid,
+        network.bid,
+        WeightKind::Section,
+        Some(doc_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut alias_w = Weight::default();
+    alias_w.set(WEIGHT_SORT_KEY, 1u16).ok();
+    alias_w.set_doc_paths(vec![url.to_string()]).unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        content.bid,
+        crate::properties::href_namespace(),
+        WeightKind::Section,
+        Some(alias_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let paths = set.paths();
+    let hm = paths.get_map(&href_bref).unwrap();
+    assert_pathmap_indices_consistent(&hm, "after stub + content claim");
+
+    let claimants: Vec<Bid> = hm
+        .path_map()
+        .get(url)
+        .map(|&i| vec![hm.map()[i].1])
+        .unwrap_or_default();
+
+    assert_eq!(
+        claimants.len(),
+        1,
+        "path {url:?} must resolve to exactly one BID, got {claimants:?}"
+    );
+
+    // The survivor must be the content node, and the stub must be gone from
+    // `states` — i.e. this is absorption, not the stub quietly failing to
+    // register. Without these two assertions a single claimant is ambiguous.
+    assert_eq!(
+        claimants,
+        vec![content.bid],
+        "the content node should own the path after claiming it"
+    );
+    assert!(
+        !set.states().contains_key(&stub.bid),
+        "stub {} survived absorption; insert_state should have retired it via \
+         NodeRenamed -> replace_bid",
+        stub.bid
+    );
+}
+
+/// Without the merge key, the stub survives and the path has two claimants.
+///
+/// This is the negative case for `test_stub_and_content_claim_do_not_share_a_path`:
+/// same setup, but the claiming `NodeUpdate` carries no key resolving to the
+/// stub, so `insert_state` cannot absorb it. It pins *where* the invariant comes
+/// from — node identity, not the PathMap.
+///
+/// A PathMap-level eviction was tried here and removed: clearing the index left
+/// the stub node and its Section edge in the graph, so the next `PathMap::new`
+/// rebuilt the duplicate from the relations and the eviction re-fired forever.
+/// If this test ever starts reporting one claimant, the fix belongs upstream at
+/// the claim site, and this test should be inverted rather than deleted.
+#[test]
+fn test_claim_without_merge_key_leaves_stub_in_place() {
+    let url = "https://example.com/browse/THING-3";
+
+    let mut set = create_balanced_test_beliefbase();
+    let href_net = BeliefNode::href_network();
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        href_net,
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let stub = BeliefNode {
+        bid: crate::properties::buildonomy_href_bid(url),
+        kind: BeliefKindSet::from(BeliefKind::External | BeliefKind::Trace),
+        title: url.to_string(),
+        id: NodeId::Explicit(url.to_string()),
+        ..Default::default()
+    };
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        stub.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut stub_w = Weight::default();
+    stub_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    stub_w.set_doc_paths(vec![url.to_string()]).unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        stub.bid,
+        crate::properties::href_namespace(),
+        WeightKind::Section,
+        Some(stub_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let href_bref = crate::properties::href_namespace().bref();
+    {
+        let paths = set.paths();
+        let hm = paths.get_map(&href_bref).unwrap();
+        assert!(
+            hm.path_map().contains_key(url),
+            "precondition: stub must hold the path before the claim"
+        );
+    }
+
+    // Claim the same path WITHOUT the merge key, so `insert_state` cannot absorb
+    // the stub. Nothing downstream compensates, so both entries persist.
+    let content = create_test_node("Claiming Document", BeliefKind::Document);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        content.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut alias_w = Weight::default();
+    alias_w.set(WEIGHT_SORT_KEY, 1u16).ok();
+    alias_w.set_doc_paths(vec![url.to_string()]).unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        content.bid,
+        crate::properties::href_namespace(),
+        WeightKind::Section,
+        Some(alias_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let paths = set.paths();
+    let hm = paths.get_map(&href_bref).unwrap();
+    assert_pathmap_indices_consistent(&hm, "after stub eviction");
+
+    // `path_map` is scalar, so it holds whichever entry was written last; the
+    // stub is still present in `map` and in the graph.
+    let entries_on_path: Vec<Bid> = hm
+        .map()
+        .iter()
+        .filter(|(p, _, _)| p == url)
+        .map(|(_, bid, _)| *bid)
+        .collect();
+    assert!(
+        entries_on_path.contains(&stub.bid),
+        "without a merge key the stub must survive — if it no longer does, the \
+         claim path gained absorption and this test should be inverted; got \
+         {entries_on_path:?}"
+    );
+    assert!(
+        set.states().contains_key(&stub.bid),
+        "stub node should still be in the graph"
+    );
+}
+
+/// A third document's reference to the stub must survive the stub's absorption.
+///
+/// When a content node claims a URL an `External|Trace` stub already holds,
+/// `insert_state` retires the stub. Any edge another document had already drawn
+/// to that stub has to be re-pointed at the claimant, or the reference is
+/// silently lost — no panic, no diagnostic, just an edge that no longer arrives.
+/// `replace_bid` is what re-points them; this pins that it does.
+#[test]
+fn test_reference_to_stub_survives_content_claim() {
+    let url = "https://example.com/browse/THING-2";
+
+    let mut set = create_balanced_test_beliefbase();
+    let network = set
+        .states()
+        .values()
+        .find(|n| n.title == "Test Network")
+        .unwrap()
+        .clone();
+
+    let href_net = BeliefNode::href_network();
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        href_net,
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    // Stub for an unresolved link.
+    let stub = BeliefNode {
+        bid: crate::properties::buildonomy_href_bid(url),
+        kind: BeliefKindSet::from(BeliefKind::External | BeliefKind::Trace),
+        title: url.to_string(),
+        id: NodeId::Explicit(url.to_string()),
+        ..Default::default()
+    };
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        stub.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut stub_w = Weight::default();
+    stub_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    stub_w.set_doc_paths(vec![url.to_string()]).unwrap();
+    set.process_event(&BeliefEvent::RelationChange(
+        stub.bid,
+        crate::properties::href_namespace(),
+        WeightKind::Section,
+        Some(stub_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    // A third document links to the stub (Epistemic, as an ordinary reference).
+    let referrer = create_test_node("Referring Document", BeliefKind::Document);
+    set.process_event(&BeliefEvent::NodeUpdate(
+        vec![],
+        referrer.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut ref_w = Weight::default();
+    ref_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        referrer.bid,
+        stub.bid,
+        WeightKind::Epistemic,
+        Some(ref_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    let edges_to = |sink: Bid, set: &BeliefBase| -> usize {
+        let rel = set.relations();
+        let g = rel.as_graph();
+        g.edge_references()
+            .filter(|e| g[e.target()] == sink && g[e.source()] == referrer.bid)
+            .count()
+    };
+    assert_eq!(
+        edges_to(stub.bid, &set),
+        1,
+        "precondition: referrer must actually link to the stub"
+    );
+
+    // The content node now claims the URL, carrying the merge key that drives
+    // absorption.
+    let content = create_test_node("Real Document 2", BeliefKind::Document);
+    let claim_keys = vec![NodeKey::Path {
+        net: crate::properties::href_namespace().bref(),
+        path: url.to_string(),
+    }];
+    set.process_event(&BeliefEvent::NodeUpdate(
+        claim_keys,
+        content.clone(),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+    let mut doc_w = Weight::default();
+    doc_w.set(WEIGHT_SORT_KEY, 0u16).ok();
+    set.process_event(&BeliefEvent::RelationChange(
+        content.bid,
+        network.bid,
+        WeightKind::Section,
+        Some(doc_w),
+        crate::event::EventOrigin::Remote,
+    ))
+    .unwrap();
+
+    assert!(
+        !set.states().contains_key(&stub.bid),
+        "stub should have been absorbed by the claim"
+    );
+    assert_eq!(
+        edges_to(content.bid, &set),
+        1,
+        "the referrer's edge must have been re-pointed at the claiming content \
+         node; if this is 0 the reference was silently dropped"
     );
 }

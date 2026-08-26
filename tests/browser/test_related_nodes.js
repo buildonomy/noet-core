@@ -32,6 +32,7 @@
 import { readFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { readFileSync } from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -82,23 +83,29 @@ async function runTests() {
     await wasmModule.default(wasmBuffer);
     log("WASM module loaded", "pass");
 
-    // Load beliefbase JSON
-    log("Loading beliefbase.json...", "info");
-    const beliefbaseJson = await readFile(join(__dirname, "test-output/beliefbase.json"), "utf-8");
-    log("Beliefbase JSON loaded", "pass");
+    // Extract entry BID from index.html (injected by generate_spa_shell).
+    log("Extracting entry BID from index.html...", "info");
+    const indexHtml = readFileSync(join(__dirname, "test-output/index.html"), "utf-8");
+    const entryBidMatch = indexHtml.match(/id="noet-entry-bid"[^>]*>\s*"([^"]+)"/);
+    assert(entryBidMatch !== null, "Found noet-entry-bid script tag in index.html");
+    const entryBidString = entryBidMatch[1];
+    log(`Entry BID: ${entryBidString}`, "info");
 
-    // Extract network root BID for metadata
-    const beliefbaseData = JSON.parse(beliefbaseJson);
-    const networkNode = Object.values(beliefbaseData.states).find(
-      (node) => node.kind && node.kind.includes("Network"),
+    // Load beliefbase.msgpack
+    log("Loading beliefbase.msgpack...", "info");
+    const beliefbaseBytes = await readFile(join(__dirname, "test-output/beliefbase.msgpack"));
+    log("beliefbase.msgpack loaded", "pass");
+
+    // Initialize BeliefBase from msgpack
+    log("Initializing BeliefBase from msgpack...", "info");
+    const bb = wasmModule.BeliefBaseWasm.from_msgpack(
+      new Uint8Array(
+        beliefbaseBytes.buffer,
+        beliefbaseBytes.byteOffset,
+        beliefbaseBytes.byteLength,
+      ),
+      entryBidString,
     );
-
-    assert(networkNode !== undefined, "Found Network node in beliefbase");
-    const entryBidString = networkNode.bid;
-
-    // Initialize BeliefBase
-    log("Initializing BeliefBase...", "info");
-    const bb = new wasmModule.BeliefBaseWasm(beliefbaseJson, entryBidString);
     assert(bb !== null, "BeliefBase initialized");
 
     // Get documents to test context
@@ -108,33 +115,14 @@ async function runTests() {
     // Test NodeContext with related nodes
     console.log(`\n${BLUE}Testing NodeContext.related_nodes structure...${RESET}`);
 
-    // Find Section A in the beliefbase data - it should have edges
-    const sectionABid = Object.keys(beliefbaseData.states).find(
-      (bid) => beliefbaseData.states[bid].title === "Section A",
-    );
-
+    // Use the first document as test subject — Section A lookup via raw JSON
+    // is no longer available (data is msgpack, not JSON-parsed here).
     let ctx;
     let testDoc;
 
-    if (!sectionABid) {
-      log("Section A not found in test data, using first document", "warn");
-      testDoc = documents[0];
-      ctx = bb.get_context(testDoc.bid);
-      log(`Getting context for: ${testDoc.title}`, "info");
-    } else {
-      log(`Testing Section A (should have relations): ${sectionABid}`, "info");
-
-      // Verify edges exist in raw JSON
-      const sectionAIdx = beliefbaseData.relations.nodes.indexOf(sectionABid);
-      const edges = beliefbaseData.relations.edges.filter(
-        ([src, sink]) => src === sectionAIdx || sink === sectionAIdx,
-      );
-      log(`  Raw edges in JSON: ${edges.length}`, "info");
-
-      ctx = bb.get_context(sectionABid);
-      testDoc = beliefbaseData.states[sectionABid];
-      log(`Getting context for: ${testDoc.title}`, "info");
-    }
+    testDoc = documents[0];
+    ctx = bb.get_context(testDoc.bid);
+    log(`Getting context for: ${testDoc.title}`, "info");
     assert(ctx !== null, "get_context() returned non-null");
     assert(ctx.node !== undefined, "NodeContext has node field");
     assert(ctx.root_path !== undefined, "NodeContext has root_path field");
@@ -209,8 +197,9 @@ async function runTests() {
       for (const [kind, [sources, sinks]] of ctx.graph.entries()) {
         log(`  ${kind}: ${sources.length} sources, ${sinks.length} sinks`, "info");
         if (sinks.length > 0) {
-          log(`    First sink BID: ${sinks[0]}`, "info");
-          log(`    Sink in related_nodes: ${ctx.related_nodes.has(sinks[0])}`, "info");
+          const firstSinkBid = sinks[0].bid;
+          log(`    First sink BID: ${firstSinkBid}`, "info");
+          log(`    Sink in related_nodes: ${ctx.related_nodes.has(firstSinkBid)}`, "info");
         }
       }
     }
@@ -221,15 +210,28 @@ async function runTests() {
       assert(Array.isArray(sources), `graph[${weightKind}].sources is array`);
       assert(Array.isArray(sinks), `graph[${weightKind}].sinks is array`);
 
-      // Verify all BIDs in graph exist in related_nodes (use Map.has())
-      const allGraphBids = [...sources, ...sinks];
-      for (const bid of allGraphBids) {
-        assert(ctx.related_nodes.has(bid), `Graph BID ${bid} exists in related_nodes`);
+      // Verify all EdgeEntries in graph have correct structure and exist in related_nodes
+      const allGraphEntries = [...sources, ...sinks];
+      for (const entry of allGraphEntries) {
+        // EdgeEntry is an object with .bid (string) and .owner_bid (string | null)
+        assert(typeof entry === "object" && entry !== null, `Graph entry is an EdgeEntry object`);
+        assert(
+          typeof entry.bid === "string",
+          `EdgeEntry.bid is a string (got ${typeof entry.bid})`,
+        );
+        assert("owner_bid" in entry, `EdgeEntry has owner_bid field`);
+        assert(
+          entry.owner_bid === null ||
+            entry.owner_bid === undefined ||
+            typeof entry.owner_bid === "string",
+          `EdgeEntry.owner_bid is null, undefined, or string`,
+        );
+        assert(ctx.related_nodes.has(entry.bid), `Graph BID ${entry.bid} exists in related_nodes`);
       }
 
-      if (allGraphBids.length > 0) {
+      if (allGraphEntries.length > 0) {
         log(
-          `Weight kind "${weightKind}": ${sources.length} sources, ${sinks.length} sinks - all BIDs valid`,
+          `Weight kind "${weightKind}": ${sources.length} sources, ${sinks.length} sinks - all EdgeEntries valid`,
           "pass",
         );
       }

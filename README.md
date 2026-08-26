@@ -1,22 +1,25 @@
 # noet-core
 
-A Rust library for parsing interconnected documents into a queryable hypergraph with bidirectional synchronization.
+A Rust library for parsing interconnected documents into a queryable, typed directed acyclic graph (DAG) with bidirectional synchronization.
 
 [![CI](https://github.com/buildonomy/noet-core/actions/workflows/test.yml/badge.svg)](https://github.com/buildonomy/noet-core/actions)
 [![codecov](https://codecov.io/gh/buildonomy/noet-core/branch/main/graph/badge.svg)](https://codecov.io/gh/buildonomy/noet-core)
 
 ## What is noet-core?
 
-**noet-core** (from "noetic" - relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable hypergraph structure called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.
+**noet-core** (from "noetic" — relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable directed acyclic graph (DAG) called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.
+
+Every claim of coverage, dependency, or relationship becomes an *explicit edge* in the graph — not an assertion buried in prose. The result is documentation you can query, diff, and validate structurally. See **[Documentation as a Dependency Graph](docs/design/dag_model.md)** for the conceptual introduction.
 
 ### Key Features
 
 - **Multi-pass compilation**: Diagnostic-driven resolution of forward references and circular dependencies
 - **Stable identifiers**: Automatically injects unique BIDs (Belief IDs) into source documents for stable cross-document linking
 - **Bidirectional sync**: Changes flow from documents to graph *and* from graph back to documents
-- **Error tolerance**: Graceful handling of parse errors via diagnostic system - compilation never fails catastrophically
+- **Error tolerance**: Graceful handling of parse errors via diagnostic system — compilation never fails catastrophically
 - **Multi-format support**: Extensible codec system (Markdown, TOML) with custom format support
-- **Hypergraph relationships**: Rich semantic relationships with typed edges and custom payloads
+- **Three orthogonal edge types**: Section (structure), Epistemic (provenance), and Pragmatic (actionable claims) — each forming its own DAG sub-graph
+- **Third-party edge ownership**: Cross-document traceability claims via `{maps_to}` directives without modifying referenced documents
 - **Nested networks**: Hierarchical network dependencies similar to git submodules
 - **Event streaming**: Incremental cache updates via event-driven architecture
 - **BeliefBase sharding**: Large repositories automatically split into per-network JSON shards for on-demand browser loading; always generates compile-time search indices
@@ -68,7 +71,7 @@ noet-core implements a compiler-like system for document networks:
 3. **Convergence**: Iterate until all resolvable references are linked
 4. **Incremental Updates**: File changes trigger selective reparsing of affected documents
 
-See the [Architecture Guide](docs/design/architecture.md) for details.
+See the [Architecture Guide](docs/design/architecture.md) and [DAG Model](docs/design/dag_model.md) for details.
 
 ### The BID System
 
@@ -136,15 +139,15 @@ IRNode (IR)
     ↓
 [Link] → GraphBuilder (multi-pass)
     ↓
-BeliefBase (Compiled Graph)
+BeliefBase (Compiled DAG)
     ↓
-[Query/Traverse] → Application logic
+[Query/Traverse] → MCP tools, WASM viewer, CLI
 ```
-See the [Architecture Guide](docs/architecture.md) for details.
+See the [Architecture Guide](docs/design/architecture.md) for details.
 
 ### Core Components
 
-- **`beliefbase`**: Hypergraph data structures (BeliefBase, BidGraph)
+- **`beliefbase`**: Multigraph data structures (BeliefBase, BidGraph)
 - **`codec`**: Document parsing (DocumentCompiler, DocCodec trait)
 - **`properties`**: Node/edge types, identifiers (BID), relationship semantics
 - **`event`**: Event streaming for cache synchronization
@@ -158,13 +161,14 @@ See the [Architecture Guide](docs/architecture.md) for details.
 | Bidirectional doc-graph sync | ✅ | Partial | ❌ | ❌ |
 | BID injection into source | ✅ | ❌ | ❌ | ❌ |
 | Multi-pass forward refs | ✅ | ❌ | ❌ | ✅ |
-| Hypergraph structure | ✅ | ❌ | ✅ | ❌ |
+| Typed DAG (3 edge kinds) | ✅ | ❌ | ✅ | ❌ |
+| Third-party edge ownership | ✅ | ❌ | ❌ | ❌ |
 | Multi-format parsing | ✅ | ✅ | Via plugins | ✅ |
 | Nested networks | ✅ | ❌ | ❌ | Workspace |
 | Error-tolerant parsing | ✅ | Partial | ❌ | ✅ |
 | Schema extensibility | ✅ | Via plugins | ✅ | ❌ |
 
-**Unique Combination**: noet-core brings together compiler techniques (multi-pass resolution, diagnostics), knowledge management (bidirectional linking), and hypergraph structures in a single library.
+**Unique Combination**: noet-core brings together compiler techniques (multi-pass resolution, diagnostics), knowledge management (bidirectional linking), and a typed DAG with three orthogonal edge dimensions in a single library.
 
 ## Installation
 
@@ -190,8 +194,11 @@ noet-core = { version = "0.0.0", features = ["service"] }
 
 ## Documentation
 
-- **[Architecture Overview](docs/architecture.md)** - High-level concepts and design
+- **[DAG Model](docs/design/dag_model.md)** - Conceptual introduction: why a DAG, the three edge types, the video camera query model
+- **[Architecture Overview](docs/design/architecture.md)** - High-level software architecture and core concepts
 - **[Design Specification](docs/design/beliefbase_architecture.md)** - Detailed technical specification
+- **[Query Model](docs/design/query_model.md)** - Formal query algebra: traversal, composition, scoring, instruments
+- **[MCP Server](docs/mcp.md)** - Agent-facing tool documentation for querying via Model Context Protocol
 - **[API Documentation](https://docs.rs/noet-core)** - Generated from source (run `cargo doc --open`)
 - **[Examples](examples/)** - Working code examples
 
@@ -273,6 +280,6 @@ noet-core draws inspiration from:
 - Knowledge management tools: Obsidian, Roam Research, Logseq
 - Language servers: rust-analyzer, tree-sitter
 - Graph databases: Neo4j
-- Hypergraph systems: HIF, Hypergraphx
+- Graph query formalisms: GQL (ISO/IEC 39075), provenance semirings
 
-The name "noet" comes from "noetic", relating to knowledge and the intellect.
+The name "noet" comes from "noetic" — relating to knowledge and the intellect.

@@ -82,7 +82,7 @@ impl SchemaRegistry {
     /// If a schema with this name already exists, it will be overwritten and a log message emitted.
     pub fn register(&self, schema_name: String, definition: SchemaDefinition) {
         while self.0.is_locked() {
-            tracing::info!(
+            tracing::debug!(
                 "[SchemaRegistry::register] Waiting for write access to schema registry"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -91,7 +91,7 @@ impl SchemaRegistry {
         let mut writer = self.0.write();
 
         if writer.contains_key(&schema_name) {
-            tracing::info!(
+            tracing::debug!(
                 "[SchemaRegistry::register] Overwriting existing schema: {}",
                 schema_name
             );
@@ -105,7 +105,7 @@ impl SchemaRegistry {
     /// Returns a cheap Arc clone if the schema exists.
     pub fn get(&self, schema_name: &str) -> Option<Arc<SchemaDefinition>> {
         while self.0.is_locked_exclusive() {
-            tracing::info!("[SchemaRegistry::get] Waiting for read access to schema registry");
+            tracing::debug!("[SchemaRegistry::get] Waiting for read access to schema registry");
             std::thread::sleep(Duration::from_millis(100));
         }
 
@@ -116,7 +116,7 @@ impl SchemaRegistry {
     /// List all registered schema names
     pub fn list_schemas(&self) -> Vec<String> {
         while self.0.is_locked_exclusive() {
-            tracing::info!(
+            tracing::debug!(
                 "[SchemaRegistry::list_schemas] Waiting for read access to schema registry"
             );
             std::thread::sleep(Duration::from_millis(100));

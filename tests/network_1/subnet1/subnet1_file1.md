@@ -17,8 +17,7 @@ Section A text.
 
 ## Requirements
 
-```{implements}
-```
+`{implements}`
 
 The following list are items from other docs in this corpus which we will treat as requirements: 
 
@@ -26,9 +25,7 @@ The following list are items from other docs in this corpus which we will treat 
 * [HSTP]
 * [API Reference]
 
-```{end}
-```
-
+`{end}`
 
 ## Project Links
 

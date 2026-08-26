@@ -1,8 +1,15 @@
 //! Shard wire format types: target-independent serialization structs.
 //!
-//! These types define the JSON schemas for the sharded BeliefBase export
+//! These types define the serialization schemas for the sharded BeliefBase export
 //! format. They must compile on **all** targets — including `wasm32` — because
 //! `BeliefBaseWasm::load_shard` deserializes them in the browser.
+//!
+//! ## Wire format
+//!
+//! Shards are written as **MessagePack** (`.msgpack`) by the native build side
+//! and deserialized via `rmp_serde` in WASM. JSON is no longer used for shard
+//! data; the manifest (`beliefbase/manifest.json`) remains JSON because it is
+//! tiny and read by JavaScript before WASM is initialized.
 //!
 //! The export *logic* (writing files, async I/O) lives in `super::export`
 //! and is gated behind `#[cfg(not(target_arch = "wasm32"))]`. The types here
@@ -10,8 +17,8 @@
 //!
 //! ## Types
 //!
-//! - [`NetworkShard`] — contents of `beliefbase/networks/{bref}.json`
-//! - [`GlobalShard`] — contents of `beliefbase/global.json`
+//! - [`NetworkShard`] — contents of `beliefbase/networks/{bref}.msgpack`
+//! - [`GlobalShard`] — contents of `beliefbase/global.msgpack`
 //! - [`SerializableBidGraph`] — portable edge list (BID strings, not petgraph indices)
 //! - [`SerializableEdge`] — one edge in a [`SerializableBidGraph`]
 //!
@@ -26,9 +33,9 @@ use std::collections::BTreeMap;
 
 // ── Per-network shard ─────────────────────────────────────────────────────────
 
-/// The JSON representation of a per-network BeliefBase shard.
+/// The wire representation of a per-network BeliefBase shard.
 ///
-/// Written to `beliefbase/networks/{bref}.json`. Contains the `BeliefGraph`
+/// Written to `beliefbase/networks/{bref}.msgpack`. Contains the `BeliefGraph`
 /// subset for one network — states and intra-network edges only. Trace nodes
 /// (cross-network references) are excluded; they are resolved via the global
 /// shard or other loaded shards.
@@ -48,7 +55,7 @@ pub struct NetworkShard {
 
 // ── Global shard ──────────────────────────────────────────────────────────────
 
-/// The JSON representation of the global shard (`beliefbase/global.json`).
+/// The wire representation of the global shard (`beliefbase/global.msgpack`).
 ///
 /// Contains the API node, system namespace nodes, and cross-network edges.
 /// Always loaded in sharded mode; provides the foundation for cross-network
@@ -60,6 +67,10 @@ pub struct GlobalShard {
     pub states: BTreeMap<String, BeliefNode>,
     /// All edges that cross network boundaries.
     pub relations: SerializableBidGraph,
+    /// Maps every node's bref (12 hex chars) to its home network's bref.
+    /// Built from PathMap data during export; used by the viewer to resolve
+    /// which shard to load for an arbitrary node BID.
+    pub bref_index: BTreeMap<String, String>,
 }
 
 // ── Portable BidGraph serialization ──────────────────────────────────────────
@@ -88,17 +99,17 @@ pub struct SerializableEdge {
 impl SerializableBidGraph {
     /// Build from a petgraph `BidGraph`, using node BIDs as the stable identifiers.
     pub fn from_bid_graph(graph: &crate::beliefbase::BidGraph) -> Self {
+        use petgraph::visit::{EdgeRef, IntoEdgeReferences};
         let g = graph.as_graph();
         let edges = g
-            .raw_edges()
-            .iter()
-            .map(|e: &petgraph::graph::Edge<WeightSet>| {
+            .edge_references()
+            .map(|e| {
                 let source_bid = g[e.source()];
                 let sink_bid = g[e.target()];
                 SerializableEdge {
                     source: source_bid.to_string(),
                     sink: sink_bid.to_string(),
-                    weights: e.weight.clone(),
+                    weights: e.weight().clone(),
                 }
             })
             .collect();

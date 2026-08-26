@@ -48,8 +48,44 @@
 //!
 //! ## Built-in Codecs
 //!
-//! - **Markdown** (`.md`) - via [`md::MdCodec`]
-//! - **NetworkCodec** (`index.md`) - via [`network::NetworkCodec`]
+//! - **Markdown** (`.md`) — via [`md::MdCodec`]
+//! - **NetworkCodec** (`index.md`) — via [`network::NetworkCodec`]
+//! - **XlsxCodec** (`.xlsx`, `.ods`) — via `xlsx::codec::XlsxCodec` (requires `xlsx` feature,
+//!   non-wasm only). Reads spreadsheets with a reserved `index` tab schema; emits a workbook →
+//!   tab → row node hierarchy. Uses `CodecContentMode::Binary` — see below.
+//!
+//! ## Binary Codecs and `CodecContentMode`
+//!
+//! Most codecs operate on UTF-8 text (the default). Binary file formats (xlsx, ods, PDF, etc.)
+//! require a different pipeline: the compiler must not attempt `String::from_utf8` on their bytes,
+//! and write-back cannot use `Option<String>`.
+//!
+//! Codecs declare their content mode via [`CodecContentMode`]:
+//!
+//! - **`CodecContentMode::Text`** (default) — `parse()` receives decoded UTF-8 content.
+//!   Write-back is via `generate_source() -> Option<String>`.
+//! - **`CodecContentMode::Binary`** — `parse()` receives an empty string (ignored). The codec
+//!   re-opens the source file from `current.path` using its own I/O. Write-back is via
+//!   `generate_source_bytes() -> Option<Vec<u8>>`.
+//!
+//! The compiler probes the mode once per file (via a cheap factory instantiation) and branches
+//! accordingly. All existing text codecs default to `Text` and require no changes.
+//!
+//! To implement a binary codec, override two methods:
+//! ```rust
+//! # use noet_core::codec::{DocCodec, CodecContentMode};
+//! # struct MyBinaryCodec;
+//! # impl MyBinaryCodec {
+//! fn content_mode(&self) -> CodecContentMode {
+//!     CodecContentMode::Binary
+//! }
+//!
+//! fn generate_source_bytes(&self) -> Option<Vec<u8>> {
+//!     // Return annotated file bytes for write-back, or None if unchanged.
+//!     None
+//! }
+//! # }
+//! ```
 //!
 //! Register custom codecs via [`CodecMap::insert_codec`] (by stem/extension):
 //!
@@ -76,6 +112,8 @@
 //!         current: IRNode,
 //!         // Any author-visible warnings discovered during parsing
 //!         diagnostics: &mut Vec<ParseDiagnostic>,
+//!         // Pre-built filesystem index. Most codecs ignore it.
+//!         _proto_index: &noet_core::codec::proto_index::ProtoIndex,
 //!     ) -> Result<(), BuildonomyError> {
 //!         todo!();
 //!     }
@@ -86,6 +124,7 @@
 //!
 //!     fn inject_context(
 //!         &mut self,
+//!         proto_idx: usize,
 //!         node: &IRNode,
 //!         ctx: &BeliefContext<'_>,
 //!         diagnostics: &mut Vec<ParseDiagnostic>,
@@ -100,6 +139,9 @@
 //!     fn generate_source(&self) -> Option<String> {
 //!         todo!();
 //!     }
+//!     // For binary codecs, override content_mode() and generate_source_bytes() instead:
+//!     // fn content_mode(&self) -> CodecContentMode { CodecContentMode::Binary }
+//!     // fn generate_source_bytes(&self) -> Option<Vec<u8>> { None }
 //! }
 //! // Register by extension (simple API)
 //! CODECS.insert_codec(None, Some("myext".to_string()), || Box::new(MyCustomCodec));
@@ -151,12 +193,18 @@ pub use assets::Layout;
 #[cfg(not(target_arch = "wasm32"))]
 use parking_lot::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use std::{path::Path, result::Result, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    result::Result,
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
     beliefbase::BeliefContext,
-    codec::{md::MdCodec, network::NetworkCodec},
+    codec::network::NetworkCodec,
     error::BuildonomyError,
     paths::os_path_to_string,
     properties::{BeliefNode, Bid},
@@ -183,6 +231,7 @@ pub mod diagnostic;
 pub mod git;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod md;
+pub mod md_options;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod myst;
 #[cfg(not(target_arch = "wasm32"))]
@@ -191,6 +240,8 @@ pub mod network;
 pub mod proto_index;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod schema_registry;
+#[cfg(all(feature = "xlsx", not(target_arch = "wasm32")))]
+pub mod xlsx;
 
 // Re-export for backward compatibility
 #[cfg(not(target_arch = "wasm32"))]
@@ -200,6 +251,7 @@ pub use builder::GraphBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 pub use compiler::DocumentCompiler;
 pub use diagnostic::{byte_offset_to_location, ParseDiagnostic, UnresolvedReference};
+pub use md_options::{buildonomy_md_options, render_markdown_snippet};
 #[cfg(not(target_arch = "wasm32"))]
 pub use proto_index::ProtoIndex;
 #[cfg(not(target_arch = "wasm32"))]
@@ -227,7 +279,497 @@ pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 pub static CODECS: Lazy<CodecMap> = Lazy::new(CodecMap::create);
 
 /// List of built-in codec extensions (synchronized between WASM and non-WASM builds).
-pub const BUILTIN_EXTENSIONS: &[&str] = &["md"];
+pub const BUILTIN_EXTENSIONS: &[&str] = &["md", "xlsx", "ods"];
+
+/// Extensions handled by the xlsx codec (non-wasm only, feature-gated).
+#[cfg(all(feature = "xlsx", not(target_arch = "wasm32")))]
+pub const XLSX_EXTENSIONS: &[&str] = &["xlsx", "ods"];
+
+// ── Walk-time codec registry ─────────────────────────────────────────────────
+
+/// Walk-time file visibility predicate.
+///
+/// Determines whether a file should be included in [`ProtoIndex`] child lists
+/// during the `net_dir_partition` WalkDir pass. Implementations must be cheap —
+/// no file I/O, no content sniffing; path-based checks only.
+///
+/// Walk codecs govern *visibility*, not *dispatch*. A file tracked by a
+/// `WalkCodec` will appear in `ProtoIndex` child lists and be passed to
+/// `parse_one_path`, but the codec that actually parses it is determined by
+/// [`CLAIM_MAP`] (registered during [`DocCodec::parse`] in Phase 1) or
+/// [`CODECS`] (extension/stem registered).
+///
+/// # Extension vs. application-specific codecs
+///
+/// Built-in walk codecs ([`MdWalkCodec`], [`YamlWalkCodec`]) are registered in
+/// [`WALK_CODECS`] at startup and are application-neutral. Application shims
+/// (e.g. `vast-noet`) register additional codecs via [`WalkCodecMap::register`]
+/// before [`DocumentCompiler::new`].
+///
+/// # Thread safety
+///
+/// Implementations must be `Send + Sync` — they are stored in a global
+/// `Arc<RwLock<Vec<Box<dyn WalkCodec>>>>`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait WalkCodec: Send + Sync {
+    /// Return `true` if this file should be included in ProtoIndex child lists.
+    ///
+    /// Called once per file during the WalkDir pass. Must be cheap — no I/O,
+    /// no content sniffing. Path-based extension checks are the standard pattern.
+    fn should_track(&self, path: &Path) -> bool;
+
+    /// Return the file extensions this codec tracks (without leading dot).
+    ///
+    /// Used by [`collect_known_extensions`] to build the codec manifest for WASM.
+    /// Implementations should return the same extensions they match in `should_track`.
+    fn tracked_extensions(&self) -> Vec<&'static str>;
+
+    /// Filenames that MAY define network roots when present in a directory.
+    ///
+    /// This is a superset declaration — `net_dir_partition` tentatively treats any
+    /// directory containing a matching file as a subnet boundary. The definitive
+    /// check happens in [`ProtoIndex::build`], which calls [`DocCodec::proto()`] on
+    /// each candidate. `proto()` returns `Some(IRNode)` with [`BeliefKind::Network`](crate::properties::BeliefKind::Network)
+    /// for real network roots, or `None` for files that share the name but aren't
+    /// network roots.
+    ///
+    /// Content-based discrimination (e.g. checking for a library definition in a
+    /// build manifest) belongs in the codec's `proto()` implementation, not here.
+    ///
+    /// Default: empty (this codec does not define network boundaries).
+    fn network_filenames(&self) -> Vec<&'static str> {
+        vec![]
+    }
+}
+
+/// Walk codec for Markdown files (`.md`).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MdWalkCodec;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WalkCodec for MdWalkCodec {
+    fn should_track(&self, path: &Path) -> bool {
+        matches!(path.extension().and_then(|e| e.to_str()), Some("md"))
+    }
+
+    fn tracked_extensions(&self) -> Vec<&'static str> {
+        vec!["md"]
+    }
+}
+
+/// Walk codec for YAML files (`.yaml` / `.yml`).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct YamlWalkCodec;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WalkCodec for YamlWalkCodec {
+    fn should_track(&self, path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yaml" | "yml")
+        )
+    }
+
+    fn tracked_extensions(&self) -> Vec<&'static str> {
+        vec!["yaml", "yml"]
+    }
+}
+
+/// Thread-safe registry of [`WalkCodec`] implementations.
+///
+/// Any registered codec whose [`WalkCodec::should_track`] returns `true` causes
+/// the file to be included in [`ProtoIndex`] child lists during
+/// `net_dir_partition`. Multiple codecs may track the same extension;
+/// `should_track` is `true` if ANY registered codec returns `true`.
+///
+/// The global instance is [`WALK_CODECS`], pre-populated with [`MdWalkCodec`]
+/// and [`YamlWalkCodec`]. Application shims register additional walk codecs via
+/// [`WalkCodecMap::register`] before [`DocumentCompiler::new`].
+#[cfg(not(target_arch = "wasm32"))]
+pub struct WalkCodecMap(Arc<RwLock<Vec<Box<dyn WalkCodec>>>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WalkCodecMap {
+    /// Create a new `WalkCodecMap` with all built-in walk codecs registered.
+    pub fn create() -> Self {
+        let map = WalkCodecMap(Arc::new(RwLock::new(Vec::new())));
+        map.register(Box::new(MdWalkCodec));
+        map.register(Box::new(YamlWalkCodec));
+        map
+    }
+
+    /// Register a walk codec. Multiple walk codecs may track the same extension;
+    /// `should_track` is true if ANY registered codec returns true.
+    pub fn register(&self, codec: Box<dyn WalkCodec>) {
+        self.0.write().push(codec);
+    }
+
+    /// True if any registered `WalkCodec` claims this path.
+    pub fn should_track(&self, path: &Path) -> bool {
+        self.0.read().iter().any(|c| c.should_track(path))
+    }
+
+    /// Collect all tracked extensions from registered walk codecs.
+    ///
+    /// Returns a deduplicated, sorted list of extensions (without leading dot).
+    pub fn extensions(&self) -> Vec<String> {
+        let mut exts: Vec<String> = self
+            .0
+            .read()
+            .iter()
+            .flat_map(|c| c.tracked_extensions())
+            .map(|s| s.to_string())
+            .collect();
+        exts.sort();
+        exts.dedup();
+        exts
+    }
+
+    /// Filename-only check (no I/O). True if `filename` matches [`NETWORK_NAME`]
+    /// or any registered walk codec's [`WalkCodec::network_filenames()`].
+    ///
+    /// Used for subnet detection in `net_dir_partition` and for path normalization
+    /// in the builder, compiler, and DB layers (stripping the network filename to
+    /// get the directory path).
+    pub fn is_network_file(&self, filename: &str) -> bool {
+        if filename == NETWORK_NAME {
+            return true;
+        }
+        self.0
+            .read()
+            .iter()
+            .any(|c| c.network_filenames().contains(&filename))
+    }
+
+    /// Returns all registered network filenames (including [`NETWORK_NAME`]),
+    /// deduplicated.
+    ///
+    /// Used by [`detect_network_file`](crate::codec::network::detect_network_file) and by
+    /// [`CodecManifest`](crate::shard::manifest::CodecManifest) to bridge the native
+    /// registry to the WASM viewer.
+    pub fn network_filenames(&self) -> Vec<String> {
+        let mut names = vec![NETWORK_NAME.to_string()];
+        for codec in self.0.read().iter() {
+            for name in codec.network_filenames() {
+                let s = name.to_string();
+                if !names.contains(&s) {
+                    names.push(s);
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Global walk-codec registry.
+///
+/// Pre-populated with [`MdWalkCodec`] and [`YamlWalkCodec`] at startup.
+/// Application shims (e.g. `vast-noet`) register additional walk codecs via
+/// [`WalkCodecMap::register`] before [`DocumentCompiler::new`] is called.
+///
+/// # WASM
+///
+/// `WALK_CODECS` is absent on `wasm32`. The WASM viewer loads a codec manifest
+/// (`codecs.json`) at startup that lists all extensions known at build time,
+/// including those registered here. See [`collect_known_extensions`] and
+/// `CodecMap::set_known_extensions` (WASM-only).
+#[cfg(not(target_arch = "wasm32"))]
+pub static WALK_CODECS: Lazy<WalkCodecMap> = Lazy::new(WalkCodecMap::create);
+
+/// True if `path`'s filename is a known network index filename.
+///
+/// Checks [`NETWORK_NAME`] first (hot path), then consults registered walk codecs
+/// via [`WalkCodecMap::is_network_file`]. Used for path normalization: stripping
+/// the network filename to get the directory path.
+///
+/// Replaces inline `== NETWORK_NAME` checks throughout the codebase.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_network_index_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| WALK_CODECS.is_network_file(n))
+        .unwrap_or(false)
+}
+
+/// Collect all document extensions known at build time.
+///
+/// Returns the union of [`BUILTIN_EXTENSIONS`], [`CODECS`] registered extensions,
+/// and [`WALK_CODECS`] tracked extensions — sorted and deduplicated.
+///
+/// Used by `finalize_html` to build the [`CodecManifest`](crate::shard::manifest::CodecManifest) that bridges the
+/// native codec registries to the WASM viewer.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn collect_known_extensions() -> Vec<String> {
+    let mut exts: Vec<String> = BUILTIN_EXTENSIONS.iter().map(|s| s.to_string()).collect();
+    exts.extend(CODECS.extensions());
+    exts.extend(WALK_CODECS.extensions());
+    // Filter empty strings (e.g. from the wildcard NetworkCodec entry)
+    // — they are not meaningful file extensions.
+    exts.retain(|s| !s.is_empty());
+    exts.sort();
+    exts.dedup();
+    exts
+}
+
+// ── Parse-time claim registry ─────────────────────────────────────────────────
+
+/// Parse-time registry mapping absolute file paths to the codec that owns them.
+///
+/// Entries are written during [`DocCodec::parse`] (Phase 1) by network codecs
+/// that discover which data files they own. `parse_one_path` consults this
+/// registry before falling back to [`CODECS`].
+///
+/// ## Inner value semantics
+///
+/// - `Some(factory)` — path has been claimed by a codec; use `factory()` to
+///   dispatch it.
+/// - `None` — path was explicitly *rejected* by a network's whitelist/blacklist
+///   filter. `parse_one_path` routes rejected paths to [`UnclaimedDataCodec`]
+///   + `ParseDiagnostic::info` without falling through to `CODECS`.
+///
+/// The `None` sentinel distinguishes "rejected by a network that ran filtering"
+/// from "never seen" (absent from the map entirely), preventing `.md` files
+/// from being re-dispatched via the old `CODECS` fallback after being
+/// explicitly excluded.
+///
+/// ## Claiming pattern
+///
+/// A codec that owns structured data files should call `claim()` inside its
+/// [`DocCodec::parse`] implementation, using `proto_index.children_of()` to
+/// discover the candidate file list:
+///
+/// ```rust,ignore
+/// fn parse(&mut self, content: &str, current: IRNode,
+///           diagnostics: &mut Vec<ParseDiagnostic>,
+///           proto_index: &ProtoIndex) -> Result<(), BuildonomyError> {
+///     let network_dir = string_to_os_path(&current.path);
+///     for child in proto_index.children_of(&network_dir).unwrap_or_default() {
+///         if self.owns(&child) {
+///             CLAIM_MAP.claim(child, my_codec_factory);
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// ## Thread safety
+///
+/// Wraps `Arc<RwLock<HashMap<PathBuf, Option<CodecFactory>>>>`. Reads and
+/// writes are short-critical-section; no long-held locks.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ClaimMap(Arc<RwLock<HashMap<PathBuf, Option<CodecFactory>>>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ClaimMap {
+    /// Create a new, empty `ClaimMap`.
+    pub fn create() -> Self {
+        ClaimMap(Arc::new(RwLock::new(HashMap::new())))
+    }
+
+    /// Claim a specific absolute path for a given codec factory.
+    ///
+    /// If already claimed by a different factory, overwrites and emits [`tracing::warn!`].
+    pub fn claim(&self, abs_path: PathBuf, factory: CodecFactory) {
+        let mut map = self.0.write();
+        if let Some(Some(existing)) = map.get(&abs_path) {
+            if *existing as usize != factory as usize {
+                tracing::warn!(
+                    path = %abs_path.display(),
+                    "ClaimMap: path already claimed by a different codec factory; overwriting"
+                );
+            }
+        }
+        map.insert(abs_path, Some(factory));
+    }
+
+    /// Register an explicit rejection sentinel for a path.
+    ///
+    /// Called by `NetworkCodec::prepare_proto_relations` for children filtered out by
+    /// whitelist/blacklist rules. Allows `parse_one_path` to distinguish "rejected by
+    /// a network filter" from "not yet seen" (absent from the map entirely), routing
+    /// rejected files to `UnclaimedDataCodec` rather than `CODECS.path_get`.
+    pub fn reject(&self, abs_path: PathBuf) {
+        self.0.write().insert(abs_path, None);
+    }
+
+    /// Returns `true` if the path has been explicitly rejected by a network filter.
+    ///
+    /// A path that is absent from the map returns `false` — absence means "not yet
+    /// seen", not "rejected".
+    ///
+    /// Checks the path itself AND all ancestor directories. When a network's
+    /// blacklist rejects a non-subnet directory (e.g. `report.media/`), the
+    /// rejection is stored for the directory path. Files inside that directory
+    /// (e.g. `report.media/ppt/media/image8.png`) must also be considered
+    /// rejected — otherwise they fall through to asset processing.
+    pub fn is_rejected(&self, abs_path: &Path) -> bool {
+        let map = self.0.read();
+        // Check the exact path first (fast path).
+        if map.get(abs_path).is_some_and(|v| v.is_none()) {
+            return true;
+        }
+        // Walk ancestor directories — if any ancestor was rejected, this
+        // path is implicitly rejected too.
+        let mut current = abs_path.parent();
+        while let Some(ancestor) = current {
+            if map.get(ancestor).is_some_and(|v| v.is_none()) {
+                return true;
+            }
+            current = ancestor.parent();
+        }
+        false
+    }
+
+    /// Look up the codec factory for an absolute path.
+    ///
+    /// First checks the claim registry; if no explicit claim exists, falls back to
+    /// `CODECS.path_get` so callers have a single unified dispatch point.
+    ///
+    /// Returns `None` if the path was explicitly rejected (callers should check
+    /// [`ClaimMap::is_rejected`] separately) or if neither the claim registry nor
+    /// `CODECS` has a factory for this path.
+    pub fn get(&self, abs_path: &Path) -> Option<CodecFactory> {
+        self.0
+            .read()
+            .get(abs_path)
+            .and_then(|v| *v)
+            .or_else(|| CODECS.path_get(abs_path))
+    }
+
+    /// Remove a claim or rejection sentinel (used by `on_file_deleted` in the watch loop).
+    pub fn unclaim(&self, abs_path: &Path) {
+        self.0.write().remove(abs_path);
+    }
+
+    /// Number of currently registered entries (claims + rejections).
+    pub fn len(&self) -> usize {
+        self.0.read().len()
+    }
+
+    /// Returns `true` if no entries are registered.
+    pub fn is_empty(&self) -> bool {
+        self.0.read().is_empty()
+    }
+}
+
+/// Global parse-time claim registry.
+///
+/// Written during Phase 1 by [`NetworkCodec::parse`] (and any other codec that
+/// claims structured data files). Read during Phase 2 by `parse_one_path`.
+///
+/// Call [`ClaimMap::unclaim`] from [`DocumentCompiler::on_file_deleted`] when
+/// a claimed file is deleted, so stale entries do not affect future re-scans.
+#[cfg(not(target_arch = "wasm32"))]
+pub static CLAIM_MAP: Lazy<ClaimMap> = Lazy::new(ClaimMap::create);
+
+// ── Codec namespace registry ─────────────────────────────────────────────────────
+
+/// Global registry of codec namespace brefs created during parsing.
+///
+/// Populated by [`builder::GraphBuilder::push`] when it lazily creates a codec
+/// namespace network node.  Queried by
+/// [`compiler::DocumentCompiler::process_unresolved_reference`] to skip
+/// filesystem resolution for synthetic namespace references, and by the wasm
+/// viewer to identify codec namespace networks for display and context lookup.
+///
+/// Same singleton pattern as [`CODECS`], [`WALK_CODECS`], and [`CLAIM_MAP`].
+static CODEC_NAMESPACES: Lazy<
+    std::sync::RwLock<std::collections::HashSet<crate::properties::Bref>>,
+> = Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// Register a codec namespace bref in the global registry.
+///
+/// Called by `push()` when it lazily creates a codec namespace network node.
+/// Idempotent — registering the same bref multiple times is a no-op.
+pub fn register_codec_namespace(bref: crate::properties::Bref) {
+    CODEC_NAMESPACES.write().unwrap().insert(bref);
+}
+
+/// Check whether a bref belongs to a registered codec namespace.
+///
+/// Used by `process_unresolved_reference` to skip filesystem resolution for
+/// synthetic namespace references.
+pub fn is_codec_namespace(bref: &crate::properties::Bref) -> bool {
+    CODEC_NAMESPACES.read().unwrap().contains(bref)
+}
+
+/// Return all registered codec namespace brefs.
+///
+/// Used by the wasm viewer to identify codec namespace networks.
+pub fn codec_namespace_brefs() -> Vec<crate::properties::Bref> {
+    CODEC_NAMESPACES.read().unwrap().iter().copied().collect()
+}
+
+/// Clear the codec namespace registry.  Used between test runs to avoid
+/// cross-test contamination.
+#[cfg(test)]
+pub fn clear_codec_namespaces() {
+    CODEC_NAMESPACES.write().unwrap().clear();
+}
+
+// ── No-op fallback codec ──────────────────────────────────────────────────────
+
+/// No-op codec for walk-tracked files that no network has claimed.
+///
+/// Used by `parse_one_path` for two cases:
+/// 1. A file is tracked by [`WALK_CODECS`] but absent from [`CLAIM_MAP`] — no
+///    network codec claimed it (e.g. a stray `.yaml` file in a plain corpus).
+/// 2. A file was explicitly rejected by a network's whitelist/blacklist filter
+///    (stored as a `None` sentinel in [`CLAIM_MAP`]).
+///
+/// In both cases this codec:
+/// - Emits `ParseDiagnostic::info` naming the file
+/// - Produces no `IRNode`s and no `BeliefBase` nodes
+/// - Does **not** reach `process_asset` — the file is identified as structured
+///   text that no codec currently owns
+///
+/// The `parse()` method accepts a `proto_index: &ProtoIndex` parameter (part of
+/// the [`DocCodec`] trait since Issue 68) but ignores it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default, Clone)]
+pub struct UnclaimedDataCodec;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DocCodec for UnclaimedDataCodec {
+    fn proto(&self, _path: &Path) -> Result<Option<IRNode>, BuildonomyError> {
+        Ok(None)
+    }
+
+    fn parse(
+        &mut self,
+        _content: &str,
+        _current: IRNode,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+        _proto_index: &crate::codec::proto_index::ProtoIndex,
+    ) -> Result<(), BuildonomyError> {
+        Ok(())
+    }
+
+    fn nodes(&self) -> Vec<IRNode> {
+        vec![]
+    }
+
+    fn inject_context(
+        &mut self,
+        _proto_idx: usize,
+        _node: &IRNode,
+        _ctx: &BeliefContext<'_>,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<Option<BeliefNode>, BuildonomyError> {
+        Ok(None)
+    }
+
+    fn finalize(
+        &mut self,
+        _diagnostics: &mut Vec<ParseDiagnostic>,
+    ) -> Result<HashMap<Bid, IRNode>, BuildonomyError> {
+        Ok(HashMap::new())
+    }
+
+    fn generate_source(&self) -> Option<String> {
+        None
+    }
+}
 
 /// Codec registration entry: (optional_stem, optional_extension, factory).
 ///
@@ -240,11 +782,39 @@ pub const BUILTIN_EXTENSIONS: &[&str] = &["md"];
 #[cfg(not(target_arch = "wasm32"))]
 type CodecEntry = (Option<String>, Option<String>, CodecFactory);
 
-/// [ ] Need to iterate out protobeliefstate
-/// [ ] Need to replace protobeliefstates
-/// [ ] Need to write doc to buffer
-/// [ ] Be able to publish markdown snippets -- with or without: anchors, revised src/hrefs, widget
-///     configuration toml
+/// Declares how a codec expects to receive file content and write it back.
+///
+/// The compiler reads this once per file (via a cheap probe instantiation) and
+/// branches accordingly. All existing codecs default to `Text`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodecContentMode {
+    /// Codec operates on UTF-8 text. `parse()` receives decoded string content.
+    /// `generate_source()` returns `Option<String>` for write-back. (default)
+    #[default]
+    Text,
+    /// Codec operates on raw bytes. The `content: &str` parameter passed to `parse()`
+    /// is an empty string and must be ignored by the codec. The codec re-opens the
+    /// file from `current.path` using its own I/O.
+    /// `generate_source_bytes()` is called for binary write-back instead of
+    /// `generate_source()`.
+    Binary,
+}
+
+// [ ] Need to iterate out protobeliefstate
+// [ ] Need to replace protobeliefstates
+// [ ] Need to write doc to buffer
+// [ ] Be able to publish markdown snippets -- with or without: anchors, revised src/hrefs, widget
+//     configuration toml
+
+/// Named placeholder pairs for HTML fragment generation. See [`DocCodec::generate_html`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type HtmlFragmentPairs = Vec<(
+    String,
+    Vec<(String, String)>,
+    Option<crate::codec::assets::Layout>,
+)>;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub trait DocCodec: Sync {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
@@ -284,6 +854,11 @@ pub trait DocCodec: Sync {
         Ok(())
     }
 
+    /// Parse the document content into IR nodes.
+    ///
+    /// The `proto_index` parameter gives access to the pre-built filesystem index.
+    /// Most codecs ignore it; `NetworkCodec` uses it during `parse()` to claim or
+    /// reject child paths in `CLAIM_MAP` before Phase 2 dispatch.
     fn parse(
         &mut self,
         // The source content to be parsed by the DocCodec implementation
@@ -293,9 +868,26 @@ pub trait DocCodec: Sync {
         // Any author-visible warnings or errors discovered during parsing (e.g. duplicate
         // heading anchors) should be pushed here rather than emitted via tracing.
         diagnostics: &mut Vec<ParseDiagnostic>,
+        // Pre-built filesystem index. Most codecs ignore it; NetworkCodec uses it during
+        // parse() to claim or reject child paths in CLAIM_MAP before Phase 2 dispatch.
+        proto_index: &crate::codec::proto_index::ProtoIndex,
     ) -> Result<(), BuildonomyError>;
 
     fn nodes(&self) -> Vec<IRNode>;
+
+    /// Write the resolved BID back into the codec's internal proto for the node at
+    /// `proto_idx`. Called from the Phase 1 push loop immediately after `push()`
+    /// returns, before `inject_context` runs.
+    ///
+    /// This ensures that when `inject_context` calls `merge_from_belief_node`, the
+    /// `bid` field is already present in the proto's TOML document. Without this,
+    /// section protos always have an absent `bid` key (it lives in the document-level
+    /// `[sections]` table, not in the heading's own frontmatter), causing
+    /// `merge_from_belief_node` to insert it on every parse → `frontmatter_changed=true`
+    /// → `generate_source()` called → content rewrite loop.
+    ///
+    /// Default: no-op (codecs that don't need BID write-back can leave this).
+    fn set_node_bid(&mut self, _proto_idx: usize, _bid: Bid) {}
 
     /// Inject resolved context into a parsed node, optionally returning an updated `BeliefNode`.
     ///
@@ -304,6 +896,7 @@ pub trait DocCodec: Sync {
     /// `tracing`. This ensures they flow through `ParseContentResult` to the CLI and LSP layers.
     fn inject_context(
         &mut self,
+        proto_idx: usize,
         node: &IRNode,
         ctx: &BeliefContext<'_>,
         diagnostics: &mut Vec<ParseDiagnostic>,
@@ -335,6 +928,39 @@ pub trait DocCodec: Sync {
 
     fn generate_source(&self) -> Option<String>;
 
+    /// Declare whether this codec operates on UTF-8 text or raw bytes.
+    ///
+    /// The compiler reads this once per file to decide whether to decode bytes
+    /// to a String before calling `parse()`. Defaults to `Text`.
+    fn content_mode(&self) -> CodecContentMode {
+        CodecContentMode::Text
+    }
+
+    /// For binary codecs (`content_mode() == Binary`): produce the annotated
+    /// file bytes for write-back (e.g. an xlsx file with injected BID columns).
+    ///
+    /// Called in place of `generate_source()` when `content_mode()` is `Binary`.
+    /// Return `None` if the file is unchanged and no write-back is needed.
+    ///
+    /// Default: `None` (no binary write-back).
+    fn generate_source_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Derived file outputs produced during `parse()`.
+    ///
+    /// Returns a list of `(repo_relative_path, bytes)` pairs. The compiler creates
+    /// each file under `<repo_root>/<repo_relative_path>` and writes it to disk so
+    /// subsequent compile passes can register a content-addressed asset node for it.
+    ///
+    /// Paths must be relative to the repo root. The compiler does not enforce any
+    /// path convention but it is strongly recommended to avoid polluting the source tree.
+    ///
+    /// Default: empty — no derived outputs.
+    fn derived_outputs(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        vec![]
+    }
+
     /// Signal whether this codec needs deferred generation.
     ///
     /// If true, compiler will call `generate_html()` again after all parsing completes
@@ -357,7 +983,10 @@ pub trait DocCodec: Sync {
     /// Use for codecs that can generate HTML from parsed AST alone (e.g., Markdown).
     ///
     /// # Returns
-    /// - `Ok(vec![(filename, body), ...])`: Output filenames and HTML body content
+    /// - `Ok(vec![(filename, body, layout), ...])`: Output filenames, HTML body content, and
+    ///   optional layout. `Some(layout)` means wrap the body in that template via
+    ///   `write_fragment`. `None` means write raw (no template wrapping), used for companion
+    ///   data files like JSON.
     /// - `Ok(vec![])`: No immediate generation (may use deferred instead if should_defer == true)
     /// - `Err(_)`: Generation failed
     ///
@@ -370,10 +999,14 @@ pub trait DocCodec: Sync {
     /// For source file `/repo/docs/page.md`, returning `"page.html"` writes to
     /// `html_output/pages/docs/page.html` with public URL `/docs/page.html`.
     ///
-    /// # Body Content
-    /// Return HTML body content only (no `<html>`, `<head>`, etc.):
-    /// - Compiler wraps with Layout::Simple template
-    /// - Template adds canonical URL and optional script injection
+    /// # Placeholder Pairs
+    /// Return named placeholder key-value pairs for template substitution:
+    /// - Each pair is `("{{KEY}}".to_string(), value)` matching a placeholder in the layout template
+    /// - For `Some(layout)`: pairs override template defaults (caller wins on collision)
+    /// - For `None` layout: first pair's value is written verbatim (key ignored)
+    /// - Common key: `"{{BODY}}"` for HTML body content (no `<html>`, `<head>`, etc.)
+    /// - Compiler applies its own defaults first (CANONICAL, SPA_ROUTE, TITLE, BID, SCRIPTS, BODY="")
+    ///   then applies caller pairs on top
     ///
     /// # Link Normalization
     /// **Implementations MUST normalize document links to `.html` extension:**
@@ -382,7 +1015,7 @@ pub trait DocCodec: Sync {
     /// - Use `CODECS.extensions()` to get the list of registered extensions
     ///
     /// Default implementation returns empty vec (no HTML generation).
-    fn generate_html(&self) -> Result<Vec<(String, String)>, BuildonomyError> {
+    fn generate_html(&self) -> Result<HtmlFragmentPairs, BuildonomyError> {
         Ok(vec![])
     }
 }
@@ -405,13 +1038,14 @@ impl CodecMap {
     /// Extracts the filestem and extension from the `Path` and checks if any codec
     /// is registered for either component.
     ///
+    /// Note: plain `.md` files (other than `index.md`) are NOT registered in `CODECS`
+    /// by extension — they are claimed per-network via `CLAIM_MAP`. This method will
+    /// return `None` for arbitrary `.md` files; use `CLAIM_MAP.get()` to check those.
+    ///
     /// # Example
     /// ```
     /// use std::path::Path;
     /// use noet_core::codec::CODECS;
-    ///
-    /// let path = Path::new("/tmp/document.md");
-    /// assert!(CODECS.path_get(&path).is_some()); // true for .md extension
     ///
     /// // Noet networks directories are identified by index.md file name
     /// let path = Path::new("/tmp/index.md");
@@ -436,12 +1070,16 @@ impl CodecMap {
     /// Create a new `CodecMap` with built-in codecs registered.
     ///
     /// Built-in codecs:
-    /// - Markdown: registered by extension `.md`
-    /// - NetworkCodec: registered by constand file name `index.md`
+    /// - `index.md` (by stem+extension): registered directly → `NetworkCodec`
+    /// - bare directory paths (no stem, no ext): registered via `(None, None)` → `NetworkCodec`
+    /// - xlsx/ods (feature-gated): registered by extension
+    ///
+    /// Markdown files (`.md`) are NOT registered by extension — they are claimed
+    /// per-network by `NetworkCodec::prepare_proto_relations` via `CLAIM_MAP`. Only
+    /// `index.md` (by stem+extension) is registered directly.
     pub fn create() -> Self {
-        CodecMap(Arc::new(RwLock::new(vec![
-            // Markdown files by extension
-            (None, Some("md".to_string()), || Box::new(MdCodec::new())),
+        #[allow(unused_mut)]
+        let mut entries: Vec<CodecEntry> = vec![
             // Network files by constant filename index.md
             (Some("index".to_string()), Some("md".to_string()), || {
                 Box::new(NetworkCodec::default())
@@ -452,7 +1090,20 @@ impl CodecMap {
             // identical to AnchorPath, so callers that have filesystem access MUST guard
             // against them via `path.is_dir()` BEFORE calling CODECS.path_get / CODECS.get.
             (None, None, || Box::new(NetworkCodec::default())),
-        ])))
+        ];
+
+        #[cfg(all(feature = "xlsx", not(target_arch = "wasm32")))]
+        {
+            use crate::codec::xlsx::codec::XlsxCodec;
+            entries.push((
+                None,
+                Some("xlsx".to_string()),
+                || Box::new(XlsxCodec::new()),
+            ));
+            entries.push((None, Some("ods".to_string()), || Box::new(XlsxCodec::new())));
+        }
+
+        CodecMap(Arc::new(RwLock::new(entries)))
     }
 
     /// Insert a codec with optional stem and extension (advanced API).
@@ -503,17 +1154,20 @@ impl CodecMap {
     /// Returns a codec factory if any registered codec matches the given stem OR extension.
     /// This is the core lookup method used by `has_codec_for_path` and `has_codec_for_anchor_path`.
     ///
+    /// Note: plain `.md` files (other than `index.md`) are NOT registered here — they are
+    /// claimed per-network via `CLAIM_MAP`. Use `CLAIM_MAP.get(full_path)` for those.
+    ///
     /// # Example
     /// ```
     /// use noet_core::{codec::CODECS, paths::AnchorPath};
     ///
-    /// // Match by extension
-    /// let factory = CODECS.get(&AnchorPath::new("README.md"));
-    /// assert!(factory.is_some());
-    ///
-    /// // Match by constant name (factory is a different constructor than .md)
+    /// // Match by constant name
     /// let factory = CODECS.get(&AnchorPath::new("index.md"));
     /// assert!(factory.is_some());
+    ///
+    /// // Plain .md files are no longer registered by extension
+    /// let factory = CODECS.get(&AnchorPath::new("README.md"));
+    /// assert!(factory.is_none());
     ///
     /// // No match
     /// let factory = CODECS.get(&AnchorPath::new("unknown.xyz"));
@@ -536,9 +1190,13 @@ impl CodecMap {
                     codec_ext.as_ref().is_some_and(|e| e == ext) || codec_ext.is_none();
                 stem_matches && ext_matches
             })
-            .or(reader
-                .iter()
-                .find(|(_codec_stem, codec_ext, _)| codec_ext.as_ref().is_some_and(|e| e == ext)))
+            .or(reader.iter().find(|(codec_stem, codec_ext, _)| {
+                // Extension-only fallback: only match entries with no stem constraint.
+                // Entries registered with a stem (e.g. `index.md`) must NOT match on
+                // extension alone — that would cause `any_name.md` to resolve to the
+                // `index.md`-specific codec when the bare `.md` entry is absent.
+                codec_stem.is_none() && codec_ext.as_ref().is_some_and(|e| e == ext)
+            }))
             .or(reader.iter().find(|(codec_stem, codec_ext, _)| {
                 codec_stem.is_none() && codec_ext.is_none() && filestem.is_empty() && ext.is_empty()
             }))
@@ -596,38 +1254,60 @@ impl CodecMap {
     }
 }
 
-// WASM-compatible version: lightweight extension registry only (no actual codec instances)
+// WASM-compatible version: lightweight extension registry only (no actual codec instances).
+//
+// Defaults to [`BUILTIN_EXTENSIONS`] at creation, but the viewer should call
+// [`set_known_extensions`] with the contents of `codecs.json` to pick up
+// extensions registered by application shims at build time.
 #[cfg(target_arch = "wasm32")]
-pub struct CodecMap;
+pub struct CodecMap {
+    /// Runtime extension set. Initialized from `BUILTIN_EXTENSIONS`, replaced
+    /// by `set_known_extensions()` when the codec manifest is loaded.
+    extensions: parking_lot::RwLock<Vec<String>>,
+}
 
 #[cfg(target_arch = "wasm32")]
 impl Clone for CodecMap {
     fn clone(&self) -> Self {
-        CodecMap
+        CodecMap {
+            extensions: parking_lot::RwLock::new(self.extensions.read().clone()),
+        }
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl CodecMap {
     pub fn create() -> Self {
-        CodecMap
+        CodecMap {
+            extensions: parking_lot::RwLock::new(
+                BUILTIN_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
+            ),
+        }
     }
 
     pub fn extensions(&self) -> Vec<String> {
-        BUILTIN_EXTENSIONS.iter().map(|s| s.to_string()).collect()
+        self.extensions.read().clone()
+    }
+
+    /// Replace the known extension set with extensions from the codec manifest.
+    ///
+    /// Called by the WASM viewer after fetching `codecs.json`. This bridges
+    /// the gap between native-registered extensions and the WASM runtime.
+    pub fn set_known_extensions(&self, extensions: Vec<String>) {
+        *self.extensions.write() = extensions;
     }
 
     /// Check if a codec exists for the given anchor path (WASM version).
     ///
-    /// Only matches built-in document extensions (e.g. "md") so that
-    /// normalize_path_extension can replace them with .html.
+    /// Matches against the runtime extension set (defaulting to
+    /// [`BUILTIN_EXTENSIONS`], updated by [`set_known_extensions`]).
     ///
     /// Empty-extension paths (network/directory entries) and non-codec extensions
     /// (.pdf, .png, etc.) deliberately return None — normalize_path_extension
     /// handles those cases itself via the ext.is_empty() branch.
     pub fn get(&self, anchor_path: &AnchorPath) -> Option<()> {
         let ext = anchor_path.ext();
-        if BUILTIN_EXTENSIONS.contains(&ext) {
+        if self.extensions.read().iter().any(|e| e == ext) {
             Some(())
         } else {
             None
@@ -650,6 +1330,30 @@ impl CodecMap {
 /// This function is always compiled (not gated on `wasm32`) so it can be
 /// unit-tested with the native test runner. The `#[wasm_bindgen]` method in
 /// `wasm.rs` delegates to this function.
+/// Returns `true` if the given `AnchorPath` has an extension known to any registered codec
+/// or walk codec.
+///
+/// Checks both `CODECS` (stem/extension registry) and, on native builds, `WALK_CODECS`
+/// (walk-time visibility registry). This is the correct extensibility-aware gate for deciding
+/// whether a link should be rewritten to `.html` — any extension with a registered codec
+/// will produce a rendered HTML page; extensions known only to `WALK_CODECS` may also produce
+/// pages if claimed by an application codec.
+///
+/// On WASM, only `CODECS` is consulted (`WALK_CODECS` is not compiled in).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_known_codec_extension(ap: &AnchorPath) -> bool {
+    if CODECS.get(ap).is_some() {
+        return true;
+    }
+    WALK_CODECS.should_track(std::path::Path::new(ap.filepath()))
+}
+
+/// WASM variant: only consults `CODECS` since `WALK_CODECS` is not compiled in.
+#[cfg(target_arch = "wasm32")]
+pub fn is_known_codec_extension(ap: &AnchorPath) -> bool {
+    CODECS.get(ap).is_some()
+}
+
 pub fn normalize_path_extension_impl(path: &str) -> String {
     let anchor_path = AnchorPath::new(path);
 
@@ -673,19 +1377,104 @@ pub fn normalize_path_extension_impl(path: &str) -> String {
         return anchor_path.to_string();
     }
 
-    // Case 3: known codec extension — replace_extension already preserves the anchor
-    if CODECS.get(&anchor_path).is_some() {
+    // Case 3: known codec extension — consult the runtime-aware extension check
+    // so that extensions registered by application shims (e.g. .yaml, .h) are
+    // normalised to .html. On WASM, this checks the CodecMap's runtime extension
+    // set (populated from codecs.json); on native, it checks both CODECS and
+    // WALK_CODECS registries. Falls back to BUILTIN_EXTENSIONS to cover
+    // feature-gated codecs (xlsx, ods) compiled without --features xlsx.
+    if is_known_codec_extension(&anchor_path) || BUILTIN_EXTENSIONS.contains(&anchor_path.ext()) {
         return anchor_path.replace_extension("html");
     }
 
-    anchor_path.to_string()
+    // Case 4: unrecognized extension — likely a dotted directory name
+    // (e.g. "env.nightly.build-42") where AnchorPath::new
+    // misidentified the last dot-separated segment as a file extension.
+    //
+    // In the HTML-output context, the only valid file extensions are "html"
+    // (Case 2) and known codec extensions (Case 3). An unrecognized
+    // extension cannot be a compiled document. All callers guard against
+    // asset-namespace BIDs (extract_node_context, resolve_related_path)
+    // before calling this function, so this path is always a directory
+    // entry that needs /index.html appended.
+    let dir_ap = AnchorPath::new_dir(path);
+    dir_ap.join("index.html").to_string()
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use crate::{codec::md::MdCodec, tests::helpers::init_logging};
 
     use super::*;
+
+    fn test_md_factory() -> Box<dyn DocCodec + Send> {
+        Box::new(MdCodec::new())
+    }
+
+    #[test]
+    fn test_walk_codecs_md() {
+        assert!(WALK_CODECS.should_track(Path::new("foo.md")));
+        assert!(WALK_CODECS.should_track(Path::new("index.md")));
+        assert!(!WALK_CODECS.should_track(Path::new("foo.rs")));
+        assert!(!WALK_CODECS.should_track(Path::new("Makefile")));
+    }
+
+    #[test]
+    fn test_walk_codecs_yaml() {
+        assert!(WALK_CODECS.should_track(Path::new("data.yaml")));
+        assert!(WALK_CODECS.should_track(Path::new("data.yml")));
+        assert!(!WALK_CODECS.should_track(Path::new("data.json")));
+    }
+
+    #[test]
+    fn test_claim_map_roundtrip() {
+        let map = ClaimMap::create();
+        let path = PathBuf::from("/tmp/test.yaml");
+        assert!(map.get(&path).is_none());
+        assert_eq!(map.len(), 0);
+        map.claim(path.clone(), || Box::new(UnclaimedDataCodec));
+        assert!(map.get(&path).is_some());
+        assert_eq!(map.len(), 1);
+        map.unclaim(&path);
+        assert!(map.get(&path).is_none());
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_claim_map_reject_propagates_to_descendants() {
+        // When a non-subnet directory is rejected by a network's blacklist,
+        // files nested inside that directory must also be considered rejected.
+        // This prevents asset processing of media files in blacklisted dirs
+        // like `report.media/ppt/media/image8.png`.
+        let map = ClaimMap::create();
+
+        // Reject a directory (as NetworkCodec::parse does for blacklisted children).
+        let rejected_dir = PathBuf::from("/repo/catalog/widget/report.media");
+        map.reject(rejected_dir.clone());
+
+        // The directory itself is rejected.
+        assert!(map.is_rejected(&rejected_dir));
+
+        // Files inside the rejected directory must also be rejected.
+        assert!(map.is_rejected(&PathBuf::from(
+            "/repo/catalog/widget/report.media/ppt/media/image8.png"
+        )));
+        assert!(map.is_rejected(&PathBuf::from(
+            "/repo/catalog/widget/report.media/image1.png"
+        )));
+
+        // Files outside the rejected directory are not affected.
+        assert!(!map.is_rejected(&PathBuf::from("/repo/catalog/widget/index.md")));
+        assert!(!map.is_rejected(&PathBuf::from("/repo/catalog/widget/other-doc.md")));
+    }
+
+    #[test]
+    fn test_unclaimed_data_codec_produces_no_nodes() {
+        let codec = UnclaimedDataCodec;
+        assert!(codec.nodes().is_empty());
+    }
 
     /// Helper: Create a test network directory with index.md file
     fn create_test_network(dir: &std::path::Path) {
@@ -706,27 +1495,38 @@ Test network for unit tests.
 
     #[test]
     fn test_codec_factory_creates_fresh_instances() {
-        // Get codec factory for markdown
+        // Plain .md files are no longer registered in CODECS by extension —
+        // they are claimed per-network via CLAIM_MAP.
         let ap = AnchorPath::new("README.md");
-        let factory = CODECS.get(&ap).expect("md codec should exist");
+        assert!(
+            CODECS.get(&ap).is_none(),
+            "README.md should NOT be in CODECS (claimed via CLAIM_MAP instead)"
+        );
 
-        // Create two instances
+        // index.md IS registered directly (by stem+ext) and should return a factory.
+        let index_ap = AnchorPath::new("index.md");
+        let factory = CODECS.get(&index_ap).expect("index.md codec should exist");
+
+        // Create two instances and verify they are separate (different addresses).
         let codec1 = factory();
         let codec2 = factory();
-
-        // Verify they are separate instances (different addresses)
         let ptr1 = &*codec1 as *const dyn DocCodec;
         let ptr2 = &*codec2 as *const dyn DocCodec;
-
         assert_ne!(ptr1, ptr2, "Factory should create separate instances");
     }
 
     #[test]
     fn test_codec_factory_extensions() {
-        let extensions = CODECS.extensions();
-
-        // Verify built-in markdown codec is registered
-        assert!(extensions.contains(&"md".to_string()));
+        let patterns = CODECS.registered_patterns();
+        // The bare (None, Some("md")) wildcard entry was removed.
+        // Plain .md files are claimed per-network via CLAIM_MAP, not CODECS.
+        // The stem-qualified (Some("index"), Some("md")) entry still exists for index.md.
+        assert!(
+            !patterns
+                .iter()
+                .any(|(stem, ext)| stem.is_none() && ext.as_ref().is_some_and(|e| e == "md")),
+            "bare (None, Some('md')) should not be registered in CODECS"
+        );
     }
 
     // --- normalize_path_extension_impl ---
@@ -764,10 +1564,13 @@ Test network for unit tests.
 
     #[test]
     fn test_normalize_asset_pdf() {
-        // Non-codec extension — asset, leave unchanged
+        // Asset paths never reach this function in practice — all callers
+        // guard against asset-namespace BIDs before calling normalize.
+        // With the Case 4 fix, unrecognized extensions are treated as
+        // dotted directory names and get /index.html appended.
         assert_eq!(
             normalize_path_extension_impl("assets/test_doc.pdf"),
-            "assets/test_doc.pdf"
+            "assets/test_doc.pdf/index.html"
         );
     }
 
@@ -775,8 +1578,23 @@ Test network for unit tests.
     fn test_normalize_asset_png() {
         assert_eq!(
             normalize_path_extension_impl("images/photo.png"),
-            "images/photo.png"
+            "images/photo.png/index.html"
         );
+    }
+
+    #[test]
+    fn test_normalize_dotted_directory_name() {
+        // Dotted directory names (e.g. versioned build directories) must be
+        // treated as directories, not files with exotic extensions.
+        assert_eq!(
+            normalize_path_extension_impl("catalog/env.nightly.build-42"),
+            "catalog/env.nightly.build-42/index.html"
+        );
+    }
+
+    #[test]
+    fn test_normalize_dotted_directory_name_simple() {
+        assert_eq!(normalize_path_extension_impl("v1.2"), "v1.2/index.html");
     }
 
     #[test]
@@ -801,6 +1619,33 @@ Test network for unit tests.
         );
     }
 
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn test_normalize_codec_extension_xlsx() {
+        assert_eq!(
+            normalize_path_extension_impl("data/requirements.xlsx"),
+            "data/requirements.html"
+        );
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn test_normalize_codec_extension_xlsx_with_anchor() {
+        assert_eq!(
+            normalize_path_extension_impl("data/requirements.xlsx#section"),
+            "data/requirements.html#section"
+        );
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn test_normalize_codec_extension_ods() {
+        assert_eq!(
+            normalize_path_extension_impl("data/items.ods"),
+            "data/items.html"
+        );
+    }
+
     // --- existing tests ---
 
     #[test]
@@ -809,6 +1654,25 @@ Test network for unit tests.
         use crate::paths::as_extension;
         let map = CodecMap::create();
         for ext in BUILTIN_EXTENSIONS.iter() {
+            // "md" is no longer registered as a bare extension in CODECS —
+            // plain .md files are claimed per-network via CLAIM_MAP.
+            // BUILTIN_EXTENSIONS still lists "md" (used by normalize_path_extension_impl
+            // and the WASM codec map), but CODECS.get() will return None for "foo.md".
+            if *ext == "md" {
+                let ap_str = format!("foo{}", as_extension(ext));
+                let ap = AnchorPath::new(&ap_str);
+                assert!(
+                    map.get(&ap).is_none(),
+                    "'md' extension should not be in CODECS (claimed via CLAIM_MAP)"
+                );
+                continue;
+            }
+            // xlsx/ods are only registered in CODECS when the xlsx feature is enabled.
+            // BUILTIN_EXTENSIONS is always authoritative; the codec registration is feature-gated.
+            #[cfg(not(feature = "xlsx"))]
+            if *ext == "xlsx" || *ext == "ods" {
+                continue;
+            }
             let ap_str = format!("foo{}", as_extension(ext));
             let ap = AnchorPath::new(&ap_str);
             assert!(map.get(&ap).is_some());
@@ -824,10 +1688,14 @@ Test network for unit tests.
             .iter()
             .any(|(stem, _)| stem.as_ref().is_some_and(|s| s == "index")));
 
-        // Verify markdown codec is registered by extension
-        assert!(patterns
-            .iter()
-            .any(|(_, ext)| ext.as_ref().is_some_and(|e| e == "md")));
+        // The bare (None, Some("md")) extension entry has been removed.
+        // Only the stem-qualified (Some("index"), Some("md")) entry should appear.
+        assert!(
+            !patterns
+                .iter()
+                .any(|(stem, ext)| stem.is_none() && ext.as_ref().is_some_and(|e| e == "md")),
+            "bare (None, Some('md')) should not be registered in CODECS"
+        );
     }
 
     #[test]
@@ -847,9 +1715,21 @@ Test network for unit tests.
 
     #[test]
     fn test_wasm_extensions_match_builtin() {
-        // Verify WASM build would have same extensions as non-WASM
+        // Verify WASM build would have same extensions as non-WASM.
+        // xlsx/ods are only registered when the xlsx feature is active.
+        // "md" is intentionally absent from CODECS.extensions() — it is in
+        // BUILTIN_EXTENSIONS for normalize_path_extension_impl / WASM, but
+        // plain .md files are claimed per-network via CLAIM_MAP, not CODECS.
         let extensions = CODECS.extensions();
         for builtin in BUILTIN_EXTENSIONS {
+            if *builtin == "md" {
+                // Intentionally not in CODECS extensions; skip.
+                continue;
+            }
+            #[cfg(not(feature = "xlsx"))]
+            if *builtin == "xlsx" || *builtin == "ods" {
+                continue;
+            }
             assert!(
                 extensions.contains(&builtin.to_string()),
                 "Missing builtin extension: '{}'",
@@ -927,6 +1807,14 @@ Test network for unit tests.
         let test_file = temp_dir.path().join("test.md");
         let content = "# Test Document\n\nThis is a test.";
         std::fs::write(&test_file, content).unwrap();
+        // Seed CLAIM_MAP so parse_content can resolve a codec for test.md
+        // (no bare .md entry in CODECS since removal of wildcard entry).
+        // Claim both paths: initialize_stack receives the non-canonicalized path from
+        // parse_content's caller, while parse_content itself canonicalizes before lookup
+        // (e.g. /var -> /private/var on macOS). Both must be registered.
+        let canonical_test_file = test_file.canonicalize().unwrap();
+        CLAIM_MAP.claim(test_file.clone(), test_md_factory);
+        CLAIM_MAP.claim(canonical_test_file, test_md_factory);
 
         // Create builder with directory as root
         let mut builder = GraphBuilder::new(temp_dir.path(), None).unwrap();
@@ -973,6 +1861,14 @@ Test network for unit tests.
         let test_file = temp_dir.path().join("test.md");
         let content = "# Test Document\n\nThis is a test with a [link](other.md).";
         std::fs::write(&test_file, content).unwrap();
+        // Seed CLAIM_MAP so parse_content can resolve a codec for test.md
+        // (no bare .md entry in CODECS since removal of wildcard entry).
+        // Claim both paths: initialize_stack receives the non-canonicalized path from
+        // parse_content's caller, while parse_content itself canonicalizes before lookup
+        // (e.g. /var -> /private/var on macOS). Both must be registered.
+        let canonical_test_file = test_file.canonicalize().unwrap();
+        CLAIM_MAP.claim(test_file.clone(), test_md_factory);
+        CLAIM_MAP.claim(canonical_test_file, test_md_factory);
 
         // Create builder with directory as root
         let mut builder = GraphBuilder::new(temp_dir.path(), None).unwrap();
@@ -999,7 +1895,8 @@ Test network for unit tests.
         let fragments = immediate_result.unwrap();
         assert_eq!(fragments.len(), 1, "Should generate one fragment");
 
-        let (output_filename, html_body) = &fragments[0];
+        let (output_filename, pairs, _layout) = &fragments[0];
+        let (_, html_body) = &pairs[0];
         assert!(
             output_filename.ends_with(".html"),
             "Output filename should end with .html, got: '{}'",
@@ -1016,5 +1913,78 @@ Test network for unit tests.
 
         // Test deferral signal (markdown doesn't need deferral)
         assert!(!codec.should_defer(), "Markdown should not need deferral");
+    }
+
+    // --- WalkCodec::network_filenames / WalkCodecMap::is_network_file ---
+
+    #[test]
+    fn test_walk_codec_network_filenames_default_is_empty() {
+        // Built-in walk codecs should not declare any network filenames.
+        let md = MdWalkCodec;
+        assert!(md.network_filenames().is_empty());
+        let yaml = YamlWalkCodec;
+        assert!(yaml.network_filenames().is_empty());
+    }
+
+    #[test]
+    fn test_walk_codecs_is_network_file_index_md() {
+        // NETWORK_NAME is always a network file, even without any registered codecs.
+        assert!(WALK_CODECS.is_network_file("index.md"));
+    }
+
+    #[test]
+    fn test_walk_codecs_is_network_file_rejects_unknown() {
+        assert!(!WALK_CODECS.is_network_file("README.md"));
+        assert!(!WALK_CODECS.is_network_file("data.yaml"));
+        assert!(!WALK_CODECS.is_network_file(""));
+    }
+
+    #[test]
+    fn test_walk_codecs_network_filenames_includes_network_name() {
+        let names = WALK_CODECS.network_filenames();
+        assert!(names.contains(&"index.md".to_string()));
+    }
+
+    #[test]
+    fn test_walk_codec_map_custom_network_filename() {
+        // Create an isolated WalkCodecMap to avoid polluting the global registry.
+        let map = WalkCodecMap::create();
+
+        struct TestNetworkWalkCodec;
+        impl WalkCodec for TestNetworkWalkCodec {
+            fn should_track(&self, path: &Path) -> bool {
+                path.file_name().and_then(|n| n.to_str()) == Some("Manifest.toml")
+            }
+            fn tracked_extensions(&self) -> Vec<&'static str> {
+                vec!["toml"]
+            }
+            fn network_filenames(&self) -> Vec<&'static str> {
+                vec!["Manifest.toml"]
+            }
+        }
+
+        // Before registration: only index.md is a network file.
+        assert!(map.is_network_file("index.md"));
+        assert!(!map.is_network_file("Manifest.toml"));
+
+        // After registration: both are network files.
+        map.register(Box::new(TestNetworkWalkCodec));
+        assert!(map.is_network_file("index.md"));
+        assert!(map.is_network_file("Manifest.toml"));
+        assert!(!map.is_network_file("README.md"));
+
+        // network_filenames returns both, deduplicated.
+        let names = map.network_filenames();
+        assert!(names.contains(&"index.md".to_string()));
+        assert!(names.contains(&"Manifest.toml".to_string()));
+    }
+
+    #[test]
+    fn test_is_network_index_file() {
+        assert!(is_network_index_file(Path::new("/repo/docs/index.md")));
+        assert!(is_network_index_file(Path::new("index.md")));
+        assert!(!is_network_index_file(Path::new("README.md")));
+        assert!(!is_network_index_file(Path::new("data.yaml")));
+        assert!(!is_network_index_file(Path::new("")));
     }
 }

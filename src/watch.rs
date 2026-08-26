@@ -49,9 +49,6 @@
 //!         Event::Belief(belief_event) => {
 //!             println!("Received belief update: {:?}", belief_event);
 //!         }
-//!         Event::Focus(focus_event) => {
-//!             println!("Received focus update: {:?}", focus_event);
-//!         }
 //!         Event::Ping => {
 //!             // Keepalive event
 //!         }
@@ -96,7 +93,7 @@
 //! use noet_core::{
 //!     watch::WatchService,
 //!     config::NetworkRecord,
-//!     properties::{BeliefNode, Bid},
+//!     properties::{BeliefNode, Bid, NodeId},
 //!     event::Event,
 //! };
 //! use std::{sync::mpsc::channel, path::PathBuf};
@@ -114,7 +111,7 @@
 //!     path: "/workspace/new_network".to_string(),
 //!     node: BeliefNode {
 //!         title: "New Network".to_string(),
-//!         id: Some("new-network".to_string()),
+//!         id: NodeId::Explicit("new-network".to_string()),
 //!         ..Default::default()
 //!     },
 //! });
@@ -239,17 +236,15 @@
 //! - [`LatticeConfigProvider`] - Configuration interface
 
 use crate::{
-    beliefbase::BeliefGraph,
     codec::{
         compiler::{CompilerStats, DocumentCompiler},
         network::detect_network_file,
-        CodecMap,
+        WALK_CODECS,
     },
     config::{LatticeConfigProvider, NetworkRecord, TomlConfigProvider},
     db::{db_init, DbConnection, Transaction},
     error::BuildonomyError,
     event::{BeliefEvent, Event},
-    query::{BeliefSource, PaginatedQuery, Query, ResultsPage},
 };
 
 use notify_debouncer_full::{
@@ -265,7 +260,7 @@ use std::{
     path::{Path, PathBuf},
     result::Result,
     sync::{atomic::Ordering, mpsc::Sender, Arc},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use tokio::{
     runtime::Runtime,
@@ -275,7 +270,6 @@ use tokio::{
         watch,
     },
     task::JoinHandle,
-    time::sleep,
 };
 
 /// A file system watcher with debouncing for a belief network
@@ -290,14 +284,9 @@ type NetworkWatcherMap = HashMap<PathBuf, WatcherWithSyncer>;
 #[derive(Default)]
 struct BnWatchers(pub Arc<Mutex<NetworkWatcherMap>>);
 
-#[derive(Default)]
-struct PaginationCache(pub Arc<RwLock<HashMap<Query, (SystemTime, BeliefGraph)>>>);
-
 pub struct WatchService {
     watchers: Arc<Mutex<BnWatchers>>,
-    pagination_cache: Arc<Mutex<PaginationCache>>,
     db: DbConnection,
-    codecs: CodecMap,
     event_tx: Sender<Event>,
     runtime: Runtime,
     config_provider: Arc<dyn LatticeConfigProvider>,
@@ -356,13 +345,9 @@ impl WatchService {
         let config_provider = TomlConfigProvider::new(config_path);
         let config_provider: Arc<dyn LatticeConfigProvider> = Arc::new(config_provider);
 
-        let codecs = CodecMap::create();
-
         Ok(WatchService {
             watchers: Arc::new(Mutex::new(BnWatchers::default())),
-            pagination_cache: Arc::new(Mutex::new(PaginationCache::default())),
             db,
-            codecs,
             event_tx,
             runtime,
             config_provider,
@@ -514,60 +499,6 @@ impl WatchService {
         Ok(write(path, text)?)
     }
 
-    pub async fn get_states(
-        &self,
-        pq: PaginatedQuery,
-    ) -> Result<ResultsPage<BeliefGraph>, BuildonomyError> {
-        let (mut maybe_page, pagination_complete) = {
-            while self.pagination_cache.lock().0.is_locked() {
-                tracing::info!("[client operation] Waiting for read access to query cache");
-                sleep(Duration::from_millis(100)).await;
-            }
-            let cache = self.pagination_cache.lock().0.read_arc();
-            if let Some((_, res)) = cache.get(&pq.query) {
-                let page = res.paginate(pq.limit, pq.offset);
-                tracing::debug!("Returning page from cache. Page len: {}", page.count);
-                let completely_paged =
-                    page.count <= pq.offset.unwrap_or(0) + page.results.states.len();
-                (Some(page), completely_paged)
-            } else {
-                (None, false)
-            }
-        };
-
-        if pagination_complete {
-            while self.pagination_cache.lock().0.is_locked() {
-                tracing::info!("[client operation] Waiting for write access to query cache");
-                sleep(Duration::from_millis(100)).await;
-            }
-            let mut cache = self.pagination_cache.lock().0.write_arc();
-            cache.remove(&pq.query);
-        }
-
-        let page = match maybe_page.take() {
-            Some(page) => page,
-            None => {
-                tracing::debug!("No cached query. Freshly evaluating ...");
-                let connection = self.db_connection();
-                let fresh_res = connection.eval_query(&pq.query, false).await?;
-                let page = fresh_res.paginate(pq.limit, pq.offset);
-                tracing::debug!("Returning fresh page. Page len: {}", page.count);
-                {
-                    tracing::debug!("Caching query");
-                    while self.pagination_cache.lock().0.is_locked() {
-                        tracing::info!("[client operation] Waiting for write access to query cache to insert new query");
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                    let mut cache = self.pagination_cache.lock().0.write_arc();
-                    cache.insert(pq.query.clone(), (SystemTime::now(), fresh_res));
-                }
-                page
-            }
-        };
-        assert!(!self.pagination_cache.lock().0.is_locked());
-        Ok(page)
-    }
-
     pub fn enable_network_syncer(&self, repo_path: &PathBuf) -> Result<(), BuildonomyError> {
         let binding = self.watchers.lock();
         let mut watchers = binding.0.lock();
@@ -578,7 +509,6 @@ impl WatchService {
         }
 
         let network_syncer = FileUpdateSyncer::new(
-            self.codecs.clone(),
             &self.db,
             &self.event_tx,
             repo_path,
@@ -602,7 +532,7 @@ impl WatchService {
         {
             let mut compiler = compiler_ref.write();
             compiler.enqueue(repo_path);
-            tracing::info!(
+            tracing::debug!(
                 "[WatchService] Enqueued network root for initial parse: {:?}",
                 repo_path
             );
@@ -610,13 +540,12 @@ impl WatchService {
         work_notifier.notify_one();
 
         let ignored_write_paths = network_syncer.ignored_write_paths.clone();
-        let debouncer_codec = self.codecs.clone();
         let debouncer_compiler_idle = network_syncer.compiler_idle.clone();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
             move |result: DebounceEventResult| {
-                tracing::info!("[FileUpdateSyncer Debouncer] processing debounce event");
+                tracing::debug!("[FileUpdateSyncer Debouncer] processing debounce event");
                 match result {
                     Ok(events) => {
                         for event in events.iter() {
@@ -669,15 +598,19 @@ impl WatchService {
                                                 return false;
                                             }
 
-                                            // For modifications/creates, only codec files and
-                                            // assets trigger a re-parse. Deletions of any
-                                            // tracked file should be forwarded.
-                                            is_remove || debouncer_codec.path_get(p).is_some()
+                                            // For modifications/creates, only walk-tracked files
+                                            // trigger a re-parse. Deletions of any tracked file
+                                            // should be forwarded.
+                                            // WALK_CODECS.should_track() is the canonical
+                                            // walk-time visibility predicate for the two-registry
+                                            // model — it covers .md (MdWalkCodec), .yaml
+                                            // (YamlWalkCodec), and any shim-registered codecs.
+                                            is_remove || WALK_CODECS.should_track(p)
                                         })
                                         .collect();
 
                                     if !relevant_paths.is_empty() {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             "[Debouncer] {} files to process (is_remove={})",
                                             relevant_paths.len(),
                                             is_remove
@@ -688,24 +621,24 @@ impl WatchService {
                                             );
                                             std::thread::sleep(Duration::from_millis(100));
                                         }
-                                        tracing::info!("[Debouncer] Acquired write lock");
+                                        tracing::debug!("[Debouncer] Acquired write lock");
                                         let mut compiler = compiler_ref.write();
                                         for path in relevant_paths {
                                             if is_remove {
-                                                tracing::info!(
+                                                tracing::debug!(
                                                     "[Debouncer] File deleted: {:?}",
                                                     path
                                                 );
                                                 compiler.on_file_deleted(path);
                                             } else {
-                                                tracing::info!(
+                                                tracing::debug!(
                                                     "[Debouncer] File modified, enqueuing for re-parse: {:?}",
                                                     path
                                                 );
                                                 compiler.on_file_modified(path);
                                             }
                                         }
-                                        tracing::info!("[Debouncer] Finished processing, compiler.has_pending()={}", compiler.has_pending());
+                                        tracing::debug!("[Debouncer] Finished processing, compiler.has_pending()={}", compiler.has_pending());
 
                                         // Notify compiler thread that work is available.
                                         work_notifier.notify_one();
@@ -789,7 +722,6 @@ impl FileUpdateSyncer {
     #[tracing::instrument(skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        _codecs: CodecMap,
         global_bb: &DbConnection,
         tx: &Sender<Event>,
         root: &Path,

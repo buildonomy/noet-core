@@ -1,0 +1,265 @@
+# Self-hosted macOS runner — temporary replacement for test.yml while
+# GitHub-hosted runners are unavailable.  Delete this file and revert to
+# test.yml once hosted runners are restored.
+#
+# Differences from test.yml:
+#   - All jobs run on `self-hosted` (macOS)
+#   - Single rust toolchain (stable) — no beta matrix
+#   - No cargo-tarpaulin coverage (Linux-only)
+#   - No benchmark / corpus-pages jobs (main-push-only, not gating)
+#   - Toolchain install uses `rustup update` (tools already present on runner)
+#   - No actions/cache (self-hosted runner has a persistent filesystem)
+#   - No disk-space cleanup (not needed on macOS)
+#
+# ## Commands live in the justfile, not here
+#
+# Every job below delegates to a recipe in `//justfile`. That file is the single
+# source of truth for what each job actually runs, so `just lint` locally is the
+# same command as the `lint` job here — not a copy of it that can drift.
+#
+# When adding a job: add the recipe to the justfile first, then call it here.
+# Do not inline a cargo invocation in this file.
+
+name: CI (self-hosted)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-matrix:
+    name: Test (${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["no-default", "bin,service", "default"]
+        include:
+          - features: "no-default"
+            cargo_flags: "--no-default-features"
+          - features: "bin,service"
+            cargo_flags: "--no-default-features --features bin,service"
+          - features: "default"
+            cargo_flags: ""
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      - name: Build
+        run: just build '${{ matrix.cargo_flags }}'
+
+      - name: Test
+        run: just test '${{ matrix.cargo_flags }}'
+
+      - name: Doc tests
+        run: just doc-test '${{ matrix.cargo_flags }}'
+
+  lint:
+    name: Lint (rustfmt + clippy)
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          rustup component add rustfmt clippy
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      - name: Check formatting
+        run: just fmt-check
+
+      - name: Run clippy
+        run: just clippy
+
+  docs:
+    name: Documentation
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      # RUSTDOCFLAGS is set inside the recipe, so local runs are also gated.
+      - name: Generate documentation
+        run: just docs
+
+  examples:
+    name: Verify Examples
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      - name: Build and run examples
+        run: just examples
+
+  wasm-interface:
+    name: WASM Interface Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Install Node.js
+        run: |
+          if command -v node > /dev/null 2>&1; then
+            echo "✓ node already present ($(node --version))"
+          else
+            NODE_VERSION=v20.19.2
+            OS=$(uname -s | tr '[:upper:]' '[:lower:]')  # linux or darwin
+            ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
+            NODE_DIR="node-${NODE_VERSION}-${OS}-${ARCH}"
+            curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIR}.tar.gz" | tar xz -C "$HOME"
+            echo "$HOME/${NODE_DIR}/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      - name: Build WASM module and run interface tests
+        run: just wasm-interface
+
+  standalone:
+    name: Standalone Crate Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+          if ! command -v wasm-bindgen > /dev/null 2>&1; then
+            cargo install wasm-bindgen-cli --version 0.2.108
+          fi
+          if ! command -v just > /dev/null 2>&1; then
+            cargo install just
+          fi
+
+      - name: Fetch vendored binaries
+        run: just vendor
+
+      # The recipe generates the consumer crate under target/, so unlike the
+      # previous version this job does not need a nested checkout path.
+      - name: Build and run standalone consumer crate
+        run: just standalone
+
+  test-summary:
+    name: Test Summary
+    runs-on: self-hosted
+    needs: [test-matrix, lint, docs, examples, wasm-interface, standalone]
+    if: always()
+    steps:
+      - name: Check test results
+        run: |
+          failed=0
+          for job in test-matrix lint docs examples wasm-interface standalone; do
+            result="${{ needs[job].result }}" 2>/dev/null || result="unknown"
+          done
+
+          if [ "${{ needs.test-matrix.result }}" != "success" ]; then
+            echo "❌ Test matrix: ${{ needs.test-matrix.result }}"
+            failed=1
+          fi
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "❌ Lint: ${{ needs.lint.result }}"
+            failed=1
+          fi
+          if [ "${{ needs.docs.result }}" != "success" ]; then
+            echo "❌ Docs: ${{ needs.docs.result }}"
+            failed=1
+          fi
+          if [ "${{ needs.examples.result }}" != "success" ]; then
+            echo "❌ Examples: ${{ needs.examples.result }}"
+            failed=1
+          fi
+          if [ "${{ needs.wasm-interface.result }}" != "success" ]; then
+            echo "❌ WASM interface: ${{ needs.wasm-interface.result }}"
+            failed=1
+          fi
+          if [ "${{ needs.standalone.result }}" != "success" ]; then
+            echo "❌ Standalone: ${{ needs.standalone.result }}"
+            failed=1
+          fi
+
+          if [ "$failed" -eq 1 ]; then
+            exit 1
+          fi
+          echo "✅ All tests passed"

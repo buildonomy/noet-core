@@ -4,19 +4,31 @@ use crate::{
     codec::{
         assets::{get_stylesheet_urls, get_template, Layout},
         belief_ir::IRNode,
-        builder::{GraphBuilder, ParseContentWithCodec},
+        builder::{AssetCodec, GraphBuilder, ParseContentResult, ParseContentWithCodec},
+        is_network_index_file,
         network::{detect_network_file, NetworkCodec, NETWORK_NAME},
         proto_index::ProtoIndex,
-        DocCodec, ParseDiagnostic, UnresolvedReference, CODECS,
+        CodecContentMode, CodecFactory, DocCodec, ParseDiagnostic, UnclaimedDataCodec,
+        UnresolvedReference, CLAIM_MAP, CODECS, WALK_CODECS,
     },
     error::BuildonomyError,
-    event::BeliefEvent,
+    event::{BeliefEvent, EventOrigin},
     nodekey::NodeKey,
     paths::{os_path_to_string, string_to_os_path, AnchorPath, AnchorPathBuf},
-    properties::{asset_namespace, content_namespaces, Bid, Bref},
-    query::{BeliefSource, Expression, Query},
+    properties::{
+        asset_namespace, content_namespaces, BeliefKind, Bid, Bref, Weight, WeightKind,
+        WEIGHT_OWNED_BY, WEIGHT_SORT_KEY,
+    },
+    query::{
+        lookup_node,
+        spec::{
+            ProjectionStep, QueryPackage, QuerySpec, Role, TapeFn, TraversalDepth, TraversalSpec,
+        },
+        BeliefSource,
+    },
 };
 
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
@@ -29,6 +41,76 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use toml_edit::value;
 use tracing::Instrument;
+
+/// A lightweight progress reporter for `parse_all`. Wraps an optional `indicatif::ProgressBar`
+/// and exposes a uniform interface regardless of whether the bar is active.
+///
+/// The reporter is advanced at each `drain_epoch` boundary in `parse_all`. During the
+/// structured Epoch 0 passes (network dirs and leaf docs) it shows a determinate bar;
+/// during the remainder loop it shows an indeterminate spinner since the total is not
+/// known up-front.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ProgressReporter {
+    #[cfg(feature = "bin")]
+    bar: Option<indicatif::ProgressBar>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "bin"))]
+impl Default for ProgressReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ProgressReporter {
+    /// Create a reporter that shows a progress bar on stderr.
+    #[cfg(feature = "bin")]
+    pub fn new() -> Self {
+        let bar = indicatif::ProgressBar::new(0);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        Self { bar: Some(bar) }
+    }
+
+    /// Create a no-op reporter (progress disabled).
+    pub fn disabled() -> Self {
+        #[cfg(feature = "bin")]
+        return Self { bar: None };
+        #[cfg(not(feature = "bin"))]
+        Self {}
+    }
+
+    /// Set total, advance position, and update the status message.
+    /// `pos` and `len` together form the fraction shown in the bar.
+    /// When `len == 0` (remainder loop) the bar acts as a spinner.
+    pub fn update(&self, _pos: u64, _len: u64, _msg: &str) {
+        #[cfg(feature = "bin")]
+        if let Some(bar) = &self.bar {
+            if _len == 0 {
+                bar.set_length(0);
+            } else {
+                bar.set_length(_len);
+            }
+            bar.set_position(_pos);
+            bar.set_message(_msg.to_string());
+            bar.tick();
+        }
+    }
+
+    /// Mark the progress bar as finished and clear it from the terminal.
+    pub fn finish(&self) {
+        #[cfg(feature = "bin")]
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
 
 /// A wrapper around GraphBuilder that manages recursive document parsing with queue
 /// management and loop prevention.
@@ -66,6 +148,9 @@ pub struct DocumentCompiler {
     /// Number of parallel jobs for epoch dispatch. 1 = sequential (default).
     /// Set via `--jobs N` CLI flag or `NOET_JOBS` environment variable.
     jobs: usize,
+    /// Controls compile-time layout metadata for the 3D viewer.
+    /// Set via `--no-layout` / `--layout-max-nodes N` or `NOET_LAYOUT_MAX_NODES`.
+    layout_config: crate::layout::LayoutConfig,
     /// Optional output directory for HTML generation
     html_output_dir: Option<PathBuf>,
     /// Optional JavaScript to inject into generated HTML (e.g., live reload script)
@@ -104,6 +189,30 @@ pub struct DocumentCompiler {
     latest_results: HashMap<PathBuf, ParseResult>,
     /// Network files that need HTML generation deferred until all documents are parsed
     deferred_html: std::collections::HashSet<PathBuf>,
+    /// The set of paths in the currently-dispatched batch. Pre-incremented paths that
+    /// are also in this set are same-batch siblings — their parse output is not yet in
+    /// session_bb when siblings run, so a file with an unresolved ref to one must
+    /// re-queue itself. Cleared after each batch's results are processed.
+    current_batch: std::collections::HashSet<PathBuf>,
+    /// NodeKeys that have been confirmed permanently unresolvable — they failed on pass 1
+    /// and again on pass 2 (or were rejected as external/non-existent on pass 1).
+    ///
+    /// When every unresolved reference in a file's diagnostic list has its primary
+    /// NodeKey in this set, the file is not re-queued. This prevents the "re-parse storm"
+    /// where files containing permanently-broken wikilinks or dead asset paths get
+    /// re-queued on every batch pass until max_reparse_count fires.
+    ///
+    /// Keys are the first element of `UnresolvedReference.other_keys` (the primary key
+    /// used by cache_fetch). Using the first key is sufficient: cache_fetch tries all
+    /// keys in order and only emits Unresolved when none resolve — so if the primary key
+    /// is permanently absent, the ref will never resolve regardless of other keys.
+    permanently_unresolved: HashSet<NodeKey>,
+    #[cfg(not(target_arch = "wasm32"))]
+    progress: ProgressReporter,
+    /// Optional per-instance ClaimMap for test isolation.
+    /// When None, the global CLAIM_MAP is used.
+    #[cfg(not(target_arch = "wasm32"))]
+    claim_map: Option<Arc<crate::codec::ClaimMap>>,
 }
 
 /// Result of parsing a single document
@@ -113,6 +222,18 @@ pub struct ParseResult {
     pub rewritten_content: Option<String>,
     pub dependent_paths: Vec<(String, Bref)>,
     pub diagnostics: Vec<crate::codec::ParseDiagnostic>,
+}
+
+/// Metadata for a single HTML fragment write operation.
+///
+/// Groups the three scalar arguments to [`DocumentCompiler::write_fragment`] that
+/// describe the *document identity* — separated from the layout/path arguments so
+/// the total parameter count stays within clippy's `too_many_arguments` limit.
+struct FragmentMeta<'a> {
+    title: &'a str,
+    bid: &'a Bid,
+    source_path: Option<&'a Path>,
+    is_binary: bool,
 }
 
 impl DocumentCompiler {
@@ -166,6 +287,15 @@ impl DocumentCompiler {
         // partial output in html_output_dir (assets/ and pages/ would otherwise be
         // written before canonicalize() or GraphBuilder::new() returns an error).
         if let Some(ref html_dir) = html_output_dir {
+            // Wipe pages/ before each build to prevent stale HTML files from prior
+            // builds (e.g. per-tab xlsx files that no longer exist) from persisting.
+            // assets/ is not wiped — extract_assets handles idempotent overwriting.
+            let pages_dir = html_dir.join("pages");
+            if pages_dir.exists() {
+                std::fs::remove_dir_all(&pages_dir).map_err(|e| {
+                    BuildonomyError::Codec(format!("Failed to wipe pages/ before build: {e}"))
+                })?;
+            }
             Self::copy_static_assets(html_dir, use_cdn)?;
         }
 
@@ -196,6 +326,7 @@ impl DocumentCompiler {
         Ok(Self {
             write,
             jobs: resolved_jobs,
+            layout_config: crate::layout::LayoutConfig::default(),
             html_output_dir,
             html_script,
             use_cdn,
@@ -207,6 +338,12 @@ impl DocumentCompiler {
             max_reparse_count: max_reparse_count.unwrap_or(2),
             latest_results: HashMap::new(),
             deferred_html: std::collections::HashSet::new(),
+            current_batch: std::collections::HashSet::new(),
+            permanently_unresolved: HashSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            progress: ProgressReporter::disabled(),
+            #[cfg(not(target_arch = "wasm32"))]
+            claim_map: None::<Arc<crate::codec::ClaimMap>>,
         })
     }
 
@@ -224,6 +361,20 @@ impl DocumentCompiler {
     /// Set the number of parallel jobs. Used by CLI after construction.
     pub fn set_jobs(&mut self, jobs: usize) {
         self.jobs = jobs.max(1);
+    }
+
+    /// Configure compile-time layout metadata generation.
+    ///
+    /// Defaults to enabled with [`crate::layout::DEFAULT_LAYOUT_MAX_NODES`].
+    pub fn set_layout_config(&mut self, config: crate::layout::LayoutConfig) {
+        self.layout_config = config;
+    }
+
+    /// Attach a progress reporter that will be advanced during `parse_all`.
+    /// Calling this replaces the default no-op reporter.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_progress(&mut self, reporter: ProgressReporter) {
+        self.progress = reporter;
     }
 
     /// Create a new compiler with an entry point (file or directory) and default arguments: no
@@ -254,6 +405,7 @@ impl DocumentCompiler {
         Ok(Self {
             write: false,
             jobs,
+            layout_config: crate::layout::LayoutConfig::default(),
             html_output_dir: None,
             html_script: None,
             use_cdn: false,
@@ -265,7 +417,28 @@ impl DocumentCompiler {
             max_reparse_count: 2,
             latest_results: HashMap::new(),
             deferred_html: std::collections::HashSet::new(),
+            current_batch: std::collections::HashSet::new(),
+            permanently_unresolved: HashSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            progress: ProgressReporter::disabled(),
+            #[cfg(not(target_arch = "wasm32"))]
+            claim_map: None::<Arc<crate::codec::ClaimMap>>,
         })
+    }
+
+    /// Create a compiler with a local ClaimMap for test isolation.
+    ///
+    /// Use this in tests that exercise `prepare_proto_relations` to avoid polluting
+    /// the global `CLAIM_MAP` between test runs. The provided `claim_map` is used
+    /// instead of the global `CLAIM_MAP` for all codec lookups in `parse_one_path`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_claim_map(
+        entry_point: impl AsRef<Path>,
+        claim_map: crate::codec::ClaimMap,
+    ) -> Result<Self, BuildonomyError> {
+        let mut compiler = Self::simple(entry_point)?;
+        compiler.claim_map = Some(Arc::new(claim_map));
+        Ok(compiler)
     }
 
     /// Initialize a directory as a BeliefNetwork by placing an index.md file with the
@@ -520,19 +693,101 @@ impl DocumentCompiler {
                             let repo_relative_path = file_path
                                 .strip_prefix(self.builder.repo_root())
                                 .unwrap_or(file_path.as_path());
-                            let base_dir = repo_relative_path.parent().unwrap_or(Path::new(""));
-                            for (filename, html_body) in fragments {
+                            // Compute the base directory for HTML fragment output.
+                            //
+                            // Codecs that rewrite IRNode.path (e.g. CppHeaderCodec
+                            // stripping include dir prefixes) need the rewritten path
+                            // used for the fragment output directory.  For all other
+                            // codecs, use the filesystem-derived repo_relative_path.
+                            let filesystem_base = repo_relative_path
+                                .parent()
+                                .unwrap_or(Path::new(""))
+                                .to_path_buf();
+                            let base_dir = codec
+                                .nodes()
+                                .first()
+                                .and_then(|root_node| {
+                                    let node_path = &root_node.path;
+                                    let file_path_str = os_path_to_string(&file_path);
+                                    // Only use the node path when it differs from the
+                                    // filesystem path (indicates a rewrite occurred).
+                                    if node_path == &file_path_str {
+                                        return None;
+                                    }
+                                    // Use PathBuf operations (not AnchorPath) to avoid
+                                    // the directory-form pitfall where AnchorPath::dir()
+                                    // strips the last path component.
+                                    let node_pb = PathBuf::from(node_path);
+                                    let repo_root_str = os_path_to_string(self.builder.repo_root());
+                                    let repo_root_pb = PathBuf::from(&repo_root_str);
+                                    let rel = node_pb.strip_prefix(&repo_root_pb).ok()?;
+                                    // Network directory nodes have a directory-form path
+                                    // (e.g. ".../cameras" not ".../cameras/index.md").
+                                    // Their codec returns ("index.html", ...) which gets
+                                    // joined to base_dir, so base_dir must BE the directory
+                                    // itself — not its parent.  For regular file nodes,
+                                    // .parent() extracts the containing directory.
+                                    if path.is_dir() {
+                                        Some(rel.to_path_buf())
+                                    } else {
+                                        rel.parent().map(|d| d.to_path_buf())
+                                    }
+                                })
+                                .unwrap_or(filesystem_base);
+                            // Pass the repo-relative source file path for the SOURCE_LINK.
+                            // Directory paths are network index nodes — their source file
+                            // is the NETWORK_NAME file (index.md) inside the directory.
+                            let fragment_source_path = if file_path.is_dir() {
+                                None
+                            } else {
+                                Some(repo_relative_path)
+                            };
+                            for (filename, pairs, layout) in fragments {
                                 let rel_path = base_dir.join(&filename);
-                                if let Err(e) = self
-                                    .write_fragment(html_dir, &rel_path, html_body, &title, &bid)
-                                    .await
-                                {
-                                    parse_result.diagnostics.push(ParseDiagnostic::warning(
-                                        format!(
-                                            "Failed to write HTML fragment {}: {e}",
-                                            rel_path.display()
-                                        ),
-                                    ));
+                                if let Some(layout) = layout {
+                                    if let Err(e) = self
+                                        .write_fragment(
+                                            html_dir,
+                                            &rel_path,
+                                            pairs,
+                                            FragmentMeta {
+                                                title: &title,
+                                                bid: &bid,
+                                                source_path: fragment_source_path,
+                                                is_binary: codec.content_mode()
+                                                    == CodecContentMode::Binary,
+                                            },
+                                            layout,
+                                        )
+                                        .await
+                                    {
+                                        parse_result.diagnostics.push(ParseDiagnostic::warning(
+                                            format!(
+                                                "Failed to write HTML fragment {}: {e}",
+                                                rel_path.display()
+                                            ),
+                                        ));
+                                    }
+                                } else {
+                                    // Raw write — no template wrapping (used for companion data files like JSON).
+                                    // Use the first pair's value as the raw content (key ignored).
+                                    let pages_dir = html_dir.join("pages");
+                                    let output_path = pages_dir.join(&rel_path);
+                                    if let Some(parent) = output_path.parent() {
+                                        tokio::fs::create_dir_all(parent).await.ok();
+                                    }
+                                    if let Some((_, content)) = pairs.into_iter().next() {
+                                        if let Err(e) =
+                                            tokio::fs::write(&output_path, content.as_bytes()).await
+                                        {
+                                            parse_result.diagnostics.push(
+                                                ParseDiagnostic::warning(format!(
+                                                    "Failed to write raw fragment {}: {e}",
+                                                    rel_path.display()
+                                                )),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -558,16 +813,40 @@ impl DocumentCompiler {
 
                 let mut dependent_paths = Vec::<(String, Bref)>::new();
 
-                // Track whether any dependency was actually enqueued. Only enqueued
-                // dependencies can be resolved by a future parse, so self-requeue is
-                // only warranted when at least one was queued.  The previous condition
-                // (`!unresolved_refs.is_empty()`) fired for href_namespace externals
-                // (e.g. MDN absolute-path slugs) whose process_unresolved_reference
-                // calls bail out without enqueuing — causing O(n) requeue churn on
-                // every file that references an out-of-corpus slug.
-                let mut any_dependency_enqueued = false;
+                // Re-queue self when any unresolved ref is a same-batch sibling or a newly
+                // enqueued dep. Same-batch siblings are pre-incremented before the batch
+                // runs, so `processed > 0` is true for them — but their parse output is not
+                // yet in session_bb. `process_unresolved_reference` distinguishes these from
+                // already-processed deps (from prior batches, whose output IS in session_bb)
+                // using `self.current_batch`.
+                //
+                // Already-processed deps from prior batches do NOT trigger self-requeue: the
+                // link should have resolved on the current parse if session_bb had the dep.
+                // If it didn't resolve, re-queuing self won't help (the dep's output is
+                // already available and was still missing from the PathMap lookup).
+                //
+                // Returns false for permanent externals (mailto:, out-of-corpus URLs,
+                // non-existent paths) that can never resolve.
+                let mut any_corpus_dependency = false;
 
                 for unresolved in &unresolved_refs {
+                    // If the primary key for this reference has already been confirmed as
+                    // permanently unresolvable (failed on a prior pass with no chance of
+                    // resolution), skip all re-queue logic for it. This prevents re-parse
+                    // storms caused by broken wikilinks, dead asset paths, or any other
+                    // reference that can never resolve regardless of what other files are
+                    // parsed.
+                    if let Some(primary_key) = unresolved.other_keys.first() {
+                        if self.permanently_unresolved.contains(primary_key) {
+                            tracing::trace!(
+                                "[Compiler] Skipping permanently unresolved ref {:?} in {:?}",
+                                primary_key,
+                                path,
+                            );
+                            continue;
+                        }
+                    }
+
                     let is_asset = unresolved.other_keys.iter().any(|key| {
                         if let NodeKey::Path { net, .. } = key {
                             *net == asset_namespace().bref()
@@ -575,35 +854,90 @@ impl DocumentCompiler {
                             false
                         }
                     });
-                    if is_asset {
-                        if self.process_asset_reference(&path, unresolved) {
-                            any_dependency_enqueued = true;
-                        }
+                    let resolved = if is_asset {
+                        self.process_asset_reference(&path, unresolved)
                     } else {
-                        let Some((dep_str, net)) = unresolved.as_unresolved_source() else {
-                            continue;
-                        };
-                        if self.process_unresolved_reference(&path, &dep_str, net) {
-                            any_dependency_enqueued = true;
+                        // For Path-keyed Incoming refs: resolve to a canonical path and
+                        // check whether it is a same-batch sibling or a newly-enqueued dep.
+                        // For Id-keyed Incoming refs (wikilinks like [[HSTP]]): we cannot
+                        // canonicalize to a path, but if current_batch is non-empty any
+                        // same-batch sibling could be the target — re-queue self so the
+                        // link gets another chance once siblings' output is in session_bb.
+                        if let Some((dep_str, net)) = unresolved.as_unresolved_source() {
+                            dependent_paths.push((dep_str.clone(), net));
+                            self.process_unresolved_reference(&path, &dep_str, net)
+                        } else if unresolved.direction == petgraph::Direction::Incoming
+                            && unresolved
+                                .other_keys
+                                .iter()
+                                .any(|k| matches!(k, NodeKey::Id { .. }))
+                            && !self.current_batch.is_empty()
+                        {
+                            // Id-keyed ref with same-batch siblings present: the target
+                            // may be one of those siblings, whose output isn't in
+                            // session_bb yet. Re-queue self to resolve after the batch.
+                            true
+                        } else {
+                            false
                         }
-                        dependent_paths.push((dep_str, net));
+                    };
+
+                    if resolved {
+                        any_corpus_dependency = true;
+                    } else {
+                        // This ref returned false from all resolution paths — it is either
+                        // a permanent external (mailto:, out-of-corpus URL, non-existent
+                        // path) or an Id-keyed ref that had no active batch siblings.
+                        // Record the primary key so future parses of this file (or any
+                        // other file containing the same broken ref) skip re-queue
+                        // evaluation immediately.
+                        if let Some(primary_key) = unresolved.other_keys.first() {
+                            if self.permanently_unresolved.insert(primary_key.clone()) {
+                                tracing::debug!(
+                                    "[Compiler] Marking as permanently unresolved: {:?} \
+                                     (referenced from {:?})",
+                                    primary_key,
+                                    path,
+                                );
+                            }
+                        }
                     }
                 }
 
-                // Re-queue self only when a dependency was actually enqueued. When
-                // that dependency resolves, this file will be re-parsed and the
-                // unresolved reference may clear.  If no dependency was enqueued all
-                // remaining unresolved refs are permanent externals — re-queuing would
-                // loop until max_reparse_count with no possibility of progress.
-                if any_dependency_enqueued && !self.remainder_queue.contains(&path) {
+                if any_corpus_dependency && !self.remainder_queue.contains(&path) {
                     self.remainder_queue.push_back(path.clone());
                 }
 
+                // Enqueue derived output paths (e.g. CSV exports of opaque xlsx tabs)
+                // so process_asset runs on them in this session's remainder epoch.
+                // This gives each derived file a content-addressed asset node with a
+                // content_hash immediately — not deferred to the next compile run.
+                for derived_abs_path in &parse_result.derived_paths {
+                    if !self.remainder_queue.contains(derived_abs_path)
+                        && !self.processed.contains_key(derived_abs_path)
+                    {
+                        tracing::debug!(
+                            "[Compiler] Enqueueing derived output for asset registration: {:?}",
+                            derived_abs_path
+                        );
+                        self.remainder_queue.push_back(derived_abs_path.clone());
+                    }
+                }
+
+                // Preserve rewritten_content from an earlier parse of the same file if this
+                // re-parse produced None. A subsequent parse with no changes should not erase
+                // BIDs that were written by the first parse — the first parse's rewrite is what
+                // stamps the time-based BIDs into the source file so they survive across runs.
+                let prior_rewritten_content = self
+                    .latest_results
+                    .get(&path)
+                    .and_then(|r| r.rewritten_content.clone());
+                let rewritten_content = parse_result.rewritten_content.or(prior_rewritten_content);
                 self.latest_results.insert(
                     path.clone(),
                     ParseResult {
                         path,
-                        rewritten_content: parse_result.rewritten_content,
+                        rewritten_content,
                         dependent_paths,
                         diagnostics: parse_result.diagnostics,
                     },
@@ -629,10 +963,151 @@ impl DocumentCompiler {
         // call-site symmetry but no longer drives any backfill logic here.
         let _ = repo_seeded; // used only to preserve call-site API
 
+        self.current_batch = batch_results.iter().map(|(p, _)| p.clone()).collect();
         for (path, task_result) in batch_results {
             self.process_one_parse_result(path, task_result).await;
         }
+        self.current_batch.clear();
         Ok(())
+    }
+
+    /// Bulk-register asset files, bypassing `parse_epoch` / `GraphBuilder` per-task overhead.
+    ///
+    /// File I/O and SHA-256 hashing are parallelised in tokio tasks (bounded by
+    /// `self.jobs`). Event emission runs sequentially on `self.builder` so that
+    /// `session_bb` remains consistent without synchronisation.
+    ///
+    /// Callers must ensure `session_bb` is warm (all known assets merged from
+    /// `global_bb` via `sync_asset_snapshot`) before invoking this method.
+    ///
+    /// Returns results compatible with `process_epoch_batch_results`.
+    async fn process_asset_batch(
+        &mut self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)>, BuildonomyError>
+    {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n = paths.len();
+        tracing::info!("[process_asset_batch] Bulk-registering {} assets", n,);
+
+        // ── Phase 1: Parallel file read + SHA-256 ──────────────────────────────
+        // Each tokio task reads file bytes and computes the SHA-256 hash.
+        // Concurrency is bounded by self.jobs via a semaphore.
+        let semaphore = Arc::new(Semaphore::new(self.jobs.max(1)));
+        let mut join_set: JoinSet<(PathBuf, Result<String, BuildonomyError>)> = JoinSet::new();
+
+        for path in paths {
+            let sem = Arc::clone(&semaphore);
+            join_set.spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        let hash_str = {
+                            let mut hasher = sha2::Sha256::new();
+                            Digest::update(&mut hasher, &bytes);
+                            format!("{:x}", hasher.finalize())
+                        };
+                        (path, Ok(hash_str))
+                    }
+                    Err(e) => (
+                        path.clone(),
+                        Err(BuildonomyError::Codec(format!(
+                            "Failed to read asset {}: {e}",
+                            path.display()
+                        ))),
+                    ),
+                }
+            });
+        }
+
+        // Collect results. Order doesn't matter for assets (no ID collision concerns).
+        let mut hash_results: Vec<(PathBuf, Result<String, BuildonomyError>)> =
+            Vec::with_capacity(n);
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(pair) => hash_results.push(pair),
+                Err(e) => {
+                    tracing::warn!("[process_asset_batch] Task join error: {e}");
+                }
+            }
+        }
+
+        // ── Phase 2: Collect events + batch-apply to session_bb ─────────────
+        // Ensure the asset_namespace network node exists in session_bb once
+        // before the batch.
+        self.builder.ensure_asset_namespace()?;
+
+        // Collect events from process_asset_prehashed (which now returns events
+        // without applying them). We accumulate all events, then apply once
+        // via apply_events_batch + flush_paths_for_events — O(N) total instead
+        // of O(N × per-event PathMap flush).
+        let mut all_events: Vec<BeliefEvent> = Vec::with_capacity(n * 3);
+        let mut results: Vec<(PathBuf, Result<ParseContentWithCodec, BuildonomyError>)> =
+            Vec::with_capacity(hash_results.len());
+
+        for (path, hash_result) in hash_results {
+            match hash_result {
+                Ok(hash_str) => {
+                    if let Some(events) = self.builder.process_asset_prehashed(&path, hash_str) {
+                        all_events.extend(events);
+                    }
+                    results.push((
+                        path,
+                        Ok(ParseContentWithCodec {
+                            result: ParseContentResult::empty(),
+                            codec: Box::new(AssetCodec),
+                            repo_bid: Bid::nil(),
+                            repo_node: None,
+                        }),
+                    ));
+                }
+                Err(_e) => {
+                    // File read failed — emit a warning result (same as parse_one_path
+                    // L1720-1739 for non-codec unreadable paths).
+                    let mut parse_result = ParseContentResult::empty();
+                    parse_result.add_diagnostic(ParseDiagnostic::warning(format!(
+                        "Asset file not found (possibly a misclassified ID link): {}",
+                        path.display()
+                    )));
+                    results.push((
+                        path,
+                        Ok(ParseContentWithCodec {
+                            result: parse_result,
+                            codec: Box::new(AssetCodec),
+                            repo_bid: Bid::nil(),
+                            repo_node: None,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        // Batch-apply all collected events to session_bb in one pass.
+        // apply_events_batch handles NodeUpsert (pass 1) and RelationChange
+        // (pass 2) efficiently; flush_paths_for_events drives PathMapMap once.
+        if !all_events.is_empty() {
+            let resolved = self
+                .builder
+                .session_bb_mut()
+                .apply_events_batch(&all_events)?;
+            let path_derivatives = self
+                .builder
+                .session_bb_mut()
+                .flush_paths_for_events(&resolved);
+
+            // Send all events (originals + path derivatives) on tx for the
+            // accumulator to process into global_bb.
+            for event in all_events.into_iter().chain(path_derivatives) {
+                self.builder.tx().send(event)?;
+            }
+        }
+
+        tracing::info!("[process_asset_batch] Completed {} assets", results.len(),);
+
+        Ok(results)
     }
 
     /// Drive the compiler to completion using a two-phase sequential strategy.
@@ -706,6 +1181,7 @@ impl DocumentCompiler {
                     self.proto_index.clone(),
                     self.write,
                     parse_number,
+                    self.claim_map.as_deref().unwrap_or(&CLAIM_MAP),
                 )
                 .await;
                 self.process_one_parse_result(actual_path, result).await;
@@ -776,25 +1252,54 @@ impl DocumentCompiler {
         for group in depth_groups {
             // Increment processed counts for the whole depth group before any file runs,
             // so every file in the batch sees the same pre-batch snapshot of counts.
+            // Skip network dirs that a parent network has explicitly rejected via
+            // CLAIM_MAP.reject() — the parent's whitelist/blacklist suppresses the subnet.
+            //
+            // When a dir is rejected, cascade the rejection to all descendant network dirs
+            // so that deeper subnets whose intermediate parent was rejected (and therefore
+            // never ran its own NetworkCodec::parse() to register their rejections) are
+            // also suppressed. This handles multi-level filtering, e.g.:
+            //   docs/ whitelists only flight_software_design/** → rejects developers/
+            //   developers/ (never parsed) → sub-networks like new_user/ are still in
+            //   ProtoIndex but must be treated as rejected transitively.
             let batch: Vec<PathBuf> = group
                 .into_iter()
-                .filter(|d| !self.processed.contains_key(d))
+                .filter(|d| {
+                    if CLAIM_MAP.is_rejected(d) {
+                        // Cascade: reject all ProtoIndex network dirs that are descendants
+                        // of this rejected dir so deeper depth groups skip them too.
+                        for descendant in self.proto_index.network_dirs() {
+                            if descendant.starts_with(d.as_path())
+                                && &descendant != d
+                                && !CLAIM_MAP.is_rejected(&descendant)
+                            {
+                                CLAIM_MAP.reject(descendant);
+                            }
+                        }
+                        return false;
+                    }
+                    !self.processed.contains_key(d)
+                })
                 .collect();
             for dir in &batch {
                 *self.processed.entry(dir.clone()).or_insert(0) += 1;
             }
+            self.current_batch = batch.iter().cloned().collect();
             for dir in batch {
                 run_one!(dir);
                 drain_rx!();
             }
+            self.current_batch.clear();
         }
 
         // ── Phase 2: leaf documents in DFS order ─────────────────────────────
         // Collect the whole leaf batch first, increment all counts, then run.
+        // Skip children of rejected network dirs — their parent suppressed them.
         let leaf_batch: Vec<PathBuf> = self
             .proto_index
             .network_dirs()
             .into_iter()
+            .filter(|net_dir| !CLAIM_MAP.is_rejected(net_dir))
             .flat_map(|net_dir| {
                 self.proto_index
                     .children_of(&net_dir)
@@ -808,10 +1313,12 @@ impl DocumentCompiler {
         for path in &leaf_batch {
             *self.processed.entry(path.clone()).or_insert(0) += 1;
         }
+        self.current_batch = leaf_batch.iter().cloned().collect();
         for path in leaf_batch {
             run_one!(path);
             drain_rx!();
         }
+        self.current_batch.clear();
 
         // ── Phase 3: remainder loop (assets + re-parses) ─────────────────────
         let path_order = self.proto_index.ordered_path_index();
@@ -829,10 +1336,12 @@ impl DocumentCompiler {
             for path in &candidates {
                 *self.processed.entry(path.clone()).or_insert(0) += 1;
             }
+            self.current_batch = candidates.iter().cloned().collect();
             for path in candidates {
                 run_one!(path);
                 drain_rx!();
             }
+            self.current_batch.clear();
         }
 
         let mut results: Vec<ParseResult> = self.latest_results.drain().map(|(_, v)| v).collect();
@@ -941,6 +1450,7 @@ impl DocumentCompiler {
                         self.proto_index.clone(),
                         self.write,
                         1, // first parse of the repo root
+                        self.claim_map.as_deref().unwrap_or(&CLAIM_MAP),
                     )
                     .await;
                     let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
@@ -952,45 +1462,64 @@ impl DocumentCompiler {
             }
         }
 
-        // ── Epoch 0, Phase 1: network dirs grouped by component depth ────────
+        // ── Epoch 0, Phase 1: network dirs grouped by subnet-tree depth ──────
         //
-        // Build depth groups from network_dirs() (already sorted shallowest-first,
-        // ties broken lexically).  Each group becomes one epoch batch so that all
-        // ancestors at depth D are committed to global_bb before depth D+1 begins.
+        // Each group becomes one epoch batch, drained before the next begins, so
+        // that all ancestors at tree depth D are committed to global_bb before
+        // depth D+1 starts.
         //
-        // INVARIANT: same as parse_sequential phase 1 — network_dirs() must return
-        // dirs with non-decreasing component counts so that same-depth dirs are
-        // contiguous and the last-group-matches grouping is correct.
-        let net_dirs = self.proto_index.network_dirs();
-        debug_assert!(
-            net_dirs
-                .windows(2)
-                .all(|w| w[0].components().count() <= w[1].components().count()),
-            "network_dirs sort invariant violated: component counts not non-decreasing; \
-             depth-grouping in parse_all phase 1 will be incorrect"
-        );
-        let mut depth_groups: Vec<Vec<PathBuf>> = Vec::new();
-        for dir in net_dirs {
-            let depth = dir.components().count();
-            if depth_groups
-                .last()
-                .and_then(|g: &Vec<PathBuf>| g.first())
-                .map(|p| p.components().count())
-                .unwrap_or(0)
-                == depth
-            {
-                depth_groups.last_mut().unwrap().push(dir);
-            } else {
-                depth_groups.push(vec![dir]);
-            }
-        }
+        // Grouping is by *subnet-tree* depth, not OS path-component count: a subnet
+        // reached through plain intervening directories (`A/docs/parts/B/`) is a
+        // direct child of `A` in the ProtoIndex, so it belongs in the same batch as
+        // a sibling at `A/B2/`.  Component-count grouping split such siblings apart
+        // and delayed the deeper-pathed one by the length of its path prefix,
+        // serializing work that has no dependency relationship.  See
+        // ProtoIndex::network_dirs_by_tree_depth.
+        //
+        // INVARIANT: every dir in group D has its parent network in group D-1.  This
+        // is what makes the drain-between-groups discipline sufficient — and also why
+        // groups cannot be merged forward to enlarge a small batch: every member of
+        // group D+1 depends on something in group D that has not been drained yet.
+        let depth_groups = self.proto_index.network_dirs_by_tree_depth();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let total_epoch0 = {
+            let net_count = self.proto_index.network_dirs().len() as u64;
+            let leaf_count = self
+                .proto_index
+                .network_dirs()
+                .iter()
+                .flat_map(|d| self.proto_index.children_of(d).unwrap_or_default())
+                .filter(|c| !c.is_dir())
+                .count() as u64;
+            net_count + leaf_count
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut epoch0_done: u64 = 0;
 
         for group in depth_groups {
             // Filter to only unprocessed dirs, increment counts for the whole
             // batch before any file in it runs.
+            // Skip network dirs that a parent network has explicitly rejected via
+            // CLAIM_MAP.reject() — the parent's whitelist/blacklist suppresses the subnet.
             let batch: Vec<PathBuf> = group
                 .into_iter()
-                .filter(|d| !self.processed.contains_key(d))
+                .filter(|d| {
+                    if CLAIM_MAP.is_rejected(d) {
+                        // Cascade: reject all ProtoIndex network dirs that are descendants
+                        // of this rejected dir so deeper depth groups skip them too.
+                        for descendant in self.proto_index.network_dirs() {
+                            if descendant.starts_with(d.as_path())
+                                && &descendant != d
+                                && !CLAIM_MAP.is_rejected(&descendant)
+                            {
+                                CLAIM_MAP.reject(descendant);
+                            }
+                        }
+                        return false;
+                    }
+                    !self.processed.contains_key(d)
+                })
                 .collect();
             if batch.is_empty() {
                 continue;
@@ -998,10 +1527,22 @@ impl DocumentCompiler {
             for dir in &batch {
                 *self.processed.entry(dir.clone()).or_insert(0) += 1;
             }
+            let batch_len = batch.len();
+            // Retain a copy of the batch paths for sync_subnet_stubs — the
+            // originals are moved into parse_epoch.
+            let batch_dirs = batch.clone();
             let _ = self.builder.tx().send(BeliefEvent::BatchStart);
             let results = self.parse_epoch(batch, cached_global_bb.clone()).await?;
             let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
             cached_global_bb.drain_epoch().await?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                epoch0_done += batch_len as u64;
+                self.progress
+                    .update(epoch0_done, total_epoch0, "parsing networks");
+            }
+            self.sync_subnet_stubs(&batch_dirs, &cached_global_bb)
+                .await?;
             self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(results, &mut repo_seeded)
                 .await?;
@@ -1012,10 +1553,12 @@ impl DocumentCompiler {
         // Gather every non-dir child from every network directory.  Skip any path
         // already in processed (stale-seeded) or remainder_queue.  Increment counts
         // for the whole batch before dispatching.
+        // Skip children of rejected network dirs — their parent suppressed them.
         let leaf_batch: Vec<PathBuf> = self
             .proto_index
             .network_dirs()
             .into_iter()
+            .filter(|net_dir| !CLAIM_MAP.is_rejected(net_dir))
             .flat_map(|net_dir| {
                 self.proto_index
                     .children_of(&net_dir)
@@ -1031,6 +1574,7 @@ impl DocumentCompiler {
             for path in &leaf_batch {
                 *self.processed.entry(path.clone()).or_insert(0) += 1;
             }
+            let leaf_batch_len = leaf_batch.len();
             // All phase-1 network-dir epochs are committed before this point, so
             // leaf documents share no unresolved cross-dependencies with each other.
             // The entire leaf batch is one epoch: parse_epoch's semaphore bounds
@@ -1042,6 +1586,12 @@ impl DocumentCompiler {
                 .await?;
             let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
             cached_global_bb.drain_epoch().await?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                epoch0_done += leaf_batch_len as u64;
+                self.progress
+                    .update(epoch0_done, total_epoch0, "parsing documents");
+            }
             self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(leaf_results, &mut repo_seeded)
                 .await?;
@@ -1052,13 +1602,13 @@ impl DocumentCompiler {
         // in remainder_queue; this catches cached assets whose referencing documents
         // were not re-parsed (mtime hit).
         {
-            let assets: Vec<(String, Bid)> = self
+            let assets: Vec<(String, Bid, Vec<u16>)> = self
                 .builder
                 .session_bb()
-                .get_all_paths(asset_namespace(), false)
+                .submap(asset_namespace(), "", u8::MAX, false)
                 .await
                 .unwrap_or_default();
-            for (repo_relative_path, _bid) in assets {
+            for (repo_relative_path, _bid, _order) in assets {
                 if repo_relative_path.is_empty() {
                     continue;
                 }
@@ -1076,12 +1626,32 @@ impl DocumentCompiler {
         }
 
         // ── Remainder loop (epoch ≥ 1) ───────────────────────────────────────
-        // Drain and sort by processed count ascending each iteration so assets
-        // (count=0) run before re-parses, and shallower re-parses run first.
-        // Increment counts for the whole batch before dispatch (consistent
-        // pre-batch snapshot invariant, same as parse_sequential phase 3).
-        // process_one_parse_result handles the ReparseLimitExceeded sentinel
-        // internally, so no separate sentinel_paths splitting is needed here.
+        // Each remainder iteration is split into two sub-epochs:
+        //
+        //   Sub-epoch A — assets (processed count == 0, never parsed before).
+        //   Sub-epoch B — document re-parses (processed count >= 1).
+        //
+        // The split is necessary for correctness under parallel dispatch (jobs > 1).
+        // When assets and the documents that reference them are dispatched in the
+        // same parse_epoch call, every task queries the same pre-batch global_bb
+        // snapshot.  Asset-processing tasks commit their BIDs via tx → accumulator,
+        // but those BIDs are not visible to parallel document tasks in the same
+        // batch — drain_epoch hasn't run yet.  Documents whose push_relation calls
+        // for asset keys miss in cache_fetch are re-queued, and inject_context sees
+        // a different BeliefContext than it will on the next pass (no asset nodes
+        // present), producing rewritten_content that the parse-2 no-rewrite
+        // assertion then catches as a spurious failure.
+        //
+        // By draining between the two sub-epochs, asset BIDs are committed to
+        // global_bb (and synced into self.builder.session_bb via sync_asset_snapshot
+        // → epoch_session_snapshot Part 2) before any document re-parse task starts.
+        // Documents that had unresolved asset refs will now hit cache_fetch on their
+        // first re-parse attempt, inject_context sees the full BeliefContext, and
+        // rewritten_content is produced at most once — not on every subsequent parse.
+        //
+        // Increment counts for the whole logical batch (both sub-epochs) before
+        // dispatch so that process_one_parse_result's reparse-limit check uses
+        // consistent counts regardless of which sub-epoch a path lands in.
         let path_order = self.proto_index.ordered_path_index();
         while !self.remainder_queue.is_empty() {
             let mut candidates: Vec<PathBuf> = self.remainder_queue.drain(..).collect();
@@ -1096,17 +1666,83 @@ impl DocumentCompiler {
             for path in &candidates {
                 *self.processed.entry(path.clone()).or_insert(0) += 1;
             }
-            let _ = self.builder.tx().send(BeliefEvent::BatchStart);
-            let batch_results = self
-                .parse_epoch(candidates, cached_global_bb.clone())
-                .await?;
-            let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
-            cached_global_bb.drain_epoch().await?;
-            self.sync_asset_snapshot(&cached_global_bb).await?;
-            self.process_epoch_batch_results(batch_results, &mut repo_seeded)
-                .await?;
+
+            // Sub-epoch A: assets only (previously unprocessed, count was 0 before increment).
+            let (asset_batch, reparse_batch): (Vec<PathBuf>, Vec<PathBuf>) = candidates
+                .into_iter()
+                .partition(|p| self.processed.get(p).copied().unwrap_or(0) == 1);
+
+            if !asset_batch.is_empty() {
+                // Partition into bulk-eligible assets (no codec, not rejected, not
+                // WALK_CODECS tracked, not a directory) and residual paths that need
+                // the full parse_one_path dispatch (directories, codec-fallback files).
+                let claim_map: &crate::codec::ClaimMap =
+                    self.claim_map.as_deref().unwrap_or(&CLAIM_MAP);
+                let (bulk_assets, residual_assets): (Vec<PathBuf>, Vec<PathBuf>) =
+                    asset_batch.into_iter().partition(|p| {
+                        !p.is_dir()
+                            && claim_map.get(p).is_none()
+                            && !claim_map.is_rejected(p)
+                            && !WALK_CODECS.should_track(p)
+                    });
+
+                let _ = self.builder.tx().send(BeliefEvent::BatchStart);
+
+                // Bulk path: parallel file read + SHA-256, sequential event emission.
+                let mut all_asset_results = if !bulk_assets.is_empty() {
+                    self.process_asset_batch(bulk_assets).await?
+                } else {
+                    Vec::new()
+                };
+
+                // Residual path: directories and codec-fallback files go through
+                // the full parse_epoch dispatch.
+                if !residual_assets.is_empty() {
+                    let mut residual_results = self
+                        .parse_epoch(residual_assets, cached_global_bb.clone())
+                        .await?;
+                    all_asset_results.append(&mut residual_results);
+                }
+
+                let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
+                cached_global_bb.drain_epoch().await?;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.progress.update(
+                    0,
+                    0,
+                    &format!("remainder: {} queued", self.remainder_queue.len()),
+                );
+                self.sync_asset_snapshot(&cached_global_bb).await?;
+                self.process_epoch_batch_results(all_asset_results, &mut repo_seeded)
+                    .await?;
+            }
+
+            // Sub-epoch B: document re-parses. global_bb now contains asset BIDs committed
+            // by sub-epoch A, so cache_fetch hits for asset keys and inject_context sees
+            // the full BeliefContext on this pass.
+            if !reparse_batch.is_empty() {
+                let _ = self.builder.tx().send(BeliefEvent::BatchStart);
+                let reparse_results = self
+                    .parse_epoch(reparse_batch, cached_global_bb.clone())
+                    .await?;
+                let _ = self.builder.tx().send(BeliefEvent::BatchEnd);
+                cached_global_bb.drain_epoch().await?;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.progress.update(
+                    0,
+                    0,
+                    &format!("remainder: {} queued", self.remainder_queue.len()),
+                );
+                self.sync_asset_snapshot(&cached_global_bb).await?;
+                self.process_epoch_batch_results(reparse_results, &mut repo_seeded)
+                    .await?;
+            }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        self.progress.finish();
+        // Copy source files while latest_results is still populated (before drain).
+        self.copy_source_files().await?;
         let mut results: Vec<ParseResult> = self.latest_results.drain().map(|(_, v)| v).collect();
         Self::promote_unresolved_to_warnings(&mut results);
         Ok(results)
@@ -1155,6 +1791,7 @@ impl DocumentCompiler {
         proto_index: ProtoIndex,
         write: bool,
         parse_number: usize,
+        claim_map: &crate::codec::ClaimMap,
     ) -> (PathBuf, Result<ParseContentWithCodec, BuildonomyError>) {
         // Resolve directory → index file, or dispatch to process_asset_dir.
         //
@@ -1167,8 +1804,61 @@ impl DocumentCompiler {
         //   Case A (git-tracking): tracked network dir → href node pointing to remote URL
         //   Case B: local-only dir → External node with sorted directory listing
         let file_path = if path.is_dir() {
+            // Check CLAIM_MAP rejection before dispatching directory → index.md.
+            // A rejected network dir must not be parsed even if it ends up in the
+            // remainder queue via an unresolved reference re-queue path.
+            if claim_map.is_rejected(&path) {
+                tracing::debug!(
+                    "[parse_one_path]: directory {:?} is rejected by CLAIM_MAP, skipping",
+                    path
+                );
+                let mut result = ParseContentResult::empty();
+                result.add_diagnostic(ParseDiagnostic::info(format!(
+                    "Network directory excluded by parent whitelist/blacklist: {}",
+                    path.display()
+                )));
+                return (
+                    path,
+                    Ok(ParseContentWithCodec {
+                        result,
+                        codec: Box::new(UnclaimedDataCodec),
+                        repo_bid: Bid::nil(),
+                        repo_node: None,
+                    }),
+                );
+            }
             match detect_network_file(&path) {
-                Some(p) => p,
+                Some(p) => {
+                    // The directory itself may not be rejected, but the network file
+                    // inside it may have been filtered by a parent network's whitelist.
+                    // Check the resolved file path against CLAIM_MAP before proceeding.
+                    // Canonicalize to match the form used by CLAIM_MAP.reject() (which
+                    // receives canonicalized paths from ProtoIndex's children_of).
+                    let p_canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if claim_map.is_rejected(&p_canonical) {
+                        tracing::debug!(
+                            "[parse_one_path]: network file {:?} in directory {:?} is rejected \
+                             by CLAIM_MAP, skipping",
+                            p,
+                            path,
+                        );
+                        let mut result = ParseContentResult::empty();
+                        result.add_diagnostic(ParseDiagnostic::info(format!(
+                            "Network file excluded by parent whitelist/blacklist: {}",
+                            p.display()
+                        )));
+                        return (
+                            path,
+                            Ok(ParseContentWithCodec {
+                                result,
+                                codec: Box::new(UnclaimedDataCodec),
+                                repo_bid: Bid::nil(),
+                                repo_node: None,
+                            }),
+                        );
+                    }
+                    p
+                }
                 None => {
                     tracing::debug!("[parse_one_path]: directory asset {:?}", path);
                     let result = builder
@@ -1186,6 +1876,34 @@ impl DocumentCompiler {
         let bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
             Err(e) => {
+                // For paths with no registered codec (i.e. asset paths), a read
+                // failure almost always means the path doesn't exist on disk — it was
+                // misclassified as an asset reference (e.g. `[R.CLDS-410]` whose dot
+                // caused NodeKey::from_str to emit an asset-namespace key). Returning
+                // Err here would produce a ParseDiagnostic::ParseError → exit(1).
+                // Instead, return Ok with a Warning so the build continues and the
+                // caller surfaces it as an unresolved-reference warning.
+                if CODECS.path_get(&file_path).is_none() && !WALK_CODECS.should_track(&file_path) {
+                    tracing::debug!(
+                        "[parse_one_path] Non-codec path unreadable ({e}), \
+                         downgrading to warning: {:?}",
+                        file_path
+                    );
+                    let mut result = ParseContentResult::empty();
+                    result.add_diagnostic(crate::codec::ParseDiagnostic::warning(format!(
+                        "Asset file not found (possibly a misclassified ID link): {}",
+                        file_path.display()
+                    )));
+                    return (
+                        path,
+                        Ok(ParseContentWithCodec {
+                            result,
+                            codec: Box::new(AssetCodec),
+                            repo_bid: Bid::nil(),
+                            repo_node: None,
+                        }),
+                    );
+                }
                 return (
                     path,
                     Err(BuildonomyError::Codec(format!(
@@ -1205,7 +1923,55 @@ impl DocumentCompiler {
         // The right fix is to make the codec pipeline path-agnostic (byte-oriented read,
         // codec-selected decode), at which point `AssetCodec` becomes a real registered
         // codec and this dispatch disappears.
-        if CODECS.path_get(&file_path).is_none() {
+        // Three-branch codec dispatch (CODECS fallback is internal to CLAIM_MAP.get):
+        //   1. claim_map.get()            — claimed codec, or CODECS.path_get() fallback
+        //   2. claim_map.is_rejected()    — explicitly filtered by a network whitelist/blacklist
+        //                                   → info diagnostic, UnclaimedDataCodec, no nodes
+        //   3. WALK_CODECS.should_track() — tracked but unclaimed → info diagnostic, UnclaimedDataCodec
+        //   4. neither                    — genuine binary asset → process_asset (unchanged)
+        let codec_factory: Option<CodecFactory> = claim_map.get(&file_path);
+
+        // Branch 2: explicitly rejected by a network filter — short-circuit before CODECS.
+        if codec_factory.is_none() && claim_map.is_rejected(&file_path) {
+            tracing::debug!(
+                "[parse_one_path]: rejected by network filter {:?}",
+                file_path
+            );
+            let mut result = ParseContentResult::empty();
+            result.add_diagnostic(ParseDiagnostic::info(format!(
+                "File excluded by network whitelist/blacklist filter: {}",
+                file_path.display()
+            )));
+            return (
+                path,
+                Ok(ParseContentWithCodec {
+                    result,
+                    codec: Box::new(UnclaimedDataCodec),
+                    repo_bid: Bid::nil(),
+                    repo_node: None,
+                }),
+            );
+        }
+
+        // Branches 3–4: fall through to WALK_CODECS / asset.
+        if codec_factory.is_none() {
+            if WALK_CODECS.should_track(&file_path) {
+                tracing::debug!("[parse_one_path]: unclaimed tracked path {:?}", file_path);
+                let mut result = ParseContentResult::empty();
+                result.add_diagnostic(ParseDiagnostic::info(format!(
+                    "File is tracked but not claimed by any codec: {}",
+                    file_path.display()
+                )));
+                return (
+                    path,
+                    Ok(ParseContentWithCodec {
+                        result,
+                        codec: Box::new(UnclaimedDataCodec),
+                        repo_bid: Bid::nil(),
+                        repo_node: None,
+                    }),
+                );
+            }
             tracing::debug!("[parse_one_path]: asset path {:?}", file_path);
             let result = builder
                 .process_asset(&file_path, &bytes, global_bb, proto_index)
@@ -1213,41 +1979,160 @@ impl DocumentCompiler {
             return (path, result);
         }
 
-        // Codec document: decode bytes to UTF-8 then parse.
-        let content = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                return (
-                    path,
-                    Err(BuildonomyError::Codec(format!(
-                        "File is not valid UTF-8 {}: {e}",
-                        file_path.display()
-                    ))),
-                );
+        // Pre-flight proto() check: any codec may opt out of document parsing by
+        // returning None from proto() (e.g. XlsxCodec when no `index` tab is
+        // present, or a CMake codec when no `add_library` target exists).
+        // A None proto means "treat as asset" — route to process_asset silently
+        // rather than letting parse_content/initialize_stack fail with a fatal error.
+        {
+            let preflight_factory = codec_factory.expect("already confirmed Some above");
+            let preflight_codec = preflight_factory();
+            match preflight_codec.proto(file_path.as_ref()) {
+                Ok(None) => {
+                    // Codec explicitly opts out — treat as asset.
+                    tracing::debug!(
+                        "[parse_one_path]: proto() returned None for {:?} \
+                         — routing to process_asset",
+                        file_path
+                    );
+                    let result = builder
+                        .process_asset(&file_path, &bytes, global_bb, proto_index)
+                        .await;
+                    return (path, result);
+                }
+                Ok(Some(_)) => {
+                    // Codec claims this file — proceed to parse_content below.
+                }
+                Err(e) => {
+                    // proto() itself failed (I/O error, corrupt file, etc.).
+                    // Emit a debug log and route to asset so the rest of the
+                    // corpus is not disrupted.
+                    tracing::debug!(
+                        "[parse_one_path]: proto() error for {:?}: {} — routing to process_asset",
+                        file_path,
+                        e
+                    );
+                    let result = builder
+                        .process_asset(&file_path, &bytes, global_bb, proto_index)
+                        .await;
+                    return (path, result);
+                }
             }
-        };
+        }
+
+        // Probe content mode via a cheap factory instantiation (no I/O, no parse state).
+        let codec_factory = codec_factory.expect("already confirmed Some above");
+        let content_mode = codec_factory().content_mode();
 
         let _ = builder
             .tx()
             .send(BeliefEvent::FileParsed(file_path.clone()));
 
-        let mut result = builder
-            .parse_content(&file_path, content, global_bb, proto_index, parse_number)
-            .await;
+        let mut result = match content_mode {
+            CodecContentMode::Text => {
+                // Decode bytes to UTF-8 then parse — existing path.
+                let content = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return (
+                            path,
+                            Err(BuildonomyError::Codec(format!(
+                                "File is not valid UTF-8 {}: {e}",
+                                file_path.display()
+                            ))),
+                        );
+                    }
+                };
+                builder
+                    .parse_content(&file_path, content, global_bb, proto_index, parse_number)
+                    .await
+            }
+            CodecContentMode::Binary => {
+                // Binary codec: pass empty string — the codec ignores content and
+                // re-opens the file from current.path using its own I/O.
+                builder
+                    .parse_content(
+                        &file_path,
+                        String::new(),
+                        global_bb,
+                        proto_index,
+                        parse_number,
+                    )
+                    .await
+            }
+        };
 
-        // Write rewritten content (BID injection, link updates) back to disk so
-        // subsequent epoch reads see the stabilised content.  Any write error is
-        // reported as a warning diagnostic rather than aborting the build.
+        // Write rewritten content back to disk.
+        // Text codecs: rewritten_content (Option<String>).
+        // Binary codecs: generate_source_bytes() (Option<Vec<u8>>).
         if let Ok(ref mut with_codec) = result {
-            if let Some(ref contents) = with_codec.result.rewritten_content {
-                if write {
-                    if let Err(e) = tokio::fs::write(&file_path, contents).await {
+            if write {
+                match content_mode {
+                    CodecContentMode::Text => {
+                        if let Some(ref contents) = with_codec.result.rewritten_content {
+                            if let Err(e) = tokio::fs::write(&file_path, contents).await {
+                                with_codec.result.diagnostics.push(
+                                    crate::codec::ParseDiagnostic::warning(format!(
+                                        "Failed to write rewritten content: {e}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    CodecContentMode::Binary => {
+                        if let Some(ref bin_bytes) = with_codec.codec.generate_source_bytes() {
+                            if let Err(e) = tokio::fs::write(&file_path, bin_bytes).await {
+                                with_codec.result.diagnostics.push(
+                                    crate::codec::ParseDiagnostic::warning(format!(
+                                        "Failed to write rewritten binary content: {e}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write derived outputs (e.g. CSV exports) to .noet/derived/.
+        //
+        // Derived outputs are written unconditionally (not gated on `write`) because
+        // they are generated artifacts, not source file rewrites. Skipping them would
+        // leave the graph with unresolvable asset references.
+        if let Ok(ref mut with_codec) = result {
+            let derived = with_codec.codec.derived_outputs();
+            if !derived.is_empty() {
+                let repo_root = builder.repo_root().to_path_buf();
+                for (rel_path, bytes) in derived {
+                    let abs_path = repo_root.join(&rel_path);
+                    // Create parent directory if needed.
+                    if let Some(parent) = abs_path.parent() {
+                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                            with_codec.result.diagnostics.push(
+                                crate::codec::ParseDiagnostic::warning(format!(
+                                    "Failed to create derived output directory {}: {e}",
+                                    parent.display()
+                                )),
+                            );
+                            continue;
+                        }
+                    }
+                    if let Err(e) = tokio::fs::write(&abs_path, &bytes).await {
                         with_codec
                             .result
                             .diagnostics
                             .push(crate::codec::ParseDiagnostic::warning(format!(
-                                "Failed to write rewritten content: {e}"
+                                "Failed to write derived output {}: {e}",
+                                abs_path.display()
                             )));
+                    } else {
+                        // File written successfully — record the absolute path so the
+                        // compiler can enqueue it into the asset discovery pipeline.
+                        // process_one_parse_result enqueues these via self.enqueue(),
+                        // which causes process_asset to run in the current session's
+                        // remainder epoch, giving the CSV a content_hash asset node
+                        // without waiting for the next compile run.
+                        with_codec.result.derived_paths.push(abs_path);
                     }
                 }
             }
@@ -1269,6 +2154,8 @@ impl DocumentCompiler {
             // NOTE: processed counts were already incremented by the caller before
             // this function was invoked — do not increment here.
             let mut results = Vec::with_capacity(paths.len());
+            let seq_claim_map: &crate::codec::ClaimMap =
+                self.claim_map.as_deref().unwrap_or(&CLAIM_MAP);
             for path in paths {
                 let proto_index = self.proto_index.clone();
                 let write = self.write;
@@ -1281,6 +2168,7 @@ impl DocumentCompiler {
                         proto_index,
                         write,
                         parse_number,
+                        seq_claim_map,
                     )
                     .await,
                 );
@@ -1314,13 +2202,232 @@ impl DocumentCompiler {
             // epochs it contains every network node parsed so far + their Section edges,
             // plus the const-namespace (href + asset) subgraphs so tasks don't hit
             // global_bb for those on the first file.
+            // `network_ancestors` is retained as the epoch-0 / asset-file fallback seed: on the
+            // very first epoch global_bb has no content yet, so submap returns empty and the
+            // balanced query would return nothing.  For those tasks we still need the
+            // network ancestor chain in the seed so that initialize_stack's fast-path guard
+            // and try_initialize_stack_from_session_cache work correctly.
             let network_ancestors = Arc::new(self.builder.epoch_session_snapshot());
+            // Build the BeliefBase index over the shared snapshot ONCE per epoch.
+            //
+            // Every task needs a session_bb indexed over this same immutable graph, and
+            // the index (`PathMapMap::new`, a seeded DFS per network) is the expensive
+            // part — 97.5% of per-task rebuild cost on a full corpus run, essentially all
+            // of it reconstructing the identical const-namespace. Cloning this base is a
+            // BTreeMap of Arc pointer copies; writes stay private via PathMapMap's
+            // copy-on-write. See `seed_session_from_base`.
+            let shared_base_start = std::time::Instant::now();
+            let shared_session_base =
+                Arc::new(BeliefBase::from((*network_ancestors).clone()).with_label("epoch_base"));
+            tracing::debug!(
+                target: "noet_core::codec::perf",
+                states = shared_session_base.states().len(),
+                build_us = shared_base_start.elapsed().as_micros(),
+                "[parse_epoch] shared session base built",
+            );
             let proto_index = self.proto_index.clone();
             let shared_tx = self.builder.tx().clone();
             let write = self.write;
             let semaphore = Arc::new(Semaphore::new(self.jobs));
 
             let n = paths.len();
+
+            // ── Per-path balanced seed pre-computation ────────────────────────────────
+            //
+            // For each document in this epoch batch we call global_bb.submap() to get the
+            // BID list of the document's own nodes, then issue a single balanced
+            // query against that BID set.  QueryPackage::balanced appends halo + section-root
+            // traversals that iteratively fetch ancestor chains until the graph is
+            // closed — amortising into one pre-spawn operation what would otherwise be N
+            // individual cache_fetch → global_bb.evaluate round-trips during Phase 2
+            // push_relation (each acquiring the global_bb mutex for 15-20 ms).
+            //
+            // Because the balanced query walks the full ancestor chain, the result already contains
+            // network nodes, Section edges, const-namespace subgraphs, and index anchors —
+            // i.e. everything epoch_session_snapshot produces — so network_ancestors is
+            // subsumed and not merged for tasks that receive a non-empty per-doc seed.
+            //
+            // Falls back to network_ancestors for epoch-0 (submap returns empty because
+            // global_bb has no content yet) and for asset/directory paths.
+            //
+            // The pre-computation loop is sequential and async; each submap call acquires
+            // the global_bb mutex once, and each balanced query runs a bounded traversal.
+            // This is acceptable: we are in the pre-spawn setup phase, not inside a task.
+            let mut doc_seeds: Vec<BeliefGraph> = Vec::with_capacity(n);
+            {
+                for path in &paths {
+                    // Resolve directory → index file (mirrors parse_one_path).
+                    let file_path = if path.is_dir() {
+                        match crate::codec::network::detect_network_file(path) {
+                            Some(p) => p,
+                            None => {
+                                // Directory asset — no document nodes to pre-seed.
+                                doc_seeds.push(BeliefGraph::default());
+                                continue;
+                            }
+                        }
+                    } else {
+                        path.clone()
+                    };
+
+                    // Resolve the owning network BID and the document's own BID
+                    // from global_bb, then use submap_by_bid to get the document's
+                    // subtree.
+                    //
+                    // We use submap_by_bid (BID-based) rather than submap (path-string)
+                    // because PathMap paths may be normalized (e.g. lowercased) relative
+                    // to filesystem names, and the DbConnection submap does
+                    // segment-by-segment SQL lookups against PathMap-format paths.
+                    // BID-based lookup bypasses path format entirely.
+                    //
+                    // We resolve BIDs from global_bb (not session_bb) because in the
+                    // parallel path subnet networks and their leaf documents are parsed
+                    // by spawned tasks whose events flow to global_bb via the
+                    // accumulator, never into self.builder.session_bb.
+                    let parent_abs = match proto_index.owning_net_dir_for(&file_path) {
+                        Some(dir) if dir.strip_prefix(&repo_root).is_ok() => dir,
+                        _ => {
+                            doc_seeds.push(BeliefGraph::default());
+                            continue;
+                        }
+                    };
+
+                    // Resolve the owning network BID.
+                    //
+                    // For the repo root (parent_rel_path = ""), use repo_bid directly.
+                    // For subnets, try session_bb first (works for the repo root and
+                    // any network parsed by self.builder), then fall back to global_bb
+                    // via get_node (needed for subnets parsed by spawned tasks).
+                    let parent_rel_path = os_path_to_string(
+                        parent_abs
+                            .strip_prefix(&repo_root)
+                            .unwrap_or(std::path::Path::new("")),
+                    );
+                    let net_bid = if parent_rel_path.is_empty() {
+                        repo_bid
+                    } else {
+                        let parent_key = NodeKey::Path {
+                            net: repo_bid.bref(),
+                            path: parent_rel_path.clone(),
+                        };
+                        // Try session_bb first (cheap, no async).
+                        match self.builder.session_bb().get(&parent_key) {
+                            Some(node) => node.bid,
+                            None => {
+                                // Fall back to global_bb for subnets parsed by
+                                // spawned tasks.
+                                match lookup_node(&global_bb, &parent_key).await {
+                                    Ok(Some(node)) => node.bid,
+                                    _ => {
+                                        let pn = self.processed.get(path).copied().unwrap_or(0);
+                                        if pn > 1 {
+                                            tracing::warn!(
+                                                target: "noet_core::codec::fast_path",
+                                                path = %file_path.display(),
+                                                parent_rel_path = %parent_rel_path,
+                                                repo_bref = %repo_bid.bref(),
+                                                "[parse_epoch] seed: net_bid lookup failed on reparse"
+                                            );
+                                        }
+                                        doc_seeds.push(BeliefGraph::default());
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    // Resolve the document node's BID.
+                    // Try session_bb first, fall back to global_bb.
+                    let is_index = is_network_index_file(&file_path);
+                    let rel_from_net = match file_path.strip_prefix(&parent_abs) {
+                        Ok(rel) => {
+                            if is_index {
+                                os_path_to_string(rel.parent().unwrap_or(rel))
+                            } else {
+                                os_path_to_string(rel)
+                            }
+                        }
+                        Err(_) => {
+                            doc_seeds.push(BeliefGraph::default());
+                            continue;
+                        }
+                    };
+                    let doc_key = NodeKey::Path {
+                        net: net_bid.bref(),
+                        path: rel_from_net,
+                    };
+                    let doc_bid = match self.builder.session_bb().get(&doc_key) {
+                        Some(node) => node.bid,
+                        None => match lookup_node(&global_bb, &doc_key).await {
+                            Ok(Some(node)) => node.bid,
+                            _ => {
+                                let pn = self.processed.get(path).copied().unwrap_or(0);
+                                if pn > 1 {
+                                    tracing::warn!(
+                                        target: "noet_core::codec::fast_path",
+                                        path = %file_path.display(),
+                                        doc_key = ?doc_key,
+                                        net_bref = %net_bid.bref(),
+                                        "[parse_epoch] seed: doc_bid lookup failed on reparse"
+                                    );
+                                }
+                                doc_seeds.push(BeliefGraph::default());
+                                continue;
+                            }
+                        },
+                    };
+
+                    // Fetch the BID list for this document's subtree from global_bb.
+                    // submap_by_bid uses the document BID directly, bypassing the
+                    // PathMap path format entirely.
+                    let submap_entries = match global_bb
+                        .submap_by_bid(net_bid, Some(doc_bid), 0, true)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(_) => {
+                            doc_seeds.push(BeliefGraph::default());
+                            continue;
+                        }
+                    };
+
+                    if submap_entries.is_empty() {
+                        // No prior epoch data for this document — epoch-0 or first parse.
+                        doc_seeds.push(BeliefGraph::default());
+                        continue;
+                    }
+
+                    // Build a balanced BeliefGraph for the full document BID set.
+                    // QueryPackage::balanced appends halo + section-root traversals
+                    // that iteratively close the ancestor chains.
+                    // The result subsumes network_ancestors: the ancestor chain walk
+                    // reaches network nodes, Section edges, and const-namespace subgraphs
+                    // automatically.
+                    let bid_vec: Vec<crate::properties::Bid> =
+                        submap_entries.into_iter().map(|(_, bid, _)| bid).collect();
+                    let per_doc_seed = {
+                        let spec = QuerySpec::seed(TapeFn::Bids(bid_vec));
+                        let mut package = QueryPackage::balanced(spec);
+                        match global_bb.evaluate(&mut package).await {
+                            Ok(()) => package.into_graph(),
+                            Err(_) => BeliefGraph::default(),
+                        }
+                    };
+
+                    tracing::debug!(
+                        target: "noet_core::codec::fast_path",
+                        path = %file_path.display(),
+                        doc_bid = %doc_bid,
+                        net_bid = %net_bid,
+                        seed_states = %per_doc_seed.states.len(),
+                        seed_edges = %per_doc_seed.relations.as_graph().edge_count(),
+                        "[parse_epoch] per-doc balanced seed computed"
+                    );
+
+                    doc_seeds.push(per_doc_seed);
+                }
+            }
 
             // Return type now includes the per-task event buffer alongside the parse result.
             type EpochTaskResult = (
@@ -1333,12 +2440,19 @@ impl DocumentCompiler {
 
             // NOTE: processed counts were already incremented by the caller before
             // this function was invoked — do not increment here.
-            for (idx, path) in paths.into_iter().enumerate() {
+            // Clone the instance claim map Arc once outside the loop; each task gets
+            // its own Arc clone (cheap reference-count increment). When no instance
+            // map is set, task_claim_map is None and the task falls back to &CLAIM_MAP.
+            let instance_claim_map: Option<Arc<crate::codec::ClaimMap>> = self.claim_map.clone();
+            for (idx, (path, doc_seed)) in paths.into_iter().zip(doc_seeds).enumerate() {
                 let repo_root = repo_root.clone();
                 let proto_index = proto_index.clone();
                 let global_bb = global_bb.clone();
                 let network_ancestors = Arc::clone(&network_ancestors);
+                let shared_session_base = Arc::clone(&shared_session_base);
                 let sem = Arc::clone(&semaphore);
+                let task_claim_map: Option<Arc<crate::codec::ClaimMap>> =
+                    instance_claim_map.clone();
                 let parse_number = self.processed.get(&path).copied().unwrap_or(1);
                 let span = tracing::info_span!(
                     "parse_task",
@@ -1372,18 +2486,53 @@ impl DocumentCompiler {
                             Ok(b) => b.with_skip_global_api_check(true),
                             Err(e) => return (idx, path, Err(e), Vec::new()),
                         };
-                        // Seed repo_bid and merge the full network ancestor chain into
-                        // this task's session_bb so that try_initialize_stack_from_session_cache
-                        // can walk upward through Section edges all the way to the repo root.
-                        // seed_session is a no-op when repo_bid is nil (epoch-0).
-                        builder.seed_session(repo_bid, &network_ancestors);
+                        // Choose the seed for this task's session_bb:
+                        //
+                        // - Non-empty doc_seed: a balanced BeliefGraph produced by
+                        //   QueryPackage::balanced on the document's submap BID set.  The
+                        //   balanced traversal already walked the full ancestor chain, so this graph
+                        //   subsumes network_ancestors (network nodes, Section edges,
+                        //   const-namespace subgraphs, index anchors are all reachable
+                        //   from the document's nodes).  Using it directly avoids an
+                        //   extra clone of network_ancestors.
+                        //
+                        // - Empty doc_seed (epoch-0, asset files, first parse of a new
+                        //   document): fall back to network_ancestors so that
+                        //   try_initialize_stack_from_session_cache can still walk the
+                        //   ancestor chain and the content_namespaces() guard fires.
+                        //
+                        // seed_session is a no-op when repo_bid is nil (epoch-0 root).
+                        let task_seed_states = doc_seed.states.len();
+                        let task_seed_edges = doc_seed.relations.as_graph().edge_count();
+                        let doc_seed_has_href = doc_seed
+                            .states
+                            .contains_key(&crate::properties::href_namespace());
+                        let network_ancestors_has_href = network_ancestors
+                            .states
+                            .contains_key(&crate::properties::href_namespace());
+                        // Clone the prebuilt shared base (Arc pointer copies, no DFS) and
+                        // merge this document's own seed on top.
+                        //
+                        // Both former branches collapse here. The shared base already carries
+                        // the network ancestors and const-namespace subgraphs that
+                        // `network_ancestors` supplied, so the empty-doc_seed case is just a
+                        // merge of nothing, and the non-empty case no longer needs the
+                        // const-namespace union that previously guarded against dropping
+                        // those namespaces (~84k href states re-fetched, ~82s per affected
+                        // task). The base is never replaced, so they cannot be dropped.
+                        builder.seed_session_from_base(repo_bid, &shared_session_base, &doc_seed);
                         tracing::debug!(
-                            target: "noet_core::codec::fast_path",
+                            target: "noet_core::codec::const_ns_refetch",
                             task_idx = idx,
-                            snapshot_states = %network_ancestors.states.len(),
-                            snapshot_edges = %network_ancestors.relations.as_graph().edge_count(),
+                            path = %path.display(),
+                            seed_states = %task_seed_states,
+                            seed_edges = %task_seed_edges,
+                            used_doc_seed = %(task_seed_states > 0),
+                            doc_seed_has_href = %doc_seed_has_href,
+                            network_ancestors_has_href = %network_ancestors_has_href,
                             "[parse_epoch] task seeded"
                         );
+                        let task_parse_start = std::time::Instant::now();
 
                         // Delegate directory resolution, file read, FileParsed event,
                         // parse_content, and optional write-back to the shared helper.
@@ -1396,8 +2545,17 @@ impl DocumentCompiler {
                             proto_index,
                             write,
                             parse_number,
+                            task_claim_map.as_deref().unwrap_or(&CLAIM_MAP),
                         )
                         .await;
+
+                        tracing::debug!(
+                            target: "noet_core::codec::const_ns_refetch",
+                            task_idx = idx,
+                            path = %orig_path.display(),
+                            elapsed_ms = task_parse_start.elapsed().as_millis() as u64,
+                            "[parse_epoch] task parse complete"
+                        );
 
                         // Drop the builder (and its task_tx clone) so the channel is fully
                         // closed; then drain all buffered events into a Vec for ordered replay.
@@ -1434,6 +2592,21 @@ impl DocumentCompiler {
                 }
             }
 
+            // PathMap copy-on-write counters. Cumulative across the run, so read the
+            // deltas between epochs. A copies/calls ratio near 1.0 means the sharing is
+            // thrashing rather than amortizing (healthy baseline: ~2.8%).
+            {
+                let (calls, copies, entries, us) = crate::paths::cow_stats();
+                tracing::debug!(
+                    target: "noet_core::codec::perf",
+                    cow_calls = calls,
+                    cow_copies = copies,
+                    cow_entries_copied = entries,
+                    cow_us = us,
+                    "[parse_epoch] pathmap copy-on-write counters (cumulative)",
+                );
+            }
+
             // Replay per-task events to the shared channel in idx (lexical path) order.
             // This is the point where ordering is enforced: all of task 0's events are
             // forwarded before any of task 1's, etc., regardless of which task finished
@@ -1461,12 +2634,12 @@ impl DocumentCompiler {
     /// subgraph (namespace nodes present, zero children) because parallel-task events
     /// flow `shared_tx → BeliefAccumulator → global_bb` but are never replayed into
     /// `self.builder.session_bb`. Every remainder-epoch task then falls through to
-    /// `global_bb.eval_unbalanced` inside `initialize_stack`, loading ~366 assets at
+    /// `global_bb.evaluate` inside `initialize_stack`, loading ~366 assets at
     /// ~10.9 ms/asset = 4–9s of Phase 0 per task on every reparse.
     ///
     /// After this call the next `epoch_session_snapshot` includes the full asset
     /// subgraph, and the `content_namespaces()` guard in `initialize_stack` fires
-    /// immediately, skipping `eval_unbalanced` entirely for all remainder tasks.
+    /// immediately, skipping the global_bb query entirely for all remainder tasks.
     ///
     /// Must be called **after** `drain_epoch` — `global_bb` does not have the new
     /// epoch's assets until the drain is complete.
@@ -1477,20 +2650,33 @@ impl DocumentCompiler {
         for ns_bid in content_namespaces().iter() {
             let key = NodeKey::Bid { bid: *ns_bid };
             // Only pull namespaces that global_bb actually knows about.
-            if let Some(ns_node) = global_bb.get_async(&key).await? {
+            if let Some(ns_node) = lookup_node(global_bb, &key).await? {
                 // Ensure the namespace node itself is present in session_bb.
                 let ns_event = BeliefEvent::NodeUpdate(
                     vec![key.clone()],
-                    ns_node.toml(),
-                    crate::event::EventOrigin::Remote,
+                    ns_node.clone(),
+                    EventOrigin::Remote,
                 );
                 self.builder.session_bb_mut().process_event(&ns_event)?;
 
-                // Fetch the full asset subgraph reachable from this namespace and
+                // Fetch the asset subgraph reachable from this namespace and
                 // merge it into session_bb.  merge_from is idempotent: re-merging
                 // on every drain is safe and picks up any newly-discovered assets.
-                let ns_expr = Expression::from(&key);
-                let ns_graph = global_bb.eval(&ns_expr).await?;
+                //
+                // Leaf-anchored query (Section leaf-ward walk only, no halo): asset
+                // and href nodes are the SOURCE of their Section edge to the
+                // namespace (the namespace is the sink) -- see
+                // GraphBuilder::process_asset. Walking toward roots (anchored /
+                // balance_map) from the namespace only continues upward and never
+                // reaches any of its children. leaf_anchored walks the other way
+                // (toward leaves) to find everything registered under this
+                // namespace hub, while still avoiding the O(N) halo explosion a
+                // balanced query would incur by fanning out through every document
+                // sharing a neighbor with the namespace hub.
+                let spec = QuerySpec::seed(TapeFn::Bids(vec![*ns_bid]));
+                let mut package = QueryPackage::leaf_anchored(spec);
+                global_bb.evaluate(&mut package).await?;
+                let ns_graph = package.into_graph();
                 let ns_seed: std::collections::BTreeSet<Bid> =
                     std::collections::BTreeSet::from([*ns_bid]);
                 self.builder
@@ -1504,6 +2690,185 @@ impl DocumentCompiler {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Register Trace-kinded stubs for subnet networks parsed in the current
+    /// depth-group batch.
+    ///
+    /// After a depth-group `drain_epoch`, the newly parsed subnet network nodes
+    /// live in `global_bb` but are absent from `self.builder.session_bb`.  Without
+    /// them, `epoch_session_snapshot` produces a `PathMapMap` that cannot resolve
+    /// multi-level path keys (e.g. `docs/flight_software_design/architecture`),
+    /// causing `cache_fetch` MISS warnings on re-parse.
+    ///
+    /// For each subnet in the batch this method:
+    ///   1. Uses `ProtoIndex` to derive the parent network directory and the
+    ///      child's relative directory name (zero `global_bb` cost).
+    ///   2. Resolves the child's `NodeKey::Path` via a seed-only query on
+    ///      `global_bb` (no halo/balanced traversal — one cheap key resolution).
+    ///   3. Inserts the resulting Trace-kinded node and a Section edge (with
+    ///      `WEIGHT_DOC_PATHS`) into `session_bb`, registering the subnet in
+    ///      the parent's `PathMap`.
+    ///
+    /// `cache_fetch` rejects Trace nodes from `session_bb` (they pass the
+    /// `.filter(|n| … || !n.kind.contains(BeliefKind::Trace))` guard), falling
+    /// through to `global_bb` for the full balanced subgraph on first access.
+    /// The stub's value is in the PathMap registration: path resolution works
+    /// locally, avoiding the cascade that would otherwise miss.
+    ///
+    /// Must be called **after** `drain_epoch` so `global_bb` has the batch's
+    /// network nodes.
+    async fn sync_subnet_stubs<B: BeliefSource + Clone>(
+        &mut self,
+        batch: &[PathBuf],
+        global_bb: &B,
+    ) -> Result<(), BuildonomyError> {
+        let repo_root = self.builder.repo_root().to_path_buf();
+        let repo_bid = self.builder.repo();
+        if repo_bid == Bid::nil() {
+            return Ok(());
+        }
+
+        for dir in batch {
+            // Skip repo root — already in session_bb non-Trace from sequential
+            // parse.
+            if *dir == repo_root {
+                continue;
+            }
+
+            // ── Step 1: derive parent/child from ProtoIndex (no global_bb) ───
+            let index_path = dir.join(NETWORK_NAME);
+            let parent_dir = match self.proto_index.owning_net_dir_for(&index_path) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Look up parent BID from session_bb.  The parent was parsed in an
+            // earlier depth group (or is the repo root), so it must already be
+            // present — either as a real node or as a Trace stub from a prior
+            // call to this method.
+            let parent_rel =
+                os_path_to_string(parent_dir.strip_prefix(&repo_root).unwrap_or(Path::new("")));
+            let parent_key = NodeKey::Path {
+                net: repo_bid.bref(),
+                path: parent_rel.clone(),
+            };
+            let parent_bid = match self.builder.session_bb().get(&parent_key) {
+                Some(n) => n.bid,
+                None => {
+                    tracing::debug!(
+                        target: "noet_core::codec::fast_path",
+                        parent_rel = %parent_rel,
+                        subnet = %dir.display(),
+                        "[sync_subnet_stubs] parent not in session_bb, skipping",
+                    );
+                    continue;
+                }
+            };
+
+            // Compute child's relative directory name within the parent network.
+            let child_rel_name =
+                os_path_to_string(dir.strip_prefix(&parent_dir).unwrap_or(Path::new("")));
+            if child_rel_name.is_empty() {
+                continue;
+            }
+
+            // Skip if already registered in session_bb.
+            let child_key = NodeKey::Path {
+                net: parent_bid.bref(),
+                path: child_rel_name.clone(),
+            };
+            if self.builder.session_bb().get(&child_key).is_some() {
+                continue;
+            }
+
+            // ── Step 2: resolve BID from global_bb (one cheap key query) ─────
+            let spec = QuerySpec::seed(TapeFn::Keys(vec![child_key.clone()]));
+            let mut package = QueryPackage::new(spec);
+            global_bb.evaluate(&mut package).await?;
+
+            let child_bid = match package.resolved_bid(0) {
+                Some(bid) => bid,
+                None => {
+                    // Expected on fresh indexes (no durable database): global_bb
+                    // has the subnet node from drain_epoch but its PathMapMap may
+                    // not have registered the path key yet.  The existing
+                    // cache_fetch cascade (session_bb miss → global_bb balanced
+                    // query) handles this case at task execution time.
+                    tracing::trace!(
+                        target: "noet_core::codec::fast_path",
+                        child_key = ?child_key,
+                        "[sync_subnet_stubs] global_bb could not resolve subnet key \
+                         (expected on fresh index)",
+                    );
+                    continue;
+                }
+            };
+            let graph = package.into_graph();
+            let child_node = match graph.states.get(&child_bid) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+
+            // Mark as Trace so cache_fetch rejects the StackCache hit and
+            // falls through to global_bb for the full balanced subgraph.
+            // A seed-only query (no halo) returns the real node kind, so we
+            // must set Trace explicitly.
+            let mut stub_node = child_node;
+            stub_node.kind.insert(BeliefKind::Trace);
+
+            // ── Step 3: insert stub + Section edge into session_bb ───────────
+            self.builder
+                .session_bb_mut()
+                .process_event(&BeliefEvent::NodeUpsert(
+                    child_bid,
+                    stub_node,
+                    EventOrigin::Remote,
+                ))?;
+
+            // Section edge registers the subnet in the parent's PathMap via
+            // WEIGHT_DOC_PATHS.
+            let mut weight = Weight {
+                payload: toml::Table::new(),
+            };
+            weight
+                .set_doc_paths(vec![child_rel_name.clone()])
+                .map_err(|e| {
+                    BuildonomyError::Codec(format!(
+                        "sync_subnet_stubs: failed to set doc_paths: {e}"
+                    ))
+                })?;
+            if let Some(sk) = self.proto_index.sort_key_for(&index_path) {
+                weight.set(WEIGHT_SORT_KEY, sk).map_err(|e| {
+                    BuildonomyError::Codec(format!(
+                        "sync_subnet_stubs: failed to set sort_key: {e}"
+                    ))
+                })?;
+            }
+            weight.set(WEIGHT_OWNED_BY, "sink").map_err(|e| {
+                BuildonomyError::Codec(format!("sync_subnet_stubs: failed to set owned_by: {e}"))
+            })?;
+
+            self.builder
+                .session_bb_mut()
+                .process_event(&BeliefEvent::RelationChange(
+                    child_bid,
+                    parent_bid,
+                    WeightKind::Section,
+                    Some(weight),
+                    EventOrigin::Remote,
+                ))?;
+
+            tracing::debug!(
+                target: "noet_core::codec::fast_path",
+                subnet = %child_rel_name,
+                child_bid = %child_bid,
+                parent_bid = %parent_bid,
+                "[sync_subnet_stubs] registered Trace subnet stub",
+            );
+        }
+
         Ok(())
     }
 
@@ -1592,10 +2957,15 @@ impl DocumentCompiler {
     }
 
     /// Handle file deletion event (clean up all tracking).
+    ///
+    /// Removes the path from the remainder queue, clears its parse count, and
+    /// removes any `CLAIM_MAP` entry so that a codec which previously claimed this
+    /// file does not receive stale dispatch on a future re-scan.
     pub fn on_file_deleted(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         self.remove_from_queues(&path);
         self.processed.remove(&path);
+        CLAIM_MAP.unclaim(&path);
     }
 
     /// Clear all processed tracking (for fresh re-parse of entire tree).
@@ -1610,15 +2980,30 @@ impl DocumentCompiler {
         self.remainder_queue.retain(|p| p != path);
     }
 
-    /// Compute a short FNV-1a 64-bit hash of a byte slice, returned as a 16-char hex string.
-    /// Used to produce an asset version token that changes whenever beliefbase content changes.
-    fn fnv1a_hex(data: &[u8]) -> String {
+    /// Compute a FNV-1a 64-bit hash of a byte slice.
+    fn fnv1a(data: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in data {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        format!("{:016x}", h)
+        h
+    }
+
+    /// Compute a combined asset version token that changes when either the beliefbase
+    /// content OR the WASM binary changes.
+    ///
+    /// XOR-combining the two hashes means Chrome's compiled WASM cache (keyed by URL)
+    /// is busted whenever the Rust code changes, not only when beliefbase data changes.
+    fn asset_version_hex(beliefbase_data: &[u8]) -> String {
+        let data_hash = Self::fnv1a(beliefbase_data);
+        // WASM_BINARY is only available with the `bin` feature; fall back to
+        // data_hash alone in library/test builds where the binary isn't embedded.
+        #[cfg(feature = "bin")]
+        let wasm_hash = Self::fnv1a(crate::codec::assets::wasm_binary());
+        #[cfg(not(feature = "bin"))]
+        let wasm_hash: u64 = 0;
+        format!("{:016x}", data_hash ^ wasm_hash)
     }
 
     /// Finalize HTML generation tasks that require synchronized BeliefBase
@@ -1643,38 +3028,95 @@ impl DocumentCompiler {
             None => return Ok(Vec::new()), // No HTML output configured
         };
 
+        // finalize_html calls such as `compute_layout_metadata` are performance taxing.
+        // This instrumentation lets us measure their burden.
+        let stage_start = std::time::Instant::now();
+
         // Generate deferred HTML with synchronized context
         self.generate_deferred_html(global_bb.clone()).await?;
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] generate_deferred_html",
+        );
 
         // Generate sitemap from document paths
+        let stage_start = std::time::Instant::now();
         self.generate_sitemap(global_bb.clone()).await?;
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] generate_sitemap",
+        );
 
         // Query synchronized global_bb for asset manifest
+        let stage_start = std::time::Instant::now();
         let asset_manifest: BTreeMap<String, Bid> = global_bb
-            .get_all_paths(asset_namespace(), false)
+            .submap(asset_namespace(), "", u8::MAX, false)
             .await
             .unwrap_or_default()
             .into_iter()
+            .map(|(path, bid, _order)| (path, bid))
             .collect();
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            asset_count = asset_manifest.len(),
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] asset_manifest submap",
+        );
 
-        self.create_asset_hardlinks(&asset_manifest).await?;
+        let stage_start = std::time::Instant::now();
+        let asset_hardlink_diagnostics = self.create_asset_hardlinks(&asset_manifest).await?;
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] create_asset_hardlinks",
+        );
 
         // Export BeliefGraph to JSON for client-side use.
         // Step 1: Obtain graph and pathmap from the synchronized global_bb.
-        let graph = global_bb.export_beliefgraph().await?;
+        let stage_start = std::time::Instant::now();
+        let mut graph = global_bb.export_beliefgraph().await?;
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            node_count = graph.states.len(),
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] export_beliefgraph",
+        );
 
         // Collects warnings generated during export (e.g. oversized networks).
         // Returned to the caller so they can surface them alongside parse diagnostics.
         let mut finalize_diagnostics: Vec<crate::codec::ParseDiagnostic> = Vec::new();
+        finalize_diagnostics.extend(asset_hardlink_diagnostics);
 
         // Reconstruct a temporary BeliefBase so we can access its PathMapMap.
         // BeliefBase::from(BeliefGraph) re-derives paths from the node/relation data,
         // giving us a PathMapMap that reflects the complete synchronized state.
         // We keep `temp_bb` alive for the duration of the export pipeline so the
         // read-guard returned by `paths()` remains valid.
+        let stage_start = std::time::Instant::now();
         let temp_bb = crate::beliefbase::BeliefBase::from(graph.clone());
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] BeliefBase::from(graph) rebuild",
+        );
+
+        // Step 1b: Compute layout metadata (assembly index + render positions)
+        // for the 3D credibility map viewer. Mutates graph.states in place.
+        let stage_start = std::time::Instant::now();
+        {
+            let pathmap = temp_bb.paths();
+            crate::layout::compute_layout_metadata(&mut graph, &pathmap, &self.layout_config);
+        }
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] compute_layout_metadata",
+        );
 
         // Step 2: Build compile-time search indices (always, before sharding decision).
+        let stage_start = std::time::Instant::now();
         let search_manifest = {
             let pathmap = temp_bb.paths();
             crate::shard::search::build_search_indices(
@@ -1685,6 +3127,11 @@ impl DocumentCompiler {
             )
             .await
         };
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] build_search_indices",
+        );
 
         let search_manifest = match search_manifest {
             Ok((manifest, warnings)) => {
@@ -1707,7 +3154,7 @@ impl DocumentCompiler {
             .and_then(|v| v.parse::<usize>().ok())
         {
             Some(threshold) => {
-                tracing::info!(
+                tracing::debug!(
                     "[finalize_html] NOET_SHARD_THRESHOLD={threshold} — overriding default shard threshold"
                 );
                 crate::shard::manifest::ShardConfig {
@@ -1717,39 +3164,50 @@ impl DocumentCompiler {
             }
             None => crate::shard::manifest::ShardConfig::default(),
         };
+        let stage_start = std::time::Instant::now();
         let export_result = {
             let pathmap = temp_bb.paths();
+            // Collect all known document extensions for the codec manifest.
+            // This tells the WASM viewer which extensions produce rendered HTML.
+            let codec_manifest = crate::shard::manifest::CodecManifest::new(
+                crate::codec::collect_known_extensions(),
+                crate::codec::WALK_CODECS.network_filenames(),
+            );
             crate::shard::export::export_beliefbase(
                 graph,
                 &pathmap,
                 &html_dir,
                 &shard_config,
                 &search_manifest,
+                &codec_manifest,
             )
             .await
         };
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] export_beliefbase",
+        );
         let asset_version = match export_result {
             Ok(crate::shard::ExportMode::Monolithic { size_mb }) => {
                 tracing::debug!(
-                    "[finalize_html] Exported monolithic beliefbase.json ({:.2} MB)",
+                    "[finalize_html] Exported monolithic beliefbase.msgpack ({:.2} MB)",
                     size_mb
                 );
-                // Re-read the written file to hash its content.  It was already
-                // serialized above; reading it back avoids holding the full string
-                // in memory across the sharding branch.
-                let json_path = html_dir.join("beliefbase.json");
-                let bytes = tokio::fs::read(&json_path).await.unwrap_or_default();
-                Self::fnv1a_hex(&bytes)
+                // Re-read the written file to hash its content.
+                let msgpack_path = html_dir.join("beliefbase.msgpack");
+                let bytes = tokio::fs::read(&msgpack_path).await.unwrap_or_default();
+                Self::asset_version_hex(&bytes)
             }
             Ok(crate::shard::ExportMode::Sharded { manifest }) => {
-                tracing::info!(
+                tracing::debug!(
                     "[finalize_html] Exported {} network shards to beliefbase/",
                     manifest.networks.len()
                 );
                 // Hash the manifest file — it changes whenever any shard content changes.
                 let manifest_path = html_dir.join("beliefbase").join("manifest.json");
                 let bytes = tokio::fs::read(&manifest_path).await.unwrap_or_default();
-                Self::fnv1a_hex(&bytes)
+                Self::asset_version_hex(&bytes)
             }
             Err(e) => {
                 // Log and fall back to the legacy exporter so a build failure here
@@ -1762,16 +3220,108 @@ impl DocumentCompiler {
                 // Hash the fallback file.
                 let json_path = html_dir.join("beliefbase.json");
                 let bytes = tokio::fs::read(&json_path).await.unwrap_or_default();
-                Self::fnv1a_hex(&bytes)
+                Self::asset_version_hex(&bytes)
             }
         };
 
         // Write the SPA shell now that we have a stable asset_version derived from
         // the beliefbase content.  This replaces the earlier call that was made from
         // parse_all before the data files existed.
+        let stage_start = std::time::Instant::now();
         self.generate_spa_shell(&asset_version).await?;
+        tracing::debug!(
+            target: "noet_core::codec::perf",
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "[finalize_html stage] generate_spa_shell",
+        );
 
         Ok(finalize_diagnostics)
+    }
+
+    /// Copy all successfully-parsed source files to html_output/pages/sources/,
+    /// mirroring the repo-relative directory structure.
+    ///
+    /// Only files that were successfully parsed (present in `self.latest_results`
+    /// with no fatal parse error) are copied. This gives static HTML viewers a
+    /// downloadable copy of the source alongside the rendered output.
+    async fn copy_source_files(&self) -> Result<(), BuildonomyError> {
+        let html_dir = match &self.html_output_dir {
+            Some(dir) => dir.clone(),
+            None => {
+                tracing::debug!("[copy_source_files] No html_output_dir set — skipping");
+                return Ok(());
+            }
+        };
+        let sources_dir = html_dir.join("pages").join("sources");
+        let repo_root = self.builder.repo_root();
+        let mut copied = 0u32;
+        let mut skipped_fatal = 0u32;
+        let mut skipped_dir = 0u32;
+        let mut skipped_prefix = 0u32;
+        let mut copy_errors = 0u32;
+
+        tracing::debug!(
+            "[copy_source_files] Starting: {} results, sources_dir={:?}, repo_root={:?}",
+            self.latest_results.len(),
+            sources_dir,
+            repo_root,
+        );
+
+        for (abs_path, result) in &self.latest_results {
+            // Skip files with fatal parse errors.
+            let has_fatal = result
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, crate::codec::ParseDiagnostic::ParseError { .. }));
+            if has_fatal {
+                skipped_fatal += 1;
+                continue;
+            }
+            // For directories (network roots), resolve to the actual network file
+            // (e.g. index.md) inside the directory.
+            let source_file = if abs_path.is_dir() {
+                match detect_network_file(abs_path) {
+                    Some(f) => f,
+                    None => {
+                        skipped_dir += 1;
+                        continue;
+                    }
+                }
+            } else {
+                abs_path.clone()
+            };
+            let rel_path = match source_file.strip_prefix(repo_root) {
+                Ok(r) => r,
+                Err(_) => {
+                    skipped_prefix += 1;
+                    continue;
+                }
+            };
+            let dest = sources_dir.join(rel_path);
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+            match tokio::fs::copy(&source_file, &dest).await {
+                Ok(_) => copied += 1,
+                Err(e) => {
+                    copy_errors += 1;
+                    if copy_errors <= 5 {
+                        tracing::warn!(
+                            "[copy_source_files] Failed to copy {:?} -> {:?}: {}",
+                            source_file,
+                            dest,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "[copy_source_files] Done: copied={}, skipped_fatal={}, skipped_dir={}, skipped_prefix={}, copy_errors={}",
+            copied, skipped_fatal, skipped_dir, skipped_prefix, copy_errors,
+        );
+        Ok(())
     }
 
     /// Returns `true` if an asset path was actually enqueued for processing.
@@ -1806,6 +3356,21 @@ impl DocumentCompiler {
             let _repo_relative_asset: &str = asset_relative_path;
 
             let absolute_path = Self::normalize_queue_path(string_to_os_path(&asset_absolute_path));
+
+            // Guard: if the computed path doesn't exist on disk, this "asset" reference
+            // is almost certainly a misclassified ID link (e.g. `[R.CLDS-410]` whose
+            // dot caused NodeKey::from_str to classify it as an asset path). Don't
+            // enqueue it — leave the UnresolvedReference diagnostic in place so
+            // promote_unresolved_to_warnings can surface it as a warning instead of
+            // letting parse_one_path fail with a hard ParseError (→ exit(1)).
+            if !absolute_path.exists() {
+                tracing::debug!(
+                    "[Compiler] Asset path does not exist on disk, treating as unresolved reference: {}",
+                    asset_absolute_path
+                );
+                return false;
+            }
+
             // Add to remainder_queue for processing (dedup check avoids double-dispatch).
             if !self.processed.contains_key(&absolute_path)
                 && !self.remainder_queue.contains(&absolute_path)
@@ -1821,13 +3386,32 @@ impl DocumentCompiler {
         false
     }
 
-    /// Returns `true` if a dependency path was actually enqueued for processing.
+    /// Resolves an unresolved reference string to a canonical dep path and enqueues it if
+    /// not yet processed or queued.
+    ///
+    /// Returns `true` when self should re-queue: either the dep was newly enqueued, or it
+    /// is a same-batch sibling (pre-incremented before the batch ran, so its parse output
+    /// is not yet in session_bb). Returns `false` for already-processed deps from prior
+    /// batches (their output IS in session_bb; if the link didn't resolve now, re-queuing
+    /// self won't help) and for permanent externals (out-of-corpus URLs, non-existent paths,
+    /// absolute slugs, or paths outside the repo).
     fn process_unresolved_reference(
         &mut self,
         path: &Path,
         net_dep_path_str: &str,
         net_ref: Bref,
     ) -> bool {
+        // Codec namespace brefs (derived from UUID_NAMESPACE_CODEC) are synthetic
+        // secondary indices — not filesystem networks.  They have no disk path to
+        // resolve, and their nodes are populated lazily during push().  Return true
+        // so the caller treats this as a corpus dependency (triggering reparse)
+        // rather than marking it as permanently unresolved.  The reference will
+        // resolve on a subsequent pass once the target node's namespace_paths
+        // entry has been committed to global_bb.
+        if crate::codec::is_codec_namespace(&net_ref) {
+            return true;
+        }
+
         // Use session_bb rather than doc_bb here. doc_bb is cleared and rebuilt for each
         // document in initialize_stack, so for plain .md files it only contains that file's
         // local nodes — the root network node (and its pathmap entry) is absent.
@@ -1904,15 +3488,87 @@ impl DocumentCompiler {
             return false;
         };
 
+        // If the dependency path's filename component (ignoring any anchor) is
+        // `index.md`, strip it to the parent directory before canonicalizing.
+        // `net_dir/index.md` and `net_dir/index.md#anchor` are both entry points
+        // for the network at `net_dir/` — parsing the file form generates a
+        // duplicate network node because the processed map is keyed on the directory
+        // form.  AnchorPath::filepath() strips any anchor first, then we check the
+        // trailing filename; AnchorPath::dir() gives the parent directory string
+        // directly, avoiding any std::path round-trip.
+        let full_dep_path = {
+            let dep_str = os_path_to_string(&full_dep_path);
+            let dep_ap = AnchorPath::new(&dep_str);
+            if WALK_CODECS.is_network_file(dep_ap.filename()) {
+                let dir = string_to_os_path(dep_ap.dir());
+                tracing::debug!(
+                    "[process_unresolved_reference] Normalising network-file reference \
+                     {:?} → directory form {:?}",
+                    full_dep_path,
+                    dir,
+                );
+                dir
+            } else {
+                full_dep_path
+            }
+        };
+
         // Canonicalize if it exists, then normalise to strip any \\?\ prefix (Windows).
         let canonical_dep_path = match full_dep_path.canonicalize() {
             Ok(p) => Self::normalize_queue_path(p),
             Err(_) => {
+                // The path doesn't exist on disk.  This can mean:
+                //   (a) External/non-existent dependency → skip
+                //   (b) Synthetic path (e.g. C++ include-convention path that
+                //       differs from the filesystem path) → the target node
+                //       may exist in the PathMap once it's been parsed
+                //
+                // For (b): return true so the source file gets requeued — but
+                // only on the FIRST encounter.  If the same synthetic path
+                // triggered a requeue on a prior parse and the target still
+                // doesn't exist, the reference will never resolve.  Return
+                // false so the caller marks the primary key as permanently
+                // unresolved, preventing futile O(N²) reparses of files with
+                // many nodes (e.g. C++ register headers with 960+ symbols).
+                //
+                // Guard: only do this for paths within repo_root.  The
+                // full_dep_path was constructed from repo_root + net_path +
+                // dep_path_str, so an in-repo path always starts with
+                // repo_root.  Absolute slugs and external URLs were already
+                // filtered above.
+                if full_dep_path.starts_with(self.builder.repo_root()) {
+                    // Only requeue on the source file's first parse.  If this
+                    // is a reparse (processed count > 1), the target had one
+                    // full epoch to materialise and didn't — it never will.
+                    // Returning false lets the caller mark the primary NodeKey
+                    // as permanently unresolved via the existing mechanism.
+                    let parse_count = self.processed.get(path).copied().unwrap_or(1);
+                    if parse_count <= 1 {
+                        tracing::debug!(
+                            "[process_unresolved_reference] {:?} does not exist on disk but \
+                             is within repo_root — requeueing source {:?} for reparse \
+                             (synthetic path, first parse)",
+                            full_dep_path,
+                            path,
+                        );
+                        return true;
+                    } else {
+                        tracing::debug!(
+                            "[process_unresolved_reference] {:?} still does not exist on \
+                             disk after reparse (parse_count={}) — treating as permanently \
+                             unresolved (source {:?})",
+                            full_dep_path,
+                            parse_count,
+                            path,
+                        );
+                        return false;
+                    }
+                }
                 tracing::trace!(
                     "[Compiler] Cannot canonicalize {:?}, treating as external",
                     full_dep_path
                 );
-                return false; // Skip external/non-existent dependencies
+                return false;
             }
         };
 
@@ -1951,7 +3607,20 @@ impl DocumentCompiler {
         );
 
         if !already_processed && !already_queued {
-            if CODECS.path_get(&canonical_dep_path).is_some()
+            // Never re-queue a path that was explicitly rejected by a network's
+            // whitelist/blacklist filter. The unresolved reference is legitimate
+            // (the link exists in source) but the target is intentionally excluded.
+            if CLAIM_MAP.is_rejected(&canonical_dep_path) {
+                tracing::debug!(
+                    "[process_unresolved_reference] {:?} is rejected by CLAIM_MAP, \
+                     not re-enqueueing (referenced from {:?})",
+                    canonical_dep_path,
+                    path,
+                );
+                return false;
+            }
+            if (CODECS.path_get(&canonical_dep_path).is_some()
+                || WALK_CODECS.should_track(&canonical_dep_path))
                 && self.proto_index.sort_key_for(&canonical_dep_path).is_none()
             {
                 tracing::warn!(
@@ -1963,9 +3632,18 @@ impl DocumentCompiler {
                 );
             }
             self.remainder_queue.push_back(canonical_dep_path.clone());
+            // Newly enqueued: self must re-queue to resolve once dep's output lands.
             return true;
         }
-        false
+
+        // Same-batch sibling: pre-incremented before the batch ran, so
+        // `already_processed` is true but the dep's parse output is NOT yet in
+        // session_bb when siblings run. Self must re-queue to pick up the dep's
+        // output after the batch completes.
+        //
+        // Already-processed dep from a prior batch: output IS in session_bb. If the
+        // link didn't resolve on this parse, re-queuing self won't help — return false.
+        self.current_batch.contains(&canonical_dep_path)
     }
     /// Check if there are pending items to parse.
     pub fn has_pending(&self) -> bool {
@@ -2144,6 +3822,14 @@ impl DocumentCompiler {
         Ok(())
     }
 
+    /// Render a short markdown snippet to HTML.
+    ///
+    /// Delegates to `crate::codec::render_markdown_snippet` — the shared
+    /// utility that uses canonical parser options and a broken-link callback.
+    fn render_markdown_snippet(md: &str) -> String {
+        crate::codec::render_markdown_snippet(md)
+    }
+
     /// Generate SPA shell (index.html) at HTML output root using Responsive template.
     ///
     /// `asset_version` is a short hex string derived from the serialized beliefbase
@@ -2175,6 +3861,14 @@ impl DocumentCompiler {
         let bid = repo_bid.to_string();
         let title = repo_node.display_title();
 
+        // Read optional footer_text from the entry network's frontmatter payload
+        let footer_text = repo_node
+            .payload
+            .get("footer_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let footer_html = Self::render_markdown_snippet(footer_text);
+
         // Get stylesheet URLs based on use_cdn parameter
         let stylesheet_urls = get_stylesheet_urls(self.use_cdn);
 
@@ -2184,6 +3878,34 @@ impl DocumentCompiler {
             .as_ref()
             .map(|s| format!("<script>{}</script>", s))
             .unwrap_or_default();
+
+        // Compute base_href and asset_prefix from base_url.
+        //
+        // base_href: used as <base href="..."> — controls how the SPA resolves
+        //   relative navigation URLs.  With a base_url (e.g. for GitHub Pages),
+        //   this is "<base_url>/pages/"; without one (local serve), "/pages/".
+        //
+        // asset_prefix: prepended to local (relative) asset paths only.
+        //   CDN URLs (already absolute, starting with "https://") are passed through
+        //   unchanged to avoid double-prefixing.
+        let (base_href, asset_prefix) = match &self.base_url {
+            Some(url) => {
+                // Strip trailing slash so we never produce double slashes.
+                let url = url.trim_end_matches('/');
+                (format!("{url}/pages/"), format!("{url}/"))
+            }
+            None => ("/pages/".to_string(), "/".to_string()),
+        };
+
+        // Prefix a stylesheet URL with asset_prefix only when it is relative
+        // (i.e. does not already start with a scheme like "https://").
+        let prefix_asset = |url: &str| -> String {
+            if url.contains("://") {
+                url.to_string()
+            } else {
+                format!("{asset_prefix}{url}")
+            }
+        };
 
         // Replace template placeholders
         let html = template
@@ -2195,11 +3917,57 @@ impl DocumentCompiler {
             .replace("{{BID}}", &bid)
             .replace("{{ASSET_VERSION}}", asset_version)
             .replace("{{SCRIPT}}", &script_tag)
-            .replace("{{STYLESHEET_OPEN_PROPS}}", &stylesheet_urls.open_props)
-            .replace("{{STYLESHEET_NORMALIZE}}", &stylesheet_urls.normalize)
-            .replace("{{STYLESHEET_THEME_LIGHT}}", &stylesheet_urls.theme_light)
-            .replace("{{STYLESHEET_THEME_DARK}}", &stylesheet_urls.theme_dark)
-            .replace("{{STYLESHEET_LAYOUT}}", &stylesheet_urls.layout);
+            .replace("{{BASE_HREF}}", &base_href)
+            .replace("{{ASSET_PREFIX}}", &asset_prefix)
+            .replace(
+                "{{BASE_URL}}",
+                self.base_url.as_deref().unwrap_or("").trim_end_matches('/'),
+            )
+            .replace(
+                "{{STYLESHEET_OPEN_PROPS}}",
+                &prefix_asset(&stylesheet_urls.open_props),
+            )
+            .replace(
+                "{{STYLESHEET_NORMALIZE}}",
+                &prefix_asset(&stylesheet_urls.normalize),
+            )
+            .replace(
+                "{{STYLESHEET_THEME_LIGHT}}",
+                &prefix_asset(&stylesheet_urls.theme_light),
+            )
+            .replace(
+                "{{STYLESHEET_THEME_DARK}}",
+                &prefix_asset(&stylesheet_urls.theme_dark),
+            )
+            .replace(
+                "{{STYLESHEET_LAYOUT}}",
+                &prefix_asset(&stylesheet_urls.layout),
+            )
+            .replace(
+                "{{STYLESHEET_KATEX_CSS}}",
+                &prefix_asset(&stylesheet_urls.katex_css),
+            )
+            .replace(
+                "{{SCRIPT_KATEX_JS}}",
+                &prefix_asset(&stylesheet_urls.katex_js),
+            )
+            .replace(
+                "{{SCRIPT_KATEX_AUTO_RENDER_JS}}",
+                &prefix_asset(&stylesheet_urls.katex_auto_render_js),
+            )
+            .replace(
+                "{{STYLESHEET_TABULATOR_CSS}}",
+                &prefix_asset(&stylesheet_urls.tabulator_css),
+            )
+            .replace(
+                "{{SCRIPT_TABULATOR_JS}}",
+                &prefix_asset(&stylesheet_urls.tabulator_js),
+            )
+            .replace(
+                "{{SCRIPT_MERMAID_JS}}",
+                &prefix_asset(&stylesheet_urls.mermaid_js),
+            )
+            .replace("{{FOOTER_TEXT}}", &footer_html);
 
         let index_path = html_output_dir.join("index.html");
         tokio::fs::write(&index_path, html).await?;
@@ -2224,8 +3992,8 @@ impl DocumentCompiler {
 
         // Get all document paths from the repository network (including subnets)
         let repo_bid = self.builder.repo();
-        let document_paths: Vec<(String, Bid)> = global_bb
-            .get_all_paths(repo_bid, true)
+        let document_paths: Vec<(String, Bid, Vec<u16>)> = global_bb
+            .submap(repo_bid, "", u8::MAX, true)
             .await
             .unwrap_or_default();
 
@@ -2244,7 +4012,7 @@ impl DocumentCompiler {
         // Get codec extensions for link normalization
         let codec_extensions = crate::codec::CODECS.extensions();
 
-        for (repo_relative_path, _bid) in document_paths {
+        for (repo_relative_path, _bid, _order) in document_paths {
             // Skip empty path (represents the network node itself)
             if repo_relative_path.is_empty() {
                 continue;
@@ -2300,15 +4068,21 @@ impl DocumentCompiler {
         Ok(())
     }
 
-    /// Write HTML fragment to pages/ subdirectory with Layout::Simple wrapper
+    /// Write HTML fragment to pages/ subdirectory wrapped in the given layout template
     async fn write_fragment(
         &self,
         html_output_dir: &Path,
         rel_path: &Path,
-        html_body: String,
-        title: &str,
-        bid: &Bid,
+        pairs: Vec<(String, String)>,
+        meta: FragmentMeta<'_>,
+        layout: Layout,
     ) -> Result<(), BuildonomyError> {
+        let FragmentMeta {
+            title,
+            bid,
+            source_path,
+            is_binary,
+        } = meta;
         let pages_dir = html_output_dir.join("pages");
         let output_path = pages_dir.join(rel_path);
 
@@ -2317,32 +4091,86 @@ impl DocumentCompiler {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Wrap body with Layout::Simple template
-        let template = get_template(Layout::Simple);
+        // Wrap body with the requested layout template
+        let template = get_template(layout);
 
-        // Generate SPA route (for interactive link and canonical URL)
-        let spa_route = format!("/#/{}", rel_path.display());
+        // Generate SPA route hash fragment (document path within the SPA).
+        let hash_fragment = format!("/#/{}", rel_path.display());
 
         // Generate canonical URL (use base URL if configured, otherwise relative)
         let canonical_url = if let Some(base) = &self.base_url {
-            format!("{}{}", base.trim_end_matches('/'), &spa_route)
+            format!("{}{}", base.trim_end_matches('/'), hash_fragment)
         } else {
-            spa_route.clone()
+            hash_fragment.clone()
         };
 
-        let html = template
-            .replace("{{BODY}}", &html_body)
-            .replace("{{CANONICAL}}", &canonical_url)
-            .replace("{{SPA_ROUTE}}", &spa_route)
-            .replace("{{TITLE}}", title)
-            .replace("{{BID}}", &bid.to_string());
+        // Generate the href for the "View Interactive Version" link.
+        // With a base_url the link must include it so the browser navigates to
+        // the correct origin+path (e.g. https://example.github.io/repo/#/doc.html).
+        // Without one, a root-relative hash fragment is sufficient.
+        let spa_route = if let Some(base) = &self.base_url {
+            format!("{}{}", base.trim_end_matches('/'), hash_fragment)
+        } else {
+            hash_fragment
+        };
+
+        let source_link = match source_path {
+            Some(p) => {
+                let prefix = match &self.base_url {
+                    Some(url) => format!("{}/", url.trim_end_matches('/')),
+                    None => "/".to_string(),
+                };
+                format!("{}pages/sources/{}", prefix, p.display())
+            }
+            None => String::new(),
+        };
 
         // Inject optional script if configured
-        let html = if let Some(script) = &self.html_script {
-            html.replace("{{SCRIPT}}", &format!("<script>{}</script>", script))
+        let scripts = if let Some(script) = &self.html_script {
+            format!("<script>{}</script>", script)
         } else {
-            html.replace("{{SCRIPT}}", "")
+            String::new()
         };
+
+        // Build the set of placeholder keys the caller supplies so we can skip
+        // defaulting those — the caller pair wins on any collision.
+        let caller_keys: std::collections::HashSet<&str> =
+            pairs.iter().map(|(k, _)| k.as_str()).collect();
+
+        // Apply caller-supplied pairs first (caller wins).
+        let mut html = template.to_string();
+        for (key, value) in &pairs {
+            html = html.replace(key.as_str(), value.as_str());
+        }
+
+        // Compute asset_prefix from base_url (same logic as generate_spa_shell).
+        // This ensures {{ASSET_PREFIX}} in fragment templates resolves to the
+        // correct subpath prefix on deployments like GitHub Pages.
+        let asset_prefix = match &self.base_url {
+            Some(url) => format!("{}/", url.trim_end_matches('/')),
+            None => "/".to_string(),
+        };
+
+        // Apply defaults for any placeholder the caller did not supply.
+        let defaults: &[(&str, &str)] = &[
+            ("{{ASSET_PREFIX}}", &asset_prefix),
+            ("{{CANONICAL}}", &canonical_url),
+            ("{{SPA_ROUTE}}", &spa_route),
+            ("{{SOURCE_LINK}}", &source_link),
+            (
+                "{{SOURCE_BINARY}}",
+                if is_binary { "true" } else { "false" },
+            ),
+            ("{{TITLE}}", title),
+            ("{{BID}}", &bid.to_string()),
+            ("{{SCRIPTS}}", &scripts),
+            ("{{BODY}}", ""),
+        ];
+        for (key, value) in defaults {
+            if !caller_keys.contains(key) {
+                html = html.replace(key, value);
+            }
+        }
 
         tokio::fs::write(&output_path, html).await?;
 
@@ -2357,14 +4185,15 @@ impl DocumentCompiler {
         html_output_dir: &Path,
         global_bb: B,
     ) -> Result<(), BuildonomyError> {
-        // Get file extension
+        // Guard: verify a codec claimed this path during parsing.  Plain .md files
+        // are NOT registered in CODECS by extension — they are claimed per-network
+        // via CLAIM_MAP.  Use CLAIM_MAP.get() which falls back to CODECS internally.
         let path_str = os_path_to_string(source_path);
-        let source_path_ap = AnchorPath::new(&path_str);
-        let _codec_factory = CODECS.get(&source_path_ap).ok_or_else(|| {
-            let msg = format!("No codec available for {} files", source_path_ap);
+        if CLAIM_MAP.get(source_path).is_none() {
+            let msg = format!("No codec available for {} files", path_str);
             tracing::warn!("{}", msg);
-            BuildonomyError::Codec(msg)
-        })?;
+            return Err(BuildonomyError::Codec(msg));
+        }
 
         // Query for the node using repo-relative path. source_path is an absolute filesystem
         // path (stored in self.deferred_html), which was normalised by normalize_queue_path
@@ -2374,51 +4203,254 @@ impl DocumentCompiler {
             .map(os_path_to_string)
             .unwrap_or_else(|_| path_str.clone());
 
+        let root_net_bid = self.builder.repo();
+
+        // ── Resolve home network + net-relative path ─────────────────────────
+        // Documents stored inside a subnet (e.g. "external/NPR_7150.2D/appendix_c.md")
+        // are registered in the DB/PathMap under net = subnet_bref, path = "appendix_c.md".
+        // Using root_net_bref + repo_relative_str for DocumentNodes or NodeKey::Path
+        // produces a query that matches nothing for subnet documents.
+        //
+        // Strategy:
+        //   1. Use session_bb's PathMapMap: call indexed_get("external/NPR_7150.2D/appendix_c.md")
+        //      on the root PathMap. indexed_get is recursive — it strips each subnet prefix in
+        //      turn and descends into the subnet's PathMap, returning (home_net_bid, doc_bid).
+        //   2. Use net_path(home_net_bref, doc_bid) to recover the net-relative path string
+        //      (e.g. "appendix_c.md") from within the home network's own PathMap.
+        //   3. Use home_net_bid + net_relative_path for DocumentNodes and NodeKey::Path.
+        //
+        // session_bb's PathMapMap is fully populated after the parse phase completes, so no
+        // extra DB round-trips are needed. For root-network documents (no '/' in
+        // repo_relative_str) or directory nodes the fast path short-circuits immediately.
+        let (doc_net_bid, doc_net_relative_path) =
+            if !source_path.is_dir() && repo_relative_str.contains('/') {
+                let pmm = self.builder.session_bb().paths();
+                // Step 1: recursive indexed_get from the root PathMap.
+                // Returns (home_net_bid, doc_bid, sort_order) crossing any subnet boundaries.
+                let resolved = pmm
+                    .get_map(&root_net_bid.bref())
+                    .and_then(|pm| pm.indexed_get(&repo_relative_str, &pmm));
+                if let Some((home_net_bid, doc_bid, _order)) = resolved {
+                    // Step 2: net-relative path = path of doc_bid within its home network's PathMap.
+                    // net_path(home_net_bref, doc_bid) looks up only that one PathMap (no recursion
+                    // needed here — the doc lives directly in its home net, not in a deeper subnet).
+                    let net_relative_path = pmm
+                        .net_path(&home_net_bid.bref(), &doc_bid)
+                        .map(|(_net, path)| path)
+                        .unwrap_or_else(|| repo_relative_str.clone());
+                    tracing::debug!(
+                        "[generate_html_for_path] subnet doc resolved: \
+                         repo_relative='{}' → net={} net_path='{}'",
+                        repo_relative_str,
+                        home_net_bid,
+                        net_relative_path
+                    );
+                    (home_net_bid, net_relative_path)
+                } else {
+                    // indexed_get returned nothing — path not in session_bb PathMap yet.
+                    // Fall back to root net (will likely warn below on the get() call).
+                    tracing::debug!(
+                        "[generate_html_for_path] indexed_get returned no result for \
+                         repo_relative='{}' in session_bb; falling back to root net",
+                        repo_relative_str
+                    );
+                    (root_net_bid, repo_relative_str.clone())
+                }
+            } else {
+                (root_net_bid, repo_relative_str.clone())
+            };
+
         // Network nodes are registered under NodeKey::Id / NodeKey::Bid, never under
         // NodeKey::Path (see speculative_path_key).  When a network directory is queued
         // into deferred_html, strip_prefix(repo_root) yields "" for the root network
-        // (source_path == repo_root) or a subnet-relative dir name for nested networks.
+        // (source_path == repo_root) or a repo-relative dir name for nested networks.
         // Neither form has a matching NodeKey::Path entry.
         //
         // Build the correct key upfront:
-        //   - Root network dir (empty repo_relative_str): use NodeKey::Bid directly —
-        //     the repo BID is known from the builder.
-        //   - Everything else (documents, subnet dirs): use NodeKey::Path as before.
-        //     Subnet-dir deferred HTML is currently dead code (only triggered by nested
-        //     networks or {requirements_table} in a subnet), left as a TODO.
-        let nodekey = if source_path.is_dir() && repo_relative_str.is_empty() {
-            NodeKey::Bid {
-                bid: self.builder.repo(),
-            }
+        //   - Network dir (any depth): use NodeKey::Bid.  The repo BID is known directly
+        //     for the root (empty repo_relative_str); all other network dirs are resolved
+        //     via indexed_get on the root PathMap, which crosses subnet boundaries
+        //     automatically.  NodeKey::Path would fail because network nodes are keyed by
+        //     NodeKey::Id in the PathMap, not by NodeKey::Path.
+        //   - Documents: NodeKey::Path with the resolved home net bref and net-relative path.
+        let nodekey = if source_path.is_dir() {
+            let bid = if repo_relative_str.is_empty() {
+                // Root network — BID is already known.
+                self.builder.repo()
+            } else {
+                // Any non-root network dir: resolve BID from session_bb PathMap.
+                // indexed_get on the root PathMap crosses subnet boundaries automatically,
+                // so deeply-nested network dirs (e.g. "horizon/docs/developers") work
+                // the same as top-level ones (e.g. "req/program_requirements").
+                // Primary: session_bb PathMap (O(log N), no I/O).
+                // Covers network nodes that emitted NodeUpsert events during this run.
+                let pmm = self.builder.session_bb().paths();
+                let from_session = pmm
+                    .get_map(&root_net_bid.bref())
+                    .and_then(|pm| pm.indexed_get(&repo_relative_str, &pmm))
+                    .map(|(_home_net, bid, _order)| bid);
+                drop(pmm);
+
+                // Fallback: global_bb NetPath query for network nodes that were pure
+                // GlobalCache hits during parsing (n_node_upsert=0 → no PathAdded event
+                // → not in session_bb PathMap).  resolve_net_path in DbConnection walks
+                // the paths table segment-by-segment, so nested dirs work correctly.
+                let resolved = if from_session.is_some() {
+                    tracing::debug!(
+                        "[generate_html_for_path] network dir '{}' resolved via session_bb: bid={:?}",
+                        repo_relative_str,
+                        from_session,
+                    );
+                    from_session
+                } else {
+                    tracing::debug!(
+                        "[generate_html_for_path] network dir '{}' not in session_bb PathMap, \
+                         falling back to global_bb NetPath query",
+                        repo_relative_str,
+                    );
+                    let spec = QuerySpec::seed(TapeFn::Keys(vec![NodeKey::Path {
+                        net: root_net_bid.bref(),
+                        path: repo_relative_str.clone(),
+                    }]));
+                    let mut package = QueryPackage::balanced(spec);
+                    global_bb.evaluate(&mut package).await?;
+                    let graph = package.into_graph();
+                    // Find the seed (non-Trace) network node.  balanced() marks
+                    // the seed state as complete and halo/ancestry neighbors as
+                    // Trace.  Filtering on is_complete()
+                    // ensures we pick the resolved target, not an ancestor.
+                    let fallback_bid = graph
+                        .states
+                        .values()
+                        .find(|n| n.kind.is_network() && n.kind.is_complete())
+                        .map(|n| n.bid);
+                    tracing::debug!(
+                        "[generate_html_for_path] global_bb NetPath fallback for '{}': \
+                         returned {} states, resolved bid={:?}",
+                        repo_relative_str,
+                        graph.states.len(),
+                        fallback_bid,
+                    );
+                    fallback_bid
+                };
+
+                match resolved {
+                    Some(bid) => bid,
+                    None => {
+                        tracing::warn!(
+                            "[generate_html_for_path] Could not resolve subnet BID for \
+                             network dir '{}' in session_bb or global_bb; skipping",
+                            repo_relative_str
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            NodeKey::Bid { bid }
         } else {
             NodeKey::Path {
-                net: self.builder.repo().bref(),
-                path: repo_relative_str.clone(),
+                net: doc_net_bid.bref(),
+                path: doc_net_relative_path.clone(),
             }
         };
 
-        // ── Step 0: resolve the document node ────────────────────────────────
-        // Seed-only query — we only need the node itself. The directive pipeline
-        // fetches additional data lazily, one eval_query call per refiner.
-        let node_graph = global_bb
-            .eval_query(
-                &Query {
-                    seed: Expression::from(&nodekey),
-                    traverse: None,
-                },
-                true,
-            )
-            .await?;
+        // ── Step 0: load all nodes belonging to this document ────────────────
+        // For directory (network) nodes, we already know the BID from the nodekey and
+        // there are no section children to load — the network's sections live in its
+        // index.md, which is a separate document node.  Use TapeFn::Bids directly to
+        // avoid the DocumentNodes path which fails for the root network: the root's
+        // PathMap entry (path = "") is not reliably reconstructed in the in-memory
+        // final_bb that is passed here.
+        //
+        // For document files, `TapeFn::DocumentNodes` fetches the document root node
+        // and every section/heading it contains in a single round-trip.  Use
+        // doc_net_bid + doc_net_relative_path (resolved above) so that subnet documents
+        // query against their own subnet's net bref and net-relative path rather than
+        // the repo root bref and repo-relative path.
+        let doc_nodes_graph = if source_path.is_dir() {
+            // Network dir: look up the node directly by BID.
+            // nodekey is always NodeKey::Bid for directories (root or subnet) — the
+            // match below is exhaustive but the Path arm should never fire.
+            let bid = match &nodekey {
+                NodeKey::Bid { bid } => *bid,
+                _ => root_net_bid, // should not occur: directories always produce NodeKey::Bid
+            };
+            {
+                let mut package = QueryPackage::balanced(QuerySpec::seed(TapeFn::Bids(vec![bid])));
+                global_bb.evaluate(&mut package).await?;
+                package.into_graph()
+            }
+        } else {
+            {
+                let spec = QuerySpec::seed(TapeFn::DocumentNodes(
+                    doc_net_bid.bref(),
+                    doc_net_relative_path.clone(),
+                ));
+                let mut package = QueryPackage::balanced(spec);
+                global_bb.evaluate(&mut package).await?;
+                package.into_graph()
+            }
+        };
 
-        let mut node_bb = BeliefBase::from(node_graph);
+        let mut node_bb = BeliefBase::from(doc_nodes_graph);
 
         let Some(node) = node_bb.get(&nodekey) else {
             tracing::warn!("[generate_html_for_path] No match found for path: '{nodekey}'",);
             return Ok(());
         };
         let node_bid = node.bid;
-        let root_net_bid = self.builder.repo();
-        let Some(ctx) = node_bb.get_context(&root_net_bid, &node_bid) else {
+        let title = node.display_title().to_string();
+
+        // ── Step 0b: pre-fetch mapping-owned edges for all nodes in this document ──
+        // `{maps_to}` directives emit edges with WEIGHT_OWNED_BY = section bref.
+        // We need those edges in node_bb so that per-section OwnedBy queries can be
+        // evaluated synchronously (against node_bb) when splicing mapping-table sentinels.
+        //
+        // One OwnedBy query per section bref.  Most documents have 0–1 {maps_to}
+        // sections, so the loop is cheap; empty results are skipped immediately.
+        {
+            let all_doc_bids: Vec<Bid> = node_bb.states().keys().copied().collect();
+
+            for bid in all_doc_bids {
+                let spec = QuerySpec::seed_then(
+                    TapeFn::Bids(vec![bid]),
+                    vec![ProjectionStep::traverse(TraversalSpec {
+                        input_roles: Role::Owner.into(),
+                        kind_filter: enumset::EnumSet::all(),
+                        output_roles: Role::Source | Role::Sink,
+                        depth: TraversalDepth::count(1),
+                        inverted: false,
+                    })],
+                );
+                let owned_graph = {
+                    let mut package = QueryPackage::balanced(spec);
+                    global_bb.evaluate(&mut package).await?;
+                    package.into_graph()
+                };
+
+                if !owned_graph.is_empty() {
+                    node_bb.merge(&owned_graph);
+                }
+            }
+        }
+
+        // Build ctx after all node_bb mutations are complete (ctx borrows node_bb).
+        //
+        // For network nodes, pass node_bid as the root net rather than root_net_bid.
+        // get_context(root_net, bid) resolves ctx.root_path via root_net's PathMap and
+        // sets ctx.home_net from that resolution. When root_net is the repo root, a
+        // subnet node's root_path comes out repo-relative (e.g. "req/derived_requirements")
+        // and home_net resolves to the repo root — causing net_path_in to query the entire
+        // repo and build_listing_html to compute relative links from the wrong base.
+        // Passing the node's own BID as root_net for network nodes gives ctx.root_path=""
+        // (the network's own root) and home_net=node_bid, so net_path_in queries only
+        // that network's documents and link computation is correct.
+        let ctx_root_net = if source_path.is_dir() {
+            node_bid
+        } else {
+            root_net_bid
+        };
+        let Some(ctx) = node_bb.get_context(&ctx_root_net, &node_bid) else {
             tracing::warn!(
                 "[generate_html_for_path] No context found for node {} (path: '{}')",
                 node_bid,
@@ -2426,7 +4458,6 @@ impl DocumentCompiler {
             );
             return Ok(());
         };
-        let title = node.display_title().to_string();
 
         // Convert absolute path to repo-relative path.
         // source_path is normalised (via normalize_queue_path at insertion), so
@@ -2470,7 +4501,7 @@ impl DocumentCompiler {
         // `graphs` is the shared accumulator for all directive pipelines on this document.
         //
         //   graphs[0]   — node-resolution graph (always present, produced above)
-        //   graphs[1..] — one entry per eval_query call across all directive pipelines,
+        //   graphs[1..] — one entry per evaluate call across all directive pipelines,
         //                 in the order the directives appear in DIRECTIVES and their
         //                 queries slices.
         //
@@ -2496,14 +4527,33 @@ impl DocumentCompiler {
         // (sentinel, built_html) pairs collected for splicing / fallback write.
         let mut splice_pairs: Vec<(String, String)> = Vec::new();
 
+        tracing::debug!(
+            "[generate_html_for_path] directive pipeline: title='{}' node_bid={} \
+             ctx_root_net={} home_net={} root_path='{}' html_exists={} \
+             existing_html_path='{}'",
+            title,
+            node_bid,
+            ctx_root_net,
+            ctx.home_net,
+            ctx.root_path,
+            html_exists,
+            existing_html_path.display(),
+        );
+
         for d in crate::codec::myst::DIRECTIVES {
-            if d.sentinel.is_empty() || d.builder.is_none() {
+            if d.builder.is_none() {
+                continue;
+            }
+            let d_sentinel = crate::codec::myst::sentinel(d.name);
+            // `maps_to` uses bref-parameterized sentinels (one per section) rather than
+            // a single static sentinel.  Skip it here; handled separately below.
+            if d.name == "maps_to" {
                 continue;
             }
             // Skip this directive if its sentinel is not present in the output.
             let sentinel_present = existing_html
                 .as_deref()
-                .map(|h| h.contains(d.sentinel))
+                .map(|h| h.contains(&d_sentinel))
                 .unwrap_or(true); // file absent → assume all sentinels relevant
             if !sentinel_present {
                 continue;
@@ -2513,30 +4563,329 @@ impl DocumentCompiler {
             // graphs[i] is the result of d.queries[i]; ctx carries the resolved node.
             let mut graphs: Vec<BeliefGraph> = Vec::new();
             for refiner in d.queries {
-                let expr = refiner(&ctx, &graphs);
-                let next = global_bb
-                    .eval_query(
-                        &Query {
-                            seed: expr,
-                            traverse: None,
-                        },
-                        true,
-                    )
-                    .await?;
+                let spec = refiner(&ctx, &graphs);
+                let mut package = QueryPackage::new(spec);
+                global_bb.evaluate(&mut package).await?;
+                let next = package.into_graph();
                 graphs.push(next);
             }
 
             // Call the sync builder with ctx and the accumulated query results.
             if let Some(builder) = d.builder {
                 let html = builder(&ctx, &graphs)?;
-                splice_pairs.push((d.sentinel.to_string(), html));
+                splice_pairs.push((d_sentinel, html));
+            }
+        }
+
+        // ── maps_to: per-section sentinel rendering ───────────────────────────
+        // Each `{maps_to}` directive produces an anchor-parameterized sentinel of the form
+        // `<!--@@noet-mapping-table:ANCHOR@@-->` where ANCHOR is the owning section's
+        // stable heading id (e.g. "trace-mapping").  Anchors are used instead of brefs
+        // because section BIDs are ephemeral (time-based) until written to disk — the bref
+        // in a previously-written sentinel would not match the current parse's fresh bref.
+        //
+        // We scan the on-disk HTML for these sentinels, resolve each anchor to a BID via
+        // node_bb's PathMap, evaluate OwnedBy(section_bref) synchronously against node_bb
+        // (pre-populated in Step 0b), and render a mapping table per section.
+        {
+            // Collect (anchor, index) pairs from the on-disk HTML.
+            // When the file is absent (first write), there are no sentinels to replace;
+            // the fallback body is written and sentinels are replaced on a subsequent parse.
+            let section_anchor_pairs: Vec<(String, usize)> = existing_html
+                .as_deref()
+                .map(crate::codec::myst::mapping_table_sentinel_anchors)
+                .unwrap_or_default();
+
+            for (anchor, directive_idx) in section_anchor_pairs {
+                // Resolve anchor → BID via the PathMap.
+                // Section nodes are registered under "<doc_path>#<anchor>" in the
+                // PathMap.  We use `indexed_get` which searches all sub-maps.
+                let section_bid_opt = {
+                    let pmm = node_bb.paths();
+                    // Build the anchored path: "<net-relative-doc>#<anchor>"
+                    // doc_net_relative_path is the home-network-relative path of this
+                    // document (e.g. "appendix_c.md" for a subnet doc, or
+                    // "external/NPR_7150.2D/appendix_c.md" for a root-net doc).
+                    // Sections are registered under this form in the PathMap.
+                    let anchored_path = format!("{}#{}", doc_net_relative_path, anchor);
+                    let from_pathmap = pmm
+                        .get_map(&doc_net_bid.bref())
+                        .and_then(|pm| pm.indexed_get(&anchored_path, &pmm))
+                        .map(|(_home_net, bid, _order)| bid);
+                    // Fallback: when the section's ID is a bref string (assigned by
+                    // noet to resolve anchor collisions), build_path_key returns
+                    // NodeKey::Bref rather than NodeKey::Path, so the section never
+                    // appears in the PathMap.  Try interpreting the anchor as a bref
+                    // and look it up directly in node_bb's bref index.
+                    from_pathmap.or_else(|| {
+                        crate::properties::Bref::try_from(anchor.as_str())
+                            .ok()
+                            .and_then(|bref| node_bb.brefs().get(&bref).copied())
+                    })
+                };
+
+                let Some(section_bid) = section_bid_opt else {
+                    tracing::debug!(
+                        "[generate_html_for_path] maps_to sentinel anchor '{}' \
+                         not found in node_bb PathMap; skipping",
+                        anchor
+                    );
+                    continue;
+                };
+
+                // Load per-directive source/sink filter from section node metadata.
+                // `_maps_to_specs[directive_idx]` is a JSON string of the form
+                // {"sources":[...], "sinks":[...]} injected by MdCodec::inject_context.
+                let (filter_source_bids, filter_sink_bids): (Option<Vec<Bid>>, Option<Vec<Bid>>) = {
+                    let section_node = node_bb.states().get(&section_bid).cloned();
+                    if let Some(sn) = section_node {
+                        if let Some(specs_array) =
+                            sn.metadata.get("_maps_to_specs").and_then(|v| v.as_array())
+                        {
+                            if let Some(spec_str) =
+                                specs_array.get(directive_idx).and_then(|v| v.as_str())
+                            {
+                                if let Ok(spec_obj) =
+                                    serde_json::from_str::<serde_json::Value>(spec_str)
+                                {
+                                    let resolve_keys = |field: &str| -> Option<Vec<Bid>> {
+                                        spec_obj.get(field).and_then(|v| v.as_array()).map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|s| s.as_str())
+                                                .filter_map(|key_str| {
+                                                    key_str.parse::<NodeKey>().ok().and_then(|k| {
+                                                        node_bb.get(&k).map(|n| n.bid)
+                                                    })
+                                                })
+                                                .collect()
+                                        })
+                                    };
+                                    let src_bids = resolve_keys("sources");
+                                    let snk_bids = resolve_keys("sinks");
+                                    (src_bids, snk_bids)
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
+
+                // Evaluate owner-traversal against node_bb before calling
+                // get_context — the two borrows cannot overlap.
+                let owned_spec = QuerySpec::seed_then(
+                    TapeFn::Bids(vec![section_bid]),
+                    vec![ProjectionStep::traverse(TraversalSpec {
+                        input_roles: Role::Owner.into(),
+                        kind_filter: enumset::EnumSet::all(),
+                        output_roles: Role::Source | Role::Sink,
+                        depth: TraversalDepth::count(1),
+                        inverted: false,
+                    })],
+                );
+                let owned_graph = {
+                    let mut package = QueryPackage::balanced(owned_spec);
+                    node_bb.evaluate_query(&mut package)?;
+                    package.into_graph()
+                };
+                let graphs = vec![owned_graph];
+
+                // Build a per-section ctx from node_bb (mutable borrow for assert).
+                let Some(section_ctx) = node_bb.get_context(&root_net_bid, &section_bid) else {
+                    tracing::debug!(
+                        "[generate_html_for_path] no context for section {} \
+                         (anchor '{}'); skipping",
+                        section_bid,
+                        anchor
+                    );
+                    continue;
+                };
+
+                let html = crate::codec::myst::build_mapping_table_html(
+                    &section_ctx,
+                    &graphs,
+                    filter_source_bids.as_deref(),
+                    filter_sink_bids.as_deref(),
+                )?;
+                let sentinel = crate::codec::myst::mapping_table_sentinel(&anchor, directive_idx);
+                splice_pairs.push((sentinel, html));
+            }
+        }
+
+        // ── {query}: per-instance query evaluation ────────────────────────────
+        // Each `{query}` directive produces a sentinel `<!--@@noet-query:N@@-->`
+        // where N is a 0-based index. The document node's metadata carries the
+        // serialized QuerySpec and directive options in parallel arrays.
+        {
+            let query_specs: Option<&Vec<toml::Value>> =
+                node.metadata.get("_query_specs").and_then(|v| v.as_array());
+            let query_options: Option<&Vec<toml::Value>> = node
+                .metadata
+                .get("_query_options")
+                .and_then(|v| v.as_array());
+            let query_texts: Option<&Vec<toml::Value>> =
+                node.metadata.get("_query_texts").and_then(|v| v.as_array());
+
+            tracing::debug!(
+                "[generate_html_for_path] {{query}}: node_bid={} has_query_specs={} \
+                 has_query_options={} metadata_keys={:?}",
+                node_bid,
+                query_specs.is_some(),
+                query_options.is_some(),
+                node.metadata.keys().collect::<Vec<_>>(),
+            );
+
+            if let Some(specs) = query_specs {
+                let indices: Vec<usize> = existing_html
+                    .as_deref()
+                    .map(crate::codec::myst::query_sentinel_indices)
+                    .unwrap_or_default();
+
+                tracing::debug!(
+                    "[generate_html_for_path] {{query}}: found {} specs, {} sentinel indices",
+                    specs.len(),
+                    indices.len(),
+                );
+
+                for idx in indices {
+                    let sentinel = crate::codec::myst::query_sentinel(idx);
+
+                    // Retrieve spec JSON
+                    let spec_json = match specs.get(idx).and_then(|v| v.as_str()) {
+                        Some(s) => s,
+                        None => {
+                            let err_html = format!(
+                                "<pre class=\"noet-query-error\"><strong>Query error:</strong> \
+                                 no spec found for query block {idx}</pre>"
+                            );
+                            splice_pairs.push((sentinel, err_html));
+                            continue;
+                        }
+                    };
+
+                    // Check for parse error stored as {"error":"msg"}
+                    if let Ok(err_obj) = serde_json::from_str::<serde_json::Value>(spec_json) {
+                        if let Some(err_msg) = err_obj.get("error").and_then(|v| v.as_str()) {
+                            let err_html = format!(
+                                "<pre class=\"noet-query-error\"><strong>Query error:</strong> \
+                                 {}</pre>",
+                                err_msg
+                                    .replace('&', "&amp;")
+                                    .replace('<', "&lt;")
+                                    .replace('>', "&gt;")
+                            );
+                            splice_pairs.push((sentinel, err_html));
+                            continue;
+                        }
+                    }
+
+                    // Deserialize the QuerySpec
+                    let mut spec: QuerySpec = match serde_json::from_str(spec_json) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let err_html = format!(
+                                "<pre class=\"noet-query-error\"><strong>Query error:</strong> \
+                                 failed to deserialize spec: {e}</pre>"
+                            );
+                            splice_pairs.push((sentinel, err_html));
+                            continue;
+                        }
+                    };
+
+                    // Resolve implicit seed → current document BID
+                    if spec
+                        .steps
+                        .first()
+                        .is_none_or(|s| matches!(s.input, TapeFn::Then(None)))
+                    {
+                        if spec.steps.is_empty() {
+                            spec.steps.push(ProjectionStep::with_input(
+                                TapeFn::Bids(vec![node_bid]),
+                                crate::query::spec::StepOperation::Identity,
+                            ));
+                        } else {
+                            spec.steps[0].input = TapeFn::Bids(vec![node_bid]);
+                        }
+                    }
+
+                    // Evaluate the query to get result count for the meta div.
+                    tracing::debug!(
+                        "[generate_html_for_path] query block {idx}: evaluating spec \
+                         subject={:?} projection_steps={}",
+                        package_seed_debug(&spec),
+                        spec.steps.len(),
+                    );
+                    let mut package = QueryPackage::balanced(spec);
+                    match global_bb.evaluate(&mut package).await {
+                        Ok(()) => {
+                            tracing::debug!(
+                                "[generate_html_for_path] query block {idx}: evaluation \
+                                 returned {} states",
+                                package.graph().map_or(0, |g| g.states.len()),
+                            );
+                        }
+                        Err(e) => {
+                            let err_html = format!(
+                                "<pre class=\"noet-query-error\"><strong>Query error:</strong> \
+                                 evaluation failed: {e}</pre>"
+                            );
+                            splice_pairs.push((sentinel, err_html));
+                            continue;
+                        }
+                    }
+
+                    let query_text = query_texts
+                        .and_then(|texts| texts.get(idx))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let result_count = package.graph().map_or(0, |g| g.states.len());
+
+                    // The meta div carries the query text and result count for content.js
+                    // (used by attachQuerySearchButtons to wire up the Search panel link).
+                    let meta_div = format!(
+                        "<div class=\"noet-query-meta\" data-query=\"{}\" \
+                         data-count=\"{}\" hidden></div>",
+                        query_text
+                            .replace('&', "&amp;")
+                            .replace('"', "&quot;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;"),
+                        result_count,
+                    );
+
+                    // Emit a static placeholder result div.
+                    // The full result rendering (via views) is deferred to the Search panel
+                    // in the browser; content.js's attachQuerySearchButtons wires up the link.
+                    let result_div =
+                        "<div class=\"noet-query-result\"><p><em>Open Search to explore results.</em></p></div>"
+                            .to_string();
+                    let final_html = format!("{}{}", meta_div, result_div);
+
+                    splice_pairs.push((sentinel, final_html));
+                }
             }
         }
 
         // ── Sentinel splicing or fallback write ───────────────────────────────
         if splice_pairs.is_empty() {
+            tracing::debug!(
+                "[generate_html_for_path] splice_pairs is empty for '{}' — no sentinels replaced",
+                title,
+            );
             return Ok(());
         }
+        tracing::debug!(
+            "[generate_html_for_path] splicing {} sentinel pairs for '{}'",
+            splice_pairs.len(),
+            title,
+        );
 
         let refs: Vec<(&str, &str)> = splice_pairs
             .iter()
@@ -2555,8 +4904,35 @@ impl DocumentCompiler {
                 .concat();
             if !fallback_body.is_empty() {
                 let rel_path = base_dir.join(deferred_filename);
-                self.write_fragment(html_output_dir, &rel_path, fallback_body, &title, &node_bid)
-                    .await?;
+                // Deferred HTML is generated for network index nodes (directories) and
+                // document files. For directories, resolve to the network file inside
+                // (e.g. index.md) so the "View Source" link works.
+                let deferred_source_file;
+                let deferred_source_path = if source_path.is_dir() {
+                    deferred_source_file = detect_network_file(source_path);
+                    deferred_source_file
+                        .as_deref()
+                        .and_then(|f| f.strip_prefix(self.builder.repo_root()).ok())
+                } else {
+                    Some(
+                        source_path
+                            .strip_prefix(self.builder.repo_root())
+                            .unwrap_or(source_path),
+                    )
+                };
+                self.write_fragment(
+                    html_output_dir,
+                    &rel_path,
+                    vec![("{{BODY}}".to_string(), fallback_body)],
+                    FragmentMeta {
+                        title: &title,
+                        bid: &node_bid,
+                        source_path: deferred_source_path,
+                        is_binary: false,
+                    },
+                    crate::codec::assets::Layout::Simple,
+                )
+                .await?;
             }
         }
 
@@ -2581,12 +4957,12 @@ impl DocumentCompiler {
     pub async fn create_asset_hardlinks(
         &self,
         manifest_data: &BTreeMap<String, Bid>,
-    ) -> Result<(), BuildonomyError> {
+    ) -> Result<Vec<crate::codec::ParseDiagnostic>, BuildonomyError> {
         if manifest_data.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let Some(html_output_dir) = self.html_output_dir() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
         tracing::debug!(
@@ -2595,17 +4971,30 @@ impl DocumentCompiler {
         );
 
         let mut copied_canonical: HashSet<PathBuf> = HashSet::new();
+        let mut diagnostics: Vec<crate::codec::ParseDiagnostic> = Vec::new();
 
         for (asset_path, asset_bid) in manifest_data.iter() {
-            // Get asset node to extract content hash from payload
-            let asset_node = self
-                .builder
-                .session_bb()
-                .states()
-                .get(asset_bid)
-                .ok_or_else(|| {
-                    BuildonomyError::Codec(format!("Asset node not found for BID: {}", asset_bid))
-                })?;
+            // Get asset node to extract content hash from payload.
+            //
+            // This should always be present once sync_asset_snapshot has merged
+            // every content_namespaces() child into session_bb (see Issue 98).
+            // Fail soft rather than aborting the whole build over one asset: a
+            // single node desynchronised from session_bb should not prevent
+            // finalize_html from producing output for everything else.
+            let Some(asset_node) = self.builder.session_bb().states().get(asset_bid) else {
+                tracing::warn!(
+                    "[Compiler] Asset node not found in session_bb for BID: {} (path: {}) \
+                     — skipping hardlink. This indicates session_bb desynchronised from \
+                     global_bb; see noet-core Issue 98.",
+                    asset_bid,
+                    asset_path
+                );
+                diagnostics.push(crate::codec::ParseDiagnostic::warning(format!(
+                    "Asset node not found for BID {} (path: {}) — hardlink skipped",
+                    asset_bid, asset_path
+                )));
+                continue;
+            };
 
             // Skip assets without content_hash (unresolved assets)
             let Some(content_hash) = asset_node
@@ -2673,6 +5062,12 @@ impl DocumentCompiler {
                     content_hash,
                     canonical.display()
                 );
+                diagnostics.push(crate::codec::ParseDiagnostic::info(format!(
+                    "Duplicate content: {} is identical to {} (hash: {}); reusing canonical asset.",
+                    asset_path,
+                    canonical.display(),
+                    content_hash
+                )));
             }
 
             // Create hardlink at semantic path in pages/ subdirectory (where HTML documents are)
@@ -2706,12 +5101,13 @@ impl DocumentCompiler {
         }
 
         tracing::debug!(
-            "[Compiler] Asset hardlinks created: {} unique files, {} total paths",
+            "[Compiler] Asset hardlinks created: {} unique files, {} total paths ({} duplicate-content notices)",
             copied_canonical.len(),
-            manifest_data.len()
+            manifest_data.len(),
+            diagnostics.len()
         );
 
-        Ok(())
+        Ok(diagnostics)
     }
 }
 
@@ -2723,11 +5119,30 @@ pub struct CompilerStats {
     pub total_parses: usize,
 }
 
+/// Debug-friendly summary of a QuerySpec's seed TapeFn for tracing.
+fn package_seed_debug(spec: &QuerySpec) -> String {
+    match spec.steps.first().map(|s| &s.input) {
+        Some(TapeFn::Bids(bids)) => format!("Bids({})", bids.len()),
+        Some(TapeFn::Keys(keys)) => format!("Keys({:?})", keys),
+        Some(TapeFn::Corpus) => "Corpus".to_string(),
+        Some(TapeFn::DocumentNodes(net, path)) => format!("DocumentNodes({net}, {path})"),
+        Some(TapeFn::Then(None)) => "Implicit".to_string(),
+        Some(other) => format!("{:?}", other),
+        None => "Empty".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "service")]
+    use crate::beliefbase::BeliefAccumulator;
+    #[cfg(feature = "service")]
+    use crate::db::{db_init_memory, DbConnection};
     #[cfg(feature = "git-tracking")]
-    use crate::{beliefbase::BeliefAccumulator, query::BeliefSource};
+    use crate::properties::NodeId;
+    #[cfg(feature = "git-tracking")]
+    use crate::query::BeliefSource;
     use crate::{
         beliefbase::{BeliefBase, BeliefGraph},
         codec::diagnostic::UnresolvedReference,
@@ -2739,7 +5154,11 @@ mod tests {
             manifest::{SearchManifest, ShardConfig},
         },
     };
+    #[cfg(feature = "git-tracking")]
+    use git2::Repository;
     use petgraph::Direction;
+    #[cfg(feature = "service")]
+    use serial_test::serial;
     use tokio::sync::mpsc::unbounded_channel;
 
     /// Helper: Create a test network directory with index.md file
@@ -3164,7 +5583,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     // Integration: monolithic export
     // ------------------------------------------------------------------
 
-    /// Small repos (below threshold) must write `beliefbase.json` and must NOT
+    /// Small repos (below threshold) must write `beliefbase.msgpack` and must NOT
     /// write `beliefbase/manifest.json`.
     #[tokio::test]
     async fn test_finalize_html_monolithic_below_threshold() {
@@ -3177,10 +5596,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             .await
             .unwrap();
 
-        // Monolithic: beliefbase.json must exist.
+        // Monolithic: beliefbase.msgpack must exist.
         assert!(
-            html_dir.path().join("beliefbase.json").exists(),
-            "monolithic export should write beliefbase.json"
+            html_dir.path().join("beliefbase.msgpack").exists(),
+            "monolithic export should write beliefbase.msgpack"
         );
 
         // Monolithic: no beliefbase/manifest.json.
@@ -3255,6 +5674,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             memory_budget_mb: 200.0,
         };
         let empty_search_manifest = SearchManifest::new();
+        let codec_manifest = crate::shard::manifest::CodecManifest::new(
+            crate::codec::collect_known_extensions(),
+            crate::codec::WALK_CODECS.network_filenames(),
+        );
 
         let result = export_beliefbase(
             graph,
@@ -3262,6 +5685,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             html_dir.path(),
             &config,
             &empty_search_manifest,
+            &codec_manifest,
         )
         .await
         .unwrap();
@@ -3279,8 +5703,8 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             "beliefbase/manifest.json should be written"
         );
         assert!(
-            bb_dir.join("global.json").exists(),
-            "beliefbase/global.json should be written"
+            bb_dir.join("global.msgpack").exists(),
+            "beliefbase/global.msgpack should be written"
         );
         assert!(
             bb_dir.join("networks").exists(),
@@ -3292,6 +5716,19 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let manifest: crate::shard::ShardManifest = serde_json::from_str(&manifest_json).unwrap();
         assert!(manifest.sharded, "manifest.sharded should be true");
         assert_eq!(manifest.memory_budget_mb, 200.0);
+
+        // Codec manifest must be written alongside the beliefbase directory.
+        let codecs_path = html_dir.path().join("codecs.json");
+        assert!(codecs_path.exists(), "codecs.json should be written");
+        let codec_json = std::fs::read_to_string(&codecs_path).unwrap();
+        let codec_manifest: crate::shard::manifest::CodecManifest =
+            serde_json::from_str(&codec_json).unwrap();
+        assert!(
+            codec_manifest
+                .document_extensions
+                .contains(&"md".to_string()),
+            "codecs.json should include 'md'"
+        );
 
         // Every network listed in the manifest must have its shard file on disk.
         for net in &manifest.networks {
@@ -3305,11 +5742,11 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     }
 
     // ------------------------------------------------------------------
-    // Integration: backward compat — old beliefbase.json still loads
+    // Integration: monolithic beliefbase.msgpack deserializes as BeliefGraph
     // ------------------------------------------------------------------
 
-    /// Verify that the monolithic `beliefbase.json` is valid JSON that can be
-    /// deserialized as a `BeliefGraph` (backward compat with old viewer code).
+    /// Verify that the monolithic `beliefbase.msgpack` is valid msgpack that can be
+    /// deserialized as a `BeliefGraph`.
     #[tokio::test]
     async fn test_monolithic_beliefbase_json_is_valid_belief_graph() {
         let src_dir = tempfile::tempdir().unwrap();
@@ -3321,12 +5758,12 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             .await
             .unwrap();
 
-        let json_path = html_dir.path().join("beliefbase.json");
-        assert!(json_path.exists(), "beliefbase.json must exist");
+        let msgpack_path = html_dir.path().join("beliefbase.msgpack");
+        assert!(msgpack_path.exists(), "beliefbase.msgpack must exist");
 
-        let json = std::fs::read_to_string(&json_path).unwrap();
-        let graph: BeliefGraph =
-            serde_json::from_str(&json).expect("beliefbase.json must deserialize as BeliefGraph");
+        let bytes = std::fs::read(&msgpack_path).unwrap();
+        let graph: BeliefGraph = rmp_serde::from_slice(&bytes)
+            .expect("beliefbase.msgpack must deserialize as BeliefGraph");
 
         // Sanity: the graph should have at least one node (the API node).
         assert!(
@@ -3344,10 +5781,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let src_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
 
-        // Root network with explicit network-children marker
+        // Root network with MyST fenced network-children directive
         std::fs::write(
             src_dir.path().join("index.md"),
-            "---\nid: \"root-network\"\ntitle: \"Root Network\"\n---\n\n# Root\n\n<!-- network-children -->\n",
+            "---\nid: \"root-network\"\ntitle: \"Root Network\"\n---\n\n# Root\n\n````{network_children}\n````\n",
         )
         .unwrap();
 
@@ -3371,7 +5808,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let content = std::fs::read_to_string(&index_path).unwrap();
 
         assert!(
-            !content.contains(crate::codec::myst::sentinel("network_children")),
+            !content.contains(crate::codec::myst::sentinel("network_children").as_str()),
             "sentinel must be replaced by finalize_html; raw sentinel found in:\n{}",
             &content[..content.len().min(1000)]
         );
@@ -3405,7 +5842,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         std::fs::create_dir_all(&subnet_dir).unwrap();
         std::fs::write(
             subnet_dir.join("index.md"),
-            "---\nid: \"sub-net\"\ntitle: \"Subnet\"\n---\n\n# Subnet\n\n<!-- network-children -->\n",
+            "---\nid: \"sub-net\"\ntitle: \"Subnet\"\n---\n\n# Subnet\n\n````{network_children}\n````\n",
         )
         .unwrap();
         std::fs::write(
@@ -3424,7 +5861,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let content = std::fs::read_to_string(&subnet_index).unwrap();
 
         assert!(
-            !content.contains(crate::codec::myst::sentinel("network_children")),
+            !content.contains(crate::codec::myst::sentinel("network_children").as_str()),
             "sentinel must be replaced in subnet index.html; raw sentinel found in:\n{}",
             &content[..content.len().min(1000)]
         );
@@ -3437,6 +5874,407 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             content.contains("page.html"),
             "subnet listing must link to page.html; got:\n{}",
             &content[..content.len().min(1000)]
+        );
+    }
+
+    /// Verify sentinel replacement works for deeply nested subnets (3+ levels).
+    ///
+    /// Reproduces the structure observed in a large systems-engineering corpus:
+    ///   root > level1 > level2 > level3
+    /// Each level is a subnet with its own `index.md` and `{network_children}` marker.
+    /// The bug report says sentinels survive unreplaced at deeper nesting levels.
+    #[tokio::test]
+    async fn test_finalize_html_replaces_sentinel_in_deeply_nested_subnet() {
+        crate::tests::helpers::init_logging();
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Root network
+        std::fs::write(
+            src_dir.path().join("index.md"),
+            "---\nid: \"root-net\"\ntitle: \"Root\"\n---\n\n# Root\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        // Root-level child doc
+        std::fs::write(
+            src_dir.path().join("root_child.md"),
+            "---\nid: \"root-child\"\ntitle: \"Root Child\"\n---\n\n# Root Child\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 1 subnet
+        let l1_dir = src_dir.path().join("level1");
+        std::fs::create_dir_all(&l1_dir).unwrap();
+        std::fs::write(
+            l1_dir.join("index.md"),
+            "---\nid: \"level1-net\"\ntitle: \"Level 1\"\n---\n\n# Level 1\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l1_dir.join("l1_doc.md"),
+            "---\nid: \"l1-doc\"\ntitle: \"L1 Doc\"\n---\n\n# L1 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 2 subnet (nested under level1)
+        let l2_dir = l1_dir.join("level2");
+        std::fs::create_dir_all(&l2_dir).unwrap();
+        std::fs::write(
+            l2_dir.join("index.md"),
+            "---\nid: \"level2-net\"\ntitle: \"Level 2\"\n---\n\n# Level 2\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l2_dir.join("l2_doc.md"),
+            "---\nid: \"l2-doc\"\ntitle: \"L2 Doc\"\n---\n\n# L2 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 3 subnet (nested under level2)
+        let l3_dir = l2_dir.join("level3");
+        std::fs::create_dir_all(&l3_dir).unwrap();
+        std::fs::write(
+            l3_dir.join("index.md"),
+            "---\nid: \"level3-net\"\ntitle: \"Level 3\"\n---\n\n# Level 3\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l3_dir.join("l3_doc.md"),
+            "---\nid: \"l3-doc\"\ntitle: \"L3 Doc\"\n---\n\n# L3 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        compile_to_html(src_dir.path(), html_dir.path())
+            .await
+            .unwrap();
+
+        let sentinel = crate::codec::myst::sentinel("network_children");
+
+        // Check root
+        let root_index = html_dir.path().join("pages").join("index.html");
+        assert!(root_index.exists(), "pages/index.html must exist");
+        let root_html = std::fs::read_to_string(&root_index).unwrap();
+        assert!(
+            !root_html.contains(sentinel.as_str()),
+            "root sentinel must be replaced; found in:\n{}",
+            &root_html[..root_html.len().min(2000)]
+        );
+        assert!(
+            root_html.contains("<ul>"),
+            "root listing must contain <ul>; got:\n{}",
+            &root_html[..root_html.len().min(2000)]
+        );
+
+        // Check level 1
+        let l1_index = html_dir
+            .path()
+            .join("pages")
+            .join("level1")
+            .join("index.html");
+        assert!(l1_index.exists(), "pages/level1/index.html must exist");
+        let l1_html = std::fs::read_to_string(&l1_index).unwrap();
+        assert!(
+            !l1_html.contains(sentinel.as_str()),
+            "level1 sentinel must be replaced; found in:\n{}",
+            &l1_html[..l1_html.len().min(2000)]
+        );
+        assert!(
+            l1_html.contains("l1_doc.html"),
+            "level1 listing must link to l1_doc.html; got:\n{}",
+            &l1_html[..l1_html.len().min(2000)]
+        );
+
+        // Check level 2
+        let l2_index = html_dir
+            .path()
+            .join("pages")
+            .join("level1")
+            .join("level2")
+            .join("index.html");
+        assert!(
+            l2_index.exists(),
+            "pages/level1/level2/index.html must exist"
+        );
+        let l2_html = std::fs::read_to_string(&l2_index).unwrap();
+        assert!(
+            !l2_html.contains(sentinel.as_str()),
+            "level2 sentinel must be replaced; found in:\n{}",
+            &l2_html[..l2_html.len().min(2000)]
+        );
+        assert!(
+            l2_html.contains("l2_doc.html"),
+            "level2 listing must link to l2_doc.html; got:\n{}",
+            &l2_html[..l2_html.len().min(2000)]
+        );
+
+        // Check level 3
+        let l3_index = html_dir
+            .path()
+            .join("pages")
+            .join("level1")
+            .join("level2")
+            .join("level3")
+            .join("index.html");
+        assert!(
+            l3_index.exists(),
+            "pages/level1/level2/level3/index.html must exist"
+        );
+        let l3_html = std::fs::read_to_string(&l3_index).unwrap();
+        assert!(
+            !l3_html.contains(sentinel.as_str()),
+            "level3 sentinel must be replaced; found in:\n{}",
+            &l3_html[..l3_html.len().min(2000)]
+        );
+        assert!(
+            l3_html.contains("l3_doc.html"),
+            "level3 listing must link to l3_doc.html; got:\n{}",
+            &l3_html[..l3_html.len().min(2000)]
+        );
+    }
+
+    /// Verify sentinel replacement renders the CORRECT children for deeply nested
+    /// subnets that use whitelist filtering (matching a large systems-engineering corpus's structure).
+    ///
+    /// Structure:
+    ///   root > mid (whitelist=["inner/**"]) > inner (has children)
+    /// Each level has `{network_children}`. The bug is that `inner`'s listing
+    /// shows root-level children instead of its own.
+    #[tokio::test]
+    #[cfg(feature = "service")]
+    #[serial(db_tests)]
+    async fn test_network_children_shows_correct_children_with_whitelists_via_db() {
+        crate::tests::helpers::init_logging();
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Root network
+        std::fs::write(
+            src_dir.path().join("index.md"),
+            "---\nid: \"root-net\"\ntitle: \"Root\"\n---\n\n# Root\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        // Root-level child doc
+        std::fs::write(
+            src_dir.path().join("root_child.md"),
+            "---\nid: \"root-child\"\ntitle: \"Root Child\"\n---\n\n# Root Child\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Mid-level subnet with whitelist
+        let mid_dir = src_dir.path().join("mid");
+        std::fs::create_dir_all(&mid_dir).unwrap();
+        std::fs::write(
+            mid_dir.join("index.md"),
+            "---\nid: \"mid-net\"\ntitle: \"Mid Level\"\nwhitelist: [\"inner/**\"]\n---\n\n# Mid\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+
+        // Inner subnet (child of mid)
+        let inner_dir = mid_dir.join("inner");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        std::fs::write(
+            inner_dir.join("index.md"),
+            "---\nid: \"inner-net\"\ntitle: \"Inner\"\n---\n\n# Inner\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner_dir.join("inner_doc.md"),
+            "---\nid: \"inner-doc\"\ntitle: \"Inner Doc\"\n---\n\n# Inner Doc\n\nInner content.\n",
+        )
+        .unwrap();
+
+        // Use the DB-backed accumulator
+        let (tx, rx) = unbounded_channel::<BeliefEvent>();
+        let db_pool = db_init_memory().await.unwrap();
+        let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
+        let global_bb = accumulator.query_handle();
+
+        let mut compiler = DocumentCompiler::with_html_output(
+            src_dir.path(),
+            Some(tx),
+            Some(5),
+            false,
+            Some(html_dir.path().to_path_buf()),
+            None,
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        compiler.parse_all(global_bb, false).await.unwrap();
+        let final_db = accumulator.into_inner().await.unwrap();
+        compiler.finalize_html(final_db).await.unwrap();
+
+        // Check inner network: must list its OWN children, not root's
+        let inner_index = html_dir.path().join("pages/mid/inner/index.html");
+        assert!(
+            inner_index.exists(),
+            "pages/mid/inner/index.html must exist"
+        );
+        let inner_html = std::fs::read_to_string(&inner_index).unwrap();
+
+        // Inner must contain its own child
+        assert!(
+            inner_html.contains("inner_doc.html"),
+            "inner listing must link to inner_doc.html (its own child); got:\n{}",
+            &inner_html[..inner_html.len().min(2000)]
+        );
+        // Inner must NOT contain root's children
+        assert!(
+            !inner_html.contains("root_child.html"),
+            "inner listing must NOT contain root_child.html (root's child); got:\n{}",
+            &inner_html[..inner_html.len().min(2000)]
+        );
+
+        // Check root network: must list its own children
+        let root_html = std::fs::read_to_string(html_dir.path().join("pages/index.html")).unwrap();
+        assert!(
+            root_html.contains("root_child.html"),
+            "root listing must link to root_child.html; got:\n{}",
+            &root_html[..root_html.len().min(2000)]
+        );
+    }
+
+    /// Same as [`test_finalize_html_replaces_sentinel_in_deeply_nested_subnet`] but
+    /// uses a `DbConnection`-backed accumulator (the `service` feature path), which is
+    /// the code path used by `noet parse` in production.
+    ///
+    /// Reproduces the bug where sentinel replacement works with in-memory `BeliefBase`
+    /// but fails when `global_bb` is a `DbConnection`.
+    #[tokio::test]
+    #[cfg(feature = "service")]
+    #[serial(db_tests)]
+    async fn test_finalize_html_replaces_sentinel_deeply_nested_via_db() {
+        crate::tests::helpers::init_logging();
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let html_dir = tempfile::tempdir().unwrap();
+
+        // Root network
+        std::fs::write(
+            src_dir.path().join("index.md"),
+            "---\nid: \"root-net\"\ntitle: \"Root\"\n---\n\n# Root\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.path().join("root_child.md"),
+            "---\nid: \"root-child\"\ntitle: \"Root Child\"\n---\n\n# Root Child\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 1 subnet
+        let l1_dir = src_dir.path().join("level1");
+        std::fs::create_dir_all(&l1_dir).unwrap();
+        std::fs::write(
+            l1_dir.join("index.md"),
+            "---\nid: \"level1-net\"\ntitle: \"Level 1\"\n---\n\n# Level 1\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l1_dir.join("l1_doc.md"),
+            "---\nid: \"l1-doc\"\ntitle: \"L1 Doc\"\n---\n\n# L1 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 2 subnet
+        let l2_dir = l1_dir.join("level2");
+        std::fs::create_dir_all(&l2_dir).unwrap();
+        std::fs::write(
+            l2_dir.join("index.md"),
+            "---\nid: \"level2-net\"\ntitle: \"Level 2\"\n---\n\n# Level 2\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l2_dir.join("l2_doc.md"),
+            "---\nid: \"l2-doc\"\ntitle: \"L2 Doc\"\n---\n\n# L2 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Level 3 subnet
+        let l3_dir = l2_dir.join("level3");
+        std::fs::create_dir_all(&l3_dir).unwrap();
+        std::fs::write(
+            l3_dir.join("index.md"),
+            "---\nid: \"level3-net\"\ntitle: \"Level 3\"\n---\n\n# Level 3\n\n````{network_children}\n````\n",
+        )
+        .unwrap();
+        std::fs::write(
+            l3_dir.join("l3_doc.md"),
+            "---\nid: \"l3-doc\"\ntitle: \"L3 Doc\"\n---\n\n# L3 Doc\n\nContent.\n",
+        )
+        .unwrap();
+
+        // Use the DB-backed accumulator (mirrors `noet parse` CLI path)
+        let (tx, rx) = unbounded_channel::<BeliefEvent>();
+        let db_pool = db_init_memory().await.unwrap();
+        let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
+        let global_bb = accumulator.query_handle();
+
+        let mut compiler = DocumentCompiler::with_html_output(
+            src_dir.path(),
+            Some(tx),
+            Some(5),
+            false,
+            Some(html_dir.path().to_path_buf()),
+            None,
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        compiler.parse_all(global_bb, false).await.unwrap();
+        let final_db = accumulator.into_inner().await.unwrap();
+        compiler.finalize_html(final_db).await.unwrap();
+
+        let sentinel = crate::codec::myst::sentinel("network_children");
+
+        // Check all levels
+        for (label, rel_path) in [
+            ("root", "index.html"),
+            ("level1", "level1/index.html"),
+            ("level2", "level1/level2/index.html"),
+            ("level3", "level1/level2/level3/index.html"),
+        ] {
+            let html_path = html_dir.path().join("pages").join(rel_path);
+            assert!(html_path.exists(), "pages/{rel_path} must exist ({label})");
+            let html = std::fs::read_to_string(&html_path).unwrap();
+            assert!(
+                !html.contains(sentinel.as_str()),
+                "{label} sentinel must be replaced; found in pages/{rel_path}:\n{}",
+                &html[..html.len().min(2000)]
+            );
+            assert!(
+                html.contains("<ul>") || html.contains("No documents"),
+                "{label} listing must contain <ul> or no-docs message; got pages/{rel_path}:\n{}",
+                &html[..html.len().min(2000)]
+            );
+        }
+
+        // Verify specific child links
+        let l1_html =
+            std::fs::read_to_string(html_dir.path().join("pages/level1/index.html")).unwrap();
+        assert!(
+            l1_html.contains("l1_doc.html"),
+            "level1 must link to l1_doc.html; got:\n{}",
+            &l1_html[..l1_html.len().min(2000)]
+        );
+
+        let l3_html = std::fs::read_to_string(
+            html_dir
+                .path()
+                .join("pages/level1/level2/level3/index.html"),
+        )
+        .unwrap();
+        assert!(
+            l3_html.contains("l3_doc.html"),
+            "level3 must link to l3_doc.html; got:\n{}",
+            &l3_html[..l3_html.len().min(2000)]
         );
     }
 
@@ -3586,7 +6424,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     #[tokio::test]
     #[cfg(feature = "git-tracking")]
     async fn test_git_metadata_populated_on_network_node() {
-        use git2::Repository;
         use std::collections::BTreeSet;
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3642,7 +6479,9 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         compiler.builder_mut().close_tx();
         let final_bb = processor.await.unwrap();
 
-        // Find the network node (BeliefKind::Network).
+        // Find the specific network node created by create_test_network (title "Test Network"),
+        // rather than relying on iteration order to pick "the first" network node — other
+        // synthetic networks (api, asset_namespace, href_namespace) are also present.
         let network_nodes: Vec<_> = final_bb
             .states()
             .values()
@@ -3654,7 +6493,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             "parse must produce at least one network node"
         );
 
-        let net = network_nodes[0];
+        let net = network_nodes
+            .iter()
+            .find(|n| n.title == "Test Network")
+            .expect("Test Network node must be present");
 
         // metadata["git"] must be present.
         assert!(
@@ -3758,16 +6600,14 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// Compile a network to HTML using the full CLI-equivalent path: events flow
     /// through a `BeliefAccumulator<DbConnection>` (not an in-memory `BeliefBase`),
     /// `into_inner` extracts the `DbConnection`, and `finalize_html` exports the
-    /// beliefbase JSON.  Returns the `BeliefGraph` deserialized from the written
-    /// `beliefbase.json` so callers can assert on its contents.
+    /// beliefbase msgpack.  Returns the `BeliefGraph` deserialized from the written
+    /// `beliefbase.msgpack` so callers can assert on its contents.
     #[cfg(all(feature = "git-tracking", feature = "service"))]
     async fn compile_to_html_via_db(
         network_dir: &std::path::Path,
         html_dir: &std::path::Path,
         git_tracking: bool,
     ) -> Result<BeliefGraph, Box<dyn std::error::Error>> {
-        use crate::db::{db_init_memory, DbConnection};
-
         let (tx, rx) = unbounded_channel::<BeliefEvent>();
 
         let db_pool = db_init_memory().await?;
@@ -3792,19 +6632,19 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         // Drain all pending events into the DB, then extract the DbConnection.
         let final_db = accumulator.into_inner().await?;
 
-        // finalize_html queries final_db for the full graph and writes beliefbase.json.
+        // finalize_html queries final_db for the full graph and writes beliefbase.msgpack.
         compiler.finalize_html(final_db).await?;
 
-        // Read and deserialize the written beliefbase.json.
-        let bb_json_path = html_dir.join("beliefbase.json");
-        let json_str = std::fs::read_to_string(&bb_json_path)?;
-        let graph: BeliefGraph = serde_json::from_str(&json_str)?;
+        // Read and deserialize the written beliefbase.msgpack.
+        let bb_msgpack_path = html_dir.join("beliefbase.msgpack");
+        let bytes = std::fs::read(&bb_msgpack_path)?;
+        let graph: BeliefGraph = rmp_serde::from_slice(&bytes)?;
         Ok(graph)
     }
 
     /// `BeliefNode.metadata` (including `git.*` and `source_url`) must survive the
-    /// full parse → NodeUpdate event → BeliefAccumulator → DbConnection → JSON export
-    /// round-trip and appear in the `beliefbase.json` written by `finalize_html`.
+    /// full parse → NodeUpdate event → BeliefAccumulator → DbConnection → msgpack export
+    /// round-trip and appear in the `beliefbase.msgpack` written by `finalize_html`.
     ///
     /// This test uses the same `DbConnection`-backed accumulator path as the CLI
     /// (`noet parse --html-output`), unlike the existing
@@ -3812,8 +6652,8 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     /// event-channel `BeliefBase`.
     #[tokio::test]
     #[cfg(all(feature = "git-tracking", feature = "service"))]
+    #[serial(db_tests)]
     async fn test_metadata_in_exported_json() {
-        use git2::Repository;
         use std::collections::BTreeSet;
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3844,7 +6684,9 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             .await
             .expect("compile_to_html_via_db must succeed");
 
-        // Locate the network node in the exported graph.
+        // Locate the specific network node created by create_test_network (title "Test
+        // Network"), rather than relying on iteration order to pick "the first" network node
+        // — other synthetic networks (api, asset_namespace, href_namespace) are also present.
         let network_nodes: Vec<_> = graph
             .states
             .values()
@@ -3853,15 +6695,18 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         assert!(
             !network_nodes.is_empty(),
-            "exported beliefbase.json must contain at least one network node"
+            "exported beliefbase.msgpack must contain at least one network node"
         );
 
-        let net = network_nodes[0];
+        let net = network_nodes
+            .iter()
+            .find(|n| n.title == "Test Network")
+            .expect("Test Network node must be present");
 
-        // metadata["git"] must survive the DB round-trip and appear in the JSON.
+        // metadata["git"] must survive the DB round-trip and appear in the msgpack.
         assert!(
             net.metadata.contains_key("git"),
-            "network node metadata[\"git\"] must be present in exported beliefbase.json \
+            "network node metadata[\"git\"] must be present in exported beliefbase.msgpack \
              after the full DB round-trip; \
              got metadata keys: {:?}",
             net.metadata.keys().collect::<BTreeSet<_>>()
@@ -3879,13 +6724,209 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         assert_eq!(
             commit.len(),
             40,
-            "git.commit hash must be 40 chars in exported JSON; got: {commit}"
+            "git.commit hash must be 40 chars in exported msgpack; got: {commit}"
         );
 
         // dirty flag must be present.
         assert!(
             git_table.contains_key("dirty"),
             "git.dirty must be present in exported metadata"
+        );
+    }
+
+    /// Regression test for the asset-sync bug: `sync_asset_snapshot`
+    /// must actually pull a namespace's asset/href children out of `global_bb`
+    /// and merge them into `self.builder.session_bb()`. Prior to the fix this
+    /// always logged "Merged 0 asset nodes" because the query walked Section
+    /// edges root-ward (toward the namespace's own parent) instead of leaf-ward
+    /// (toward the namespace's children), and asset nodes are the SOURCE of
+    /// their Section edge to the namespace (the namespace is the sink) — see
+    /// `GraphBuilder::process_asset`.
+    #[tokio::test]
+    async fn test_sync_asset_snapshot_merges_namespace_children() {
+        use crate::properties::{
+            asset_namespace, BeliefKind, BeliefNode, Weight, WEIGHT_DOC_PATHS,
+        };
+
+        // ── Setup ─────────────────────────────────────────────────
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        let repo_path_buf = crate::paths::canonicalize_path(repo_dir.path()).unwrap();
+        let repo_path = repo_path_buf.as_path();
+        create_test_network(repo_path);
+
+        let mut compiler = DocumentCompiler::simple(repo_path).unwrap();
+
+        // Build a `global_bb` (plain in-memory BeliefBase, which implements
+        // BeliefSource) seeded with the asset namespace node plus two asset
+        // children, using the SAME edge shape GraphBuilder::process_asset
+        // produces: asset_bid --Section--> asset_namespace() (asset is source,
+        // namespace is sink).
+        let ns_node = crate::properties::BeliefNode::asset_network();
+        let ns_bid = ns_node.bid;
+        assert_eq!(
+            ns_bid,
+            asset_namespace(),
+            "sanity: asset_network's bid must equal asset_namespace()"
+        );
+
+        let asset_a = Bid::new(ns_bid);
+        let asset_b = Bid::new(ns_bid);
+        let make_asset_node = |bid: Bid, path: &str| BeliefNode {
+            bid,
+            kind: BeliefKind::External.into(),
+            title: path.to_string(),
+            ..Default::default()
+        };
+
+        let mut global_bb = BeliefBase::default();
+        global_bb
+            .process_event(&BeliefEvent::NodeUpsert(
+                ns_bid,
+                ns_node,
+                crate::event::EventOrigin::Remote,
+            ))
+            .unwrap();
+        for (bid, path) in [(asset_a, "vendor/a.txt"), (asset_b, "vendor/b.txt")] {
+            global_bb
+                .process_event(&BeliefEvent::NodeUpsert(
+                    bid,
+                    make_asset_node(bid, path),
+                    crate::event::EventOrigin::Remote,
+                ))
+                .unwrap();
+            let mut payload = toml::Table::new();
+            payload.insert(
+                WEIGHT_DOC_PATHS.to_string(),
+                toml::Value::Array(vec![toml::Value::String(path.to_string())]),
+            );
+            global_bb
+                .process_event(&BeliefEvent::RelationChange(
+                    bid,
+                    ns_bid,
+                    WeightKind::Section,
+                    Some(Weight { payload }),
+                    crate::event::EventOrigin::Remote,
+                ))
+                .unwrap();
+        }
+
+        // ── Exercise ─────────────────────────────────────────────────────────
+        compiler.sync_asset_snapshot(&global_bb).await.unwrap();
+
+        // ── Assert ───────────────────────────────────────────────────────────
+        let session_bb = compiler.builder().session_bb();
+        assert!(
+            session_bb.states().contains_key(&asset_a),
+            "sync_asset_snapshot must merge asset_a into session_bb; got states: {:?}",
+            session_bb.states().keys().collect::<Vec<_>>()
+        );
+        assert!(
+            session_bb.states().contains_key(&asset_b),
+            "sync_asset_snapshot must merge asset_b into session_bb; got states: {:?}",
+            session_bb.states().keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Same bug as [`test_sync_asset_snapshot_merges_namespace_children`] but uses a
+    /// `DbConnection`-backed accumulator (the `service` feature path), which is the
+    /// code path used by noet-core's parse CLI / a downstream consumer's render CLI
+    /// in production (e.g. `--jobs N render`). The in-memory-`BeliefBase` version of this test does NOT
+    /// catch the SQL-backend-specific leaf-map bug described below — this test is
+    /// the one that matters for catching regressions in production builds.
+    #[tokio::test]
+    #[cfg(feature = "service")]
+    #[serial(db_tests)]
+    async fn test_sync_asset_snapshot_merges_namespace_children_via_db() {
+        use crate::properties::{
+            asset_namespace, BeliefKind, BeliefNode, Weight, WeightSet, WEIGHT_DOC_PATHS,
+        };
+
+        // ── Setup ─────────────────────────────────────────────────
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        let repo_path_buf = crate::paths::canonicalize_path(repo_dir.path()).unwrap();
+        let repo_path = repo_path_buf.as_path();
+        create_test_network(repo_path);
+
+        let mut compiler = DocumentCompiler::simple(repo_path).unwrap();
+
+        // Use the DB-backed accumulator (mirrors noet-core's parse CLI / a downstream
+        // consumer's render CLI path).
+        let (tx, rx) = unbounded_channel::<BeliefEvent>();
+        let db_pool = db_init_memory().await.unwrap();
+        let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
+        let global_bb = accumulator.query_handle();
+
+        let ns_node = BeliefNode::asset_network();
+        let ns_bid = ns_node.bid;
+        assert_eq!(
+            ns_bid,
+            asset_namespace(),
+            "sanity: asset_network's bid must equal asset_namespace()"
+        );
+
+        let asset_a = Bid::new(ns_bid);
+        let asset_b = Bid::new(ns_bid);
+        let make_asset_node = |bid: Bid, path: &str| BeliefNode {
+            bid,
+            kind: BeliefKind::External.into(),
+            title: path.to_string(),
+            ..Default::default()
+        };
+
+        // Send the same events sync_asset_snapshot's real callers see once GraphBuilder's
+        // terminate_stack/compute_diff has resolved a RelationChange into a RelationUpdate
+        // (RelationChange alone is a no-op on the DB write path -- Transaction::add_event
+        // deliberately ignores it, waiting for the resolved RelationUpdate; see
+        // noet-core Issue 98 investigation), bracketed in a BatchStart/BatchEnd epoch so
+        // drain_epoch commits them to the DB.
+        tx.send(BeliefEvent::BatchStart).unwrap();
+        tx.send(BeliefEvent::NodeUpsert(
+            ns_bid,
+            ns_node,
+            crate::event::EventOrigin::Remote,
+        ))
+        .unwrap();
+        for (bid, path) in [(asset_a, "vendor/a.txt"), (asset_b, "vendor/b.txt")] {
+            tx.send(BeliefEvent::NodeUpsert(
+                bid,
+                make_asset_node(bid, path),
+                crate::event::EventOrigin::Remote,
+            ))
+            .unwrap();
+            let mut payload = toml::Table::new();
+            payload.insert(
+                WEIGHT_DOC_PATHS.to_string(),
+                toml::Value::Array(vec![toml::Value::String(path.to_string())]),
+            );
+            let mut weights = WeightSet::default();
+            weights
+                .weights
+                .insert(WeightKind::Section, Weight { payload });
+            tx.send(BeliefEvent::RelationUpdate(
+                bid,
+                ns_bid,
+                weights,
+                crate::event::EventOrigin::Remote,
+            ))
+            .unwrap();
+        }
+        tx.send(BeliefEvent::BatchEnd).unwrap();
+        global_bb.drain_epoch().await.unwrap();
+
+        // ── Exercise ───────────────────────────────────────────────────
+        compiler.sync_asset_snapshot(&global_bb).await.unwrap();
+
+        // ── Assert ───────────────────────────────────────────────────────────
+        let session_bb = compiler.builder().session_bb();
+        assert!(
+            session_bb.states().contains_key(&asset_a),
+            "sync_asset_snapshot (DB-backed) must merge asset_a into session_bb; got states: {:?}",
+            session_bb.states().keys().collect::<Vec<_>>()
+        );
+        assert!(
+            session_bb.states().contains_key(&asset_b),
+            "sync_asset_snapshot (DB-backed) must merge asset_b into session_bb; got states: {:?}",
+            session_bb.states().keys().collect::<Vec<_>>()
         );
     }
 
@@ -4113,9 +7154,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             codec::proto_index::ProtoIndex,
             properties::{href_namespace, BeliefKind},
         };
-        use git2::Repository;
         use tempfile::TempDir;
-        use tokio::sync::mpsc::unbounded_channel;
 
         // ── Setup: git repo with a github remote ─────────────────────────────
         let repo_dir = TempDir::new().unwrap();
@@ -4148,7 +7187,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
 
         // Confirm the repo root is in the index (sanity check).
         assert!(
-            proto_index.git_status_for(repo_path).is_some(),
+            proto_index.get_meta(repo_path, "git").is_some(),
             "ProtoIndex must have git status for the repo root network directory"
         );
 
@@ -4182,7 +7221,8 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             .states()
             .values()
             .filter(|n| {
-                n.kind.contains(BeliefKind::External) && n.id.as_deref() == Some(expected_url)
+                n.kind.contains(BeliefKind::External)
+                    && matches!(&n.id, NodeId::Explicit(id) if id == expected_url)
             })
             .collect();
 
@@ -4191,7 +7231,10 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             1,
             "expected exactly one href node with id={expected_url}; got {}: {:?}",
             href_nodes.len(),
-            href_nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+            href_nodes
+                .iter()
+                .map(|n| n.id.to_string())
+                .collect::<Vec<_>>()
         );
 
         let href_node = href_nodes[0];

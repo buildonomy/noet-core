@@ -41,7 +41,11 @@ import {
   handleKeyboardShortcuts,
   showNavError,
 } from "./viewer/panels.js";
-import { updateNavTreeHighlight } from "./viewer/navigation.js";
+import {
+  updateNavTreeHighlight,
+  initShardLoadListener,
+  handleNavLinkClick,
+} from "./viewer/navigation.js";
 import {
   clearSelectedLinkHighlight,
   highlightSelectedLink,
@@ -54,10 +58,16 @@ import {
   navigateToLink,
   navigateToSection,
 } from "./viewer/routing.js";
-import { initializeWasm } from "./viewer/wasm.js";
+import { initializeWasm, readBaseUrl } from "./viewer/wasm.js";
 import { initNetworkSelector } from "./viewer/network-selector.js";
+import { initVersionSelector } from "./viewer/version-selector.js";
 import { initResizeHandles } from "./viewer/resize.js";
 import { initSearch } from "./viewer/search.js";
+import {
+  openTraceabilityModal,
+  openTraceabilitySearch,
+  closeTraceabilityModal,
+} from "./viewer/traceability.js";
 
 // =============================================================================
 // Bootstrap
@@ -77,6 +87,32 @@ document.addEventListener("DOMContentLoaded", async () => {
   callbacks.updateNavTreeHighlight = updateNavTreeHighlight;
   callbacks.navigateToLink = navigateToLink;
   callbacks.highlightExternalInContent = highlightExternalInContent;
+  callbacks.openTraceabilityModal = openTraceabilityModal;
+  callbacks.openTraceabilitySearch = openTraceabilitySearch;
+  callbacks.closeTraceabilityModal = closeTraceabilityModal;
+  callbacks.handleNodeLinkClick = function (bid, href, element) {
+    // Two-click pattern for node links outside .noet-content (e.g. Tabulator cells).
+    // First click on a BID: show metadata panel, record selection.
+    // Second click on same BID: navigate, clear selection.
+    if (bid && state.selectedNodeBid === bid) {
+      // Second click — navigate.
+      state.selectedNodeBid = null;
+      if (element) clearSelectedLinkHighlight();
+      if (href) {
+        navigateToLink(href, element, bid);
+      }
+    } else {
+      // First click — show metadata.
+      if (bid && state.beliefbase) {
+        showMetadataPanel(bid);
+        state.selectedNodeBid = bid;
+        if (element) highlightSelectedLink(element);
+      } else if (href) {
+        // No BID available — navigate directly.
+        navigateToLink(href, element, null);
+      }
+    }
+  };
 
   // 4. Attach DOM event listeners
   setupEventListeners();
@@ -84,9 +120,74 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 5. Theme, panel state, and resize handles (work without WASM)
   initializeTheme();
   initializePanelState();
-  initResizeHandles();
+  initResizeHandles({ toggleNav: toggleNavPanel, toggleMetadata: toggleMetadataPanel });
+
+  // 5b. Prefetch AND render the initial page HTML before WASM init.
+  // The URL hash is known immediately but the full loadDocument() flow
+  // (path normalization, BID extraction, metadata panel) requires WASM.
+  // We do a best-effort fetch + render here so the user sees content
+  // instantly, then loadDocument() re-renders with full metadata when
+  // WASM is ready.  The HTML body is identical both times — no flash.
+  {
+    const hash = window.location.hash.substring(1);
+    if (hash && hash !== "/") {
+      // Best-effort path normalisation without WASM: .md → .html
+      let pagePath = hash.replace(/\.md(#|$)/, ".html$1");
+      if (!pagePath.startsWith("/")) pagePath = "/" + pagePath;
+      const fetchPath = pagePath.replace(/#.*$/, "");
+      const baseUrl = readBaseUrl();
+      const fullUrl = `${baseUrl}/pages${fetchPath}`;
+      console.log(`[Noet] Prefetching initial page: ${fullUrl}`);
+
+      const prefetchPromise = fetch(fullUrl).catch((err) => {
+        console.warn("[Noet] Page prefetch failed:", err);
+        return null;
+      });
+
+      state.prefetchedPage = { path: fetchPath, promise: prefetchPromise };
+
+      // Render the prefetched HTML into the content area immediately.
+      // This gives the user visible content while WASM loads in the background.
+      // Target .noet-content__inner (same node loadDocument uses) so the
+      // layout wrapper stays intact.
+      prefetchPromise
+        .then(async (resp) => {
+          if (!resp || !resp.ok || !state.contentElement) return;
+          // Clone the response so loadDocument can still consume the original.
+          const html = await resp.clone().text();
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, "text/html");
+          const article = doc.querySelector("article");
+          if (article) {
+            const inner = state.contentElement.querySelector(".noet-content__inner");
+            const target = inner || state.contentElement;
+            let existingArticle = target.querySelector("article");
+            if (!existingArticle) {
+              existingArticle = document.createElement("article");
+              target.appendChild(existingArticle);
+            }
+            existingArticle.innerHTML = article.innerHTML;
+            console.log("[Noet] Early page render complete (pre-WASM)");
+          }
+        })
+        .catch(() => {
+          /* swallow — loadDocument will handle errors */
+        });
+    }
+  }
 
   // 6. Load WASM and BeliefBase (non-blocking — theme/basic features still work if this fails)
+  // Show the progress bar while WASM + shards load.  The user already sees
+  // page content (from the early render above), but nav and metadata panels
+  // are still populating.  The bar gives visual feedback that work is ongoing.
+  {
+    const bar = document.createElement("div");
+    bar.id = "noet-shard-progress";
+    bar.className = "noet-shard-progress";
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-label", "Loading navigation data\u2026");
+    document.body.appendChild(bar);
+  }
   try {
     await initializeWasm();
     // Expose BeliefBaseWasm on window.noet for browser console use.
@@ -95,22 +196,51 @@ document.addEventListener("DOMContentLoaded", async () => {
     window.noet = state.wasmModule.BeliefBaseWasm;
     // Initialize network selector panel (sharded mode only; no-op in monolithic mode).
     initNetworkSelector();
+    // Initialize version selector dropdown (no-op in single-version deployments).
+    initVersionSelector();
     // Initialize full-text search (requires state.searchIndex populated by initializeWasm).
     initSearch();
+    // Register background shard-load listener — rebuilds nav tree when a shard finishes loading.
+    initShardLoadListener();
   } catch (error) {
     console.error(
       "[Noet] WASM initialization failed (theme and basic features still work):",
       error,
     );
-    showNavError();
+    // Pass the error so the banner can name the cause when it recognises one.
+    showNavError(error);
   }
 
-  // 7. Load the initial document
+  // 7. Load the initial document (populates metadata panel via showMetadataPanel)
   const initialHash = window.location.hash;
   if (initialHash && initialHash !== "#") {
     await handleHashChange();
   } else {
     await loadDefaultDocument();
+  }
+
+  // 8. Handle ?q= URL parameter — open traceability panel with the query.
+  // Must run after WASM init (step 6) and initial document load (step 7)
+  // so that the beliefbase and nav tree are available.
+  {
+    const urlParams = new URLSearchParams(window.location.search);
+    const qParam = urlParams.get("q");
+    if (qParam && state.beliefbase) {
+      console.log("[Noet] Opening traceability from ?q= parameter:", qParam);
+      // Open the traceability panel in search mode with the query text.
+      // The query text may be a plain text search, an id:// anchored query
+      // grammar string, or any other query form. Search mode handles all
+      // of these by running TF-IDF against the query tokens.
+      openTraceabilitySearch(qParam);
+    }
+  }
+
+  // 9. Remove the init progress bar — nav, content, and metadata are now
+  // populated (or errored).  Subsequent shard loads will show their own
+  // progress bar via the noet:shard-loading event listener.
+  {
+    const bar = document.getElementById("noet-shard-progress");
+    if (bar) bar.remove();
   }
 
   console.log("[Noet] Viewer initialized successfully");
@@ -154,7 +284,8 @@ function initializeDOMReferences() {
     console.error("[Noet] Critical DOM elements missing — viewer may not work correctly");
   }
   if (!state.themeSelect) console.error("[Noet] Theme select element not found");
-  if (!state.themeLightLink) console.error("[Noet] Light theme stylesheet link not found");
+  if (!state.themeLightLink)
+    console.error("[Noet] Light theme stylesheet link not found");
   if (!state.themeDarkLink) console.error("[Noet] Dark theme stylesheet link not found");
 }
 
@@ -212,6 +343,20 @@ function setupEventListeners() {
     state.contentElement.addEventListener("click", handleContentClick);
   }
 
+  // Footer links (e.g. cover page reference) should route through the SPA
+  const footer = document.querySelector(".noet-footer");
+  if (footer) {
+    footer.addEventListener("click", (e) => {
+      const link = e.target.closest("a");
+      if (!link) return;
+      const href = link.getAttribute("href");
+      if (href && href.startsWith("#/")) {
+        e.preventDefault();
+        window.location.hash = href.substring(1);
+      }
+    });
+  }
+
   window.addEventListener("hashchange", handleHashChange);
 
   // Reset two-click selection on click outside content
@@ -248,7 +393,20 @@ function handleNavClick(event) {
     const targetBid = target.getAttribute("data-bid");
     if (href) {
       console.log("[Noet] Navigating to:", href);
-      navigateToLink(href, target, targetBid);
+      // For network nodes: expand the subtree and load the shard in addition
+      // to navigating.  handleNavLinkClick is a no-op for non-network nodes.
+      if (targetBid) {
+        handleNavLinkClick(targetBid);
+      }
+      // Nav links emit hash-based hrefs (#/path or #/path#anchor) so that
+      // clicking updates window.location.hash and fires hashchange → handleHashChange,
+      // rather than issuing a real HTTP request. navigateToLink treats "#"-prefixed
+      // hrefs as same-page section anchors (navigateToSection), which is wrong here.
+      if (href.startsWith("#/")) {
+        window.location.hash = href.substring(1); // strip leading "#" — hash setter adds it
+      } else {
+        navigateToLink(href, target, targetBid);
+      }
     }
   }
 }
@@ -279,8 +437,29 @@ function handleContentClick(e) {
     return;
   }
 
-  const linkBid = extractBidFromLink(link);
+  let linkBid = extractBidFromLink(link);
   const href = link.getAttribute("href");
+
+  // Resolve section BID from anchor href when the link has no explicit bref.
+  // This lets in-page anchor links (e.g. source-view line-number links) participate
+  // in the two-click metadata pattern without requiring a bref:// title.
+  if (!linkBid && href && href.startsWith("#") && state.beliefbase) {
+    const sectionId = href.substring(1);
+    const lookupBref = state.currentDocNetworkBref ?? state.beliefbase.entryPoint().bref;
+    const result = state.beliefbase.get_bid_from_id(lookupBref, sectionId);
+    console.log(
+      `[Noet] Anchor BID resolution: sectionId="${sectionId}" lookupBref="${lookupBref}"`,
+      `result=`,
+      result,
+      `currentDocNetworkBref=`,
+      state.currentDocNetworkBref,
+      `entryBref=`,
+      state.beliefbase.entryPoint().bref,
+    );
+    if (result) {
+      linkBid = result.bid;
+    }
+  }
 
   if (!linkBid && !href) {
     console.warn("[Noet] Link has no BID or href, ignoring");
@@ -326,7 +505,21 @@ function extractBidFromLink(link) {
     return null;
   }
 
-  return state.beliefbase.get_bid_from_bref(match[1]);
+  const bid = state.beliefbase.get_bid_from_bref(match[1]);
+  if (!bid) {
+    // Node is in an unloaded shard. Return null so the caller falls through to
+    // navigateToLink, where the hasSchema guard will open external URLs in a
+    // new tab. Returning the raw bref would break showMetadataPanel (which
+    // requires a full BID, not a bref string).
+    const loadedShards = JSON.parse(state.beliefbase.loaded_shards());
+    console.warn(
+      `[Noet] Bref not resolved (unloaded shard?): ${match[1]}\n` +
+        `  Loaded shards: ${JSON.stringify(loadedShards)}\n` +
+        `  Total nodes in beliefbase: ${state.beliefbase.node_count()}`,
+    );
+    return null;
+  }
+  return bid;
 }
 
 // =============================================================================

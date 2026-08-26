@@ -4,11 +4,15 @@
   "description": "UI dependencies for noet-core HTML viewer",
   "private": true,
   "scripts": {
-    "install:vendor": "npm install && npm run copy:open-props",
-    "copy:open-props": "mkdir -p open-props && cp node_modules/open-props/open-props.min.css open-props/ && cp node_modules/open-props/normalize.min.css open-props/"
+    "install:vendor": "npm install && npm run copy:open-props && npm run copy:katex && npm run copy:tabulator",
+    "copy:open-props": "mkdir -p open-props && cp node_modules/open-props/open-props.min.css open-props/ && cp node_modules/open-props/normalize.min.css open-props/",
+    "copy:katex": "mkdir -p katex/fonts && cp node_modules/katex/dist/katex.min.css katex/ && cp node_modules/katex/dist/katex.min.js katex/ && cp node_modules/katex/dist/contrib/auto-render.min.js katex/ && cp node_modules/katex/dist/fonts/* katex/fonts/",
+    "copy:tabulator": "mkdir -p tabulator && cp node_modules/tabulator-tables/dist/css/tabulator.min.css tabulator/ && cp node_modules/tabulator-tables/dist/js/tabulator.min.js tabulator/"
   },
   "dependencies": {
-    "open-props": "^1.7.23"
+    "katex": "^0.16.45",
+    "open-props": "^1.7.23",
+    "tabulator-tables": "^6.4.0"
   },
   "devDependencies": {},
   "repository": {

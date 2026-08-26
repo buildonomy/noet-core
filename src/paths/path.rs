@@ -71,6 +71,8 @@ pub fn os_path_to_string<P: AsRef<Path>>(os_path_ref: P) -> String {
     res
 }
 
+/// Convert a forward-slash path string to an OS path by replacing `/` with
+/// the platform separator.
 pub fn string_to_os_path(path_string: &str) -> PathBuf {
     PathBuf::from(path_string.replace("/", MAIN_SEPARATOR_STR))
 }
@@ -96,6 +98,16 @@ pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
     let canonical = path.as_ref().canonicalize()?;
     Ok(string_to_os_path(&os_path_to_string(&canonical)))
 }
+
+/// Regex character class matching the characters that [`to_anchor`] preserves.
+///
+/// This covers: Unicode alphanumeric (`\w` = `[a-zA-Z0-9_]` + non-ASCII word chars),
+/// plus `-`, `.`, `(`, `)`, `[`, `]`, `@`.  It is the *output* alphabet of `to_anchor`
+/// and the *input* alphabet expected by inline `{#id}` anchors.
+///
+/// The value is a raw string suitable for embedding inside a regex `[...]` or as a
+/// standalone character class.
+pub const ANCHOR_CHAR_CLASS: &str = r"[\w.@()\[\]-]";
 
 /// Turn a title string into a regularized anchor string.
 ///
@@ -758,7 +770,16 @@ impl<'a> AnchorPath<'a> {
     /// See tests module for examples.
     pub fn join<E: AsRef<str>>(&self, end_ref: E) -> AnchorPathBuf {
         let end = AnchorPath::from(end_ref.as_ref());
-        if end.is_absolute() || end.has_hostname() && end.hostname() != self.hostname() {
+        // Any URL with a schema is an absolute external reference and must never be joined
+        // relative to self. This covers both hierarchical URLs (https://host/path — has schema
+        // + hostname) and non-hierarchical URLs (mailto:user@host, javascript:void(0), data:…
+        // — have schema but no hostname). Without this guard, filepath() strips the schema from
+        // non-hierarchical URLs during the join, storing "user@host" instead of "mailto:user@host"
+        // in the PathMap — causing a permanent cache MISS on every subsequent lookup.
+        //
+        // Protocol-relative URLs (//host/path) have no schema but are caught by is_absolute()
+        // since they start with '/'.
+        if end.is_absolute() || end.has_schema() {
             return AnchorPathBuf::new(end.to_string());
         }
         if end.path.is_empty() {
@@ -1436,6 +1457,30 @@ mod tests {
 
     #[test]
     fn test_join() {
+        // Hierarchical URL — returned as-is regardless of base
+        assert_eq!(
+            AnchorPath::from("docs/guide.md").join("https://example.com/page"),
+            "https://example.com/page"
+        );
+        assert_eq!(
+            AnchorPath::from("https://example.com/base/").join("https://example.com/other"),
+            "https://example.com/other"
+        );
+
+        // Non-hierarchical URL (no hostname) — schema must be preserved, not stripped
+        assert_eq!(
+            AnchorPath::from("docs/guide.md").join("mailto:user@example.com"),
+            "mailto:user@example.com"
+        );
+        assert_eq!(
+            AnchorPath::from("").join("mailto:user@example.com"),
+            "mailto:user@example.com"
+        );
+        assert_eq!(
+            AnchorPath::from("docs/").join("javascript:void(0)"),
+            "javascript:void(0)"
+        );
+
         // Relative path joining
         let ap = AnchorPath::from("docs/guide.md");
         assert_eq!(ap.dir(), "docs");

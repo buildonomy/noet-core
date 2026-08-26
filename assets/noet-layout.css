@@ -25,12 +25,14 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+    max-inline-size: none;
 }
 
 html {
     font-family: var(--noet-font-family, var(--font-sans));
     font-size: var(--font-size-fluid-0);
     line-height: var(--font-lineheight-3);
+    background-color: var(--noet-bg-secondary);
 }
 
 /* Scale UI chrome (everything except content) to 80% */
@@ -45,9 +47,14 @@ body {
 }
 
 body {
-    background-color: var(--noet-bg-primary);
+    background-color: var(--noet-bg-secondary);
     color: var(--noet-text-primary);
-    overflow: hidden; /* Prevent body scroll, use internal scrolling */
+}
+
+@media (min-width: 1024px) {
+    body {
+        overflow: hidden; /* Desktop: prevent all body scroll, use internal scrolling */
+    }
 }
 
 /* =========================================================================
@@ -56,10 +63,10 @@ body {
 
 .noet-container {
     display: grid;
-    height: 100vh;
-    width: 100vw;
+    min-height: 100vh;
+    width: 100%;
 
-    /* Mobile layout: single column with footer */
+    /* Mobile layout: single column with footer flowing below content */
     grid-template-columns: 1fr;
     grid-template-rows: 1fr auto;
     grid-template-areas:
@@ -71,6 +78,7 @@ body {
 @media (min-width: 1024px) {
     .noet-container {
         position: relative;
+        height: 100vh; /* pin footer at bottom; content scrolls within its cell */
     }
 }
 
@@ -83,25 +91,52 @@ body {
     display: none; /* Hidden by default, shown on mobile/tablet */
     position: fixed;
     top: var(--size-2);
-    left: var(--size-2);
+    left: var(--size-1);
     z-index: 150;
-    background: var(--noet-bg-primary);
+    background: var(--noet-bg-tertiary);
     border: 1px solid var(--noet-border-primary);
     border-radius: var(--radius-2);
-    font-size: var(--font-size-3);
+    font-size: var(--font-size-2);
     cursor: pointer;
-    padding: var(--size-1);
     color: var(--noet-text-primary);
     box-shadow: var(--noet-shadow-small);
 }
 
 .noet-hamburger:hover {
-    background: var(--noet-bg-secondary);
+    background: var(--noet-button-bg-hover);
 }
 
 @media (max-width: 1023px) {
     .noet-hamburger {
         display: block;
+    }
+}
+
+/* Info button for metadata panel - fixed position in bottom-left corner */
+.noet-info-btn {
+    display: none;
+    position: fixed;
+    background: var(--noet-bg-tertiary);
+    bottom: var(--size-1);
+    left: var(--size-1);
+    z-index: 150;
+    border-radius: 50%;
+    font-size: var(--font-size-2);
+    line-height: 1;
+    cursor: pointer;
+    color: var(--noet-text-primary);
+    box-shadow: var(--noet-shadow-small);
+}
+
+.noet-info-btn:hover {
+    background: var(--noet-button-bg-hover);
+}
+
+@media (max-width: 1023px) {
+    .noet-info-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
 }
 
@@ -154,12 +189,58 @@ body {
 
 /* Desktop: Always visible */
 
+.noet-nav-header {
+    padding-left: var(--size-2);
+}
+
+/* Version selector dropdown — shown only in multi-version deployments.
+   Inserted by version-selector.js as the first child of .noet-nav-header. */
+.noet-version-selector {
+    display: block;
+    width: 100%;
+    padding: var(--size-1) var(--size-2);
+    margin-bottom: var(--size-2);
+    font-size: var(--font-size-0);
+    font-family: inherit;
+    color: var(--noet-text-primary);
+    background-color: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    appearance: auto;
+    box-sizing: border-box;
+}
+
+.noet-version-selector:focus-visible {
+    outline: 2px solid var(--noet-accent-primary);
+    outline-offset: 1px;
+}
 .noet-nav__content {
     flex: 1;
-    padding: var(--size-4);
-    padding-bottom: calc(var(--size-4) + 70px); /* Extra padding to clear footer */
+    padding-bottom: 70px; /* clear the fixed footer */
+    padding-right: var(--size-3); /* breathing room between nav content and border */
     overflow-y: auto;
     font-weight: var(--noet-font-weight-ui, 350);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+}
+
+.noet-nav__content::-webkit-scrollbar {
+    width: 8px;
+    background: transparent;
+}
+
+.noet-nav__content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.noet-nav__content::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+}
+
+.noet-nav__content::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.3);
 }
 
 /* Collapse button for nav panel (desktop only) - manila folder tab style */
@@ -168,6 +249,8 @@ body {
 }
 
 @media (min-width: 1024px) {
+    /* Unified drag+click handle: short click collapses/expands, drag resizes.
+       ew-resize cursor signals draggability (also implies interactivity). */
     .noet-nav__collapse {
         display: block;
         position: fixed;
@@ -181,11 +264,12 @@ body {
         border-left: none;
         border-radius: 0 var(--radius-2) var(--radius-2) 0;
         padding: var(--size-3) var(--size-1);
-        cursor: pointer;
-        font-size: var(--font-size-3);
-        font-weight: bold;
+        cursor: ew-resize;
         color: var(--noet-text-secondary);
         z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         transition:
             left 0.3s var(--ease-2),
             background 0.2s var(--ease-2),
@@ -197,9 +281,10 @@ body {
         background: var(--noet-collapse-bg-hover);
         color: var(--noet-text-primary);
         box-shadow: var(--noet-collapse-shadow-nav-hover);
+        cursor: pointer;
     }
 
-    /* When nav is collapsed, move button to left edge */
+    /* When nav is collapsed, move button to left edge and flip icon */
     .nav-collapsed .noet-nav__collapse {
         left: 0;
     }
@@ -210,53 +295,151 @@ body {
 
 .noet-content {
     grid-area: content;
-    overflow-y: auto;
     padding: 0;
     background-color: var(--noet-bg-secondary);
-    max-height: 100vh;
+}
+
+.noet-content__layout {
+    min-height: 100%;
+}
+
+/* Gutter handles hidden on mobile — only used in desktop flex layout */
+.noet-gutter-handle {
+    display: none;
 }
 
 .noet-content__inner {
-    padding: var(--size-4);
-    padding-bottom: calc(var(--size-4) + 70px); /* Extra padding to clear footer */
+    padding: 0 var(--size-4);
     background-color: var(--noet-bg-primary);
     min-height: 100%;
 }
 
-/* Mobile: Add top/bottom padding to avoid hamburger button */
+/* Mobile: scrollable content, padding on left only */
 @media (max-width: 1023px) {
+    .noet-content {
+        overflow-y: auto;
+    }
+
     .noet-content__inner {
-        padding: var(--size-8) var(--size-4);
-        padding-bottom: calc(var(--size-8) + 70px); /* Extra padding to clear footer */
+        padding: 0 var(--size-3) 0 var(--size-6);
     }
 }
 
-/* Desktop: Add max-width and shadow for paper effect */
+/* Desktop: __layout is the flex row containing gutter handles and __inner.
+   Padding on .noet-content clears the fixed panels.
+   Gutter handles sit between the padding and __inner.
+   On panel collapse, JS absorbs panel width into gutter. */
 @media (min-width: 1024px) {
+    .noet-content {
+        --noet-panel-gutter: var(--size-3);
+        padding-left: var(--noet-nav-width, 280px);
+        padding-right: var(--noet-metadata-width, 320px);
+    }
+
+    .noet-content__layout {
+        display: flex;
+        flex-direction: row;
+        align-items: stretch;
+        min-height: 100%;
+    }
+
+    .noet-content {
+        max-height: 100vh;
+        overflow: hidden; /* __inner handles scrolling on desktop */
+    }
+
     .noet-content__inner {
-        max-width: var(
-            --noet-content-max-width,
-            45rem
-        ); /* ~720px at 16px base, optimal reading width */
-        margin: 0 auto;
+        flex: 1;
+        min-width: 0;
+        overflow-y: auto;
+        max-height: 100vh;
+        padding-bottom: 70px; /* clear the fixed footer */
         box-shadow: var(--noet-shadow-medium);
+        scrollbar-width: thin;
+        scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+    }
+
+    .noet-content__inner::-webkit-scrollbar {
+        width: 8px;
+        background: transparent;
+    }
+
+    .noet-content__inner::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    .noet-content__inner::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.15);
+        border-radius: 4px;
+    }
+
+    .noet-content__inner::-webkit-scrollbar-thumb:hover {
+        background: rgba(0, 0, 0, 0.3);
+    }
+
+    /* Gutter drag handles — siblings of __inner, sit in the gutter area.
+       They are outside the scroll container so no scrollbar interference. */
+    .noet-gutter-handle {
+        display: block;
+        width: var(--noet-panel-gutter);
+        min-width: var(--noet-panel-gutter);
+        cursor: ew-resize;
+        z-index: 10;
+        background: transparent;
+        transition: background 0.15s var(--ease-2);
+        flex-shrink: 0;
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    .noet-gutter-handle:hover {
+        background: rgba(0, 0, 0, 0.06);
+    }
+
+    .noet-gutter-handle--left {
+        width: var(--noet-gutter-left, var(--noet-panel-gutter));
+        min-width: var(--noet-panel-gutter);
+    }
+
+    .noet-gutter-handle--right {
+        width: var(--noet-gutter-right, var(--noet-panel-gutter));
+        min-width: var(--noet-panel-gutter);
+    }
+
+    html.is-resizing .noet-gutter-handle {
+        background: rgba(0, 0, 0, 0.08);
+    }
+
+    /* When panels collapse, padding drops to 0. JS adjusts the gutter
+       handle width to absorb the panel width so content stays put. */
+    .nav-collapsed .noet-content {
+        padding-left: 0;
+    }
+
+    .metadata-collapsed .noet-content {
+        padding-right: 0;
+    }
+
+    .nav-collapsed.metadata-collapsed .noet-content {
+        padding-left: 0;
+        padding-right: 0;
     }
 }
 
 /* Theme selector styling */
 .noet-footer__theme label {
-    font-size: var(--font-size-1);
+    font-size: var(--font-size-0);
     font-weight: var(--font-weight-5);
     color: var(--noet-text-secondary);
 }
 
 .noet-theme-select {
-    padding: var(--size-1) var(--size-2);
+    padding: 0 var(--size-2);
     background-color: var(--noet-bg-primary);
     border: 1px solid var(--noet-border-primary);
     border-radius: var(--radius-2);
     color: var(--noet-text-primary);
-    font-size: var(--font-size-1);
+    font-size: var(--font-size-0);
     cursor: pointer;
 }
 
@@ -280,6 +463,8 @@ body {
     display: flex;
     flex-direction: column;
     padding: var(--size-4);
+    padding-left: var(--size-3); /* match nav's padding-right for symmetric feel */
+    box-sizing: border-box;
     font-weight: var(--noet-font-weight-ui, 350);
     background-color: var(--noet-bg-primary);
 }
@@ -340,6 +525,8 @@ body {
 }
 
 @media (min-width: 1024px) {
+    /* Unified drag+click handle: short click collapses/expands, drag resizes.
+       ew-resize cursor signals draggability (also implies interactivity). */
     .noet-metadata__collapse {
         display: block;
         position: fixed;
@@ -353,11 +540,12 @@ body {
         border-right: none;
         border-radius: var(--radius-2) 0 0 var(--radius-2);
         padding: var(--size-3) var(--size-1);
-        cursor: pointer;
-        font-size: var(--font-size-3);
-        font-weight: bold;
+        cursor: ew-resize;
         color: var(--noet-text-secondary);
         z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         transition:
             right 0.3s var(--ease-2),
             background 0.2s var(--ease-2),
@@ -369,9 +557,10 @@ body {
         background: var(--noet-collapse-bg-hover);
         color: var(--noet-text-primary);
         box-shadow: var(--noet-collapse-shadow-metadata-hover);
+        cursor: pointer;
     }
 
-    /* When metadata is collapsed, move button to right edge */
+    /* When metadata is collapsed, move button to right edge and flip icon */
     .metadata-collapsed .noet-metadata__collapse {
         right: 0;
     }
@@ -416,6 +605,21 @@ body {
     margin: 0 0 var(--size-3) 0;
 }
 
+/* Cause-specific explanation under the generic message. Hidden unless
+   showNavError() was given a diagnosis it can state plainly. */
+.noet-error__detail {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    margin: 0 0 var(--size-3) 0;
+    line-height: var(--font-lineheight-3);
+}
+
+.noet-error__detail code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    word-break: break-all;
+}
+
 .noet-error__action {
     background: var(--noet-button-bg);
     border: 1px solid var(--noet-border-primary);
@@ -439,10 +643,10 @@ body {
    for this. Resize handles use the same 70px offset to sit just above the footer. */
 .noet-footer {
     grid-area: footer;
-    padding: var(--size-3) var(--size-4);
+    padding: var(--size-1) var(--size-4);
     background-color: var(--noet-bg-secondary);
     border-top: 1px solid var(--noet-border-primary);
-    font-size: var(--font-size-1);
+    font-size: var(--font-size-0);
     color: var(--noet-text-tertiary);
     z-index: 50;
     display: flex;
@@ -458,6 +662,24 @@ body {
 }
 
 .noet-footer__credit {
+    margin: 0;
+    font-size: var(--font-size-0);
+}
+
+.noet-footer__banner {
+    width: 100%;
+    text-align: center;
+    padding: 0.5rem 1rem;
+    font-size: var(--font-size-0);
+    font-weight: var(--font-weight-5);
+    letter-spacing: 0.03em;
+}
+
+.noet-footer__banner:empty {
+    display: none;
+}
+
+.noet-footer__banner p {
     margin: 0;
 }
 
@@ -475,79 +697,6 @@ body {
     .noet-footer {
         flex-direction: column;
         text-align: center;
-    }
-}
-
-/* =========================================================================
-   Resize Handles
-   Desktop only. Each handle is a small draggable button flush with the bottom
-   of its panel, protruding inward toward panel content.
-
-   nav handle    — bottom of .noet-nav, arrow points left (into the drawer)
-   metadata handle — bottom of .noet-metadata, arrow points right (into the drawer)
-   content handle  — right edge of .noet-content__inner, arrow points right
-   ========================================================================= */
-
-.noet-resize-handle {
-    display: none; /* Hidden on mobile */
-}
-
-@media (min-width: 1024px) {
-    .noet-resize-handle {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        position: absolute;
-        bottom: 65px; /* Flush with footer — shared by all three handles */
-        width: 8px;
-        height: 40px;
-        background: var(--noet-border-secondary);
-        /*border: 1px solid var(--noet-border-primary);*/
-        color: var(--noet-collapse-bg);
-        cursor: ew-resize;
-        font-size: var(--font-size-2);
-        line-height: 1;
-        z-index: 60;
-        transition:
-            background 0.15s var(--ease-2),
-            color 0.15s var(--ease-2);
-        user-select: none;
-        touch-action: none;
-    }
-
-    .noet-resize-handle:hover,
-    .noet-resize-handle.is-dragging {
-        background: var(--noet-border-primary);
-        color: var(--noet-collapse-bg-hover);
-    }
-
-    /* Nav handle: right edge of .noet-nav, protrudes rightward out of the drawer */
-    .noet-resize-handle--nav {
-        right: 0;
-        /*transform: translateX(50%);*/
-        border-radius: var(--radius-2) 0 0 var(--radius-2);
-        border-right: none;
-        box-shadow: var(--noet-collapse-shadow-metadata);
-    }
-
-    /* Metadata handle: left edge of .noet-metadata, protrudes leftward out of the drawer */
-    .noet-resize-handle--metadata {
-        left: 0;
-        /*transform: translateX(-50%);*/
-        border-radius: 0 var(--radius-2) var(--radius-2) 0;
-        border-left: none;
-        box-shadow: var(--noet-collapse-shadow-nav);
-    }
-
-    /* Content handle: fixed at the bottom of the viewport, aligned to the right
-       edge of content__inner. content__inner is margin:0 auto with max-width
-       --noet-content-max-width, so its right edge is at: 50vw + (--noet-content-max-width / 2). */
-    .noet-resize-handle--content {
-        position: fixed;
-        left: calc(50vw + var(--noet-content-max-width, 45rem) / 2);
-        border-radius: 0 var(--radius-2) var(--radius-2) 0;
-        border-left: none;
-        box-shadow: var(--noet-collapse-shadow-nav);
     }
 }
 
@@ -583,6 +732,47 @@ html.is-resizing .noet-metadata__collapse {
 /* =========================================================================
    Navigation Tree
    ========================================================================= */
+
+.noet-nav-tree__heading {
+    font-size: var(--font-size-2);
+    font-weight: var(--font-weight-7);
+    margin: 0 0 var(--size-2) 0;
+    padding: var(--size-1) var(--size-2);
+    color: var(--noet-text-secondary);
+    border-bottom: 1px solid var(--noet-border-primary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.noet-nav-tree__heading-link {
+    color: inherit;
+    text-decoration: none;
+}
+
+.noet-nav-tree__heading-link:hover {
+    color: var(--noet-text-primary);
+}
+
+.noet-nav-tree__heading-link.active {
+    color: var(--noet-accent-primary);
+}
+
+.noet-nav-tree__shard-placeholder {
+    display: block;
+}
+
+.noet-nav-tree__ellipsis {
+    display: inline-block;
+    padding: var(--size-1) var(--size-2);
+    color: var(--noet-text-secondary);
+    cursor: pointer;
+    font-size: var(--font-size-2);
+    letter-spacing: 0.15em;
+}
+
+.noet-nav-tree__ellipsis:hover {
+    color: var(--noet-accent-primary);
+}
 
 .noet-nav-tree {
     list-style: none;
@@ -670,7 +860,6 @@ html.is-resizing .noet-metadata__collapse {
 
 .noet-nav-tree__link {
     display: block;
-    padding: var(--size-1) var(--size-3);
     font-size: var(--font-size-1);
     color: var(--noet-text-primary);
     text-decoration: none;
@@ -745,6 +934,17 @@ html.is-resizing .noet-metadata__collapse {
     padding-bottom: 0;
 }
 
+/* Synthetic "index" stem wrapping a network's anchor children (section headings
+   from the network's own index.md). Collapsed by default to keep the tree concise. */
+.noet-nav-tree__item.is-index-stem > .noet-nav-tree__link {
+    color: var(--noet-text-secondary);
+    font-style: italic;
+}
+
+.noet-nav-tree__item.is-index-stem > .noet-nav-tree__toggle {
+    color: var(--noet-text-secondary);
+}
+
 /* Label for network nodes (no href) */
 .noet-nav-tree__label {
     display: block;
@@ -780,18 +980,174 @@ html.is-resizing .noet-metadata__collapse {
     overflow-y: auto;
     overflow-x: hidden;
     padding-bottom: 70px; /* Extra padding to clear footer */
+    font-size: 0.9em; /* Uniform reduction for all metadata content — catches p, pre, tables, etc. */
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+}
+
+.noet-metadata-content::-webkit-scrollbar {
+    width: 8px;
+    background: transparent;
+}
+
+.noet-metadata-content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.noet-metadata-content::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+}
+
+.noet-metadata-content::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.3);
 }
 
 .noet-metadata-header {
     flex-shrink: 0;
+    padding-bottom: var(--size-2);
+}
+
+/* Override normalize h2 element rules — keep h2 for semantics but strip its
+   typographic opinions so the header container's values apply uniformly. */
+.noet-metadata-header h2 {
+    font-size: var(--font-size-3);
+    line-height: var(--font-lineheight-2);
+    font-weight: var(--noet-font-weight-heading);
+    margin: 0;
+    padding: 0;
+}
+
+/* Navigable node title link in the metadata panel header */
+.noet-metadata-title-link {
+    color: var(--noet-accent-primary);
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.noet-metadata-title-link:hover {
+    text-decoration: underline;
+    color: var(--noet-accent-primary);
 }
 
 /* =========================================================================
    Metadata Panel Content (Placeholder for Step 2)
    ========================================================================= */
 
+/* Node text hero block — rendered markdown preview in metadata panel */
+.noet-node-text-wrap {
+    position: relative;
+    margin-bottom: var(--size-4);
+}
+
+.noet-node-text {
+    background: var(--noet-bg-tertiary);
+    border-radius: var(--radius-2);
+    border: 1px solid var(--noet-border-secondary);
+    padding: var(--size-3);
+    min-height: 30vh;
+    /* Explicit reset: this block does not carry .noet-content, so font-size
+       inherits cleanly from .noet-metadata-content (0.9em). */
+    font-size: inherit;
+}
+
+/* normalize.css uses :where(p,ul,ol,dl,h6) { font-size: ... } at zero specificity.
+   These rules win and enforce inheritance from .noet-metadata-content uniformly —
+   including pre and code which were previously getting 1.25em from .noet-content. */
+.noet-node-text p,
+.noet-node-text ul,
+.noet-node-text ol,
+.noet-node-text dl,
+.noet-node-text pre,
+.noet-node-text code,
+.noet-node-text h1,
+.noet-node-text h2,
+.noet-node-text h3,
+.noet-node-text h4,
+.noet-node-text h5,
+.noet-node-text h6 {
+    font-size: inherit;
+}
+
+/* Compact, scannable typography for the node text preview block */
+.noet-node-text h1,
+.noet-node-text h2,
+.noet-node-text h3,
+.noet-node-text h4,
+.noet-node-text h5,
+.noet-node-text h6 {
+    margin-top: var(--size-3);
+    margin-bottom: var(--size-2);
+}
+
+.noet-node-text p {
+    margin-bottom: var(--size-2);
+}
+
+.noet-node-text ul,
+.noet-node-text ol {
+    margin-bottom: var(--size-2);
+    padding-left: var(--size-4);
+}
+
+.noet-node-text li {
+    margin-bottom: var(--size-1);
+}
+
+.noet-node-text pre {
+    background: var(--noet-bg-primary);
+    padding: var(--size-2);
+    border-radius: var(--radius-2);
+    overflow-x: auto;
+    margin-bottom: var(--size-2);
+}
+
+.noet-node-text code {
+    background: var(--noet-bg-primary);
+}
+
+/* Copy source button — semi-transparent overlay in top-right corner of text wrap */
+.noet-copy-source-btn {
+    position: absolute;
+    top: 0;
+    right: 0;
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    padding: 0;
+    cursor: pointer;
+    font-size: var(--font-size-1);
+    opacity: 0.6;
+    transition: opacity 0.15s ease;
+    z-index: 1;
+}
+
+.noet-copy-source-btn:hover {
+    opacity: 1;
+}
+
+.noet-copy-source-btn::after {
+    content: "copy content";
+    display: none;
+    position: absolute;
+    top: calc(100% + var(--size-1));
+    right: 0;
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    padding: var(--size-1) var(--size-2);
+    font-size: var(--font-size-00, 0.75rem);
+    white-space: nowrap;
+    color: var(--noet-text-secondary);
+    pointer-events: none;
+}
+
+.noet-copy-source-btn:hover::after {
+    display: block;
+}
+
 .noet-metadata__title {
-    font-size: var(--font-size-3);
+    font-size: var(--font-size-1);
     font-weight: var(--font-weight-7);
     margin-bottom: var(--size-3);
     color: var(--noet-text-primary);
@@ -829,6 +1185,19 @@ html.is-resizing .noet-metadata__collapse {
 /* Metadata content sections */
 .noet-metadata-section {
     margin-bottom: var(--size-5);
+    font-size: var(--font-size-0);
+    line-height: 1.4;
+}
+
+/* Beat normalize :where(p,ul,ol,dl,h6) { font-size: var(--font-size-2) } which
+   has zero specificity. A plain class+element selector always wins, enforcing
+   inheritance from .noet-metadata-section's --font-size-0 uniformly. */
+.noet-metadata-section p,
+.noet-metadata-section ul,
+.noet-metadata-section ol,
+.noet-metadata-section dl,
+.noet-metadata-section h6 {
+    font-size: inherit;
 }
 
 .noet-metadata-section h3 {
@@ -893,6 +1262,15 @@ html.is-resizing .noet-metadata__collapse {
     margin: var(--size-1) 0;
 }
 
+/* Implicit id indicator — shown when the id is derived from the title rather
+   than explicitly authored. The tilde glyph signals "approximate / derived". */
+.noet-metadata-implicit {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    cursor: help;
+    margin-left: var(--size-1);
+}
+
 .noet-metadata-links {
     list-style: none;
     padding: 0;
@@ -904,6 +1282,10 @@ html.is-resizing .noet-metadata__collapse {
     list-style: none;
     padding: 0;
     margin: var(--size-2) 0;
+    /* Beat normalize :where(ul) { font-size: var(--font-size-2) } which has
+       zero specificity. This plain class selector wins and inherits from
+       .noet-metadata-section's --font-size-0. */
+    font-size: var(--font-size-0);
 }
 
 .noet-relation-list li {
@@ -1026,6 +1408,22 @@ html.is-resizing .noet-metadata__collapse {
     padding: 0;
 }
 
+/* Bound imported media to the content column instead of native intrinsic
+   size. The global `* { max-inline-size: none }` reset above (needed to
+   defeat normalize's zero-specificity content-width caps on text elements)
+   otherwise strips normalize's own img/svg/video sizing, leaving embedded
+   media unconstrained and wider than the reading area. */
+.noet-content img,
+.noet-content svg,
+.noet-content video,
+.noet-content canvas,
+.noet-content iframe,
+.noet-content embed,
+.noet-content object {
+    max-inline-size: 100%;
+    block-size: auto;
+}
+
 .noet-content blockquote {
     border-left: 4px solid var(--noet-border-primary);
     padding-left: var(--size-4);
@@ -1044,10 +1442,337 @@ html.is-resizing .noet-metadata__collapse {
     margin-bottom: var(--size-2);
 }
 
+/* ── xlsx workbook tab layout ──────────────────────────────────────────────── */
+
+/* Tab sections are hidden by default — JS adds .is-active to show one at a time.
+   Without JS the sections remain hidden; the .spa-upgrade nav in template-simple.html
+   provides the View Interactive Version and View Source fallback links. */
+.xlsx-tab {
+    display: none;
+}
+
+.xlsx-tab.is-active {
+    display: block;
+}
+
+/* Tab navigation bar is also hidden until JS activates it. */
+.xlsx-tab-nav {
+    display: none;
+}
+
+.xlsx-tab-nav.is-active {
+    display: block;
+    margin-bottom: var(--size-4);
+}
+
+.xlsx-tab-nav ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--size-2);
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border-bottom: 2px solid var(--noet-border-primary);
+}
+
+.xlsx-tab-nav li {
+    margin: 0;
+}
+
+.xlsx-tab-link {
+    display: inline-block;
+    padding: var(--size-1) var(--size-3);
+    text-decoration: none;
+    color: var(--noet-text-secondary);
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: var(--radius-2) var(--radius-2) 0 0;
+    margin-bottom: -2px;
+}
+
+.xlsx-tab-link:hover {
+    color: var(--noet-text-primary);
+    background-color: var(--noet-bg-secondary);
+}
+
+.xlsx-tab-link.is-active {
+    color: var(--noet-text-primary);
+    background-color: var(--noet-bg-primary);
+    border-color: var(--noet-border-primary);
+    font-weight: var(--font-weight-6);
+}
+
+.xlsx-table-container {
+    overflow-x: auto;
+    margin-top: var(--size-3);
+}
+
+.xlsx-fullscreen-btn {
+    display: block;
+    margin-left: auto;
+    margin-bottom: var(--size-2);
+    padding: var(--size-1) var(--size-3);
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+}
+
+.xlsx-fullscreen-btn:hover {
+    background: var(--noet-bg-tertiary);
+    color: var(--noet-text-primary);
+}
+
+/* Wrap-enabled Tabulator cells — set via col.wrap: true in the xlsx schema.
+   Tabulator applies cssClass directly to .tabulator-cell elements.
+   Must use a two-component selector (.tabulator-row .tabulator-cell) to beat
+   Tabulator's own base rule which sets white-space:nowrap and overflow:hidden
+   at that specificity level. height:auto !important overrides the inline pixel
+   height Tabulator writes on each row when variableHeight is not set. */
+.tabulator-row .tabulator-cell.xlsx-cell-wrap {
+    white-space: normal;
+    word-break: break-word;
+    overflow: visible;
+    height: auto !important;
+    min-height: 2em;
+}
+
+/* Unresolved relation keys in xlsx tables — rendered as plain text spans with a
+   muted style so users can distinguish them from navigable links. No cursor
+   change (not clickable). The title attribute carries the raw key for debugging. */
+.xlsx-rel-unresolved {
+    color: var(--noet-text-secondary, #888);
+    font-style: italic;
+    cursor: default;
+}
+
+/* ── Tabulator theme overrides ──────────────────────────────────────────────
+   Remap Tabulator's hardcoded colors to --noet-* variables so the table
+   respects both light and dark themes. These rules override tabulator.min.css
+   by matching the same selectors at higher specificity (prefixed with .xlsx-tab
+   or .noet-focused-panel where needed) or by using the same selectors at a
+   later position in the cascade.                                               */
+
+/* Table container */
+.tabulator {
+    background-color: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+    font-family: var(--noet-font-family);
+    font-size: var(--font-size-0);
+}
+
+/* Header row */
+.tabulator .tabulator-header {
+    background-color: var(--noet-bg-secondary);
+    border-bottom: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+
+/* Header columns */
+.tabulator .tabulator-header .tabulator-col {
+    background: var(--noet-bg-secondary);
+    border-right: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+
+/* Column being dragged */
+.tabulator .tabulator-header .tabulator-col.tabulator-moving {
+    background: var(--noet-bg-tertiary);
+    border: 1px solid var(--noet-border-primary);
+}
+
+/* Sort arrow */
+.tabulator .tabulator-header .tabulator-col .tabulator-col-sorter .tabulator-arrow {
+    border-bottom-color: var(--noet-text-secondary);
+}
+.tabulator
+    .tabulator-header
+    .tabulator-col.tabulator-sortable[aria-sort="none"]
+    .tabulator-col-sorter
+    .tabulator-arrow {
+    border-bottom-color: var(--noet-text-secondary);
+}
+.tabulator
+    .tabulator-header
+    .tabulator-col.tabulator-sortable[aria-sort="ascending"]
+    .tabulator-col-sorter
+    .tabulator-arrow,
+.tabulator
+    .tabulator-header
+    .tabulator-col.tabulator-sortable[aria-sort="descending"]
+    .tabulator-col-sorter
+    .tabulator-arrow {
+    border-bottom-color: var(--noet-text-primary);
+    border-top-color: var(--noet-text-primary);
+}
+
+/* Header filter inputs */
+.tabulator .tabulator-header .tabulator-col .tabulator-header-filter input,
+.tabulator .tabulator-header .tabulator-col .tabulator-header-filter select {
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    border: 1px solid var(--noet-border-primary);
+}
+
+/* Frozen header columns */
+.tabulator .tabulator-header .tabulator-frozen.tabulator-frozen-left {
+    border-right-color: var(--noet-border-primary);
+}
+.tabulator .tabulator-header .tabulator-frozen.tabulator-frozen-right {
+    border-left-color: var(--noet-border-primary);
+}
+
+/* Data rows */
+.tabulator-row {
+    background-color: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+}
+.tabulator-row.tabulator-row-even {
+    background-color: var(--noet-bg-secondary);
+}
+.tabulator-row:hover {
+    background-color: var(--noet-bg-tertiary);
+}
+.tabulator-row:focus {
+    background-color: var(--noet-bg-tertiary);
+    outline: 2px solid var(--noet-link);
+    outline-offset: -2px;
+    z-index: 1;
+}
+.tabulator-row.tabulator-selected {
+    background-color: color-mix(in srgb, var(--noet-link) 20%, var(--noet-bg-primary));
+}
+.tabulator-row.tabulator-selected:hover {
+    background-color: color-mix(in srgb, var(--noet-link) 30%, var(--noet-bg-primary));
+}
+
+/* Cells — display:flex + align-items:stretch ensures all cells in a row
+   share the same height so borders extend the full row height even when
+   adjacent cells have different content lengths.  Overrides Tabulator's
+   default display:block on rows. */
+.tabulator-row {
+    display: flex;
+    align-items: stretch;
+}
+.tabulator-row .tabulator-cell {
+    border-right: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+    height: auto;
+}
+.tabulator-row .tabulator-cell.tabulator-frozen.tabulator-frozen-left {
+    border-right-color: var(--noet-border-primary);
+}
+.tabulator-row .tabulator-cell.tabulator-frozen.tabulator-frozen-right {
+    border-left-color: var(--noet-border-primary);
+}
+
+/* Column resize handle */
+.tabulator .tabulator-col-resize-guide,
+.tabulator .tabulator-row-resize-guide {
+    background-color: var(--noet-text-secondary);
+}
+
+/* Footer / pagination */
+.tabulator .tabulator-footer {
+    background-color: var(--noet-bg-secondary);
+    border-top: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+.tabulator .tabulator-footer .tabulator-page-size,
+.tabulator .tabulator-footer .tabulator-page {
+    background: color-mix(in srgb, var(--noet-bg-primary) 20%, transparent);
+    border: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+.tabulator .tabulator-footer .tabulator-page.active {
+    color: var(--noet-link);
+}
+.tabulator .tabulator-footer .tabulator-page:not(:disabled):hover {
+    background: var(--noet-bg-tertiary);
+    color: var(--noet-text-primary);
+}
+
+/* Frozen footer calcs */
+.tabulator .tabulator-header .tabulator-calcs-holder,
+.tabulator .tabulator-footer .tabulator-calcs-holder {
+    background: var(--noet-bg-secondary) !important;
+    border-color: var(--noet-border-primary);
+}
+.tabulator .tabulator-header .tabulator-calcs-holder .tabulator-row,
+.tabulator .tabulator-footer .tabulator-calcs-holder .tabulator-row {
+    background: var(--noet-bg-secondary) !important;
+}
+
+/* Row group headers */
+.tabulator-row.tabulator-group {
+    background: var(--noet-bg-secondary);
+    border-top: 1px solid var(--noet-border-primary);
+    border-bottom: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+.tabulator-row.tabulator-group:hover {
+    background-color: var(--noet-bg-tertiary);
+}
+.tabulator-row.tabulator-group .tabulator-arrow {
+    border-left-color: var(--noet-text-secondary);
+}
+.tabulator-row.tabulator-group.tabulator-group-visible .tabulator-arrow {
+    border-top-color: var(--noet-text-secondary);
+}
+
+/* Placeholder (empty table) */
+.tabulator .tabulator-tableholder .tabulator-placeholder .tabulator-placeholder-contents {
+    color: var(--noet-text-secondary);
+}
+
+/* Alert overlay */
+.tabulator .tabulator-alert {
+    background: color-mix(in srgb, var(--noet-bg-overlay) 70%, transparent);
+}
+.tabulator .tabulator-alert .tabulator-alert-msg {
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+}
+
+/* Popup (e.g. header menu) */
+.tabulator-popup-container {
+    background: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+.tabulator-menu .tabulator-menu-item:not(.tabulator-menu-item-disabled):hover {
+    background: var(--noet-bg-secondary);
+}
+.tabulator-menu .tabulator-menu-separator {
+    border-top-color: var(--noet-border-primary);
+}
+
+/* Edit dropdown list */
+.tabulator-edit-list .tabulator-edit-list-item {
+    color: var(--noet-text-primary);
+}
+.tabulator-edit-list .tabulator-edit-list-item.active,
+.tabulator-edit-list .tabulator-edit-list-item:hover {
+    background: var(--noet-link);
+    color: var(--noet-text-inverse);
+}
+.tabulator-edit-list .tabulator-edit-list-group {
+    color: var(--noet-text-secondary);
+    border-bottom-color: var(--noet-border-primary);
+}
+
+/* ── end Tabulator theme overrides ─────────────────────────────────────────── */
+
+/* ── end xlsx tab layout ────────────────────────────────────────────────────── */
+
 .noet-content table {
     width: 100%;
     border-collapse: collapse;
     margin-bottom: var(--size-4);
+    background: transparent;
 }
 
 .noet-content th,
@@ -1055,11 +1780,264 @@ html.is-resizing .noet-metadata__collapse {
     padding: var(--size-2) var(--size-3);
     border: 1px solid var(--noet-border-primary);
     text-align: left;
+    background: transparent;
+    max-inline-size: none;
 }
 
 .noet-content th {
     background-color: var(--noet-bg-secondary);
     font-weight: var(--font-weight-6);
+}
+
+/* ── {query} directive output ─────────────────────────────────────────────── */
+
+.noet-query-result {
+    position: relative;
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    background: var(--noet-bg-secondary);
+    padding: var(--size-3);
+    margin-block: var(--size-4);
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.noet-query-open-search {
+    position: absolute;
+    top: var(--size-2);
+    right: var(--size-2);
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    padding: var(--size-1) var(--size-2);
+    cursor: pointer;
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-secondary);
+    opacity: 0.6;
+    transition: opacity 0.15s ease;
+}
+
+.noet-query-open-search:hover {
+    opacity: 1;
+    background: var(--noet-button-bg-hover);
+}
+
+.noet-query-result figure {
+    margin: 0;
+}
+
+.noet-query-result figcaption {
+    font-weight: var(--font-weight-6);
+    margin-bottom: var(--size-3);
+    padding-bottom: var(--size-2);
+    border-bottom: 1px solid var(--noet-border-secondary);
+}
+
+.noet-query-depth0 {
+    margin: 0;
+    padding: 0;
+}
+
+.noet-query-node-title {
+    font-size: var(--font-size-1);
+    margin-top: var(--size-3);
+    padding-top: var(--size-2);
+    border-top: 1px solid var(--noet-border-secondary);
+}
+
+.noet-query-node-title:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+.noet-query-node-title a {
+    color: var(--noet-text-primary);
+    text-decoration: none;
+}
+
+.noet-query-node-title a:hover {
+    text-decoration: underline;
+}
+
+.noet-query-node-title code {
+    font-size: 0.85em;
+    color: var(--noet-text-secondary);
+}
+
+.noet-query-schema {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-secondary);
+    font-style: italic;
+}
+
+.noet-query-node-text {
+    margin-left: 0;
+    padding-left: var(--size-4);
+    font-size: var(--font-size-1);
+    color: var(--noet-text-secondary);
+}
+
+.noet-query-node-text p {
+    margin-block: var(--size-1);
+}
+
+.noet-query-node-text:empty {
+    display: none;
+}
+
+.noet-query-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2) var(--radius-2) 0 0;
+    overflow: hidden;
+}
+
+.noet-query-table thead {
+    background-color: var(--noet-bg-secondary);
+}
+
+.noet-query-table thead th {
+    padding: var(--size-2) var(--size-3);
+    font-weight: var(--font-weight-6);
+    text-align: left;
+    border-bottom: 1px solid var(--noet-border-primary);
+}
+
+.noet-query-table thead th:not(:last-child) {
+    border-right: 1px solid var(--noet-border-secondary);
+}
+
+.noet-query-table tbody td {
+    padding: var(--size-2) var(--size-3);
+    border-bottom: 1px solid var(--noet-border-secondary);
+}
+
+.noet-query-table tbody td:not(:last-child) {
+    border-right: 1px solid var(--noet-border-secondary);
+}
+
+.noet-query-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.noet-query-empty {
+    color: var(--noet-text-secondary);
+    margin: 0;
+}
+
+pre.noet-query-error {
+    border: 1px solid var(--noet-text-secondary);
+    border-left: 3px solid var(--noet-text-secondary);
+    border-radius: var(--radius-2);
+    background: var(--noet-bg-secondary);
+    padding: var(--size-3);
+    margin-block: var(--size-4);
+    font-size: var(--font-size-1);
+    white-space: pre-wrap;
+    color: var(--noet-text-secondary);
+}
+
+/* ── end {query} directive output ─────────────────────────────────────────── */
+
+.noet-prev-next {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    align-items: center;
+    gap: var(--size-2);
+    padding-block: var(--size-2);
+    border-bottom: 1px solid var(--noet-border-secondary);
+}
+
+.noet-content article {
+    border-bottom: 1px solid var(--noet-border-secondary);
+}
+
+.noet-prev-next a {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--size-1);
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    color: var(--noet-link);
+    text-decoration: none;
+    font-size: var(--font-size-0);
+    transition: background-color 0.2s var(--ease-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+}
+
+.noet-prev-next a:hover {
+    background-color: var(--noet-bg-secondary);
+}
+
+.noet-prev-next__prev {
+    justify-self: start;
+    min-width: 0;
+}
+
+.noet-prev-next__current {
+    justify-self: center;
+    font-size: var(--font-size-1);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.noet-prev-next__next {
+    justify-self: end;
+    min-width: 0;
+}
+
+/* Override normalize's details/summary styling.  normalize uses
+   var(--surface-2) for details background, but we want --noet-bg-primary
+   (one step lighter/darker) plus an explicit border.  Summary gets a
+   transparent background instead of normalize's var(--surface-3). */
+.noet-metadata details,
+.noet-content details {
+    background: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    margin-bottom: var(--size-4);
+    padding: var(--size-2) var(--size-4);
+}
+
+.noet-content details[open] {
+    padding-bottom: var(--size-4);
+}
+
+/* Transparent summary background (normalize uses var(--surface-3) via :where()) */
+.noet-metadata summary,
+.noet-content summary {
+    background: transparent;
+    cursor: pointer;
+    font-weight: var(--font-weight-6);
+    padding: var(--size-2) 0;
+    user-select: none;
+    list-style: disclosure-closed;
+}
+
+.noet-content details[open] > summary {
+    list-style: disclosure-open;
+    margin-bottom: var(--size-3);
+}
+
+.noet-content summary:hover {
+    color: var(--noet-link);
+}
+
+.noet-content details > *:last-child {
+    margin-bottom: 0;
 }
 
 /* =========================================================================
@@ -1205,6 +2183,42 @@ h6:hover .noet-header-anchor {
     color: var(--noet-text-primary);
 }
 
+/* Inline-anchor nodes: the <a class="noet-inline-anchor"> and the 🔗 link
+   both live inside the <p> or <li>.  Simple :hover on the parent reveals them. */
+p:hover > .noet-header-anchor,
+li:hover > .noet-header-anchor {
+    opacity: 1;
+}
+
+/* =========================================================================
+   Toast Notification
+   ========================================================================= */
+
+.noet-toast {
+    position: fixed;
+    bottom: var(--size-6);
+    left: 50%;
+    transform: translateX(-50%) translateY(var(--size-4));
+    background: var(--noet-bg-secondary);
+    color: var(--noet-text-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    padding: var(--size-2) var(--size-4);
+    font-size: var(--font-size-1);
+    z-index: 10001;
+    opacity: 0;
+    transition:
+        opacity 0.2s var(--ease-2),
+        transform 0.2s var(--ease-2);
+    pointer-events: none;
+    box-shadow: var(--shadow-3);
+}
+
+.noet-toast--visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
 /* =========================================================================
    Special Namespace Link Styles
    ========================================================================= */
@@ -1215,25 +2229,25 @@ h6:hover .noet-header-anchor {
 }
 
 .noet-href-link {
-    color: var(--noet-link-color, var(--link));
+    color: var(--noet-link);
     text-decoration: none;
     transition: color 0.2s var(--ease-2);
 }
 
 .noet-href-link:hover {
-    color: var(--noet-link-hover, var(--link-visited));
+    color: var(--noet-link-hover);
     text-decoration: underline;
 }
 
 .noet-asset-metadata-link {
-    color: var(--noet-link-color, var(--link));
+    color: var(--noet-link);
     text-decoration: none;
     cursor: pointer;
     transition: color 0.2s var(--ease-2);
 }
 
 .noet-asset-metadata-link:hover {
-    color: var(--noet-link-hover, var(--link-visited));
+    color: var(--noet-link-hover);
     text-decoration: underline;
 }
 
@@ -1536,7 +2550,7 @@ h6:hover .noet-header-anchor {
     position: fixed;
     /* Sit just above the footer; ~48px is a safe footer-height estimate.
        If the footer height ever changes, update --noet-footer-height here too. */
-    bottom: calc(var(--noet-footer-height, 48px));
+    bottom: calc(var(--noet-footer-height, 64px));
     left: 0;
     right: 0;
     z-index: 190; /* below modals (typically 300+), above content */
@@ -1627,6 +2641,13 @@ h6:hover .noet-header-anchor {
     line-height: 1.5;
 }
 
+.noet-shard-drawer__hidden-note {
+    margin: var(--size-2, 0.5rem) var(--size-4, 1rem);
+    font-size: 0.75rem;
+    color: var(--noet-text-tertiary);
+    font-style: italic;
+}
+
 /* Error message inside drawer */
 .noet-shard-drawer__error {
     margin: var(--size-2, 0.5rem) var(--size-4, 1rem);
@@ -1679,6 +2700,54 @@ h6:hover .noet-header-anchor {
 @media print {
     .noet-footer__shard-tab,
     .noet-shard-drawer__body {
+        display: none !important;
+    }
+}
+
+/* =========================================================================
+   Shard Load Progress Bar
+   A 2px fixed bar at the top of the viewport that appears while a background
+   shard load is in progress. Created and removed by JS (ensureNetworkLoaded).
+   Uses a shimmer animation to indicate indeterminate progress.
+   ========================================================================= */
+
+.noet-shard-progress {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    z-index: 9999;
+    overflow: hidden;
+    background-color: var(--noet-border-primary);
+    /* Counter for concurrent loads — bar stays visible until all finish */
+    pointer-events: none;
+}
+
+.noet-shard-progress::after {
+    content: "";
+    display: block;
+    height: 100%;
+    width: 40%;
+    background: var(--noet-link, #4e7fff);
+    animation: noet-shard-shimmer 1.4s ease-in-out infinite;
+    transform-origin: left center;
+}
+
+@keyframes noet-shard-shimmer {
+    0% {
+        transform: translateX(-100%);
+    }
+    60% {
+        transform: translateX(350%);
+    }
+    100% {
+        transform: translateX(350%);
+    }
+}
+
+@media print {
+    .noet-shard-progress {
         display: none !important;
     }
 }
@@ -1784,6 +2853,7 @@ h6:hover .noet-header-anchor {
 .noet-search-result {
     border-bottom: 1px solid var(--noet-border-secondary);
     cursor: pointer;
+    position: relative;
 }
 
 .noet-search-result:last-child {
@@ -1834,6 +2904,7 @@ h6:hover .noet-header-anchor {
     /* Allow snippet to wrap — content is useful */
     white-space: normal;
     overflow: hidden;
+    line-clamp: 3;
     /* Clamp to 3 lines */
     display: -webkit-box;
     -webkit-line-clamp: 3;
@@ -1850,6 +2921,32 @@ h6:hover .noet-header-anchor {
 }
 
 /* "idx" badge for results from unloaded network shards */
+.noet-search-result__explore {
+    position: absolute;
+    top: var(--size-2);
+    right: var(--size-2);
+    z-index: 1;
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-1);
+    padding: var(--size-1);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.noet-search-result:hover .noet-search-result__explore,
+.noet-search-result.is-selected .noet-search-result__explore {
+    opacity: 1;
+}
+
+.noet-search-result__explore:hover {
+    background: var(--noet-button-bg-hover);
+    border-color: var(--noet-border-primary);
+}
+
 .noet-search-result__badge {
     flex-shrink: 0;
     font-size: var(--font-size-00);
@@ -1868,4 +2965,1016 @@ h6:hover .noet-header-anchor {
     .noet-search-results {
         display: none !important;
     }
+}
+
+/* =========================================================================
+   Traceability Side Panel
+   Slides in from the right, anchored to the left edge of .noet-metadata.
+   On desktop: fixed panel, full viewport height, material card style.
+   On mobile: embedded inside .noet-metadata as lower 70% of the drawer.
+   ========================================================================= */
+
+/* Hidden by default — off-screen to the right. */
+.noet-focused-panel {
+    display: none; /* hidden on mobile until .has-focused-panel is set */
+    flex-direction: column;
+    background: var(--noet-bg-primary);
+    overflow: hidden;
+}
+
+/* Desktop: fixed side panel sliding in from the right */
+@media (min-width: 1024px) {
+    .noet-focused-panel {
+        display: none;
+        position: fixed;
+        top: 0;
+        bottom: var(--noet-footer-height, 64px);
+        right: var(--noet-metadata-width, 320px);
+        width: calc(100vw - var(--noet-metadata-width, 320px) - 20px);
+        z-index: 41;
+        border-left: 1px solid var(--noet-border-primary);
+        border-top: 1px solid var(--noet-border-primary);
+        border-bottom: 1px solid var(--noet-border-primary);
+    }
+
+    .noet-focused-panel.is-open {
+        display: flex;
+        z-index: 110;
+        /* Left-only shadow — extends leftward over nav, does not bleed onto metadata panel */
+        box-shadow: -12px 0 0 12px rgba(0, 0, 0, 0.22);
+        /* Clip the hard-spread shadow so it doesn't bleed below the panel
+           into the footer. inset() matches the panel bounds exactly. */
+        clip-path: inset(0 0 0 -24px);
+    }
+
+    /* When metadata is collapsed, pin panel to right edge instead */
+    .metadata-collapsed .noet-focused-panel.is-open {
+        right: 0;
+    }
+}
+
+/* Mobile: panel is moved inside .noet-metadata by JS.
+   .has-focused-panel on .noet-metadata triggers the expanded drawer layout. */
+@media (max-width: 1023px) {
+    /* Expand the metadata drawer to show both metadata + focused panel */
+    .noet-metadata.has-focused-panel {
+        height: 70vh;
+        max-height: none;
+    }
+
+    /* Metadata scroll area shrinks to top 30% */
+    .noet-metadata.has-focused-panel .noet-metadata-content {
+        flex: 0 0 30%;
+        overflow-y: auto;
+    }
+
+    /* Focused panel fills the bottom 70% when embedded */
+    .noet-metadata.has-focused-panel .noet-focused-panel {
+        display: flex;
+        flex: 0 0 70%;
+        overflow: hidden;
+        border-top: 1px solid var(--noet-border-primary);
+        border-radius: 0;
+        transform: none; /* no slide animation on mobile — just show/hide */
+    }
+}
+
+.noet-traceability {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+@media (max-width: 1023px) {
+    .noet-traceability {
+        max-height: 85vh;
+    }
+}
+
+.noet-traceability__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--size-3) var(--size-4) var(--size-3) var(--size-4);
+    border-bottom: 1px solid var(--noet-border-primary);
+    flex-shrink: 0;
+    position: relative;
+}
+
+.noet-traceability__title {
+    font-size: var(--font-size-3);
+    font-weight: var(--noet-font-weight-heading);
+    margin: 0;
+}
+
+.noet-traceability__close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: var(--font-size-3);
+    color: var(--noet-text-secondary);
+    padding: var(--size-1) var(--size-2);
+    border-radius: var(--radius-2);
+    line-height: 1;
+}
+
+.noet-traceability__close:hover {
+    background: var(--noet-bg-tertiary);
+    color: var(--noet-text-primary);
+}
+
+/* .noet-traceability__controls removed — replaced by
+   __query-region and __view-region sections */
+
+/* ── Query region ──────────────────────────────────────────────────────── */
+
+.noet-traceability__query-region {
+    padding: var(--size-2) var(--size-4);
+    border-bottom: 1px solid var(--noet-border-primary);
+    background: var(--noet-bg-secondary);
+    flex-shrink: 0;
+}
+
+.noet-traceability__section-label {
+    font-size: var(--font-size-0);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.noet-traceability__query-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--size-2);
+    margin-bottom: var(--size-2);
+}
+
+.noet-traceability__query-body[hidden] {
+    display: none;
+}
+
+/* ── Subject selector ─────────────────────────────────────────────────── */
+
+.noet-traceability__subject-selector {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--size-2);
+    margin-bottom: var(--size-2);
+}
+
+.noet-traceability__subject-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--size-1);
+    flex: 1;
+    min-width: 0;
+}
+
+.noet-traceability__subject-all {
+    font-size: var(--font-size-0);
+    color: var(--noet-text-tertiary);
+    font-style: italic;
+}
+
+.noet-traceability__subject-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--size-1);
+    padding: 1px var(--size-2);
+    border: 1px solid var(--noet-accent-primary, var(--noet-border-primary));
+    border-radius: var(--radius-2);
+    background: var(--noet-bg-primary);
+    font-size: var(--font-size-0);
+    max-width: 25ch;
+    white-space: nowrap;
+}
+
+.noet-traceability__chip-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+
+.noet-traceability__chip-remove {
+    background: none;
+    border: none;
+    color: var(--noet-text-tertiary);
+    cursor: pointer;
+    font-size: 0.65rem;
+    line-height: 1;
+    padding: 0;
+    flex-shrink: 0;
+}
+
+.noet-traceability__chip-remove:hover {
+    color: var(--noet-error, #c00);
+}
+
+.noet-traceability__subject-input-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 12ch;
+}
+
+.noet-traceability__subject-input {
+    width: 100%;
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__subject-input:focus {
+    outline: 2px solid var(--noet-accent-primary);
+    outline-offset: -1px;
+}
+
+.noet-traceability__subject-suggestions {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    background: var(--noet-bg-primary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    box-shadow: var(--noet-shadow-medium);
+    max-height: 200px;
+    overflow-y: auto;
+    list-style: none;
+    margin: var(--size-1) 0 0;
+    padding: var(--size-1) 0;
+}
+
+.noet-traceability__subject-suggestion {
+    padding: var(--size-1) var(--size-3);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__subject-suggestion:hover,
+.noet-traceability__subject-suggestion.is-active {
+    background: var(--noet-bg-tertiary);
+}
+
+.noet-traceability__suggestion-title {
+    display: block;
+    font-weight: var(--font-weight-6);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.noet-traceability__suggestion-path {
+    display: block;
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-tertiary);
+    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* .noet-traceability__query-text removed — query input is now in __query-bar */
+
+.noet-traceability__parse-error {
+    width: 100%;
+    font-size: var(--font-size-0);
+    color: var(--noet-error, #c00);
+    margin-top: var(--size-1);
+}
+
+.noet-traceability__steps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--size-1);
+    margin-top: var(--size-2);
+}
+
+.noet-traceability__steps:empty {
+    display: none;
+}
+
+.noet-traceability__step-card {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--size-1);
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    background: var(--noet-bg-primary);
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__step-card--subject {
+    border-color: var(--noet-accent-primary, var(--noet-border-primary));
+}
+
+.noet-traceability__step-type {
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-00, 0.75rem);
+    text-transform: uppercase;
+}
+
+.noet-traceability__step-input {
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-tertiary);
+    font-weight: var(--font-weight-6);
+    font-family: var(--font-mono);
+    padding: 0 var(--size-1);
+    border-right: 1px solid var(--noet-border-secondary);
+    margin-right: var(--size-1);
+    flex-shrink: 0;
+    cursor: default;
+}
+
+.noet-traceability__step-detail {
+    color: var(--noet-text-primary);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.noet-traceability__step-detail:hover {
+    text-decoration: underline;
+    text-decoration-style: dotted;
+}
+
+.noet-traceability__step-nav {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0;
+    margin-right: var(--size-1);
+}
+
+.noet-traceability__step-btn {
+    background: none;
+    border: none;
+    color: var(--noet-text-tertiary);
+    cursor: pointer;
+    font-size: 0.6rem;
+    line-height: 1;
+    padding: 0 2px;
+}
+
+.noet-traceability__step-btn:hover {
+    color: var(--noet-text-primary);
+}
+
+.noet-traceability__step-btn--remove {
+    font-size: var(--font-size-00, 0.75rem);
+    margin-left: auto;
+    opacity: 0.4;
+}
+
+.noet-traceability__step-btn--remove:hover {
+    opacity: 1;
+    color: var(--noet-error, #c00);
+}
+
+.noet-traceability__step-add {
+    display: inline-flex;
+    align-items: center;
+    padding: var(--size-1) var(--size-2);
+    border: 1px dashed var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    background: none;
+    color: var(--noet-text-tertiary);
+    font-size: var(--font-size-0);
+    cursor: pointer;
+}
+
+.noet-traceability__step-add:hover {
+    border-color: var(--noet-border-primary);
+    color: var(--noet-text-primary);
+}
+
+.noet-traceability__step-editor {
+    width: 100%;
+    padding: var(--size-2);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-2);
+    background: var(--noet-bg-primary);
+    font-size: var(--font-size-0);
+    margin-bottom: var(--size-1);
+}
+
+.noet-traceability__editor-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--size-2);
+    margin-bottom: var(--size-1);
+}
+
+.noet-traceability__editor-row:last-child {
+    margin-bottom: 0;
+}
+
+.noet-traceability__editor-row > label {
+    display: flex;
+    align-items: center;
+    gap: var(--size-1);
+    white-space: nowrap;
+}
+
+.noet-traceability__editor-select {
+    padding: 1px var(--size-1);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__editor-input {
+    padding: 1px var(--size-1);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+    width: 10ch;
+}
+
+.noet-traceability__editor-input--wide {
+    flex: 1;
+    min-width: 15ch;
+    width: auto;
+}
+
+.noet-traceability__editor-input--narrow {
+    width: 5ch;
+}
+
+.noet-traceability__editor-cb {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    cursor: pointer;
+    margin-right: var(--size-1);
+}
+
+.noet-traceability__editor-hint {
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-tertiary);
+    font-style: italic;
+}
+
+.noet-traceability__editor-group {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--size-1);
+    padding: 1px var(--size-1);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-secondary);
+}
+
+.noet-traceability__editor-divider {
+    color: var(--noet-text-tertiary);
+    font-weight: var(--font-weight-6);
+    font-family: var(--font-mono);
+    padding: 0 2px;
+    flex-shrink: 0;
+}
+
+.noet-traceability__editor-row--traverse {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__editor-branch {
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 8ch;
+}
+
+.noet-traceability__editor-branch-label {
+    font-size: var(--font-size-00, 0.75rem);
+    font-weight: var(--font-weight-6);
+    color: var(--noet-text-secondary);
+    text-transform: uppercase;
+}
+
+.noet-traceability__editor-branch-step {
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 20ch;
+}
+
+.noet-traceability__editor-row--pick {
+    flex-wrap: wrap;
+}
+
+.noet-traceability__step-pick {
+    padding: 1px var(--size-2);
+    border: 1px solid var(--noet-border-secondary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-00, 0.75rem);
+    cursor: pointer;
+}
+
+.noet-traceability__step-pick:hover {
+    border-color: var(--noet-accent-primary, var(--noet-border-primary));
+    color: var(--noet-text-primary);
+}
+
+.noet-traceability__step-label {
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-accent-primary, var(--noet-text-secondary));
+    font-family: var(--font-mono);
+    font-style: italic;
+}
+
+/* ── View region ──────────────────────────────────────────────────────── */
+
+.noet-traceability__view-region {
+    padding: var(--size-1) var(--size-4);
+    border-bottom: 1px solid var(--noet-border-secondary);
+    flex-shrink: 0;
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__view-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+}
+
+.noet-traceability__view-toggle {
+    background: none;
+    border: none;
+    color: var(--noet-text-secondary);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    padding: 0;
+}
+
+.noet-traceability__view-body {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--size-3);
+    margin-top: var(--size-1);
+}
+
+.noet-traceability__view-body[hidden] {
+    display: none;
+}
+
+.noet-traceability__view-actions {
+    display: flex;
+    gap: var(--size-1);
+}
+
+.noet-traceability__mode-select,
+.noet-traceability__tape-select {
+    padding: 1px var(--size-1);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+}
+
+/* ── Existing controls (updated context) ─────────────────────────────── */
+
+.noet-traceability__search-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--size-2);
+    flex: 1;
+    min-width: 0;
+}
+
+.noet-traceability__search-input {
+    flex: 1;
+    min-width: 12ch;
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__search-input:focus {
+    outline: 2px solid var(--noet-accent-primary);
+    outline-offset: -1px;
+}
+
+.noet-traceability__execute-btn {
+    flex-shrink: 0;
+    padding: var(--size-1) var(--size-3);
+    background: var(--noet-button-bg);
+    color: var(--noet-button-text);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    font-weight: var(--font-weight-6);
+    opacity: 0.5;
+    transition: opacity 0.15s ease;
+}
+
+.noet-traceability__execute-btn.is-dirty {
+    opacity: 1;
+}
+
+.noet-traceability__execute-btn:hover {
+    background: var(--noet-button-bg-hover);
+    opacity: 1;
+}
+
+.noet-traceability__network-filter {
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+    max-width: 20ch;
+}
+
+/* .noet-traceability__submap-controls removed — depth/maps_to
+   are now part of the query grammar, not separate controls */
+
+.noet-traceability__kind-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--size-2);
+}
+
+.noet-traceability__kind-label {
+    display: flex;
+    align-items: center;
+    gap: var(--size-1);
+    cursor: pointer;
+    user-select: none;
+}
+
+.noet-traceability__mapsto-label,
+.noet-traceability__depth-label {
+    display: flex;
+    align-items: center;
+    gap: var(--size-1);
+    cursor: pointer;
+    user-select: none;
+}
+
+.noet-traceability__depth-input {
+    width: 5ch;
+    padding: 0;
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-1);
+    background: var(--noet-bg-primary);
+    color: var(--noet-text-primary);
+    font-size: var(--font-size-0);
+    text-align: center;
+}
+
+.noet-traceability__btn {
+    padding: var(--size-1) var(--size-3);
+    background: var(--noet-button-bg);
+    color: var(--noet-button-text);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    font-weight: var(--noet-font-weight-medium);
+}
+
+.noet-traceability__btn:hover {
+    background: var(--noet-button-bg-hover);
+}
+
+.noet-traceability__toast {
+    position: absolute;
+    right: var(--size-8);
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    padding: var(--size-1) var(--size-3);
+    font-size: var(--font-size-0);
+    color: var(--noet-text-primary);
+    white-space: nowrap;
+    animation: noet-toast-fade 2.5s ease-in-out;
+    pointer-events: none;
+}
+
+@keyframes noet-toast-fade {
+    0% {
+        opacity: 0;
+    }
+    10% {
+        opacity: 1;
+    }
+    80% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0;
+    }
+}
+
+.noet-traceability__body {
+    flex: 1;
+    overflow: auto;
+    padding: 0;
+    border: 1px solid var(--noet-border-primary);
+    /* Single scrollport for both axes so thead { position: sticky; top: 0 }
+       is anchored here, not broken by a nested overflow-x container. */
+}
+
+.noet-traceability__loading,
+.noet-traceability__error,
+.noet-traceability__empty {
+    padding: var(--size-4) var(--size-4) var(--size-4) var(--size-4);
+    text-align: center;
+    color: var(--noet-text-secondary);
+}
+
+.noet-traceability__error {
+    color: var(--red-6);
+}
+
+.noet-traceability__table-wrap {
+    /* overflow-x is handled by the parent .noet-traceability__body so that
+       thead sticky positioning has a single scrolling ancestor. */
+    min-width: 0;
+}
+
+.noet-traceability__table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-0);
+}
+
+.noet-traceability__table thead {
+    position: sticky;
+    top: 0;
+    background: var(--noet-bg-secondary);
+    /* z-index above tbody rows so cells don't bleed through on scroll */
+    z-index: 2;
+}
+
+/* Override normalize.min.css which rounds the first/last th in thead */
+.noet-traceability__table thead th {
+    border-start-start-radius: 0;
+    border-start-end-radius: 0;
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+    background-color: transparent;
+}
+
+.noet-traceability__table th,
+.noet-traceability__table td {
+    padding: var(--size-1) var(--size-2);
+    border: 1px solid var(--noet-border-secondary);
+    text-align: left;
+    white-space: nowrap;
+}
+
+/* Explicit background on every tbody cell so the browser's native tr:hover
+   never bleeds through (tr background is visible wherever no td bg is set). */
+.noet-traceability__table tbody td {
+    background: var(--noet-bg-primary);
+}
+
+.noet-traceability__table th {
+    font-weight: var(--noet-font-weight-medium);
+    color: var(--noet-text-secondary);
+}
+
+.noet-traceability__col-path {
+    min-width: 200px;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.noet-traceability__col-links {
+    min-width: 8ch;
+}
+
+.noet-traceability__cell {
+    vertical-align: top;
+    padding: var(--size-1) var(--size-2);
+    max-width: 350px;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.noet-traceability__empty-cell {
+    color: var(--noet-text-tertiary);
+}
+
+.noet-traceability__link-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.noet-traceability__node-link {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    background: none;
+    border: none;
+    padding: 2px 0;
+    margin: 0;
+    cursor: pointer;
+    color: var(--noet-link);
+    font-size: var(--font-size-0);
+    font-family: var(--noet-font-family);
+    text-align: left;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.noet-traceability__tape-nav-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 4px 0;
+}
+
+.noet-traceability__tape-select {
+    flex: 1;
+    text-align: center;
+    margin: 0 8px;
+}
+
+.noet-traceability__tape-nav {
+    background: none;
+    border: 1px solid var(--noet-border, #ccc);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 1em;
+}
+
+.noet-traceability__role-link {
+    display: inline;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.noet-traceability__node-link:hover {
+    color: var(--noet-link-hover);
+}
+
+.noet-traceability__node-link:hover .noet-traceability__ref-label {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+/* Collapsed (repeat) reference: inline, identifier only */
+
+/* Full reference sub-elements */
+.noet-traceability__ref-label {
+    font-weight: var(--noet-font-weight-medium);
+    color: var(--noet-link);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    line-height: var(--font-lineheight-2);
+}
+
+.noet-traceability__ref-title {
+    color: var(--noet-text-primary);
+    font-style: italic;
+    line-height: var(--font-lineheight-2);
+}
+
+.noet-traceability__ref-text {
+    color: var(--noet-text-secondary);
+    font-size: var(--font-size-00, 0.75em);
+    line-height: var(--font-lineheight-3);
+    max-width: 40ch;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.noet-traceability__row--network {
+    font-weight: var(--noet-font-weight-medium);
+}
+
+/* Suppress browser native tr:hover (causes big-dipper shape with rowspans);
+   highlight individual cells instead. */
+.noet-traceability__row:hover {
+    background: inherit;
+}
+
+.noet-traceability__cell:hover {
+    background: var(--noet-bg-secondary);
+}
+
+.noet-traceability__row--network .noet-traceability__cell {
+    background: var(--noet-bg-tertiary) !important;
+}
+
+/* Keyboard-focused cell (all columns now unified under .noet-traceability__cell) */
+.noet-traceability__cell.is-keyboard-focused {
+    outline: 2px solid var(--noet-accent-primary);
+    outline-offset: -2px;
+}
+
+/* Gutter column: compact, muted, borderless */
+.noet-traceability__gutter-col {
+    font-size: var(--font-size-00, 0.75rem);
+    color: var(--noet-text-tertiary);
+    font-family: var(--font-mono);
+    padding: 1px 4px;
+    border: none !important;
+    white-space: nowrap;
+    vertical-align: top;
+    max-width: none;
+    background: transparent !important;
+}
+
+/* Depth heatmap badge — inline colored indicator */
+.noet-traceability__depth-badge {
+    display: inline-block;
+    min-width: 1.1em;
+    text-align: center;
+    border-radius: var(--radius-1, 2px);
+    padding: 0 2px;
+    font-weight: var(--font-weight-5, 500);
+}
+
+.noet-traceability__net-icon {
+    margin-right: var(--size-1);
+}
+
+/* Traceability View button — accent left-border hints panel expands leftward */
+.noet-traceability-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: var(--size-2) var(--size-3);
+    background: var(--noet-bg-secondary);
+    border: 1px solid var(--noet-border-secondary);
+    border-left: 3px solid var(--noet-accent-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    font-size: var(--font-size-1);
+    color: var(--noet-text-primary);
+    font-weight: var(--noet-font-weight-medium);
+    transition: background 0.15s ease;
+}
+
+.noet-traceability-btn:hover {
+    background: var(--noet-bg-tertiary);
+}
+
+.noet-traceability-btn.is-active {
+    background: var(--noet-bg-tertiary);
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.18);
+    border-left-color: var(--noet-accent-secondary, var(--noet-accent-primary));
+    color: var(--noet-accent-primary);
+}
+
+.noet-traceability-btn.is-active:hover {
+    background: var(--noet-bg-secondary);
+}
+
+/* Traceability trigger button in metadata panel */
+.noet-metadata-action-btn {
+    display: block;
+    width: 100%;
+    padding: var(--size-2) var(--size-3);
+    background: var(--noet-button-bg);
+    color: var(--noet-button-text);
+    border: 1px solid var(--noet-border-primary);
+    border-radius: var(--radius-2);
+    cursor: pointer;
+    font-size: var(--font-size-0);
+    font-weight: var(--noet-font-weight-medium);
+    text-align: center;
+}
+
+.noet-metadata-action-btn:hover {
+    background: var(--noet-button-bg-hover);
 }

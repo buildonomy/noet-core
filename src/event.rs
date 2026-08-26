@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::{
     nodekey::NodeKey,
-    properties::{Bid, Bref, Weight, WeightKind, WeightSet},
+    properties::{BeliefNode, Bid, Bref, Weight, WeightKind, WeightSet},
 };
 
 /// Indicates the origin of a BeliefEvent for proper handling by different cache implementations.
@@ -23,8 +23,16 @@ pub enum EventOrigin {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BeliefEvent {
-    /// Keys mapping to old node, toml-serialized node
-    NodeUpdate(Vec<NodeKey>, String, EventOrigin),
+    /// Apply a node with merge semantics: the provided keys are resolved against existing
+    /// nodes to detect renames/replacements (see `insert_state`). Use this when the caller
+    /// cannot guarantee the BID is already canonical (e.g. Phase 1 `push()` calls where
+    /// two nodes may share a NodeKey::Id and one must absorb the other).
+    NodeUpdate(Vec<NodeKey>, BeliefNode, EventOrigin),
+    /// Apply a node directly by BID with no merge/replace semantics. The BID is already
+    /// canonical — no collision resolution, no `to_replace` loop, no TOML round-trip.
+    /// Use this for batch paths (Phase 2 relation queue, `merge_graph_mut`) where all
+    /// nodes have already been resolved to their final BIDs in Phase 1.
+    NodeUpsert(Bid, BeliefNode, EventOrigin),
     NodesRemoved(Vec<Bid>, EventOrigin),
     /// From ID, To ID
     NodeRenamed(Bid, Bid, EventOrigin),
@@ -56,6 +64,9 @@ impl PartialEq for BeliefEvent {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::NodeUpdate(l0, l1, l2), Self::NodeUpdate(r0, r1, r2)) => {
+                l0 == r0 && l1 == r1 && l2 == r2
+            }
+            (Self::NodeUpsert(l0, l1, l2), Self::NodeUpsert(r0, r1, r2)) => {
                 l0 == r0 && l1 == r1 && l2 == r2
             }
             (Self::NodesRemoved(l0, l1), Self::NodesRemoved(r0, r1)) => l0 == r0 && l1 == r1,
@@ -94,6 +105,7 @@ impl BeliefEvent {
     pub fn origin(&self) -> Option<EventOrigin> {
         match self {
             BeliefEvent::NodeUpdate(_, _, origin) => Some(*origin),
+            BeliefEvent::NodeUpsert(_, _, origin) => Some(*origin),
             BeliefEvent::NodesRemoved(_, origin) => Some(*origin),
             BeliefEvent::NodeRenamed(_, _, origin) => Some(*origin),
             BeliefEvent::PathAdded(_, _, _, _, origin) => Some(*origin),
@@ -112,7 +124,8 @@ impl BeliefEvent {
     /// Returns a new event with the specified origin
     pub fn with_origin(self, new_origin: EventOrigin) -> Self {
         match self {
-            BeliefEvent::NodeUpdate(k, s, _) => BeliefEvent::NodeUpdate(k, s, new_origin),
+            BeliefEvent::NodeUpdate(k, n, _) => BeliefEvent::NodeUpdate(k, n, new_origin),
+            BeliefEvent::NodeUpsert(b, n, _) => BeliefEvent::NodeUpsert(b, n, new_origin),
             BeliefEvent::NodesRemoved(b, _) => BeliefEvent::NodesRemoved(b, new_origin),
             BeliefEvent::NodeRenamed(f, t, _) => BeliefEvent::NodeRenamed(f, t, new_origin),
             BeliefEvent::PathAdded(n, p, b, o, _) => BeliefEvent::PathAdded(n, p, b, o, new_origin),
@@ -137,6 +150,7 @@ impl BeliefEvent {
     pub fn as_str(&self) -> &'static str {
         match self {
             BeliefEvent::NodeUpdate(..) => "NodeUpdate",
+            BeliefEvent::NodeUpsert(..) => "NodeUpsert",
             BeliefEvent::NodesRemoved(..) => "NodesRemoved",
             BeliefEvent::NodeRenamed(..) => "NodeRenamed",
             BeliefEvent::PathAdded(..) => "PathAdded",
@@ -157,6 +171,7 @@ impl Display for BeliefEvent {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             BeliefEvent::NodeUpdate(_, _, _) => write!(f, "NodeUpdate"),
+            BeliefEvent::NodeUpsert(_, _, _) => write!(f, "NodeUpsert"),
             BeliefEvent::NodesRemoved(_, _) => write!(f, "NodesRemoved"),
             BeliefEvent::NodeRenamed(_, _, _) => write!(f, "NodeRenamed"),
             BeliefEvent::PathAdded(_, _, _, _, _) => write!(f, "PathAdded"),
@@ -173,22 +188,9 @@ impl Display for BeliefEvent {
     }
 }
 
-// // TODO: Make perceptionevent into a trait? Such that different value types can be tracked by the compiler
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PerceptionEvent {
-    /// An event to automatically fill out an input field within a procedure
-    Input(Bid, String),
-    /// A participant focus event (hover/select within a table of contents or belief link for example)
-    Focus(Bid),
-    /// A change of awareness that should result in a change to the BeliefBase store within the UI
-    Awareness(Vec<Bid>),
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     #[default]
     Ping,
     Belief(BeliefEvent),
-    // Perception(PerceptionEvent),
-    Focus(PerceptionEvent),
 }
