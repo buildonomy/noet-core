@@ -27,6 +27,21 @@ production: `DbConnection` generates SQL, `BeliefBase` does in-memory graph
 traversal, WASM does the initial background parse. No intermediate
 `Expression` type exists.
 
+## Updates
+
+### 2026-08-27: Post-issue drift
+
+- Target trait shape verified in `src/query/mod.rs`; `Expression`, `StatePred`,
+  `RelationPred`, `eval_unbalanced` are gone.
+- `Subject` deleted: `QuerySpec` is `{ steps }`, seed is a `TapeFn` on step 0,
+  plus `StepOperation::Identity` (Issue 82 step 8).
+- `Filter(FilterSpec)` → `Filter(NodeFilter)`; `Compose(ComposeSpec)` →
+  `Compose(Composition)`
+- `src/mcp/state.rs` holds `BeliefSourceKind` + `source_ref()`; no
+  `McpBeliefSource` shim, no `Box<dyn BeliefSource>`.
+- `Instrument` trait not adopted; views are `ViewRenderer` + `ViewRegistry` in
+  `src/query/view/mod.rs`.
+
 ## Goals
 
 - `BeliefSource` primary method: `eval(&QuerySpec) -> EvalOutput`

@@ -36,6 +36,38 @@ Documentation for `noet-core` open source library completed in two stages:
 
 **Verification**: "Documentation compiles" means `cargo doc` passes without errors and all cross-references resolve correctly.
 
+## Updates
+
+### 2026-08-27: Path references are stale; documentation hierarchy has moved
+
+This issue predates the `rust_core/crates/core/` → standalone-repo extraction it
+describes, so most `rust_core/crates/core/...` paths throughout the body
+(Architecture, Implementation Steps, References, Stage 1 Completion Notes) refer
+to the pre-extraction workspace layout and don't exist in the now-standalone
+`noet-core` repo. This is expected for a historical record of a migration and is
+not itself an error, but a reader following those paths today should instead
+look at:
+
+- `docs/design/architecture.md` (not `docs/architecture.md` — the design docs
+  were consolidated under `docs/design/` at some point after this issue closed)
+- `docs/README.md` — current documentation map and hierarchy
+- `docs/project/DOCUMENTATION_STRATEGY.md` — still exists and still describes
+  the same hierarchy, though the concrete file `docs/architecture.md` it
+  references (§"`docs/architecture.md`: High-Level Architecture") has since
+  moved to `docs/design/architecture.md`.
+
+The `beliefbase_architecture.md` version claim ("version updated to 0.2") is a
+point-in-time note from the original migration and is not a currently-accurate
+version number.
+
+Two cross-referenced roadmap files no longer exist under those names:
+`ROADMAP_NOET-CORE_v0.1.md` and `ROADMAP_HTML_RENDERING.md`. Project history
+and roadmap content now lives in `docs/project/ROADMAP.md`.
+
+No further action taken — this issue is a closed historical record and its
+core narrative (soft-open-source doc migration) is accurate; only the specific
+file paths have drifted with later reorganization.
+
 ## Goals
 
 1. Migrate `beliefbase_architecture.md` to core library design docs, removing lattice references

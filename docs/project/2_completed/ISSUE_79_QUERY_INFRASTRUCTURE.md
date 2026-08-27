@@ -3,7 +3,7 @@
 **Version**: 0.1
 **Priority**: HIGH
 **Estimated Effort**: 5 days (RELATIVE COMPARISON ONLY)
-**Status**: Near-complete (Steps 1–5 done, Step 6 deferred to Issue 82)
+**Status**: Near-complete (Steps 1–5 done, Step 6 deferred to Issue 82), OBE
 **Dependencies**: Blocks Issue 80 (Query Parser), Blocks Issue 81 (`{query}`
 Directive). Related to Issue 83 (BeliefSource refactoring — the follow-on
 that deletes `Expression` and makes `QuerySpec` the sole primitive).
@@ -21,6 +21,18 @@ The evaluation currently lowers `QuerySpec` to the existing `Expression`/
 `eval_query` infrastructure. Issue 83 replaces this with direct evaluation
 and deletes `Expression`. The `QuerySpec` types and `Instrument` trait from
 this issue are stable across that transition — consumers don't change.
+
+## Updates
+
+### 2026-08-27: Superseded by Issue 83
+
+- `src/query/expression.rs` deleted; `src/query/instrument/` → `src/query/view/` (`mod.rs`, `table.rs`, `raw_tape.rs`)
+- `Instrument` / `TableInstrument` / `InstrumentConfig` → `ViewRenderer` / `TableView` + `toml::Table` params via `VIEWS` / `ViewRegistry`
+- `TableDisplayMode` has 3 modes (Depth0, Columns, Connectivity) — no MapsTo
+- `Subject` enum removed; `QuerySpec` = `{ steps: Vec<ProjectionStep> }`, seed is the first step's `input: TapeFn`
+- `ProjectionStep` = `{ label, input: TapeFn, operation: StepOperation }` (Filter/Traverse/Compose/Identity)
+- `QuerySpec::evaluate(&BeliefSource)` → `BeliefSource::evaluate(&mut QueryPackage)` (`src/query/mod.rs`)
+- `TraversalSpec` roles/kinds are `EnumSet`; adds `depth: TraversalDepth` and an inversion flag
 
 ## Goals
 

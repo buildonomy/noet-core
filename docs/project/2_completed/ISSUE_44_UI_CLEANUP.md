@@ -28,6 +28,16 @@ Successfully completed all 5 phases:
 
 Clean up HTML viewer UI/UX issues discovered during ISSUE_38/39 work: fix network index.html generation bug, improve collapse button accessibility, remove redundant header, adjust font weights for visual hierarchy, and add a distinctive reading font for brand identity.
 
+## Updates
+
+### 2026-08-27: Viewer JS restructured into ES modules
+
+- `assets/viewer.js` (formerly monolithic) → thin entry point importing `assets/viewer/*.js`
+- Collapse/panel logic (Phase 2/3) now lives in `assets/viewer/panels.js`
+- Header/nav-tree logic now in `assets/viewer/navigation.js`, `assets/viewer/content.js`
+- Font weight vars (`--noet-font-weight-*`) and vendored IBM Plex Sans (Phase 4/5) unchanged, still current in `assets/noet-theme-{light,dark}.css` and `assets/fonts/`
+- Network index generation fix (Phase 1) unchanged, still current in `src/codec/compiler.rs`
+
 ## Goals
 
 - Fix network index.html generation (currently not working)

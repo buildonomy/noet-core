@@ -15,6 +15,18 @@ this corrupts PathMap paths and causes `cache_fetch` misses on re-parse when
 `Option<String>` with a `NodeId` enum that separates the collision signal from
 the anchor value.
 
+## Updates
+
+### 2026-08-27: API drift
+
+- `NodeId::Collision` → `NodeId::Collision(String)` (carries the colliding slug;
+  see `src/properties.rs`)
+- "Ephemeral, not persisted" no longer holds: `Collision` serializes with the
+  `COLLISION_PREFIX` (`@@collision:`) sentinel and round-trips; only `Slug`
+  serializes as absent
+- Backward-compat `id()` retained; bref-disambiguated lookups now use
+  `BeliefNode::collision_aware_id()`
+
 ## Goals
 
 - Eliminate duplicate section nodes caused by FIRST-ONE-WINS + re-parse interaction

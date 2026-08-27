@@ -188,6 +188,15 @@ ls -lh open-props/
 
 **Note:** All committed files in `assets/` are embedded in the binary at compile time via `include_dir!`. Keep vendored assets minimal to avoid binary bloat.
 
+### Vendored Binaries (`vendor/`)
+
+The same commit-and-embed pattern applies to `vendor/`, which holds the
+`miniserve` static-file-server binary used by the `distribute` feature
+(enabled by default). It is embedded via `include_bytes!` in
+`src/distribute.rs` rather than downloaded at build time — see
+[`vendor/README.md`](vendor/README.md) for the binary inventory and update
+instructions. No separate fetch step is required before building.
+
 ## Getting Help
 
 - **Questions**: [GitHub Discussions](https://github.com/buildonomy/noet-core/discussions)

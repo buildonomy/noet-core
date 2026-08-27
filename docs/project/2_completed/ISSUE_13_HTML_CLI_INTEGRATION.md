@@ -24,6 +24,29 @@ Integrate HTML generation from Issue 6 into the `noet` CLI tool and daemon from 
 
 **Post-Implementation**: noet becomes a complete static site generator with live reload capability, suitable for documentation sites, knowledge bases, and networked note systems.
 
+## Updates
+
+### 2026-08-27: Confirming OBE status; flag name and live-reload mechanism differ from this design
+
+The pre-existing OBE banner at the top of this file is accurate and still
+current — no further status change needed. Two additional specifics for anyone
+following this doc as a reference rather than history:
+
+- **The flag is `--html-output <dir>`, not `--html <dir>`** on both `noet parse`
+  and `noet watch` (see `src/cli.rs`, `pub enum Commands`). This issue's CLI
+  examples throughout (§"CLI Integration", §"Testing Requirements", etc.) use
+  the `--html` name, which was never shipped.
+- **Live reload uses Server-Sent Events (SSE), not WebSockets.** The actual
+  implementation (`src/dev_server.rs`, wired via `noet watch --serve`) is an
+  axum + `tower-http` static file server pushing SSE `reload` events, matching
+  what Issue 6 documents (§"5. Dev Server with Live Reload"), not the
+  `tokio-tungstenite` WebSocket approach sketched in this issue's
+  §"7. Live Reload Server" and dependency list above.
+- Current HTML-generation architecture (codec-level `generate_html()`,
+  two-registry codec dispatch, sharded/msgpack export) is documented in the
+  Updates section of `ISSUE_06_HTML_GENERATION.md` and in
+  `docs/design/interactive_viewer.md` / `docs/design/search_and_sharding.md`.
+
 ## Goals
 
 1. Add `--html <output_dir>` flag to `noet parse` subcommand

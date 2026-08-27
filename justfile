@@ -37,10 +37,6 @@ deps:
     rustup component add rustfmt clippy
     @if ! command -v wasm-bindgen > /dev/null 2>&1; then cargo install wasm-bindgen-cli --version 0.2.108; else echo "wasm-bindgen already present"; fi
 
-# Fetch vendored third-party binaries (miniserve, for the `distribute` feature).
-vendor:
-    ./vendor/fetch.sh
-
 # ---------------------------------------------------------------------------
 # CI job: test-matrix
 #

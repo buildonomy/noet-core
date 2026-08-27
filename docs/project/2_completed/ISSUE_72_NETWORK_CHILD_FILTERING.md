@@ -16,6 +16,19 @@ dirs). Rejected children are registered with `CLAIM_MAP.reject()` (a `None` sent
 `parse_one_path` routes them to `UnclaimedDataCodec` + `ParseDiagnostic::info` without
 producing any nodes.
 
+## Updates
+
+### 2026-08-27: Line-number drift
+
+Core mechanism (whitelist/blacklist semantics, two-site claiming, `CLAIM_MAP.reject()` sentinel, four-branch dispatch) is unchanged and matches current `src/codec/network.rs` / `src/codec/compiler.rs`. Cited line ranges have drifted with file growth:
+
+| Item | Doc cites | Current |
+|------|-----------|---------|
+| `build_glob_set`/`apply_child_filter` | L17–56 | L164–203 |
+| `NetworkCodec::parse()` | L250–366 | L425–~640 |
+| `prepare_proto_relations` | L136–248 | L306–423 |
+| `parse_one_path` dispatch | ~L1491 | ~L1926 |
+
 ## Problem Statement
 
 Currently `net_dir_partition` includes any file matched by `CODECS ∪ WALK_CODECS`

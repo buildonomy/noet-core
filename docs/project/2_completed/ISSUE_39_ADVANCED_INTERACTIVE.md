@@ -58,6 +58,15 @@ Implement two-click navigation pattern and metadata panel display for the intera
 - ✅ Reading mode + collapsible panels
 - ✅ Visible error states
 
+## Updates
+
+### 2026-08-27: Path/data-format drift
+
+- `assets/viewer.js` → `assets/viewer/*.js` (16 ES modules; two-click logic now in `content.js`, `routing.js`, `xlsx-tabs.js`).
+- `NavTree`/`NavNode` (`get_nav_tree()`) is implemented and consumed by `navigation.js`; the "Remaining Work: update viewer.js to consume get_nav_tree()" checklist in Phase 0.2 is done, unlike the checkbox state shown.
+- `beliefbase.json` → `beliefbase.msgpack` / sharded `beliefbase/*.msgpack` (Issue 50); `BeliefBaseWasm` construction now via `from_msgpack`/`from_manifest`, not `from_json` with two string args as described in Session 11.
+- `tests/browser/twoclick_test.html` and `metadata_test.html` (referenced in Session 11) no longer exist.
+
 ## Goals
 
 **Phase 1 Scope** (this issue): ✅ COMPLETE

@@ -9,6 +9,41 @@
 
 ✅ **COMPLETE**: Implemented a clean, cross-renderer compatible anchor strategy using title-based IDs with Bref fallback for collisions. Leverages the existing multi-ID triangulation system to enable automatic synchronization of ID changes across source files and caches. Does NOT inject BID anchors into markdown - uses title-based anchors for semantics and Brefs for uniqueness.
 
+## Updates
+
+### 2026-08-27: Collision fallback is no longer Bref — human-readable slug-N is used instead
+
+The core collision-resolution design in this issue ("Bref for collisions", see
+"ID Generation Strategy" and "Write Authority Model" above) has been superseded
+by a different mechanism. In the current implementation
+(`src/codec/md.rs`, `seen_ids: HashSet<String>` collision tracking in `MdCodec`),
+a title-slug collision is resolved by appending a numeric suffix to the slug
+(`details`, `details-2`, `details-3`, …) rather than falling back to the node's
+Bref. Bref is still used as a last-resort fallback only in pathological cases
+(loop exceeds 9999 attempts) or when no title/id exists at all.
+
+This changes several concrete claims in the Architecture section above:
+- The "Markdown (Clean, Minimal Injection)" example (`## Details {#a1b2c3d4e5f6}`)
+  and `determine_node_id()` pseudocode no longer reflect what the parser does on
+  collision — it now produces `## Details {#details-2}` (or injects `id =
+  "details-2"` for inline anchors), not a Bref-derived id.
+- The "Title Change Behavior" table's collision-related rows describing Bref
+  injection are similarly out of date.
+
+The underlying goals (stable, addressable, collision-free anchors; markdown as
+source of truth; no anchor injection except when necessary) are still honored
+— only the specific fallback value changed. See `MdCodec::parse()`'s
+`End(Heading)` handling (search `seen_ids` in `src/codec/md.rs`) for the current
+logic, including the distinction between "explicit anchor collides but title is
+free" (drop the explicit anchor, fall through to title) and "title itself
+collides" (assign `slug-N`).
+
+Also note: `beliefbase.rs` and `paths.rs`, referenced throughout the Appendix
+("Integration with Existing Systems") and the References section, have since
+been split into `src/beliefbase/` and `src/paths/` module directories
+(multiple files each). The described responsibilities (BID/Bref/path
+triangulation) still hold; only the file layout changed.
+
 ## Goals
 
 1. Parse existing anchors from headings: `{#introduction}`, `{#custom-anchor}`

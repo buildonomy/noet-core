@@ -16,6 +16,14 @@
 
 Add a visual query builder UI to the interactive HTML viewer that allows users to construct and execute queries against the belief base without writing code. The query builder translates user selections into WASM API calls and displays results in the metadata panel.
 
+## Updates
+
+### 2026-08-27: Further superseded; API drift
+
+- Issue 70 itself closed OBE; the actual UI work shipped via Issue 82 (Viewer Query UI Enhancements), not Issue 70 directly.
+- WASM query API described here (`query_by_kind`, `query_by_schema`, etc.) never existed. Current API: `BeliefBaseWasm::query(spec_js: JsValue)` deserializing a `QuerySpec` (see `src/wasm.rs`).
+- `src/query.rs` → `src/query/` module (`spec.rs`, `parser.rs`, `view/`). Textual grammar in `src/query/parser.rs` per `docs/design/query_model.md` §9.5.
+
 ## Goals
 
 - Visual query construction (dropdowns, checkboxes, text inputs)

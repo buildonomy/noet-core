@@ -1,6 +1,6 @@
 # Issue 42: Force-Directed Graph Visualization for Interactive Viewer
 
-> **Status: SUPERSEDED by Issue 70 (Unified Search, Query, and Graph Visualization UI)**
+> **Status: SUPERSEDED by Issue 70 (Unified Search, Query, and Graph Visualization UI), OBE**
 > Graph visualization is absorbed into Issue 70 as a render-mode toggle (`[Table | Graph]`)
 > on the traceability panel, rather than a separate overlay. The core technical approach
 > (D3.js modular imports, force simulation, lazy-load on first activation, click→metadata
@@ -16,6 +16,14 @@
 ## Summary
 
 Add an interactive force-directed graph visualization to the HTML viewer that displays belief networks as visual graphs. Users can explore node relationships spatially, with nodes positioned based on their connections and influence (weights).
+
+## Updates
+
+### 2026-08-27: Supersession chain moved again
+
+- Issue 70 (cited above as superseding this) is itself OBE — decomposed into Issue 82 (viewer UI) and Issue 85.
+- Current tracking: `docs/project/1_in_progress/ISSUE_85_GRAPH_MODE.md` — "3D Credibility Map Viewer" (Three.js recursive bubble focus), not the 2D D3.js force-directed layout described here.
+- `assets/viewer/state.js` retains unused `graphContainer`/`graphCanvas`/`graphClose` stub fields; no D3.js graph renderer exists in `assets/viewer/*.js`.
 
 ## Goals
 

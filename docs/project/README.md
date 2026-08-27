@@ -10,9 +10,12 @@ docs/project/
 ├── BACKLOG.md                   # Optional enhancements, extracted from completed issues
 ├── LESSONS_LEARNED.md           # Durable failure modes and diagnostic patterns
 ├── ROADMAP*.md                  # Version-specific and feature-specific roadmaps
-├── ISSUE_*.md                   # Active issues (in progress or planned)
-├── completed/                   # Completed and resolved issues
-│   ├── ISSUE_*.md              # Archived completed work
+├── 0_open/                      # Active issues (not yet started)
+│   └── ISSUE_*.md
+├── 1_in_progress/                # Issues currently being worked
+│   └── ISSUE_*.md
+├── 2_completed/                  # Completed and resolved issues
+│   └── ISSUE_*.md               # Archived completed work
 └── trades/                      # Trade studies (architectural alternatives analysis)
     └── *.md                     # Decision documents for complex choices
 ```
@@ -197,7 +200,7 @@ Our workflow follows a structured cycle that enables efficient collaboration bet
 
 **Move to Completed**:
 ```bash
-mv docs/project/ISSUE_XX_*.md docs/project/completed/
+mv docs/project/0_open/ISSUE_XX_*.md docs/project/2_completed/
 ```
 
 **Update References**:
@@ -246,7 +249,7 @@ High-level approach, data structures, key decisions
 
 ### Completed Issue Example
 
-See `completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md` for a well-documented completed issue.
+See `2_completed/ISSUE_23_INTEGRATION_TEST_CONVERGENCE.md` for a well-documented completed issue.
 
 ## Workflow Principles
 
@@ -336,19 +339,19 @@ This workflow is designed for human-AI collaboration. See `AGENTS.md` for:
 ### Finding Issues
 ```bash
 # List all active issues
-find_path "ISSUE_*"
+find_path "0_open/ISSUE_*"
 
 # List completed issues
-find_path "completed/ISSUE_*"
+find_path "2_completed/ISSUE_*"
 
 # Search issue content
-grep "keyword" "docs/project/ISSUE_*.md"
+grep "keyword" "docs/project/**/ISSUE_*.md"
 ```
 
 ### Creating Issues
 ```bash
-# Check highest issue number
-ls docs/project/ISSUE_* | sort -V | tail -1
+# Check highest issue number across all three stages
+ls docs/project/0_open/ISSUE_* docs/project/1_in_progress/ISSUE_* docs/project/2_completed/ISSUE_* | sort -V | tail -1
 
 # Next issue number is highest + 1
 ```
@@ -356,7 +359,7 @@ ls docs/project/ISSUE_* | sort -V | tail -1
 ### Moving to Completed
 ```bash
 # After marking complete in document
-mv docs/project/ISSUE_XX_*.md docs/project/completed/
+mv docs/project/0_open/ISSUE_XX_*.md docs/project/2_completed/
 ```
 
 ## Maintenance

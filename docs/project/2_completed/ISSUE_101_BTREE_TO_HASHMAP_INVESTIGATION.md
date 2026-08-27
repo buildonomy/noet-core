@@ -41,6 +41,15 @@ resistance (the usual reason `std::collections::HashMap`'s default
 library, not a network-facing service processing untrusted input at this
 layer.
 
+## Updates
+
+### 2026-08-27: Stage 3 partly landed; reference path drift
+
+- Recommendation stage 3 (`src/paths/pathmap.rs`) is now partly done: `PathMap.bid_map`, `order_map`, `path_map` are `FxHashMap` (`path_map` was re-added as a scalar-valued index, not still removed as the audit section states). `subnets`, `loops`, and `PathMapMap`'s maps remain `BTreeMap`/`BTreeSet`.
+- Stages 4 (`base.rs`/`graph.rs` locals, `query/spec.rs`) and 5 (`shard/export.rs`, `shard/search.rs`) not started — still `BTreeMap`/`BTreeSet` as described.
+- Confirmed unchanged: `states`/`bid_to_index` = `FxHashMap`; `find_orphaned_edges` → `BTreeSet<Bid>`; `WeightSet.weights` = `BTreeMap`.
+- `docs/project/0_open/ISSUE_99_LARGE_CORPUS_PERF_INVESTIGATION.md` → `docs/project/2_completed/ISSUE_99_LARGE_CORPUS_PERF_INVESTIGATION.md`
+
 ## Goals
 
 1. **Audit every BTree usage** in `src/beliefbase/*.rs` (and any other

@@ -2,26 +2,18 @@
 
 Vendored third-party binaries used by the `distribute` feature.
 
-These binaries are **not committed to the repository**. They are fetched on
-demand by `fetch.sh` and ignored via `.gitignore`.
+These binaries are **committed to the repository** and embedded into the
+`noet` binary at compile time via `include_bytes!` (see `src/distribute.rs`) —
+the same pattern used for UI assets in `assets/` (see `CONTRIBUTING.md` §
+"UI Asset Workflow"). This keeps `cargo build` / `cargo install` fully
+offline-capable: no build-time network fetch, no `docs.rs` build-sandbox
+failure, no extra setup step for contributors or downstream consumers.
 
 ## Contents
 
 | Binary | Version | Purpose |
 |--------|---------|---------|
 | `miniserve-x86_64-pc-windows-msvc.exe` | 0.35.0 | Embedded HTTP server bundled into Windows distributions |
-
-## Usage
-
-From the repository root:
-
-```sh
-# Download all vendored binaries (skips if already present)
-./vendor/fetch.sh
-
-# Force re-download
-./vendor/fetch.sh --force
-```
 
 ## Why vendor?
 
@@ -31,5 +23,12 @@ system-provided HTTP server, so we bundle
 [miniserve](https://github.com/svenstaro/miniserve) — a single-file, zero-config
 static file server.
 
-The binary is fetched from the official GitHub release rather than checked in,
-keeping the repository small while ensuring reproducible builds.
+## Updating a vendored binary
+
+```sh
+curl -L --fail -o vendor/miniserve-x86_64-pc-windows-msvc.exe \
+  https://github.com/svenstaro/miniserve/releases/download/v<VERSION>/miniserve-<VERSION>-x86_64-pc-windows-msvc.exe
+```
+
+Bump the version in the table above and commit the new binary alongside the
+version bump.

@@ -1,0 +1,2 @@
+# Vendored third-party binaries — never diff/merge as text.
+vendor/*.exe binary

@@ -1,8 +1,14 @@
-# Issue 91: Inline Anchor Nodes — Non-Heading Block Anchors as Named Nodes
+# Issue 91B: Inline Anchor Nodes — Non-Heading Block Anchors as Named Nodes
 
 **Priority**: MEDIUM
 **Estimated Effort**: 3 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: None
+
+> [!NOTE]
+> Renumbered from `ISSUE_91` to `ISSUE_91B` on 2026-08-27 to resolve a
+> duplicate-number collision with `ISSUE_91_CONTENT_TYPE_CLASSIFIER.md`
+> (the original holder of 91, cross-referenced by Issues 85/92/93 and the
+> CHANGELOG). No content changed.
 
 ## Summary
 
@@ -11,6 +17,19 @@ anchors (`{#some-id}`) appearing in non-heading blocks (paragraphs, list items)
 are silently ignored. Adding support for these would allow individually-named
 requirements, checklist items, or other block-level content to become first-class
 graph nodes without requiring a heading for every item.
+
+## Updates
+
+### 2026-08-27: Implementation drift
+
+- `extract_inline_anchor`, `scan_for_inline_anchor`, and the
+  `End(TagEnd::Paragraph)` / `End(TagEnd::Item)` boundary all present in
+  `src/codec/md.rs` as described.
+- `render_html_body` inline-anchor detection also requires `proto.heading > 2`,
+  not just "explicit ID, no `Start(Heading)`".
+- Step 6: 🔗 is appended to the parent block element (`p`/`li`);
+  `insertAdjacentElement("afterend", link)` is now only the no-parent fallback
+  (`assets/viewer/content.js`).
 
 ## Goals
 

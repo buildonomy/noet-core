@@ -6,6 +6,15 @@
 **Completed**: 2024-02-17  
 **Verified**: 2024-02-17
 
+## Updates
+
+### 2026-08-27: Data format and loading API superseded
+
+- Core threading fix (Option B: `SharedLock<T>` = `Rc<RefCell<T>>` on wasm32, `Arc<RwLock<T>>` natively) is still current — see `src/beliefbase/base.rs`
+- Beliefbase export format moved from monolithic `beliefbase.json` to msgpack shards
+- `BeliefBaseWasm::from_json(data, metadata)` (Option A code sample) was never implemented; current loaders are `from_json(data, entry_bid_str)`, `from_msgpack(...)`, and `from_manifest(...)` (sharded mode) in `src/wasm.rs`
+- `wasm-bindgen-rayon` dependency (Option A) is not present in `Cargo.toml`; not adopted, per this doc's own decision
+
 ## Problem Statement
 
 `BeliefBase` uses `parking_lot::RwLock` which requires OS threading primitives that don't exist in WASM's single-threaded environment. This causes `PathMapMap` to appear empty when accessed from WASM, breaking the `RelatedNode` refactor.

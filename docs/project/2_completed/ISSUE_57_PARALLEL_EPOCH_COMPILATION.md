@@ -5,7 +5,7 @@
 **Dependencies**: None hard. Issue 56 protocol model informs the merge-safety
 argument but does not block implementation.
 **Related**: Issue 56 (PathMap protocol observability)
-**Status**: COMPLETE. All core steps done. Open threads (integration tests,
+**Status**: COMPLETE, OBE. All core steps done. Open threads (integration tests,
 AnchorPath bug, attempt-3 requeue, perf follow-ons) carried to Issue 60.
 **Completed**: 2026-03-23. Validated on MDN JS corpus: ×7.8 speedup at `--jobs 8`,
 attempt-1 Phase 0 mean ~101ms/file (flat O(1)), attempt-2+ ~284ms/file (flat).
@@ -20,6 +20,18 @@ restructuring epoch 0 as a depth-ordered work-queue of parallel leaf batches,
 each separated by an explicit `BatchStart`/`BatchEnd` sentinel pair. Epoch N≥1
 reparse rounds are also parallelised. The result is a pipeline where `global_bb`
 is always live, queryable, and cache-coherent between batch boundaries.
+
+## Updates
+
+### 2026-08-27: Epoch-0 batching superseded
+
+- Epoch 0 dispatch is no longer a per-entry `VecDeque` (pop → parse `index.md`
+  → split leaf/subnet). `parse_all` now groups all network dirs by subnet-tree
+  depth (`ProtoIndex::network_dirs_by_tree_depth`) into one batch per depth,
+  then gathers every leaf document across all networks into a single global
+  batch. See Issue 97 "Bottleneck 7" and `compiler.rs::parse_all` doc comment.
+- `parse_epoch_parallel` no longer exists as a separate function — merged into
+  `parse_epoch` (dispatches sequential vs. spawned-task path on `self.jobs`).
 
 ## Goals
 

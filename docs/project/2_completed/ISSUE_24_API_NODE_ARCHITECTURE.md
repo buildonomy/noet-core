@@ -19,6 +19,14 @@
 
 **Status:** ✅ COMPLETE - Reserved BID validation implemented, all tests passing, documentation complete
 
+## Updates
+
+### 2026-08-27: Reserved-ID validation was never implemented
+
+- Only reserved-**BID** validation exists (`Bid::is_reserved()` in `src/properties.rs`, called from `IRNode::from_str_with_format()` in `src/codec/belief_ir.rs`).
+- The reserved-**ID** validation described in Steps 4 and 6 (`is_reserved_bid()` name, rejection of `buildonomy_*`-prefixed IDs, `test_reserved_id_buildonomy_prefix()`) has no corresponding code — confirmed absent as far back as the earliest available commit history.
+- `docs/design/beliefbase_architecture.md` § 2.4 repeats the same unimplemented ID-prefix-rejection claim.
+
 ## Goals
 
 1. ✅ ~~**Fix merging bug**~~ - Fixed by correcting test file BID

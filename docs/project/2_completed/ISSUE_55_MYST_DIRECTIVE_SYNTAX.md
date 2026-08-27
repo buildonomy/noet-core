@@ -13,6 +13,18 @@ intercepting `CodeBlock(Fenced("{name}"))` events in the existing `MdCodec::pars
 the same pattern already used for `MetadataBlock` and `Heading` processing. The colon-fence
 (`:::`) form is not supported.
 
+## Updates
+
+### 2026-08-27: Extension point evolved; backward-compat revoked
+
+- Hardcoded `NETWORK_CHILDREN_MARKER`/`_DIRECTIVE`/`_SENTINEL` consts described here no longer
+  exist; sentinel/directive strings are now derived from the `DIRECTIVES` registry via
+  `myst::sentinel(name)` / `myst::directive(name)` (see `src/codec/myst.rs`, Issue 71).
+- Legacy `<!-- network-children -->` backward compat (a stated Goal) was later removed:
+  it now passes through unchanged with no sentinel/listing generated — see
+  `test_generate_html_backward_compat_html_comment_passthrough` in `src/codec/network.rs`.
+  Migration to the MyST fenced form is required.
+
 ## Goals
 
 - Author-facing syntax is standard MyST backtick-fence: `` ````{network_children} `` instead of a raw HTML comment

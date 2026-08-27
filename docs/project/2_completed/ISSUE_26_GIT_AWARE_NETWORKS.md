@@ -21,6 +21,13 @@ but never written back to `index.md` and excluded from diff/stability logic.
 - Version tracking: embed git commit in exported HTML
 - CI/CD integration: validate all networks are committed before deployment
 
+## Updates
+
+### 2026-08-27: Export format drift
+
+- `beliefbase.json` is no longer the primary browser payload: `finalize_html` now writes `beliefbase.msgpack` (monolithic) or `beliefbase/` shards by default (Issue 50). `beliefbase.json` only appears as a legacy fallback path.
+- Everything else (feature flag, CLI/env wiring, `compute_source_url`, `metadata.js` rendering, `NodeContext.metadata`) matches current source.
+
 ## Goals
 
 1. Detect git repository for each `BeliefNetwork` node during `ProtoIndex::build`

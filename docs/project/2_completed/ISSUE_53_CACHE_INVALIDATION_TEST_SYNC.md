@@ -15,6 +15,17 @@ pass (tests pass on Linux), but the Windows failures revealed a deeper design fl
 transaction task's polling model meant `wait_for_idle` could unblock after the *first* partial
 batch rather than after the full compile cycle. This issue tracks the complete fix.
 
+## Updates
+
+### 2026-08-27: Idle-signal mechanism superseded
+
+- `commit_notify: Arc<Notify>` (described under "What `wait_for_idle` does") does not exist;
+  current impl uses `tokio::sync::watch::channel::<u64>` (`commit_generation_tx`/`_rx`) with
+  level-triggered `Receiver::wait_for()` — see `src/watch.rs` `FileUpdateSyncer::commit_generation_rx`,
+  `WatchService::wait_for_next_idle`.
+- `perform_transaction` free function no longer exists; transaction loop is inlined in
+  `FileUpdateSyncer::new`'s spawned task, as anticipated in "Key design decisions".
+
 ## Goals
 
 - [x] Replace sleep-based synchronization in cache invalidation tests with a deterministic

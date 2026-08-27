@@ -14,6 +14,15 @@ and (2) markdown links that resolve to local directories are silently dropped ra
 expanded into a git-remote hyperlink (if the directory is a tracked repo) or a directory listing
 (if it is not).
 
+## Updates
+
+### 2026-08-27: Minor drift
+
+- `proto_index.git_status_for(path)` → `proto_index.get_meta_as::<NetworkGitStatus>(path, "git")`
+  (see `builder.rs::process_asset_dir`, `proto_index.rs::get_meta_as`).
+- Deferred integration test (Step 4) actually lives in
+  `docs/project/0_open/ISSUE_07_COMPREHENSIVE_TESTING.md` §10.1, not `BACKLOG.md`.
+
 ## Status — Final
 
 All goals complete. Step 4 (integration test) deferred to Backlog. Additional fixes

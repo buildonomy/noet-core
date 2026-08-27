@@ -11,6 +11,15 @@ The integration test `test_belief_set_builder_bid_generation_and_caching` is fai
 
 This is our most realistic test environment for how noet-core should function in production, making it critical path for reliability.
 
+## Updates
+
+### 2026-08-27: Referenced test/function names since renamed
+
+- `test_belief_set_builder_bid_generation_and_caching` no longer exists; replaced by `test_sequential_in_memory` / `test_sequential_db` / `test_parallel_in_memory` / `test_parallel_db` in `tests/codec_test/bid_tests.rs` (Issue 57/60 parallel-epoch refactor)
+- `DocumentCompiler::parse_next()` → `parse_epoch()` / `parse_all()` in `src/codec/compiler.rs`
+- `src/beliefbase.rs` → split into `src/beliefbase/{base,accumulator,context,graph,sink}.rs`
+- Root-cause diagnosis (BID collision in test fixtures) and fix remain accurate; `tests/network_1/sections_test.md` still carries the corrected BID.
+
 ## Goals
 
 - Achieve single-pass parsing on second run with populated cache. 

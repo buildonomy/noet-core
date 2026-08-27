@@ -22,19 +22,14 @@ Replace the monolithic `beliefbase.json` export with per-network JSON shards, en
 
 See `docs/design/search_and_sharding.md` for the full specification, including output structure (§3.1), manifest format (§4), shard format (§5), memory budget model (§6), and WASM integration (§8).
 
-**This is the first issue in the sequence.** It establishes the export infrastructure, viewer UI, and memory management that Issue 54 (search) layers onto. After this issue, Issue 47 (Performance Profiling) creates scale-sized test fixtures that validate sharding behavior and provide scaffolding for search performance testing in Issue 54.
+## Updates
 
-**Key points**:
+### 2026-08-27: Format drift since this issue landed
 
-1. **Sharding decision in `finalize_html`.** After serializing the full `BeliefGraph`, measure its size. If below `SHARD_THRESHOLD` (default 10MB), write `beliefbase.json` as today. If above, write the `beliefbase/` directory with manifest, global shard, and per-network shards.
-
-2. **Per-network subgraph extraction.** Each shard contains the `BeliefGraph` subset for one network: its states and intra-network relations. The `global.json` shard contains the API node, system namespace nodes, and cross-network relations. This ensures cross-network link resolution works with only the global shard loaded.
-
-3. **`BeliefBaseWasm` shard-aware API.** Extends the existing WASM struct with `from_manifest`, `load_shard`, `unload_shard` methods. The existing `from_json` constructor remains for monolithic format. Internally, loading a shard merges nodes/relations into the single `BeliefBase` instance; unloading removes them.
-
-4. **Search indices always generated.** `finalize_html` calls `build_search_indices()` unconditionally — before the sharding decision. This writes `search/{bref}.idx.json` (one per network) and `search/manifest.json`. The `search/` directory is always present in the HTML output regardless of export mode.
-
-5. **JavaScript `ShardManager`.** Manages loading of BB shards under a memory budget. On init, it fetches `search/manifest.json` and all `.idx.json` files so full-corpus search is available immediately — even for networks whose data shards haven't been loaded yet.
+- Sharding threshold: 10MB → 2MB (`SHARD_THRESHOLD` in `src/shard/manifest.rs`)
+- Data payloads switched JSON → MessagePack: `beliefbase.json` → `beliefbase.msgpack`, `global.json` → `global.msgpack`, `networks/{bref}.json` → `networks/{bref}.msgpack`, `search/{bref}.idx.json` → `search/{bref}.idx.msgpack`
+- `beliefbase/manifest.json` and `search/manifest.json` remain JSON
+- See `src/shard/export.rs`, `src/shard/search.rs` for current format
 
 ## Implementation Steps
 

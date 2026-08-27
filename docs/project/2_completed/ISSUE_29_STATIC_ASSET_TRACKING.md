@@ -9,6 +9,15 @@
 
 Track static assets (images, PDFs, media) as first-class BeliefNodes with stable BIDs and content hash in payload, enabling automatic hardlink creation during HTML export with content-addressed paths, usage tracking, and bidirectional queryability. Assets remain at their source locations in the repository while relations in the belief graph track their usage.
 
+## Updates
+
+### 2026-08-27: BID scheme and manifest storage drift
+
+- Asset BIDs are `Bid::new(&asset_namespace())` (v4, random), not `Bid::now_v6()` or `buildonomy_asset_bid(hash)` as shown in the Architecture section — `buildonomy_asset_bid()` still exists in `src/properties.rs` but is unused by the asset pipeline (`src/codec/builder.rs::process_asset`).
+- `DocumentCompiler.asset_manifest` field (`Arc<RwLock<BTreeMap<String, Bid>>>`) no longer exists. The manifest is now derived on demand in `finalize_html` via `global_bb.submap(asset_namespace(), ...)`.
+- Asset detection/creation logic lives in `GraphBuilder::process_asset` / `process_asset_dir` (`src/codec/builder.rs`), not inline in `compiler.rs::parse_next()` (no `parse_next` function exists).
+- A directory-asset case (`process_asset_dir`, listing + hash of directory contents) was added later and isn't described here.
+
 ## Goals
 
 1. **Generate stable BIDs** for static assets using `Bid::now_v6()` (time-based UUID)

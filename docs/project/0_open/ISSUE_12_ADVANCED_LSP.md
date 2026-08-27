@@ -509,6 +509,9 @@ pub struct CompletionCache {
 **Risk**: Code actions too complex for users
 **Mitigation**: Clear action descriptions; preview changes; make actions reversible
 
+**Risk**: Format-on-save BID injection (§2.2) races with a concurrently-running `noet watch` on the same files
+**Mitigation**: See Issue 11 Open Question 7 (writes are not currently atomic; no cross-instance write-ignore coordination exists yet) — resolve there before shipping formatting
+
 **Risk**: Feature scope creep delays release
 **Mitigation**: Prioritize navigation over editing features; ship incrementally if needed; defer semantic tokens to v0.4.0
 

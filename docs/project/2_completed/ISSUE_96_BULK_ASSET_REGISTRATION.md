@@ -18,6 +18,18 @@ Replace the per-asset `parse_task` spawn with a bulk registration path that
 processes the entire asset `remainder_queue` in one pass, emitting events
 directly to the accumulator without GraphBuilder overhead.
 
+## Updates
+
+### 2026-08-27: Implementation drift
+
+- `DocumentCompiler::process_asset_batch` — `src/codec/compiler.rs`.
+- Builder-side fast path is `GraphBuilder::process_asset_prehashed` +
+  `GraphBuilder::ensure_asset_namespace` (`src/codec/builder.rs`); neither is
+  named in the architecture sketch above.
+- `process_asset_prehashed` *returns* events rather than applying them; the
+  batch is applied once via `apply_events_batch` + `flush_paths_for_events`,
+  not per-event through `builder.tx()` alone.
+
 ## Goals
 
 - Process asset batches at filesystem I/O speed, not GraphBuilder speed

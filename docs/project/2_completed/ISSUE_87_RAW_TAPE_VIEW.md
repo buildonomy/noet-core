@@ -15,6 +15,15 @@ correctly represent owner-edge semantics, and adds `ViewOutput::Json` so the
 WASM/JS viewer can consume structured view data instead of doing its own
 rendering.
 
+## Updates
+
+### 2026-08-27: Path drift
+
+- `src/query/instrument/` → `src/query/view/` (Issue 83); `RawTapeView` lives at
+  `src/query/view/raw_tape.rs`
+- `covers` shorthand is `o-epistemic-sk(N)`, not `o-pragmatic-sk{N}`
+  (`src/query/parser.rs`)
+
 ## Goals
 
 - Fix `covers` shorthand to output both edge endpoints (`Source|Sink`)

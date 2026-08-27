@@ -22,6 +22,17 @@ content-type signal is in the **voice and tense, not in the nouns**. Passive
 voice + modals → N, imperative + causal + future → P, past tense → R. This
 makes the classifier domain-independent without recalibration.
 
+## Updates
+
+### 2026-08-27: Minor drift
+
+- `classify_node` skips writing `metadata.content_profile` when all four scores
+  are zero (`ContentProfile::is_zero`) — `src/codec/builder.rs`
+- Issue 85 consumer landed: `score_structural` + `score_merge` called from
+  `src/layout.rs`; API unchanged
+- `repo/templates/index.md.j2` (last bullet of "Additional fixes") is not a
+  path in this repo
+
 ## Goals
 
 - Classify content at **node granularity** — the parser's existing

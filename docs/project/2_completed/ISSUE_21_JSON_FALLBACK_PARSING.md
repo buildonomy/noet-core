@@ -4,7 +4,7 @@
 **Estimated Effort**: 3-4 days
 **Dependencies**: Issue 1 (Schema Registry) ✅
 **Blocks**: ROADMAP_HTML_RENDERING Phase 1
-**Status**: **COMPLETE** (2025-01-28) - Triple-format parsing fully implemented
+**Status**: **COMPLETE** (2025-01-28) - Triple-format parsing fully implemented, OBE
 
 ## Summary
 
@@ -24,6 +24,15 @@
 - Dropped: Adds complexity without clear value. Users can use file extensions to specify format preference.
 
 The core parsing infrastructure is production-ready. Users can now write metadata in YAML (markdown standard), JSON (web/programmatic), or TOML (Hugo compatibility), and all formats parse successfully with automatic fallback.
+
+## Updates
+
+### 2026-08-27: Network file identification superseded (Issue 39)
+
+- `BeliefNetwork.{yaml,yml,json,toml,jsn,tml}` (multi-extension discovery) → single `index.md` file (`NETWORK_NAME` in `src/codec/network.rs`). Network config now lives in `index.md` frontmatter, not a separate `BeliefNetwork.*` file.
+- `belief_ir.rs::NETWORK_CONFIG_NAME(S)` constants described here do not exist under those names; see `detect_network_file()` / `WalkCodecMap::network_filenames()` in `src/codec/network.rs` and `src/codec/mod.rs`.
+- Default frontmatter format is **JSON-first**, not YAML-first as stated in Summary/Goals (`impl FromStr for IRNode` calls `from_str_with_format(str, MetadataFormat::Json)` in `src/codec/belief_ir.rs`).
+- Triple-format fallback parsing itself (`MetadataFormat`, `parse_with_fallback`) is intact and matches this issue's core intent.
 
 ## Goals
 

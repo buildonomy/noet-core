@@ -163,3 +163,35 @@ python3 -m http.server "$PORT"
 
 - Zip support deferred to a follow-up — users can zip the output directory
   themselves.
+
+## Updates
+
+### 2026-08-26: `distribute` moved to default features; binary now committed
+
+The original vendoring design (fetch-on-demand, gitignored binary,
+feature-gated off by default) has changed:
+
+- **`distribute` is now in the `default` feature set**, not opt-in. The
+  intent is for non-power users to get the offline-distribution capability
+  on the easy install path (`cargo install noet-core` / plain `cargo build`)
+  without needing to know the feature exists.
+- **`vendor/miniserve-x86_64-pc-windows-msvc.exe` is now committed to the
+  repository** and embedded via `include_bytes!`, the same pattern used for
+  `assets/open-props/` (see `CONTRIBUTING.md` § "UI Asset Workflow" and the
+  new "Vendored Binaries" subsection). `vendor/fetch.sh` and
+  `vendor/.gitignore` have been deleted.
+
+This reverses the original rationale in Implementation Step 1 and the
+"Miniserve binary size" risk mitigation above. The reason: a gitignored,
+fetch-on-demand binary is invisible to `cargo package`/`cargo publish` (Cargo
+respects `.gitignore` when assembling the crate tarball), so once `distribute`
+is default, every `cargo install noet-core` and every downstream `cargo build`
+would hit the same missing-file compile error that motivated this fix in the
+first place — a build-time network fetch inside `build.rs` was rejected as a
+fix because it breaks under `docs.rs`'s network-sandboxed build, offline
+installs, and any CI that audits/vendors dependencies. Committing the binary
+trades ~2.1 MB of permanent repo size for zero-setup builds, judged worthwhile
+given the feature is now default-on.
+
+See `noet-core/.gitattributes` for the binary-diff marker added alongside
+this change.

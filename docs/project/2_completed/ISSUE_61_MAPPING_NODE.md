@@ -13,6 +13,22 @@ without being either endpoint. The owning node is identified by its bref in
 The full spec will be written to `docs/design/mapping_node_architecture.md` as the final
 step of this issue, once the working implementation is in place.
 
+## Updates
+
+### 2026-08-27: Query layer and directive model superseded
+
+- `RelationPred::OwnedBy` / `src/query.rs` no longer exist — query layer rewritten
+  (Issue 83); ownership traversal is now `Role::Owner` in `src/query/spec.rs`.
+- `fetch_owned_edges` (async, 3-tier session/global/empty) → sync
+  `BeliefBase::graph_for_owner` memo lookup.
+- `DirectiveDef` no longer has `marker`/`sentinel`/`is_block_opener` fields (now
+  `ref_role`/`weight_kind`); sentinel derived via `mapping_table_sentinel`.
+- `IntermediateMappingRelation`: `source` is now `sources: Vec<NodeKey>` (Cartesian
+  product with `sinks`), not a single value.
+- `covers` added later as a preferred synonym for `maps_to` (same directive impl).
+- `docs/design/mapping_node_architecture.md` has been substantially rewritten since
+  (cross-document mappings, traceability views — Issue 63).
+
 ## Goals
 
 - Parse `{maps_to}` directive bodies into `IRNode.mappings` via a new `IntermediateMappingRelation` struct

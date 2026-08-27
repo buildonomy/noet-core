@@ -118,9 +118,6 @@ jobs:
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
 
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
-
       - name: Build
         run: cargo build --verbose ${{ matrix.cargo_flags }}
 
@@ -162,9 +159,6 @@ jobs:
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
 
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
-
       - name: Check MSRV
         run: |
           cargo build --all-features
@@ -199,9 +193,6 @@ jobs:
           else
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
-
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
 
       - name: Build examples
         run: cargo build --examples
@@ -243,9 +234,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
 
       - name: Build WASM module
         run: cargo build --features bin
@@ -305,9 +293,6 @@ jobs:
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
 
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -343,9 +328,6 @@ jobs:
           else
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
-
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
 
       - name: Generate documentation
         run: cargo doc --no-deps --all-features
@@ -393,9 +375,6 @@ jobs:
           else
             echo "✓ cargo-tarpaulin already present"
           fi
-
-      - name: Fetch vendored binaries
-        run: ./vendor/fetch.sh
 
       - name: Run coverage with tarpaulin
         run: cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
@@ -599,11 +578,6 @@ jobs:
           else
             echo "✓ wasm-bindgen already present ($(wasm-bindgen --version))"
           fi
-
-      - name: Fetch vendored binaries
-        run: |
-          cd noet-core
-          ./vendor/fetch.sh
 
       - name: Build noet-core with default features
         run: |

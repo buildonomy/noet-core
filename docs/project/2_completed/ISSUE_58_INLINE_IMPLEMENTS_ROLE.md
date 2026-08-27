@@ -1,6 +1,6 @@
 # Issue 58: Inline `{implements}` Role
 
-> **STATUS: SUBSUMED BY ISSUE 71** — The unified codespan toggle design in Issue 71
+> **STATUS: SUBSUMED BY ISSUE 71, OBE** — The unified codespan toggle design in Issue 71
 > covers all inline relation role functionality and supersedes this issue. Mark as
 > duplicate/closed. Do not implement separately.
 
@@ -15,6 +15,16 @@ A single `Code` event whose content starts with `{implements}` is sub-parsed as 
 all links extracted as `WeightKind::Pragmatic` relations, and the links rendered as normal
 `<a class="noet-implements">` tags. This gives authors a compact, single-line citation form
 without opening a full `{implements}` / `{end}` block.
+
+## Updates
+
+### 2026-08-27: Confirmed subsumed — inline role never implemented
+
+- `parse_code_span` / `lookup_role` described here were never added to `myst.rs`.
+- Actual implementation (Issue 71): `{implements}` is a codespan toggle verb in
+  `myst.rs::DIRECTIVES` (legacy alias for `{uses}`, `WeightKind::Pragmatic`),
+  opened/closed via a relation-context stack in `md.rs` — not a sub-parsed
+  single-line code-span role.
 
 ## Goals
 

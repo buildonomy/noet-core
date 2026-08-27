@@ -20,6 +20,18 @@ This is Phase 4b from Issue 70, pulled forward because the `{query}` directive
 (wired in this issue) and the MCP `query` tool to accept textual query
 strings directly (wired in step 4b).
 
+## Updates
+
+### 2026-08-27: Grammar/path drift
+
+- `src/query_parser.rs` → `src/query/parser.rs`
+- Arrow shorthands (`->section(N)`, `<-pragmatic(N)`, `->owner(N)`) removed — arrows now emit a "use named shorthands" error
+- Shorthand verbs: `composed_of`/`consists_of`, `component_of`, `uses`, `implements`, `used_by`, `covers`, `constrained_by`, `constrains`, `draws_from`, `underlies`, `roots`, `leaves`, `halo`. `covers` = `o-epistemic-sk`.
+- `| sort:` / `| project:` suffixes not implemented; view config travels as sibling params (see `parser.rs` header)
+- Bare words and bare quoted strings rejected — `TextMatch` requires `field:term`
+- `Subject::Implicit` → first step's `TapeFn::Then(None)`
+- `docs/design/query_language.md` (Step 5) does not exist
+
 ## Goals
 
 - Implement a recursive descent parser in `src/query_parser.rs` that parses the

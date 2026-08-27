@@ -20,6 +20,14 @@ The compiler lacks file modification time tracking, causing it to serve stale co
 
 **Status**: ✅ **COMPLETE** - All phases implemented and integration tests passing.
 
+## Updates
+
+### 2026-08-27: Path/API drift
+
+- `src/db.rs`, `src/watch.rs` unchanged; `src/beliefbase.rs` → `src/beliefbase/{base,graph}.rs`; `src/paths.rs` → `src/paths/pathmap.rs`; `src/bin/noet/main.rs` → `src/cli.rs` (CLI now lives in `cli.rs`, `main.rs` just calls `noet_core::cli::run()`)
+- `StatePred::NetPathIn` / `BeliefSource::get_network_paths` no longer exist — replaced by `BeliefSource::submap` (Issue 83 QuerySpec refactor); asset-manifest querying in `finalize_html` now uses `global_bb.submap(asset_namespace(), "", u8::MAX, false)`
+- Core mtime mechanism (`file_mtimes` table, `FileParsed` event, `check_stale_files`, `--force` flag) is unchanged and matches this issue's description
+
 ## Evidence
 
 **Scenario**:

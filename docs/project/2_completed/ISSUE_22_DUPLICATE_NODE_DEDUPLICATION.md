@@ -11,6 +11,15 @@ Two markdown headings with the same title (e.g., `## Details` twice) incorrectly
 
 This bug blocks full verification of Issue 03's collision detection behavior, where two "Details" headings should create two nodes with different IDs (first: "details", second: Bref fallback).
 
+## Updates
+
+### 2026-08-27: Function names/paths drifted
+
+- `src/paths.rs` → `src/paths/pathmap.rs` (module split)
+- `GraphBuilder::speculative_section_path()` → `GraphBuilder::speculative_path_key()` + `build_path_key()` (`src/codec/builder.rs`)
+- `PathMap::speculative_path()` (described as new method) does not exist under that name; the collision-aware path computation is inlined in `build_path_key()`, still calling `generate_path_name_with_collision_check()` in `src/paths/pathmap.rs`
+- Core fix (Path-only keys for sections, Bref fallback on collision) is intact and matches current code
+
 ## Problem Statement
 
 **Expected Behavior**:

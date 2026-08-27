@@ -1,6 +1,6 @@
 # Issue 46: Full-Text Search with Tantivy
 
-**STATUS**: SUPERSEDED - Split into Issue 50 (Sharding) and Issue 54 (Built-In Search MVP)
+**STATUS**: SUPERSEDED - Split into Issue 50 (Sharding) and Issue 54 (Built-In Search MVP), OBE
 
 **Priority**: HIGH
 **Estimated Effort**: 16-24 days (SPLIT: 5-7 days MVP + 8-12 days Production)
@@ -34,6 +34,14 @@ A design review determined that every field needed for search (`title`, `payload
 **Implementation sequence**: Issue 50 → Issue 47 (perf profiling for scale fixtures) → Issue 54. BeliefBase sharding first establishes the shared infrastructure (export hooks, viewer UI, memory budget), performance profiling creates scale-sized test fixtures, then built-in search layers on top.
 
 ---
+
+## Updates
+
+### 2026-08-27: Format/location drift
+
+- Search index format shipped as msgpack, not JSON: `search/{bref}.idx.msgpack` (see `src/shard/search.rs`), despite this doc and Issue 54/49 describing `.idx.json`.
+- Built-in search implementation lives in `src/shard/search.rs`, not a new `src/search/` module.
+- See Issue 54 (MVP) and Issue 50 (Sharding) for the as-built design.
 
 ## Original Issue Content (For Reference)
 

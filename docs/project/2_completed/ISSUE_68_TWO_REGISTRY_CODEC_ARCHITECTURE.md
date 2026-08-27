@@ -16,6 +16,14 @@ The current codec dispatch pipeline has a single registry (`CODECS`) that confla
 
 This issue implements a two-registry architecture that separates the two concerns cleanly. One addition was made to `DocCodec::parse` (a `proto_index: &ProtoIndex` parameter) and the bare `.md` extension entry was removed from `CODECS` — see "Deviations from Original Spec" below.
 
+## Updates
+
+### 2026-08-27: Drift since completion
+
+- Pre-flight `proto()` workaround (marked as tech debt, expected removal) is still present in `compiler.rs` — not yet removed.
+- "Ordering Guarantee" note claiming `prepare_proto_relations` does NOT register `CLAIM_MAP` entries is now false: both `NetworkCodec::prepare_proto_relations` and `NetworkCodec::parse` call `CLAIM_MAP.claim`/`.reject` (`src/codec/network.rs`).
+- `MdWalkCodec::should_track` code sample shows `Some("md" | "markdown")`; current impl only matches `"md"`.
+
 ## Problem Statement
 
 `ProtoIndex::build()` calls `net_dir_partition()`, which filters every file in the repo through:

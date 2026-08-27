@@ -10,6 +10,14 @@ Refactor `WEIGHT_DOC_PATH` (single string) to `WEIGHT_DOC_PATHS` (vector of stri
 
 Process WEIGHT_DOC_PATH within RelationChange events, but propagate any supplied path into WEIGHT_DOC_PATHS for the RelationUpdate event. This enables change generators to not know the entire relationship structure when emitting a path-related event.
 
+## Updates
+
+### 2026-08-27: File moves
+
+- `src/paths.rs` → `src/paths/pathmap.rs` (+ `src/paths/path.rs`, `src/paths/mod.rs`)
+- `src/beliefbase.rs` → `src/beliefbase/graph.rs` (`BidGraph`, `BidSubGraph`) + `src/beliefbase/base.rs` (`BeliefBase`)
+- `WEIGHT_DOC_PATH`/`WEIGHT_DOC_PATHS` constants and `Weight::get_doc_paths`/`set_doc_paths` unchanged, still in `src/properties.rs`
+
 ## Goals
 
 - Change `WEIGHT_DOC_PATH` constant and all usage to `WEIGHT_DOC_PATHS`

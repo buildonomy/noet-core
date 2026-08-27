@@ -39,6 +39,13 @@ correctness bug in `Transaction::execute` (missing `BEGIN`/`COMMIT`
 wrapping) that should be fixed as part of this issue regardless of the lock
 redesign.
 
+## Updates
+
+### 2026-08-27: Reference path drift
+
+- `docs/project/0_open/ISSUE_99_LARGE_CORPUS_PERF_INVESTIGATION.md` → `docs/project/2_completed/ISSUE_99_LARGE_CORPUS_PERF_INVESTIGATION.md`
+- Otherwise clean: `Arc<tokio::sync::RwLock<AccInner<S>>>`, `AccInner` fields, `AccCache`, `Transaction::execute` `begin()`/`commit()`, both `PRAGMA busy_timeout` sites, and both regression tests verified present on current `main`.
+
 ## Goal 1 Findings (root-cause investigation — complete)
 
 **Scope note**: this investigation is scoped to the `db_init_memory` path

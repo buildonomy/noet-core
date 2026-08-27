@@ -8,6 +8,16 @@
 
 Implement full-text search for the interactive HTML viewer using compile-time per-network search indices (`.idx.json`). The compiler builds lightweight inverted indices during `finalize_html` — always, regardless of whether the export is monolithic or sharded. The WASM side only deserializes these pre-built indices and runs TF-IDF queries against them. Zero index construction in the browser, zero additional WASM binary size, zero WASM compilation risk. Search covers the *entire* corpus from the moment the viewer loads, including networks whose data shards haven't been loaded.
 
+## Updates
+
+### 2026-08-27: Format and location drift
+
+- Index format is msgpack, not JSON: `search/{bref}.idx.msgpack` (`src/shard/search.rs`), not `.idx.json`.
+- Module is `src/shard/search.rs`, not `src/search/mod.rs`.
+- Struct is `SearchIndex` (docs map of `IndexedDoc`), not `CompactSearchIndex`/`DocStub`.
+- Stemming (Snowball via `rust-stemmers`) is implemented and on by default for `bin`/`wasm`
+  builds (`stemming` Cargo feature) — not deferred as stated in Risk 1.
+
 ## Goals
 
 - Full-text search across **all** networks immediately on viewer init (not just loaded ones)

@@ -1,4 +1,4 @@
-# Issue 19: Per-Network HTML Theming
+# Issue 25: Per-Network HTML Theming
 
 **Priority**: LOW - Post-MVP enhancement (after Issue 06)
 **Estimated Effort**: 2-3 days

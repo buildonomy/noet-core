@@ -16,6 +16,14 @@ Three related bugs discovered during `noet watch` testing that affect heading an
 
 These issues break the core contract established in Issue 3: section IDs must be network-unique and reliably derived from heading content.
 
+## Updates
+
+### 2026-08-27: Fix 2 superseded, paths moved
+
+- Fix 2 ("network-unique ID enforcement" in `finalize()`) was never implemented as planned. Actual mechanism: first-one-wins collision detection in `BeliefBase::insert_state` (`src/beliefbase/base.rs`), later refined by Issue 75 into a `NodeId::Collision` variant (`src/properties.rs`) rather than string Bref-replacement in `finalize()`.
+- Test fixtures moved: `belief-network-sm-test/sym/{hsml,hstp}.md` → `tests/network_1/net1_dir1/{hsml,hstp}.md`.
+- Line references (`md.rs:1604`, `1160-1170`, `1042-1250`, `1379-1500`) no longer match; file is now ~7550 lines (`inject_context` L2208, `finalize` L2578).
+
 ## Goals
 
 - Fix heading ID injection so `{#anchor-id}` syntax appears in markdown output

@@ -18,6 +18,50 @@ Several type and field names in noet-core are pedagogically confusing and don't 
 
 **Decision**: After analysis, we'll rename `BeliefSet` → `BeliefBase` to better capture its role as database-style infrastructure that applications build upon. The `.bb` abbreviation parallels the familiar `.db` pattern.
 
+## Updates
+
+### 2026-08-27: Renames verified against current source; two follow-on changes noted
+
+Spot-checked every entry in the "SELECTED" rename table (§ Proposed Naming Scheme) against
+current `src/`. The renames proposed here were carried out and remain intact:
+
+- `BeliefSetParser` → `DocumentCompiler` — confirmed in `src/codec/compiler.rs`.
+- `BeliefSetAccumulator` → `GraphBuilder` — confirmed in `src/codec/builder.rs` (moved out of
+  `codec/mod.rs`, see below).
+- `BeliefSet` → `BeliefBase` — confirmed in `src/beliefbase/base.rs`.
+- `Beliefs` → `BeliefGraph` — confirmed in `src/beliefbase/graph.rs`.
+- `BeliefCache` trait → `BeliefSource` trait — confirmed in `src/query/mod.rs`.
+- `.set`/`.stack_cache`/`global_cache: B` → `.doc_bb`/`.session_bb`/`global_bb: B` — confirmed in
+  `src/codec/builder.rs` (`GraphBuilder` fields) and used pervasively (including in the
+  `label` field of `BeliefBase` itself, which documents the `doc_bb`/`session_bb`/`global_bb`
+  convention directly in its doc comment).
+
+Two details in this document no longer match current source and are noted here rather than
+edited into the (intentionally frozen) original body:
+
+1. **Module location moved**: § "2. GraphBuilder (codec/mod.rs)" and the Phase 1/4 code
+   samples reference `codec/mod.rs` as `GraphBuilder`'s home. `GraphBuilder` now lives in
+   `src/codec/builder.rs`, a dedicated module introduced by a later refactor (the two-registry
+   codec architecture work, see `docs/project/2_completed/ISSUE_68_TWO_REGISTRY_CODEC_ARCHITECTURE.md`).
+   `codec/mod.rs` now holds the `DocCodec` trait and codec-registry types, not `GraphBuilder`.
+2. **Accessor names differ from the migration guide's example**: § "Phase 3" and the "Migration
+   Guide" code sample show `document_base()`/`session_base()` as the proposed public accessors.
+   The actual accessors implemented on `GraphBuilder` are `doc_bb()`, `session_bb()`,
+   `session_bb_mut()`, and `doc_bb_mut()` — i.e. the `.bb`-suffixed field names themselves,
+   not the more verbose `_base()` forms sketched in the proposal. Functionally equivalent;
+   naming diverged during implementation.
+3. `src/beliefset.rs` (referenced under "Phase 1: Type Aliases" and "Phase 4: Documentation")
+   no longer exists as a standalone file — its contents live in `src/beliefbase/` (a module
+   directory: `base.rs`, `graph.rs`, `accumulator.rs`, `context.rs`, `sink.rs`), per the
+   BeliefSource refactor (`docs/project/2_completed/ISSUE_83_BELIEF_SOURCE_REFACTOR.md`).
+   Likewise `docs/design/beliefset_architecture.md` (referenced under "Phase 4" and
+   "References") is now `docs/design/beliefbase_architecture.md`.
+
+No naming claim in the "Additional Improvements" section was contradicted: `DocCodec` was not
+renamed to `DocumentCodec`, and `MdCodec`/`TomlCodec` were not renamed either — those were left
+as open suggestions, never implemented, and current source confirms they remain as originally
+named (`MdCodec` in `src/codec/md.rs`, `DocCodec` trait in `src/codec/mod.rs`).
+
 ## Goals
 
 1. Rename types to match their actual responsibilities

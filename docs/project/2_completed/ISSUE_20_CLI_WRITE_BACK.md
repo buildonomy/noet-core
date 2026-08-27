@@ -9,6 +9,44 @@
 
 Add `--write` flag to `noet parse` and `noet watch` subcommands to enable writing changes back to source files. Currently, both commands operate in read-only mode. Additionally, ensure graceful error handling when `watch` subcommand is used without the `service` feature flag (edge case protection).
 
+## Updates
+
+### 2026-08-27: CLI entry point relocated; "atomic write" claim does not match current implementation
+
+The core feature this issue describes — `--write/-w` on both `parse` and `watch`, defaulting
+to read-only, with `service`-feature gating on `watch` — is still accurate. Confirmed against
+current `src/cli.rs`: `Commands::Parse` and `Commands::Watch` (the latter under
+`#[cfg(feature = "service")]`) both carry a `write: bool` field with `#[arg(short = 'w', long)]`,
+and `service` remains an optional Cargo feature (present in `default` but not required for the
+crate to build). Two claims have drifted, however:
+
+1. **`src/bin/noet.rs` no longer exists.** The CLI was refactored (during the Issue 6 HTML
+   Generation work) into `src/cli.rs` (all `Commands`/`run()` logic, including the
+   `compile_error!`/runtime `service`-feature checks this issue describes) plus a thin
+   `src/bin/noet/main.rs` that just calls `noet_core::cli::run()`. Every `src/bin/noet.rs`
+   reference in this document's Architecture and References sections should now read
+   `src/cli.rs` for the logic and `src/bin/noet/main.rs` for the binary entry point.
+   `src/codec/markdown.rs` referenced under "Code locations" is likewise stale — the markdown
+   codec lives at `src/codec/md.rs` (as `MdCodec`).
+
+2. **No temp-file+rename atomic write exists.** This document's module-doc excerpt ("Uses atomic
+   write operations (temp file + rename) to prevent partial writes on failure") and Decision
+   Log / Testing Requirements sections describe atomic writes as implemented. Current
+   `parse_one_path` in `src/codec/compiler.rs` writes rewritten content directly via
+   `tokio::fs::write(&file_path, contents).await` (no temp file, no rename) for both parse and
+   watch write-back paths. `tempfile` is a dev-dependency only (used in tests), not a runtime
+   dependency, and no `NamedTempFile`/rename-based write helper exists anywhere in `src/`. A
+   write failure is caught and reported as a diagnostic warning rather than crashing, but the
+   write itself is not atomic in the temp-file+rename sense this document claims. If atomicity
+   is still a requirement, it should be filed as a fresh issue rather than assumed from this
+   record.
+
+The "3-second" self-write ignore window for `watch --write` (Decision 6) still matches current
+behavior structurally, though the actual constant is applied as a coarser "ignore until the
+next compiler-idle flush" in `src/watch.rs` (`ignored_write_paths` is cleared when the debounced
+parse epoch completes) rather than a literal fixed 3-second timer per path. The debouncer's own
+window (`new_debouncer(Duration::from_secs(2), ...)`) is unrelated and unchanged.
+
 ## Goals
 
 1. Add `--write/-w` flag to both `parse` and `watch` subcommands

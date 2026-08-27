@@ -1,9 +1,14 @@
-# Issue 60: href/mailto Cache MISS and Bare Anchor Path Form Fixes
+# Issue 60B: href/mailto Cache MISS and Bare Anchor Path Form Fixes
 
 **Priority**: HIGH (was causing unresolved-link warnings on every parse)
 **Status**: COMPLETE
 **Estimated Effort**: 2 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: None
+
+> [!NOTE]
+> Renumbered from `ISSUE_60` to `ISSUE_60B` on 2026-08-27 to resolve a
+> duplicate-number collision with `ISSUE_60_PARALLEL_COMPILATION_FOLLOWON.md`
+> (the original holder of 60, per `ROADMAP.md`). No content changed.
 
 ## Summary
 
@@ -14,6 +19,17 @@ due to a Trace-filter over-exclusion and session_bb seeding gap. Second: bare
 query key form (`"#quick-links"`) never matched the stored key form
 (`"index.md#quick-links"`). Both were diagnosed via targeted instrumentation and
 fixed at the correct abstraction layer.
+
+## Updates
+
+### 2026-08-27: Post-issue drift
+
+- Fix A: `indexed_get` bare-anchor alias now qualifies with the per-network
+  `self.network_filename` (Issue 67), not the hardcoded `NETWORK_NAME`.
+- Fix A caller list is stale: `BeliefBase::filter_states` and
+  `DbConnection::eval_unbalanced` no longer exist (Issue 83); the lookup path is
+  now `BeliefSource::evaluate` → `QueryPackage`.
+- Fixes B–F verified intact against current `main`.
 
 ## Goals
 

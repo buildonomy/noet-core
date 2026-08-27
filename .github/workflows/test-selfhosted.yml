@@ -64,9 +64,6 @@ jobs:
             cargo install just
           fi
 
-      - name: Fetch vendored binaries
-        run: just vendor
-
       - name: Build
         run: just build '${{ matrix.cargo_flags }}'
 
@@ -96,9 +93,6 @@ jobs:
             cargo install just
           fi
 
-      - name: Fetch vendored binaries
-        run: just vendor
-
       - name: Check formatting
         run: just fmt-check
 
@@ -124,9 +118,6 @@ jobs:
             cargo install just
           fi
 
-      - name: Fetch vendored binaries
-        run: just vendor
-
       # RUSTDOCFLAGS is set inside the recipe, so local runs are also gated.
       - name: Generate documentation
         run: just docs
@@ -149,9 +140,6 @@ jobs:
           if ! command -v just > /dev/null 2>&1; then
             cargo install just
           fi
-
-      - name: Fetch vendored binaries
-        run: just vendor
 
       - name: Build and run examples
         run: just examples
@@ -188,9 +176,6 @@ jobs:
             echo "$HOME/${NODE_DIR}/bin" >> $GITHUB_PATH
           fi
 
-      - name: Fetch vendored binaries
-        run: just vendor
-
       - name: Build WASM module and run interface tests
         run: just wasm-interface
 
@@ -212,9 +197,6 @@ jobs:
           if ! command -v just > /dev/null 2>&1; then
             cargo install just
           fi
-
-      - name: Fetch vendored binaries
-        run: just vendor
 
       # The recipe generates the consumer crate under target/, so unlike the
       # previous version this job does not need a nested checkout path.

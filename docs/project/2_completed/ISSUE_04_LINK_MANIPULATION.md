@@ -12,6 +12,51 @@ Parse and manipulate markdown links to use relative paths (universal renderer co
 
 **Implementation Complete**: All functionality implemented and tested. Canonical link format generation working. Same-document anchor links working correctly. Critical bugs fixed during implementation.
 
+## Updates
+
+### 2026-08-27: Title-attribute format finalized as `bref://`, not `noet:`; see `docs/design/link_format.md`
+
+Much of the *early* Architecture/Goals text in this issue (Format 1–4 examples,
+`RefConfig`/`process_link_title`/`update_bref_in_config`/`rebuild_title` pseudocode,
+and the `noet:bref:abc123` / `noet:auto-title:false` title-attribute grammar) describes
+a design that was superseded **during this same issue's implementation** — see
+"Design Decisions Made" (Q1) further down this document, which already records the
+switch to the `bref://abc123` URL-style format. That later section, not the early
+Architecture section, reflects what shipped. The canonical, currently-accurate spec
+for the link format is `docs/design/link_format.md`, and the current implementation
+lives in `parse_title_attribute()` / `build_title_attribute()` in `src/codec/md.rs`
+(confirmed present and matching the `bref://[bref] [{json config}] [user words]`
+format, e.g. `"bref://abc123 {\"auto_title\":true} My Note"`).
+
+A few other concrete file/dependency references in this issue's "Completed"
+sections no longer hold on current `main`:
+
+- **`pathdiff` crate**: No longer a dependency (`Cargo.toml` has no `pathdiff`
+  entry). Relative-path calculation now goes through `AnchorPath::path_to()` /
+  `AnchorPath::join()` in `src/paths/path.rs`.
+- **`src/paths.rs` and `src/beliefbase.rs`**: Both have since been split into
+  module directories, `src/paths/` (`path.rs`, `pathmap.rs`, `mod.rs`) and
+  `src/beliefbase/` (`base.rs`, `accumulator.rs`, `context.rs`, `graph.rs`,
+  `sink.rs`, `mod.rs`, `tests.rs`). Line-number references like
+  `src/paths.rs:1328`, `src/beliefbase.rs:1687-1691` no longer resolve to those
+  files; the described behavior (PathMap anchor-join flattening, `RelationRemoved`
+  triggering reindex via `update_relation()`) is still present, now in
+  `src/paths/path.rs` (`AnchorPath::join`) and `src/beliefbase/base.rs`
+  (`BeliefBase::process_event`) respectively.
+- **`tests/codec_test.rs`**: Now a thin module aggregator; the link-manipulation
+  integration tests referenced here live in `tests/codec_test/link_tests.rs`.
+- **`src/nodekey.rs:47` (`get_doc_path`)**: No `get_doc_path` function exists in
+  the current `src/nodekey.rs` under that name — anchor-stripping logic has been
+  absorbed into `AnchorPath` methods (e.g. `AnchorPath::filepath()`). Not
+  investigated further since the described bugfix is historical and the
+  higher-level behavior (same-document anchors resolve without double anchors)
+  is exercised by current tests.
+
+Core goals and shipped behavior (relative paths + stable Bref in the CommonMark
+title attribute, canonical link transformation, auto-title default-false logic,
+WikiLink conversion) remain accurate as implemented; only the specific file
+paths/line numbers and one named dependency have drifted.
+
 ## Goals
 
 1. Parse links in all formats: Bref-only, path+Bref, path-only

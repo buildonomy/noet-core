@@ -7,9 +7,15 @@
 > loading item remains relevant as a standalone backlog enhancement. No further action
 > required on this issue as a whole.
 
-**Status**: ~~BACKLOG~~ SUPERSEDED (see note above)
+**Status**: ~~BACKLOG~~ SUPERSEDED (see note above), OBE
 **Priority**: ~~LOW~~ SUPERSEDED
 **Dependencies**: Issue 54 (Full-Text Search MVP) complete
+
+## Updates
+
+### 2026-08-27: Format drift
+
+- Search index format shipped as msgpack, not JSON: `search/{bref}.idx.msgpack` (see `src/shard/search.rs`), despite this doc's references to `.idx.json`.
 
 ## Context
 

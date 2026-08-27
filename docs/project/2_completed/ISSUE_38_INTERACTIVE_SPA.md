@@ -100,6 +100,14 @@
 - No query builder UI
 - No graph visualization
 
+## Updates
+
+### 2026-08-27: Viewer JS modularized, data format changed
+
+- `assets/viewer.js` (~300 lines monolithic) → thin entry point + `assets/viewer/*.js` (16 modules, ~11k lines total: navigation, content, metadata, routing, wasm, shard-manager, etc.)
+- `get_paths()` superseded as the primary nav data source by `get_nav_tree()` (`NavTree`/`NavNode`, Issue 39 Phase 0.2); `get_paths()` still exists for path→BID lookups.
+- `beliefbase.json` → `beliefbase.msgpack` (monolithic) or sharded `beliefbase/{global,networks/*}.msgpack` above a size threshold (Issue 50). `BeliefBaseWasm.from_json()` still exists but the viewer uses `from_msgpack`/`from_manifest`.
+
 ---
 
 ## Original Goals (Foundation Phase Complete)

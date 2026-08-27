@@ -7,6 +7,31 @@
 
 Enable TOML frontmatter `sections` field to provide metadata for markdown heading nodes. The `sections` field is a flat lookup map that enriches heading-generated nodes with schema types, custom fields, and validation rules. Maintains clean separation: markdown defines structure (which nodes exist), frontmatter defines metadata (what fields they have).
 
+## Updates
+
+### 2026-08-27: `NodeKey` shape and test file layout have moved
+
+Two details in this issue no longer match current `main`:
+
+- **`NodeKey` enum shape**: The Architecture section ("Matching Strategy") shows a
+  3-variant tuple enum: `NodeKey::Bid(Bid)`, `NodeKey::Anchor(String)`,
+  `NodeKey::Title(String)`. The current definition lives in `src/nodekey.rs` and
+  is a 4-variant struct-style enum: `Bid { bid }`, `Bref { bref }`,
+  `Path { net, path }`, `Id { net, id }`. Anchor and title matching both route
+  through `NodeKey::Id` today (see `find_metadata_match()` in `src/codec/md.rs`).
+  The **behavior** this issue specifies — priority matching BID > anchor > title,
+  `matched_sections: HashSet<NodeKey>` tracking, and `finalize()` garbage
+  collection of unmatched sections — is still implemented as described; only the
+  `NodeKey` variant names/shapes have changed, most likely as part of Issue 75
+  ("separate anchor identity from network-scoped ID").
+- **Test file layout**: `tests/codec_test.rs` is now a thin module aggregator.
+  The actual section-metadata integration tests referenced here
+  (`test_sections_metadata_enrichment`, `test_sections_garbage_collection`, etc.)
+  now live in `tests/codec_test/section_tests.rs`.
+
+Core architectural claims (authority model, "look up" pattern, codecs-generate-
+nodes/schemas-validate-fields split) are unchanged and still accurate.
+
 ## Goals
 
 1. Parse frontmatter `sections` as flat metadata lookup map

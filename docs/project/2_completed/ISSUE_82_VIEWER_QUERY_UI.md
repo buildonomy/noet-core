@@ -21,6 +21,19 @@ search, Share/Embed, Explore affordance. Step 7 restructures the control
 panel into a proper query builder with clear separation between query
 construction and view configuration.
 
+## Updates
+
+### 2026-08-27: Post-issue drift
+
+- `src/query/query_parser.rs` → `src/query/parser.rs`
+- `BeliefBaseWasm.get_submap` still exists in `src/wasm.rs`; only the viewer-side
+  `refreshData()` path was removed.
+- `_openExplore` now resolves the network bref via `bb.get_bid_from_bref()`, with
+  the nav-tree-roots scan as fallback.
+- Issue 87 items landed: `ViewOutput::Json`, `RawTapeView`
+  (`src/query/view/raw_tape.rs`), `mapsToMode` removed from `traceability.js`.
+- Viewer JS modules named in References all still present.
+
 ## Goals
 
 - The traceability panel control area is a composable form builder that

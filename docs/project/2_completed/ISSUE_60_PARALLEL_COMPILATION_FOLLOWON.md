@@ -15,6 +15,16 @@ systematic attempt-3 requeue affecting ~85% of the attempt-2 population whose
 root cause is unknown. This issue also tracks the ongoing pattern of perf
 regressions as each fix exposes the next bottleneck.
 
+## Updates
+
+### 2026-08-27: Stale line references
+
+- `build_path_key` / `get_parent_from_stack` are now at `src/codec/builder.rs`
+  ~L2143 / ~L1982 (were ~L1139 / ~L1061).
+- `get_parent_from_stack` calls `AnchorPath::new_dir()` directly (as described).
+  `build_path_key` instead manually appends a trailing slash to `net_path_dir`
+  rather than calling `AnchorPath::new_dir()` — same effect, different mechanism.
+
 ## Resolution (2025-04-30)
 
 Goals 1–3 resolved in subsequent commits (AnchorPath `new_dir` fix applied,

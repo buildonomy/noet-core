@@ -14,6 +14,17 @@ re-queuing themselves after Phase 2. The result: links stayed unresolved on pass
 pass 2 emitted spurious `NodeUpdate(Remote)` + `RelationUpdate(Remote)` events —
 failing the `bid_tests` idempotency assertion.
 
+## Updates
+
+### 2026-08-27: `is_content_ns_key` superseded
+
+- The `is_content_ns_key` predicate in `cache_fetch` (`src/codec/builder.rs`, Files
+  Changed table) was replaced shortly after by `n.kind.contains(BeliefKind::External)`
+  — the exemption is now kind-based, not namespace-key-based.
+- `current_batch` sibling-awareness fix itself (field, set/clear points,
+  `process_unresolved_reference` tail return, Id-keyed Incoming branch) still
+  matches `src/codec/compiler.rs` as described.
+
 ## Root Cause
 
 The refactor replaced `!unresolved_refs.is_empty()` with `any_dependency_enqueued`

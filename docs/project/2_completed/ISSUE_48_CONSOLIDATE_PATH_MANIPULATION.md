@@ -20,6 +20,13 @@ Consolidate manual path manipulation in `viewer.js` to use WASM-exposed `AnchorP
 - Reduce bugs from inconsistent path parsing
 - Leverage well-tested Rust path utilities
 
+## Updates
+
+### 2026-08-27: File path drift
+
+- `assets/viewer.js` was split into modules under `assets/viewer/`; the path/hash helpers described here now live in `assets/viewer/routing.js` (`parseHashPath`, `stripAnchor`, `getCurrentDocPath`), `assets/viewer/navigation.js` (`getActiveBid`), and `assets/viewer/content.js`.
+- WASM `AnchorPath` methods (`pathParts`, `pathJoin`, `pathParent`, `pathExtension`, `pathFilestem`, `normalizePath`) remain as designed; see `src/wasm.rs`.
+
 ## Architecture
 
 ### Subnet Path Prefix Problem (CRITICAL BUG)

@@ -13,6 +13,17 @@ via an explicit `url_aliases` frontmatter field or a network-level
 mechanisms register entries in the existing `href_namespace` PathMap — no new
 codec namespace, no changes to `regularize_unchecked` or `push_relation`.
 
+## Updates
+
+### 2026-08-27: Scope config and PathMap routing fix
+
+- `AliasTemplateConfig` gained `scope: AliasScope` (`alias-scope` network
+  frontmatter; per-node `alias = true`/`false` override in document frontmatter
+  or a `[sections."#anchor"]` table) — `src/codec/network.rs`
+- Alias Section edges no longer route to const-namespace PathMaps:
+  `candidate_nets` in `PathMapMap::process_event_queue` excludes const-namespace
+  brefs unless the sink IS that namespace (`src/paths/pathmap.rs`)
+
 ## Goals
 
 - Nodes with `url_aliases: [...]` in frontmatter register each entry in the

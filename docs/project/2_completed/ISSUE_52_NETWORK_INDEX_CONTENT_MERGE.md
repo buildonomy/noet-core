@@ -1,6 +1,6 @@
 # Issue 52: Network Index Page Content Merge
 
-**Priority**: HIGH
+**Priority**: HIGH, OBE
 **Estimated Effort**: 2 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: Requires working `NetworkCodec` (complete), Blocks Issue 13 (full HTML CLI output)
 
@@ -10,6 +10,15 @@
 scratch, discarding authored prose in `index.md`. We need to merge the two: the human-written
 body of `index.md` and the auto-generated directory listing. This is the first use of
 quasi-dynamic content injection in the render pipeline.
+
+## Updates
+
+### 2026-08-27: Mechanism superseded
+
+- `DocCodec::generate_deferred_html` trait method (per-codec, `Result<Option<(String,String)>,_>`) removed entirely
+- Sentinel splicing is now generic, done in `DocumentCompiler::generate_html_for_path` (`src/codec/compiler.rs`) driven by the `myst::DIRECTIVES` table, not per-codec logic
+- Per-codec `NETWORK_CHILDREN_SENTINEL`/`NETWORK_CHILDREN_MARKER` constants replaced by `myst::sentinel(name)` (`src/codec/myst.rs`)
+- Author marker syntax changed: `<!-- network-children -->` HTML comment → ````{network_children}```` MyST fenced directive; old HTML-comment form is no longer auto-converted (migration required)
 
 ## Goals
 

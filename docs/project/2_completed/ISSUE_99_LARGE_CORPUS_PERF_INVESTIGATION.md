@@ -24,6 +24,18 @@ run, invalidating the working data before the sleep-correlation check could
 be completed. **This issue exists to redo that investigation properly, in a
 fresh session, against a clean log.**
 
+## Updates
+
+### 2026-08-27: Reference check
+
+- `ISSUE_98_ASSET_SYNC_SESSION_BB_GAP.md` no longer exists (deleted; see git
+  history). References to it in Background and References are dead.
+- Still present as named: `sync_asset_snapshot` (`src/codec/compiler.rs`),
+  `initialize_stack` (`src/codec/builder.rs`), `apply_traversal_sql`
+  (`src/db.rs`), `src/beliefbase/accumulator.rs`,
+  `benches/log_analysis/parse_log.py`, `ISSUE_97_BUILD_PERFORMANCE_BOTTLENECKS.md`.
+- Measurements below are a point-in-time record; not re-verified.
+
 ## Background / What Prompted This
 
 See prior related work for context:

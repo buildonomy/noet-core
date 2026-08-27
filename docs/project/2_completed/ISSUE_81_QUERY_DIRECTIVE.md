@@ -18,6 +18,17 @@ as HTML in the document.
 The integration test fixture and test harness are already committed (Issue 80 scope)
 as a TDD contract. This issue makes those tests pass.
 
+## Updates
+
+### 2026-08-27: Phase 3 no longer renders views
+
+- `generate_html_for_path` now emits `<div class="noet-query-meta" data-query data-count hidden>` + a static `<div class="noet-query-result">` placeholder; result rendering is deferred to the browser Search panel. No `VIEWS` lookup in `compiler.rs`.
+- Error block is `<pre class="noet-query-error">`, not `<div>`
+- `src/query_parser.rs` → `src/query/parser.rs`
+- `Subject::Implicit`/`Subject::Bids` → first step's `TapeFn::Then(None)` / `TapeFn::Bids`
+- `ViewOutput::Rows` → `ViewOutput::Json`
+- `{query}` `DirectiveDef` registers in `DIRECTIVES` as specified (`queries: &[]`, `builder: None`)
+
 ## Current API Surface (post-Issues 79, 80, 83)
 
 Key types available for the builder implementation:

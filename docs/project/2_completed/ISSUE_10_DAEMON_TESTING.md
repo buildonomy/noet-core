@@ -9,6 +9,34 @@
 
 Migrate `compiler.rs` to `watch.rs`, extract library patterns for file watching and database integration. The `compiler.rs` (original `watch.rs`) module was written before `codec/compiler.rs` (and contains untested code. It uses product-specific language (`LatticeService`) for library patterns (`FileUpdateSyncer`, file watching, database sync) that should be documented and exposed as examples and as an executable that can be installed and run locally as a service or user-space executable. This issue determines what belongs in the library vs. product, creates working tests/examples/executables, and prepares these patterns for Issue 5 documentation.
 
+## Updates
+
+### 2026-08-27: File path moved; CLI grew well beyond `parse`/`watch`; Issue 11 re-scoped
+
+- **`src/bin/noet.rs` is now `src/bin/noet/main.rs`**, and it is now a two-line
+  wrapper (`fn main() { noet_core::cli::run() }`). The actual CLI argument
+  parsing, subcommand enum, and dispatch logic described in this issue's
+  "Target Structure" and "Implementation Steps → 7" now live in `src/cli.rs`
+  (`pub enum Commands`, `pub fn run`).
+- **The `noet` binary now has far more subcommands than `parse`/`watch`**
+  (`init`, `parse`, `watch`, `mcp`, `distribute`, etc. — see `src/cli.rs`), so
+  the "Single binary with subcommands... Initial subcommands: parse, watch"
+  framing in Decision 3 and the Architecture section describes only the v0.1.0
+  starting point, not the current surface.
+- **Issue 11 was re-scoped**, not simply "future work" for a REST/IPC API as
+  described here. `docs/project/0_open/ISSUE_11_BASIC_LSP.md` now carries a
+  warning that the LSP is being re-architected as a PII surface for an
+  attestation service (see `docs/design/attestation_fabric.md` §13), pending
+  further design work — it is not simply "REST/IPC API layer" work as this
+  issue's References section describes.
+- The core architectural claims — `WatchService`, `FileUpdateSyncer`,
+  `BnWatchers`, `perform_transaction`, the `commands.rs` `Op`/`OpResult` enums,
+  and the `service` feature gate — all still match current `src/watch.rs` and
+  `src/commands.rs`. No drift found there.
+
+No edits made to the historical body; this note only redirects readers to the
+current CLI entry point and clarifies Issue 11's status.
+
 ## Goals
 
 1. Migrate `compiler.rs` → `watch.rs` (rename `LatticeService` → `WatchService`)

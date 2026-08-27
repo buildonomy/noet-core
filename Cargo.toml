@@ -110,7 +110,7 @@ tracing-subscriber = "0.3.20"
 trybuild = "1.0"
 
 [features]
-default = ["bin", "service", "git-tracking", "server-math"]
+default = ["bin", "service", "git-tracking", "server-math", "distribute"]
 bin = ["clap", "dep:tracing-subscriber", "wasm", "stemming", "dep:indicatif"]
 service = ["notify", "sqlx", "dep:notify-debouncer-full", "dep:futures-core", "axum", "tokio-stream", "tower", "tower-http", "ctrlc"]
 wasm = ["serde-wasm-bindgen", "wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys", "uuid/js", "futures", "tracing-wasm", "dep:tracing-subscriber", "stemming", "dep:rust_xlsxwriter"]
@@ -127,7 +127,9 @@ git-tracking = ["dep:git2"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:tracing-subscriber"]
 xlsx = ["dep:calamine", "dep:rust_xlsxwriter"]
 # Bundle a vendored miniserve binary for `noet distribute` (Windows distribution).
-# Run `./vendor/fetch.sh` before building with this feature.
+# The binary is committed under vendor/ and embedded via include_bytes! — no
+# build-time fetch required. Enabled by default so the easy-install path
+# includes offline distribution packaging.
 distribute = []
 # Batteries-included build: everything except the WASM target.
 # Equivalent to: bin + service + git-tracking + mcp + xlsx + distribute

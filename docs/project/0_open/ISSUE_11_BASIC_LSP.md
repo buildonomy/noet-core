@@ -572,6 +572,22 @@ async fn main() {
    until then. See `src/codec/builder.rs` `push()` and `src/beliefbase/base.rs`
    `insert_state` for current collision diagnostic wiring.
 
+7. **Are atomic (temp-file + rename) writes needed for LSP-initiated writes?**
+
+   `DocumentCompiler::parse_one_path` writes directly via `tokio::fs::write` — no
+   temp file, no rename (`src/codec/compiler.rs`). The watch service's
+   `ignored_write_paths` set (`src/watch.rs`) only suppresses re-parse triggers for
+   writes made by that *same* `WatchService` instance; it provides no atomicity and
+   doesn't help against a second, independent writer. `textDocument/didSave` (§3
+   above) and BID-injection-on-format (Issue 12 §2.2) are exactly that: a second
+   writer to files a concurrently-running `noet watch` may also be touching. A
+   non-atomic write leaves a window where a concurrent watcher could observe a
+   partially-written file.
+   - **Decision**: TBD — either (a) share the watch instance's `ignored_write_paths`
+     with the LSP writer (consistent with Decision 2 above, "share instance"), or
+     (b) add temp-file+rename atomicity to the write path if LSP and watch are
+     expected to run as separate processes/instances.
+
 ## Future Work (Issue 12)
 
 **Navigation features** (2-3 days):

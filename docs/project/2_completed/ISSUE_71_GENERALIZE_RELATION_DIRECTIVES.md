@@ -26,6 +26,13 @@ directives to all six WeightKind × reference_role combinations, introduces a pr
 All corpora using it must migrate to the new codespan toggle form. The author has control
 over all affected documents and will migrate them as part of this effort.
 
+## Updates
+
+### 2026-08-27: Doc/registry drift
+
+- `docs/design/myst_directive_architecture.md` has since been updated to reflect the codespan toggle model (§2.2, §3, §4.3, §6.3) — the "pending" note in Completion Notes above is stale.
+- Registry now has 10 verb entries (`uses`, `implements`, `used_by`, `draws_from`, `underlies`, `constrained_by`, `constrains`, `consists_of`, `composed_of`, `component_of`), not seven — `constrained_by`/`constrains` and `composed_of` were added after this issue closed.
+
 ## Goals
 
 1. Replace the fenced block directive syntax with a codespan toggle: `` `{implements}` ``

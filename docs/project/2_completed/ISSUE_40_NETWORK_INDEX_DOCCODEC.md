@@ -12,6 +12,13 @@ Network index pages (`index.html`) are currently generated in a post-processing 
 
 **Solution**: Treat `BeliefNetwork.{toml,json,yaml}` files as first-class documents that generate their own `index.html` via `DocCodec::generate_html()`, just like markdown documents.
 
+## Updates
+
+### 2026-08-27: Path drift
+
+- `belief_ir.rs::generate_deferred_html(ctx)` (Architecture step 3) does not exist — deferred HTML generation lives in `DocumentCompiler::generate_deferred_html` (`src/codec/compiler.rs`).
+- `belief_ir.rs` no longer implements `DocCodec` (post-ISSUE_68 two-registry refactor); `should_defer`/`generate_html` for networks live in `NetworkCodec` (`src/codec/network.rs`), wrapping `MdCodec`.
+
 ## Goals
 
 - Network indices use responsive template with full WASM support (navigation, theme switching, etc.)

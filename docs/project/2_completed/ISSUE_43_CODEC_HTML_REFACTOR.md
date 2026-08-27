@@ -5,7 +5,7 @@
 **Dependencies**: Issue 40 (complete)  
 **Blocks**: Future codec implementations, report generation
 
-**Status**: ✅ **COMPLETE** - All Phases Complete
+**Status**: ✅ **COMPLETE** - All Phases Complete, OBE
 
 ## Progress
 
@@ -205,6 +205,15 @@ This refactor successfully transformed the DocCodec HTML generation system from 
 ## Original Summary
 
 Replace codec singleton pattern with factory pattern where `parse_content()` returns owned codec instances. Enable dual-phase HTML generation: immediate (uses parsed state) and deferred (uses BeliefContext). Separate content generation (codecs) from presentation wrapping (compiler). Generate SPA architecture with shell + fragments + sitemap.
+
+## Updates
+
+### 2026-08-27: API and dispatch superseded
+
+- `fn generate_html(&self) -> Result<Vec<(PathBuf, String)>, _>` → actual signature is `fn generate_html(&self) -> Result<HtmlFragmentPairs, _>` where `HtmlFragmentPairs = Vec<(String, Vec<(String,String)>, Option<Layout>)>` (`src/codec/mod.rs`).
+- `generate_deferred_html(&self, ctx: &BeliefContext)` trait method no longer exists; deferred/context-dependent content is now spliced via sentinel directives (`crate::codec::myst::DIRECTIVES`) in `generate_html_for_path` (`src/codec/compiler.rs`).
+- Single `CODECS: HashMap<_, CodecFactory>` map described here → superseded by two-registry dispatch (`CODECS`, `WALK_CODECS`, `CLAIM_MAP`); see Issue 68 and `docs/design/beliefbase_architecture.md` §3.2/§3.6.
+- `beliefbase.json` output → `beliefbase.msgpack` (monolithic) or sharded `beliefbase/manifest.json` + `*.msgpack` shards (Issue 50 sharding).
 
 ## Core Problems
 

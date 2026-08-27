@@ -13,7 +13,17 @@
 
 **Impact**: Without fixes, SQLite cache accumulates duplicates (node count doubles: 0→29→56→112), PathMap reconstruction fails due to orphaned edges, cache lookups miss, and duplicate BIDs are generated.
 
-**Status**: Phases 1-5 COMPLETE ✅ (orphaned edges, relation duplication, Trace marking for RelationIn). Remaining: Fix eval_trace SQL error + manual validation.
+**Status**: Phases 1-5 COMPLETE ✅ (orphaned edges, relation duplication, Trace marking for RelationIn). Remaining: Fix eval_trace SQL error + manual validation, OBE
+
+## Updates
+
+### 2026-08-27: Query API described here was deleted
+
+- `Expression` / `StatePred` / `RelationPred` / `DbConnection::eval_unbalanced` / `eval_trace` no longer exist — replaced wholesale by `QuerySpec` / `TapeFn` / `QueryPackage` (Issue 83, see `docs/design/query_model.md` §10.2 "Deleted Constructs")
+- `DbConnection` now implements `BeliefSource::evaluate(&mut QueryPackage)` directly (`src/db.rs`), not the described `eval_unbalanced`/`eval_trace` methods
+- `src/beliefbase.rs` → `src/beliefbase/graph.rs` (`BidGraph`, `find_orphaned_edges`) + `src/beliefbase/base.rs` (`BeliefBase`)
+- `src/paths.rs` → `src/paths/pathmap.rs`
+- `tests/belief_source_test.rs` still exists but is not building against the API shown in this issue's snippets
 
 ## Evidence (Log Files)
 

@@ -16,6 +16,22 @@ one against the other.  The fix is to let codecs register **secondary index
 namespaces** — named, cross-network PathMaps that map synthetic lookup paths
 to node BIDs, analogous to a SQL secondary index on a non-primary-key column.
 
+## Updates
+
+### 2026-08-27: API drift
+
+- `IRNode::namespace_paths` is `Vec<(Bid, String)>`, not `Vec<(Bref, String)>`
+  as shown under Architecture → Population
+- `Bid::codec_namespace` additionally stamps octets 10–15 with
+  `codec_namespace_root().bref()`; omitted from the Namespace Identity snippet
+- `const_namespaces()` holds `codec_namespace_root()`, not `UUID_NAMESPACE_CODEC`
+- "No Registration Step" is superseded: `push()` calls
+  `register_codec_namespace()` into the `CODEC_NAMESPACES` registry, and
+  `cache_fetch` dispatches on `is_codec_namespace()` rather than `is_reserved()`
+  (`src/codec/mod.rs`)
+- `namespace_paths` is also used for `href_namespace()` aliases (`url_aliases`
+  frontmatter, `[sections."#anchor"]` alias tables) — not codec-only
+
 ## Problem
 
 The PathMap stores each node under a single canonical path, scoped to its home

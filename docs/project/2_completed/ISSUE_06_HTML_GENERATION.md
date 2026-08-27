@@ -1,9 +1,9 @@
 # Issue 6: HTML Generation and Interactive Viewer
 
-**Priority**: MEDIUM - Post-open source feature  
-**Estimated Effort**: 12-15 days (includes WASM SPA architecture)  
-**Dependencies**: Phase 1 complete (Issues 1-4), v0.1.0 released  
-**Status**: Phase 1 ✅ Complete | Phase 1.5 🚧 In Progress (Steps 1-5/6 Complete, 2026-01-29)
+**Priority**: MEDIUM - Post-open source feature
+**Estimated Effort**: 12-15 days (includes WASM SPA architecture)
+**Dependencies**: Phase 1 complete (Issues 1-4), v0.1.0 released
+**Status**: Phase 1 ✅ Complete | Phase 1.5 🚧 In Progress (Steps 1-5/6 Complete, 2026-01-29), OBE
 **Architecture Update**: HTML generation is a parse/watch option, not a separate command
 
 ## Summary
@@ -11,6 +11,61 @@
 Implement static site generation with progressive enhancement via WASM-powered BeliefBase. Generate Jekyll-style static HTML that works without JavaScript, then layer on rich interactivity by loading the entire belief network in the browser via WebAssembly. This enables offline-capable, client-side query/navigation while maintaining SEO-friendly static content.
 
 **Architecture**: Static HTML (fast initial load, SEO) + WASM BeliefBase (rich interactivity) = Progressive Enhancement SPA
+
+## Updates
+
+### 2026-08-27: Architecture and API surface have been substantially replaced by later issues
+
+The HTML/WASM plumbing described here was real and shipped, but almost every
+concrete API shape in this document has since been redesigned. Treat this issue
+as a historical narrative of Phase 1/2 delivery, not as a reference for the
+current HTML generation architecture. Current sources of truth:
+
+- **`docs/design/interactive_viewer.md`** — authoritative architecture for the
+  SPA/viewer (this doc's own § "Phase 2" work was superseded here and in Issues
+  38/39/44).
+- **`docs/design/search_and_sharding.md`** — authoritative for the export format
+  (see below).
+- **Issue 43** (`ISSUE_43_CODEC_HTML_REFACTOR.md`) — replaced the `DocCodec`
+  HTML API described in §"Architecture → DocCodec Extension" here. The actual
+  current trait method is `fn generate_html(&self) -> Result<HtmlFragmentPairs, BuildonomyError>`
+  (see `src/codec/mod.rs`) — it takes no `HtmlGenerationOptions` argument, and
+  `HtmlGenerationOptions` / `MetadataRenderMode` do not exist in the codebase.
+- **Issue 68** (`ISSUE_68_TWO_REGISTRY_CODEC_ARCHITECTURE.md`) — replaced the
+  single `CodecMap`/`CODECS` registry model referenced in § "Step 7" with the
+  current two-registry `WALK_CODECS` + `CLAIM_MAP` dispatch.
+- **Issue 50** (`ISSUE_50_BELIEFBASE_SHARDING.md`) — replaced the single
+  `beliefbase.json` export described in § "6. Export BeliefBase to Portable
+  Format" with per-network sharded export plus always-on search indices.
+  The export format itself has also moved from pretty-printed JSON to
+  **msgpack** (`beliefbase.msgpack` for the monolithic case, or
+  `beliefbase/manifest.json` + per-network `.msgpack` shards) — see
+  `src/codec/compiler.rs::finalize_html` and `src/shard/`. Plain JSON export
+  (`export_beliefbase_json`) still exists only as a fallback path.
+
+File-path claims that no longer match the repo layout: `src/html_gen.rs`,
+`src/codec/mdcodec.rs`, `src/commands/html.rs`, and `src/bin/noet/main.rs`
+(singular) don't exist. HTML generation for markdown now lives in
+`src/codec/md.rs`'s `DocCodec::generate_html`, and the CLI is
+`src/cli.rs`/`src/bin/noet/main.rs` (the binary is a thin wrapper calling
+`noet_core::cli::run()`).
+
+The WASM API shape in §"7. Compile noet-core to WASM" is also out of date:
+`BeliefBaseWasm::from_json` now additionally requires an `entry_bid_str`
+parameter, `get_backlinks`/`get_forward_links` as named no longer exist (superseded
+by `get_context`/`get_context_bulk`), and a `from_msgpack` constructor was added
+alongside `from_json` to support the sharded/monolithic msgpack export above
+(see `src/wasm.rs`).
+
+The viewer JavaScript in §"8. Create Viewer JavaScript" (`class NoetViewer`,
+a single `viewer.js`) was refactored into a set of ES modules under
+`assets/viewer/*.js` (state, theme, panels, navigation, content, metadata,
+routing, resize, wasm, shard-manager, network-selector, search, etc.), with
+`assets/viewer.js` now just a thin entry point. See that directory directly
+rather than this issue's inline sketch.
+
+No edits made to the historical body; this note exists purely to
+redirect readers to current sources of truth.
 
 ## Goals
 
@@ -90,7 +145,7 @@ Implement static site generation with progressive enhancement via WASM-powered B
 ```rust
 pub trait DocCodec: Sync {
     fn generate_html(
-        &self, 
+        &self,
         options: &HtmlGenerationOptions
     ) -> Result<Option<String>, BuildonomyError> {
         Ok(None)  // Default: not supported
@@ -123,17 +178,17 @@ pub enum MetadataRenderMode {
 type: procedure
 schema: Action</pre>
     </details>
-    
-    <h1 id="01234567-89ab-cdef" 
+
+    <h1 id="01234567-89ab-cdef"
         data-nodekey="bid://01234567-89ab-cdef"
         data-bid="01234567-89ab-cdef"
         data-bref="doc-shortname">
         My Document
     </h1>
-    
+
     <p>Content here...</p>
-    
-    <h2 id="intro" 
+
+    <h2 id="intro"
         data-nodekey="bref://intro"
         data-bid="98765432-10ab-cdef"
         data-bref="intro">
@@ -170,7 +225,7 @@ document.querySelector('[data-bref="doc-shortname"]')
 **Progressive Enhancement (With WASM)**:
 - **Client-Side BeliefBase**: Entire belief network loaded in browser memory
 - **Real-Time NodeKey Resolution**: All links validated locally, no server round-trips
-- **Interactive Navigation**: 
+- **Interactive Navigation**:
   - Click heading to copy BID to clipboard
   - Hover to show full node metadata (schema, kind, relationships)
   - Navigate via `#bid://`, `#bref://`, `#id://` anchors
@@ -308,7 +363,7 @@ async fn generate_network_indices(&self, html_output_dir: &Path) -> Result<()> {
         .doc_bb()
         .query(Query::of_kind(BeliefKind::Network))
         .collect::<Vec<_>>();
-    
+
     for network in networks {
         // Query all documents in this network
         let docs = self.builder()
@@ -316,17 +371,17 @@ async fn generate_network_indices(&self, html_output_dir: &Path) -> Result<()> {
             .paths()
             .get_docs_in_network(network.bid)
             .collect::<Vec<_>>();
-        
+
         // Generate index.html
         let index_html = self.generate_index_page(&network, &docs)?;
-        
+
         // Determine output path (network root or subdir)
         let network_path = self.builder().doc_bb().paths().get_network_path(network.bid)?;
         let index_path = html_output_dir.join(network_path).join("index.html");
-        
+
         tokio::fs::write(index_path, index_html).await?;
     }
-    
+
     Ok(())
 }
 
@@ -345,7 +400,7 @@ fn generate_index_page(&self, network: &BeliefNode, docs: &[PathBuf]) -> Result<
         })
         .collect::<Vec<_>>()
         .join("\n");
-    
+
     Ok(format!(
         r#"<!DOCTYPE html>
 <html>
@@ -449,7 +504,7 @@ noet watch docs/ --html-output ./html --serve --port 3000
 
 ### 6. Export BeliefBase to Portable Format ✅ COMPLETE (2026-02-03)
 
-**Files Modified**: 
+**Files Modified**:
 - `src/query.rs` - Added `export_beliefgraph()` to `BeliefSource` trait
 - `src/beliefbase.rs` - Implemented for `BeliefBase` and `&BeliefBase`
 - `src/db.rs` - Implemented for `DbConnection`
@@ -551,10 +606,10 @@ pub struct BeliefBaseWasm {
 impl BeliefBaseWasm {
     #[wasm_bindgen(constructor)]
     pub fn from_json(data: String) -> Result<BeliefBaseWasm, JsValue>;
-    
+
     // Full query API using Expression syntax
     pub async fn query(&self, expr_js: JsValue) -> Result<JsValue, JsValue>;
-    
+
     // Convenience methods
     pub fn get_by_bid(&self, bid: String) -> JsValue;
     pub fn search(&self, query: String) -> JsValue;
@@ -627,31 +682,31 @@ class NoetViewer {
   async init() {
     // Load WASM module
     await init('./noet-wasm.wasm');
-    
+
     // Load belief network data
     const response = await fetch('./belief-network.json');
     const data = await response.text();
-    
+
     // Instantiate BeliefBase in browser (stays in memory)
     this.beliefBase = BeliefBaseWasm.from_json(data);
-    
+
     // CRITICAL: Install SPA navigation to avoid WASM reload
     this.installSPANavigation();
-    
+
     // Enable interactive features
     this.attachEventHandlers();
   }
-  
+
   installSPANavigation() {
     // Intercept all internal link clicks
     document.body.addEventListener('click', async (e) => {
       const link = e.target.closest('a');
       if (!link || !this.isInternalLink(link.href)) return;
-      
+
       e.preventDefault();
       await this.navigateTo(link.href);
     });
-    
+
     // Handle browser back/forward buttons
     window.addEventListener('popstate', (e) => {
       if (e.state?.path) {
@@ -659,27 +714,27 @@ class NoetViewer {
       }
     });
   }
-  
+
   async navigateTo(url) {
     // Fetch HTML, extract content, swap in-place
     const html = await fetch(url).then(r => r.text());
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    
+
     // Swap content (WASM stays in memory)
     const newContent = doc.querySelector('.document');
     document.querySelector('.document').replaceWith(newContent);
-    
+
     // Re-attach handlers to new content
     this.attachEventHandlers();
-    
+
     // Update browser history
     history.pushState({path: url}, '', url);
   }
-  
+
   isInternalLink(url) {
     return url.startsWith('/') || url.startsWith(window.location.origin);
   }
-  
+
   resolveNodeKey(nodekey) {
     // Query WASM instead of DOM search
     const node = this.beliefBase.query_by_nodekey(nodekey);
@@ -691,7 +746,7 @@ class NoetViewer {
     }
     return null;
   }
-  
+
   async searchDocuments(query) {
     // Client-side search via WASM
     const results = this.beliefBase.search(query);
@@ -896,25 +951,25 @@ Defer to Phase 3 - WASM approach handles most use cases client-side.
 
 ## Risks
 
-**Risk**: WASM bundle size too large  
+**Risk**: WASM bundle size too large
 **Mitigation**: Use MessagePack for smaller data format, implement lazy loading, compress assets. Target < 2MB total (WASM + data).
 
-**Risk**: WASM load time unacceptable  
+**Risk**: WASM load time unacceptable
 **Mitigation**: Progressive enhancement - static HTML works immediately, WASM enhances. Show loading indicator. Cache aggressively.
 
-**Risk**: Browser compatibility issues with WASM  
+**Risk**: Browser compatibility issues with WASM
 **Mitigation**: Feature detection, graceful fallback to DOM-only mode. Test across browsers. WASM supported by 95%+ of browsers (2023+).
 
-**Risk**: Memory usage with large belief networks  
+**Risk**: Memory usage with large belief networks
 **Mitigation**: Implement pagination, lazy loading of node details, prune unnecessary data from export. Monitor memory usage in tests.
 
-**Risk**: HTML generation complexity  
+**Risk**: HTML generation complexity
 **Mitigation**: Start simple (basic conversion), iterate based on feedback. Make features optional.
 
-**Risk**: Performance with large documents  
+**Risk**: Performance with large documents
 **Mitigation**: Stream HTML generation, optimize WASM queries, use Web Workers for heavy computation.
 
-**Risk**: NodeKey anchor resolution ambiguity  
+**Risk**: NodeKey anchor resolution ambiguity
 **Mitigation**: WASM provides deterministic resolution via full belief graph. Fall back to DOM search if WASM unavailable.
 
 ## Open Questions
@@ -1081,7 +1136,7 @@ Successfully exported `link_format.md` (design document) to HTML:
 
 **Test Results with `tests/network_1`:**
 - ✅ Root index at root with 12 documents
-- ✅ Subnet index at `subnet1/` with 2 documents  
+- ✅ Subnet index at `subnet1/` with 2 documents
 - ✅ All HTML files with rewritten links
 - ✅ CSS copied to `assets/default-theme.css`
 - ✅ Document titles visible with proper styling
@@ -1110,7 +1165,7 @@ Implementation details:
 
 **Architecture decision**: Dev server watches HTML directory directly (using notify) rather than callback mechanism through WatchService - cleaner separation of concerns.
 
-**Testing**: 
+**Testing**:
 ```bash
 ./target/release/noet watch tests/network_1/subnet1 --html-output docs-html --serve
 # Access at http://127.0.0.1:9037 ✅

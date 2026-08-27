@@ -27,6 +27,13 @@ permanent author-visible failure.
 4. Add tests asserting that specific link-resolution failures produce the expected diagnostics
    after compilation completes.
 
+## Updates
+
+### 2026-08-27: CLI command name drift
+
+- Doc references `noet build`; the actual subcommand is `noet parse` (`Commands::Parse` in `src/cli.rs`) — no `build` subcommand exists
+- Diagnostic mechanism otherwise matches current code: `check_for_link_and_push` diagnostics out-param, `DocumentCompiler::promote_unresolved_to_warnings`, CLI stderr reporting in `src/cli.rs`
+
 ## Architecture
 
 ### The Gap Today
