@@ -875,6 +875,22 @@ pub trait DocCodec: Sync {
 
     fn nodes(&self) -> Vec<IRNode>;
 
+    /// Whether this codec handles opaque binary assets rather than parseable content.
+    ///
+    /// Only `AssetCodec` overrides this. Consumers use it to distinguish asset results
+    /// from document results in `latest_results`, which otherwise treats them uniformly
+    /// by design (see [`crate::codec::builder::AssetCodec`]).
+    ///
+    /// The concrete need: assets are already emitted to the HTML output by
+    /// `create_asset_hardlinks` (content-addressed under `static/`, hardlinked to their
+    /// semantic path under `pages/`), so `copy_source_files` must not copy them a third
+    /// time into `pages/sources/`.
+    ///
+    /// Default: `false` — content codecs need no change.
+    fn is_asset_codec(&self) -> bool {
+        false
+    }
+
     /// Write the resolved BID back into the codec's internal proto for the node at
     /// `proto_idx`. Called from the Phase 1 push loop immediately after `push()`
     /// returns, before `inject_context` runs.

@@ -78,6 +78,10 @@ impl DocCodec for AssetCodec {
         Vec::new()
     }
 
+    fn is_asset_codec(&self) -> bool {
+        true
+    }
+
     fn inject_context(
         &mut self,
         _proto_idx: usize,

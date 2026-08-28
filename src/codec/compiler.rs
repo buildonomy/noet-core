@@ -222,6 +222,14 @@ pub struct ParseResult {
     pub rewritten_content: Option<String>,
     pub dependent_paths: Vec<(String, Bref)>,
     pub diagnostics: Vec<crate::codec::ParseDiagnostic>,
+    /// True when this path was handled by [`AssetCodec`] rather than a content codec.
+    ///
+    /// Assets already reach the HTML output twice via `create_asset_hardlinks`:
+    /// once content-addressed at `static/{sha256}.{ext}`, and once at their semantic
+    /// path under `pages/` as a *hardlink* to that canonical file. `copy_source_files`
+    /// must therefore skip them, or every asset gets a third, independently-allocated
+    /// copy under `pages/sources/`.
+    pub is_asset: bool,
 }
 
 /// Metadata for a single HTML fragment write operation.
@@ -635,6 +643,7 @@ impl DocumentCompiler {
                     rewritten_content: None,
                     dependent_paths: Vec::new(),
                     diagnostics: Vec::new(),
+                    is_asset: false,
                 })
                 .diagnostics
                 .push(ParseDiagnostic::ReparseLimitExceeded);
@@ -654,11 +663,13 @@ impl DocumentCompiler {
                             format!("Parse failed: {e}"),
                             parse_count,
                         )],
+                        is_asset: false,
                     },
                 );
             }
             Ok(with_codec) => {
                 let (mut parse_result, codec) = (with_codec.result, with_codec.codec);
+                let is_asset = codec.is_asset_codec();
 
                 // HTML generation — only active when an html_output_dir is configured.
                 if let Some(html_dir) = &self.html_output_dir.clone() {
@@ -940,6 +951,7 @@ impl DocumentCompiler {
                         rewritten_content,
                         dependent_paths,
                         diagnostics: parse_result.diagnostics,
+                        is_asset,
                     },
                 );
             }
@@ -3244,6 +3256,13 @@ impl DocumentCompiler {
     /// Only files that were successfully parsed (present in `self.latest_results`
     /// with no fatal parse error) are copied. This gives static HTML viewers a
     /// downloadable copy of the source alongside the rendered output.
+    ///
+    /// Binary assets are excluded. `create_asset_hardlinks` already emits every
+    /// asset twice — content-addressed at `static/{sha256}.{ext}`, and at its
+    /// semantic path under `pages/` as a hardlink to that same inode. Copying
+    /// them here would add a third, independently-allocated copy that duplicates
+    /// bytes already served from two locations. On an asset-heavy corpus this
+    /// dominated the output: 23.6 GB of a 40 GB site.
     async fn copy_source_files(&self) -> Result<(), BuildonomyError> {
         let html_dir = match &self.html_output_dir {
             Some(dir) => dir.clone(),
@@ -3256,6 +3275,7 @@ impl DocumentCompiler {
         let repo_root = self.builder.repo_root();
         let mut copied = 0u32;
         let mut skipped_fatal = 0u32;
+        let mut skipped_asset = 0u32;
         let mut skipped_dir = 0u32;
         let mut skipped_prefix = 0u32;
         let mut copy_errors = 0u32;
@@ -3268,6 +3288,12 @@ impl DocumentCompiler {
         );
 
         for (abs_path, result) in &self.latest_results {
+            // Skip binary assets: already emitted by create_asset_hardlinks at both
+            // static/{hash}.{ext} and pages/{semantic}, sharing one inode.
+            if result.is_asset {
+                skipped_asset += 1;
+                continue;
+            }
             // Skip files with fatal parse errors.
             let has_fatal = result
                 .diagnostics
@@ -3318,8 +3344,8 @@ impl DocumentCompiler {
         }
 
         tracing::debug!(
-            "[copy_source_files] Done: copied={}, skipped_fatal={}, skipped_dir={}, skipped_prefix={}, copy_errors={}",
-            copied, skipped_fatal, skipped_dir, skipped_prefix, copy_errors,
+            "[copy_source_files] Done: copied={}, skipped_asset={}, skipped_fatal={}, skipped_dir={}, skipped_prefix={}, copy_errors={}",
+            copied, skipped_asset, skipped_fatal, skipped_dir, skipped_prefix, copy_errors,
         );
         Ok(())
     }
@@ -5187,6 +5213,7 @@ Test network for unit tests.
             rewritten_content: None,
             dependent_paths: vec![],
             diagnostics,
+            is_asset: false,
         }];
         DocumentCompiler::promote_unresolved_to_warnings(&mut results);
         results.remove(0).diagnostics
