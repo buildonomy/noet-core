@@ -135,10 +135,31 @@ See [[a1b2c3d4e5f6]] for details.
 - Scoped to network (namespace) to prevent collisions
 - Optional - not all nodes have explicit IDs
 
-**Normalization**: `src/nodekey.rs:to_anchor()` function
-- Lowercase: `Section` → `section`
+**Normalization**: `src/paths/path.rs:to_anchor()` function
+- NFKC normalize, then lowercase: `Section` → `section`
 - Spaces to hyphens: `Getting Started` → `getting-started`
-- Strip special chars: `API & Reference!` → `api--reference`
+- Keep alphanumeric (all Unicode scripts) plus `-` `.` `_` `(` `)` `[` `]` `@`
+- Strip everything else, then collapse hyphen runs: `API & Reference!` →
+  `api-reference`
+- **Drop boundary terminators**: a run of `.` `,` `:` `;` is kept only *within*
+  a word. A run that abuts the `-` word separator, or has no neighbour on one
+  side, is dropped: `1. Introduction` → `1-introduction`, not a stranded
+  `1.-introduction`. Intra-word runs survive, so `1.1 Context` →
+  `1.1-context`, `Symbol.iterator` → `symbol.iterator`, and `for...in` →
+  `for...in` are unaffected.
+
+The terminator rule is applied *after* the keep-filter, so adjacency is judged
+on surviving characters. Judging it on the raw input would let a terminator
+collapse across an already-stripped character — `Appendix A: References` would
+become `appendix-areferences` rather than `appendix-a-references`.
+
+> [!IMPORTANT]
+> `to_anchor` backs BID derivation (`Bid::codec_namespace`), `NodeId`, and
+> `NodeKey` construction. It must remain a pure, fixed function of its input —
+> never configurable per network, or frontmatter could silently change node
+> identity. Site generators that slug differently (kramdown, GitHub, Hugo) are a
+> *presentation* concern; any such mapping belongs on the href-alias
+> registration path, not here.
 
 **Example**:
 ```markdown

@@ -109,6 +109,15 @@ pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
 /// standalone character class.
 pub const ANCHOR_CHAR_CLASS: &str = r"[\w.@()\[\]-]";
 
+/// Sentence terminators that [`to_anchor`] drops when they fall at a word
+/// boundary rather than between two alphanumerics.
+///
+/// Only `.` is currently reachable: `,`, `:` and `;` are not in `to_anchor`'s
+/// keep-set, so they are already stripped unconditionally before the terminator
+/// rule runs. They are listed here so the rule stays correct if the keep-set
+/// ever widens — not because they change behaviour today.
+const TERMINATORS: &str = ".,:;";
+
 /// Turn a title string into a regularized anchor string.
 ///
 /// Rules:
@@ -130,7 +139,33 @@ pub const ANCHOR_CHAR_CLASS: &str = r"[\w.@()\[\]-]";
 ///   kept as-is — they are valid in HTML5 `id=` and modern browsers handle
 ///   non-ASCII URL fragments correctly.
 /// - Strip everything else (e.g. `&`, `!`, `:`, `#`, `%`, `+`, `=`, …)
+/// - **Drop boundary terminators**: a run of terminators ([`TERMINATORS`]:
+///   `.` `,` `:` `;`) is only meaningful *within* a word. A run at a word
+///   boundary — missing a neighbour on either side, or abutting the `-` word
+///   separator — is dropped, so `"1. Introduction"` yields `1-introduction`
+///   rather than a stranded `1.-introduction`. Intra-word runs survive
+///   untouched, which is what keeps `1.1 Context` → `1.1-context`,
+///   `Symbol.iterator` → `symbol.iterator`, and `for...in` → `for...in`.
 /// - Collapse runs of `-` to a single `-` and strip leading/trailing `-`
+///
+/// # Ordering
+///
+/// The terminator rule is applied **after** the keep-filter, so adjacency is
+/// judged on characters that survive. Judging it on the raw input instead
+/// would let a terminator collapse across an already-doomed character —
+/// `"Appendix A: References"` would become `appendix-areferences` and
+/// `"6 Verification & Validation Plan"` would become
+/// `6-verificationvalidation-plan`. Both are correct only under
+/// strip-then-judge.
+///
+/// # Stability
+///
+/// This function backs BID derivation ([`crate::properties::Bid::codec_namespace`]),
+/// [`crate::properties::NodeId`], and `NodeKey` construction. It must stay a
+/// pure, fixed function of its input — never configurable per network, or
+/// frontmatter would silently change node identity. Site generators that slug
+/// differently (kramdown, GitHub, Hugo) are a *presentation* concern and belong
+/// on the href-alias registration path, not here.
 pub fn to_anchor(title: &str) -> String {
     // NFKC first: resolves compatibility variants without stripping accents
     let s: String = title.trim().nfkc().collect::<String>().to_lowercase();
@@ -141,6 +176,45 @@ pub fn to_anchor(title: &str) -> String {
             c.is_alphanumeric() || matches!(c, '-' | '.' | '_' | '(' | ')' | '[' | ']' | '@')
         })
         .collect();
+    // Drop terminator *runs* that are not flanked by alphanumerics on both
+    // sides.  Runs on the filtered string so neighbours are surviving
+    // characters (see "Ordering" above).  `-` here is the whitespace
+    // substitution from the map above, so `"1. Introduction"` is at this point
+    // `1.-introduction`: the `.` sees `1` on the left and `-` on the right, is
+    // judged a boundary terminator, and is dropped.
+    //
+    // Whole runs are judged together, not each character independently.  A
+    // per-character rule would look *inside* `for...in` and find the middle dot
+    // flanked by dots rather than letters, dropping it and collapsing the
+    // anchor to `forin` — silently colliding with a genuine `forin` heading.
+    // Treating `...` as one unit sees `r` and `i` at its edges and keeps it.
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !TERMINATORS.contains(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Extent of this terminator run.
+        let mut j = i;
+        while j < chars.len() && TERMINATORS.contains(chars[j]) {
+            j += 1;
+        }
+        // "Word boundary" means the run is missing a neighbour on either side,
+        // or abuts the `-` word separator.  Everything else — including `_`,
+        // `(`, `]`, `@` — counts as intra-word, so `Object.__defineGetter__()`
+        // keeps its dot.  Testing `is_alphanumeric()` here instead would drop
+        // it, since `_` is punctuation to Unicode.
+        let flanked = |c: Option<&char>| c.is_some_and(|c| *c != '-');
+        let prev = i.checked_sub(1).and_then(|p| chars.get(p));
+        if flanked(prev) && flanked(chars.get(j)) {
+            out.extend(&chars[i..j]);
+        }
+        i = j;
+    }
+    let s = out;
     // Collapse consecutive hyphens and strip leading/trailing hyphens
     let mut result = String::with_capacity(s.len());
     let mut prev_hyphen = false;
@@ -1846,6 +1920,76 @@ mod tests {
         let precomposed = "\u{00E9}"; // é (single codepoint)
         let decomposed = "e\u{0301}"; // e + combining acute
         assert_eq!(to_anchor(precomposed), to_anchor(decomposed));
+    }
+
+    /// A terminator is only meaningful between two alphanumerics; at a word
+    /// boundary it is dropped rather than left stranding a separator.
+    #[test]
+    fn test_to_anchor_drops_boundary_terminators() {
+        // The motivating case: numbered headings no longer strand the period.
+        assert_eq!(to_anchor("1. Introduction"), "1-introduction");
+        assert_eq!(to_anchor("6. Additional Setup"), "6-additional-setup");
+        assert_eq!(
+            to_anchor("2. SSH Key Pair Generation"),
+            "2-ssh-key-pair-generation"
+        );
+
+        // Intra-word terminators survive: this is what keeps dotted section
+        // numbers and JS API names distinct and readable.
+        assert_eq!(to_anchor("1.1 Context"), "1.1-context");
+        assert_eq!(to_anchor("4.1.1 Telemetry"), "4.1.1-telemetry");
+        assert_eq!(to_anchor("Symbol.iterator"), "symbol.iterator");
+        assert_eq!(to_anchor("Array.prototype.map()"), "array.prototype.map()");
+        assert_eq!(to_anchor("rf_links.yaml"), "rf_links.yaml");
+
+        // Mixed: intra-word dots survive, the boundary one is dropped.
+        assert_eq!(
+            to_anchor("2.1. SSH Setup for Accessing Remote Desktops"),
+            "2.1-ssh-setup-for-accessing-remote-desktops"
+        );
+
+        // Trailing terminator has no right-hand neighbour at all.
+        assert_eq!(to_anchor("Overview."), "overview");
+        assert_eq!(to_anchor("Introduction..."), "introduction");
+
+        // `_` is Unicode punctuation, not alphanumeric, but is intra-word for
+        // our purposes — only the `-` separator marks a boundary. Testing
+        // `is_alphanumeric()` for the flanks would drop this dot.
+        assert_eq!(
+            to_anchor("Object.__defineGetter__()"),
+            "object.__definegetter__()"
+        );
+
+        // Ordering regression guards. The terminator rule runs *after* the
+        // keep-filter, so `:` and `&` are already gone and cannot cause the
+        // surrounding words to collapse together. Judging adjacency on the raw
+        // input would yield `appendix-areferences` and
+        // `6-verificationvalidation-plan` respectively.
+        assert_eq!(to_anchor("Appendix A: References"), "appendix-a-references");
+        assert_eq!(
+            to_anchor("6 Verification & Validation Plan"),
+            "6-verification-validation-plan"
+        );
+        assert_eq!(
+            to_anchor("5.3 Timing, Latency, Determinism"),
+            "5.3-timing-latency-determinism"
+        );
+
+        // Terminator *runs* are judged as a unit. `...` sees `r` and `i` at its
+        // edges, so it survives whole. Evaluating each dot independently would
+        // find the middle one flanked by dots rather than letters, drop it, and
+        // collapse the anchor to `forin` — silently colliding with a genuine
+        // `forin` heading.
+        assert_eq!(to_anchor("for...in"), "for...in");
+        assert_eq!(to_anchor("try...catch"), "try...catch");
+        assert_ne!(to_anchor("for...in"), to_anchor("forin"));
+
+        // Bracket boundaries are NOT terminators — the space around them is
+        // real word separation and must still become a hyphen.
+        assert_eq!(
+            to_anchor("4.1.3 Static Configurations (immutable)"),
+            "4.1.3-static-configurations-(immutable)"
+        );
     }
 
     #[test]
