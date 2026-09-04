@@ -319,7 +319,7 @@ pub struct BeliefGraph {
 ## References
 
 - ISSUE_39: Interactive viewer foundation
-- `docs/design/interactive_viewer.md`: § Graph Visualization
+- `docs/design/presentation/interactive_viewer.md`: § Graph Visualization
 - D3.js Force Documentation: https://d3js.org/d3-force
 - Cytoscape.js: https://js.cytoscape.org/ (alternative)
 

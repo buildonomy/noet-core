@@ -88,7 +88,7 @@ Implement two-click navigation pattern and metadata panel display for the intera
 
 ## Architecture
 
-**See**: [Interactive Viewer Design](../design/interactive_viewer.md) § Two-Click Navigation Pattern and § Metadata Panel Display for complete specifications.
+**See**: [Interactive Viewer Design](../../design/presentation/interactive_viewer.md) § Two-Click Navigation Pattern and § Metadata Panel Display for complete specifications.
 
 **Phase 1 Components**:
 
@@ -519,7 +519,7 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 - [ ] Create troubleshooting guide (common issues, solutions)
 
 **Files Modified**:
-- `docs/design/interactive_viewer.md` - Implementation notes
+- `docs/design/presentation/interactive_viewer.md` - Implementation notes
 - `README.md` - User documentation
 - `docs/USER_GUIDE.md` (new file) - Comprehensive guide
 
@@ -696,14 +696,14 @@ Failed to load WASM module. Navigation tree and metadata require JavaScript.
 
 ## References
 
-- **[Interactive Viewer Design](../design/interactive_viewer.md)** - Complete architecture, § Two-Click Navigation Pattern, § Metadata Panel Display
-- **[ISSUE_38: Interactive SPA Foundation](completed/ISSUE_38_INTERACTIVE_SPA.md)** - Completed foundation work
-- **[ISSUE_40: Network Index Generation](completed/ISSUE_40_NETWORK_INDEX_DOCCODEC.md)** - ✅ Complete (implemented via ISSUE_43 SPA shell)
+- **[Interactive Viewer Design](../../design/presentation/interactive_viewer.md)** - Complete architecture, § Two-Click Navigation Pattern, § Metadata Panel Display
+- **[ISSUE_38: Interactive SPA Foundation](ISSUE_38_INTERACTIVE_SPA.md)** - Completed foundation work
+- **[ISSUE_40: Network Index Generation](ISSUE_40_NETWORK_INDEX_DOCCODEC.md)** - ✅ Complete (implemented via ISSUE_43 SPA shell)
 - **[ISSUE_41: Query Builder UI](ISSUE_41_QUERY_BUILDER.md)** - Future work (extracted from original Phase 2)
 - **[ISSUE_42: Graph Visualization](ISSUE_42_GRAPH_VISUALIZATION.md)** - Future work (extracted from original Phase 3)
-- [BeliefBase Architecture](../design/beliefbase_architecture.md) - Data model
-- [Link Format Design](../design/link_format.md) - BID attribution
-- [Architecture Overview](../design/architecture.md) - System namespaces
+- [BeliefBase Architecture](../../design/core/beliefbase_architecture.md) - Data model
+- [Link Format Design](../../design/identity/link_format.md) - BID attribution
+- [Architecture Overview](../../design/core/architecture.md) - System namespaces
 - [MDN ARIA Guide](https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA)
 - [WAI-ARIA Authoring Practices](https://www.w3.org/WAI/ARIA/apg/)
 - [Cytoscape.js Documentation](https://js.cytoscape.org/)
@@ -1238,7 +1238,7 @@ BeliefBaseWasm constructor expected 2 arguments, only received 1
 - `build.rs`: Pre-built WASM support, better error messages, removed bad guard
 - `src/bin/noet/main.rs`: Conditional Watch subcommand
 - `.github/workflows/test.yml`: Fixed all feature combinations
-- `docs/design/interactive_viewer.md`: Flat map algorithm and JavaScript integration
+- `docs/design/presentation/interactive_viewer.md`: Flat map algorithm and JavaScript integration
 - `docs/project/ROADMAP_NOET-CORE_v0.1.md`: Two-phase compilation note
 
 **Phase 0 Complete**: All UX improvements and refinements finished. Ready for Phase 1 (Two-Click Navigation + Metadata Panel).

@@ -296,9 +296,9 @@ messages include the problematic token and what was expected.
 
 ## References
 
-- `docs/design/query_model.md` §9.5 — the full grammar specification
-- `docs/design/query_model.md` §9.5.8 — parser rules
-- `docs/design/query_model.md` §9.5.9 — surface bindings (URL, MyST, MCP)
+- `docs/design/core/query_model.md` §9.5 — the full grammar specification
+- `docs/design/core/query_model.md` §9.5.8 — parser rules
+- `docs/design/core/query_model.md` §9.5.9 — surface bindings (URL, MyST, MCP)
 - Issue 79 — `QuerySpec`, `Subject`, `InstrumentConfig`, `SortSpec` types
 - Issue 81 — `{query}` directive that consumes parsed queries (defines
   precedence: directive options override query string suffixes)

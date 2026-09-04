@@ -1,6 +1,6 @@
 # Issue 41: Stream BeliefEvents to Browser for Incremental SPA Updates
 
-> **Status: OBE — superseded by Issue 66, step 4.**
+> **Status: OBE — superseded by Issue 102 (`noet serve`).**
 >
 > The `BeliefEvent`-streaming approach (requiring client-side `process_event` and
 > incremental graph reconstruction in JS/WASM) has been replaced by a simpler
@@ -8,8 +8,10 @@
 > message (carrying `bref` and `compiled_at`) after each re-parse, and the SPA
 > reloads only the affected shard. On reconnect, the SPA fetches `manifest.json`
 > and diffs `compiled_at` per network to reload only stale networks — no full
-> shard reload and no client-side event application needed. See Issue 66 step 4
-> for the implementation.
+> shard reload and no client-side event application needed. See Issue 102 for the
+> implementation; Issue 66 supplies the per-network `compiled_at` values the
+> broadcast carries. (This step originally lived in Issue 66 step 4 and moved to
+> Issue 102 when the server gained its own issue.)
 
 **Priority**: MEDIUM  
 **Estimated Effort**: 3-4 days  
@@ -24,7 +26,7 @@ Enable real-time incremental updates in watch mode by streaming `BeliefEvent`s d
 
 ### 2026-08-27: Cited replacement still unimplemented
 
-- Issue 66 step 4 (WebSocket `shard_updated` invalidation) is still open/unimplemented — no `shard_updated`, `hydrate_from_shards`, or WebSocket `/events` endpoint exists in source.
+- The WebSocket `shard_updated` invalidation (now Issue 102; then Issue 66 step 4) is still open/unimplemented — no `shard_updated`, `hydrate_from_shards`, or WebSocket `/events` endpoint exists in source.
 - Current watch-mode behavior: `src/dev_server.rs` SSE `/events` endpoint sends a bare `reload` event triggering full page reload — closer to this issue's "Current Architecture" problem statement than to either proposed replacement.
 
 ## Problem Statement

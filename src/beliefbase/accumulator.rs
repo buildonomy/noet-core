@@ -295,7 +295,7 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
                 //
                 // `BatchStart` is preserved as an explicit sentinel (rather than inferring
                 // batch boundaries from `BatchEnd` alone) because the federated model
-                // (see `docs/design/federated_belief_network.md`) will receive event streams
+                // (see `docs/design/annotation/federated_belief_network.md`) will receive event streams
                 // from external peers where the stream may not be well-formed and explicit
                 // open/close pairs are required for safe accumulation.
                 if !self.pending.is_empty() {

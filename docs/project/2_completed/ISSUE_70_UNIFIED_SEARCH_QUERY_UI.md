@@ -11,7 +11,7 @@
 This issue defined the unified three-axis query model (Subject / Projection /
 Instrument) and planned a 7-phase implementation spanning the viewer UI, query
 parser, graph visualization, and compile-time directives. The conceptual model
-proved sound and was formalized in `docs/design/query_model.md`.
+proved sound and was formalized in `docs/design/core/query_model.md`.
 
 The scope has been decomposed into focused issues:
 
@@ -46,10 +46,10 @@ Enhancements):
 
 ### Key design artifacts preserved
 
-- `docs/design/query_model.md` — full formal model (three-component QuerySpec,
+- `docs/design/core/query_model.md` — full formal model (three-component QuerySpec,
   Score algebra, textual grammar §9.5, surface bindings)
-- `docs/design/dag_model.md` §4 — the video camera conceptual model
-- `docs/design/myst_directive_architecture.md` — directive pipeline that
+- `docs/design/core/dag_model.md` §4 — the video camera conceptual model
+- `docs/design/codecs/myst_directive_architecture.md` — directive pipeline that
   Issue 81 extends
 
 ## Original Goals (for reference)
@@ -67,7 +67,7 @@ Enhancements):
 - Issue 80 — Query Parser (textual grammar + `?q=` URL integration)
 - Issue 81 — `{query}` Directive (compile-time rendering)
 - Issue 82 — Viewer Query UI Enhancements (search, graph, Explore, Share/Embed)
-- `docs/design/query_model.md` — the formal model this issue originated
+- `docs/design/core/query_model.md` — the formal model this issue originated
 - Issue 63 — Traceability View (complete, prerequisite)
 - Issue 54 — Full-Text Search MVP (complete, prerequisite)
 - Issue 41, 42, 49 — superseded by this issue

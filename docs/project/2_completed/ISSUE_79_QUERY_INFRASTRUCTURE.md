@@ -10,7 +10,7 @@ that deletes `Expression` and makes `QuerySpec` the sole primitive).
 
 ## Summary
 
-The query model design (`docs/design/query_model.md`) defines a three-component
+The query model design (`docs/design/core/query_model.md`) defines a three-component
 `QuerySpec` (Subject, Projection, Instrument) that unifies all current query
 tools as special cases of a single evaluation pipeline. This issue implements
 the core types, evaluation bridge, and table instrument, creating the
@@ -191,7 +191,7 @@ None remaining. WASM and viewer validation deferred to Issue 82.
 
 ## References
 
-- `docs/design/query_model.md` §3–§7 — formal model
+- `docs/design/core/query_model.md` §3–§7 — formal model
 - `src/query/spec.rs` — QuerySpec types and evaluation
 - `src/query/instrument/table.rs` — TableInstrument
 - `src/query/expression.rs` — Expression, BeliefSource (to be deleted in 83)

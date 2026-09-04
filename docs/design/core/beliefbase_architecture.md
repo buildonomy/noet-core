@@ -72,7 +72,7 @@ pub enum NodeKey {
 }
 ```
 
-**Implementation**: `src/nodekey.rs`, `src/properties.rs:871-923` (BeliefNode::keys())
+**Implementation**: `src/nodekey.rs`, `src/properties.rs:1272` (`BeliefNode::keys()`)
 
 ##### 1. BID (Belief ID) - System-Generated Stable Identity
 
@@ -185,7 +185,7 @@ Second occurrence - collision! Gets Bref: {#a1b2c3d4e5f6}
 **Purpose**: File system operations and initial discovery
 
 **Properties**:
-- Relative to network root: `docs/design/architecture.md`
+- Relative to network root: `docs/design/core/architecture.md`
 - Changes when files move
 - Least stable identifier (use BID for permanent references)
 - Used by `PathMapMap` for efficient lookups
@@ -401,7 +401,7 @@ pub struct PathMapMap {
 - `net_get_from_title(&net, &title)` → `Option<(doc_bid, node_bid)>`
 - `net_path(&net, &bid)` → `Option<(net, path)>`
 
-**BeliefNode::keys()** (`src/properties.rs:871-923`) generates all valid references:
+**BeliefNode::keys()** (`src/properties.rs:1272`) generates all valid references:
 
 ```rust
 fn keys(&self, net: Bid, parent: Option<Bid>, bs: &BeliefBase) -> Vec<NodeKey> {
@@ -706,15 +706,15 @@ Error: `BID '6b3d2154-c0a9-437b-9324-5f62adeb9a44' is reserved for system use...
 
 #### Implementation Details
 
-**Location:** `src/properties.rs:808-839` (`api_state()` function)
+**Location:** `src/properties.rs:1114` (`BeliefNode::api_state()`)
 
-**Reserved namespace checking:** `src/properties.rs:192-208` (`Bid::is_reserved()` method)
+**Reserved namespace checking:** `src/properties.rs:285` (`Bid::is_reserved()`)
 
-**Validation:** `src/codec/belief_ir.rs:1081-1125` (reserved identifier checks)
+**Validation:** `src/codec/belief_ir.rs:787-800` — rejects a user-supplied `bid`
+falling inside the Buildonomy API namespace
 
-**Builder integration:** `src/codec/builder.rs:556-559` (API node initialization)
-
-**Tests:** `src/properties.rs:1330-1380` (reserved namespace checking)
+**Tests:** `src/properties.rs:1714` (`test_reserved_namespace_checking`);
+`src/codec/belief_ir.rs:1004-1061` (reserved-BID namespace cases)
 
 #### Future Extensions
 
@@ -1597,7 +1597,7 @@ for `update_relation` in `merge_graph_mut` without a full graph scan.
 > The `generate_deferred_html` trait method has been removed. The deferred phase is now
 > owned entirely by `DocumentCompiler::generate_html_for_path`, which runs an async query
 > pipeline defined in `src/codec/myst.rs`. See
-> [`myst_directive_architecture.md`](./myst_directive_architecture.md) for the current
+> [`myst_directive_architecture.md`](../codecs/myst_directive_architecture.md) for the current
 > specification of the deferred pipeline, sentinel splicing, and the `DirectiveDef`
 > registry. The conceptual two-phase model (immediate → deferred) remains accurate;
 > only the implementation boundary has moved from the codec to the compiler.
@@ -1692,7 +1692,7 @@ HTML generation happens in two phases to handle different codec needs:
 - `false` (default): Only immediate generation needed
 - `true`: Document contains at least one sentinel-bearing directive; deferred pass required
 
-**See** [`myst_directive_architecture.md`](./myst_directive_architecture.md) for the
+**See** [`myst_directive_architecture.md`](../codecs/myst_directive_architecture.md) for the
 complete specification of the directive registry, query pipeline, sentinel protocol, and
 extension point.
 
@@ -1911,10 +1911,125 @@ See BACKLOG for the placeholder.
 - Event stream provides reactive updates to graph changes
 
 ### 4.3. Event System
-- **BeliefEvent Stream**: Builder → Applications
-- Event types: NodeAdded, NodeRemoved, NodeUpdated, RelationChanged
-- Async channels enable non-blocking updates
-- Event batching prevents UI thrashing during bulk changes
+
+The event stream carries graph mutations from the builder to any consumer that
+needs to track graph state — the DB, the accumulator, remote peers, the viewer.
+
+**`BeliefEvent`** (`src/event.rs`) is the vocabulary of graph mutations. Each
+variant is an instruction the receiver applies directly:
+
+| Variant | Effect |
+|---|---|
+| `NodeUpdate(keys, node, origin)` | apply with merge semantics — resolves renames/replacements |
+| `NodeUpsert(bid, node, origin)` | apply by BID, no collision resolution (BID already canonical) |
+| `NodesRemoved` / `NodeRenamed` | node lifecycle |
+| `PathAdded` / `PathUpdate` / `PathsRemoved` | `PathMap` mutations |
+| `RelationUpdate` / `RelationChange` / `RelationRemoved` | edge lifecycle |
+| `FileParsed(path)` | mtime tracking for cache invalidation |
+| `BatchStart` / `BatchEnd` | frame a coherent group for atomic commit (§3.4) |
+
+`EventOrigin` on each mutation variant answers *"has this already been applied to
+my state?"* — `Local` for events this `BeliefBase` generated, `Remote` for
+anything arriving from outside. It is a dispatch flag, not provenance: it does
+not identify a producer.
+
+Async channels keep delivery non-blocking; `BatchStart`/`BatchEnd` framing
+prevents consumers from observing partial epochs.
+
+#### Assertions vs. mutations
+
+A `BeliefEvent` is an instruction. An **annotation** — a comment, sign-off,
+todo, or redline — is not: it is an authored *claim about* a node, which must be
+interpreted before it affects graph state. The two are siblings in the outer
+`Event` enum rather than variants of one:
+
+```rust
+pub enum Event {
+    Ping,
+    Belief(BeliefEvent),        // mutation — apply directly
+    Annotation(Annotation),     // assertion — interpret, then emit mutations
+}
+```
+
+Folding an `Annotation` **emits** `BeliefEvent`s, per the edge assignment in
+`attestation_fabric.md` §12.3: the record becomes a `NodeUpsert`, its provenance
+links become Epistemic `RelationUpdate`s, and its coverage claims become
+Pragmatic ones. One stream, two payload kinds, one direction of derivation.
+
+Keeping them separate is a structural requirement, not a preference. Every
+`BeliefEvent` variant is something the accumulator's apply path handles directly;
+an annotation is not. Merging them would force every `match` on `BeliefEvent` —
+including `BeliefSink::apply_batch` — to carry arms for events it cannot apply.
+Consumers that care only about graph state subscribe downstream of the
+projection and never observe an `Annotation`.
+
+Annotation *kinds* are distinguished by a `protocol_id` resolved through the
+protocol registry (`attestation_fabric.md` §6), not by Rust enum variants, so a
+new kind is a registry entry rather than a code change.
+
+#### Annotation envelope: identity, ordering, provenance
+
+> [!IMPORTANT]
+> **Sketch. Issue 104 is authoritative for the field set.** The shape below
+> records intent, not a settled schema. Issue 104 defines the necessary and
+> sufficient properties and updates this section once implemented; Issue 105
+> (persistence) and Issue 109 (run brackets) contribute fields.
+
+An annotation needs metadata the graph does not hold: who made it, how it orders
+against concurrent annotations, and what it reasons from. Roughly:
+
+```rust
+pub struct Envelope {
+    pub id: EventId,             // (actor, sequence) — globally unique, uncoordinated
+    pub actor: ActorId,          // opaque: user, peer, or pipeline
+    pub observed_at: Timestamp,  // wall clock, display only
+    pub caused_by: Vec<EventId>, // what this record reasons from — retrospective
+    pub payload: Annotation,
+}
+```
+
+**This wraps annotations, not `BeliefEvent`s.** `BeliefEvent`s are
+compiler-generated at thousands per parse, single-writer by construction, and
+already ordered by the `BatchStart`/`BatchEnd` epoch structure (§3.4). They need
+no actor and no logical clock; wrapping them would be overhead on the hot path.
+Annotations are the multi-writer, order-independent, merged case — that is what
+an envelope is for.
+
+Two consequences of that scoping:
+
+- **`EventOrigin` is not redundant.** It lives on `BeliefEvent` variants and
+  answers "already applied to my state?" — a dispatch concern. `actor` answers
+  "who produced this?" If envelopes were universal, `actor == self` would subsume
+  `EventOrigin`; scoped to annotations, the two never meet.
+- **A logical clock may not be needed at all.** Ordering matters for the
+  derived-state fold, and `(observed_at, id)` may suffice for records that merge
+  by set union. A lamport field is only justified if something reads it; Issue 105
+  carries that obligation. **Open — Issue 104 to settle.**
+
+`caused_by` is deliberately retrospective: a record names what it reasons *from*,
+not what it predicts. `attestation_fabric.md` §4.2a calls the same relation
+`provenance`; whether these unify under one name is Issue 104's call.
+
+`Envelope.actor` and `EventOrigin` are orthogonal and both are needed: an event
+replicated from a peer is `EventOrigin::Remote` with that peer's `actor`, while
+a locally-generated event derived from a remote actor's record is
+`EventOrigin::Local` with a remote `actor`.
+
+The envelope is what makes the stream replicable. `federated_belief_network.md`
+§3.2 uses it as the Layer 2 replication log entry; the annotation store
+(`living_corpus.md` §3) persists the same envelopes at Layer 3. Immutable records
+with globally unique `id`s form a grow-only set, so merging two stores is set
+union — conflict-free by construction, with no CRDT library required.
+
+**If** a `lamport` field is adopted, it carries an obligation: the derived-state
+fold must then order by `(lamport, observed_at, id)` rather than by wall clock,
+so the field is exercised on a single writer rather than lying dormant until a
+second one appears. A clock nobody reads is a clock nobody maintains correctly.
+That obligation is a *consequence* of the open question above, not a decision
+ahead of it.
+
+See `living_corpus.md` for the layer model this participates in, and
+`content_versioning.md` for how a record anchors to a node version.
 
 ### 4.4. Persistence Layer
 - **Database**: SQLite-based persistent cache (accessed via `DbConnection`)
@@ -2009,7 +2124,7 @@ Internally, `BeliefBaseWasm` maintains a `loaded_shards: RefCell<HashMap<String,
 
 The `"global"` key is reserved for the global shard. Network shards use their 5-hex-char bref as the key.
 
-See `docs/design/search_and_sharding.md` for the complete specification including manifest JSON schemas, memory budget model (§6), and WASM integration (§8).
+See `docs/design/core/search_and_sharding.md` for the complete specification including manifest JSON schemas, memory budget model (§6), and WASM integration (§8).
 
 ### 4.6. UI Layer
 - Query interfaces for filtered graph views

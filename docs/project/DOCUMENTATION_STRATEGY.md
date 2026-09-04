@@ -55,9 +55,9 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 
 **Source of Truth For**: "How does the library work at a conceptual level?"
 
-**Links to**: `docs/design/beliefbase_architecture.md` for technical details
+**Links to**: `docs/design/core/beliefbase_architecture.md` for technical details
 
-### 3. `docs/design/beliefbase_architecture.md`: "Technical Specification"
+### 3. `docs/design/core/beliefbase_architecture.md`: "Technical Specification"
 
 **Purpose**: Complete technical specification for understanding internals, contributing, or making architectural decisions
 
@@ -80,7 +80,7 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 
 **References**: Code locations (e.g., `beliefbase.rs:660-2420`)
 
-### 3a. `docs/design/search_and_sharding.md`: "Shard and Search Specification"
+### 3a. `docs/design/core/search_and_sharding.md`: "Shard and Search Specification"
 
 **Purpose**: Complete specification for the sharding export pipeline and compile-time search index system
 
@@ -99,6 +99,63 @@ noet-core follows Rust ecosystem best practices for documentation organization, 
 **Source of Truth For**: "How does sharding and full-text search work end-to-end?"
 
 **Cross-referenced from**: `beliefbase_architecture.md` §3.8, `architecture.md` §BeliefBase Sharding
+
+### 3b. `docs/design/annotation/living_corpus.md`: "Layer Model and Annotation Loop"
+
+**Purpose**: Explain how a compiled corpus becomes a working surface — the layers
+above compilation, the interfaces that consume them, and the path from an
+annotation back to a source change
+
+**Target Audience**: Contributors working on the server, annotation, LSP, or
+write-back; anyone deciding where a new capability belongs
+
+**Content**:
+- The three-layer model (source / belief graph / annotation) and why three
+- The durable-store-plus-live-projection pattern, repeated per layer
+- `Event::Belief` vs `Event::Annotation` — the assert/mutate boundary
+- PII surfaces (viewer, LSP, MCP, CLI) as peer consumers of one live graph
+- The annotate → promote loop
+- An architecture map from each element to its implementation or its issue
+- What is deliberately not unified, and why
+
+**Length**: ~950 lines
+
+**Source of Truth For**: "How does noet work as a living system, and what exists
+versus what is planned?"
+
+**Relationship to `architecture.md`**: `architecture.md` covers the compile path
+(Layer 1 → Layer 2) and stops at the compiled artifact. This document covers what
+sits on top. The two are halves of one picture and cross-reference each other.
+
+**Note on status**: this document describes a target architecture. Its §9 is the
+authoritative statement of what is implemented versus what an issue will build —
+keep it current as issues land, or the document becomes misleading rather than
+merely incomplete.
+
+### 3c. `docs/design/identity/content_identity.md`: "Node Identity Specification"
+
+**Purpose**: Specify `metadata["_identity_hash"]` — how a node is recognized as
+*the same thing* after it moves, is reformatted, or is copied
+
+**Target Audience**: Contributors working on the codec, the compiler's
+deduplication pass, or anything that compares nodes across parses
+
+**Content**:
+- Why identity and staleness are two hashes, not one
+- Placement in `metadata`, the three claimants on "content hash", and the two
+  circularity faults that rule out `payload`
+- The hashed field set, and why `id` and `schema` are excluded
+- Normalization: hashing the `pulldown_cmark` token stream rather than a string
+- The link-collapse rule, and the `auto_title` coupling that forces it
+
+**Length**: ~450 lines
+
+**Source of Truth For**: "Is this the same node I saw before?"
+
+**Relationship to `content_versioning.md`**: siblings. Versioning answers *did
+this change?*; identity answers *is this the same thing?* Their normalization
+requirements are deliberately opposite. Cross-referenced from
+`content_versioning.md` §5.1a.
 
 ### 4. Module-Level Rustdoc: "API Guide"
 
@@ -147,9 +204,9 @@ src/lib.rs (rustdoc)
     ↓ (Learn concepts)
 docs/architecture.md
     ↓ (Deep dive)
-docs/design/beliefbase_architecture.md
+docs/design/core/beliefbase_architecture.md
     ↓ (Shard/search deep dive)
-docs/design/search_and_sharding.md
+docs/design/core/search_and_sharding.md
     ↓ (Use API)
 Module-level rustdoc
 ```
@@ -172,7 +229,7 @@ Module-level rustdoc
 ```rust
 // lib.rs
 //! noet-core implements multi-pass compilation to handle forward references.
-//! See `docs/design/beliefbase_architecture.md` for algorithm specification.
+//! See `docs/design/core/beliefbase_architecture.md` for algorithm specification.
 ```
 
 ### Rule 2: Brief in Rustdoc, Detailed in Design Docs
@@ -185,7 +242,7 @@ Module-level rustdoc
 //! 2. **Resolution Passes**: Reparse with resolved dependencies
 //! 3. **Convergence**: Iterate until complete
 //!
-//! See `docs/design/beliefbase_architecture.md` for details.
+//! See `docs/design/core/beliefbase_architecture.md` for details.
 ```
 
 **design doc example**:
@@ -220,7 +277,7 @@ Use markdown links and rustdoc links to connect related content:
 ```rust
 //! See [`beliefbase::BeliefBase`] for graph operations.
 //! See `docs/architecture.md` for conceptual overview.
-//! See `docs/design/beliefbase_architecture.md` for implementation details.
+//! See `docs/design/core/beliefbase_architecture.md` for implementation details.
 ```
 
 ## When Content Overlaps: Decision Matrix
@@ -312,7 +369,7 @@ lib.rs (rustdoc)          ← tokio/serde style: brief, links to guides
     ↓
 architecture.md            ← Website guide equivalent: conceptual
     ↓
-design/beliefbase_architecture.md  ← RFC-style: technical spec
+design/core/beliefbase_architecture.md  ← RFC-style: technical spec
     ↓
 Module rustdoc            ← Standard Rust: API reference
 ```
@@ -321,6 +378,12 @@ Module rustdoc            ← Standard Rust: API reference
 
 | Topic | Source of Truth | Also Mentioned In |
 |-------|----------------|-------------------|
+| Layer model (source/graph/annotation) | living_corpus.md | architecture.md (brief), federated_belief_network.md §3.7 (origin) |
+| Node staleness (`_content_hash`, closures) | content_versioning.md | content_identity.md §1 (contrast) |
+| Node identity (`_identity_hash`) | content_identity.md | content_versioning.md §5.1a (sibling note), Issue 36 (consumers) |
+| Assert vs. mutate (`Event` variants) | design/core/beliefbase_architecture.md §4.3 | living_corpus.md (in the layer model) |
+| PII surfaces | attestation_fabric.md §13 | living_corpus.md (as consumers) |
+| What is implemented vs. planned | living_corpus.md §9 | individual issues |
 | Multi-pass compilation concept | lib.rs (brief) | architecture.md (detailed), design spec (algorithm) |
 | Multi-pass algorithm | design spec | - |
 | BID system concept | lib.rs (brief) | architecture.md (example), design spec (full spec) |

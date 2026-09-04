@@ -11,6 +11,12 @@ Enable structural comparison between two versioned BeliefBase snapshots using th
 
 No new projection primitives are introduced. Cross-version diff is a score interpretation that falls out of the existing algebra when the score carries content identity instead of relevance weight.
 
+**Two consumers, and the snapshot case is only one of them.** The annotation
+layer's live projection is a held-out BeliefBase — a diff against the root corpus
+context (`docs/design/annotation/living_corpus.md` §2) — so diffing is that layer's *native*
+read operation, not an application of machinery built for snapshots. See
+§The Annotation Layer below before fixing the design around versioned builds.
+
 ## Problem
 
 Two independent `noet parse` invocations on the same source tree at different git tags produce BeliefBases with **different BIDs** for nodes whose BIDs were not persisted to source. BID generation embeds a timestamp (UUID v7), and ephemeral build directories don't carry forward prior BIDs. Without BID stability, cross-version comparison sees every node as "removed in A, added in B" — the join key is broken.
@@ -203,7 +209,7 @@ The version selector (Issue 73) gains a "Compare with..." option that loads a se
 
 ### Phase 4: Documentation (1 day)
 
-7. **Design doc updates** — `docs/design/query_model.md` (0.5 day)
+7. **Design doc updates** — `docs/design/core/query_model.md` (0.5 day)
    - [ ] §5.1: document `ContentHash` NodeFilter with `include`/`exclude` parameters
    - [ ] §7.3: document `Diff` render mode
    - [ ] §4: note that versioned graph snapshots are valid `BeliefGraph` references
@@ -279,14 +285,62 @@ An earlier draft proposed a `diff.rs` module with `VersionDiff`, `NodeDiff`, and
 
 The instrument layer (§7) is the only genuinely new code: a `Diff` render mode that presents the union of two evaluated result sets with per-row annotations.
 
+## The Annotation Layer: Diff as the Native Operation
+
+This issue is *written* around comparing two versioned snapshots, but that is not
+the only — or the primary — consumer. Per `docs/design/annotation/living_corpus.md` §2,
+**the annotation layer's live projection is a held-out BeliefBase, in essence a
+diff applied to its root corpus context.** The annotation server maintains that
+overlay and merges it continuously on top of the compiled graph.
+
+So for the annotation layer, diffing is not an application of machinery built
+elsewhere — it *is* the layer's read operation. "Compiled corpus" versus "corpus
+with the annotation queue folded in" is not a comparison performed on the
+overlay; it is what looking at the overlay means. This issue builds the primitive
+that operation is expressed in, and should be evaluated against that use as much
+as against snapshot comparison.
+
+Mechanically it is the same computation either way: a `ContentHash`-scored
+comparison over two graph states, with added / removed / changed / unchanged
+falling out of `Difference` and `And`. The `Diff` render mode remains the natural
+surface — for the annotation case, it shows a pending edit before it is
+committed.
+
+The versioned-snapshot case is unaffected and remains in scope: comparing two
+builds of a corpus is a real need with its own BID-stability problem
+(§Problem, `--hydrate-from`). It is simply no longer the framing that governs the
+annotation half.
+
+Two implications worth carrying while building this:
+
+- **BID stabilization matters differently.** §Problem solves BID instability
+  across independent builds via `--hydrate-from`. In the annotation case both
+  sides derive from the *same* live graph, so BIDs are stable by construction —
+  except for draft content, which has no BID at all. Do not assume both sides of
+  a diff always have BIDs on every node.
+- **The edit script may be consumed, not only displayed.** Rendering a diff needs
+  only correctness. Emitting one as `BeliefEvent`s — which is what committing an
+  annotation queue means — additionally wants the *most semantically meaningful*
+  sequence of primitive operations: "moved this section" rather than "removed
+  here, added there." That is a diff-quality concern this issue does not currently
+  address and does not need to, but the instrument's output shape should not
+  foreclose it.
+
+Not a dependency in either direction; recorded so the machinery is not built in a
+way that serves only the snapshot case.
+
 ## References
 
+- `docs/design/annotation/living_corpus.md` §2 — the held-out-BeliefBase model of Layer 3's
+  live projection; authoritative for why diff is the annotation layer's native
+  operation
+- `docs/design/annotation/living_corpus.md` §11 — the annotation-queue diff case above
 - Issue 66: Incremental Parse via Shard Hydration — shard deserialization, `global_bb` hydration
 - Issue 73: Versioned Rendering — per-version sharded output, version selector UI
 - Issue 63: Traceability View (COMPLETE) — primary rendering surface for diff annotations
 - Issue 70: Unified Search, Query, and Graph Visualization UI — future diff integration
-- `docs/design/query_model.md` §5.0 (Score), §5.1 (NodeFilter), §5.3 (Compositions), §7 (Instrument)
-- `docs/design/beliefbase_architecture.md` §2.2 — BID resolution hierarchy
+- `docs/design/core/query_model.md` §5.0 (Score), §5.1 (NodeFilter), §5.3 (Compositions), §7 (Instrument)
+- `docs/design/core/beliefbase_architecture.md` §2.2 — BID resolution hierarchy
 - `src/shard/manifest.rs` — `NetworkShardMeta`, `ShardManifest`
 - `src/shard/wire.rs` — `NetworkShard`, `GlobalShard` (deserialization types)
 - `src/codec/compiler.rs` — `DocumentCompiler`, `global_bb` threading

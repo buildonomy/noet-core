@@ -108,4 +108,4 @@ pattern (first click previews, second navigates) → navigation resolves through
 
 - `noet-core/src/codec/xlsx/` — codec implementation
 - `noet-core/assets/viewer/xlsx-tabs.js` — Tabulator viewer
-- `noet-core/docs/design/xlsx_codec_schema.md` — schema reference
+- `noet-core/docs/design/codecs/xlsx_codec_schema.md` — schema reference

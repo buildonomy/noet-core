@@ -245,7 +245,7 @@ role = "reviewer"
 ### Architecture References
 - `src/codec/schema_registry.rs` - Current scaffolding
 - `src/codec/belief_ir.rs:IRNode::traverse_schema()` - Integration point
-- `docs/design/beliefbase_architecture.md` - Schema vs Kind distinction
+- `docs/design/core/beliefbase_architecture.md` - Schema vs Kind distinction
 
 ### Future Enhancements
 - **Custom Content Types**: User-defined schemas for domain-specific nodes

@@ -451,7 +451,7 @@ a larger corpus per Issue 99).
 - `noet-core/src/beliefbase/graph.rs` — `BidGraph`, `WEIGHT_SORT_KEY` usage
   in `as_subgraph`/`as_subgraph_seeded` (evidence that sibling ordering is
   already captured via sort key, not map iteration order).
-- `noet-core/docs/design/dag_model.md` and `docs/design/query_model.md` —
+- `noet-core/docs/design/core/dag_model.md` and `docs/design/core/query_model.md` —
   background on the Section-edge/`WEIGHT_SORT_KEY` ordering model that
   motivates the "ordering is already captured relationally" argument.
 - `noet-core/docs/project/0_open/ISSUE_99_LARGE_CORPUS_PERF_INVESTIGATION.md`

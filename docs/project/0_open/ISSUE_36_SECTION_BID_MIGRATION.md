@@ -1,15 +1,25 @@
 # Issue 36: Content-Based Section Identity (BID Migration on Move / Shared-Section Unification)
 
-**Priority**: MEDIUM
+**Status**: **DEFERRED** — open, not scheduled. The move-detection half is
+well-understood; the shared-section unification half carries an unresolved
+destructive-edit hazard (see Risks → "Why unification is deferred"). Do not start
+this issue without a decision on that hazard.
+**Priority**: MEDIUM (move detection) — unification is **deferred pending design**
 **Estimated Effort**: 2-3 days
 **Dependencies**: Issue 34 (Cache Stability), Issue 35 (Cache Invalidation)
+**Related design**: `docs/design/identity/content_identity.md` — **authoritative** for the
+`metadata["_identity_hash"]` design (placement, field set, normalization, link
+collapse). This issue is its implementation vehicle and owns the consumers: move
+detection and unification. `docs/design/identity/content_versioning.md` §5.1, §5.1a defines
+the sibling key `metadata["_content_hash"]` (staleness) and the rule that hashes
+live in `metadata`, not `payload`.
 **Blocks**: None (quality-of-life improvement)
 
 ## Summary
 
 When users move a section from one document to another (cut/paste), the system currently treats this as a delete + create operation, generating a new BID for the "new" section. This breaks all existing links to that section. We should detect content-based moves and migrate the BID automatically to preserve link stability.
 
-Beyond move detection, content-addressed section identity enables a second capability: **shared-section unification**. If two documents contain structurally identical sections (same title + same content), they are referencing the same concept. The graph should model this as a single shared node with two parent documents, not two disconnected nodes that happen to have identical text. This is the same insight as content-addressed storage — hash equality implies identity.
+Beyond move detection, content-addressed section identity enables a second capability: **shared-section unification**. If two documents contain structurally identical sections (same title + same content), they are referencing the same concept. The graph should model this as a single shared node with two parent documents, not two disconnected nodes that happen to have identical text. This is the same insight as content-addressed storage — hash equality implies identity. **That premise is contested for editable content**; unification is deferred pending a resolution (see Risks → "Why unification is deferred").
 
 **Core Issue**: BID assignment is location-based (new parse = new BID), but section identity should be content-based (same content = same BID, regardless of where or how many times it appears).
 
@@ -79,7 +89,7 @@ Follow these steps to install...  # ← Same content
 ### Use Case 3: Shared Section (Copy-in-Place)
 - User copies (not moves) a standard section into multiple documents
   (e.g., a safety disclaimer, a standard interface contract, a test protocol)
-- System detects identical content hash across documents
+- System detects identical identity hash across documents
 - Rather than emitting two nodes, the compiler emits **one shared node** with
   `WeightKind::Section` edges from both parent documents
 - Queries against either document surface the shared node; backlinks show all parents
@@ -87,7 +97,7 @@ Follow these steps to install...  # ← Same content
 
 ### Use Case 4: Shared Section Diverges
 - User edits one copy of a previously-shared section
-- Content hash changes; the edited copy gets a new BID
+- Identity hash changes; the edited copy gets a new BID
 - The other copy retains the original shared BID
 - System emits a `ParseDiagnostic::Info` noting the divergence
 
@@ -98,9 +108,15 @@ Follow these steps to install...  # ← Same content
 
 ## Architecture: Content Hash as First-Class Identity
 
-The unifying model: **a section's BID is derived from a hash of its normalized content** (title + body text, whitespace-normalized). This hash is computed during `IRNode` construction and stored in `node.payload["content_hash"]`. The compiler's deduplication pass then:
+**The identity hash is specified in `docs/design/identity/content_identity.md`** — its
+placement in `metadata["_identity_hash"]`, its field set, the normalization
+rules, and the link-collapse rule that makes it stable under codec source
+rewriting. That document is authoritative; this issue is the implementation
+vehicle and owns the consumers below.
 
-1. **Indexes** all section nodes by content hash within a compile session.
+Given the hash, the compiler's deduplication pass:
+
+1. **Indexes** all section nodes by identity hash within a compile session.
 2. **On collision** (two nodes share a hash):
    - If one was previously persisted (known BID in cache) and the other is new: assign the known BID to the new node (move detection).
    - If both are new (first time seeing this content): assign one BID and make the second node a reference to the first, adding a second parent `Section` edge to the shared node.
@@ -118,25 +134,25 @@ This generalizes move detection and copy-unification into a single mechanism. Th
 During `finish_parse_session()` or event stream processing:
 - Collect `BeliefEvent::NodeDelete` events (sections removed)
 - Collect `BeliefEvent::NodeCreate` events (sections added)
-- Index all live section nodes by content hash; detect collisions
-- Correlate deleted → created pairs by content hash (exact match = move)
+- Index all live section nodes by identity hash; detect collisions
+- Correlate deleted → created pairs by identity hash (exact match = move)
 - For surviving collisions (both nodes present): unify into single shared node
 - Emit `BeliefEvent::BidMigration` when move detected
 - Emit `BeliefEvent::NodeUnified` when duplicate content converges
 
-### 2. Content Hashing
+### 2. Identity Hashing
 
 **File**: `src/properties.rs` or `src/codec/belief_ir.rs`
 
-Add content hash to `IRNode`:
-- Hash section title + body text, whitespace-normalized (stable, reproducible across editors)
-- Use SHA256 (already a project dependency via `sha2`) to avoid adding Blake3
-- Store as `node.payload["content_hash"]` in both `IRNode` and persisted `BeliefNode`
-- Hashing is performed in the codec during `parse()`, before BID assignment
+**Specified in `docs/design/identity/content_identity.md`** — placement, field set,
+normalization, and the link-collapse rule. Build to that document, not to a
+restatement here. Its §8 lists the questions still open (token-stream stability,
+href-aliased links, the fixpoint predicate); resolve them there, not in this
+issue.
 
 ### 2a. Shared-Node Graph Model
 
-When two section nodes share a content hash, the compiler emits a single `BeliefNode` with
+When two section nodes share an identity hash, the compiler emits a single `BeliefNode` with
 two incoming `WeightKind::Section` edges — one from each parent document. This is structurally
 identical to how a subsection is a child of multiple parents today, just with the shared node
 having multiple Section-weight parents rather than one.
@@ -165,13 +181,13 @@ pub enum BeliefEvent {
         reason: String,
     },
 
-    /// Two section nodes with identical content hash were unified into one shared node.
+    /// Two section nodes with identical identity hash were unified into one shared node.
     /// `retained_bid` is the BID kept; `merged_bid` is retired. All edges to `merged_bid`
     /// are rewritten to `retained_bid`.
     NodeUnified {
         retained_bid: Bid,
         merged_bid: Bid,
-        content_hash: String,
+        identity_hash: String,
         parent_paths: Vec<PathBuf>,
     },
 }
@@ -188,14 +204,19 @@ When BID migration detected:
 
 ### 5. Section Metadata Manifest
 
-**Integration with Issue 02**: Update `sections` table to include content hash:
+**Integration with Issue 02**: Update `sections` table to include the identity hash:
 
 ```toml
 [sections.installation]
 bid = "section-1234"
 id = "installation"
-content_hash = "blake3:abc123..."  # Optional: for move detection
+identity_hash = "sha256:abc123..."  # Optional: for move detection
 ```
+
+Note this is the *round-tripped* form of `metadata["_identity_hash"]` — authoring
+state in the sense of `content_versioning.md` §5.1a, written back so a move can be
+detected across a session boundary. It is not `_content_hash`, and it is not the
+asset-node `payload["content_hash"]`. See `content_identity.md` §2.4.
 
 ## Detection Algorithm (High-Level)
 
@@ -203,20 +224,20 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 - Track all `NodeDelete` events for sections
 - Track all `NodeCreate` events for sections
 - Track all live section nodes (present in both before and after)
-- Store per event: (BID, title, content_hash, document_path)
+- Store per event: (BID, title, identity_hash, document_path)
 
 **Phase 2: Hash Index** (after parse session)
-- Build a `HashMap<content_hash, Vec<(BID, path)>>` over all live + created section nodes
+- Build a `HashMap<identity_hash, Vec<(BID, path)>>` over all live + created section nodes
 - Identify collisions (multiple entries per hash)
 
 **Phase 3a: Move Detection** (deleted hash appears in created set)
-- Exact content hash match between a deleted node and a created node → confidence 1.0
+- Exact identity hash match between a deleted node and a created node → confidence 1.0
 - Assign deleted BID to created node; emit `BidMigration`
 - Fuzzy match (title match + high text similarity, no hash match) → confidence < 1.0;
   defer to user confirmation
 
 **Phase 3b: Shared-Section Unification** (same hash, both nodes live)
-- Two or more live nodes share a content hash (copy-in-place scenario)
+- Two or more live nodes share an identity hash (copy-in-place scenario)
 - Retain the BID of the node with the earlier `created_at` (or lowest BID value as
   tiebreaker for determinism)
 - Rewrite all edges from `merged_bid` to `retained_bid`
@@ -232,7 +253,7 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 - [ ] Two documents containing identical section content produce one shared `BeliefNode`
       with two parent `Section` edges, not two disconnected nodes
 - [ ] Backlink query on a shared node returns all parent documents
-- [ ] Content hash calculated efficiently (< 1ms per section, SHA256 of normalized text)
+- [ ] Identity hash calculated efficiently (< 1ms per section, SHA256 of normalized text)
 - [ ] False positive unification rate < 1% (short/generic sections are a risk; see Risks)
 - [ ] User can override automatic migration or unification when needed
 - [ ] Logging shows which sections were migrated or unified and why
@@ -240,15 +261,85 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 ## Risks
 
 - **False positive unification on short/generic sections**: A section titled "Notes" with
-  body "TBD" will hash-collide across many documents. **Mitigation**: require a minimum
-  content length (e.g., >100 normalized characters) before triggering unification; below
-  that threshold, treat as independent nodes even on hash match.
+  body "TBD" will hash-collide across many documents. **Proposed mitigation**: require a
+  minimum content length (e.g., >100 normalized characters) before triggering unification;
+  below that threshold, treat as independent nodes even on hash match. **This mitigation is
+  inadequate — see below.**
 - **Unification surprises authors**: two authors independently write identical content and
   expect separate nodes. **Mitigation**: emit `ParseDiagnostic::Info` on every unification
   so it is visible; provide a frontmatter opt-out (`no_unify: true` on a section).
 - **BID tiebreaker non-determinism**: if both nodes are new in the same session, neither
   has an earlier `created_at`. **Mitigation**: use lexicographic minimum of the two BID
   values as the deterministic tiebreaker.
+
+### Why unification is deferred
+
+The owner's objection, recorded verbatim in substance. Consider a document
+containing:
+
+```markdown
+## Notes
+
+todo
+```
+
+Is it advisable to give every such section across the corpus the *same* BID? And
+what happens when one of them takes on new content? It would be very easy to
+inadvertently propagate an edit to unrelated sections — a user editing "Notes" in
+document A would be editing document B's "Notes" too, because they are one node.
+Use Case 4 ("Shared Section Diverges") assumes the system can cleanly split the
+node back apart on edit; it does not say what the user saw in the interval, nor
+what happens to annotations, links, or an in-flight edit anchored to the shared
+BID.
+
+**The length threshold does not rescue this.** Content *complexity* does not help
+either: a document template that includes a long description of what content is
+*expected* in a section will exceed any character threshold while still being
+pure boilerplate replicated across many documents — and boilerplate is exactly
+the class we must not unify. So the heuristic fails in both directions: it misses
+short genuine duplicates (below threshold) and admits long boilerplate ones
+(above it). Length is uncorrelated with the property we actually care about,
+which is whether two texts are the *same authored thing* or merely the *same
+string*.
+
+### Move detection and unification are separable
+
+These are two capabilities sharing one mechanism, and they do not share a risk
+profile:
+
+| | Use Cases | What it does to the graph | Hazard |
+|---|---|---|---|
+| **Move detection** | 1, 2, 5 | migrates one BID between locations | a wrong guess relocates a node; recoverable |
+| **Unification** | 3, 4 | **merges two live nodes into one** | a wrong guess makes an edit to A silently rewrite B |
+
+Move detection never merges anything — node count is preserved, and a
+misidentified move is a link pointing somewhere unexpected, which is visible and
+reversible. Unification collapses two nodes, and that is where the
+destructive-propagation hazard lives.
+
+This **suggests** the two could be phased separately, with move detection
+shipping first and unification gated on a resolution to the boilerplate problem.
+Not decided here — the issue stays deferred, and the phasing question is part of
+what a future session must settle.
+
+### Prior art: asset dedup already ships this shape
+
+`src/codec/compiler.rs:5084-5096` already implements hash-collision deduplication
+for **assets**: on a duplicate content hash the compiler reuses the canonical node
+and emits a `ParseDiagnostic::info` ("Duplicate content: ... is identical to ...;
+reusing canonical asset."). That is this issue's unification mechanism, shipping
+today, over a different substrate. Whatever this issue eventually does for
+sections should be recognizably the same shape — same detection, same
+canonical-node reuse, same info-level diagnostic — rather than a parallel
+invention.
+
+**The salient difference is why the hazard above applies to sections and not to
+assets**: an asset is *immutable content addressed by its bytes*. Editing it
+produces a different hash and therefore a different asset; there is no operation
+that mutates a shared asset in place. A section is *editable* — it has an
+identity that persists across content changes, which is the entire premise of
+this issue. Sharing a node between two parents is safe exactly when the node
+cannot be edited through one parent, and sections fail that condition.
 
 ## Open Questions
 
@@ -267,7 +358,7 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 - Should we still detect based on content alone?
 
 ### Q4: Performance
-- How expensive is content hashing for large documents?
+- How expensive is identity hashing for large documents?
 - Should we cache hashes between parse sessions?
 - **Note**: SHA256 of a typical section body is < 1 µs; not a concern.
 
@@ -283,9 +374,21 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
   semantics. **Proposed**: within-network only for initial implementation; cross-network
   as a follow-on.
 
+### Q7: How do we distinguish a genuine duplicate from boilerplate?
+**Unresolved, and the reason this issue is deferred.** See Risks → "Why
+unification is deferred". Neither content length nor content complexity
+discriminates; both admit long template text and reject short genuine
+duplicates. A viable answer likely needs a signal outside the text itself —
+provenance, an explicit author declaration, or template-awareness — none of which
+this issue currently proposes.
+
+### Q8: Should move detection ship without unification?
+**Unresolved.** The two are separable (see Risks) and carry different hazards.
+Not decided here.
+
 ## Implementation Estimate
 
-- Phase 1: Content hashing infrastructure (1 day)
+- Phase 1: Identity hashing infrastructure — `metadata["_identity_hash"]` (1 day)
 - Phase 2: Event correlation and detection (1 day)
 - Phase 3: BID migration logic (1 day)
 - Phase 4: Testing and edge cases (1 day)
@@ -307,10 +410,18 @@ content_hash = "blake3:abc123..."  # Optional: for move detection
 - **Issue 15**: Filtered Event Streaming (event consumption pattern)
 - **Issue 34**: Cache Stability (prerequisite - cache must work correctly)
 - **Issue 35**: Cache Invalidation (interacts with content hashing)
+- **Issue 66**: Incremental Parse (ships `metadata["_content_hash"]` — a sibling
+  key, **not** a substitute for `_identity_hash`; see `content_identity.md` §2.3)
 
 ## References
 
+- `docs/design/identity/content_identity.md` - **the identity-hash specification**;
+  placement, field set, normalization, link collapse, and its own open questions
 - `src/codec/compiler.rs` - Event stream processing
+- `src/codec/compiler.rs:5084-5096` - shipped asset hash-dedup; the same shape
+  this issue proposes for sections
 - `src/event.rs` - Belief event types
 - `src/codec/belief_ir.rs` - IRNode structure
-- `docs/design/section_metadata_manifest.md` - Section tracking architecture
+- `docs/design/identity/content_versioning.md` §5.1, §5.1a - `_content_hash` definition and
+  the `metadata` placement rule
+- `docs/design/identity/section_metadata_manifest.md` - Section tracking architecture

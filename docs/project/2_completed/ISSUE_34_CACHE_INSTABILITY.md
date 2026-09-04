@@ -19,7 +19,7 @@
 
 ### 2026-08-27: Query API described here was deleted
 
-- `Expression` / `StatePred` / `RelationPred` / `DbConnection::eval_unbalanced` / `eval_trace` no longer exist — replaced wholesale by `QuerySpec` / `TapeFn` / `QueryPackage` (Issue 83, see `docs/design/query_model.md` §10.2 "Deleted Constructs")
+- `Expression` / `StatePred` / `RelationPred` / `DbConnection::eval_unbalanced` / `eval_trace` no longer exist — replaced wholesale by `QuerySpec` / `TapeFn` / `QueryPackage` (Issue 83, see `docs/design/core/query_model.md` §10.2 "Deleted Constructs")
 - `DbConnection` now implements `BeliefSource::evaluate(&mut QueryPackage)` directly (`src/db.rs`), not the described `eval_unbalanced`/`eval_trace` methods
 - `src/beliefbase.rs` → `src/beliefbase/graph.rs` (`BidGraph`, `find_orphaned_edges`) + `src/beliefbase/base.rs` (`BeliefBase`)
 - `src/paths.rs` → `src/paths/pathmap.rs`

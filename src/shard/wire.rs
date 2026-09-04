@@ -24,7 +24,7 @@
 //!
 //! ## References
 //!
-//! - `docs/design/search_and_sharding.md` §5 — Per-network shard format
+//! - `docs/design/core/search_and_sharding.md` §5 — Per-network shard format
 //! - Issue 50: BeliefBase Sharding
 
 use crate::properties::{BeliefNode, WeightSet};
@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 /// (cross-network references) are excluded; they are resolved via the global
 /// shard or other loaded shards.
 ///
-/// See `docs/design/search_and_sharding.md` §5 for the schema.
+/// See `docs/design/core/search_and_sharding.md` §5 for the schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkShard {
     /// Short reference (5 hex chars) of the network.

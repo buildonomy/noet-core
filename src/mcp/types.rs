@@ -293,7 +293,7 @@ fn default_submap_direction() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct QueryInput {
     /// Query string in the noet textual grammar.
-    /// See docs/design/query_model.md §9.5 for the full syntax.
+    /// See docs/design/core/query_model.md §9.5 for the full syntax.
     /// Examples: `"id://my-network composed_of(*)"`, `"title:auth AND schema:procedure"`,
     /// `"id:class-a uses(1) NOT id:class-b uses(1)"`.
     pub query_string: String,

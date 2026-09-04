@@ -40,8 +40,8 @@
 //!
 //! ## References
 //!
-//! - `docs/design/search_and_sharding.md` §3 — Output structure
-//! - `docs/design/search_and_sharding.md` §5 — Per-network shard format
+//! - `docs/design/core/search_and_sharding.md` §3 — Output structure
+//! - `docs/design/core/search_and_sharding.md` §5 — Per-network shard format
 //! - Issue 50: BeliefBase Sharding
 
 use crate::{

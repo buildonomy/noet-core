@@ -219,7 +219,7 @@ Never silently fail or emit the raw sentinel.
    - [x] Verify `{requirements_table}` regression test still passes
 
 5. Documentation (0.5 day)
-   - [x] Document `{query}` in `docs/design/myst_directive_architecture.md` §3.1 and §6
+   - [x] Document `{query}` in `docs/design/codecs/myst_directive_architecture.md` §3.1 and §6
    - [x] Document `_query_specs` / `_query_options` metadata keys in code
          (internal contract, not user-facing — documented at write site in
          `md.rs::inject_context`)
@@ -343,9 +343,9 @@ closures. Also: `ExtendedRelation::render_anchor` method for the common
 
 ## References
 
-- `docs/design/query_model.md` §9.5.9 — MyST directive surface binding
-- `docs/design/myst_directive_architecture.md` §4, §8 — three-phase model
-- `docs/design/myst_directive_architecture.md` §6.2 — `{requirements_table}` as prior art
+- `docs/design/core/query_model.md` §9.5.9 — MyST directive surface binding
+- `docs/design/codecs/myst_directive_architecture.md` §4, §8 — three-phase model
+- `docs/design/codecs/myst_directive_architecture.md` §6.2 — `{requirements_table}` as prior art
 - `src/codec/myst.rs` — `DIRECTIVES`, `DirectiveDef`, `DirectiveRefiner`, `BeliefContext`
 - `src/query_parser.rs` — `parse()`, `ParseError` (Issue 80)
 - `src/query/view/mod.rs` — `VIEWS`, `ViewRegistry`, `ViewFactory`, `ViewRenderer`

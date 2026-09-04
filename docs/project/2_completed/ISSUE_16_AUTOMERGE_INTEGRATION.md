@@ -1,5 +1,53 @@
 # Issue 16: Distributed Event Log with Automerge + Keyhive
 
+> **Status: CLOSED — OBE. Superseded by the living-corpus annotation model.**
+>
+> This issue proposed a distributed event log (Automerge) with capability-based
+> authorization (Keyhive) and SQLite derivative indices. **The problem it solves
+> is now solved differently, and mostly for free.**
+>
+> **What replaced it:**
+>
+> - **The event log** — records are immutable with globally unique `id`s, so a
+>   record set is a **grow-only set** and merging two stores is set union:
+>   conflict-free by construction, **no CRDT library required**
+>   (`docs/design/core/beliefbase_architecture.md` §4.3). Automerge was solving a
+>   convergence problem the G-Set properties make impossible by construction.
+> - **`ActivityEvent`** — an annotation *is* an as-run record, and an event is an
+>   annotation subtype. The record schema is `Envelope` + `Annotation` (§4.3),
+>   with record kinds as `protocol_id` registry entries. A bespoke event type is
+>   the competing-schema mistake the unification removed.
+> - **`lamport_clock`** — Decision 4 below assumed it necessary. §4.3 now records
+>   it as **open**: `(observed_at, id)` may suffice for records that merge by set
+>   union, and a clock is only justified if something reads it. Issue 104 settles it.
+> - **Rotated logs + SQLite indices** — the durable-store-plus-live-projection
+>   pattern, which `living_corpus.md` §2 applies uniformly across all three
+>   layers. Issue 105 owns the annotation store; Issue 66 owns shard hydration.
+> - **Focus** — Issue 15 owns the cursor/filter concept. It is a stream filter,
+>   and probably an annotation subtype in its own right.
+>
+> **What survives, and where it went:** the **authorization model**. The
+> capability structure below — actions (`Read`/`Write`/`Append`/`Subscribe`),
+> scopes (`AllEvents`/`UserEvents`/`FocusEvents`/`EventType`/`TargetBid`), and
+> constraints (time window, rate limit, approval-required) — is a genuine
+> contribution that the annotation model does **not** yet answer. Nothing in the
+> current design says who may read or write which scope.
+>
+> That question becomes live when overlay layers become **remote peers**. It is
+> therefore inherited by the **async-overlay successor to Issue 110**, which
+> Issue 110 step 1a is responsible for opening. Until that issue exists, this
+> document is the record of the thinking — which is why it is closed rather than
+> deleted.
+>
+> Also worth carrying forward: **Decision 3's insight that a focus is a natural
+> permission boundary**, not just a query scope. Under the layered model that
+> reads as *a layer is a permission boundary* — which is what makes
+> percolation (`federated_belief_network.md` §1.2) a privacy mechanism rather
+> than only a volume-control one.
+>
+> Everything below is preserved as written. Do not treat `ActivityEvent`,
+> `EventLog`, `RotationPeriod`, or `procedure_correction` as live types.
+
 **Priority**: MEDIUM (Post-v0.1.0)  
 **Estimated Effort**: 3-4 weeks  
 **Dependencies**: ISSUE_10 (WatchService), ISSUE_15 (Filtered Event Streaming)  
@@ -664,13 +712,13 @@ Focus {
 ## References
 
 - **Depends On**:
-  - [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - WatchService foundation
+  - [`ISSUE_10_DAEMON_TESTING.md`](../2_completed/ISSUE_10_DAEMON_TESTING.md) - WatchService foundation
   - [`ISSUE_15_FILTERED_EVENT_STREAMING.md`](./ISSUE_15_FILTERED_EVENT_STREAMING.md) - Focus and subscriptions
 - **Related**:
   - `procedure_engine.md` - Procedure matching and redline learning
   - `action_inference_engine.md` - Action detection events
   - `redline_system.md` - Correction feedback loop
-  - [`docs/design/federated_belief_network.md`](../design/federated_belief_network.md) -
+  - [`docs/design/annotation/federated_belief_network.md`](../../design/annotation/federated_belief_network.md) -
     Distributed compiler-DB coordination. Defines the **Layer 2** belief graph replication
     protocol that sits below the **Layer 3** activity event log specified here. The two layers
     use different consistency models (single-owner pull replication vs. Automerge CRDT) for

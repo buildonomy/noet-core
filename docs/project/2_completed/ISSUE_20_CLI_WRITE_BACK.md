@@ -312,9 +312,9 @@ window (`new_debouncer(Duration::from_secs(2), ...)`) is unrelated and unchanged
 
 ## References
 
-- **Extends**: [Issue 10: Daemon Testing](./completed/ISSUE_10_DAEMON_TESTING.md) - CLI tool foundation
+- **Extends**: [Issue 10: Daemon Testing](ISSUE_10_DAEMON_TESTING.md) - CLI tool foundation
 - **Blocks**: CLI utility for production use
-- **Related**: ~~[Issue 19: File Watcher Bug](./ISSUE_19_FILE_WATCHER_TIMING_BUG.md)~~ - must be fixed (Deleted and consolidated into [Issue 07: Comprehensive Testing](./ISSUE_07_COMPREHENSIVE_TESTING.md)) for reliable watch testing
+- **Related**: ~~[Issue 19: File Watcher Bug](./ISSUE_19_FILE_WATCHER_TIMING_BUG.md)~~ - must be fixed (Deleted and consolidated into [Issue 07: Comprehensive Testing](../0_open/ISSUE_07_COMPREHENSIVE_TESTING.md)) for reliable watch testing
 - **Code locations**:
   - `src/bin/noet.rs` - CLI entry point
   - `src/codec/compiler.rs` - `DocumentCompiler` interface

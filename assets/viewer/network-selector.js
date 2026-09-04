@@ -38,7 +38,7 @@
  *
  * ## References
  *
- * - docs/design/search_and_sharding.md §6 — Memory budget model
+ * - docs/design/core/search_and_sharding.md §6 — Memory budget model
  * - Issue 50, Phase 4.2 — Network Selector UI
  */
 

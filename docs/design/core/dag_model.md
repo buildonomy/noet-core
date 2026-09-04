@@ -235,7 +235,7 @@ node, Camera B oriented along the coverage axis from the review document, with o
 the binocular overlap returned. "Which items in category X have NO coverage?" is
 blind spot detection — Camera A's field minus Camera B's.
 
-See `docs/design/query_model.md` §5.3 for the formal composition algebra and §9 for
+See `docs/design/core/query_model.md` §5.3 for the formal composition algebra and §9 for
 a worked example of a category-filtered coverage gap query.
 
 ## 6. Reachability and Queries
@@ -258,7 +258,7 @@ shared, and re-executed as the underlying graph evolves. The same query run toda
 next week will reveal what changed structurally — not because someone remembered to
 check, but because the query's structure encodes what matters.
 
-See `docs/design/query_model.md` for the full formal treatment of query
+See `docs/design/core/query_model.md` for the full formal treatment of query
 specifications, the score algebra, path recording, and the textual query surface.
 
 ## 7. Getting Started
@@ -289,7 +289,7 @@ This declares that the "Review of Safety Requirements" section (the owner) asser
 coverage of REQ-001 and REQ-002 (the sinks) — without modifying either requirement
 document. The six canonical relation directives (`{composed_of}`, `{component_of}`,
 `{draws_from}`, `{underlies}`, `{uses}`, `{implements}`) cover all three edge types
-in both directions. See `docs/design/query_model.md` §9.5 and Issue 71 for the full
+in both directions. See `docs/design/core/query_model.md` §9.5 and Issue 71 for the full
 directive surface.
 
 ### How the Compiler Builds the Graph
@@ -311,7 +311,7 @@ BeliefBase (compiled graph)
 The multi-pass compiler resolves forward references, injects BIDs, and iterates until
 all resolvable links are wired. Unresolvable references are tracked as diagnostics,
 not fatal errors — the graph is always available, even when incomplete. See
-`docs/design/beliefbase_architecture.md` for the full compilation model.
+`docs/design/core/beliefbase_architecture.md` for the full compilation model.
 
 ---
 
@@ -323,6 +323,6 @@ not fatal errors — the graph is always available, even when incomplete. See
 - **[BeliefBase Architecture](beliefbase_architecture.md)** — Detailed
   technical specification of identity management, the compilation pipeline,
   graph invariants, and incremental updates.
-- **[MCP Server](../mcp.md)** — Agent-facing tool documentation for querying a
+- **[MCP Server](../../mcp.md)** — Agent-facing tool documentation for querying a
   compiled BeliefBase via the Model Context Protocol.
 - **[README](../../README.md)** — Project overview, installation, and quick start.

@@ -25,7 +25,7 @@
 
 - Only reserved-**BID** validation exists (`Bid::is_reserved()` in `src/properties.rs`, called from `IRNode::from_str_with_format()` in `src/codec/belief_ir.rs`).
 - The reserved-**ID** validation described in Steps 4 and 6 (`is_reserved_bid()` name, rejection of `buildonomy_*`-prefixed IDs, `test_reserved_id_buildonomy_prefix()`) has no corresponding code — confirmed absent as far back as the earliest available commit history.
-- `docs/design/beliefbase_architecture.md` § 2.4 repeats the same unimplemented ID-prefix-rejection claim.
+- `docs/design/core/beliefbase_architecture.md` § 2.4 repeats the same unimplemented ID-prefix-rejection claim.
 
 ## Goals
 
@@ -276,6 +276,6 @@ if let Some(id_str) = doc.get("id").and_then(|v| v.as_str()) {
   - `belief_ir.rs:1096-1125` - Reserved ID validation in `from_str_with_format()`
   - `belief_ir.rs:1477-1561` - 8 tests for reserved identifier rejection
 - **Documentation:**
-  - `docs/design/architecture.md` § 9 - API node concept and purpose (brief overview)
-  - `docs/design/beliefbase_architecture.md` § 2.7 - Complete technical specification (220 lines)
+  - `docs/design/core/architecture.md` § 9 - API node concept and purpose (brief overview)
+  - `docs/design/core/beliefbase_architecture.md` § 2.7 - Complete technical specification (220 lines)
   - Covers: version management, reserved namespace design, BID generation, validation, lifecycle, future extensions

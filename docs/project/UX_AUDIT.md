@@ -14,7 +14,7 @@ current product fails to do so.
 ## 1. The Governing Principle
 
 noet's philosophical stance is **smooth iterative deepening** (see
-[`smooth_iterative_deepening.md`](../design/smooth_iterative_deepening.md)): a user's first
+[`smooth_iterative_deepening.md`](../essays/smooth_iterative_deepening.md)): a user's first
 experience should be simple, and as they go deeper they should be able to take
 localized control without disturbing what already works. Most tools fail this
 because either the initial experience is hard or the step from "simple" to "in
@@ -301,9 +301,15 @@ cases are:
 2. **A/B corpus comparison**: compare two versions of the same corpus by BID
    identity. Requires stable BIDs across independently compiled instances.
 3. **Content-addressed section identity** (Issue 36): migrating BIDs when
-   sections move between documents. With content hashing, source-injected BIDs
-   become less necessary — the content hash *is* the stable identity, and the
-   BID can be derived from it.
+   sections move between documents. A content hash helps *match* a moved section
+   to its prior BID; it does not replace the BID. An earlier version of this
+   audit claimed the hash *is* the identity and the BID derives from it — that is
+   refuted. A section's `id`, absent an explicit anchor, derives from the title,
+   and on collision from the **bref**, which derives from the **BID**, so hashing
+   a field set containing `id` gives BID → `id` → hash → BID. The design
+   therefore uses a separate `metadata["_identity_hash"]` over a narrower field
+   set (excluding `id` and `schema`) precisely to break that circularity. See
+   `docs/design/identity/content_identity.md` §2.
 
 For live authoring workflows, the cache DB or output shards provide sufficient
 identity persistence without touching source files. This suggests `--write`
@@ -497,7 +503,7 @@ Three infrastructure pieces address this at different levels:
 3. **Attestation fabric** (`attestation_fabric.md`) bridges the *reader-to-
    author* feedback loop for shared/deployed sites. When a reviewer leaves
    a comment or flag on a deployed (static) site, that feedback is an
-   attestation event anchored to a specific `(site_url, asset_version, bid)`.
+   attestation event anchored to a specific `(site_url, bid, version)`.
    The author should see these attestations surfaced in their editing
    environment — either in the browser during a `watch` session or in their
    IDE via LSP. This turns the collaboration overlay from a read-only
@@ -523,6 +529,23 @@ an afterthought. The depth model should target:
 Issue 11 (Basic LSP) and the `watch`-as-server evolution are the critical
 path items. The attestation integration is a later layer that builds on
 both.
+
+> [!NOTE]
+> **This violation now has an architecture.**
+> [`../design/annotation/living_corpus.md`](../design/annotation/living_corpus.md) specifies the
+> three-layer model (source / graph / annotation), the PII surfaces that make the
+> editor and viewer peer clients of one live graph, and the annotate → promote
+> loop that closes the reader-to-author channel described above.
+>
+> The three infrastructure pieces listed here map onto it directly: the LSP is a
+> PII surface (§5), `watch`-as-server is `noet serve` (Issue 102), and the
+> attestation fabric is Layer 3 (§2), now local-first with a sidecar store
+> (Issue 105) rather than requiring a deployed server.
+>
+> One gap that section 3.9 did not anticipate: the viewer-to-source path needs a
+> codec that can turn a graph mutation back into a source edit, which does not
+> exist today — write-back is currently scoped to a single parse. See
+> `living_corpus.md` §10 and Issue 107.
 
 ---
 
@@ -567,8 +590,8 @@ not decisions — they are candidates for evaluation.
 | No audience-specific entry points | Missing L0 | Authored landing pages with `{query}` directives |
 | No getting-started tutorial | Missing L1 | Create one |
 | No traceability guide | Missing L3 | Create one |
-| View-to-edit cliff (no shared state) | Missing L0↔L1 bridge | LSP + `watch`-as-server + viewer "edit" action |
-| Reader feedback invisible to authors | Missing L0→L1 channel | Attestation events surfaced in editor via LSP |
+| View-to-edit cliff (no shared state) | Missing L0↔L1 bridge | LSP + `noet serve` + viewer "edit" action — see `living_corpus.md` |
+| Reader feedback invisible to authors | Missing L0→L1 channel | Layer 3 annotations surfaced in editor via LSP — see `living_corpus.md` |
 
 ---
 
@@ -579,7 +602,7 @@ that should inform implementation decisions. Each subtraction candidate that is
 approved becomes an issue or a modification to an existing issue.
 
 This document also does not define the philosophical rationale for smooth iterative
-deepening. That lives in [`smooth_iterative_deepening.md`](../design/smooth_iterative_deepening.md).
+deepening. That lives in [`smooth_iterative_deepening.md`](../essays/smooth_iterative_deepening.md).
 This document is the *engineering application* of that philosophy to noet's product
 surface.
 
@@ -587,15 +610,17 @@ surface.
 
 ## 7. References
 
-- [`smooth_iterative_deepening.md`](../design/smooth_iterative_deepening.md) — Philosophical stance
-- [`network_authoring.md`](../design/network_authoring.md) — Level 2 reference (network setup)
-- [`beliefbase_architecture.md`](../design/beliefbase_architecture.md) — Level 5 specification
-- [`dag_model.md`](../design/dag_model.md) — Conceptual introduction to the graph model
-- [`myst_directive_architecture.md`](../design/myst_directive_architecture.md) — Directive pipeline
-- [`collaboration_overlay.md`](../design/collaboration_overlay.md) — Attestation annotation layer for static sites
-- [`attestation_fabric.md`](../design/attestation_fabric.md) — General provenance and annotation infrastructure
+- [`smooth_iterative_deepening.md`](../essays/smooth_iterative_deepening.md) — Philosophical stance
+- [`network_authoring.md`](../design/codecs/network_authoring.md) — Level 2 reference (network setup)
+- [`beliefbase_architecture.md`](../design/core/beliefbase_architecture.md) — Level 5 specification
+- [`dag_model.md`](../design/core/dag_model.md) — Conceptual introduction to the graph model
+- [`myst_directive_architecture.md`](../design/codecs/myst_directive_architecture.md) — Directive pipeline
+- [`living_corpus.md`](../design/annotation/living_corpus.md) — Layer model, PII surfaces, and the annotation loop; the architecture answering §3.9
+- [`collaboration_overlay.md`](../design/annotation/collaboration_overlay.md) — Attestation annotation layer for static sites
+- [`attestation_fabric.md`](../design/annotation/attestation_fabric.md) — General provenance and annotation infrastructure
 - Issue 11 — Basic LSP implementation (editing bridge)
 - Issue 36 — Content-based section identity (BID migration)
+- `docs/design/identity/content_identity.md` — the identity-hash specification
 - Issue 71 — Generalized relation block directives
 - Issue 73 — Versioned rendering (multi-version SPA viewer)
 - BACKLOG — Codec API footguns and ergonomic issues

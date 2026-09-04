@@ -220,7 +220,7 @@ High-level approach (diagrams, data structures, key decisions)
 4. Reference existing code to extend rather than reinventing
 
 > **Implementing any new codec, integration point, or extension to the parse pipeline?**
-> Read `docs/design/beliefbase_architecture.md` §3.2 and §3.6 first — specifically the
+> Read `docs/design/core/beliefbase_architecture.md` §3.2 and §3.6 first — specifically the
 > "Two-Registry Codec Dispatch" subsection. The codec system has non-obvious ordering
 > constraints (`WALK_CODECS` for walk-time visibility, `CLAIM_MAP` for parse-time dispatch,
 > `DocCodec::parse` as the Phase 1 claim site). Getting these wrong produces silently
@@ -256,14 +256,14 @@ making further code changes.
 unless the BIDs were previously persisted in source files. Unpersisted BIDs
 embed a timestamp and will differ between runs. Compare *counts* and *structural
 position* instead. Use `noet bref [bid]` to look up a bref for cross-referencing.
-See `docs/design/beliefbase_architecture.md` §2.2 for the full mechanism.
+See `docs/design/core/beliefbase_architecture.md` §2.2 for the full mechanism.
 
 **Network node dual-path representation**: A network node has a directory path
 (`"subnet1"`) and an index-file path (`"subnet1/index.md"`) — these are not
 interchangeable. When constructing an `AnchorPath` from a known directory path,
 always use `AnchorPath::new_dir(dir_path)` (or append a trailing slash). Bare
 `AnchorPath::new` on a directory path silently drops the last component, producing
-unresolvable `NodeKey::Path` values. See `docs/design/beliefbase_architecture.md`
+unresolvable `NodeKey::Path` values. See `docs/design/core/beliefbase_architecture.md`
 §2.2 for the full specification.
 
 **Log output is ANSI-coloured even when redirected to a file**, and the tracing
@@ -283,12 +283,14 @@ diagnostic patterns.
 
 | Type | Location | Notes |
 |------|----------|-------|
-| Active issues | `docs/project/ISSUE_XX_*.md` | Sequential numbering, never reuse |
-| Completed issues | `docs/project/completed/ISSUE_XX_*.md` | No orphaned actions |
-| Design docs | `docs/design/*.md` | Semantic versioning |
+| Open issues | `docs/project/0_open/ISSUE_XX_*.md` | Not yet started; sequential numbering, never reuse |
+| In-progress issues | `docs/project/1_in_progress/ISSUE_XX_*.md` | Currently being worked |
+| Completed issues | `docs/project/2_completed/ISSUE_XX_*.md` | No orphaned actions |
+| Design docs | `docs/design/<topic>/*.md` | Grouped by topic; see `docs/design/README.md` |
 | Trade studies | `docs/project/trades/*.md` | Complex analyses |
-| Roadmaps | `docs/project/ROADMAP*.md` or project root | |
+| Roadmaps | `docs/project/ROADMAP.md` | |
 | Backlog | `docs/project/BACKLOG.md` | Optional enhancements |
+| Essays | `docs/essays/*.md` | Philosophy and strategy |
 | Scratchpad | `.scratchpad/` | Ephemeral, agent-managed |
 
 **Before creating any document**: search for existing docs covering similar scope, check naming conventions, confirm with human if uncertain.
@@ -297,9 +299,10 @@ diagnostic patterns.
 
 - `README.md` — Project overview
 - `CONTRIBUTING.md` — Development workflow, code standards, CI/CD
-- `docs/architecture.md` — High-level architecture and core concepts
-- `docs/design/beliefbase_architecture.md` — Detailed technical spec
-- `docs/design/network_authoring.md` — User-facing reference for authoring BeliefNetworks (`index.md`, whitelist/blacklist, subnets)
+- `docs/design/README.md` — Index of all design docs, grouped by topic
+- `docs/design/core/architecture.md` — High-level architecture and core concepts
+- `docs/design/core/beliefbase_architecture.md` — Detailed technical spec
+- `docs/design/codecs/network_authoring.md` — User-facing reference for authoring BeliefNetworks (`index.md`, whitelist/blacklist, subnets)
 - `docs/project/DOCUMENTATION_STRATEGY.md` — Documentation hierarchy
 - `docs/project/README.md` — Issue resolution workflow
 - `docs/project/LESSONS_LEARNED.md` — Durable failure modes and diagnostic patterns

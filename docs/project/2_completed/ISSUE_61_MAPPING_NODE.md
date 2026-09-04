@@ -10,7 +10,7 @@ Implement the `{maps_to}` directive — a MyST fenced-block directive that lets 
 section or document node own directed edges between two other nodes (source and sink)
 without being either endpoint. The owning node is identified by its bref in
 `WEIGHT_OWNED_BY`, extending that field beyond its current `"source"` / `"sink"` values.
-The full spec will be written to `docs/design/mapping_node_architecture.md` as the final
+The full spec will be written to `docs/design/codecs/mapping_node_architecture.md` as the final
 step of this issue, once the working implementation is in place.
 
 ## Updates
@@ -26,7 +26,7 @@ step of this issue, once the working implementation is in place.
 - `IntermediateMappingRelation`: `source` is now `sources: Vec<NodeKey>` (Cartesian
   product with `sinks`), not a single value.
 - `covers` added later as a preferred synonym for `maps_to` (same directive impl).
-- `docs/design/mapping_node_architecture.md` has been substantially rewritten since
+- `docs/design/codecs/mapping_node_architecture.md` has been substantially rewritten since
   (cross-document mappings, traceability views — Issue 63).
 
 ## Goals
@@ -37,7 +37,7 @@ step of this issue, once the working implementation is in place.
 - Extend `WEIGHT_OWNED_BY` to accept a bref string; add `RelationPred::OwnedBy(Bref)` to the query layer
 - Render owned edges as an HTML table in-place of the directive via the deferred-render pipeline
 - Surface `owner_bid` in the viewer via `EdgeEntry` and a "via <link>" annotation in `metadata.js`
-- Rewrite `docs/design/mapping_node_architecture.md` to reflect the implemented design
+- Rewrite `docs/design/codecs/mapping_node_architecture.md` to reflect the implemented design
 
 ## Architecture
 
@@ -275,7 +275,7 @@ present.
    - [x] Update `assets/viewer/metadata.js`: `renderRelationGroup` accepts `EdgeEntry`; render "via \<link\>" when `owner_bid` is present; backward-compatible with plain string bids
 
 7. **Rewrite design doc** (0.5 days)
-   - [x] Rewrite `docs/design/mapping_node_architecture.md` to reflect the implemented directive-first design, correct GC mechanics, `fetch_owned_edges` three-tier pattern, `RelationPred::OwnedBy`, and `compute_diff` bref arm
+   - [x] Rewrite `docs/design/codecs/mapping_node_architecture.md` to reflect the implemented directive-first design, correct GC mechanics, `fetch_owned_edges` three-tier pattern, `RelationPred::OwnedBy`, and `compute_diff` bref arm
 
 ## Testing Requirements
 
@@ -298,7 +298,7 @@ present.
 - [ ] The compiled HTML for a section with `{maps_to}` contains a rendered mapping table at the directive's source position
 - [ ] The viewer shows "via \<section title\>" for edges owned by a section node
 - [ ] All existing tests pass; new unit and integration tests cover the above scenarios
-- [ ] `docs/design/mapping_node_architecture.md` is rewritten to match the implemented design
+- [ ] `docs/design/codecs/mapping_node_architecture.md` is rewritten to match the implemented design
 
 ## Risks
 

@@ -26,7 +26,7 @@ Migrate `compiler.rs` to `watch.rs`, extract library patterns for file watching 
 - **Issue 11 was re-scoped**, not simply "future work" for a REST/IPC API as
   described here. `docs/project/0_open/ISSUE_11_BASIC_LSP.md` now carries a
   warning that the LSP is being re-architected as a PII surface for an
-  attestation service (see `docs/design/attestation_fabric.md` §13), pending
+  attestation service (see `docs/design/annotation/attestation_fabric.md` §13), pending
   further design work — it is not simply "REST/IPC API layer" work as this
   issue's References section describes.
 - The core architectural claims — `WatchService`, `FileUpdateSyncer`,

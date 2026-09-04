@@ -346,7 +346,7 @@ on cited section BIDs to verify relevance → produce dispositioned finding list
 - `src/shard/wire.rs` — shard wire types (usable natively, not wasm32-only)
 - `src/wasm.rs` — `extract_node_context` (JS serialization adapter; owned-edge merge to move to `context.rs`)
 - `src/beliefbase/context.rs` — `BeliefContext`, `OwnedEdge` (native API, already correct)
-- `docs/design/search_and_sharding.md`; `docs/design/beliefbase_architecture.md`
+- `docs/design/core/search_and_sharding.md`; `docs/design/core/beliefbase_architecture.md`
 - Issue 11 (LSP) — shares subscriber pattern and `last_diagnostics` accessor
 - Issue 50 (Sharding) — shard format; Issue 54 (Search) — shared TF-IDF logic
 - MCP spec: https://modelcontextprotocol.io/docs/concepts/prompts — Prompts primitive

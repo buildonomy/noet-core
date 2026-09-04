@@ -6,7 +6,7 @@
 
 ---
 
-> **Note**: This is the **authoritative architecture reference** for the Interactive HTML Viewer. All design decisions are documented here. For implementation tasks and progress tracking, see [ISSUE_38: Interactive SPA Implementation](../project/ISSUE_38_INTERACTIVE_SPA.md).
+> **Note**: This is the **authoritative architecture reference** for the Interactive HTML Viewer. All design decisions are documented here. For implementation tasks and progress tracking, see [ISSUE_38: Interactive SPA Implementation](../../project/2_completed/ISSUE_38_INTERACTIVE_SPA.md).
 
 ---
 
@@ -763,8 +763,8 @@ impl BeliefBaseWasm {
     
     /// Get system network namespace BIDs
     /// These identify special tracking networks for external links, assets, and API versioning.
-    /// See `docs/design/architecture.md` § 10 for conceptual overview.
-    /// See `docs/design/beliefbase_architecture.md` § 2.7 for technical specification.
+    /// See `docs/design/core/architecture.md` § 10 for conceptual overview.
+    /// See `docs/design/core/beliefbase_architecture.md` § 2.7 for technical specification.
     pub fn href_namespace() -> String;        // External HTTP/HTTPS links network
     pub fn asset_namespace() -> String;       // Images/PDFs/attachments network
     pub fn buildonomy_namespace() -> String;  // API node (version management)
@@ -1516,10 +1516,10 @@ Brief overview:
 
 ## References
 
-- [ISSUE_06: HTML Generation and Interactive Viewer](../project/completed/ISSUE_06_HTML_GENERATION.md) - WASM infrastructure
-- [ISSUE_38: Interactive SPA Implementation](../project/ISSUE_38_INTERACTIVE_SPA.md) - Implementation plan
-- [BeliefBase Architecture](./beliefbase_architecture.md) - Data model
-- [Link Format Design](./link_format.md) - BID attribution system
+- [ISSUE_06: HTML Generation and Interactive Viewer](../../project/2_completed/ISSUE_06_HTML_GENERATION.md) - WASM infrastructure
+- [ISSUE_38: Interactive SPA Implementation](../../project/2_completed/ISSUE_38_INTERACTIVE_SPA.md) - Implementation plan
+- [BeliefBase Architecture](../core/beliefbase_architecture.md) - Data model
+- [Link Format Design](../identity/link_format.md) - BID attribution system
 - [Open Props](https://open-props.style/) - Design token system
 - [WASM Bindgen](https://rustwasm.github.io/docs/wasm-bindgen/) - Rust ↔ JS bridge
 

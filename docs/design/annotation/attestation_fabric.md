@@ -20,7 +20,7 @@ dependencies = ["collaboration_overlay.md (v0.1)", "federated_belief_network.md 
 
 The `noet-collab` collaboration overlay (Phase 1) provides human attestations —
 comments, sign-offs, flags — keyed on noet document nodes. Its anchor is
-`(site_url, asset_version, bid)`.
+`(site_url, bid, version)`.
 
 This document generalizes that model into an **attestation fabric**: an
 infrastructure layer that can attach structured, identity-attributed attestation
@@ -75,8 +75,8 @@ Tooling: Go (most mature), Python, Rust, Java language bindings.
 
 **Key lesson:** in-toto struggled with adoption because it required buy-in from
 every pipeline step simultaneously. The attestation fabric avoids this by
-supporting single-boundary pilots (the "hancock" pattern) without requiring
-end-to-end adoption.
+supporting **single-boundary pilots** — attesting one trust boundary in isolation
+— without requiring end-to-end adoption.
 
 **Key difference:** in-toto is scoped to software supply chains and artifact
 provenance. The attestation fabric extends the model to non-software substrates
@@ -113,8 +113,8 @@ the attestation server's `attester_id` + `credential_type` model.
 **Key lesson:** Rekor's transparency log is the right model for the attestation
 server's storage layer — append-only, tamper-evident, publicly auditable.
 
-**Recommendation:** for software artifact attestation (the hancock pilot scoped
-to CI/CD configuration files), consider using Cosign + in-toto links + Rekor
+**Recommendation:** for software artifact attestation (a first pilot scoped to
+CI/CD configuration files), consider using Cosign + in-toto links + Rekor
 directly rather than building a custom server. The custom server is needed for
 the human sign-off overlay, the path+version history registry, and the
 cross-substrate federation — not for basic software provenance.
@@ -156,11 +156,21 @@ knowledge graph integrates external event streams:
   identical: each domain's attestation server is a peer emitting events.
 
 **Key lesson:** the operational model is not batch-pull from source files — it
-is stream integration via typed events with origin tracking. An attestation
-server emitting `NodeUpdate` and `RelationUpdate` events with
-`EventOrigin::Remote`, framed by `BatchStart`/`BatchEnd`, integrates into the
-beliefbase without any new infrastructure. The `on_belief_event` hook is the
-natural wiring point.
+is stream integration via typed events with origin tracking.
+
+**With one correction, which the rest of this document depends on.** A PII
+surface or attestation server emits **records** (`Event::Annotation`), not
+`BeliefEvent`s. Records are folded, and the *fold* emits `NodeUpdate` /
+`RelationUpdate` with `EventOrigin::Remote`, framed by `BatchStart`/`BatchEnd`
+(§12.3). The events that reach `on_belief_event` are the fold's output, never a
+record rewritten as an event.
+
+The direction is one-way and structural: a `BeliefEvent` is an instruction
+applied directly; an `Annotation` is a claim requiring interpretation. Folding an
+annotation *emits* BeliefEvents; nothing turns a BeliefEvent back into a record
+(`core/beliefbase_architecture.md` §4.3). So the fold **is** the new
+infrastructure this passage said was unnecessary — Issue 109 owns it, and
+`on_belief_event` is the wiring point *downstream* of it.
 
 **Key difference:** noet's event stream is currently designed for belief graph
 nodes (documents, sections, edges). The attestation fabric extends this to
@@ -229,17 +239,21 @@ schema://system/message-type-name               # message schema
 Path scheme definitions are maintained in the protocol registry (§6).
 
 **`version`** is the cryptographic fingerprint of the artifact at this path at
-a specific point in time. For a noet site, `version = asset_version` (FNV-1a
-hash of the compiled beliefbase). For a file, `version = sha256(file_content)`.
-For a physical part, `version = sha256(inspection_record_content)`.
+a specific point in time. For a noet document node, `version = sha256` over the
+node's non-metadata content (`kind`, `title`, `schema`, `payload`, `id`). For a
+file, `version = sha256(file_content)`. For a physical part,
+`version = sha256(inspection_record_content)`.
 
-This two-component anchor generalizes the Phase 1 `(site_url, asset_version, bid)`
-without invalidating any existing records:
+The noet mapping is deliberately *per-node*, not per-build. An earlier design
+used `asset_version` (FNV-1a over the whole compiled beliefbase); that is
+rejected, because on a realistic corpus every build changes it and every
+annotation is therefore permanently stale. See
+`docs/design/identity/content_versioning.md`.
 
-| Phase 1 field | General field |
+| noet field | General field |
 | ------------- | ------------- |
 | `site_url` + `bid` | `path` |
-| `asset_version` | `version` |
+| node content hash | `version` |
 
 ### 4.2 The Attestation Record
 
@@ -274,6 +288,22 @@ deleted. Revocation of a credential affects future attestations; it does not
 erase historical ones (which were made in good faith and whose historical
 validity matters for audit).
 
+> [!NOTE]
+> **This schema is not independently authoritative.** An attestation record and
+> an as-run record are the same object described from two ends — one starts from
+> "a claim was made about an artifact", the other from "a procedure was
+> executed". The three-piece as-run model that was the other end is **withdrawn**
+> (`ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` → "What Was Removed and Why"), and
+> its executor-context piece collapsed into the annotation `Envelope`
+> (`beliefbase_architecture.md` §4.3).
+>
+> The fields above therefore overlap the envelope under different names —
+> `attester_id` / `actor`, `timestamp` / `observed_at`, `provenance` /
+> `caused_by`. Whether these unify under one spelling is **Issue 104**'s call
+> (record field set), with **Issue 105** owning storage and the `(path, version)`
+> anchor as a `NodeVersionRef`. Treat this block as the attestation-side view of
+> one record, not a second record type.
+
 ### 4.2a Provenance-Chained Attestations
 
 The `provenance` field is **optional**. An attestation with no `provenance`
@@ -300,7 +330,7 @@ version          = "sha256:b7c9d..."
 attester_id      = "engineer@example.com"
 credential_type  = "guidance-engineer"
 kind             = "SignOff"
-protocol_id      = "iie:peer-signoff:v1"
+protocol_id      = "noet:peer-signoff:v1"
 result           = "pass"
 evidence_hash    = "sha256:e4f2a..."   # structured rationale document
 
@@ -440,7 +470,7 @@ required = [
 ]
 
 [independence_protocol]
-protocol_id = "iie:schema-validate:v1"
+protocol_id = "noet:schema-validate:v1"
 checks = [
     "payload conforms to declared schema",
     "all required fields present",
@@ -528,14 +558,14 @@ The protocol registry is a shared, version-controlled store that resolves
 `protocol_id` strings to their check specifications. It plays the same role as
 DNS: a shared vocabulary, not a shared gatekeeper.
 
-A `protocol_id` like `iie:bounds-check:v1` resolves to a registry entry that
+A `protocol_id` like `noet:bounds-check:v1` resolves to a registry entry that
 is simultaneously a **check specification**, a **node schema definition**, and
 a **graph traversal role declaration**. The `protocol_id` is the `schema:`
 value used in noet query filters — the same identifier viewed from three angles.
 
 ```toml
 [[protocol]]
-id          = "iie:bounds-check:v1"
+id          = "noet:bounds-check:v1"
 name        = "Bounds and Sanity Check"
 version     = "1"
 intent      = ["Configuration", "Observation"]
@@ -583,18 +613,18 @@ server emits when a node of this schema is posted:
 - Each `Pragmatic` role entry → `RelationUpdate(WeightKind::Pragmatic)` from the
   attestation node to the boundary it covers
 
-Query expressions over attestation nodes use `schema:iie:bounds-check:v1` as
+Query expressions over attestation nodes use `schema:noet:bounds-check:v1` as
 the `NodeFilter` predicate, then traverse the declared edges:
 
 ```
 # All passing bounds checks on this artifact
-schema:iie:bounds-check:v1 AND result:pass
+schema:noet:bounds-check:v1 AND result:pass
 
 # Provenance chain: what did this bounds check draw from?
-schema:iie:bounds-check:v1 s-epistemic-k(*)
+schema:noet:bounds-check:v1 s-epistemic-k(*)
 
 # What boundaries does this bounds check cover?
-schema:iie:bounds-check:v1 s-pragmatic-k
+schema:noet:bounds-check:v1 s-pragmatic-k
 ```
 
 No new query primitives are required. The registry entry defines the vocabulary;
@@ -609,21 +639,53 @@ The five seed protocol entries for the initial registry are:
 
 | `protocol_id` | Schema tag | Primary graph roles |
 | ------------- | ---------- | ------------------- |
-| `iie:peer-signoff:v1` | Human approval with credential | Epistemic → provenance; Pragmatic → boundary |
-| `iie:schema-validate:v1` | Machine schema conformance check | Pragmatic → boundary |
-| `iie:bounds-check:v1` | Machine range/sanity check | Pragmatic → boundary |
-| `iie:sig-verify:v1` | Cryptographic signature verification | Pragmatic → boundary |
-| `iie:mode-gate:v1` | State/mode compatibility check | Pragmatic → boundary |
+| `noet:peer-signoff:v1` | Human approval with credential | Epistemic → provenance; Pragmatic → boundary |
+| `noet:schema-validate:v1` | Machine schema conformance check | Pragmatic → boundary |
+| `noet:bounds-check:v1` | Machine range/sanity check | Pragmatic → boundary |
+| `noet:sig-verify:v1` | Cryptographic signature verification | Pragmatic → boundary |
+| `noet:mode-gate:v1` | State/mode compatibility check | Pragmatic → boundary |
 
-`iie:peer-signoff:v1` is the only seed protocol with an Epistemic role — human
+`noet:peer-signoff:v1` is the only seed protocol with an Epistemic role — human
 sign-offs are the primary carriers of provenance chains, because human judgment
 is typically backed by prior computational records. Machine check protocols cover
 boundaries directly without citing prior records (their evidence payload is
 self-contained in the `evidence_hash` field).
 
+> [!NOTE]
+> **Planned third field: `protocol.template` — a reference, not a state machine.**
+> Records are immutable, so a record kind's state is derived by folding its
+> `caused_by` chain, which needs to know what states exist and which transitions
+> are legal.
+>
+> **That is a procedure, and noet already has one definition of it.** A
+> `.procedure` document declares ordered steps with types — `sequence`,
+> `any_of`, `all_of`, `parallel` — which *are* transition semantics. Declaring a
+> second state-machine grammar inside registry entries would give the same
+> concept two schemas, two parsers, and two ways to drift.
+>
+> So the registry entry carries a **`NodeVersionRef`** — the general
+> `(bid, content_version)` node reference owned by **Issue 105** — pointing at a
+> procedure document, rather than an embedded `[protocol.states]` block. A
+> custom lifecycle is an authored `.procedure` file plus a registry entry
+> pointing at it — still no code change, and the template is a first-class graph
+> node that can be versioned, reviewed, and annotated like any other content.
+>
+> The reference is deliberately **not** procedure-specific: every record Issue
+> 105 stores is anchored by the same pair, so a lifecycle reference is an
+> ordinary use of it.
+>
+> §6.2's degradation rule extends unchanged: a record whose template is
+> unresolvable stays readable and mergeable with no derived state, exactly as an
+> unrecognized protocol is accepted and marked rather than rejected.
+>
+> **Definition: Issue 17** (procedure codec and schema) owns what a lifecycle
+> *is*. **Fold semantics: Issue 109** owns deriving state from a record log
+> against one. See `docs/design/annotation/living_corpus.md` §4 for the model.
+
 ### 6.2 Namespacing
 
-- **`iie:<name>:<ver>`** — registered protocols, governed by the registry
+- **`noet:<name>:<ver>`** — registered protocols shipped with noet, governed by
+  the registry
 - **`local:<team>:<name>:<ver>`** — experimental protocols; valid but not
   portable across organizations. Teams can use these without registry approval,
   accepting that downstream consumers may not recognize them. When an attestation
@@ -817,7 +879,7 @@ artifact attestation in a CI/CD pipeline):
 1. Sign the artifact with Cosign using workload identity
 2. Record an in-toto link for the boundary crossing
 3. Post the link hash to a Rekor instance as the append-only receipt
-4. Define the boundary policy in domain frontmatter referencing `iie:sig-verify:v1`
+4. Define the boundary policy in domain frontmatter referencing `noet:sig-verify:v1`
 
 This requires zero custom server infrastructure and provides immediate
 interoperability with the broader supply chain security ecosystem. The custom
@@ -874,13 +936,13 @@ federation, or the path+version history model are required.
   authenticated user); owner-registry as an opt-in per-path-scheme config in
   Phase 3.
 
-- **❓8 Hancock pilot OTS→custom server transition trigger** — Next Steps §2
+- **❓8 Pilot OTS→custom server transition trigger** — Next Steps §2
   specifies qualitative conditions for moving from Cosign/in-toto/Rekor to the
   custom attestation server ("when human sign-off credentials, cross-substrate
   federation, or path+version history are needed"), but no concrete trigger is
   defined. Recommendation: the trigger is the addition of the first human
-  `SignOff` requirement to a hancock IIC entry — at that point the custom server
-  is strictly required and the OTS path is exhausted.
+  `SignOff` requirement to a boundary-registry entry — at that point the custom
+  server is strictly required and the OTS path is exhausted.
 
 - **❓9 Protocol registry governance parameters** — §6.3 specifies threshold
   signature governance but does not name the initial `n` key holders, the
@@ -890,14 +952,14 @@ federation, or the path+version history model are required.
   design question; it is recorded here so it is not silently skipped when the
   registry is first created.
 
-- **❓10 Assertion/Verification dual-role case** — The intent class taxonomy
-  (§ of IIE process) distinguishes Verification (demonstrating a prior claim is
-  true) from Assertion (a substrate reporting on itself). The common CI/CD case
-  — where the same agent both produces an artifact and verifies its own output
-  — spans both classes simultaneously. Guidance is needed on how to classify
-  IIC entries for dual-role boundaries: two separate IIC entries (one per
-  intent), a single entry with both intents listed, or a new `Assertion+
-  Verification` compound class.
+- **❓10 Assertion/Verification dual-role case** — An intent-class taxonomy that
+  distinguishes Verification (demonstrating a prior claim is true) from Assertion
+  (a substrate reporting on itself) runs into the common CI/CD case, where the
+  same agent both produces an artifact and verifies its own output — spanning
+  both classes simultaneously. Guidance is needed on how to classify
+  boundary-registry entries for dual-role boundaries: two separate entries (one
+  per intent), a single entry with both intents listed, or a compound
+  `Assertion+Verification` class.
 
 - **❓11 Attester trust quorum design** — Phase 1 uses single-peer credential
   attestation. Phase 2 may require quorum (N ≥ 2 distinct peers). The quorum
@@ -916,7 +978,7 @@ federation, or the path+version history model are required.
 
 ## 12. Relationship to the noet DAG Model
 
-The noet beliefbase graph (`docs/design/dag_model.md`) uses three orthogonal edge
+The noet beliefbase graph (`docs/design/core/dag_model.md`) uses three orthogonal edge
 types — **Section**, **Epistemic**, and **Pragmatic** — to encode containment,
 provenance, and normative coverage respectively. These three dimensions map onto the
 attestation fabric's structure with striking fidelity:
@@ -938,7 +1000,7 @@ types and adds cryptographic identity, append-only persistence, and policy evalu
 If attestation records are compiled into a noet beliefbase, the full noet query model
 becomes available over attestation data with no new query infrastructure required:
 
-- **Gap analysis** — "which trust boundaries in the IIC have no passing attestation
+- **Gap analysis** — "which trust boundaries in the registry have no passing attestation
   for the current artifact version?" is the noet complement operation: nodes reachable
   via Section traversal from the substrate registry but not reachable via Pragmatic
   traversal from the attestation ledger.
@@ -950,8 +1012,8 @@ becomes available over attestation data with no new query infrastructure require
   Epistemic provenance chains, which have Pragmatic attestation coverage.
 - **Consistency checks** — `check_consistency` surfaces unresolved cross-references:
   provenance citations to non-existent records, attestations referencing unregistered
-  protocol IDs, or boundaries declared in the IIC with no corresponding attestation
-  ledger entry.
+  protocol IDs, or boundaries declared in the registry with no corresponding
+  attestation ledger entry.
 
 The MCP tools already deployed against knowledge corpora (the `search`, `get_submap`,
 `get_context` primitives) would apply directly to attestation data once compiled,
@@ -965,12 +1027,20 @@ composable operational roles:
 
 - **Attestation server** — the write path. Accepts append-only POST requests from
   arbitrary attesters (humans, CI/CD pipelines, agents, TPM hardware) in real time.
-  The authoritative store of attestation records. Optimized for low-latency write and
-  policy evaluation at POST time.
-- **noet beliefbase** — the query path. Consumes attestation records as a
-  `BeliefEvent` stream and integrates them into the graph, assigning BIDs to
-  attestation records and typed edges to provenance links. The beliefbase is the
-  live or snapshot query layer over the attestation ledger.
+  Optimized for low-latency write and policy evaluation at POST time.
+
+  > [!NOTE]
+  > **Superseded in the noet case: the server is a peer, not the authoritative
+  > store.** Records are an append-only G-Set whose merge is set union, so no
+  > store is master; the server and the local sidecar store (Issue 105) are one
+  > mechanism at two scopes, and the authoritative value is their union. See
+  > `living_corpus.md` §2 and Issue 65 §Relationship to the Local Sidecar Store.
+- **noet beliefbase** — the query path. Consumes the **fold's output** — the
+  `BeliefEvent`s produced by projecting attestation records per §12.3 — and
+  integrates them into the graph, assigning BIDs to attestation records and typed
+  edges to provenance links. It does **not** consume records as an event stream;
+  records are folded first. The beliefbase is the live or snapshot query layer
+  over the attestation ledger.
 
 This is not a batch-pull model. The `BeliefEvent` enum in `src/event.rs` carries an
 `EventOrigin` discriminant — `Local` for events generated by this beliefbase,
@@ -978,9 +1048,12 @@ This is not a batch-pull model. The `BeliefEvent` enum in `src/event.rs` carries
 `on_belief_event` hook (`src/codec/compiler.rs`) that is the designed integration
 point for external event streams. An attestation server integration would emit
 `NodeUpdate`, `RelationUpdate`, and `RelationChange` events with
-`EventOrigin::Remote`; the compiler applies them through the same pipeline as any
-other remote belief stream, with `BatchStart`/`BatchEnd` framing coherent groups of
-attestation records for atomic commit.
+`EventOrigin::Remote` — these are the *output of folding* records per §12.3, not
+records rewritten as events; the fold remains the only bridge from claim to
+instruction (`beliefbase_architecture.md` §4.3). The compiler applies them through
+the same pipeline as any other remote belief stream, with
+`BatchStart`/`BatchEnd` framing coherent groups of attestation records for atomic
+commit.
 
 This is the same pattern used in production deployments, where external records
 (issue trackers, hazard reports) are ingested as event streams and compiled into a
@@ -1024,17 +1097,24 @@ produces R that carries the user's identity as provenance. The infosec
 meaning reinforces the design constraint: this surface handles
 identity-sensitive data and must be governed accordingly.
 
+> **`living_corpus.md` §6 is authoritative for what each surface reads and
+> writes.** This section covers the *deployment* concerns — multi-tenancy,
+> credentials, role-gated presentation. The table below is orientation; where it
+> and §6 differ on read/write paths, §6 governs.
+
 | PII surface | Executor type | What it does |
 |---|---|---|
-| **LSP** (Issues 11/12) | Human in editor | Presents inference gaps as diagnostics, captures edits as deltas, emits BeliefEvents for review/sign-off actions |
+| **LSP** (Issues 11/12) | Human in editor | Presents inference gaps as diagnostics, captures edits as deltas, emits **records** for review/sign-off actions |
 | **Viewer** (metadata card) | Human in browser | Presents inference results as dashboard, captures annotations/comments |
 | **MCP server** | AI agent | Presents inference results as structured queries, captures agent actions |
-| **CLI** | Automated pipeline | Emits BeliefEvents from CI/CD, test runners, vulnerability scanners |
+| **CLI** | Automated pipeline | Emits **records** from CI/CD, test runners, vulnerability scanners |
 
 All PII surfaces share:
 - **Read path**: consume the compiled belief network + inference engine
   output (projection completeness, credibility texture, gaps)
-- **Write path**: emit `BeliefEvent`s into the attestation service
+- **Write path**: emit **records** (`Event::Annotation`) into the attestation
+  service. Never `BeliefEvent`s — a surface makes claims; the fold turns claims
+  into graph mutations (§12.3, and `core/beliefbase_architecture.md` §4.3)
 - **Role awareness**: the user's role (from the collaboration overlay's
   credential model) parameterizes which inference results are surfaced
   and which procedures are active

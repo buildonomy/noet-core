@@ -434,7 +434,7 @@ For deployments requiring full-corpus navigation without manual shard loading, t
 
 This is explicitly **not** a search-specific server. Navigation, metadata, context, and search all benefit equally from remote data access. The federated approach provides a single query interface (`BeliefSource`) over both local and remote data.
 
-See `docs/design/federated_belief_network.md` for the full federated architecture.
+See `docs/design/annotation/federated_belief_network.md` for the full federated architecture.
 
 ## 11. Backward Compatibility
 
@@ -500,9 +500,9 @@ Issue 54: Full-Text Search MVP
 
 ## 14. References
 
-- `docs/design/beliefbase_architecture.md` — BeliefGraph/BeliefBase data model, PathMapMap, event system
-- `docs/design/interactive_viewer.md` — Viewer architecture, WASM integration, navigation
-- `docs/design/federated_belief_network.md` — Federated data access for large-corpus scaling
+- `docs/design/core/beliefbase_architecture.md` — BeliefGraph/BeliefBase data model, PathMapMap, event system
+- `docs/design/presentation/interactive_viewer.md` — Viewer architecture, WASM integration, navigation
+- `docs/design/annotation/federated_belief_network.md` — Federated data access for large-corpus scaling
 - `src/codec/compiler.rs::finalize_html()` — Export entry point and search index generation
 - `src/codec/compiler.rs::export_beliefbase_json()` — Current monolithic export
 - `src/wasm.rs::BeliefBaseWasm` — Current WASM bindings (including existing `search()` method)

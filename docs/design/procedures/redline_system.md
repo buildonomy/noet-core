@@ -2,12 +2,46 @@
 title: "Redline System: As-Run Deviation Tracking"
 authors: "Andrew Lyjak, Claude Code"
 last_updated: "2025-01-XX"
-status: "Active"
+status: "Withdrawn record types — analysis and promotion concerns retained"
 version: "0.1"
-dependencies: ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)", "intention_lattice.md (v0.1)"]
+dependencies: ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)"]
 ---
 
 # Redline System: As-Run Deviation Tracking
+
+> [!WARNING]
+> **The record types in this document are withdrawn; its subject matter is not.**
+>
+> §3.2's `ProcedureCorrectionEvent` is the withdrawn `CorrectionEvent` under a
+> longer name — its `event_type` is literally `"procedure_correction"`, the same
+> event `procedure_execution.md` §7.2 defines in the withdrawn unified event log,
+> and its `Vec<Deviation>` payload is the withdrawn `DeviationReport` inlined.
+> `Deviation`, `DeviationType`, `CorrectionType`, and `CorrectionPayload` go with
+> it. None of these types exist.
+>
+> **The current model** is `docs/design/annotation/living_corpus.md` §2 and
+> `docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` → "What Was
+> Removed and Why": **an annotation *is* an as-run record**, and **an event is an
+> annotation subtype** — a registered `protocol_id` with a payload schema, not a
+> Rust type. A redline is exactly that subtype, and it is the *worked example*
+> the current design leads with.
+>
+> **Ownership, which this document predates:**
+>
+> | Concern | Owner |
+> |---|---|
+> | The redline `protocol_id` and its payload schema | **Issue 17** step 2a |
+> | The record store and `(bid, content_version)` anchoring | **Issue 105** |
+> | Run identity (`run_id`), bracketing, nesting, folding | **Issue 109** |
+> | Promoting a redline into a source edit | **Issue 106** |
+> | The write-back path a promotion runs over | **Issue 107** |
+> | The execution loop that would detect a deviation | **Issue 18** — undesigned |
+>
+> **What stands**: §2 (the template-vs-reality gap), the deviation taxonomy, the
+> analysis questions in §3.3 and §6, the use cases in §7, the design principles
+> in §10, and the open questions in §11. These are requirements and vocabulary,
+> and the current model does not answer them — it relocates them. §5 (template
+> promotion) is now **Issue 106**'s and is retained here only as motivation.
 
 ## 1. Purpose
 
@@ -96,10 +130,35 @@ The redline system consists of three distinct responsibilities:
 
 ### 3.2 Deviation Recording
 
+> [!CAUTION]
+> **Every type in this block is withdrawn.** `ProcedureCorrectionEvent` is the
+> withdrawn `CorrectionEvent`; the inlined `Vec<Deviation>` is the withdrawn
+> `DeviationReport`. There is no separate execution event log to store them in —
+> the annotation store is the one log (**Issue 105**), and a correction is an
+> annotation carrying a registered `protocol_id` (**Issue 17** step 2a).
+>
+> The field-by-field mapping onto the current record:
+>
+> | Withdrawn field | Current |
+> |---|---|
+> | `event_id` | `Envelope.id` (an `EventId`) |
+> | `timestamp` | `Envelope.observed_at` |
+> | `source` ("always executor") | `Envelope.actor` — opaque; no human/machine distinction |
+> | `event_type` ("always procedure_correction") | `protocol_id` — the subtype selector |
+> | `payload.run_id` | `run_id`, from the `RunStart` bracket (**Issue 109**) |
+> | `payload.correction_type` / `deviations` / `executor_note` | payload fields of the redline protocol's schema |
+>
+> **The enums survive as vocabulary.** `CorrectionType` and `DeviationType`
+> enumerate the distinctions a redline payload schema must be able to express;
+> they are candidate payload values, not Rust types. Note that the record they
+> live on is immutable and never edited — a correction of a correction is a new
+> record citing the prior one via `caused_by`.
+
 **Storage**: Correction events in unified event log (see `procedure_execution.md`)
 
-**Schema**:
+**Schema** *(withdrawn — see the note above)*:
 ```rust
+// WITHDRAWN TYPES: none of the below exist. Retained as payload vocabulary.
 pub struct ProcedureCorrectionEvent {
     pub event_id: String,
     pub timestamp: String,
@@ -173,6 +232,13 @@ Does this match what you did?
 
 ### 4.2 Correction Workflow
 
+> [!CAUTION]
+> **"Updates the run record" is not an operation the current model has.** Records
+> are immutable and the store is append-only; a correction is a *new record
+> citing the prior one* via `caused_by`, and the corrected view is what the fold
+> produces (`living_corpus.md` §3–§4). The three options below are sound as
+> *user-facing choices*; the mechanics described under each are not.
+
 **Option 1: Confirm**
 - System records as-run as accurate
 - No further action needed
@@ -188,6 +254,13 @@ Does this match what you did?
 - Original procedure run marked as false positive
 
 ### 4.3 Correction Event Storage
+
+> The wire form of the withdrawn `ProcedureCorrectionEvent`. See §3.2's note for
+> the field-by-field mapping onto the annotation record. "The event log" is the
+> annotation store (**Issue 105**); there is no second one. `step_index` is
+> notable as an error the current model corrects: a step is referenced by its
+> **stable step BID**, never a positional index, so the reference survives
+> template revision (Issue 17 step 1).
 
 All confirmations and corrections are stored in event log:
 
@@ -214,6 +287,15 @@ All confirmations and corrections are stored in event log:
 ```
 
 ## 5. Template Promotion
+
+> [!NOTE]
+> **Now owned by Issue 106** (source write-back and redline promotion), over
+> **Issue 107**'s codec write-back path. Retained here as motivation and as the
+> source of the promotion criteria in §5.1. Two corrections to §5.2's mechanism:
+> promoting a redline **appends a record whose `caused_by` cites the redline**
+> rather than consuming it, and the redline itself is unmodified afterwards.
+> Whether promotion warrants its own registry entry distinct from the redline's
+> is an open question in Issue 106, not settled here.
 
 ### 5.1 When to Promote
 
@@ -282,6 +364,14 @@ note = "Simplified variant derived from as-run analysis"
 - Support rollback if needed
 
 ## 6. Deviation Analysis Queries
+
+> [!NOTE]
+> The `Deviation` and `ExecutorId` types in these signatures are withdrawn
+> (`ExecutorId` → `Envelope.actor`). The **questions** are the retained part, and
+> they are the requirement: whatever surface answers them must do so over the
+> annotation store. Whether that needs a bespoke Rust API or is expressible in
+> the existing query grammar (`query_model.md`) is undecided —
+> `procedure_execution.md` §8 raises the same question.
 
 ### 6.1 Frequency Analysis
 
@@ -372,6 +462,12 @@ fn executor_deviation_patterns(
 
 ## 8. Implementation Checklist
 
+> [!CAUTION]
+> **Do not implement this checklist.** "Correction event schema" and "deviation
+> storage in event log" describe withdrawn types and a store this document does
+> not own; "template promotion" and "lattice integration" are Issue 106's.
+> Retained as an inventory of concerns.
+
 For libraries implementing redline system:
 
 - [ ] Deviation detection algorithm
@@ -437,4 +533,12 @@ Applications can add:
 
 ---
 
-**Status**: This design defines core deviation tracking infrastructure. Predictive matching and learning algorithms are out of scope (product-specific extensions).
+**Status**: **Record types withdrawn; analysis and promotion concerns retained.**
+This document defined deviation tracking on the three-piece as-run model. A
+redline is now an annotation subtype — a registered `protocol_id` with a payload
+schema (**Issue 17** step 2a) — stored by **Issue 105**, bracketed and folded by
+**Issue 109**, and promoted into a source edit by **Issue 106** over **Issue
+107**'s write-back path. The detecting engine is undesigned (**Issue 18**). See
+`docs/design/annotation/living_corpus.md` §2 and
+`docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md`. Predictive matching
+and learning algorithms remain out of scope (product-specific extensions).

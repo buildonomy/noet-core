@@ -131,7 +131,7 @@ The responsive template (`assets/template-responsive.html`) loads `version-selec
 
 ### 5. Documentation (0.25 day)
 
-- [x] Document `versions.json` schema in `docs/design/network_authoring.md` §11
+- [x] Document `versions.json` schema in `docs/design/codecs/network_authoring.md` §11
 - [x] Document the expected directory layout for multi-version deployments
 - [x] Document the `v/` prefix contract
 - [x] Document `assemble-versions.sh` usage

@@ -66,7 +66,7 @@ Both produce a repo-root-relative child path paired with the subnet's bref as
 They must be fixed together — fixing only one creates a cross-layer mismatch
 worse than the current consistent-but-wrong state.
 
-See `docs/design/beliefbase_architecture.md` section 2.2.
+See `docs/design/core/beliefbase_architecture.md` section 2.2.
 
 ### Known Bug: Integration Test `global_bb` Mismatch
 

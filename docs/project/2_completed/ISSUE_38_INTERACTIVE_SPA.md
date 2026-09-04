@@ -8,7 +8,7 @@
 
 ---
 
-> **Note**: This is an **implementation planning document**. For architecture and design decisions, see [Interactive Viewer Design](../design/interactive_viewer.md). This issue tracks tasks, progress, and success criteria only.
+> **Note**: This is an **implementation planning document**. For architecture and design decisions, see [Interactive Viewer Design](../../design/presentation/interactive_viewer.md). This issue tracks tasks, progress, and success criteria only.
 
 ---
 
@@ -17,7 +17,7 @@
 **Deliverables**: Functional interactive HTML viewer with responsive layout, navigation tree, theme system, and WASM integration.
 
 ### Phase 0: Planning & Architecture ✅
-- Created comprehensive design document ([interactive_viewer.md](../design/interactive_viewer.md))
+- Created comprehensive design document ([interactive_viewer.md](../../design/presentation/interactive_viewer.md))
 - Removed layout system complexity (single responsive template)
 - Defined standard asset paths and progressive enhancement strategy
 - Established NodeContext structure for WASM bindings
@@ -130,7 +130,7 @@ This issue established the **foundation** for an interactive SPA viewer. All cor
 
 ## Architecture Reference
 
-**Complete documentation**: [Interactive Viewer Design](../design/interactive_viewer.md)
+**Complete documentation**: [Interactive Viewer Design](../../design/presentation/interactive_viewer.md)
 
 **Key Architectural Decisions Implemented**:
 - Single responsive template (no layout switching)
@@ -145,7 +145,7 @@ This issue established the **foundation** for an interactive SPA viewer. All cor
 ### Step 0: Planning & Cleanup ✅
 
 **Deliverables**:
-- [interactive_viewer.md](../design/interactive_viewer.md) design document (859 lines)
+- [interactive_viewer.md](../../design/presentation/interactive_viewer.md) design document (859 lines)
 - Removed layout system complexity (Single vs Responsive templates)
 - Standard paths defined (`assets/`, `beliefbase.json`)
 - NodeContext structure specified
@@ -420,9 +420,9 @@ Implemented hierarchical navigation tree generation from flat paths data.
 - `pkg/noet_core.js` + `pkg/noet_core_bg.wasm` regenerated ✅
 - Browser tests added (Test 9: Namespaces, Test 10: NodeContext) ✅
 - Documentation updated:
-  - `docs/design/architecture.md` - Added § 10 (System Network Namespaces) ✅
-  - `docs/design/beliefbase_architecture.md` - Expanded § 2.7 ✅
-  - `docs/design/interactive_viewer.md` - Added cross-references ✅
+  - `docs/design/core/architecture.md` - Added § 10 (System Network Namespaces) ✅
+  - `docs/design/core/beliefbase_architecture.md` - Expanded § 2.7 ✅
+  - `docs/design/presentation/interactive_viewer.md` - Added cross-references ✅
 
 **Time Spent**: ~2 hours (Session 4, 2026-02-04)
 
@@ -626,12 +626,12 @@ All success criteria achieved:
 
 ## References
 
-- **[Interactive Viewer Design](../design/interactive_viewer.md)** - Complete architecture (859 lines)
+- **[Interactive Viewer Design](../../design/presentation/interactive_viewer.md)** - Complete architecture (859 lines)
 - **[ISSUE_39: Advanced Interactive Features](ISSUE_39_ADVANCED_INTERACTIVE.md)** - Continuation work
-- [ISSUE_06: HTML Generation](completed/ISSUE_06_HTML_GENERATION.md) - WASM infrastructure (complete)
-- [BeliefBase Architecture](../design/beliefbase_architecture.md) - Data model
-- [Link Format Design](../design/link_format.md) - BID attribution
-- [Architecture Overview](../design/architecture.md) - System namespaces
+- [ISSUE_06: HTML Generation](ISSUE_06_HTML_GENERATION.md) - WASM infrastructure (complete)
+- [BeliefBase Architecture](../../design/core/beliefbase_architecture.md) - Data model
+- [Link Format Design](../../design/identity/link_format.md) - BID attribution
+- [Architecture Overview](../../design/core/architecture.md) - System namespaces
 
 ---
 

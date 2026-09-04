@@ -693,7 +693,7 @@ edges and verify the path matches a registered node.
 
 The SQL-native `DbConnection::evaluate` pipeline (Issue 83 Phase 6b)
 issues one SQL query per traversal hop. Several optimizations can
-reduce the query count. See `docs/design/beliefbase_architecture.md`
+reduce the query count. See `docs/design/core/beliefbase_architecture.md`
 §3.8 "Optimization Opportunities" for full details and example SQL.
 
 **Priority: LOW** — correctness is established; optimize when profiling

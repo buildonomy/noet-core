@@ -949,7 +949,7 @@ this register. Worth its own entry.
 
 ### Architecture
 
-Per `docs/design/beliefbase_architecture.md` §3.1, Phase 5
+Per `docs/design/core/beliefbase_architecture.md` §3.1, Phase 5
 (`terminate_stack`) does, per document:
 
 ```
@@ -1132,7 +1132,7 @@ occurs. Measured shift was exactly zero.
   2026-08-21 entry holds the const-namespace profiling detail.
 - `noet-core/benches/log_analysis/README.md` — which `RUST_LOG` targets each
   analysis tool needs, and the ANSI-grep trap.
-- `noet-core/docs/design/beliefbase_architecture.md` §3.1 ("Phase 5 —
+- `noet-core/docs/design/core/beliefbase_architecture.md` §3.1 ("Phase 5 —
   `terminate_stack`") and §3.2 ("Two-Cache Architecture").
 - `noet-core/docs/project/BACKLOG.md` — const-namespace nesting (deferred; once
   the leading candidate fix for Bottleneck 7's per-task clone cost, until

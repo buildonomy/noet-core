@@ -5,7 +5,7 @@
 **Dependencies**: Informed by [wp-model-ontology] §5-9 (projections,
 geometry, E/F/M, credibility assessment), Issue 91 (content classifier),
 Issue 85 (graph mode / 3D viewer), and the collaboration overlay design
-(`docs/design/collaboration_overlay.md` — provides the identity/role
+(`docs/design/annotation/collaboration_overlay.md` — provides the identity/role
 layer that parameterizes inference per user).
 
 **Origin**: migrated from planning Issue 17. The inference algorithm,
@@ -160,7 +160,7 @@ role cares about. The collaboration overlay’s credential model
 (§4a) already defines peer-derived credentials; the inference
 algorithm can consume these as role selectors.
 
-The existing procedure system (`docs/design/procedure_schema.md`,
+The existing procedure system (`docs/design/procedures/procedure_schema.md`,
 `procedure_execution.md`, `redline_system.md`) is the early
 incarnation of this. Its three-layer architecture maps directly
 to EMO primitives: Intention = N (what should happen), Execution
@@ -207,7 +207,7 @@ The inference engine assesses credibility texture and surprise state,
 but the compiled belief network does not currently represent R or
 surprise. These are a separate graph layer — federated attestation
 shards that connect into the belief network as "halo" connections
-via the attestation fabric (`docs/design/attestation_fabric.md`).
+via the attestation fabric (`docs/design/annotation/attestation_fabric.md`).
 
 The belief network is the observed model (compiled from sources of
 truth, not directly manipulated). The R/surprise layer is the dynamic
@@ -322,7 +322,7 @@ validated.
   classifier code is unchanged.
 - **Issue 85** (3D credibility viewer): the credibility surface is
   the rendering mode this issue adds to the viewer
-- **Collaboration overlay** (`docs/design/collaboration_overlay.md`):
+- **Collaboration overlay** (`docs/design/annotation/collaboration_overlay.md`):
   provides the identity/role layer that parameterizes inference per
   user. Attestation records are R with P-identity (who produced this
   observation). Credentials are role selectors for the inference

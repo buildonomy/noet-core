@@ -48,13 +48,13 @@ to the pre-extraction workspace layout and don't exist in the now-standalone
 not itself an error, but a reader following those paths today should instead
 look at:
 
-- `docs/design/architecture.md` (not `docs/architecture.md` — the design docs
+- `docs/design/core/architecture.md` (not `docs/architecture.md` — the design docs
   were consolidated under `docs/design/` at some point after this issue closed)
 - `docs/README.md` — current documentation map and hierarchy
 - `docs/project/DOCUMENTATION_STRATEGY.md` — still exists and still describes
   the same hierarchy, though the concrete file `docs/architecture.md` it
   references (§"`docs/architecture.md`: High-Level Architecture") has since
-  moved to `docs/design/architecture.md`.
+  moved to `docs/design/core/architecture.md`.
 
 The `beliefbase_architecture.md` version claim ("version updated to 0.2") is a
 point-in-time note from the original migration and is not a currently-accurate
@@ -135,13 +135,13 @@ docs/
 ### Stage 1: Soft Open Source (1-2 days)
 
 0. **Migrate Core Design Document** (0.5 days) ⭐ REQUIRED FOR SOFT OPEN SOURCE ✅ COMPLETE
-   - [x] Copy `docs/design/beliefbase_architecture.md` to `rust_core/crates/core/docs/design/`
+   - [x] Copy `docs/design/core/beliefbase_architecture.md` to `rust_core/crates/core/docs/design/`
    - [x] **Remove all LatticeService references** (Section 3.5, lines 550-679) - this is product-specific orchestration
    - [x] Remove "Relationship to Intention Lattice" section (lines 681-708) - product-specific
    - [x] Verify `cargo doc` passes and cross-references resolve
    - [x] Ensure no external references - doc must be self-contained for standalone repo
 
-**Result**: Created `rust_core/crates/core/docs/design/beliefbase_architecture.md` (747 lines) with product sections removed, version updated to 0.2, library-focused terminology
+**Result**: Created `rust_core/crates/core/docs/design/core/beliefbase_architecture.md` (747 lines) with product sections removed, version updated to 0.2, library-focused terminology
 
 0b. **Clean Cargo.toml Dependencies** (0.25 days) ⭐ REQUIRED FOR SOFT OPEN SOURCE ✅ COMPLETE
    - [x] Audit `rust_core/crates/core/Cargo.toml` dependencies
@@ -334,7 +334,7 @@ docs/
 - **Roadmap Context**: [`ROADMAP_NOET-CORE_v0.1.md`](./ROADMAP_NOET-CORE_v0.1.md) - overall open source preparation plan
 - **Future Work**: [`ROADMAP_HTML_RENDERING.md`](./ROADMAP_HTML_RENDERING.md) - will be part of extracted repo
 - **Primary Source**: `src/lib.rs` - extensive rustdoc with overview, prior art comparison, multi-pass compilation
-- **Migrate**: `docs/design/beliefbase_architecture.md` → `rust_core/crates/core/docs/design/beliefbase_architecture.md`
+- **Migrate**: `docs/design/core/beliefbase_architecture.md` → `rust_core/crates/core/docs/design/core/beliefbase_architecture.md`
   - Remove Section 3.5 "LatticeService" (lines 550-679) - product-specific
   - Remove Section 4 "Relationship to Intention Lattice" (lines 681-708) - product-specific
 - **Extract from**: 
@@ -355,7 +355,7 @@ docs/
 **Repository**: https://gitlab.com/buildonomy/noet-core
 
 **Files Created**:
-- `docs/design/beliefbase_architecture.md` (747 lines)
+- `docs/design/core/beliefbase_architecture.md` (747 lines)
 - `docs/architecture.md` (275 lines)
 - `docs/project/DOCUMENTATION_STRATEGY.md` (320 lines)
 

@@ -7,7 +7,7 @@
 //!   into the binary via `include_str!`. Annotated `audience: ["assistant"]` and
 //!   `priority: 0.9` so host clients auto-inject it as system context.
 //!
-//! - **`noet://help/{name}`** — serves any `docs/design/*.md` file from the
+//! - **`noet://help/{name}`** — serves any `docs/design/**/*.md` file from the
 //!   `noet-core` source tree, compiled into the binary via `include_dir!`. Lets an
 //!   agent fetch the authoritative design docs on demand without filesystem access.
 //!
@@ -15,12 +15,16 @@
 //!
 //! ```text
 //! noet://help/orientation              → orientation.md (always available)
-//! noet://help/beliefbase_architecture  → docs/design/beliefbase_architecture.md
-//! noet://help/search_and_sharding      → docs/design/search_and_sharding.md
-//! noet://help/{name}                   → docs/design/{name}.md
+//! noet://help/beliefbase_architecture  → docs/design/core/beliefbase_architecture.md
+//! noet://help/search_and_sharding      → docs/design/core/search_and_sharding.md
+//! noet://help/{name}                   → docs/design/<subdir>/{name}.md
 //! ```
 //!
-//! The `name` component strips the `.md` extension and uses the bare filename stem.
+//! The `name` component is the bare filename stem, without the `.md` extension
+//! and without the subdirectory. Design docs are grouped into topic
+//! subdirectories (`core/`, `identity/`, `annotation/`, `procedures/`,
+//! `codecs/`, `presentation/`), but the URI scheme is deliberately flat: stems
+//! are unique across the tree, so callers need not know the grouping.
 //!
 //! ## TOML frontmatter stripping
 //!
@@ -28,7 +32,7 @@
 //! stripped before serving so agents receive clean Markdown without the metadata
 //! noise. The orientation doc has no frontmatter and is served verbatim.
 
-use include_dir::{include_dir, Dir};
+use include_dir::{include_dir, Dir, File};
 use rmcp::{
     model::{
         Annotated, Annotations, RawResource, RawResourceTemplate, Resource, ResourceContents,
@@ -39,9 +43,12 @@ use rmcp::{
 
 /// All `docs/design/` Markdown files compiled into the binary at build time.
 ///
-/// Paths within this `Dir` are relative to the `noet-core` source root, so a
-/// file at `docs/design/beliefbase_architecture.md` is accessible via
-/// `DESIGN_DOCS.get_file("docs/design/beliefbase_architecture.md")`.
+/// Paths within this `Dir` are relative to `docs/design`, and design docs live
+/// one level down in topic subdirectories, so a file at
+/// `docs/design/core/beliefbase_architecture.md` is accessible via
+/// `DESIGN_DOCS.get_file("core/beliefbase_architecture.md")`. Use
+/// [`design_doc_files`] rather than `DESIGN_DOCS.files()`, which lists only the
+/// top level and would therefore see no design docs at all.
 static DESIGN_DOCS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/docs/design");
 
 /// The LLM-targeted orientation document, compiled into the binary.
@@ -53,27 +60,47 @@ const ORIENTATION_URI: &str = "noet://help/orientation";
 /// URI template for design doc resources.
 const DESIGN_DOC_URI_TEMPLATE: &str = "noet://help/{name}";
 
+/// Every compiled design doc, including those nested in topic subdirectories.
+///
+/// `Dir::files()` is not recursive; design docs are grouped one level down
+/// (`core/`, `identity/`, ...), so recursing is required to see them.
+fn design_doc_files() -> impl Iterator<Item = &'static File<'static>> {
+    fn walk(dir: &'static Dir<'static>) -> Box<dyn Iterator<Item = &'static File<'static>>> {
+        Box::new(dir.files().chain(dir.dirs().flat_map(walk)))
+    }
+    walk(&DESIGN_DOCS).filter(|f| f.path().extension().is_some_and(|e| e == "md"))
+}
+
+/// Resolve a design doc by its bare filename stem, searching all subdirectories.
+///
+/// The `noet://help/{name}` URI scheme is flat while the files are grouped, so
+/// the stem must be matched against each compiled path rather than used
+/// directly as a lookup key.
+fn find_design_doc(stem: &str) -> Option<&'static File<'static>> {
+    design_doc_files().find(|f| f.path().file_stem().is_some_and(|s| s == stem))
+}
+
 // ── Resource listing ──────────────────────────────────────────────────────────
 
 /// Return all resources available from this MCP server.
 ///
 /// Called in response to a `resources/list` request. Returns:
 /// 1. The static orientation resource.
-/// 2. One entry per `docs/design/*.md` file compiled into the binary.
+/// 2. One entry per `docs/design/**/*.md` file compiled into the binary.
 pub fn list_resources() -> Vec<Resource> {
     let mut resources = Vec::new();
 
     // Orientation resource — always first so clients encounter it immediately.
     resources.push(orientation_resource_entry());
 
-    // One entry per compiled design doc.
-    for file in DESIGN_DOCS.files() {
+    // One entry per compiled design doc, across all topic subdirectories.
+    for file in design_doc_files() {
         let path = file.path();
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
         let uri = format!("noet://help/{}", stem);
-        let name = format!("docs/design/{}.md", stem);
+        let name = format!("docs/design/{}", path.display());
         let description = format!("noet design document: {}", stem.replace('_', " "));
         resources.push(Annotated::new(
             RawResource::new(uri, name)
@@ -146,17 +173,19 @@ fn read_orientation() -> Result<ResourceContents, McpError> {
 /// Strips TOML frontmatter (the `---`-delimited block at the top of the file)
 /// before returning the content.
 fn read_design_doc(name: &str) -> Result<ResourceContents, McpError> {
-    let filename = format!("{}.md", name);
-    let Some(file) = DESIGN_DOCS.get_file(&filename) else {
+    let Some(file) = find_design_doc(name) else {
         return Err(McpError::invalid_params(
-            format!("Design doc not found: docs/design/{filename}"),
+            format!("Design doc not found: {name}.md"),
             None,
         ));
     };
 
     let raw = file.contents_utf8().ok_or_else(|| {
         McpError::internal_error(
-            format!("Design doc is not valid UTF-8: docs/design/{filename}"),
+            format!(
+                "Design doc is not valid UTF-8: docs/design/{}",
+                file.path().display()
+            ),
             None,
         )
     })?;
@@ -310,5 +339,30 @@ mod tests {
     fn test_read_unknown_uri_returns_error() {
         let result = read_resource("noet://help/nonexistent_doc_xyz");
         assert!(result.is_err());
+    }
+
+    /// Design docs live in topic subdirectories under `docs/design`. `Dir::files()`
+    /// is not recursive, so a non-recursive walk silently lists zero design docs.
+    #[test]
+    fn test_list_resources_includes_nested_design_docs() {
+        let resources = list_resources();
+        let design_docs = resources.len() - 1; // minus the orientation entry
+        assert!(
+            design_docs >= 20,
+            "expected design docs from nested subdirs to be listed, got {design_docs}"
+        );
+    }
+
+    /// A doc nested in `core/` must be reachable by its bare stem.
+    #[test]
+    fn test_read_nested_design_doc_by_stem() {
+        let result = read_resource("noet://help/beliefbase_architecture")
+            .expect("nested design doc should resolve by bare stem");
+        match result {
+            ResourceContents::TextResourceContents { text, .. } => {
+                assert!(!text.is_empty());
+            }
+            _ => panic!("expected text resource"),
+        }
     }
 }

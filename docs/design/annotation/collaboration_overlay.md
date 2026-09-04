@@ -9,9 +9,21 @@ dependencies = ["federated_belief_network.md (v0.1)", "search_and_sharding.md"]
 
 # Collaboration Overlay: Attested Annotation Layer for Static Noet Sites
 
-> **Draft** — Open questions ❓1–❓3 are resolved. New open questions ❓4–❓6
-> are non-blocking for Phase 1 implementation. See §10 for the full resolution
-> table. The credential model (§4a) is new material added during the Draft pass.
+> [!IMPORTANT]
+> **Design sketch, owned by Issue 65. Read §1–§3 only.**
+>
+> **§3.4, §5, §6, and §§9–10 are stale** — they describe `asset_version` as the
+> anchor and the server as the system of record. Neither holds: the anchor is a
+> per-node `sha256` content hash (`identity/content_versioning.md`), and the
+> server is a **sync peer** for Issue 105's local sidecar store, not the system
+> of record. Where they conflict with §3.2, §3.2 governs.
+>
+> **Where this is headed**: the general sidecar-propagation design — how an
+> overlay is maintained, scoped, and propagated between stores and peers — with
+> `federated_belief_network.md` as its use case rather than its sibling. The
+> propagation mechanism lives in that document's §1.2 (scoped queues and
+> percolation) and the composition rule in `overlay_model.md`; cross-reference
+> both rather than restating them. Nothing below has been restructured for this.
 
 ---
 
@@ -59,11 +71,11 @@ Layer 3: Human Attestations  ← THIS DOCUMENT
 Layer 2: Belief Graph
   Parsed nodes, edges, paths, compiled shards
   Single-owner-per-node, pull-replicated
-  "What does the graph contain?"
+  "How does the content relate?"
 
 Layer 1: Source Files
   Filesystem, WatchService, DocumentCompiler
-  "What do the files say?"
+  "What content is in the data?"
 ```
 
 The collaboration peer lives at Layer 3 and reads Layer 2 identifiers
@@ -83,44 +95,44 @@ An **attestation** is a statement about a specific version of a specific node.
 | General field | noet-specific value |
 | ------------- | ------------------- |
 | `path` | `site_url + "/" + bid` |
-| `version` | `asset_version` (FNV-1a hash of the compiled beliefbase) |
+| `version` | `sha256` content hash of the node's non-metadata content |
 
-The three noet-specific fields that compose the anchor are:
+The noet-specific fields that compose the anchor are:
 
 - **`bid`** — the `Bid` of the target node (stable across renames, moves,
   and re-renders; embedded in the DOM by the existing viewer)
-- **`asset_version`** — the FNV-1a hash of the compiled beliefbase content,
-  already embedded in every page via `<script id="noet-asset-version">`;
-  changes whenever any content in the beliefbase changes
+- **`version`** — a scoped content hash of the target node. **Defined by
+  [`content_versioning.md`](../identity/content_versioning.md)**, which is authoritative;
+  it is not restated here. What matters to this document: `version` changes when
+  the annotated scope changes and not otherwise, and which scope a record anchors
+  to is selected by its `protocol_id`.
 - **`site_url`** — the canonical base URL of the deployed site (from
   `<script id="noet-base-url">`), disambiguating between multiple deployments
   of the same source
 
-Together, `(site_url, asset_version, bid)` is the noet-specific instantiation
+Together, `(site_url, bid, version)` is the noet-specific instantiation
 of the general `(path, version)` anchor. The collaboration server stores `path`
-and `version` internally; the three-field decomposition is a convenience for
+and `version` internally; the decomposition is a convenience for
 the client and for human readability. See `attestation_fabric.md` §4.1 for the
 full anchor schema and §5 for the path+version history and predecessor chain
 model.
 
-### 3.2. Why `asset_version` Is the Right Fingerprint
+### 3.2. Consequences for This Overlay
 
-The `asset_version` token is already computed by the noet-core compiler and
-embedded in every rendered page. It covers the full serialized beliefbase
-content — all shards, all networks — so it changes whenever any node in the
-graph changes. This is intentionally coarse:
+> Earlier revisions argued at length that `asset_version` — an FNV-1a hash over
+> the *entire* compiled beliefbase — was the right fingerprint. That is rejected;
+> `content_versioning.md` §2 records why. Only the consequences for the overlay
+> are kept here.
 
-- A typo fix anywhere invalidates sign-offs everywhere. In a QMS context this
-  is correct behavior: cross-network references mean a change anywhere could
-  affect the interpretation of anything. Re-approval prompts are the right
-  default.
-- For large multi-network sites where per-network versioning is needed, the
-  shard manifest already carries per-network metadata. A `network_content_hash`
-  field could be added to the manifest later without changing the attestation
-  schema.
+Three properties follow from the anchor being a per-node scoped hash:
 
-The collaboration server does **not** need to understand noet's shard format.
-It treats `asset_version` as an opaque string.
+- **The client needs per-node hashes in the DOM.** With a global
+  `asset_version` the value was already on every page. Now the viewer must emit
+  the target node's hash alongside `data-bid`; Issue 65 carries the task.
+- **`asset_version` is retained as an informational field** — which build the
+  attester was viewing — but is never the anchor.
+- **The server still treats `version` as an opaque string.** It does not need to
+  understand noet's shard format, or which scope a hash covers.
 
 ### 3.3. Attestation Kinds
 
@@ -153,7 +165,7 @@ AttestationEvent {
     site_url:      String,        // e.g. "https://docs.example.com"
     asset_version: String,        // e.g. "3a9f1b2c" (FNV-1a hex)
     bid:           String,        // target node BID (UUID string)
-    // Stored internally as: path = site_url + "/" + bid, version = asset_version
+    // Stored internally as: path = site_url + "/" + bid, version = node content hash
 
     // Content
     kind:          AttestationKind,  // Comment | SignOff | Flag
@@ -375,7 +387,7 @@ DELETE /credentials/<credential_id>
 │  Collaboration server  (separate service / repo)                │
 │  - Authenticates requests (JWT / Keyhive)                       │
 │  - Stores AttestationEvents (SQLite or Automerge)               │
-│  - Serves overlay data keyed on (site_url, asset_version, bid)  │
+│  - Serves overlay data keyed on (site_url, bid, version)        │
 │  - No knowledge of noet shard format                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -508,7 +520,18 @@ execution. The collaboration overlay's `Flag` and `Comment` kinds are
 complementary: a flag on a procedure node ("this step is consistently
 skipped") is a precursor to a formal redline. The attestation schema is
 intentionally designed to accommodate redline payloads in Phase 2 without
-schema changes — only a new `AttestationKind::Redline` variant is needed.
+schema changes.
+
+> [!NOTE]
+> **Two corrections.** `redline_system.md`'s record types are withdrawn (it
+> carries a banner); a redline is now an **annotation subtype** — a registered
+> `protocol_id` with a payload schema, owned by **Issue 17** step 2a, with
+> promotion into a source edit owned by **Issue 106**. Consequently **no
+> `AttestationKind::Redline` variant is needed** — that is the enum-variant
+> approach the current model explicitly rejects. The overlay's forward
+> compatibility is better than this section claimed: a new kind is a registry
+> entry, not a code change (`attestation_fabric.md` §6;
+> `beliefbase_architecture.md` §4.3).
 
 ### 7.3. noet-core impact
 

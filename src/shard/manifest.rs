@@ -7,7 +7,7 @@
 //!
 //! ## References
 //!
-//! - `docs/design/search_and_sharding.md` §4 — Manifest format specification
+//! - `docs/design/core/search_and_sharding.md` §4 — Manifest format specification
 
 use crate::properties::{Bid, Bref};
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub struct GlobalShardMeta {
 /// Only present in sharded mode (total export >= threshold). The viewer reads
 /// this to populate the network selector UI and locate per-network shard files.
 ///
-/// See `docs/design/search_and_sharding.md` §4.1 for the JSON schema.
+/// See `docs/design/core/search_and_sharding.md` §4.1 for the JSON schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardManifest {
     /// Format version for forward compatibility.
@@ -155,7 +155,7 @@ pub struct NetworkSearchMeta {
 /// The viewer fetches this first, then loads all `.idx.msgpack` files listed here,
 /// enabling full-corpus search before any data shard is loaded.
 ///
-/// See `docs/design/search_and_sharding.md` §4.1 for the JSON schema.
+/// See `docs/design/core/search_and_sharding.md` §4.1 for the JSON schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchManifest {
     /// Format version.
@@ -188,7 +188,7 @@ impl Default for SearchManifest {
 /// (e.g. `.yaml`, `.h`) — extensions not known to the compile-time
 /// `BUILTIN_EXTENSIONS` constant.
 ///
-/// See `docs/design/beliefbase_architecture.md` §3.2 — WASM note.
+/// See `docs/design/core/beliefbase_architecture.md` §3.2 — WASM note.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodecManifest {
     /// Format version for forward compatibility.

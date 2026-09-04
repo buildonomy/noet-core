@@ -228,7 +228,7 @@ The `query` tool accepts a textual query string. Common patterns:
 { "query_string": "KEYS(id:a,id:b) composed_of(*) FOLD(UNION)" }
 ```
 
-See `docs/design/query_model.md` §9.5 for the full grammar reference.
+See `docs/design/core/query_model.md` §9.5 for the full grammar reference.
 
 ### BID ↔ Bref Translation
 

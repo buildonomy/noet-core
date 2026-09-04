@@ -2,7 +2,7 @@
 
 **Priority**: MEDIUM  
 **Estimated Effort**: 5-7 days  
-**Dependencies**: ISSUE_10 (WatchService), ISSUE_11 (LSP/IPC foundation)  
+**Dependencies**: ISSUE_10 (WatchService) — satisfied, completed; ISSUE_11 (LSP/IPC foundation)  
 **Context**: Part of v0.2.0+ roadmap - Advanced real-time collaboration features
 
 ## Summary
@@ -56,6 +56,26 @@ Reuse existing `Query`/`PaginatedQuery` infrastructure from `src/query.rs`:
   - Does this event modify paths matching the subscription?
 
 ### Subscription Management
+
+> [!IMPORTANT]
+> **A subscription may be an annotation subtype, not a bespoke registry.**
+>
+> `EventSubscription { id, query, tx }` below is a per-consumer,
+> in-memory-scoped, mutable-by-its-owner filter over the graph. That is the
+> shape of an annotation whose anchor is a *query* rather than a node — the
+> `(QuerySpec, tape_hash)` form in `docs/design/identity/content_versioning.md`
+> §4.
+>
+> If that holds, this issue is defining the **cursor/focus annotation**, and
+> "every PII surface has a focus filter it fully owns" becomes a structural
+> property of the layer model (`docs/design/annotation/overlay_model.md` §5)
+> rather than a convention. It would also mean subscriptions get scope,
+> provenance, and persistence for free instead of needing their own mechanisms.
+>
+> **Not decided.** Issue 104 owns the annotation field set and lists this in its
+> primitive census; settle it there before building a second registry. The risk
+> of getting it wrong is a parallel storage model for something the annotation
+> store already handles.
 
 **New Types** (in `src/watch.rs` or new `src/subscription.rs`):
 
@@ -293,7 +313,8 @@ impl WatchService {
 
 4. **How to handle subscription authorization (who can subscribe to what)?**
    - **Deferred**: No auth in v0.2.0; assume trusted clients
-   - Future: Add permission model (ISSUE_16?)
+   - Future: permission model — inherited by the async-overlay successor to
+     Issue 110 (see closed Issue 16 for the capability model worked out there)
 
 5. **Should subscriptions auto-refresh when query definition changes?**
    - **Leaning No**: Client must explicitly update subscription
@@ -328,7 +349,7 @@ impl WatchService {
 ## References
 
 - **Depends On**: 
-  - [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - WatchService foundation
+  - [`ISSUE_10_DAEMON_TESTING.md`](../2_completed/ISSUE_10_DAEMON_TESTING.md) - WatchService foundation
   - [`ISSUE_11_BASIC_LSP.md`](./ISSUE_11_BASIC_LSP.md) - LSP protocol and IPC
 - **Related**:
   - `src/query.rs` - Query types and evaluation
@@ -336,7 +357,11 @@ impl WatchService {
   - `src/watch.rs` - WatchService orchestration
 - **Roadmap Context**: v0.2.0+ feature for real-time collaboration
 - **Future Work**:
-  - ISSUE_16 (Future): Authorization and permission model for subscriptions
+  - Authorization and permission model for subscriptions: owned by the
+    async-overlay successor to Issue 110. Closed Issue 16
+    (`2_completed/ISSUE_16_AUTOMERGE_INTEGRATION.md`) holds the capability model
+    — actions, scopes, constraints — and the insight that a focus is a permission
+    boundary, not only a query scope
   - ISSUE_17 (Future): Websocket transport for web clients
   - Operational transform / CRDT for conflict-free editing
 

@@ -154,8 +154,8 @@ This is a pre-release version for early feedback. The API is not yet stable and 
 
 ### Documentation
 - Comprehensive README with usage examples
-- Architecture overview in `docs/architecture.md`
-- Detailed specification in `docs/design/beliefbase_architecture.md`
+- Architecture overview in `docs/design/core/architecture.md`
+- Detailed specification in `docs/design/core/beliefbase_architecture.md`
 - API documentation with examples
 - Contributing guidelines
 - Basic usage example

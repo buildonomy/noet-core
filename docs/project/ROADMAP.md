@@ -16,7 +16,7 @@ automatically managing cross-document references and propagating changes.
 The output is an interactive HTML viewer for navigating, searching, and inspecting the
 document graph in the browser, plus an MCP server for AI-agent-driven graph queries.
 
-See [Documentation as a Dependency Graph](../design/dag_model.md) for the conceptual
+See [Documentation as a Dependency Graph](../design/core/dag_model.md) for the conceptual
 introduction.
 
 ## Strategic Direction
@@ -168,11 +168,11 @@ human attestation.
 The query model and DAG model documents define the architectural direction for the
 query system and the conceptual framework. Implementation will follow these specs:
 
-- **[DAG Model](../design/dag_model.md)** — Conceptual introduction to the multigraph
+- **[DAG Model](../design/core/dag_model.md)** — Conceptual introduction to the multigraph
   model: nodes, three edge types, the video camera query metaphor
-- **[Query Model](../design/query_model.md)** — Formal query algebra: subject,
+- **[Query Model](../design/core/query_model.md)** — Formal query algebra: subject,
   projection, instrument, score semiring, textual syntax
-- **[BeliefBase Architecture](../design/beliefbase_architecture.md)** — Core data model,
+- **[BeliefBase Architecture](../design/core/beliefbase_architecture.md)** — Core data model,
   compilation pipeline, identity management
 - **[MCP Server](../mcp.md)** — Agent-facing query interface documentation
 

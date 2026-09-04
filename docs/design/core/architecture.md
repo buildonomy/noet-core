@@ -94,7 +94,7 @@ The path stays human-readable and portable. The Bref ensures the link survives f
 
 Supported input formats include standard markdown links, WikiLinks (`[[Document Name]]`), same-document anchors, and explicit Bref references.
 
-For the full link resolution algorithm, see [`link_format.md`](./link_format.md).
+For the full link resolution algorithm, see [`link_format.md`](../identity/link_format.md).
 
 ### Relationship Types (WeightKind)
 
@@ -170,13 +170,40 @@ noet-core supports multiple document formats through a pluggable codec system. T
 
 For structured data formats that require context from an owning network codec, a two-registry dispatch system (`WALK_CODECS` + `CLAIM_MAP`) controls which codec handles which file. This is a non-obvious subsystem — see [`beliefbase_architecture.md` § 3.2](./beliefbase_architecture.md#32-the-codec-system-three-sources-of-truth) before implementing new codecs.
 
-noet also extends Markdown with MyST backtick-fence block directives (e.g., `{network_children}`, `{requirements_table}`) that are resolved during the compiler's deferred pass. See [`myst_directive_architecture.md`](./myst_directive_architecture.md) for the directive pipeline.
+noet also extends Markdown with MyST backtick-fence block directives (e.g., `{network_children}`, `{requirements_table}`) that are resolved during the compiler's deferred pass. See [`myst_directive_architecture.md`](../codecs/myst_directive_architecture.md) for the directive pipeline.
 
 ### Sharding and Search
 
 For large repositories, the export pipeline automatically splits the BeliefBase into per-network MessagePack shards so browser viewers can load data on demand. Compile-time search indices (TF-IDF with English stemming) are always generated per-network, enabling full-corpus search before any data shard is fetched.
 
 See [`search_and_sharding.md`](./search_and_sharding.md) for the full specification.
+
+## Beyond Compilation: The Living Corpus
+
+Everything above describes the compile path — source files in, queryable graph
+out. That is one half of the system.
+
+A compiled corpus answers questions but records nothing about the asking. The
+other half concerns what accumulates *on top of* a compiled graph: comments,
+todos, review sign-offs, proposed changes. These are assertions about content
+rather than content itself, so they live in a third layer with its own store and
+lifecycle:
+
+```
+Layer 3: Annotation     "What have people asserted about the content?"
+Layer 2: Belief Graph   "How does the content relate?"
+Layer 1: Source         "What content is in the data?"
+```
+
+The `Event` enum carries both kinds: `Event::Belief` is a graph *mutation*,
+`Event::Annotation` an *assertion*. Assertions project into mutations — never the
+reverse — so annotations become queryable alongside content without the compiler
+ever treating them as source.
+
+See [`living_corpus.md`](../annotation/living_corpus.md) for the layer model, the PII surfaces
+(viewer, LSP, MCP, CLI) that consume it, and the annotate → promote loop that
+returns a proposed change to source. Much of Layer 3 is designed but not yet
+built; that document's §9 maps each element to its implementation or its issue.
 
 ## Relationship to Prior Art
 

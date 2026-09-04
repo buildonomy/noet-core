@@ -33,7 +33,7 @@
  *
  * ## References
  *
- * - docs/design/search_and_sharding.md §7 — Search index format and query model
+ * - docs/design/core/search_and_sharding.md §7 — Search index format and query model
  * - src/shard/search.rs — Compile-time index builder (tokenizer, stemmer, weights)
  * - assets/viewer/shard-manager.js — search index loading (msgpack → WASM)
  * - assets/viewer/wasm.js — WASM init and beliefbase construction

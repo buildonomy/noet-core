@@ -35,8 +35,8 @@
 //! - **[`paths`]**: Relative path resolution across nested networks
 //!
 //! For detailed architecture documentation, see:
-//! - High-level overview: `docs/architecture.md`
-//! - Technical specification: `docs/design/beliefbase_architecture.md`
+//! - High-level overview: `docs/design/core/architecture.md`
+//! - Technical specification: `docs/design/core/beliefbase_architecture.md`
 //!
 //! ## Quick Start
 //!
@@ -141,7 +141,7 @@
 //! 2. **Resolution Passes**: Reparse files with resolved dependencies, inject BIDs
 //! 3. **Convergence**: Iterate until all resolvable references are linked
 //!
-//! See `docs/design/beliefbase_architecture.md` for detailed algorithm specification.
+//! See `docs/design/core/beliefbase_architecture.md` for detailed algorithm specification.
 //!
 //! ### BID System
 //!
@@ -172,8 +172,9 @@
 //! through relative paths. WikiLinks, standard markdown links, and same-document anchors are
 //! all automatically transformed to this format during parsing.
 //!
-//! See `docs/architecture.md` § 5 for conceptual overview and `docs/design/link_format.md`
-//! for complete specification.
+//! See `docs/design/core/architecture.md` ("Link Format: Readable + Resilient") for a
+//! conceptual overview and `docs/design/identity/link_format.md` for the complete
+//! specification.
 //!
 //! ### Multigraph Structure
 //!
@@ -214,7 +215,7 @@
 //!
 //! **Unique combination**: Compiler techniques + knowledge management + multigraph structures in a single library.
 //!
-//! See `docs/architecture.md` for detailed comparisons.
+//! See `docs/design/core/architecture.md` for detailed comparisons.
 //!
 //! ## Features
 //!
@@ -224,8 +225,8 @@
 //!
 //! ## Documentation
 //!
-//! - **Getting started**: `docs/architecture.md` (high-level concepts)
-//! - **Technical spec**: `docs/design/beliefbase_architecture.md` (detailed architecture)
+//! - **Getting started**: `docs/design/core/architecture.md` (high-level concepts)
+//! - **Technical spec**: `docs/design/core/beliefbase_architecture.md` (detailed architecture)
 //! - **API reference**: Module-level docs (run `cargo doc --open`)
 //! - **Examples**: See `examples/` directory
 //!

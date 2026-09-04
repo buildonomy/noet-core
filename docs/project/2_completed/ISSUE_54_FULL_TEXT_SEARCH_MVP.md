@@ -32,7 +32,7 @@ Implement full-text search for the interactive HTML viewer using compile-time pe
 
 ## Architecture
 
-See `docs/design/search_and_sharding.md` §7 for the full search design.
+See `docs/design/core/search_and_sharding.md` §7 for the full search design.
 
 **Key architectural decisions:**
 
@@ -183,9 +183,9 @@ See `docs/design/search_and_sharding.md` §7 for the full search design.
 
 ## References
 
-- `docs/design/search_and_sharding.md` §7 — Compile-time search architecture specification
-- `docs/design/beliefbase_architecture.md` §3.4 — BeliefGraph vs BeliefBase
-- `docs/design/interactive_viewer.md` — Viewer architecture and WASM integration
+- `docs/design/core/search_and_sharding.md` §7 — Compile-time search architecture specification
+- `docs/design/core/beliefbase_architecture.md` §3.4 — BeliefGraph vs BeliefBase
+- `docs/design/presentation/interactive_viewer.md` — Viewer architecture and WASM integration
 - `src/codec/compiler.rs::finalize_html()` — Integration point for index generation
 - `src/wasm.rs::BeliefBaseWasm::search()` — Current search implementation to replace
 - `src/properties.rs::BeliefNode` — Struct with `title`, `payload["text"]`, `kind`, `schema`, `id`

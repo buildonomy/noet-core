@@ -156,7 +156,7 @@ how the boundary was determined. It just needs a boundary.
   boundary results to run projection completeness assessment
 - **[wp-model-ontology] §8.3** (registration event): defines
   the theoretical criterion for model boundaries
-- **Network authoring** (`docs/design/network_authoring.md`):
+- **Network authoring** (`docs/design/codecs/network_authoring.md`):
   Tier 1 boundaries derive from network structure
 - **Application-specific validation cases** exist in the planning
   repo that exercise Tier 2 boundary detection against real

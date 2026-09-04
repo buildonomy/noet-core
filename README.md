@@ -9,7 +9,7 @@ A Rust library for parsing interconnected documents into a queryable, typed dire
 
 **noet-core** (from "noetic" — relating to knowledge and intellect) transforms document networks (Markdown, TOML, etc.) into a queryable directed acyclic graph (DAG) called a "BeliefBase". It maintains **bidirectional synchronization** between human-readable source files and a machine-queryable graph, automatically managing cross-document references and propagating changes.
 
-Every claim of coverage, dependency, or relationship becomes an *explicit edge* in the graph — not an assertion buried in prose. The result is documentation you can query, diff, and validate structurally. See **[Documentation as a Dependency Graph](docs/design/dag_model.md)** for the conceptual introduction.
+Every claim of coverage, dependency, or relationship becomes an *explicit edge* in the graph — not an assertion buried in prose. The result is documentation you can query, diff, and validate structurally. See **[Documentation as a Dependency Graph](docs/design/core/dag_model.md)** for the conceptual introduction.
 
 ### Key Features
 
@@ -71,7 +71,7 @@ noet-core implements a compiler-like system for document networks:
 3. **Convergence**: Iterate until all resolvable references are linked
 4. **Incremental Updates**: File changes trigger selective reparsing of affected documents
 
-See the [Architecture Guide](docs/design/architecture.md) and [DAG Model](docs/design/dag_model.md) for details.
+See the [Architecture Guide](docs/design/core/architecture.md) and [DAG Model](docs/design/core/dag_model.md) for details.
 
 ### The BID System
 
@@ -143,7 +143,7 @@ BeliefBase (Compiled DAG)
     ↓
 [Query/Traverse] → MCP tools, WASM viewer, CLI
 ```
-See the [Architecture Guide](docs/design/architecture.md) for details.
+See the [Architecture Guide](docs/design/core/architecture.md) for details.
 
 ### Core Components
 
@@ -194,10 +194,10 @@ noet-core = { version = "0.0.0", features = ["service"] }
 
 ## Documentation
 
-- **[DAG Model](docs/design/dag_model.md)** - Conceptual introduction: why a DAG, the three edge types, the video camera query model
-- **[Architecture Overview](docs/design/architecture.md)** - High-level software architecture and core concepts
-- **[Design Specification](docs/design/beliefbase_architecture.md)** - Detailed technical specification
-- **[Query Model](docs/design/query_model.md)** - Formal query algebra: traversal, composition, scoring, instruments
+- **[DAG Model](docs/design/core/dag_model.md)** - Conceptual introduction: why a DAG, the three edge types, the video camera query model
+- **[Architecture Overview](docs/design/core/architecture.md)** - High-level software architecture and core concepts
+- **[Design Specification](docs/design/core/beliefbase_architecture.md)** - Detailed technical specification
+- **[Query Model](docs/design/core/query_model.md)** - Formal query algebra: traversal, composition, scoring, instruments
 - **[MCP Server](docs/mcp.md)** - Agent-facing tool documentation for querying via Model Context Protocol
 - **[API Documentation](https://docs.rs/noet-core)** - Generated from source (run `cargo doc --open`)
 - **[Examples](examples/)** - Working code examples

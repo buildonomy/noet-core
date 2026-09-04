@@ -19,7 +19,7 @@ The pre-implementation system has three separate query surfaces that share struc
 
 These surfaces expose lines and planes in a higher-dimensional relation space. The missing model is what lets us express **manifolds** — composed, multi-hop, multi-kind queries with principled ordering. Without it, every new use case requires a new special-purpose code path. With it, new use cases are compositions of existing primitives.
 
-> See [`docs/design/dag_model.md`](dag_model.md) for the full treatment
+> See [`docs/design/core/dag_model.md`](dag_model.md) for the full treatment
 > of the mesh/camera metaphor, the three WeightKind axes, the Taylor series depth
 > model, and the validation vs. diagnosis modes of engagement.
 
@@ -501,7 +501,7 @@ one `PathStep` per iteration.
 
 `path_info` records for the named structural predicates:
 
-```noet-core/docs/design/query_model.md#L1-14
+```noet-core/docs/design/core/query_model.md#L1-14
 // SectionSubmap — depth-2 section descendant:
 PathInfo {
     steps:     [(anchor_bid, Section, Out), (child_bid, Section, Out), (grandchild_bid, _, _)],
@@ -568,7 +568,7 @@ T-conorm. They satisfy associativity, commutativity, and the distributivity law
 `And(p, Or(q, r)) = Or(And(p, q), And(p, r))` — algebraic laws inherited from the
 semiring structure that a future query optimizer can exploit for rewriting.
 
-> See [`docs/design/dag_model.md` §5](dag_model.md#5-composed-queries-stereoscopic-vision)
+> See [`docs/design/core/dag_model.md` §5](dag_model.md#5-composed-queries-stereoscopic-vision)
 > for the full stereoscopic/blind-spot/panoramic metaphor.
 
 The current `QuerySpec` + `SetOp` + composition steps encode a Boolean (hard-only)
@@ -859,7 +859,7 @@ tape + graph) and produces rendered output. The view is not part of the `QuerySp
 — it is external to the query model. The evaluator does not know or care how results
 will be displayed.
 
-```noet-core/docs/design/query_model.md#L1-7
+```noet-core/docs/design/core/query_model.md#L1-7
 trait View {
     type Output;
     fn render(&self, package: &QueryPackage) -> Result<Self::Output, Error>;
@@ -882,7 +882,7 @@ This means:
 Consumers that need a self-contained graph (balanced, with ancestor chains and
 edge-endpoint context) call `QueryPackage::balanced()` before evaluation:
 
-```noet-core/docs/design/query_model.md#L1-3
+```noet-core/docs/design/core/query_model.md#L1-3
 let mut package = QueryPackage::balanced(spec);
 source.evaluate(&mut package).await?;
 // package now contains a balanced graph with halo + ancestry
@@ -1052,7 +1052,7 @@ view decides how to render it.
 
 The query model uses a video camera metaphor: the query is a camera moving through
 the fixed beliefbase graph, recording dimensionally-reduced frames at each position.
-See [`docs/design/dag_model.md` §4](dag_model.md#4-the-video-camera-model)
+See [`docs/design/core/dag_model.md` §4](dag_model.md#4-the-video-camera-model)
 for the conceptual introduction. This section specifies the formal mapping.
 
 A `QuerySpec` configures the camera rig with two independent controls:
@@ -1175,7 +1175,7 @@ review coverage, and which are uncovered?
 
 ### Step 1 — Define Set A: Items in the Target Category
 
-```noet-core/docs/design/query_model.md#L1-6
+```noet-core/docs/design/core/query_model.md#L1-6
 set_a = NeighborSet(
     anchor      = "id://priority-high",  // BID resolved via IdMatch
     weight_kind = Pragmatic,
@@ -1191,7 +1191,7 @@ a Pragmatic out-edge `n → priority_high`.
 
 `set_a` produces paths of the form:
 
-```noet-core/docs/design/query_model.md#L1-5
+```noet-core/docs/design/core/query_model.md#L1-5
 PathInfo {
     steps: [(item_bid, Pragmatic, Out), (category_bid, _, _)],
     sort_keys: [],
@@ -1205,7 +1205,7 @@ category node) is the same for all paths and is not a useful filter.
 
 ### Step 2 — Define Set B: Review Coverage
 
-```noet-core/docs/design/query_model.md#L1-5
+```noet-core/docs/design/core/query_model.md#L1-5
 set_b = MapsToTraversal(
     anchor = review_doc_bid,   // BID of the review document network root
     depth  = 2,
@@ -1216,7 +1216,7 @@ This is the existing `get_maps_to_traceability` traversal: for each owner sectio
 review document, follow WEIGHT_OWNED_BY edges to claim nodes, then Pragmatic edges to item
 sinks. Each path has the structure:
 
-```noet-core/docs/design/query_model.md#L1-7
+```noet-core/docs/design/core/query_model.md#L1-7
 PathInfo {
     steps: [
         (review_doc_root, WEIGHT_OWNED_BY, Out),
@@ -1233,7 +1233,7 @@ the item sinks as waypoints: `ExplicitSet(set_b.terminus_nodes())`.
 
 ### Step 3 — Join: Intersection of Coverage with Category Membership
 
-```noet-core/docs/design/query_model.md#L1-12
+```noet-core/docs/design/core/query_model.md#L1-12
 // Item nodes that belong to the target category
 items_from_a = ExplicitSet(set_a.start_nodes())
 
@@ -1261,7 +1261,7 @@ them — the item with the most coverage appears first.
 
 **Evaluator pseudocode** for this step:
 
-```noet-core/docs/design/query_model.md#L1-16
+```noet-core/docs/design/core/query_model.md#L1-16
 fn eval_join(set_a, set_b, graph) -> Vec<(Bid, PathInfo)> {
     let nodes_a: HashSet<Bid> = set_a.start_nodes().collect();
     let nodes_b: HashSet<Bid> = set_b.terminus_nodes().collect();
@@ -1278,7 +1278,7 @@ fn eval_join(set_a, set_b, graph) -> Vec<(Bid, PathInfo)> {
 
 ### Step 4 — Complement: Uncovered Items (The Coverage Gap)
 
-```noet-core/docs/design/query_model.md#L1-11
+```noet-core/docs/design/core/query_model.md#L1-11
 items_covered = ExplicitSet(set_b.terminus_nodes())
 
 gap = QuerySpec { steps: [
@@ -2338,9 +2338,10 @@ are tracked in `ISSUE_70_UNIFIED_SEARCH_QUERY_UI.md` Open Questions.
 - `noet-core/src/mcp/tools.rs` — `get_maps_to_traceability`, `get_maps_to`, `get_traceability`
 - `noet-core/src/mcp/types.rs` — `GetMapsToTraceabilityInput`, `MapsToTraceabilityOutput`
 - `noet-core/docs/project/ISSUE_70_UNIFIED_SEARCH_QUERY_UI.md` — viewer UI implementation plan
-- `noet-core/docs/design/search_and_sharding.md` — compile-time search index; `query_search_index` MCP tool is the `TextMatch` predicate implementation
+- `noet-core/docs/design/core/search_and_sharding.md` — compile-time search index; `query_search_index` MCP tool is the `TextMatch` predicate implementation
 - `noet-core/assets/viewer/navigation.js` — `renderNavNode` visited-set / back-reference pattern (analogous to intra-table back-references in §5.2)
-- `.scratchpad/vast_qms_validation.md` — application-specific acceptance tests for the §9 use case
+- Application-specific acceptance tests for the §9 use case live outside this
+  repository, alongside the corpus they validate against
 
 ---
 

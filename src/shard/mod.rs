@@ -36,7 +36,7 @@
 //!
 //! ## References
 //!
-//! - `docs/design/search_and_sharding.md` — Full architecture specification
+//! - `docs/design/core/search_and_sharding.md` — Full architecture specification
 //! - Issue 50: BeliefBase Sharding
 //! - Issue 54: Full-Text Search MVP (uses the `.idx.msgpack` files built here)
 

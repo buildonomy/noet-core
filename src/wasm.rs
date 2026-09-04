@@ -293,7 +293,7 @@ impl BidBrefResult {
 ///
 /// Pre-structured tree generated in Rust for better performance than client-side tree building.
 /// Uses a flat map structure with child IDs for efficient lookups and intelligent expand/collapse.
-/// See `docs/design/interactive_viewer.md` § Navigation Tree Generation for specification.
+/// See `docs/design/presentation/interactive_viewer.md` § Navigation Tree Generation for specification.
 #[cfg(feature = "wasm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NavTree {
@@ -370,7 +370,7 @@ impl EdgeEntry {
     }
 }
 
-/// See `docs/design/interactive_viewer.md` § WASM Integration for specification.
+/// See `docs/design/presentation/interactive_viewer.md` § WASM Integration for specification.
 #[cfg(feature = "wasm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeContext {
@@ -2169,7 +2169,7 @@ impl BeliefBaseWasm {
 
     /// Get href namespace BID (external HTTP/HTTPS links tracking network)
     ///
-    /// See `docs/design/architecture.md` § 10 for network namespace details.
+    /// See `docs/design/core/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
@@ -2201,7 +2201,7 @@ impl BeliefBaseWasm {
 
     /// Get asset namespace BID (images/PDFs/attachments tracking network)
     ///
-    /// See `docs/design/architecture.md` § 10 for network namespace details.
+    /// See `docs/design/core/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
@@ -2214,7 +2214,7 @@ impl BeliefBaseWasm {
 
     /// Get buildonomy namespace BID (API node for version management)
     ///
-    /// See `docs/design/architecture.md` § 10 for network namespace details.
+    /// See `docs/design/core/architecture.md` § 10 for network namespace details.
     ///
     /// # JavaScript Example
     /// ```javascript,ignore
@@ -2234,7 +2234,7 @@ impl BeliefBaseWasm {
     /// This provides the complete document hierarchy for building navigation trees.
     /// The order_indices array contains sort keys from WEIGHT_SORT_KEY (Subsection relations).
     ///
-    /// See `docs/design/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
+    /// See `docs/design/presentation/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
     ///
     /// ✅ **JavaScript**: This returns a plain object (uses serde_json serialization)
     ///
@@ -2293,7 +2293,7 @@ impl BeliefBaseWasm {
     /// This is more efficient than `get_paths()` because the tree is built in Rust
     /// with proper title extraction from BeliefNode states.
     ///
-    /// See `docs/design/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
+    /// See `docs/design/presentation/interactive_viewer.md` § 8 (Navigation Tree Generation) for usage.
     ///
     /// ⚠️ **JavaScript**: `tree.nodes` is a Map object (not plain object)!
     ///

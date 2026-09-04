@@ -322,6 +322,32 @@ batch boundaries and behind an explicit opt-in.
 
 ---
 
+## Design constraints
+
+### A forward-compatibility field is a liability unless something exercises it
+
+"It costs nothing to carry" is false. A field written but never read is not
+free — it is unverified data accumulating, and on the day something finally
+depends on it, it is as likely to be garbage as useful. The failure is silent:
+the field looks populated, nothing rejects it, and whatever it encodes is wrong.
+
+Logical clocks are the canonical case. A clock is only correct if *every* writer
+maintains it correctly, and a single-writer deployment never exercises that
+property.
+
+**Practice**: any field justified by forward compatibility must name the
+mechanism that exercises it *now*. If none exists, omit the field. If the field
+is genuinely unretrofittable — an ordering cannot be reconstructed for records
+written before it existed — then carry it, but make something read it: route a
+real code path through the field so ordinary use verifies it, and assert the
+property in a test. "Exercised by a test that would fail if it were wrong" is
+the bar; "stored correctly" is not.
+
+The corollary is a triage question worth asking of any speculative field: is it
+**omittable** (add it later at no cost), **unretrofittable** (must be carried
+from the first record), or **inert** (carried but unread)? Only the first two are
+legitimate; the third is the case that rots.
+
 ## Identity and caching
 
 ### Do not conflate identities that have different scopes
@@ -504,7 +530,7 @@ extract the restoration into one function before adding to it.
 
 ## See also
 
-- `docs/design/beliefbase_architecture.md` — the specifications these
+- `docs/design/core/beliefbase_architecture.md` — the specifications these
   lessons constrain
 - `docs/project/0_open/` — current work
 - `AGENTS.md` § "Known Pitfalls" — the subset of these that agents hit most

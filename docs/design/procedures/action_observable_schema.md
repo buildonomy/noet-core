@@ -2,12 +2,37 @@
 title = "Observable Action Schema"
 authors = "Andrew Lyjak, Claude"
 last_updated = "2025-01-24"
-status = "Active"
+status = "Active (schema) / Withdrawn (execution integration)"
 version = "0.2"
 dependencies = ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)", "beliefbase_architecture.md"]
 ---
 
 # Observable Action Schema
+
+> [!IMPORTANT]
+> **Partially withdrawn: the observation model stands, the record types do not.**
+>
+> This document has two halves. The **`inference_hint` schema** — grouping and
+> transition events, temporal and confidence constraints, the Participant
+> channel, and `response_config` — is a declarative description of *what pattern
+> to match*. It does not depend on the withdrawn as-run model and is **retained
+> as sound**; Issue 18's stub independently reaffirms its governing insight, that
+> "a prompt is not a step type" and every step advances via an observation
+> regardless of whether the observer is a sensor, a system, or a human.
+>
+> The **integration half** — how an observation becomes a record, where response
+> variables are scoped, and what an engine does with a detection — was written
+> against the withdrawn three-piece as-run model. `ProcedureRun` and
+> `ObservationEvent` are withdrawn types and do not exist. The current model is
+> `docs/design/annotation/living_corpus.md` §2 and
+> `docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` → "What Was
+> Removed and Why": **an annotation *is* an as-run record**, a run is the set of
+> annotations sharing a `RunStart` ancestor (a query, not a type), and **an event
+> is an annotation subtype** — a registered `protocol_id` with a payload schema,
+> not a Rust type.
+>
+> Affected passages are marked inline. No replacement execution design exists
+> yet; Issue 18 is an aspirational stub.
 
 ## Purpose
 
@@ -311,9 +336,12 @@ The `Participant` channel enables procedures to request human input. These are *
    - Uses step markdown text as prompt description
    - Uses `response_config` to render form element
 4. **Participant responds** via UI
-5. **ObservationEvent emitted** with response data
+5. **An observation record is emitted** with response data — an annotation
+   carrying a registered `protocol_id`, not a bespoke `ObservationEvent` type
+   (Issue 17 step 2a registers procedural subtypes)
 6. **Inference engine matches** observation to hint
-7. **Procedure advances**, stores response in run context
+7. **Procedure advances**, stores response in run context *(run scoping: see the
+   note under "Variable Scoping")*
 
 ### Participant Producers
 
@@ -511,8 +539,16 @@ description = "Additional product-specific metadata"
 
 [properties.payload.properties.supporting_data.items]
 type = "object"
-description = "Reference to ObservationEvent (product-specific schema)"
+description = "Reference to a contributing observation record (product-specific schema)"
 ```
+
+> [!NOTE]
+> `supporting_data` formerly said "Reference to `ObservationEvent`". That type is
+> withdrawn. A contributing observation is an **annotation** carrying a
+> registered `protocol_id`; a reference to one is an `EventId`, and the
+> "contributed to this match" relation is `caused_by`
+> (`beliefbase_architecture.md` §4.3). The field remains — only its referent's
+> spelling changes.
 
 ## Multi-Modal Observations
 
@@ -579,6 +615,14 @@ Production deployment requires both automated config verification AND explicit o
 
 ## Integration with Procedure Execution
 
+> [!CAUTION]
+> **This section describes the withdrawn execution model.** The `inference_hint`
+> schema above is independent of it and stands; what follows presumes a running
+> engine with a mutable run context, which is undesigned. Issue 18 — which owned
+> the execution loop — is an aspirational stub, and `procedure_execution.md`
+> carries the same withdrawal banner. Read the lifecycle below as a statement of
+> the steps an observation must pass through, not as owned mechanics.
+
 ### Lifecycle
 
 1. **Template Loading**: Procedure engine loads BeliefNodes representing steps
@@ -589,7 +633,10 @@ Production deployment requires both automated config verification AND explicit o
 6. **Action Detection**: Inference engine emits `action_detected` events
 7. **Variable Storage**: For responses with `stores_in_variable`, value stored in run context
 8. **Procedure Advancement**: State machine advances to next step
-9. **As-Run Recording**: Execution recorded with observed data
+9. **As-Run Recording**: Execution recorded with observed data — under the
+   current model steps 6–9 are not distinct phases: **appending the annotation
+   *is* the as-run recording**, and advancement is what the fold derives from
+   the record set (`living_corpus.md` §2–§3; folding is Issue 109's)
 
 ### State Machine Behavior
 
@@ -601,7 +648,19 @@ When a procedure reaches an observable action step:
 
 ### Variable Scoping
 
-Response variables are **run-scoped**: stored in the `ProcedureRun` context and accessible to subsequent steps:
+> [!CAUTION]
+> **`ProcedureRun` is a withdrawn type and does not exist.** There is no run
+> context object to store a variable in. A run is the set of annotations sharing
+> a `RunStart` ancestor — a query over the annotation store keyed on `run_id`
+> (**Issue 109**) — so a captured value lives in the payload of the record that
+> captured it, and "run-scoped" means *reachable by querying the same `run_id`*.
+>
+> **The requirement is sound and unmet**: a later step needing an earlier step's
+> captured value implies a read across records in the same run, and nothing
+> currently specifies how a `condition` expression resolves such a name. That is
+> a design decision for the replacement, not one to make here.
+
+Response variables are **run-scoped**: stored in the run's record set and accessible to subsequent steps:
 
 ```toml
 # Step 1: Capture temperature
@@ -647,10 +706,15 @@ Component that matches observation streams to inference hints:
 ```rust
 trait InferenceEngine {
     fn register_pattern(&mut self, node_bid: Bid, hint: InferenceHint);
-    fn process_observation(&mut self, event: ObservationEvent);
+    fn process_observation(&mut self, event: ObservationEvent);  // WITHDRAWN TYPE
     fn emit_action_detected(&self, detection: ActionDetection);
 }
 ```
+
+> `ObservationEvent` is withdrawn. The parameter is an annotation record
+> (`Envelope` + payload, `beliefbase_architecture.md` §4.3) whose `protocol_id`
+> identifies it as an observation. The trait's *shape* — register patterns,
+> consume observations, emit detections — is unaffected by the renaming.
 
 Responsibilities:
 - Pattern matching (grouping/transition logic)
@@ -664,9 +728,11 @@ Component that displays prompts and captures responses:
 ```rust
 trait ParticipantRenderer {
     fn render_observation_request(&self, step: &BeliefNode) -> Result<()>;
-    fn collect_response(&self) -> Result<ObservationEvent>;
+    fn collect_response(&self) -> Result<ObservationEvent>;  // WITHDRAWN TYPE
 }
 ```
+
+> As above: the return value is an annotation record, not an `ObservationEvent`.
 
 Uses BeliefNode fields:
 - `title` → Prompt title
@@ -677,7 +743,7 @@ Uses BeliefNode fields:
 
 Products map semantic labels to concrete values:
 ```
-"home" → GPS coordinates (37.7749, -122.4194)
+"home" → GPS coordinates (latitude, longitude)
 "part_123" → Barcode value "0012345678905"
 "37C" → Temperature range (36.5°C - 37.5°C)
 ```
@@ -757,14 +823,15 @@ Wait for all microservices to report healthy status with normal load for at leas
 ### Product-Specific (Downstream)
 
 - Observation event producers (hardware/software integrations)
-- ObservationEvent schema (product defines structure)
+- Observation payload schema (product defines structure, within the annotation
+  record shape — formerly written as "`ObservationEvent` schema", a withdrawn type)
 - Inference engine implementation (pattern matching algorithms)
 - Confidence scoring formulas
 - Semantic label resolution (mapping labels to concrete values)
 - Channel/producer namespaces (product defines vocabulary)
 - UI rendering for Participant channel (modal dialogs, forms, notifications)
 - Delivery strategy (immediate, deferred, scheduled)
-- Attention windows (psychological guardrails - product-specific extension)
+- Attention/notification policy (a consuming-application extension)
 
 ## Design Rationale
 
@@ -772,7 +839,10 @@ Wait for all microservices to report healthy status with normal load for at leas
 
 Treating all observations (sensors, systems, participants) with the same schema:
 1. **Conceptual simplicity**: One state machine model for all steps
-2. **Consistent as-run recording**: All observations recorded the same way
+2. **Consistent as-run recording**: All observations recorded the same way — this
+   is the insight Issue 18's stub preserves as "a prompt is not a step type", and
+   it is strengthened rather than weakened by the withdrawal: one record shape
+   for every observation, distinguished by `protocol_id`
 3. **Natural multi-modal patterns**: Easy to combine automatic + manual verification
 4. **Extension friendly**: Adding new observation channels is uniform
 
@@ -815,38 +885,52 @@ Each step is a BeliefNode, which provides:
   - Numeric values within `min`/`max` if specified
   - Selected options must be in `options` list
 
-## Migration from Product Workspace
+## Scope Boundary
 
-**Source**: 
-- `noet/docs/design/action_interface.md` (observable actions)
-- `noet/docs/design/prompt_interface.md` (participant prompts)
+This document specifies the **schema** for observable actions and participant
+prompts. It deliberately excludes the machinery that consumes that schema, which
+is a downstream-application concern.
 
-**Migrated**:
+**In scope here**:
 - `inference_hint` schema definition
 - Grouping/transition event structures
 - Temporal constraints
-- Participant channel patterns (merged from prompt_interface.md)
+- Participant channel patterns
 - Response capture configuration
-- `action_detected` event schema
+- The action-detected event schema
 
-**Stays in Product**:
-- Action Inference Engine implementation
-- ObservationEvent schema (product-specific)
+**Out of scope — belongs to a consuming application**:
+- Action inference engine implementation
+- Observation payload schema
 - Semantic label mapping and resolution
 - Confidence scoring algorithms
-- Sensor-specific examples (GPS, screen activity)
-- Attention window system (psychological guardrails, body budget, crisis override)
-- Window selection policies and frequency management
-- `opens_window` step type (bridge to attention windows)
+- Sensor-specific handling
+- Attention/notification policy, including any window-selection or frequency
+  management
+- Step types that bridge into such policy
 
 ## References
 
+**Current model** (read these first):
+
+- **living_corpus.md** §2 - the three-layer model; an annotation *is* an as-run record
+- **beliefbase_architecture.md** §4.3 - `Envelope` + `Annotation`; the assert-vs-mutate boundary
+- **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - procedure codec, `steps` schema,
+  and the procedural annotation subtypes (step 2a); "What Was Removed and Why"
+- **ISSUE_104** - annotation record field set · **ISSUE_105** - the record store
+  and `NodeVersionRef` · **ISSUE_109** - `RunStart`/`RunEnd`, `run_id`, folding
+- **ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md** - **aspirational stub**; its prior
+  draft design (the execution loop this document's integration half assumes) is
+  withdrawn and not yet replaced
+
+**Withdrawn framing, retained for requirements:**
+
+- **procedure_execution.md** - execution lifecycle (carries a withdrawal banner)
+- **redline_system.md** - as-run deviation tracking (same framing)
+
+**Unaffected:**
+
 - **procedure_schema.md** - Core procedure schema
-- **procedure_execution.md** - Execution lifecycle
-- **redline_system.md** - As-run deviation tracking
-- **beliefbase_architecture.md** - BeliefNode structure
-- **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - Implementation plan
-- **ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md** - Extended schemas
 
 ## Version History
 

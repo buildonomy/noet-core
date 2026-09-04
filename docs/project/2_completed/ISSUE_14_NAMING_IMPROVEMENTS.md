@@ -55,7 +55,7 @@ edited into the (intentionally frozen) original body:
    directory: `base.rs`, `graph.rs`, `accumulator.rs`, `context.rs`, `sink.rs`), per the
    BeliefSource refactor (`docs/project/2_completed/ISSUE_83_BELIEF_SOURCE_REFACTOR.md`).
    Likewise `docs/design/beliefset_architecture.md` (referenced under "Phase 4" and
-   "References") is now `docs/design/beliefbase_architecture.md`.
+   "References") is now `docs/design/core/beliefbase_architecture.md`.
 
 No naming claim in the "Additional Improvements" section was contradicted: `DocCodec` was not
 renamed to `DocumentCodec`, and `MdCodec`/`TomlCodec` were not renamed either — those were left

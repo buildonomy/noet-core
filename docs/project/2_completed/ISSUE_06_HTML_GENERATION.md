@@ -21,10 +21,10 @@ concrete API shape in this document has since been redesigned. Treat this issue
 as a historical narrative of Phase 1/2 delivery, not as a reference for the
 current HTML generation architecture. Current sources of truth:
 
-- **`docs/design/interactive_viewer.md`** — authoritative architecture for the
+- **`docs/design/presentation/interactive_viewer.md`** — authoritative architecture for the
   SPA/viewer (this doc's own § "Phase 2" work was superseded here and in Issues
   38/39/44).
-- **`docs/design/search_and_sharding.md`** — authoritative for the export format
+- **`docs/design/core/search_and_sharding.md`** — authoritative for the export format
   (see below).
 - **Issue 43** (`ISSUE_43_CODEC_HTML_REFACTOR.md`) — replaced the `DocCodec`
   HTML API described in §"Architecture → DocCodec Extension" here. The actual

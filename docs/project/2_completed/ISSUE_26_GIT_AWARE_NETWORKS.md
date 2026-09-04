@@ -608,5 +608,5 @@ let git_tracking = git_tracking
   `export_beliefbase_json`
 - `src/bin/noet/main.rs` — CLI `jobs` pattern to mirror for `git_tracking`
 - `assets/viewer/metadata.js` — `renderNodeContext`, metadata panel rendering
-- `docs/design/beliefbase_architecture.md` — Section 3.2 (codec system),
+- `docs/design/core/beliefbase_architecture.md` — Section 3.2 (codec system),
   Section 3.1 (GraphBuilder phases)

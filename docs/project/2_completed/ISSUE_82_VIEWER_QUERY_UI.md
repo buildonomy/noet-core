@@ -374,7 +374,7 @@ cross-network MapsTo edge resolution.
 
 ## References
 
-- `docs/design/query_model.md` §9.5.9 — surface bindings (URL, MyST, MCP)
+- `docs/design/core/query_model.md` §9.5.9 — surface bindings (URL, MyST, MCP)
 - `assets/viewer/traceability.js` — primary edit target
 - `assets/viewer/search.js` — Explore button added here
 - `assets/viewer/content.js` — `processLoadedContent` hook for query buttons

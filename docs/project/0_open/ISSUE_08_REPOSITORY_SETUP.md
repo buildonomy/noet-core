@@ -3,7 +3,7 @@
 **Priority**: MEDIUM - Required before v0.1.0 publication  
 **Estimated Effort**: 2-3 days  
 **Dependencies**: Issues 5-7 complete (docs, quality, tests ready)  
-**Context**: Release gate — creates standalone repository infrastructure. See [`ROADMAP.md`](./ROADMAP.md).
+**Context**: Release gate — creates standalone repository infrastructure. See [`ROADMAP.md`](../ROADMAP.md).
 
 ## Summary
 

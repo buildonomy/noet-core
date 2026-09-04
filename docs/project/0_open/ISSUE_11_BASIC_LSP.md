@@ -1,42 +1,107 @@
 # Issue 11: Basic Language Server Protocol (LSP) Implementation
 
-> [!WARNING]
-> **Architectural re-scoping needed.** The LSP is a PII (Personal
-> Inference Interface) surface for the attestation service, not a
-> standalone compilation feature. Editor diagnostics are inference
-> engine gap findings (Issue 93); code actions are procedures firing
-> from rule maps; hover is metadata card content rendered inline.
-> This issue depends on the attestation service architecture
-> (`docs/design/attestation_fabric.md` §13) and is likely to need
-> heavy modification of its design and task list once the attestation
-> service has been implemented. The core LSP protocol wiring and
-> position tracking work described below remains valid, but the
-> feature set will be driven by the inference engine's output rather
-> than the compiler's diagnostics alone.
+> [!NOTE]
+> **Re-scoped — this issue is now LSP protocol work only.** Four changes:
+>
+> 1. **The LSP is a PII (Personal Inference Interface) surface**, not a
+>    compilation feature — see `docs/design/annotation/attestation_fabric.md` §13.
+>    Editor diagnostics are inference-engine gap findings (Issue 93); code
+>    actions are procedures firing from rule maps; hover is metadata card
+>    content rendered inline. The feature set is driven by the inference
+>    engine's output, not by the compiler's diagnostics alone.
+> 2. **Position tracking has been split out to Issue 103** (node source
+>    ranges). This issue no longer designs or builds it; it consumes it.
+> 3. **The LSP attaches to `noet serve` (Issue 102)** for the shared live
+>    graph. The `DaemonService` model this issue was originally written
+>    against no longer exists — `src/daemon.rs` is gone, and Issue 10 is
+>    completed and superseded by the serve model.
+> 4. **Diagnostics come from `DocumentCompiler::last_diagnostics()`**
+>    (Issue 66), not from a daemon-owned diagnostic cache.
 
 **Priority**: HIGH - Enables IDE integration for v0.2.0
-**Estimated Effort**: 3-5 days
-**Dependencies**: Issue 10 (Daemon must be tested and working),
-attestation service (attestation_fabric.md), Issue 93 (inference engine)
+**Estimated Effort**: 2-3 days
+**Dependencies**: Requires Issue 102 (`noet serve` — shared live graph and
+consumer registry), Issue 103 (node source ranges), Issue 66
+(`DocumentCompiler::last_diagnostics`). Informed by the attestation service
+(`attestation_fabric.md` §13) and Issue 93 (inference engine).
 **Target Version**: v0.2.0 (post-open source, pre-announcement)
 **Context**: LSP integration positions noet as a "real" language with modern tooling support
 
 ## Summary
 
-Implement basic Language Server Protocol (LSP) support for noet, enabling IDE integration with real-time diagnostics and hover information. This transforms noet from a CLI tool into a language with first-class editor support in VSCode, Zed, Neovim, and other LSP-compatible editors. The implementation adds position tracking to the compiler, implements the LSP protocol using `tower-lsp`, and provides document synchronization between editor state and the daemon's compiler cache.
+Build an **LSP shim**: a translation layer between the annotation model and the
+Language Server Protocol. Editors get real-time diagnostics and hover in VSCode,
+Zed, Neovim, and any other LSP client; noet gets one more PII surface
+(`attestation_fabric.md` §13) rather than a bespoke subsystem.
+
+The shim is deliberately thin. It does two things:
+
+| Direction | Translation |
+|---|---|
+| **Annotation → LSP** | records anchored to a node render as `publishDiagnostics`, hover content, and code lenses |
+| **LSP → Annotation** | editor actions — resolving a diagnostic, closing a todo, signing off — emit records |
+
+Everything else already exists: Issue 103 supplies node source ranges, Issue 102
+holds the live graph and the consumer registry, Issue 105 stores the records.
+The shim maps between `(bid, range)` and LSP's `(uri, position)`, and between
+record kinds and LSP concepts. `tower-lsp` handles the protocol.
+
+### Diagnostics are annotations
+
+A compiler diagnostic — an unresolved reference, a collision warning — is an
+observation about a node made by an identified `P` (the compiler), anchored to a
+version. That is an annotation (`living_corpus.md` §2), and treating it as one
+unifies three things that would otherwise need separate plumbing:
+
+- A compiler diagnostic and a human `{todo}` on the same line are the same kind
+  of object, rendered the same way, dismissed the same way.
+- The inference engine's gap findings (Issue 93) reach the editor with no new
+  mechanism — they are annotations from a different `P`.
+- "Resolve this diagnostic" and "close this todo" are one code action.
+
+**But compiler diagnostics are *ephemeral* annotations, and the distinction is
+load-bearing.** They are derived from the current parse, regenerated on every
+compile, and must not accumulate in the sidecar store — which is sized for
+deliberate human acts and is append-only. Persisting a diagnostic that a reparse
+would re-derive is the volume failure `living_corpus.md` §2 warns about, in a new
+form.
+
+So annotations divide by lifetime, not only by kind:
+
+| | Durable | Ephemeral |
+|---|---|---|
+| Examples | `{todo}`, `{reviewed}`, redlines | compiler diagnostics, inference findings, cursors, presence |
+| Produced by | a human act | recomputation |
+| Stored | Issue 105 sidecar | nowhere — held in the live session |
+| Survives restart | yes | no, and should not |
+| Routed by | Issue 102's registry | Issue 102's registry |
+
+Both travel the same path and render through the same surface. Only the durable
+ones are written. **`living_corpus.md` does not yet name this split** — see Open
+Questions; it is a design-doc gap this issue surfaces rather than one it should
+resolve unilaterally.
+
+> Cursors and presence are the other ephemeral case and belong to the same
+> mechanism: an actor's position is an observation about a node that is never
+> written down. Out of scope here, noted so the split is designed once.
 
 **User Experience**: Users edit markdown documents in their IDE, see parse errors as they type, hover over headings/links to see metadata (BID, node type, resolved references), and get immediate feedback on broken references.
 
-**Post-Implementation**: noet documents have the same IDE experience as code (diagnostics, hover, etc.), significantly lowering the barrier to adoption.
+**Post-Implementation**: noet documents have the same IDE experience as code (diagnostics, hover, etc.), significantly lowering the barrier to adoption — and the editor becomes a write surface for annotations, not only a read surface for diagnostics.
 
 ## Goals
 
-1. Add position and range tracking to the DocCodec trait (proper extension point for all parsers)
-2. Implement LSP server using `tower-lsp` with JSON-RPC over stdio
-3. Provide document synchronization (didOpen, didChange, didSave, didClose)
-4. Publish diagnostics in real-time as documents change
-5. Implement hover provider showing node metadata
-6. Support full-document sync mode (incremental sync deferred to Issue 12)
+1. **Translate annotations to LSP** — records anchored to a node become
+   `publishDiagnostics` and hover content; one path, whether the record came
+   from the compiler, a human, or the inference engine
+2. **Translate LSP actions to annotations** — an editor action emits a record
+   through Issue 102, exactly as the viewer does
+3. **Distinguish ephemeral from durable** — compiler diagnostics are recomputed
+   and must not reach the Issue 105 sidecar
+4. Consume Issue 103's node source ranges to map `(bid, range)` ↔ `(uri, position)`
+5. Implement the LSP server using `tower-lsp` with JSON-RPC over stdio
+6. Provide document synchronization (didOpen, didChange, didSave, didClose),
+   full-document sync mode (incremental deferred to Issue 12)
 7. Create VSCode extension configuration for testing
 8. Document IDE setup for VSCode, Zed, Neovim
 
@@ -55,67 +120,46 @@ Implement basic Language Server Protocol (LSP) support for noet, enabling IDE in
                  │ JSON-RPC 2.0 over stdio
                  │
 ┌────────────────▼────────────────────────────────┐
-│  noet lsp (bin/noet-lsp.rs)                     │
+│  noet lsp                                       │
 │  - Implements tower_lsp::LanguageServer         │
 │  - Manages in-memory document state             │
 │  - Converts: LSP types ↔ noet types             │
-│  - Coordinates with DaemonService               │
+│  - Registers as a consumer of `noet serve`      │
 └────────────────┬────────────────────────────────┘
-                 │ Internal API
+                 │ Consumer registry (Issue 102)
                  │
 ┌────────────────▼────────────────────────────────┐
-│  DaemonService (src/daemon.rs)                  │
-│  - Parses in-memory documents                   │
-│  - Maintains BeliefBase cache                   │
-│  - Generates diagnostics with ranges            │
+│  noet serve (Issue 102)                         │
+│  - Owns the authoritative in-memory graph       │
+│  - Parses in-memory documents incrementally     │
+│  - Exposes DocumentCompiler::last_diagnostics() │
 │  - Resolves cross-document references           │
+│  - Node source ranges from Issue 103            │
 └─────────────────────────────────────────────────┘
 ```
 
+The LSP is **one consumer among several**. `noet serve` also serves the browser
+viewer, the MCP server, and the annotation client (Issue 105) from the same live
+graph, and owns the idle boundary at which the graph is safe to read. The LSP has
+no private compiler and no private cache; it holds only editor-side document text
+and the LSP-shaped projection of what `serve` already knows.
+
 ### Data Structures
 
-**Position Tracking Architecture**:
-
-Position information is kept separate from the domain model (BeliefNode) to avoid polluting core types with presentation concerns. Instead, positions are tracked at the codec and builder layers:
-
-```rust
-use lsp_types::{Position, Range};
-
-// NEW: Position index maintained by GraphBuilder during parse_content
-pub struct PositionIndex {
-    // Maps BID to its source range in the document
-    node_ranges: HashMap<Bid, Range>,
-    // Maps source positions to BIDs for reverse lookup
-    position_tree: IntervalTree<Range, Bid>,
-}
-
-impl PositionIndex {
-    pub fn get_range(&self, bid: &Bid) -> Option<Range>;
-    pub fn get_node_at_position(&self, line: u32, col: u32) -> Option<Bid>;
-}
-
-pub struct ParseDiagnostic {
-    pub message: String,
-    pub range: Range,               // NEW: diagnostic location
-    pub severity: DiagnosticSeverity,
-    // ... existing fields
-}
-
-// NEW: Track link positions for navigation (codec-specific)
-pub struct LinkPosition {
-    pub range: Range,
-    pub target: NodeKey,
-    pub resolved: bool,
-}
-```
-
-**Note**: BeliefNode remains unchanged - it's a domain model and shouldn't contain presentation-layer Range data.
+**Position Tracking**: specified in
+[`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) and not
+duplicated here. Issue 103 delivers byte-offset source ranges per node, a
+position → BID lookup for a single document, and ranges on diagnostics. The LSP
+converts byte offsets to LSP `Position` values at the protocol boundary using the
+existing `codec::byte_offset_to_location`. The `PositionIndex` / `IntervalTree`
+design previously sketched in this section was superseded during that split —
+Issue 103 uses a sorted `Vec` with binary search instead.
 
 **LSP Server State**:
 ```rust
 struct NoetLanguageServer {
     client: Client,                              // LSP client connection
-    daemon: Arc<RwLock<DaemonService>>,         // Shared daemon instance
+    graph: ServeHandle,                          // Live graph handle from Issue 102
     documents: Arc<RwLock<HashMap<Url, String>>>, // In-memory document state
     diagnostics: Arc<RwLock<HashMap<Url, Vec<Diagnostic>>>>, // Cached diagnostics
 }
@@ -143,65 +187,9 @@ struct NoetLanguageServer {
 
 ## Implementation Steps
 
-### 1. Add Position Tracking to DocCodec Trait (1-2 days)
+### 1. Consume Issue 103's node ranges (0 days — delivered by Issue 103)
 
-**Objective**: Extend the DocCodec trait to support position tracking while keeping domain model clean
-
-**Rationale**: The `DocCodec` trait (defined in `src/codec/mod.rs`) is the proper extension point for adding position tracking. All parsers implement this trait, so extending it ensures uniform position tracking. **Critically, position data stays in the codec/builder layers and does NOT pollute BeliefNode** (which is a domain model).
-
-**Architecture**: Position tracking happens in three places:
-1. **DocCodec implementations** - Track positions during parsing, store internally
-2. **GraphBuilder** - Builds a `PositionIndex` during `parse_content()` by querying codec
-3. **LSP Server** - Queries GraphBuilder's position index for LSP operations
-
-**Changes to `src/codec/mod.rs` (DocCodec trait)**:
-- [ ] Add trait method: `fn get_node_range(&self, bid: &Bid) -> Option<Range>`
-- [ ] Add trait method: `fn get_link_ranges(&self) -> Vec<LinkPosition>`
-- [ ] Add trait method: `fn supports_positions(&self) -> bool { false }` (default: opt-in)
-- [ ] Document position tracking contract in trait documentation
-- [ ] Position data is codec-internal - NOT stored in IRNode or BeliefNode
-
-**Changes to `src/codec/diagnostic.rs`**:
-- [ ] Add `range: Option<Range>` field to `ParseDiagnostic`
-- [ ] Update diagnostic generation to include ranges when available
-- [ ] Add conversion utility: `lsp_types::Range` ↔ internal range type (if needed)
-
-**Changes to codec implementations**:
-- [ ] Update `src/codec/md.rs` (MdCodec):
-  - Add internal `positions: HashMap<Bid, Range>` field
-  - Track heading positions during parsing (line/column of `#` markers)
-  - Track link positions (source range of `[text](ref)`)
-  - Track BID annotation positions
-  - Implement `get_node_range()` and `get_link_ranges()`
-  - Return `true` for `supports_positions()`
-- [ ] Update `src/codec/belief_ir.rs` (TomlCodec):
-  - Add internal position tracking for frontmatter blocks
-  - Track individual TOML field positions if possible
-  - Implement position query methods
-- [ ] Position data lives only in codec instances, never in IRNode or BeliefNode
-
-**Changes to `src/codec/builder.rs` (GraphBuilder)**:
-- [ ] Add `position_index: Option<PositionIndex>` field to GraphBuilder
-- [ ] During `parse_content()`, after codec.parse():
-  - Query `codec.get_node_range()` for each parsed BID
-  - Build PositionIndex mapping BID ↔ Range
-  - Store in `self.position_index`
-- [ ] Add method: `pub fn position_index(&self) -> Option<&PositionIndex>`
-- [ ] Add helper: `pub fn get_node_at_position(&self, line: u32, col: u32) -> Option<Bid>`
-
-**Changes to `src/codec/position.rs` (NEW FILE)**:
-- [ ] Create `PositionIndex` struct with BID ↔ Range mappings
-- [ ] Implement efficient position queries (interval tree or simple lookup)
-- [ ] Provide conversion utilities for lsp_types::Range
-
-**Testing**:
-- [ ] Test: MdCodec tracks positions internally, query methods return correct ranges
-- [ ] Test: TomlCodec tracks frontmatter positions
-- [ ] Test: GraphBuilder builds PositionIndex during parse_content
-- [ ] Test: `get_node_at_position()` returns correct BID for various positions
-- [ ] Test: Diagnostic ranges point to correct source locations
-- [ ] Test: Custom codec can opt-out (supports_positions returns false, no crash)
-- [ ] Test: BeliefNode remains unchanged (no Range field)
+Position tracking is specified and built in [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md). This step is a consumption point only: convert Issue 103's byte-offset ranges to LSP `Position` values via `codec::byte_offset_to_location` at the protocol boundary.
 
 ### 2. Implement LSP Server with tower-lsp (1-2 days)
 
@@ -258,8 +246,8 @@ async fn main() {
   - Remove from in-memory cache
   - Clean up diagnostics
 
-**Coordination with daemon**:
-- [ ] Share `DaemonService` instance between LSP server and file watcher
+**Coordination with `noet serve`**:
+- [ ] Attach to the Issue 102 consumer registry rather than owning a compiler instance
 - [ ] Handle conflicts between editor changes and filesystem changes
 - [ ] Prioritize editor state over filesystem when document is open
 - [ ] Document synchronization semantics
@@ -374,7 +362,7 @@ async fn main() {
   
 **Goal**: Convert parse-time tracing logs to structured ParseDiagnostic for LSP integration.
   
-**Pattern**: Use instrumentation design pattern from `docs/design/instrumentation_design.md`
+**Pattern**: Use instrumentation design pattern from `docs/design/presentation/instrumentation_design.md`
   
 **Tasks**:
 1. Audit codebase for `tracing::{warn, info, debug}` calls related to parsing:
@@ -418,7 +406,7 @@ async fn main() {
 - Network-level ID collision warnings
   
 **Related**:
-- `docs/design/instrumentation_design.md` - Proven pattern
+- `docs/design/presentation/instrumentation_design.md` - Proven pattern
 - Issue 22 - Uses tracing now, marked with TODO for conversion
   
 ### 8. Documentation and Examples (0.5 days)
@@ -514,11 +502,58 @@ async fn main() {
 
 ## Open Questions
 
+0. **The ephemeral/durable annotation split is not in the design docs.**
+   `living_corpus.md` §2 distinguishes annotations from general `R` by subject
+   and volume, but assumes all annotations are written to the Issue 105 store.
+   Compiler diagnostics, inference findings, cursors, and presence are
+   annotations by that definition and must **not** be stored — they are derived
+   or transient, and persisting them defeats the volume argument that keeps the
+   store human-scale.
+
+   **The likely shape is not a new class but an existing one extended.** Issue
+   105 already defines a scope hierarchy — repo / user / shared — with union
+   read semantics and precedence governing writes. An **in-memory scope** sits
+   below repo as the most local: records live there, are readable and
+   projectable exactly like any other, and simply never persist. A diagnostic
+   does not "skip the sidecar"; it lives in the most-local sidecar and never
+   extends past it.
+
+   That reframing makes the governing mechanism a **protocol property**: what a
+   record kind does when its anchor version goes stale, and what it does on a
+   flush. Roughly:
+
+   | Kind | On stale version | On flush |
+   |---|---|---|
+   | compiler diagnostic | discard — recomputed | never promotes |
+   | cursor / presence | discard | never promotes |
+   | `{todo}` | mark stale, keep | promote to repo scope |
+   | draft / working record | keep | promote when the run closes |
+
+   Three things follow, none of which belongs to this issue alone:
+
+   - **Staleness policy is per-`protocol_id`**, declared alongside the anchor
+     scope the kind already selects (`content_versioning.md` §3). Discard,
+     retain-and-mark, and re-derive are the plausible values.
+   - **Flush is promotion between scopes**, which is also how percolation works
+     at a federation boundary (`federated_belief_network.md` §1.2 — a child run
+     promotes its `RunEnd` summary to the shared queue and keeps its working
+     records local). Same mechanism, different boundary.
+   - **Issue 102 routes all kinds identically**; the scope decides persistence,
+     not the router.
+
+   Still open: whether an ephemeral annotation projects into the compiled graph
+   or renders only at the surface. Projecting a diagnostic as a node puts derived
+   data in the graph, which §4's assert/mutate boundary argues against.
+
+   **Recommend**: `living_corpus.md` §2 gains the in-memory scope, Issue 105
+   extends its hierarchy downward, Issue 109 owns flush semantics (it already
+   owns run brackets, and a flush is a close). Raise before implementing step 4.
+
 1. **Incremental document sync in Issue 11 or defer to Issue 12?**
    - **Decision**: Defer to Issue 12. Use full-document sync (TextDocumentSyncKind::FULL) for simplicity. Most editors handle this fine for markdown documents.
 
-2. **Should LSP server share DaemonService instance or create its own?**
-   - **Decision**: Share instance. Allows coordination between filesystem changes and editor changes. Document synchronization semantics carefully.
+2. **Should LSP server share the compiler instance or create its own?**
+   - **Decision**: Share. The shared instance is now `noet serve`'s live graph (Issue 102), not a `DaemonService`. Allows coordination between filesystem changes and editor changes. Document synchronization semantics carefully.
 
 3. **How to handle documents with no BIDs yet?**
    - **Decision**: LSP works fine without BIDs. Hover shows "No BID yet" and suggests running `noet parse` to inject BIDs.
@@ -530,6 +565,13 @@ async fn main() {
    - **Decision**: For v0.2.0, document manual installation. For v0.3.0+, consider publishing to VSCode marketplace.
 
 6. **Where do per-node diagnostics and source positions live?**
+
+   > **Resolved — moved to Issue 103.** The design below is carried forward in
+   > [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md), which
+   > also corrects two details that have since gone stale: `BeliefBase.diagnostics`
+   > is already `Vec<ParseDiagnostic>` (not `Vec<String>`), and `BeliefNode` already
+   > has a `metadata` field — but a serialized, equality-participating one, not the
+   > ephemeral field proposed here. Text kept for provenance.
 
    LSP requires source ranges for diagnostics and hover. Currently `ParseDiagnostic`
    lives in `codec::diagnostic` and is produced in `codec::builder::push()`. Several
@@ -573,6 +615,13 @@ async fn main() {
    `insert_state` for current collision diagnostic wiring.
 
 7. **Are atomic (temp-file + rename) writes needed for LSP-initiated writes?**
+
+   > **Resolved — delegated to Issue 106.** Source write-back and redline promotion
+   > (Issue 106) owns the graph-edit → atomic source-file-write path. The LSP is one
+   > caller of that path, not an independent solver of it: `textDocument/didSave`
+   > and BID-injection-on-format go through Issue 106's writer, which owns both the
+   > temp-file+rename atomicity and the coordination with the watcher. The analysis
+   > below stands as the statement of the problem Issue 106 must solve.
 
    `DocumentCompiler::parse_one_path` writes directly via `tokio::fs::write` — no
    temp file, no rename (`src/codec/compiler.rs`). The watch service's
@@ -619,6 +668,10 @@ async fn main() {
 - Impact: Re-parse entire document on every change (acceptable for markdown)
 
 **Decision 3: Position tracking via BeliefNode metadata field (deferred)**
+- **Resolved — moved to Issue 103.** See
+  [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) Decision 2,
+  which carries this design forward and reconciles it with the `metadata: Table`
+  field that now exists on `BeliefNode`.
 - Date: [To be filled during implementation]
 - Rationale: Positions are integral to node identity in LSP context. A `metadata:
   HashMap<String, MetadataValue>` field excluded from serialization and equality gives
@@ -627,7 +680,7 @@ async fn main() {
 - Alternative considered: `BeliefBase.diagnostics: SharedLock<Vec<String>>` — implemented
   as a stepping stone (see `src/beliefbase/base.rs`). Works for current collision
   diagnostic forwarding but loses type structure and source position.
-- Alternative considered: `tracing` side-channel (see `docs/design/instrumentation_design.md`)
+- Alternative considered: `tracing` side-channel (see `docs/design/presentation/instrumentation_design.md`)
   — adds indirection without benefit; the LSP needs a pull model, not a log stream.
 - Alternative considered: Separate `PositionIndex` mapping BID → Range — more complex,
   requires a parallel data structure kept in sync with `BeliefBase` states.
@@ -640,10 +693,15 @@ async fn main() {
 
 ## References
  
-- **Instrumentation Pattern**: `docs/design/instrumentation_design.md` - Proven tracing-based capture system
+- **Instrumentation Pattern**: `docs/design/presentation/instrumentation_design.md` - Proven tracing-based capture system
 
-- **Depends On**: [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - daemon must be working
+- **Depends On**: Issue 102 (`noet serve`) - shared live graph, consumer registry,
+  idle boundary. Supersedes the `DaemonService` model; Issue 10
+  ([`2_completed/ISSUE_10_DAEMON_TESTING.md`](../2_completed/ISSUE_10_DAEMON_TESTING.md))
+  is completed and its daemon framing no longer applies
+- **Depends On**: [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) - node source ranges and position → BID lookup for hover and diagnostic placement
 - **Depends On**: [`ISSUE_66_INCREMENTAL_PARSE.md`](./ISSUE_66_INCREMENTAL_PARSE.md) - `last_diagnostics` accessor on `DocumentCompiler` required for `publishDiagnostics`
+- **Uses**: Issue 106 (source write-back) - atomic write path for LSP-initiated writes
 - **Enables**: [`ISSUE_12_ADVANCED_LSP.md`](./ISSUE_12_ADVANCED_LSP.md) - advanced LSP features
 - **Roadmap**: To be added to v0.2.0 section of roadmap
 - **LSP Specification**: https://microsoft.github.io/language-server-protocol/
@@ -654,11 +712,10 @@ async fn main() {
   - marksman (markdown LSP): https://github.com/artempyanykh/marksman
   - zeta-note (zettelkasten LSP): https://github.com/artempyanykh/zeta-note
 - **Code Changes**:
-  - `src/codec/builder.rs` - add position tracking in order to construct diagnostics with this information
-  - `src/codec/diagnostic.rs` - add ranges to diagnostics
-  - `src/properties.rs` - add Range to BeliefNode
-  - `src/bin/noet-lsp.rs` - new LSP server binary
+  - `src/bin/noet-lsp.rs` - new LSP server binary (or a `noet lsp` subcommand, see Decision 4)
   - `Cargo.toml` - add tower-lsp, lsp-types dependencies
+  - Note: `src/codec/builder.rs`, `src/codec/diagnostic.rs`, and `src/properties.rs`
+    changes for position tracking are Issue 103's, not this issue's
 - **New Files**:
   - `docs/lsp.md` - LSP documentation
   - `.vscode/extensions/noet/` - VSCode extension

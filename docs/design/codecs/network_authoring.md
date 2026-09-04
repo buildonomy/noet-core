@@ -369,7 +369,7 @@ name; body is empty; all children are included.
 ---
 id = "system-requirements"
 title = "System Requirements"
-text = "Functional and performance requirements for the Haven spacecraft."
+text = "Functional and performance requirements for the Widget Project."
 blacklist = ["generated/**", "archive/**"]
 ---
 
@@ -589,6 +589,6 @@ assemble-versions.sh output "Latest (main):latest" "v2.0.0:v2.0.0"
 
 - `src/codec/network.rs` — `NetworkCodec` implementation; `detect_network_file`
 - `src/codec/proto_index.rs` — `net_dir_partition`, `ProtoIndex::build`
-- `docs/design/beliefbase_architecture.md` §3.2 — codec dispatch and CLAIM_MAP
-- `docs/design/myst_directive_architecture.md` — `{network_children}` and other directives
+- `docs/design/core/beliefbase_architecture.md` §3.2 — codec dispatch and CLAIM_MAP
+- `docs/design/codecs/myst_directive_architecture.md` — `{network_children}` and other directives
 - Issue 72: Network Child Filtering — whitelist/blacklist implementation details

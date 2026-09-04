@@ -475,7 +475,7 @@ rationale = "Supports network goal"
 - [x] Comprehensive error messages for parse failures (shows all three format errors)
 - [x] YAML-specific limitations documented (anchors/aliases not supported - accepted limitation)
 - [x] All tests passing (106 tests, 17 in belief_ir including 6 new YAML tests)
-- [x] Documentation updated (`docs/design/architecture.md` § 8 added - metadata format flexibility)
+- [x] Documentation updated (`docs/design/core/architecture.md` § 8 added - metadata format flexibility)
 - [x] `serde_yaml = "0.9"` dependency added
 
 ## Risks

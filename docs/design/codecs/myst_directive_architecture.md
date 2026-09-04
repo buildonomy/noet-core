@@ -19,7 +19,7 @@ phase), and the `DocCodec` trait's `should_defer` / `generate_html` methods as t
 relate to directives.
 
 **Out of scope**: The broader codec system and multi-pass compilation model are specified
-in [`beliefbase_architecture.md`](./beliefbase_architecture.md).
+in [`beliefbase_architecture.md`](../core/beliefbase_architecture.md).
 
 ---
 
@@ -88,7 +88,7 @@ through the directive system for any known name.
 **Subject/verb/referent model**: the authoring document is always the **subject** (owner).
 The **verb** (directive name) determines which graph slot the **referent** (referenced node)
 occupies; the subject takes the complementary slot automatically. See
-`docs/design/dag_model.md` §3 for the full model.
+`docs/design/core/dag_model.md` §3 for the full model.
 
 **Detection**: `myst::parse_directive_info` handles both forms — the same function parses
 `{network_children}` from a fenced info string and `{uses}` or `{relation}kind=…` from a
@@ -531,7 +531,7 @@ Relation verbs are codespan toggle directives — they push and pop a relation c
 stack in `MdCodec`. All nine built-in verbs plus the `{end}` closer are registered in
 `DIRECTIVES` with `ref_role` and `weight_kind`; they produce no HTML output.
 
-**Verb table** (see `docs/design/dag_model.md` §3 for the subject/verb/referent model;
+**Verb table** (see `docs/design/core/dag_model.md` §3 for the subject/verb/referent model;
 `docs/design/engineering_model_ontology.md` §7.2 for normative coupling on the epistemic axis):
 
 | Verb | `weight_kind` | `ref_role` | Referent slot | Subject slot |
@@ -680,7 +680,7 @@ Document the pipeline layout (which graph index holds what) in the refiner's doc
 3. `MdCodec::parse` detects it in the `Code` arm via the bare-codespan rule (§2.2):
    relation verbs (`weight_kind.is_some()`) are always treated as directive invocations
    in bare codespan form. Dispatched to `dispatch_relation_directive`.
-4. Document the verb in `myst.rs` module doc and in `docs/design/dag_model.md` §3.
+4. Document the verb in `myst.rs` module doc and in `docs/design/core/dag_model.md` §3.
 
 ---
 
@@ -747,8 +747,8 @@ is ephemeral (dropped at the end of the builder call).
 - `docs/project/ISSUE_55_MYST_DIRECTIVE_SYNTAX.md` — original implementation issue
 - `docs/project/completed/ISSUE_71_GENERALIZE_RELATION_DIRECTIVES.md` — codespan toggle,
   derived sentinels, `ReferenceRole`, `promote_markers` removal
-- `docs/design/dag_model.md` §3 — subject/verb/referent model, `ReferenceRole` semantics
-- `docs/design/beliefbase_architecture.md` § 3.5 — `DocCodec` trait specification
-- `docs/design/architecture.md` § 11 — codec system overview
+- `docs/design/core/dag_model.md` §3 — subject/verb/referent model, `ReferenceRole` semantics
+- `docs/design/core/beliefbase_architecture.md` § 3.5 — `DocCodec` trait specification
+- `docs/design/core/architecture.md` § 11 — codec system overview
 - MyST specification: https://mystmd.org/guide/syntax-overview
 - `src/codec/md.rs` — `MAGIC_CONTINUE_ID` constant and `{#__continue}` merge logic in `MdCodec::parse`

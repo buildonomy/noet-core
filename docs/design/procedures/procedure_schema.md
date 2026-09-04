@@ -4,7 +4,7 @@ authors: "Andrew Lyjak, Gemini 2.5 Pro, Claude Code"
 last_updated: "2025-01-XX"
 status: "Active"
 version: "0.1"
-dependencies: ["intention_lattice.md (v0.1)"]
+dependencies: []
 ---
 
 # Procedure Schema

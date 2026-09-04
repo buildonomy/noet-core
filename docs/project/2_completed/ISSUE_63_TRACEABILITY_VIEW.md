@@ -8,7 +8,7 @@ title = "Issue 63: Traceability View"
 **Priority**: HIGH
 **Status**: COMPLETE (2025-07-10)
 **Estimated Effort**: 5 days (RELATIVE COMPARISON ONLY) (Actual: ~5 days)
-**Dependencies**: Mapping Node Architecture (completed, see `docs/design/mapping_node_architecture.md`)
+**Dependencies**: Mapping Node Architecture (completed, see `docs/design/codecs/mapping_node_architecture.md`)
 
 ---
 

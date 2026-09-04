@@ -127,8 +127,8 @@ The following items from the original Issue 49 are **not backlog items** — the
 
 ## References
 
-- `docs/design/search_and_sharding.md` §7 — Built-in search architecture
-- `docs/design/federated_belief_network.md` §3.6 — Federated query layer (replaces HTTP search server)
+- `docs/design/core/search_and_sharding.md` §7 — Built-in search architecture
+- `docs/design/annotation/federated_belief_network.md` §3.6 — Federated query layer (replaces HTTP search server)
 - `src/beliefbase/base.rs` — `BeliefBase` struct, lazy indexing patterns
 - Issue 54: Full-Text Search MVP (prerequisite — establishes built-in search)
 - Issue 50: BeliefBase Sharding (establishes shard loading infrastructure)

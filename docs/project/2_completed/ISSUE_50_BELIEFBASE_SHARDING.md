@@ -20,7 +20,7 @@ Replace the monolithic `beliefbase.json` export with per-network JSON shards, en
 
 ## Architecture
 
-See `docs/design/search_and_sharding.md` for the full specification, including output structure (§3.1), manifest format (§4), shard format (§5), memory budget model (§6), and WASM integration (§8).
+See `docs/design/core/search_and_sharding.md` for the full specification, including output structure (§3.1), manifest format (§4), shard format (§5), memory budget model (§6), and WASM integration (§8).
 
 ## Updates
 
@@ -103,7 +103,7 @@ See `docs/design/search_and_sharding.md` for the full specification, including o
 
 ### Phase 5: Documentation and Testing (0.5 days)
 
-- [x] README section: "BeliefBase Sharding" — how it works, threshold, network selector (moved to `docs/design/architecture.md` and `docs/design/beliefbase_architecture.md` per DOCUMENTATION_STRATEGY.md; one-liner added to README Key Features)
+- [x] README section: "BeliefBase Sharding" — how it works, threshold, network selector (moved to `docs/design/core/architecture.md` and `docs/design/core/beliefbase_architecture.md` per DOCUMENTATION_STRATEGY.md; one-liner added to README Key Features)
 - [x] Integration test: end-to-end sharded export → viewer load → navigate across networks (`test_sharded_export_writes_correct_structure`, `test_finalize_html_always_writes_search_indices`)
 - [x] Integration test: backward compat — old `beliefbase.json` still loads correctly (`test_monolithic_beliefbase_json_is_valid_belief_graph`, `test_finalize_html_monolithic_below_threshold`)
 
@@ -163,10 +163,10 @@ See `docs/design/search_and_sharding.md` for the full specification, including o
 
 ## References
 
-- `docs/design/search_and_sharding.md` — Full architecture specification (§3 output structure, §4 manifest, §5 shard format, §6 memory budget, §7 search architecture, §8 WASM integration)
-- `docs/design/search_and_sharding.md` §7 — Search index format and `search/` directory layout
-- `docs/design/beliefbase_architecture.md` §3.4 — BeliefGraph vs BeliefBase
-- `docs/design/interactive_viewer.md` — Viewer WASM integration
+- `docs/design/core/search_and_sharding.md` — Full architecture specification (§3 output structure, §4 manifest, §5 shard format, §6 memory budget, §7 search architecture, §8 WASM integration)
+- `docs/design/core/search_and_sharding.md` §7 — Search index format and `search/` directory layout
+- `docs/design/core/beliefbase_architecture.md` §3.4 — BeliefGraph vs BeliefBase
+- `docs/design/presentation/interactive_viewer.md` — Viewer WASM integration
 - `src/codec/compiler.rs::export_beliefbase_json()` — Current monolithic export
 - `src/wasm.rs::BeliefBaseWasm` — Current WASM bindings
 - Issue 47: Performance Profiling (next — creates scale-sized test fixtures)

@@ -414,5 +414,5 @@ python3 -m http.server 8888
 - `src/wasm.rs` - Lines 255-350 (WASM path methods)
 - `src/paths/path.rs` - `AnchorPath` implementation
 - `assets/viewer.js` - Lines 139-188 (new helper functions)
-- `docs/design/interactive_viewer.md` - Navigation architecture
+- `docs/design/presentation/interactive_viewer.md` - Navigation architecture
 - `.scratchpad/path_operations_audit.md` - Detailed audit findings

@@ -3,7 +3,7 @@
 **Priority**: MEDIUM - Final step before v0.1.0 public release  
 **Estimated Effort**: 2-3 days  
 **Dependencies**: Issues 5-8 complete (docs, quality, tests, repo ready)  
-**Context**: Release gate — publishes crate to crates.io and announces. See [`ROADMAP.md`](./ROADMAP.md).
+**Context**: Release gate — publishes crate to crates.io and announces. See [`ROADMAP.md`](../ROADMAP.md).
 
 ## Summary
 
@@ -297,7 +297,7 @@ noet-core = "0.1.0"
 
 - 📚 [API Documentation](https://docs.rs/noet-core)
 - 🎓 [Examples](https://github.com/alyjak/noet-core/tree/main/examples)
-- 🏗️ [Architecture Guide](https://github.com/alyjak/noet-core/blob/main/docs/architecture.md)
+- 🏗️ [Architecture Guide](https://github.com/alyjak/noet-core/blob/main/docs/design/core/architecture.md)
 
 ## Quick Example
 

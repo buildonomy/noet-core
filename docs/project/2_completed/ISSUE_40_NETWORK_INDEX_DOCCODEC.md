@@ -180,7 +180,7 @@ fn generate_html(&mut self, script: Option<&str>, use_cdn: bool)
 ### 4. Documentation Updates (30 minutes)
 
 **Files to update**:
-- `docs/design/interactive_viewer.md`: Note network indices use same template
+- `docs/design/presentation/interactive_viewer.md`: Note network indices use same template
 - `ISSUE_06_HTML_GENERATION.md`: Archive with note about refactoring
 - `ROADMAP.md`: Mark ISSUE_40 complete
 

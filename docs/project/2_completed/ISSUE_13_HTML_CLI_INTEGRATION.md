@@ -45,7 +45,7 @@ following this doc as a reference rather than history:
 - Current HTML-generation architecture (codec-level `generate_html()`,
   two-registry codec dispatch, sharded/msgpack export) is documented in the
   Updates section of `ISSUE_06_HTML_GENERATION.md` and in
-  `docs/design/interactive_viewer.md` / `docs/design/search_and_sharding.md`.
+  `docs/design/presentation/interactive_viewer.md` / `docs/design/core/search_and_sharding.md`.
 
 ## Goals
 
@@ -478,7 +478,7 @@ async fn serve_html(output_dir: PathBuf, port: u16) {
 - **Depends On**: 
   - [`ISSUE_06_HTML_GENERATION.md`](./ISSUE_06_HTML_GENERATION.md) - HTML generation basics
   - [`ISSUE_10_DAEMON_TESTING.md`](./ISSUE_10_DAEMON_TESTING.md) - CLI and daemon infrastructure
-- **Roadmap**: [`ROADMAP.md`](./ROADMAP.md) - project history and vision
+- **Roadmap**: [`ROADMAP.md`](../ROADMAP.md) - project history and vision
 - **Integration**: Bridges Issues 1-4 (clean markdown) with Issue 6 (HTML generation)
 - **Static Site Generators** (inspiration):
   - mdBook: https://github.com/rust-lang/mdBook

@@ -29,7 +29,7 @@ A design review determined that every field needed for search (`title`, `payload
 
 **Issue 49** (originally "Full-Text Search Production") has been converted to a backlog brainstorm of post-MVP enhancements (stemming, boolean queries, phrase search, ranking boosts). Its event-driven indexing is automatic under the built-in model, and its HTTP search server is superseded by the federated `BeliefSource` architecture (see `federated_belief_network.md` §3.6).
 
-**Architecture**: See `docs/design/search_and_sharding.md` for the unified design.
+**Architecture**: See `docs/design/core/search_and_sharding.md` for the unified design.
 
 **Implementation sequence**: Issue 50 → Issue 47 (perf profiling for scale fixtures) → Issue 54. BeliefBase sharding first establishes the shared infrastructure (export hooks, viewer UI, memory budget), performance profiling creates scale-sized test fixtures, then built-in search layers on top.
 
@@ -440,7 +440,7 @@ CI/CD Pipeline:
 
 - **Trade Study**: `docs/project/trades/TEXT_SEARCH_INDEXER.md` - Comparison of search options
 - **Tantivy**: https://github.com/quickwit-oss/tantivy
-- **BeliefBase Architecture**: `docs/design/beliefbase_architecture.md` - § 3.4 BeliefGraph export
+- **BeliefBase Architecture**: `docs/design/core/beliefbase_architecture.md` - § 3.4 BeliefGraph export
 - **Compiler**: `src/codec/compiler.rs::finalize_html()` - Integration point
 - **ISSUE_41**: Query Builder UI (text search integration)
 - **ISSUE_39**: Interactive viewer (SPA frontend)

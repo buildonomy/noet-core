@@ -14,7 +14,7 @@ Parse and manipulate markdown links to use relative paths (universal renderer co
 
 ## Updates
 
-### 2026-08-27: Title-attribute format finalized as `bref://`, not `noet:`; see `docs/design/link_format.md`
+### 2026-08-27: Title-attribute format finalized as `bref://`, not `noet:`; see `docs/design/identity/link_format.md`
 
 Much of the *early* Architecture/Goals text in this issue (Format 1–4 examples,
 `RefConfig`/`process_link_title`/`update_bref_in_config`/`rebuild_title` pseudocode,
@@ -23,7 +23,7 @@ a design that was superseded **during this same issue's implementation** — see
 "Design Decisions Made" (Q1) further down this document, which already records the
 switch to the `bref://abc123` URL-style format. That later section, not the early
 Architecture section, reflects what shipped. The canonical, currently-accurate spec
-for the link format is `docs/design/link_format.md`, and the current implementation
+for the link format is `docs/design/identity/link_format.md`, and the current implementation
 lives in `parse_title_attribute()` / `build_title_attribute()` in `src/codec/md.rs`
 (confirmed present and matching the `bref://[bref] [{json config}] [user words]`
 format, e.g. `"bref://abc123 {\"auto_title\":true} My Note"`).

@@ -1075,7 +1075,12 @@ pub struct BeliefNode {
     /// DB `metadata` column so it survives the full parse → DB → export → browser round-trip.
     /// Never appears in source files: `generate_source` is driven by the markdown event
     /// stream and `IRNode::as_frontmatter`, neither of which reads `BeliefNode::metadata`.
-    /// Included in `PartialEq` so merges and `compute_diff` propagate it correctly.
+    ///
+    /// Included in `PartialEq` so `compute_diff` emits a `NodeUpdate` for a metadata-only
+    /// change and the value reaches the DB. Note that `PartialEq` inclusion is a delivery
+    /// mechanism, not a claim that metadata is part of node identity: `merge` deliberately
+    /// does **not** touch this field, and `apply_source_update` explicitly preserves it.
+    /// See `BeliefNode::merge` for why.
     #[serde(default)]
     #[serde(skip_serializing_if = "Table::is_empty")]
     pub metadata: Table,
@@ -1319,6 +1324,32 @@ impl BeliefNode {
         ids
     }
 
+    /// Merge source-derived fields from `rhs` into `self`, returning whether anything
+    /// changed.
+    ///
+    /// Fields merged: `bid`, `title`, `kind` (set union, with a `Trace` strip when either
+    /// side is complete), `schema`, and `payload` (per-key union, rhs wins on conflict).
+    ///
+    /// Two fields are deliberately **not** merged:
+    ///
+    /// - **`id`**: `NodeId::Collision` is assigned FIRST-ONE-WINS by the builder
+    ///   (`builder.rs`, `BeliefBase::insert_state`). Letting a merge overwrite `id` would
+    ///   clobber an already-resolved collision.
+    /// - **`metadata`**: runtime-only annotations (git status, `source_url`, directive
+    ///   caches) that never originate from the rhs on any live path. The sole caller
+    ///   (`push()` in `builder.rs`) builds its rhs via `BeliefNode::try_from(&IRNode)`,
+    ///   which hard-codes an empty metadata table, while `self` is a cache hit that may
+    ///   carry live annotations. Any rule that let rhs win would erase them. This mirrors
+    ///   `apply_source_update`, which preserves `metadata` for the same reason.
+    ///
+    /// Consequence worth knowing: because `metadata` participates in `PartialEq` but not
+    /// here, two nodes differing only in metadata compare unequal while `merge` reports
+    /// no change. That is consistent given the empty-rhs invariant above; it would not be
+    /// if a caller ever passed populated metadata. `test_irnode_conversion_yields_empty_metadata`
+    /// guards that invariant. See `docs/design/identity/content_versioning.md` §5.1a before
+    /// introducing metadata merge semantics — observations, directive caches, and
+    /// authoring state plausibly want different rules, so a single blanket rule is
+    /// unlikely to be correct.
     pub fn merge(&mut self, rhs: &BeliefNode) -> bool {
         let mut changed = false;
         if self.bid != rhs.bid {
@@ -1675,89 +1706,6 @@ impl IntoWeightedEdge<WeightSet> for BeliefRelation {
     }
 }
 
-/// Express the intended participant experience for a BeliefBase rendering.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, uniffi::Enum)]
-pub enum RenderMode {
-    #[default]
-    Execute,
-    Edit,
-    Presentation,
-    Graph,
-}
-
-impl Display for RenderMode {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl TryFrom<&str> for RenderMode {
-    type Error = BuildonomyError;
-
-    fn try_from(string: &str) -> Result<Self, Self::Error> {
-        match string {
-            "Edit" => Ok(RenderMode::Edit),
-            "Execute" => Ok(RenderMode::Execute),
-            "Presentation" => Ok(RenderMode::Presentation),
-            "Graph" => Ok(RenderMode::Graph),
-            _ => Err(BuildonomyError::Command(format!(
-                "Unknown RenderMode '{string}'"
-            ))),
-        }
-    }
-}
-
-/// Represents the current state of an `AsRun` procedure execution.
-#[derive(Debug, Serialize, Deserialize, PartialOrd, Ord, Hash, EnumSetType, uniffi::Enum)]
-#[enumset(repr = "u32")]
-pub enum AsRunState {
-    Running,
-    Failed,
-    Redlined,
-    Inventory,
-}
-
-type AsRunStateSet = EnumSet<AsRunState>;
-// Use `Uuid` as a custom type, with `String` as the Builtin
-uniffi::custom_type!(AsRunStateSet, u64, {
-    remote,
-    try_lift: |val| Ok(EnumSet::from_u64(val)),
-    lower: |obj| obj.as_u64()
-});
-
-impl Display for AsRunState {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-// #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-// pub struct AsRunHandle {
-//     pub hid: Bid,
-//     pub path: String,
-//     pub proc: Bid,
-//     pub version: u32,
-// }
-
-/// Represents a running instance of a procedure document.
-///
-/// This struct captures the full context of a procedure's execution, including
-/// the network it belongs to, its path, the specific procedure `Bid`, its
-/// content, and its current state. It is used to track the dynamic state of a
-/// procedure as a participant interacts with it.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, uniffi::Record)]
-pub struct AsRun {
-    pub net: Bid,
-    pub doc_path: String,
-    pub anchor: Bid,
-    pub proc: Bid,
-    pub doc: String,
-    pub state: EnumSet<AsRunState>,
-    pub content: String,
-    // pub log: Vec<PerceptionEvent>,
-    pub mode: RenderMode,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2019,6 +1967,91 @@ mod tests {
             vec!["new_path1.md".to_string(), "new_path2.md".to_string()]
         );
     }
+    /// `merge` does not touch `metadata` — the receiver's metadata is preserved
+    /// verbatim and a metadata-only difference does not mark the merge as changed.
+    ///
+    /// This is a characterization test, not an aspiration. The single caller
+    /// (`builder.rs` `push()`) always passes an rhs built by
+    /// `BeliefNode::try_from(&IRNode)`, which hard-codes `metadata: Table::new()`.
+    /// The receiver, by contrast, is a cache hit that may legitimately carry
+    /// `source_url`, `git`, or directive caches. Merging an always-empty rhs into
+    /// it under any union rule that lets rhs win would erase live annotations, so
+    /// "leave metadata alone" is the behaviour that keeps that path correct.
+    ///
+    /// If a future caller passes an rhs with populated metadata, this test should
+    /// be revisited alongside `content_versioning.md` §5.1a — observations,
+    /// directive caches, and authoring state plausibly want different merge rules.
+    #[test]
+    fn test_merge_leaves_metadata_untouched() {
+        let bid = Bid::new(Bid::nil());
+        let base_node = |metadata: Table| BeliefNode {
+            bid,
+            kind: crate::properties::BeliefKind::Document.into(),
+            title: "Guide".to_string(),
+            schema: None,
+            payload: Table::new(),
+            id: NodeId::Explicit("guide".to_string()),
+            metadata,
+        };
+
+        let mut lhs_metadata = Table::new();
+        lhs_metadata.insert(
+            "source_url".to_string(),
+            Value::String("https://github.com/org/repo/blob/main/docs/guide.md".to_string()),
+        );
+        let mut lhs = base_node(lhs_metadata.clone());
+
+        // The real-world shape: rhs is IRNode-derived, so its metadata is empty.
+        let rhs = base_node(Table::new());
+        assert_ne!(lhs, rhs, "PartialEq must see the metadata difference");
+
+        let changed = lhs.merge(&rhs);
+        assert!(
+            !changed,
+            "a metadata-only difference is not reported as a change"
+        );
+        assert_eq!(
+            lhs.metadata, lhs_metadata,
+            "receiver metadata must survive a merge with an empty-metadata rhs"
+        );
+
+        // The converse direction: rhs metadata is not propagated into the receiver.
+        let mut empty_lhs = base_node(Table::new());
+        let populated_rhs = base_node(lhs_metadata);
+        let changed = empty_lhs.merge(&populated_rhs);
+        assert!(!changed);
+        assert!(
+            empty_lhs.metadata.is_empty(),
+            "merge does not propagate rhs metadata; see doc comment for why this \
+             is currently unreachable"
+        );
+    }
+
+    /// The invariant the above test leans on: the only production rhs source for
+    /// `merge` yields empty metadata. If this ever fails, `merge`'s metadata
+    /// behaviour becomes reachable and must be designed rather than characterized.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_irnode_conversion_yields_empty_metadata() {
+        // Even if metadata somehow reaches IRNode.document, conversion must strip it.
+        let proto = <IRNode as std::str::FromStr>::from_str(
+            "title = \"Guide\"\n\
+             [metadata]\n\
+             source_url = \"https://example.com/guide.md\"\n",
+        )
+        .expect("IRNode parses");
+
+        let node = BeliefNode::try_from(&proto).expect("conversion succeeds");
+        assert!(
+            node.metadata.is_empty(),
+            "IRNode→BeliefNode must never populate metadata"
+        );
+        assert!(
+            !node.payload.contains_key("metadata"),
+            "metadata must not bleed into payload"
+        );
+    }
+
     #[test]
     fn test_belief_node_metadata_serde_round_trip_json() {
         // metadata must survive a JSON round-trip (the beliefbase.json → browser path).

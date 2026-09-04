@@ -95,7 +95,7 @@ use enumset::EnumSet;
 /// - `Sink`: referent is the graph sink (ocean); subject is the source (tributary).
 ///   Links push to `IRNode::downstream`.
 ///
-/// See `docs/design/dag_model.md` §3 for the full subject/verb/referent model.
+/// See `docs/design/core/dag_model.md` §3 for the full subject/verb/referent model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceRole {
     /// Referent is the graph source → subject is sink → links go to `upstream`.

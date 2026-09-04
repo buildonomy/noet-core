@@ -12,8 +12,8 @@ first gives 80/81/82 the clean `source.eval(&spec)` API from day one.
 ## Summary
 
 `QuerySpec` is the query primitive — the canonical representation of what to
-query (see `docs/design/query_model.md` §3–§7 for the three-component model
-and `docs/design/dag_model.md` §4 for the video-camera analogy that motivates
+query (see `docs/design/core/query_model.md` §3–§7 for the three-component model
+and `docs/design/core/dag_model.md` §4 for the video-camera analogy that motivates
 it). `Expression`, `eval_query`, `balance`, and `submap` are implementation
 details of specific evaluation strategies (DB, in-memory). Currently
 `BeliefSource` exposes these details as the trait API, forcing every consumer
@@ -929,17 +929,17 @@ Each phase is independently committable and testable.
          call in `noet-core/src/mcp/tools.rs` (fixed — was missed
          in Phase 7a). The downstream crate compiles and tests pass
          against the Phase 8 working tree.
-   - [x] `docs/design/beliefbase_architecture.md` — §3.5
+   - [x] `docs/design/core/beliefbase_architecture.md` — §3.5
          (`BeliefGraph` vs `BeliefBase` updated for `QueryPackage`),
          §3.8 (Query Cost Model: `View::Graph` → balanced
          `QueryPackage`). 6 edits total.
-   - [x] `docs/design/query_model.md` — §9.5.9 (MCP surface
+   - [x] `docs/design/core/query_model.md` — §9.5.9 (MCP surface
          binding updated to `QuerySpec` JSON), §10 (Implementation
          Notes: `QuerySpec` as sole primitive, no Expression
          lowering), §10.1 (trait summary table: 5 methods with
          BoxFuture), §10.2 (Deleted Constructs reorganized into
          categorized groups). 4 sections updated.
-   - [x] `docs/design/dag_model.md` — §4 and §6 verified:
+   - [x] `docs/design/core/dag_model.md` — §4 and §6 verified:
          no stale references, uses abstract language consistent
          with `QuerySpec` as primitive. No changes needed.
    - [x] `docs/architecture.md` — verified: high-level overview

@@ -182,7 +182,7 @@
 //! - Two-cache architecture (`self.doc_bb` vs `session_bb`)
 //! - Link resolution protocol and relative path handling
 //!
-//! See `docs/design/beliefbase_architecture.md` (Section 3.2: The Codec System).
+//! See `docs/design/core/beliefbase_architecture.md` (Section 3.2: The Codec System).
 //!
 
 use once_cell::sync::Lazy;

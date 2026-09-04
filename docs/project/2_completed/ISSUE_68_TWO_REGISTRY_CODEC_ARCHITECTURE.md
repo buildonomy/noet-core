@@ -450,8 +450,8 @@ has a lower count than its children and is therefore processed first within any 
     - [ ] AGENTS.md / CONTRIBUTING.md claiming-pattern note — deferred
 
 12. **Design doc updates** (0.25 day)
-    - [x] `docs/design/beliefbase_architecture.md` §3.0 and §3.2 updated: `Source Files` line extended to include `.yaml`; WALK_CODECS/CLAIM_MAP callout block replaced with current description; new §3.2 subsection "Two-Registry Codec Dispatch" added
-    - [ ] `docs/design/architecture.md` §11 — deferred
+    - [x] `docs/design/core/beliefbase_architecture.md` §3.0 and §3.2 updated: `Source Files` line extended to include `.yaml`; WALK_CODECS/CLAIM_MAP callout block replaced with current description; new §3.2 subsection "Two-Registry Codec Dispatch" added
+    - [ ] `docs/design/core/architecture.md` §11 — deferred
 
 ## Testing Requirements
 

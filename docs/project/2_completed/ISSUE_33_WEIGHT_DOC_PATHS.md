@@ -277,7 +277,7 @@ if !paths.contains(&new_path) {
 
 ### Architecture References
 
-- `docs/design/beliefbase_architecture.md` - Relations and weights
+- `docs/design/core/beliefbase_architecture.md` - Relations and weights
 - `src/paths.rs` - PathMap implementation
 - `src/properties.rs` - Weight structure
 

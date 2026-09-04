@@ -26,8 +26,8 @@
  *
  * ## References
  *
- * - docs/design/search_and_sharding.md §6 — Memory budget model
- * - docs/design/search_and_sharding.md §8 — WASM integration
+ * - docs/design/core/search_and_sharding.md §6 — Memory budget model
+ * - docs/design/core/search_and_sharding.md §8 — WASM integration
  * - Issue 50: BeliefBase Sharding
  * - Issue 54: Full-Text Search MVP (consumes searchIndex)
  */

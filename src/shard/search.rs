@@ -58,8 +58,8 @@
 //!
 //! ## References
 //!
-//! - `docs/design/search_and_sharding.md` §7.2 — Index format
-//! - `docs/design/search_and_sharding.md` §7.3 — Index building algorithm
+//! - `docs/design/core/search_and_sharding.md` §7.2 — Index format
+//! - `docs/design/core/search_and_sharding.md` §7.3 — Index building algorithm
 //! - Issue 50: BeliefBase Sharding (generates the files)
 //! - Issue 54: Full-Text Search MVP (deserializes and queries the `.idx.msgpack` files)
 
@@ -360,7 +360,7 @@ pub struct IndexedDoc {
 /// side (Issue 54) deserializes this and runs TF-IDF queries against it —
 /// no index construction happens in the browser.
 ///
-/// See `docs/design/search_and_sharding.md` §7.2 for the index schema.
+/// See `docs/design/core/search_and_sharding.md` §7.2 for the index schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchIndex {
     /// Short reference (5 hex chars) of the network this index covers.

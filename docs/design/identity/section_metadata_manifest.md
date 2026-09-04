@@ -413,5 +413,5 @@ docs/guide.metadata.toml  # Section metadata
 
 - Issue 02: Section Metadata Enrichment (Implementation)
 - `src/codec/md.rs`: MdCodec implementation
-- `docs/design/beliefbase_architecture.md` § 2.2: Identity Management
-- `docs/design/beliefbase_architecture.md` § 3.5: DocCodec Interface
+- `docs/design/core/beliefbase_architecture.md` § 2.2: Identity Management
+- `docs/design/core/beliefbase_architecture.md` § 3.5: DocCodec Interface

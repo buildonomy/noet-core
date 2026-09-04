@@ -1,6 +1,6 @@
 # Contributing to noet-core
 
-Thank you for your interest in contributing! This guide follows the principle of [smooth iterative deepening](docs/design/smooth_iterative_deepening.md) - start simple, deepen as needed.
+Thank you for your interest in contributing! This guide follows the principle of [smooth iterative deepening](docs/essays/smooth_iterative_deepening.md) - start simple, deepen as needed.
 
 ## Quick Start
 
@@ -229,6 +229,6 @@ Contributors are recognized in:
 
 ---
 
-**Philosophy**: This project follows [smooth iterative deepening](docs/design/smooth_iterative_deepening.md). Documentation should be brief with links to deeper material. Start simple, deepen iteratively.
+**Philosophy**: This project follows [smooth iterative deepening](docs/essays/smooth_iterative_deepening.md). Documentation should be brief with links to deeper material. Start simple, deepen iteratively.
 
 Thank you for contributing! 🎉

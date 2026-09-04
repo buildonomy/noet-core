@@ -3,7 +3,7 @@
 // This module defines the QuerySpec unified pipeline model: a single
 // Vec<ProjectionStep> where the seed (starting BID set) is expressed as a
 // TapeFn variant on a step's input.
-// See docs/design/query_model.md §3–§7 for the formal model.
+// See docs/design/core/query_model.md §3–§7 for the formal model.
 //
 // Evaluation is handled by the query evaluator (see evaluator.rs).
 

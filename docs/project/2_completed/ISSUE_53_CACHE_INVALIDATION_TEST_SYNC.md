@@ -3,7 +3,7 @@
 **Priority**: HIGH
 **Estimated Effort**: 2 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: None (partially unblocked by the path-canonicalization fix in `src/db.rs`)
-**See Also**: [`docs/design/federated_belief_network.md`](../design/federated_belief_network.md) — the `commit_generation` counter introduced here is the seed of the Layer 2 sequence number described in that design doc.
+**See Also**: [`docs/design/annotation/federated_belief_network.md`](../../design/annotation/federated_belief_network.md) — the `commit_generation` counter introduced here is the seed of the Layer 2 sequence number described in that design doc.
 
 ## Summary
 

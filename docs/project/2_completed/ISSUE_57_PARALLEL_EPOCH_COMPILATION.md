@@ -430,7 +430,7 @@ assigned the batch-boundary semantics directly:
   a cross-layer mismatch worse than the current consistent-but-wrong state.
   → **Fix**: append trailing slash to `net_path` / `stack_path` before
   `strip_prefix`; use `AnchorPath::new_dir` for the `starts_with` filter at
-  `get_parent_from_stack` L1032. See `docs/design/beliefbase_architecture.md`
+  `get_parent_from_stack` L1032. See `docs/design/core/beliefbase_architecture.md`
   section 2.2 "Network Node Dual-Path Representation".
 
 - **`BeliefBase` no-op `EpochDrain` in integration test** (ACTIVE BUG — fix

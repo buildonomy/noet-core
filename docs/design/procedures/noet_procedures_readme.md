@@ -2,7 +2,7 @@
 title = "noet-procedures: Observable, Auditable, Event-Driven Procedures"
 authors = "Andrew Lyjak, Claude"
 last_updated = "2025-01-24"
-status = "Active"
+status = "Withdrawn model — positioning argument retained"
 version = "0.1"
 dependencies = []
 ---
@@ -10,6 +10,31 @@ dependencies = []
 # noet-procedures
 
 **Observable, auditable, event-driven procedure execution for any domain.**
+
+> [!WARNING]
+> **This document describes a withdrawn model.** It is a positioning and
+> comparison document — noet-procedures against Jupyter, Airflow, and Terraform
+> — written against the three-piece as-run model (template / executor context /
+> as-run record) as three bespoke types. **That model is withdrawn.**
+> `ObservationEvent`, `CorrectionEvent`, `ProcedureRun`, `ExecutionRecord`, and
+> `DeviationReport` do not exist and will not be built under those names, and
+> there is no `noet_procedures` crate to import.
+>
+> **The current model** is `docs/design/annotation/living_corpus.md` §2 and
+> `docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` → "What Was
+> Removed and Why": **an annotation *is* an as-run record**; a run is the set of
+> annotations sharing a `RunStart` ancestor — a *query* over the annotation
+> store, not a type; and **an event is an annotation subtype**, a registered
+> `protocol_id` with a payload schema rather than a Rust type.
+>
+> **What survives is the argument, not the API.** The separation of intention
+> from execution, the observability critique of embedded-computation notebooks,
+> and the unified treatment of sensor / system / participant observations are all
+> reaffirmed by the current model — an append-only annotation store *is* the
+> "complete audit trail" this document claims. The Rust snippets and type names
+> are stale; the comparison tables are not. Affected passages are marked inline.
+>
+> No replacement execution design exists yet; Issue 18 is an aspirational stub.
 
 ## What is this?
 
@@ -70,6 +95,11 @@ When sample.csv appears, load and analyze it.
 1. **BeliefBase** (compiled structure): WHAT to do, relationships between nodes
 2. **Procedure Engine** (runtime): Watches event streams, matches patterns
 3. **As-Run Record** (audit trail): What ACTUALLY happened vs. template
+
+> Under the current model piece 3 is not a separate artifact: the as-run record
+> *is* the annotation store, and "the record for this run" is a query over it
+> keyed on `run_id` (`living_corpus.md` §2; Issue 109). The three-way split below
+> is presentational, not structural.
 
 **As-Run Record**:
 ```
@@ -285,6 +315,11 @@ Procedure Engine:
 
 ### 3. Reality (As-Run Record)
 
+> Presentational. This is what a *fold* over the run's annotations renders as —
+> not a stored object. `run_id` partitions the store, the template reference is
+> a `NodeVersionRef` (Issue 105), and each deviation line is an annotation
+> carrying a registered `protocol_id` (Issue 17 step 2a).
+
 Complete audit trail with deviations:
 
 ```
@@ -328,6 +363,12 @@ stores_in_variable = "temp_reading"
 ```
 
 ### Observation Channels Enable Arbitrary Computation
+
+> [!NOTE]
+> The argument in this subsection survives; its `ObservationEvent` literals do
+> not. Every occurrence below denotes an **annotation** carrying a registered
+> `protocol_id` and a payload — `references_run` is `run_id`, and the
+> "contributed to" link is `caused_by` (`beliefbase_architecture.md` §4.3).
 
 **Key insight**: Observation channels provide the same computational power as Jupyter cells, but with observability.
 
@@ -430,6 +471,7 @@ impl AnalyticsChannel {
                 let plot = generate_visualization(results);
                 
                 // Emit: Send back to procedure engine
+                // WITHDRAWN TYPE: `ObservationEvent` -> an annotation record
                 self.emit_observation(ObservationEvent {
                     channel: "Analytics",
                     producer: "StatisticalAnalysis",
@@ -503,6 +545,27 @@ Unlike Jupyter (mutable but opaque), noet-procedures provides **mutable executio
 
 ### The Redline Channel
 
+> [!CAUTION]
+> **Two things here are withdrawn, and one is an inverted layering.**
+>
+> 1. `CorrectionEvent` does not exist. A redline is an **annotation subtype** —
+>    a registered `protocol_id` whose payload proposes a change to the node it
+>    anchors. **Issue 17 step 2a** registers it; **Issue 106** promotes one into
+>    a source edit over **Issue 107**'s write-back path.
+> 2. "Injects `BeliefEvent`s to modify the loaded BeliefBase" **inverts the
+>    assert/mutate boundary.** An annotation is a *claim* requiring
+>    interpretation; a `BeliefEvent` is an *instruction* the store applies
+>    directly. Assertions project into mutations, never the reverse, and the
+>    fold is the only bridge — no channel writes `BeliefEvent`s directly, and
+>    none is "privileged" in the sense of bypassing interpretation
+>    (`living_corpus.md` §4; `beliefbase_architecture.md` §4.3). The overlay a
+>    fold produces is a *held-out* BeliefBase, not a mutation of the compiled
+>    one (`living_corpus.md` §2).
+>
+> The **key features** listed below — attribution on every deviation, executor
+> correction, promotion of consistent patterns, complete audit trail — all hold
+> under the current model. Only the mechanism described here is wrong.
+
 The redline system is a **privileged observable channel** that can inject BeliefEvents to modify the loaded BeliefBase:
 
 ```
@@ -514,11 +577,11 @@ Reality (as-run):
   Step 3 ✓ (Step 2 skipped)
   
 Redline Event (recorded):
-  CorrectionEvent {
+  CorrectionEvent {                       // WITHDRAWN TYPE
     type: "step_skipped",
     step: "Step 2",
     executor_note: "Step 2 automated last week",
-    timestamp: "2025-01-24T10:30:00Z"
+    timestamp: "2025-01-24T10:30:00Z"     // -> Envelope.observed_at
   }
 ```
 
@@ -669,6 +732,11 @@ noet-procedures is **domain-agnostic**. It does not assume:
 
 ## Extension Points
 
+> [!NOTE]
+> The trait *shapes* below are unaffected by the withdrawal; only
+> `ObservationEvent` is stale. Read it as an annotation record (`Envelope` +
+> payload) whose `protocol_id` marks it as an observation.
+
 Products extend noet-procedures by implementing:
 
 ### 1. Observation Producers
@@ -689,7 +757,7 @@ Examples: Barcode scanners, temperature sensors, GPS, system monitors, UI framew
 ```rust
 trait InferenceEngine {
     fn register_pattern(&mut self, node_bid: Bid, hint: InferenceHint);
-    fn process_observation(&mut self, event: ObservationEvent);
+    fn process_observation(&mut self, event: ObservationEvent);  // WITHDRAWN TYPE
     fn emit_action_detected(&self, detection: ActionDetection);
 }
 ```
@@ -701,7 +769,7 @@ Responsibilities: Pattern matching, confidence scoring, semantic label resolutio
 ```rust
 trait ParticipantRenderer {
     fn render_observation_request(&self, step: &BeliefNode) -> Result<()>;
-    fn collect_response(&self) -> Result<ObservationEvent>;
+    fn collect_response(&self) -> Result<ObservationEvent>;  // WITHDRAWN TYPE
 }
 ```
 
@@ -735,7 +803,16 @@ Uses BeliefNode title and text for prompt content
 
 ## Getting Started
 
+> [!CAUTION]
+> **Aspirational — none of this API exists.** There is no `noet_procedures`
+> crate: Issue 17 ships the procedure codec as a module *inside* noet-core, with
+> crate extraction deferred to Issue 95. `ObservationEvent` and the run objects
+> returned by `completed_runs` are withdrawn types, and `run.deviations` presumes
+> a stored run record where the current model has a query over annotations keyed
+> on `run_id` (Issue 109). Retained to show the intended ergonomics only.
+
 ```rust
+// WITHDRAWN: illustrative only; this crate and these types do not exist.
 use noet_procedures::{ProcedureEngine, ObservationEvent};
 
 // Load procedures from lattice
@@ -767,10 +844,28 @@ for run in runs {
 
 ## Learn More
 
-- **Observable Action Schema**: `docs/design/action_observable_schema.md`
-- **Procedure Execution**: `docs/design/procedure_execution.md`
-- **Redline System**: `docs/design/redline_system.md`
-- **Procedure Schema**: `docs/design/procedure_schema.md`
+**Current model** (read these first):
+
+- **The Living Corpus**: `docs/design/annotation/living_corpus.md` §2 — the three-layer
+  model; an annotation *is* an as-run record
+- **Event system**: `docs/design/core/beliefbase_architecture.md` §4.3 — `Envelope` +
+  `Annotation`; assert vs. mutate
+- **Issue 17**: `docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` —
+  the procedure codec, the `steps` schema, and the procedural annotation
+  subtypes; "What Was Removed and Why"
+- **Issues 104 / 105 / 109** — record field set, record store, run bracketing
+  and folding
+
+**Withdrawn framing, retained for requirements:**
+
+- **Procedure Execution**: `docs/design/procedures/procedure_execution.md`
+- **Redline System**: `docs/design/procedures/redline_system.md`
+- **Observable Action Schema**: `docs/design/procedures/action_observable_schema.md`
+  (schema half sound; execution integration withdrawn)
+
+**Unaffected:**
+
+- **Procedure Schema**: `docs/design/procedures/procedure_schema.md`
 
 ## License
 

@@ -504,7 +504,7 @@ struct ExportHtmlArgs {
 ## References
 
 - Issue 06: HTML Generation and Interactive Viewer
-- `docs/design/architecture.md` - BeliefNode payload structure
-- `docs/design/beliefbase_architecture.md` - Network node specification
+- `docs/design/core/architecture.md` - BeliefNode payload structure
+- `docs/design/core/beliefbase_architecture.md` - Network node specification
 - Jekyll themes: https://jekyllrb.com/docs/themes/
 - CSS Scoping: https://developer.mozilla.org/en-US/docs/Web/CSS/Attribute_selectors

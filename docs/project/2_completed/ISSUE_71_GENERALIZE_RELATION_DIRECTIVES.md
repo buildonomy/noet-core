@@ -30,7 +30,7 @@ over all affected documents and will migrate them as part of this effort.
 
 ### 2026-08-27: Doc/registry drift
 
-- `docs/design/myst_directive_architecture.md` has since been updated to reflect the codespan toggle model (§2.2, §3, §4.3, §6.3) — the "pending" note in Completion Notes above is stale.
+- `docs/design/codecs/myst_directive_architecture.md` has since been updated to reflect the codespan toggle model (§2.2, §3, §4.3, §6.3) — the "pending" note in Completion Notes above is stale.
 - Registry now has 10 verb entries (`uses`, `implements`, `used_by`, `draws_from`, `underlies`, `constrained_by`, `constrains`, `consists_of`, `composed_of`, `component_of`), not seven — `constrained_by`/`constrains` and `composed_of` were added after this issue closed.
 
 ## Goals
@@ -392,8 +392,8 @@ self-owned relation directives). `in_implements_block: bool` is removed entirely
 - `src/codec/md.rs` — `MdCodec`, `dispatch_relation_directive`, `session_verb_registry`,
   `relation_context_stack`, `build_title_attribute` (extended with `rel`), `render_html_body`
 - `src/codec/builder.rs` — `push_relation`, `Direction::Incoming/Outgoing` semantics
-- `docs/design/dag_model.md` — source/sink/reference_role terminology (corrected §2, §3)
-- `docs/design/myst_directive_architecture.md` — needs update (pending)
-- `docs/design/query_model.md` §4.2 — projection direction semantics
+- `docs/design/core/dag_model.md` — source/sink/reference_role terminology (corrected §2, §3)
+- `docs/design/codecs/myst_directive_architecture.md` — needs update (pending)
+- `docs/design/core/query_model.md` §4.2 — projection direction semantics
 - `docs/mcp.md` — WeightKind × direction × verb table
 - Issue 58: Inline `{implements}` Role — subsumed/closed

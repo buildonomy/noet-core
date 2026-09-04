@@ -199,7 +199,7 @@ impl ServerHandler for BeliefBaseServer {
             Tool::new(
                 "query",
                 "Execute a query against the BeliefBase using the textual grammar. \
-                 See docs/design/query_model.md §9.5 for syntax. \
+                 See docs/design/core/query_model.md §9.5 for syntax. \
                  Examples: \"id://my-network composed_of(*)\", \
                  \"title:auth AND schema:procedure\", \
                  \"id:class-a uses(1) NOT id:class-b uses(1)\".",
