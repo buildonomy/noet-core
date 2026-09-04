@@ -914,6 +914,19 @@ pub(crate) fn build_listing_html(
             // Only render documents, not file contents
             continue;
         }
+        if edge.root_path_is_bref() {
+            // A bref is not an addressable location — see
+            // `ExtendedRelation::root_path_is_bref`. Rendering it as an href would
+            // emit a link to a path that cannot exist. Unlike the source-rewrite
+            // path in `md.rs` this is regenerated output, so skipping is safe and
+            // self-correcting once the node gains a real path.
+            tracing::debug!(
+                "[build_listing_html] skipping child {} — root_path is its own bref, \
+                 not an addressable location",
+                edge.other.bid,
+            );
+            continue;
+        }
         let link_ap = AnchorPath::from(&edge.root_path);
         // Convert the source path to its HTML equivalent before computing a relative link.
         let html_path = if CODECS.get(&link_ap).is_some()

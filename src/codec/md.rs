@@ -590,12 +590,40 @@ fn check_for_link_and_push(
             // Parse the title attribute to check for existing Bref
             let title_parts = parse_title_attribute(link_data.title.as_ref());
 
-            // Determine the key to use for matching
-            // If title attribute contains a Bref, prioritize it
-            let key = if let Some(bref) = &title_parts.bref {
-                NodeKey::Bref { bref: *bref }
+            // Determine the key to use for matching.
+            //
+            // If the title attribute contains a Bref, try it first as an optimization
+            // — but distrust it if it fails to resolve, or if it resolves to an
+            // External+Trace stub (e.g. an href-alias stub that has since been
+            // absorbed into its claimant, but whose bref survived in this file's
+            // stale on-disk title attribute). In either case, fall through to the
+            // same URL-derivation path used when no bref is present at all, so the
+            // link converges to whatever `ctx.beliefbase()` currently believes.
+            //
+            // Without this, a citation that raced an alias-claim and got rewritten
+            // to point at the stub (see .scratchpad/url_alias_resolution_gap.md,
+            // "Bug 2") stays wrong forever: the stub gets absorbed and deleted, but
+            // nothing ever re-examines the embedded bref against the current graph
+            // state, so the dangling reference is re-emitted unchanged on every
+            // subsequent parse. This check is deliberately namespace-agnostic —
+            // External+Trace is the same stub shape the write-side absorption logic
+            // in `push()` (builder.rs) checks — not specific to href-derived links.
+            //
+            // Ordinary internal cross-references (not href/URL-derived) are
+            // unaffected: a renamed target still resolves to a real (non-External)
+            // node via NodeKey::Bref and keeps the existing bref-priority behavior.
+            let bref_key = title_parts.bref.map(|bref| NodeKey::Bref { bref });
+            let bref_is_trustworthy = bref_key.as_ref().is_some_and(|key| {
+                ctx.beliefbase().get(key).is_some_and(|n| {
+                    !(n.kind.contains(BeliefKind::External) && n.kind.contains(BeliefKind::Trace))
+                })
+            });
+
+            let key = if bref_is_trustworthy {
+                bref_key.expect("bref_is_trustworthy implies bref_key is Some")
             } else {
-                // Otherwise parse from normalized dest_url
+                // Otherwise parse from normalized dest_url. This is the same branch
+                // taken when there was never a bref present at all.
                 let title = CowStr::from(link_text.clone());
                 let parsed_keys = link_to_relation(
                     &link_data.link_type,
@@ -897,7 +925,27 @@ fn check_for_link_and_push(
                     &keys[0],
                     NodeKey::Path { net, .. } if *net == href_namespace().bref()
                 );
-                let relative_path = if relation.home_net == href_namespace() {
+                // A bref is never a valid link destination — see
+                // `ExtendedRelation::root_path_is_bref`. This check is first so that
+                // no branch below can route a bref into the href, and because doing
+                // so here is irreversible: this rewrite is written back to the
+                // author's source file, and the URL it would overwrite is the only
+                // copy from which the link could later be re-derived.
+                let root_path_is_bref = relation.root_path_is_bref();
+                if root_path_is_bref {
+                    tracing::debug!(
+                        "[check_for_link_and_push] link target {} has no addressable path \
+                         (root_path is its own bref); preserving the authored destination \
+                         {:?} rather than writing a bref into the link",
+                        relation.other.bid,
+                        link_data.rel_url,
+                    );
+                }
+
+                let relative_path = if root_path_is_bref {
+                    // Nothing addressable to point at — keep what the author wrote.
+                    link_data.rel_url.to_string()
+                } else if relation.home_net == href_namespace() {
                     relation.root_path.clone()
                 } else if is_href_aliased_link {
                     // href-aliased link: the content node was resolved via its URL

@@ -213,6 +213,28 @@ pub struct DocumentCompiler {
     /// When None, the global CLAIM_MAP is used.
     #[cfg(not(target_arch = "wasm32"))]
     claim_map: Option<Arc<crate::codec::ClaimMap>>,
+    /// Absorbed BID -> claimant, accumulated across the whole `parse_sequential`
+    /// run. Mirrors `AccInner::absorbed_to_claimant` in `beliefbase/accumulator.rs`
+    /// (same cross-batch lifetime rationale: a deterministic href-stub BID can be
+    /// re-minted in a later batch and needs redirecting without re-resolving).
+    /// `parse_sequential` has no `AccInner` of its own to hold this, since it never
+    /// goes through `BeliefAccumulator` — see `apply_absorbing_batch` in
+    /// `beliefbase/accumulator.rs`, called once per `drain_rx!` invocation.
+    absorbed_to_claimant: BTreeMap<Bid, Bid>,
+    /// BID -> absolute path for every document node this compile has parsed.
+    ///
+    /// `requeue_reparse_bids` receives BIDs from the accumulator and must turn
+    /// them back into paths to enqueue. It used to do that solely via
+    /// `session_bb`'s PathMap, which works sequentially (where `run_one!` mutates
+    /// the compiler's own `session_bb`) but **not** under `--jobs > 1`: a parallel
+    /// task parses into a private copy-on-write `session_bb` clone, so the
+    /// document's path registration reaches `global_bb` through the event channel
+    /// and never the compiler's `session_bb`. The lookup missed, the requeue was
+    /// silently dropped, and the citing document was never reparsed.
+    ///
+    /// Recording the mapping as each parse result is processed removes the lookup
+    /// dependency entirely — the compiler already holds both halves at that point.
+    parsed_node_paths: BTreeMap<Bid, PathBuf>,
 }
 
 /// Result of parsing a single document
@@ -352,6 +374,8 @@ impl DocumentCompiler {
             progress: ProgressReporter::disabled(),
             #[cfg(not(target_arch = "wasm32"))]
             claim_map: None::<Arc<crate::codec::ClaimMap>>,
+            absorbed_to_claimant: BTreeMap::new(),
+            parsed_node_paths: BTreeMap::new(),
         })
     }
 
@@ -431,6 +455,8 @@ impl DocumentCompiler {
             progress: ProgressReporter::disabled(),
             #[cfg(not(target_arch = "wasm32"))]
             claim_map: None::<Arc<crate::codec::ClaimMap>>,
+            absorbed_to_claimant: BTreeMap::new(),
+            parsed_node_paths: BTreeMap::new(),
         })
     }
 
@@ -670,6 +696,21 @@ impl DocumentCompiler {
             Ok(with_codec) => {
                 let (mut parse_result, codec) = (with_codec.result, with_codec.codec);
                 let is_asset = codec.is_asset_codec();
+
+                // Record BID -> path for every node this file produced, so a later
+                // requeue can resolve a citing BID without depending on the
+                // compiler's session_bb (which parallel tasks never write to).
+                // See `parsed_node_paths`.
+                for proto in codec.nodes() {
+                    if let Some(bid) = proto
+                        .document
+                        .get("bid")
+                        .and_then(|v| v.as_str())
+                        .and_then(|b| Bid::try_from(b).ok())
+                    {
+                        self.parsed_node_paths.insert(bid, path.clone());
+                    }
+                }
 
                 // HTML generation — only active when an html_output_dir is configured.
                 if let Some(html_dir) = &self.html_output_dir.clone() {
@@ -1219,7 +1260,26 @@ impl DocumentCompiler {
                         batch.push(evt);
                     }
                     if !batch.is_empty() {
-                        global_bb.apply_batch(&batch).await?;
+                        // Route through apply_absorbing_batch (not a bare
+                        // apply_batch) so parse_sequential gets the same
+                        // merge-key/absorption handling as parse_all's
+                        // EpochDrain path — including reparse-bid tracking
+                        // for citing documents that raced an absorption
+                        // within this batch. See
+                        // `.scratchpad/url_alias_resolution_gap.md` part (C).
+                        let reparse_bids = crate::beliefbase::accumulator::apply_absorbing_batch(
+                            &mut batch,
+                            global_bb,
+                            &mut self.absorbed_to_claimant,
+                        )
+                        .await?;
+                        // Same reason as parse_all's call site: session_bb never
+                        // learns of absorptions on its own, and a retired stub left
+                        // there keeps winning cache_fetch's StackCache probe. Apply
+                        // before the requeue so requeued documents reparse against a
+                        // cleaned session_bb.
+                        self.apply_absorptions_to_session_map()?;
+                        self.requeue_reparse_bid_set(reparse_bids)?;
                     }
                 }
                 // Note: global_bb is &mut so apply_batch mutations propagate to
@@ -1470,6 +1530,12 @@ impl DocumentCompiler {
                     self.sync_asset_snapshot(&cached_global_bb).await?;
                     self.process_epoch_batch_results(vec![root_result], &mut repo_seeded)
                         .await?;
+                    // Requeue AFTER process_epoch_batch_results: it calls
+                    // remove_from_queues for every path in the just-processed batch,
+                    // which would otherwise strip a citing document requeued here right
+                    // back out when that document is itself a member of this batch.
+                    self.apply_absorptions_to_session(&cached_global_bb).await?;
+                    self.requeue_reparse_bids(&cached_global_bb).await?;
                 }
             }
         }
@@ -1558,6 +1624,10 @@ impl DocumentCompiler {
             self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(results, &mut repo_seeded)
                 .await?;
+            // See comment at the pre-epoch call site above: must run after
+            // process_epoch_batch_results, not before.
+            self.apply_absorptions_to_session(&cached_global_bb).await?;
+            self.requeue_reparse_bids(&cached_global_bb).await?;
         }
 
         // ── Epoch 0, Phase 2: all leaf documents across all networks ─────────
@@ -1607,6 +1677,10 @@ impl DocumentCompiler {
             self.sync_asset_snapshot(&cached_global_bb).await?;
             self.process_epoch_batch_results(leaf_results, &mut repo_seeded)
                 .await?;
+            // See comment at the pre-epoch call site above: must run after
+            // process_epoch_batch_results, not before.
+            self.apply_absorptions_to_session(&cached_global_bb).await?;
+            self.requeue_reparse_bids(&cached_global_bb).await?;
         }
 
         // Seed remainder_queue with cached assets from session_bb not yet processed.
@@ -1727,6 +1801,10 @@ impl DocumentCompiler {
                 self.sync_asset_snapshot(&cached_global_bb).await?;
                 self.process_epoch_batch_results(all_asset_results, &mut repo_seeded)
                     .await?;
+                // See comment at the pre-epoch call site above: must run after
+                // process_epoch_batch_results, not before.
+                self.apply_absorptions_to_session(&cached_global_bb).await?;
+                self.requeue_reparse_bids(&cached_global_bb).await?;
             }
 
             // Sub-epoch B: document re-parses. global_bb now contains asset BIDs committed
@@ -1748,6 +1826,10 @@ impl DocumentCompiler {
                 self.sync_asset_snapshot(&cached_global_bb).await?;
                 self.process_epoch_batch_results(reparse_results, &mut repo_seeded)
                     .await?;
+                // See comment at the pre-epoch call site above: must run after
+                // process_epoch_batch_results, not before.
+                self.apply_absorptions_to_session(&cached_global_bb).await?;
+                self.requeue_reparse_bids(&cached_global_bb).await?;
             }
         }
 
@@ -2700,6 +2782,188 @@ impl DocumentCompiler {
                     ns_graph.states.len().saturating_sub(1), // -1 for the namespace node itself
                     ns_bid
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve BIDs returned by `EpochDrain::take_reparse_bids` to absolute
+    /// filesystem paths and push them into `remainder_queue` for reparse.
+    ///
+    /// Call this after `sync_asset_snapshot`/`sync_subnet_stubs` (i.e. once
+    /// `session_bb` reflects the post-absorption state) at every `drain_epoch()`
+    /// call site. See `AccInner::reparse_bids` and `.scratchpad/url_alias_resolution_gap.md`
+    /// for why this exists: a citing document's Phase 4 link-rewrite can race an
+    /// alias-claim absorption within the same epoch batch, and this closes that
+    /// gap within the same compile rather than requiring a second `parse_all` call.
+    ///
+    /// **Must be called AFTER `process_epoch_batch_results` for the same batch**,
+    /// not before. `process_epoch_batch_results` -> `process_one_parse_result`
+    /// calls `remove_from_queues` for every path in the batch just processed; the
+    /// citing document that needs reparsing is frequently a member of that very
+    /// batch (its Phase 4 rewrite is what raced the absorption in the first
+    /// place), so requeuing it before that cleanup runs gets it silently evicted
+    /// again in the same breath.
+    ///
+    /// Silently skips a BID that cannot be resolved to a path in `session_bb` —
+    /// this happens for legitimate non-citing endpoints picked up incidentally
+    /// (e.g. a network node), and a missed requeue here degrades to the
+    /// already-correct "self-heals on next compile" behaviour rather than losing
+    /// data.
+    async fn requeue_reparse_bids<B: EpochDrain>(
+        &mut self,
+        global_bb: &B,
+    ) -> Result<(), BuildonomyError> {
+        let reparse_bids = global_bb.take_reparse_bids().await;
+        self.requeue_reparse_bid_set(reparse_bids)
+    }
+
+    /// Replay the accumulator's absorptions into `self.builder.session_bb`.
+    ///
+    /// `session_bb` is a pure *producer* of the belief-event stream: it emits
+    /// events through `terminate_stack -> tx -> BeliefAccumulator -> global_bb`
+    /// and never consumes anything coming back. Absorption, however, is resolved
+    /// on the far side of that channel — `resolve_merge_keys` synthesizes the
+    /// `NodeRenamed`/`NodesRemoved` pair against `global_bb`. The result is that
+    /// `global_bb` converges correctly while `session_bb` keeps the retired stub
+    /// for the remainder of the run.
+    ///
+    /// That stale stub is not inert. `cache_fetch`'s StackCache probe consults
+    /// `session_bb` before falling through to `global_bb`, and its filter
+    /// (`External || !Trace`) deliberately admits `External` nodes — so a retired
+    /// href stub is accepted as a valid hit and returned in preference to the
+    /// claimant that absorbed it. The citing document then keeps its edge to the
+    /// stub, re-emits it, and the duplicate path is recreated on the next PathMap
+    /// rebuild. Self-sustaining: see `.scratchpad/url_alias_resolution_gap.md`.
+    ///
+    /// Applying the rename to `session_bb` closes the loop. `NodeRenamed` is the
+    /// right event: `BeliefBase::process_event` routes it to `replace_bid`, which
+    /// re-points incident edges onto the claimant and deletes the stub, and
+    /// `PathMapMap::process_node_renamed` remaps the path bookkeeping — both
+    /// already correct, simply never previously invoked here.
+    ///
+    /// The absorption map is cumulative rather than drained, so this is
+    /// idempotent: a BID already absorbed out of `session_bb` is absent and
+    /// `replace_bid` is a no-op for it. That is deliberate — an href stub's BID is
+    /// deterministic (UUIDv5 of the URL), so a later epoch can re-mint the very
+    /// same BID, and it must be re-absorbed when it does.
+    async fn apply_absorptions_to_session<B: EpochDrain>(
+        &mut self,
+        global_bb: &B,
+    ) -> Result<(), BuildonomyError> {
+        let absorbed = global_bb.absorbed_to_claimant().await;
+        self.apply_absorption_map(&absorbed)
+    }
+
+    /// [`apply_absorptions_to_session`] for `parse_sequential`, which owns its
+    /// absorption map directly (`self.absorbed_to_claimant`) rather than reading
+    /// it back through an [`EpochDrain`].
+    fn apply_absorptions_to_session_map(&mut self) -> Result<(), BuildonomyError> {
+        let absorbed = std::mem::take(&mut self.absorbed_to_claimant);
+        let res = self.apply_absorption_map(&absorbed);
+        self.absorbed_to_claimant = absorbed;
+        res
+    }
+
+    /// Shared core: retire every absorbed BID still present in `session_bb`.
+    fn apply_absorption_map(
+        &mut self,
+        absorbed: &BTreeMap<Bid, Bid>,
+    ) -> Result<(), BuildonomyError> {
+        if absorbed.is_empty() {
+            return Ok(());
+        }
+        let session = self.builder.session_bb_mut();
+        let mut applied = 0usize;
+        for (absorbed_bid, claimant) in absorbed {
+            // Only act when session_bb actually still holds the stub *and* knows
+            // the claimant: `replace_bid` asserts the target is present.
+            if session.states().contains_key(absorbed_bid)
+                && session.states().contains_key(claimant)
+            {
+                session.process_event(&BeliefEvent::NodeRenamed(
+                    *absorbed_bid,
+                    *claimant,
+                    EventOrigin::Remote,
+                ))?;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            tracing::debug!(
+                "[apply_absorptions_to_session] retired {applied} absorbed node(s) from \
+                 session_bb (of {} known absorptions)",
+                absorbed.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Shared resolve-and-push core for [`requeue_reparse_bids`]. Split out so
+    /// `parse_sequential`'s `drain_rx!` macro (which gets its reparse-bid set
+    /// directly from `apply_absorbing_batch` rather than an `EpochDrain`) can
+    /// reuse the exact same path-resolution logic. See `requeue_reparse_bids`'s
+    /// doc comment for the full rationale and ordering constraint.
+    fn requeue_reparse_bid_set(
+        &mut self,
+        reparse_bids: std::collections::BTreeSet<Bid>,
+    ) -> Result<(), BuildonomyError> {
+        if !reparse_bids.is_empty() {
+            tracing::debug!(
+                "[requeue_reparse_bids] took {} reparse bid(s): {:?}",
+                reparse_bids.len(),
+                reparse_bids
+            );
+        }
+        if reparse_bids.is_empty() {
+            return Ok(());
+        }
+        let repo_root = self.builder.repo_root().to_path_buf();
+        let repo_bref = self.builder.repo().bref();
+        for bid in reparse_bids {
+            // Prefer the compiler's own record of what it parsed. Under `--jobs > 1`
+            // the citing document was parsed in a spawned task whose `session_bb` is
+            // a private copy-on-write clone, so its path never reaches the PathMap
+            // consulted below — the lookup missed and the requeue was dropped,
+            // leaving the stale citation on disk with no reparse to correct it.
+            // See `parsed_node_paths`.
+            let abs_path = if let Some(known) = self.parsed_node_paths.get(&bid) {
+                known.clone()
+            } else {
+                // Fall back to the PathMap for BIDs this compile did not itself
+                // parse (e.g. nodes carried in from a previous run's cache).
+                //
+                // Resolve relative to the repo root's own PathMap specifically (not
+                // `PathMapMap::path`, which may pick whichever network's PathMap
+                // resolves the bid "best" and is not guaranteed to be repo-root-relative).
+                // `net_path` on the root net crosses subnet boundaries internally
+                // (see `PathMap::path`'s docstring), so this is correct for nested subnets too.
+                let pmm = self.builder.session_bb().paths();
+                let Some((_home_net, rel_path)) = pmm.net_path(&repo_bref, &bid) else {
+                    tracing::debug!(
+                        "[requeue_reparse_bids] could not resolve citing bid {bid} to a path \
+                         (not parsed by this compile, and absent from session_bb); \
+                         will self-heal on next compile instead"
+                    );
+                    continue;
+                };
+                let resolved =
+                    Self::normalize_queue_path(repo_root.join(string_to_os_path(&rel_path)));
+                drop(pmm);
+                resolved
+            };
+            // Unlike the initial-discovery enqueue sites, deliberately do NOT check
+            // `self.processed` here: this citing document has, by construction,
+            // already been parsed at least once (that parse is what raced the
+            // absorption) and its `processed` entry is always non-zero. The
+            // reparse-count / max_reparse_count guard in `process_one_parse_result`
+            // is what still protects against runaway loops.
+            if !self.remainder_queue.contains(&abs_path) {
+                tracing::debug!(
+                    "[requeue_reparse_bids] requeuing citing document {abs_path:?} \
+                     (bid={bid}) whose Phase 4 rewrite may have raced an absorption"
+                );
+                self.remainder_queue.push_back(abs_path);
             }
         }
         Ok(())

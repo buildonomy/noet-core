@@ -214,11 +214,38 @@ struct AccInner<S> {
     /// without re-resolving anything. Bounded by the number of absorptions in a
     /// compile (tens on a corpus of ~1,100 nodes), so it is not worth evicting.
     absorbed_to_claimant: BTreeMap<Bid, Bid>,
+    /// BIDs of documents that cited a BID absorbed by this compile, accumulated
+    /// across every batch since the last [`AccInner::take_reparse_bids`] call.
+    ///
+    /// Populated by `expand_renames`: whenever an absorbed BID's incident edge is
+    /// re-pointed onto its claimant, the edge's other endpoint is a citing node
+    /// whose already-written Phase 4 link rewrite may have raced the absorption. The compiler
+    /// drains this set after every `drain_epoch()` and requeues the corresponding
+    /// paths so the citation gets a chance to re-resolve against the post-absorption
+    /// graph, within the same compile rather than waiting for the next one.
+    reparse_bids: BTreeSet<Bid>,
     /// Number of calls to drain_with_census
     drain_count: usize,
 }
 
 impl<S: BeliefSink + BeliefSource> AccInner<S> {
+    /// Drain and return the accumulated set of citing BIDs that need reparsing,
+    /// clearing it for the next epoch. See [`AccInner::reparse_bids`] for why
+    /// these accumulate.
+    fn take_reparse_bids(&mut self) -> BTreeSet<Bid> {
+        std::mem::take(&mut self.reparse_bids)
+    }
+
+    /// Snapshot every absorption performed so far this compile.
+    ///
+    /// Unlike [`AccInner::take_reparse_bids`] this does **not** drain: the map is
+    /// deliberately cumulative (see [`AccInner::absorbed_to_claimant`]) and the
+    /// compiler needs to be able to re-apply the full set to a `session_bb` that
+    /// may have re-minted a previously-absorbed stub in a later epoch.
+    fn absorbed_to_claimant(&self) -> BTreeMap<Bid, Bid> {
+        self.absorbed_to_claimant.clone()
+    }
+
     /// Drain all events currently available in `rx` without blocking.
     ///
     /// Semantics per event:
@@ -312,9 +339,13 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
             }
             BeliefEvent::BatchEnd => {
                 let mut sorted = std::mem::take(&mut self.pending);
-                resolve_merge_keys(&mut sorted, &self.inner, &mut self.absorbed_to_claimant).await;
-                prepare_batch(&mut sorted);
-                self.inner.apply_batch(&sorted).await?;
+                let new_reparse_bids = apply_absorbing_batch(
+                    &mut sorted,
+                    &mut self.inner,
+                    &mut self.absorbed_to_claimant,
+                )
+                .await?;
+                self.reparse_bids.extend(new_reparse_bids);
                 // pending is now empty (moved into `sorted`, which is dropped here)
                 self.in_batch = false;
                 cache.clear();
@@ -338,6 +369,33 @@ impl<S: BeliefSink + BeliefSource> AccInner<S> {
         }
         Ok(())
     }
+}
+
+/// Resolve absorption for one already-collected batch of events and apply it to
+/// `sink`, returning the set of citing BIDs that need reparsing (see
+/// [`AccInner::reparse_bids`] for why that set exists).
+///
+/// This is the shared core of [`AccInner::handle_event`]'s `BatchEnd` arm,
+/// extracted so [`DocumentCompiler::parse_sequential`](crate::codec::compiler::DocumentCompiler::parse_sequential)
+/// can drive the same absorption machinery as [`BeliefAccumulator`] without
+/// going through the `BatchStart`/`BatchEnd`/channel apparatus at all.
+/// `parse_sequential` has no `AccInner` to hold `absorbed_to_claimant` across
+/// calls, so the caller owns and threads that map itself (see
+/// `DocumentCompiler::absorbed_to_claimant`).
+///
+/// Order matches `handle_event`'s `BatchEnd` arm exactly: `resolve_merge_keys`
+/// (which also runs `expand_renames` internally) before `prepare_batch`, then
+/// `sink.apply_batch`.
+pub(crate) async fn apply_absorbing_batch<S: BeliefSource + BeliefSink>(
+    events: &mut Vec<BeliefEvent>,
+    sink: &mut S,
+    absorbed_to_claimant: &mut BTreeMap<Bid, Bid>,
+) -> Result<BTreeSet<Bid>, BuildonomyError> {
+    let mut reparse_bids = BTreeSet::new();
+    resolve_merge_keys(events, sink, absorbed_to_claimant, &mut reparse_bids).await;
+    prepare_batch(events);
+    sink.apply_batch(events).await?;
+    Ok(reparse_bids)
 }
 
 /// Resolve `NodeUpdate` merge keys into explicit `NodeRenamed` + `NodesRemoved`
@@ -410,6 +468,7 @@ async fn resolve_merge_keys<S: BeliefSource>(
     events: &mut Vec<BeliefEvent>,
     inner: &S,
     absorbed_to_claimant: &mut BTreeMap<Bid, Bid>,
+    reparse_bids: &mut BTreeSet<Bid>,
 ) {
     // Cheap pre-pass: most batches carry no absorbing key at all. A key that
     // names its own node is a self-reference (the overwhelmingly common case —
@@ -602,6 +661,22 @@ async fn resolve_merge_keys<S: BeliefSource>(
     // collapsed two events into one, so only these need unioning below.
     let mut redirected_pairs: HashSet<(Bid, Bid)> = HashSet::new();
     for event in events.iter_mut() {
+        // Only a *live* edge (RelationUpdate/RelationChange) still naming the
+        // absorbed BID indicates a citation that needs re-resolving. A
+        // RelationRemoved is ordinary cleanup housekeeping — `terminate_stack`'s
+        // compute_diff emits one for the citing document's *own* stale edge once
+        // its reparse has already fixed the reference (see (B) requeue mechanism
+        // above). Treating that removal as a fresh "needs requeue" signal creates
+        // a self-perpetuating loop: the same citing BID gets flagged again on
+        // every subsequent batch's cleanup, forever, until max_reparse_count
+        // truncates it — confirmed via tracing during (B) validation (4 parses
+        // observed where 2 were expected, with the href flip-flopping between
+        // the original URL and a stale relative path on alternating passes).
+        // Computed before the mutable match below borrows `event`'s fields.
+        let is_live_edge = matches!(
+            &*event,
+            BeliefEvent::RelationUpdate(..) | BeliefEvent::RelationChange(..)
+        );
         match event {
             BeliefEvent::RelationUpdate(source, sink, _, _)
             | BeliefEvent::RelationChange(source, sink, _, _, _)
@@ -612,6 +687,26 @@ async fn resolve_merge_keys<S: BeliefSource>(
                 if before_src != *source || before_snk != *sink {
                     rewritten += 1;
                     redirected_pairs.insert((*source, *sink));
+                    if is_live_edge {
+                        // The endpoint that did NOT change is a citing node whose
+                        // Phase 4 link-rewrite may already have run against the
+                        // pre-absorption graph this same epoch (the intra-epoch
+                        // race). Collect it for the compiler to requeue, same
+                        // rationale and exclusions as the citing-BID collection in
+                        // `expand_renames` (skip the claimant itself and
+                        // constant-namespace hub nodes).
+                        let citing = if before_src != *source {
+                            before_snk
+                        } else {
+                            before_src
+                        };
+                        if !absorbed_to_claimant.contains_key(&citing)
+                            && !claimants.contains(&citing)
+                            && !crate::properties::const_namespaces().contains(&citing)
+                        {
+                            reparse_bids.insert(citing);
+                        }
+                    }
                 }
             }
             BeliefEvent::PathAdded(_, _, target, _, _)
@@ -704,7 +799,7 @@ async fn resolve_merge_keys<S: BeliefSource>(
     // The rewrite above only touches events this batch happens to carry. Edges
     // that live solely in the backing store are invisible to it, and re-pointing
     // those is what the expansion does.
-    expand_renames(events, inner).await;
+    expand_renames(events, inner, reparse_bids).await;
 }
 
 /// Rewrite every `NodeRenamed` in a batch into the explicit edge events it
@@ -739,7 +834,11 @@ async fn resolve_merge_keys<S: BeliefSource>(
 /// Two queries for a whole corpus parse, against one per absorption.
 ///
 /// [`lookup_edges`]: crate::query::lookup_edges
-async fn expand_renames<S: BeliefSource>(events: &mut Vec<BeliefEvent>, inner: &S) {
+async fn expand_renames<S: BeliefSource>(
+    events: &mut Vec<BeliefEvent>,
+    inner: &S,
+    reparse_bids: &mut BTreeSet<Bid>,
+) {
     let renames: Vec<(Bid, Bid)> = events
         .iter()
         .filter_map(|e| match e {
@@ -815,6 +914,19 @@ async fn expand_renames<S: BeliefSource>(events: &mut Vec<BeliefEvent>, inner: &
         for ((source, sink), ws) in incident {
             let new_source = if source == *from { *to } else { source };
             let new_sink = if sink == *from { *to } else { sink };
+
+            // The endpoint that is NOT the absorbed BID is a citing node whose
+            // Phase 4 link-rewrite may have already run against the pre-absorption
+            // graph. Collect
+            // it for the compiler to requeue — but only when it is a genuine citing
+            // document, not the claimant itself (its own edge moving is expected,
+            // not a signal that it needs reparsing) or a constant-namespace hub node
+            // (href_namespace/asset_namespace/etc., which is a structural anchor,
+            // never a document with a Phase 4 rewrite of its own).
+            let citing = if source == *from { sink } else { source };
+            if citing != *to && !crate::properties::const_namespaces().contains(&citing) {
+                reparse_bids.insert(citing);
+            }
 
             // An edge between the two renamed nodes collapses to a self-loop:
             // meaningless to either sink, and rejected by the unique index.
@@ -981,6 +1093,7 @@ where
                 pending: Vec::new(),
                 in_batch: false,
                 absorbed_to_claimant: BTreeMap::new(),
+                reparse_bids: BTreeSet::new(),
                 drain_count: 0,
             })),
             cache: Arc::new(AccCache::new()),
@@ -1183,6 +1296,30 @@ pub struct QueryHandle<S: BeliefSource + BeliefSink> {
 /// canonical handle, holds this bound.
 pub trait EpochDrain {
     fn drain_epoch(&self) -> impl std::future::Future<Output = Result<(), BuildonomyError>> + Send;
+
+    /// Drain and return the set of BIDs that cited a node absorbed during the
+    /// epoch(s) since the last call, clearing the accumulated set.
+    ///
+    /// Call this after [`EpochDrain::drain_epoch`] to discover documents whose
+    /// Phase 4 link-rewrite may have raced an absorption within the same batchs
+    /// and requeue them
+    /// for reparse. Backends with no absorption machinery of their own (anything
+    /// that isn't backed by a [`BeliefAccumulator`]) return an empty set.
+    fn take_reparse_bids(&self) -> impl std::future::Future<Output = BTreeSet<Bid>> + Send {
+        async { BTreeSet::new() }
+    }
+
+    /// Every absorption (absorbed BID -> claimant) performed so far this compile.
+    ///
+    /// The compiler applies these to its own `session_bb`, which is otherwise a
+    /// pure *producer* of the event stream and never learns that a node it minted
+    /// has been retired. See `DocumentCompiler::apply_absorptions_to_session`.
+    ///
+    /// Cumulative, not drained — a stub can be re-minted in a later epoch, and
+    /// re-applying a no-longer-present absorption is a cheap no-op.
+    fn absorbed_to_claimant(&self) -> impl std::future::Future<Output = BTreeMap<Bid, Bid>> + Send {
+        async { BTreeMap::new() }
+    }
 }
 
 impl<S> EpochDrain for QueryHandle<S>
@@ -1206,6 +1343,22 @@ where
             // never see stale cached results across an epoch boundary.
             cache.clear();
             Ok(())
+        }
+    }
+
+    fn take_reparse_bids(&self) -> impl std::future::Future<Output = BTreeSet<Bid>> + Send {
+        let acc = Arc::clone(&self.acc);
+        async move {
+            let mut guard = acc.write().await;
+            guard.take_reparse_bids()
+        }
+    }
+
+    fn absorbed_to_claimant(&self) -> impl std::future::Future<Output = BTreeMap<Bid, Bid>> + Send {
+        let acc = Arc::clone(&self.acc);
+        async move {
+            let guard = acc.read().await;
+            guard.absorbed_to_claimant()
         }
     }
 }
@@ -1843,7 +1996,8 @@ mod tests {
     /// carry one map across calls.
     async fn resolve_one_batch<S: BeliefSource>(events: &mut Vec<BeliefEvent>, store: &S) {
         let mut absorbed = BTreeMap::new();
-        resolve_merge_keys(events, store, &mut absorbed).await;
+        let mut reparse = BTreeSet::new();
+        resolve_merge_keys(events, store, &mut absorbed, &mut reparse).await;
     }
 
     /// Collect (from, to) pairs from every `NodeRenamed` in a batch.
@@ -2091,6 +2245,39 @@ mod tests {
         );
     }
 
+    /// The endpoint that survives an in-batch redirect is collected as a
+    /// citing BID needing reparse — covering the actual repro shape for Bug 1
+    /// (both citing and claiming document land in the same epoch batch).
+    #[tokio::test]
+    async fn in_batch_redirect_collects_citing_bid_for_reparse() {
+        let store = CountingStore::new();
+        let stub = test_bid(1);
+        let claimant = test_bid(2);
+        let citing_doc = test_bid(3);
+
+        let mut events = vec![
+            node_update(stub, vec![NodeKey::Bid { bid: stub }]),
+            node_update(claimant, vec![NodeKey::Bid { bid: stub }]),
+            // citing_doc's own Phase 4 rewrite already emitted a citation edge to
+            // the stub, in this same batch (the intra-epoch race).
+            BeliefEvent::RelationUpdate(
+                citing_doc,
+                stub,
+                crate::properties::WeightSet::default(),
+                EventOrigin::Remote,
+            ),
+        ];
+        let mut absorbed = BTreeMap::new();
+        let mut reparse = BTreeSet::new();
+        resolve_merge_keys(&mut events, &store, &mut absorbed, &mut reparse).await;
+
+        assert_eq!(
+            reparse,
+            BTreeSet::from([citing_doc]),
+            "the citing document (not the claimant or the stub) should be queued for reparse"
+        );
+    }
+
     /// The absorbed node's own `NodeUpdate` must be dropped from the batch.
     ///
     /// Regression: absorptions usually resolve against the *pending* set, so the
@@ -2178,13 +2365,14 @@ mod tests {
         let claimant = test_bid(2);
         let neighbour = test_bid(3);
         let mut absorbed = BTreeMap::new();
+        let mut reparse = BTreeSet::new();
 
         // Epoch 1: the claiming document absorbs the stub.
         let mut batch1 = vec![
             node_update(stub, vec![NodeKey::Bid { bid: stub }]),
             node_update(claimant, vec![NodeKey::Bid { bid: stub }]),
         ];
-        resolve_merge_keys(&mut batch1, &store, &mut absorbed).await;
+        resolve_merge_keys(&mut batch1, &store, &mut absorbed, &mut reparse).await;
         assert_eq!(renames_in(&batch1), vec![(stub, claimant)]);
 
         // Epoch 2: a second document cites the same URL. `ensure_href_entry`
@@ -2199,7 +2387,7 @@ mod tests {
                 EventOrigin::Remote,
             ),
         ];
-        resolve_merge_keys(&mut batch2, &store, &mut absorbed).await;
+        resolve_merge_keys(&mut batch2, &store, &mut absorbed, &mut reparse).await;
 
         assert!(
             !batch2

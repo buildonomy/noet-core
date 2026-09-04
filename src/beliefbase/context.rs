@@ -70,6 +70,28 @@ pub struct ExtendedRelation<'a> {
 }
 
 impl<'a> ExtendedRelation<'a> {
+    /// Whether `root_path` is this node's own bref rather than a real location.
+    ///
+    /// `PathMap`'s `generate_terminal_path` falls back to a node's id when it has
+    /// no explicit path, and for anchor-collision losers that id *is* the bref
+    /// (deliberately — `inject_context` writes the same bref into the rendered
+    /// HTML heading, so the PathMap must agree). A bref is therefore a legitimate
+    /// *path component*, but it is never a legitimate **link target**: nothing can
+    /// navigate to it, and `NodeKey::from_str` parses a bare bref token as
+    /// `NodeKey::Bref`, not as a path.
+    ///
+    /// Any code that turns a `root_path` into a URL, href, or `dest_url` must
+    /// check this first and fall back to something addressable. Writing a bref
+    /// into a *source* file's link destination is additionally irreversible: the
+    /// original URL is the only copy, and once overwritten the link can never be
+    /// re-derived on a later parse.
+    ///
+    /// See `.scratchpad/url_alias_resolution_gap.md` for the incident this came
+    /// from.
+    pub fn root_path_is_bref(&self) -> bool {
+        !self.root_path.is_empty() && self.root_path == self.other.bid.bref().to_string()
+    }
+
     pub fn new(
         other_bid: Bid,
         root_net: Bid,
@@ -454,4 +476,89 @@ pub fn resolve_href_from_root_path(target_root_path: &str, from_path: &str) -> S
 
     let from_ap = AnchorPath::from(from_path);
     from_ap.path_to(&html_path, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::properties::{BeliefKind, BeliefKindSet, NodeId};
+
+    fn node(bid: Bid, title: &str) -> BeliefNode {
+        BeliefNode {
+            bid,
+            kind: BeliefKindSet::from(BeliefKind::Document),
+            title: title.to_string(),
+            schema: None,
+            payload: toml::Table::default(),
+            id: NodeId::Explicit(title.to_string()),
+            metadata: toml::Table::default(),
+        }
+    }
+
+    fn relation<'a>(
+        other: &'a BeliefNode,
+        root_path: &str,
+        ws: &'a WeightSet,
+    ) -> ExtendedRelation<'a> {
+        ExtendedRelation {
+            other,
+            home_net: Bid::nil(),
+            root_path: root_path.to_string(),
+            weight: ws,
+            link_title: None,
+        }
+    }
+
+    /// A `root_path` that is the node's own bref is a PathMap fallback, not an
+    /// addressable location. Callers that build links must be able to detect it.
+    #[test]
+    fn root_path_is_bref_detects_the_pathmap_bref_fallback() {
+        let bid = Bid::new(Bid::nil());
+        let n = node(bid, "Some Doc");
+        let ws = WeightSet::default();
+
+        assert!(
+            relation(&n, &bid.bref().to_string(), &ws).root_path_is_bref(),
+            "a root_path equal to the node's own bref must be detected"
+        );
+    }
+
+    /// The check must not fire for real paths, URLs, or the empty path that
+    /// `ExtendedRelation::new` already uses to mean "no path known".
+    #[test]
+    fn root_path_is_bref_ignores_real_destinations() {
+        let bid = Bid::new(Bid::nil());
+        let n = node(bid, "Some Doc");
+        let ws = WeightSet::default();
+
+        for path in [
+            "",
+            "docs/guide.md",
+            "/bare/a2",
+            "https://example.com/full/a",
+            "index.md#section",
+        ] {
+            assert!(
+                !relation(&n, path, &ws).root_path_is_bref(),
+                "{path:?} is an addressable destination and must not be flagged"
+            );
+        }
+    }
+
+    /// Guards against matching on shape rather than identity: another node's
+    /// bref is still not *this* node's bref-fallback.
+    #[test]
+    fn root_path_is_bref_is_identity_scoped_not_shape_scoped() {
+        let bid = Bid::new(Bid::nil());
+        let other_bid = Bid::new(Bid::nil());
+        assert_ne!(bid, other_bid, "test needs two distinct bids");
+
+        let n = node(bid, "Some Doc");
+        let ws = WeightSet::default();
+
+        assert!(
+            !relation(&n, &other_bid.bref().to_string(), &ws).root_path_is_bref(),
+            "a different node's bref is not this node's path fallback"
+        );
+    }
 }
