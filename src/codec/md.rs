@@ -3588,11 +3588,33 @@ impl DocCodec for MdCodec {
             // Resolve the config once using the document root's path (all nodes
             // in this file share the same ancestor network).
             let doc_path = std::path::PathBuf::from(&self.current_events[0].0.path);
-            if let Some((_ancestor_dir, alias_config)) = proto_index
+            if let Some((ancestor_dir, alias_config)) = proto_index
                 .ancestor_meta_as::<crate::codec::network::AliasTemplateConfig>(
                 &doc_path,
                 "url_alias",
             ) {
+                // Synthetic path variables, so a template can address a node by
+                // *where it is* rather than by a frontmatter field its author had to
+                // remember. Computed once per file against the declaring network's
+                // directory and injected into every node's document before
+                // evaluation, shadowed by a real frontmatter key of the same name.
+                //
+                // `ancestor_meta_as` walks up from `doc_path`, so it returns the
+                // directory of the network whose `alias-template` we are about to
+                // apply -- exactly the base these paths must be relative to.
+                //
+                // The root node of a network file carries `BeliefKind::Network` and
+                // its `path` is the directory, not `index.md`; `compute_path_vars`
+                // uses that to pick the directory-index URL convention.
+                let root_is_network = self.current_events[0]
+                    .0
+                    .kind
+                    .contains(crate::properties::BeliefKind::Network);
+                let path_vars = crate::codec::network::compute_path_vars(
+                    &doc_path,
+                    &ancestor_dir,
+                    root_is_network,
+                );
                 // A heading's `alias` opt-in/out lives in the document root's
                 // `[sections."#anchor"]` table.  `inject_context` merges those tables
                 // into their nodes, but that runs in Phase 4 — after `push()` has
@@ -3621,9 +3643,36 @@ impl DocCodec for MdCodec {
                     if !alias_config.scope.applies(node_opt) {
                         continue;
                     }
+                    // Evaluate against a scratch copy carrying the synthetic path
+                    // variables, never against `node.document` itself.
+                    //
+                    // `node.document` is the authored frontmatter and is written back
+                    // to disk by `generate_source`. Inserting into it leaks `__path`
+                    // and `__html_path` into every source file on the first parse --
+                    // and, worse, freezes them: a later file move would find the stale
+                    // value already present and skip the injection, silently aliasing
+                    // the node to its old location.
+                    //
+                    // A real frontmatter key of the same name still wins, since we only
+                    // insert when absent.
+                    let eval_doc = match path_vars {
+                        Some((ref rel_path, ref html_path)) => {
+                            let mut scratch = node.document.clone();
+                            for (key, val) in [
+                                (crate::codec::network::TEMPLATE_VAR_PATH, rel_path),
+                                (crate::codec::network::TEMPLATE_VAR_HTML_PATH, html_path),
+                            ] {
+                                if !scratch.contains_key(key) {
+                                    scratch.insert(key, value(val.clone()));
+                                }
+                            }
+                            std::borrow::Cow::Owned(scratch)
+                        }
+                        None => std::borrow::Cow::Borrowed(&node.document),
+                    };
                     if let Some(alias) = crate::codec::network::evaluate_alias_template(
                         &alias_config.template,
-                        &node.document,
+                        &eval_doc,
                     ) {
                         node.namespace_paths
                             .push((crate::properties::href_namespace(), alias));

@@ -2636,7 +2636,34 @@ impl GraphBuilder {
         // Each entry creates a Section edge from this node to the namespace network,
         // with the alias path as the doc_paths weight (populating the namespace's PathMap).
         if !proto.namespace_paths.is_empty() {
-            for (ns_bid, alias_path) in &proto.namespace_paths {
+            for (ns_bid, raw_alias_path) in &proto.namespace_paths {
+                // Normalize the declared alias the same way a *citation* of it will be
+                // normalized, so the two meet on one key.
+                //
+                // A citation reaches the PathMap via `NodeKey::regularize_unchecked`,
+                // which runs `AnchorPath::normalize()` on href-namespace paths
+                // (`nodekey.rs`). That drops a trailing slash, among other things.
+                // Registration used the raw frontmatter string, so an alias written
+                // `https://ex.com/x/doc/` was indexed with the slash while every
+                // citation of it — with or without the slash — looked up
+                // `https://ex.com/x/doc`. The key never matched, the citation minted an
+                // `External|Trace` stub, and the alias sat in the namespace unreachable.
+                //
+                // Normalizing here rather than at each producer keeps the invariant in
+                // one place: `url_aliases`, `alias-template`, and any future alias
+                // source all funnel through this loop.
+                let normalized_alias = AnchorPath::from(raw_alias_path.as_str())
+                    .normalize()
+                    .into_string();
+                if normalized_alias != *raw_alias_path {
+                    tracing::debug!(
+                        "[push] normalized url alias {:?} -> {:?} for node {}",
+                        raw_alias_path,
+                        normalized_alias,
+                        bid,
+                    );
+                }
+                let alias_path = &normalized_alias;
                 if *ns_bid == href_namespace() {
                     // href-namespace alias: use the shared helper instead of the
                     // generic codec-namespace factory.  The aliased node gets two

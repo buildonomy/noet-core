@@ -132,6 +132,67 @@ pub fn evaluate_alias_template(
     Some(result)
 }
 
+/// Synthetic template variables derived from a node's location rather than its
+/// frontmatter, injected by [`MdCodec::parse`] before template evaluation.
+///
+/// A published documentation site addresses a page by *where it is*, not by a
+/// field its author remembered to write. Without these, a network declaring
+/// `alias-template` can only alias documents that carry a hand-maintained slug
+/// field — which for most real corpora means no documents at all.
+///
+/// | variable | value for `guide/setup.md` | value for the network `guide/` |
+/// |---|---|---|
+/// | `__path` | `guide/setup.md` | `guide` |
+/// | `__html_path` | `guide/setup.html` | `guide` |
+///
+/// Both are relative to the directory of the network that declared the
+/// `alias-template`, so a template is written once on a root `index.md` and
+/// every descendant derives its own alias.
+///
+/// `__html_path` maps source extensions to their rendered `.html` form via
+/// [`normalize_path_extension_impl`]. For a **network** node it deliberately
+/// yields the bare directory rather than `dir/index.html`: static-site
+/// generators serve a directory index at `.../guide/`, and that is the spelling
+/// documents actually cite. The trailing slash is dropped because the href
+/// PathMap normalizes it away on both sides (see `GraphBuilder::push`), so
+/// `.../guide` and `.../guide/` converge on one key either way.
+pub const TEMPLATE_VAR_PATH: &str = "__path";
+
+/// Rendered-HTML companion to [`TEMPLATE_VAR_PATH`]. See that constant's docs.
+pub const TEMPLATE_VAR_HTML_PATH: &str = "__html_path";
+
+/// Compute `(__path, __html_path)` for a node at `node_path`, relative to the
+/// directory of the network that declared the `alias-template`.
+///
+/// `is_network` selects the directory-index convention: a network's own
+/// `IRNode::path` is already its directory, and its published URL is that
+/// directory rather than the `index.html` inside it.
+///
+/// Returns `None` when `node_path` is not beneath `ancestor_dir` — a
+/// belt-and-braces guard, since `ancestor_meta_as` found the config by walking
+/// up from this very path.
+pub fn compute_path_vars(
+    node_path: &Path,
+    ancestor_dir: &Path,
+    is_network: bool,
+) -> Option<(String, String)> {
+    let rel = node_path.strip_prefix(ancestor_dir).ok()?;
+    let rel_str = os_path_to_string(rel);
+    if rel_str.is_empty() {
+        // The declaring network itself. Its alias is the site root, which the
+        // template can express without a variable, and emitting "" here would
+        // produce a bare-prefix alias shared by nothing.
+        return None;
+    }
+    let html = if is_network {
+        // Directory index: serve at `.../guide`, not `.../guide/index.html`.
+        rel_str.clone()
+    } else {
+        crate::codec::normalize_path_extension_impl(&rel_str)
+    };
+    Some((rel_str, html))
+}
+
 /// Navigate a dotted path like `"payload.slug"` through a TOML table.
 fn resolve_toml_path<'a>(table: &'a toml_edit::Table, path: &str) -> Option<&'a toml_edit::Item> {
     let parts: Vec<&str> = path.split('.').collect();

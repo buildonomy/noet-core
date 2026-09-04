@@ -700,3 +700,169 @@ async fn test_citation_resolves_to_claimant_not_absorbed_stub() {
         );
     }
 }
+
+/// An alias declared with a trailing slash must be reachable, and reachable by
+/// *either* spelling of the citation.
+///
+/// A citation reaches the href PathMap through `NodeKey::regularize_unchecked`,
+/// which runs `AnchorPath::normalize()` on href-namespace paths. `normalize`
+/// rebuilds the path from its non-empty components, so a trailing slash is
+/// dropped. Registration, however, used the raw frontmatter string. An alias
+/// written `https://example.com/dir/` was therefore indexed *with* the slash
+/// while every citation of it looked up the key *without* one — the two could
+/// never meet, so the citation minted an `External|Trace` stub and the alias
+/// sat in the namespace permanently unreachable.
+///
+/// This shape is not exotic: it is how every static-site generator addresses a
+/// directory index (`.../power/`), so it is the normal spelling for any alias
+/// pointing at a section landing page.
+///
+/// The fix normalizes the alias at the single point where `namespace_paths` is
+/// consumed in `GraphBuilder::push`, so `url_aliases`, `alias-template`, and
+/// any future alias producer share one invariant rather than each remembering
+/// to normalize.
+///
+/// Both citation spellings are asserted because normalization must make them
+/// converge on one key — that convergence is the actual guarantee, and testing
+/// only the slash form would still pass if registration and lookup happened to
+/// agree on the *wrong* key.
+#[tokio::test]
+async fn test_trailing_slash_alias_resolves_under_either_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("aaa")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+
+    std::fs::write(
+        root.join("index.md"),
+        "---\ntitle = \"Alias Net\"\nid = \"alias-net\"\n---\n",
+    )
+    .unwrap();
+    // Alias declared WITH a trailing slash, in both URL and bare-path form.
+    std::fs::write(
+        root.join("target/doc.md"),
+        "---\ntitle = \"Target Doc\"\n\
+         url_aliases = [\"https://example.com/dir/\", \"/bare/dir/\"]\n---\n\nbody\n",
+    )
+    .unwrap();
+    // `aaa/` sorts before `target/`, so citations are parsed before the claim.
+    let citing_path = root.join("aaa/consumer.md");
+    std::fs::write(
+        &citing_path,
+        "---\ntitle = \"Consumer Doc\"\n---\n\n\
+         [url-slash](https://example.com/dir/)\n\n\
+         [url-bare](https://example.com/dir)\n\n\
+         [path-slash](/bare/dir/)\n\n\
+         [path-bare](/bare/dir)\n",
+    )
+    .unwrap();
+
+    let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+    let accum = BeliefAccumulator::new(BeliefBase::empty(), accum_rx);
+    let handle = accum.query_handle();
+    let mut compiler = DocumentCompiler::new(root, Some(accum_tx), None, true).unwrap();
+    compiler.set_jobs(4);
+    compiler.parse_all(handle, false).await.unwrap();
+    let bb = accum.into_inner().await.unwrap();
+
+    let claimant_bid = find_by_title(&bb, "Target Doc").expect("Should find 'Target Doc'");
+    let claimant_bref = claimant_bid.bref().to_string();
+
+    let text = std::fs::read_to_string(&citing_path).unwrap();
+
+    // Match on the link *label*, not the URL: `extract_bref_from_line` finds the
+    // first line containing the needle, and "/bare/dir" is a substring of
+    // "/bare/dir/", so a URL needle would silently read the wrong line.
+    for (label, spelling) in [
+        ("url-slash", "https://example.com/dir/"),
+        ("url-bare", "https://example.com/dir"),
+        ("path-slash", "/bare/dir/"),
+        ("path-bare", "/bare/dir"),
+    ] {
+        let got = extract_bref_from_line(&text, &format!("[{label}]"));
+        assert_eq!(
+            got, claimant_bref,
+            "citation {label} ({spelling}) should resolve to the claimant \
+             ({claimant_bref}) regardless of trailing-slash spelling:\n{text}"
+        );
+    }
+}
+
+/// `{{ __html_path }}` lets one `alias-template` alias a whole tree by location,
+/// without any per-file frontmatter.
+///
+/// Before this, a template could only interpolate frontmatter fields, so a
+/// network could alias only those documents carrying a hand-maintained slug. Most
+/// real documentation trees have no such field — pages are addressed by *where
+/// they are*. The variables are computed relative to the directory of the network
+/// that declared the template, so one line on a root `index.md` covers every
+/// descendant.
+///
+/// Asserts the two properties that make the feature usable:
+///
+/// 1. A citation of the derived URL resolves to the document (`.md` is mapped to
+///    its rendered `.html` form).
+/// 2. The variables do **not** leak into the source file. They are evaluated
+///    against a scratch copy of the frontmatter, never the node's own document,
+///    which `generate_source` writes back to disk. Leaking them would also freeze
+///    them: injection only fires when the key is absent, so a stale value written
+///    on one run would survive a later file move and silently alias the node to
+///    its old location.
+#[tokio::test]
+async fn test_html_path_template_var_aliases_by_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("guide")).unwrap();
+    std::fs::create_dir_all(root.join("aaa")).unwrap();
+
+    // The template lives only here; no document below carries alias frontmatter.
+    std::fs::write(
+        root.join("index.md"),
+        "---\ntitle = \"Root\"\nid = \"root\"\n\
+         alias-template = \"https://site.example/x/{{ __html_path }}\"\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("guide/index.md"),
+        "---\ntitle = \"Guide\"\nid = \"guide\"\n---\n",
+    )
+    .unwrap();
+    let target_path = root.join("guide/setup.md");
+    std::fs::write(&target_path, "---\ntitle = \"Setup\"\n---\n\nbody\n").unwrap();
+
+    let citing_path = root.join("aaa/consumer.md");
+    std::fs::write(
+        &citing_path,
+        "---\ntitle = \"Consumer Doc\"\n---\n\n\
+         [setup](https://site.example/x/guide/setup.html)\n",
+    )
+    .unwrap();
+
+    let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+    let accum = BeliefAccumulator::new(BeliefBase::empty(), accum_rx);
+    let handle = accum.query_handle();
+    let mut compiler = DocumentCompiler::new(root, Some(accum_tx), None, true).unwrap();
+    compiler.set_jobs(4);
+    compiler.parse_all(handle, false).await.unwrap();
+    let bb = accum.into_inner().await.unwrap();
+
+    let claimant_bid = find_by_title(&bb, "Setup").expect("Should find 'Setup'");
+    let claimant_bref = claimant_bid.bref().to_string();
+
+    let citing_text = std::fs::read_to_string(&citing_path).unwrap();
+    let got = extract_bref_from_line(&citing_text, "[setup]");
+    assert_eq!(
+        got, claimant_bref,
+        "citation of the __html_path-derived URL should resolve to the document \
+         it names ({claimant_bref}):\n{citing_text}"
+    );
+
+    let target_text = std::fs::read_to_string(&target_path).unwrap();
+    for var in ["__path", "__html_path"] {
+        assert!(
+            !target_text.contains(var),
+            "synthetic template variable {var:?} leaked into source frontmatter; \
+             it must be evaluated against a scratch copy:\n{target_text}"
+        );
+    }
+}
