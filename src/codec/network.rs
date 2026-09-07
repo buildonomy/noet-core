@@ -179,10 +179,19 @@ pub fn compute_path_vars(
     let rel = node_path.strip_prefix(ancestor_dir).ok()?;
     let rel_str = os_path_to_string(rel);
     if rel_str.is_empty() {
-        // The declaring network itself. Its alias is the site root, which the
-        // template can express without a variable, and emitting "" here would
-        // produce a bare-prefix alias shared by nothing.
-        return None;
+        // The declaring network itself. Both variables are empty, so a template
+        // ending in `{{ __html_path }}` collapses to its bare prefix -- which is
+        // exactly this network's published URL:
+        //
+        //     "https://example.com/docs/{{ __html_path }}"  ->  "https://example.com/docs/"
+        //
+        // The trailing slash is then normalized away by `GraphBuilder::push`, on
+        // the same rule that normalizes citations, so `.../docs/` and `.../docs`
+        // converge. The site root therefore needs no separate `url_aliases` entry.
+        //
+        // Only reachable for a network node: a document's path can never equal
+        // the directory it lives in.
+        return is_network.then(|| (String::new(), String::new()));
     }
     let html = if is_network {
         // Directory index: serve at `.../guide`, not `.../guide/index.html`.
@@ -635,6 +644,20 @@ impl DocCodec for NetworkCodec {
             if let Ok(val) = serde_json::to_value(&config) {
                 proto_index.set_meta(&network_dir, "url_alias", val);
             }
+
+            // Apply the template to this network's own root node.
+            //
+            // `MdCodec::parse` ran above, before the `set_meta` call that just
+            // happened, and it only consults *ancestor* config. So the network that
+            // declares `alias-template` is the one node the template never reached --
+            // which for a docs tree is the site root, typically its most-cited URL.
+            //
+            // Both path variables are empty for this node, so a template ending in
+            // `{{ __html_path }}` collapses to its bare prefix, which is exactly this
+            // network's published URL. `GraphBuilder::push` then normalizes the
+            // trailing slash away on the same rule it applies to citations, so
+            // `.../docs/` and `.../docs` converge on one key.
+            self.apply_self_alias(&config, diagnostics);
         }
 
         // Propagate any glob-build warnings to the caller's diagnostics.
@@ -695,6 +718,75 @@ impl DocCodec for NetworkCodec {
             vec![("{{BODY}}".to_string(), body)],
             Some(crate::codec::assets::Layout::Simple),
         )])
+    }
+}
+
+impl NetworkCodec {
+    /// Register this network's own href alias from its `alias-template`.
+    ///
+    /// Applies only to the network root node (`current_events[0]`), and only when
+    /// the template evaluates against empty path variables -- i.e. the template is
+    /// path-driven. A template built from frontmatter fields (`{{ slug }}`,
+    /// `{{ id | upper }}`) is evaluated per descendant by `MdCodec::parse` and is
+    /// not meaningful for the declaring network itself, so it is skipped here.
+    ///
+    /// Honours `alias-scope`: under `explicit`, the network must opt in with
+    /// `alias = true`, same as any other node.
+    fn apply_self_alias(
+        &mut self,
+        config: &AliasTemplateConfig,
+        diagnostics: &mut Vec<ParseDiagnostic>,
+    ) {
+        let Some((root, _)) = self.0.current_events.first_mut() else {
+            return;
+        };
+
+        // The network's own opt-in/out. `alias-scope: explicit` means nothing is
+        // aliased unless it asks, and that applies to the declaring network too.
+        let node_opt = root.document.get("alias").and_then(|v| v.as_bool());
+        if !config.scope.applies(node_opt) {
+            return;
+        }
+
+        // Empty path variables: this node *is* the template's base directory.
+        let mut scratch = root.document.clone();
+        for key in [TEMPLATE_VAR_PATH, TEMPLATE_VAR_HTML_PATH] {
+            if !scratch.contains_key(key) {
+                scratch.insert(key, toml_edit::value(String::new()));
+            }
+        }
+
+        let Some(alias) = evaluate_alias_template(&config.template, &scratch) else {
+            // A field the template needs is absent. Normal for a frontmatter-driven
+            // template; the descendants that carry the field still get theirs.
+            tracing::debug!(
+                "[NetworkCodec] self-alias template {:?} did not evaluate for {:?}",
+                config.template,
+                root.path,
+            );
+            return;
+        };
+
+        // Guard against a frontmatter-driven template that happens to evaluate.
+        // Such a template describes descendants, not this network, and registering
+        // it here would let the network claim a URL meant for a child.
+        if !config.template.contains(TEMPLATE_VAR_PATH)
+            && !config.template.contains(TEMPLATE_VAR_HTML_PATH)
+        {
+            return;
+        }
+
+        if alias.is_empty() {
+            diagnostics.push(ParseDiagnostic::warning(format!(
+                "alias-template {:?} evaluated to an empty alias for network {:?}; \
+                 skipping self-registration.",
+                config.template, root.path,
+            )));
+            return;
+        }
+
+        root.namespace_paths
+            .push((crate::properties::href_namespace(), alias));
     }
 }
 

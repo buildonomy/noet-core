@@ -713,7 +713,7 @@ Focus {
 
 - **Depends On**:
   - [`ISSUE_10_DAEMON_TESTING.md`](../2_completed/ISSUE_10_DAEMON_TESTING.md) - WatchService foundation
-  - [`ISSUE_15_FILTERED_EVENT_STREAMING.md`](./ISSUE_15_FILTERED_EVENT_STREAMING.md) - Focus and subscriptions
+  - [`ISSUE_15_FILTERED_EVENT_STREAMING.md`](../0_open/ISSUE_15_FILTERED_EVENT_STREAMING.md) - Focus and subscriptions
 - **Related**:
   - `procedure_engine.md` - Procedure matching and redline learning
   - `action_inference_engine.md` - Action detection events

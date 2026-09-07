@@ -3588,6 +3588,16 @@ impl DocCodec for MdCodec {
             // Resolve the config once using the document root's path (all nodes
             // in this file share the same ancestor network).
             let doc_path = std::path::PathBuf::from(&self.current_events[0].0.path);
+            let root_is_network = self.current_events[0]
+                .0
+                .kind
+                .contains(crate::properties::BeliefKind::Network);
+            // Only ancestors are consulted here. A network's *own* `alias-template`
+            // is not yet in `codec_meta` at this point -- `NetworkCodec::parse` calls
+            // `MdCodec::parse` (this function) before it reads the frontmatter and
+            // calls `set_meta`. The declaring network's self-alias is therefore
+            // applied by `NetworkCodec::parse` after that store; see
+            // `apply_self_alias`.
             if let Some((ancestor_dir, alias_config)) = proto_index
                 .ancestor_meta_as::<crate::codec::network::AliasTemplateConfig>(
                 &doc_path,
@@ -3606,10 +3616,6 @@ impl DocCodec for MdCodec {
                 // The root node of a network file carries `BeliefKind::Network` and
                 // its `path` is the directory, not `index.md`; `compute_path_vars`
                 // uses that to pick the directory-index URL convention.
-                let root_is_network = self.current_events[0]
-                    .0
-                    .kind
-                    .contains(crate::properties::BeliefKind::Network);
                 let path_vars = crate::codec::network::compute_path_vars(
                     &doc_path,
                     &ancestor_dir,

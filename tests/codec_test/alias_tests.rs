@@ -866,3 +866,104 @@ async fn test_html_path_template_var_aliases_by_location() {
         );
     }
 }
+
+/// A path-driven template also aliases the network that declares it, with no
+/// separate `url_aliases` entry.
+///
+/// The declaring network was the one node its own template never reached.
+/// `MdCodec::parse` consults only *ancestor* config, and a network's own
+/// `alias-template` is not in `codec_meta` yet when it runs -- `NetworkCodec::parse`
+/// calls `MdCodec::parse` before reading the frontmatter and calling `set_meta`.
+/// For a documentation tree that missing node is the site root, typically the
+/// most-cited URL of the lot. `NetworkCodec::apply_self_alias` closes it after the
+/// store.
+///
+/// Both path variables are empty for this node, so a template ending in
+/// `{{ __html_path }}` collapses to its bare prefix -- exactly the network's
+/// published URL. The citation is written with a trailing slash and the alias
+/// without one, which also pins that the two still converge through
+/// `GraphBuilder::push`'s normalization.
+#[tokio::test]
+async fn test_path_template_aliases_the_declaring_network_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("aaa")).unwrap();
+
+    std::fs::write(
+        root.join("index.md"),
+        "---\ntitle = \"Root\"\nid = \"root\"\n\
+         alias-template = \"https://site.example/x/{{ __html_path }}\"\n---\n",
+    )
+    .unwrap();
+    let citing_path = root.join("aaa/consumer.md");
+    std::fs::write(
+        &citing_path,
+        "---\ntitle = \"Consumer Doc\"\n---\n\n[site-root](https://site.example/x/)\n",
+    )
+    .unwrap();
+
+    let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+    let accum = BeliefAccumulator::new(BeliefBase::empty(), accum_rx);
+    let handle = accum.query_handle();
+    let mut compiler = DocumentCompiler::new(root, Some(accum_tx), None, true).unwrap();
+    compiler.set_jobs(4);
+    compiler.parse_all(handle, false).await.unwrap();
+    let bb = accum.into_inner().await.unwrap();
+
+    let root_bid = find_by_title(&bb, "Root").expect("Should find the root network");
+    let root_bref = root_bid.bref().to_string();
+
+    let text = std::fs::read_to_string(&citing_path).unwrap();
+    let got = extract_bref_from_line(&text, "[site-root]");
+    assert_eq!(
+        got, root_bref,
+        "the site-root URL should resolve to the network that declared the \
+         template ({root_bref}), with no url_aliases entry:\n{text}"
+    );
+}
+
+/// A *frontmatter-driven* template must not alias its declaring network.
+///
+/// `{{ id | upper }}` describes descendants -- each carries its own key. Evaluated
+/// against the network it would yield the network's own id, letting it claim a URL
+/// in a namespace it does not own (for a Jira-style template, an issue key). Only
+/// templates that interpolate a path variable self-register.
+#[tokio::test]
+async fn test_frontmatter_template_does_not_alias_declaring_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("aaa")).unwrap();
+
+    std::fs::write(
+        root.join("index.md"),
+        "---\ntitle = \"Root\"\nid = \"root\"\n\
+         alias-template = \"https://tracker.example/browse/{{ id | upper }}\"\n---\n",
+    )
+    .unwrap();
+    let citing_path = root.join("aaa/consumer.md");
+    std::fs::write(
+        &citing_path,
+        "---\ntitle = \"Consumer Doc\"\n---\n\n\
+         [root-key](https://tracker.example/browse/ROOT)\n",
+    )
+    .unwrap();
+
+    let (accum_tx, accum_rx) = unbounded_channel::<BeliefEvent>();
+    let accum = BeliefAccumulator::new(BeliefBase::empty(), accum_rx);
+    let handle = accum.query_handle();
+    let mut compiler = DocumentCompiler::new(root, Some(accum_tx), None, true).unwrap();
+    compiler.set_jobs(4);
+    compiler.parse_all(handle, false).await.unwrap();
+    let bb = accum.into_inner().await.unwrap();
+
+    let root_bid = find_by_title(&bb, "Root").expect("Should find the root network");
+    let root_bref = root_bid.bref().to_string();
+
+    let text = std::fs::read_to_string(&citing_path).unwrap();
+    let got = extract_bref_from_line(&text, "[root-key]");
+    assert_ne!(
+        got, root_bref,
+        "a frontmatter-driven template must not let the declaring network claim \
+         a descendant-shaped URL:\n{text}"
+    );
+}
