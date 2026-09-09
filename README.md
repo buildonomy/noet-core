@@ -197,6 +197,7 @@ noet-core = { version = "0.0.0", features = ["service"] }
 - **[DAG Model](docs/design/core/dag_model.md)** - Conceptual introduction: why a DAG, the three edge types, the video camera query model
 - **[Architecture Overview](docs/design/core/architecture.md)** - High-level software architecture and core concepts
 - **[Design Specification](docs/design/core/beliefbase_architecture.md)** - Detailed technical specification
+- **[Query Language](docs/query_language.md)** - The textual query grammar: quick start, cookbook, filters, traversals, composition
 - **[Query Model](docs/design/core/query_model.md)** - Formal query algebra: traversal, composition, scoring, instruments
 - **[MCP Server](docs/mcp.md)** - Agent-facing tool documentation for querying via Model Context Protocol
 - **[API Documentation](https://docs.rs/noet-core)** - Generated from source (run `cargo doc --open`)

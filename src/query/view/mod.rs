@@ -14,7 +14,7 @@
 //   - `:view:` directive option (`{query}` MyST directive)
 //   - `view` field in MCP tool input
 //
-// See `query_model.md` §9.5 for the surface binding contract.
+// See `docs/query_language.md` §10 and §12 for the surface binding contract.
 
 pub mod raw_tape;
 pub mod table;

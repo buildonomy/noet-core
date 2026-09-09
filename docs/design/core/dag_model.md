@@ -289,8 +289,8 @@ This declares that the "Review of Safety Requirements" section (the owner) asser
 coverage of REQ-001 and REQ-002 (the sinks) — without modifying either requirement
 document. The six canonical relation directives (`{composed_of}`, `{component_of}`,
 `{draws_from}`, `{underlies}`, `{uses}`, `{implements}`) cover all three edge types
-in both directions. See `docs/design/core/query_model.md` §9.5 and Issue 71 for the full
-directive surface.
+in both directions. See `docs/query_language.md` §5 (named traversal shorthands) and
+Issue 71 for the full directive surface.
 
 ### How the Compiler Builds the Graph
 

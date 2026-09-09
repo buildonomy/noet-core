@@ -26,7 +26,7 @@ Start here.
 | [`dag_model.md`](core/dag_model.md) | Why model documentation as a DAG? What are the three edge types (Section, Epistemic, Pragmatic), and what is the subject/verb/referent model? Conceptual introduction — read first. |
 | [`architecture.md`](core/architecture.md) | How does the library fit together at a high level, and how does the multi-pass compiler work? Orientation for developers new to noet-core. |
 | [`beliefbase_architecture.md`](core/beliefbase_architecture.md) | How is it actually implemented? The authoritative technical spec: identity management (§2.2), codec dispatch (§3.2, §3.6), the event system (§4.3). |
-| [`query_model.md`](core/query_model.md) | What is the formal query algebra — traversal, composition, scoring, instruments — and what is the textual query grammar (§9.5)? |
+| [`query_model.md`](core/query_model.md) | What is the formal query algebra — traversal, composition, scoring, instruments? The user-facing textual grammar lives in [`docs/query_language.md`](../query_language.md). |
 | [`search_and_sharding.md`](core/search_and_sharding.md) | How does full-text search work, and how is a large corpus split into shards so the viewer can scale? |
 
 ## `identity/` — what makes a node the same node
@@ -50,6 +50,7 @@ modifying the source it annotates.
 |---|---|
 | [`living_corpus.md`](annotation/living_corpus.md) | What are the three layers (source, compiled, annotation), and how does the annotation loop close? The current model for how a corpus stays alive. |
 | [`overlay_model.md`](annotation/overlay_model.md) | When annotations are projected onto a compiled corpus, what is the resulting object and how is it read? Layer composition, and why federation is the same construction. |
+| [`collector_model.md`](annotation/collector_model.md) | Where do records live, who may write them, and how do they move between stores? Store topology, admission as a trust boundary, automatic promotion. |
 | [`attestation_fabric.md`](annotation/attestation_fabric.md) | How is cross-domain provenance recorded, and how do attestation records project onto graph edges (§12.3)? |
 | [`collaboration_overlay.md`](annotation/collaboration_overlay.md) | How can multiple people annotate a *static* generated site, with attested annotations layered over it? |
 | [`federated_belief_network.md`](annotation/federated_belief_network.md) | How do separate corpora share annotations, source, and compiled state across a boundary? |

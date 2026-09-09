@@ -75,6 +75,43 @@ encountered and propose neutral replacements before proceeding with other change
 > **In practice**: when you cannot verify, prefer the neutral phrasing. It costs
 > nothing to write "a large application corpus" instead of a repository name.
 
+### No Historical Narrative in Documents
+
+> [!IMPORTANT]
+> **A document states what IS. The journey belongs to the version history.**
+> Do not write "an earlier version said X", "this was previously Y", "the first
+> draft was wrong because Z", or "corrected on <date>" into a design doc, spec,
+> procedure, reference, or README. When you correct a document, **write the
+> corrected claim and delete the wrong one.** The reasoning goes in the commit
+> message.
+
+The enemy of context is noise, and a superseded claim next to a current one is
+the worst kind: on-topic, plausible, and false. Cross-references cannot
+disambiguate them — a link points at a section, not at the half of it that is
+still true.
+
+**Where the journey goes**: commit messages (what changed and why), issues (what
+the problem state is and what to do), trade studies (options considered and
+rejected), `LESSONS_LEARNED.md` (patterns that will recur), `.scratchpad/`
+(session context).
+
+**Exception**: documents whose *subject* is a state of affairs — issues, problem
+reports, trade studies, a planning tracker's decision log. There the history is
+the content.
+
+**Legitimate in a what-is document**, because both are pointers rather than
+narration:
+- a one-line supersession pointer ("Superseded by `X.md`; read that instead")
+- a method note stating durable guidance ("this set is reached by traversal, not
+  search")
+
+**Self-check before writing**: *earlier*, *previously*, *originally*, *the first
+draft*, *was wrong*, *has been corrected*, *note that this changed*. Each is a
+candidate for deletion. Ask what a reader arriving today needs.
+
+See `docs/project/DOCUMENTATION_STRATEGY.md` Rule 4 and
+`docs/project/LESSONS_LEARNED.md` § Design constraints.
+
 ### No Deleting Documents
 
 Propose consolidation or archiving. Never delete a document yourself.

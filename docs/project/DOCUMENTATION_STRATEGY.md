@@ -270,7 +270,69 @@ It's OK to have similar examples in multiple places if they serve different purp
 
 Each example should be maintained independently.
 
-### Rule 4: Cross-Reference Aggressively
+### Rule 4: A Document States What Is; the Journey Belongs to the History
+
+Documents describe what is currently true, or what is believed about to become
+true. They do not narrate how they got there.
+
+**Bad** (in a design doc, spec, procedure, or reference):
+```markdown
+## 3. Anchor format
+
+The anchor is a `QuerySpec` evaluated lazily. An earlier version of this section
+specified `(bid, hash)`, which was wrong because a re-minted BID orphans the
+anchor. That approach has been withdrawn.
+```
+
+**Good**:
+```markdown
+## 3. Anchor format
+
+The anchor is a `QuerySpec` evaluated lazily. A stored `(bid, hash)` pair cannot
+survive a BID re-mint, which is why liveness is re-derived rather than recorded.
+```
+
+The second states the current design *and* keeps the constraint that produced it
+— because the constraint is durable knowledge. What it drops is the narrative of
+the change, which belongs in the commit message.
+
+**Why this matters more than tidiness.** A superseded claim sitting next to a
+current one is the highest-density noise a corpus can carry: on-topic,
+plausible, and false. Every reader and every cross-reference must then
+disambiguate them, and a cross-reference cannot — it points at a section, not at
+the half of the section that is still true.
+
+**Where the journey goes instead:**
+
+| Content | Home |
+|---|---|
+| What changed in this edit, and why | Commit message |
+| What the problem state is and what to do about it | An issue (`docs/project/0_open/`) |
+| A decision, its alternatives, and its outcome | Trade study, or a planning tracker's decision log |
+| A failure mode that will recur | `LESSONS_LEARNED.md` |
+| Working context for the current session | `.scratchpad/` |
+
+**The exception**, and it is narrow: documents whose *subject* is a state of
+affairs. An issue must explain what is wrong with the current state. A trade
+study must record rejected options. A planning tracker's decision log is an
+archive by design. In those, history is the content.
+
+**Two supersession patterns are legitimate in a document that describes what
+is**, and both are pointers rather than narration:
+
+1. **A supersession pointer** — one sentence at the top of the affected section:
+   "Superseded by `X.md`; read that instead." No retained prose, no argument.
+2. **A method note** — durable guidance about arriving at the content ("this set
+   is reached by traversal, not search"), which is a statement about what is
+   true, not a record of a past error.
+
+**The tell**: *earlier*, *previously*, *originally*, *the first draft*, *was
+wrong*, *has been corrected*, *note that this changed*. In a design doc, spec,
+procedure, or reference, each is a candidate for deletion. Ask what a reader who
+arrived today needs; if the answer does not include the old claim, cut it and
+put the reasoning in the commit.
+
+### Rule 5: Cross-Reference Aggressively
 
 Use markdown links and rustdoc links to connect related content:
 
@@ -284,6 +346,7 @@ Use markdown links and rustdoc links to connect related content:
 
 | Content Type | lib.rs | architecture.md | design spec | Module doc |
 |--------------|--------|-----------------|-------------|------------|
+| Superseded claims / revision narrative | No | No | No | No |
 | What is noet-core? | Brief | Detailed | No | No |
 | How to install | No | No | No | No (in README) |
 | Quick start example | Yes | Yes (enhanced) | No | No |

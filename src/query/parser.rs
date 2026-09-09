@@ -1,7 +1,10 @@
 // query/parser.rs — Textual query grammar parser and serializer.
 //
-// Parses the noet query language (see docs/design/core/query_model.md §9.5) into
-// a `QuerySpec` and serializes `QuerySpec` back to canonical text.
+// Parses the noet query language (see docs/query_language.md) into a `QuerySpec`
+// and serializes `QuerySpec` back to canonical text.
+//
+// The grammar surfaces the primitives defined in docs/design/core/query_model.md
+// §5; implementer-facing disambiguation rules are in that document's §10.3.
 //
 // ## Grammar summary (no view-config suffix — that travels as sibling URL params)
 //
@@ -1820,7 +1823,7 @@ fn label_steps(steps: &mut [ProjectionStep]) {
 /// Parse a query string into a [`QuerySpec`].
 ///
 /// The query string uses the noet textual grammar defined in
-/// `docs/design/core/query_model.md §9.5`. View configuration (sort, display mode)
+/// `docs/query_language.md`. View configuration (sort, display mode)
 /// is **not** part of the query string — it travels as sibling URL parameters,
 /// directive options, or MCP fields.
 ///

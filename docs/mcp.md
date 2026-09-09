@@ -194,7 +194,7 @@ owner → sink → {kind: [sources]} index. The compliance review primitive.
 ```json
 { "query_string": "id://my-network composed_of(*)", "network": "<bref>" }
 ```
-Accepts a textual query string (see `docs/design/core/query_model.md` §9.5 for the
+Accepts a textual query string (see [`query_language.md`](query_language.md) for the
 full grammar). `network` is optional — omit to query all networks. Examples:
 
 ```json

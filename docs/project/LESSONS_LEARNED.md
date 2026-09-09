@@ -348,6 +348,42 @@ The corollary is a triage question worth asking of any speculative field: is it
 from the first record), or **inert** (carried but unread)? Only the first two are
 legitimate; the third is the case that rots.
 
+### A document states what is; the journey belongs to the history
+
+A revision note inlined into a document — "an earlier version said X, that was
+wrong because Y" — reads like diligence and is a defect. It puts two claims in
+one place with no marker of which is load-bearing, and every downstream reader
+and every cross-reference now has to disambiguate them. **The enemy of context is
+noise**, and a superseded claim adjacent to a current one is the highest-density
+noise available: it is on-topic, plausible, and false.
+
+The journey has its own homes, and they are the ones built for it: **commit
+messages** (what changed and why, per change), **issues** (what the problem
+state is, why it is a problem, what to do), **prompts and scratchpads**
+(ephemeral working context), and **this file** (patterns that transfer). Version
+control exists to make the path traversable; duplicating it into the artifact
+defeats the separation.
+
+The exception is narrow and identifiable: a document whose *subject* is a state
+of affairs — an issue, a problem report, a decision log in a planning tracker.
+There the history is the content. In a design document, a specification, a
+procedure, or a reference, it is not.
+
+**Practice**: when a document is corrected, write the corrected claim and delete
+the wrong one. Put the reason in the commit message. Two supersession patterns
+are legitimate in the document itself, and both are pointers rather than
+narration:
+
+- **A supersession pointer** at the top of a section: "superseded by X; read
+  that instead." One sentence, no argument, no retained prose.
+- **A method note** stating what is true about how to arrive at the content —
+  "this set is reached by traversal, not search" — which is durable guidance,
+  not a record of a past mistake.
+
+The tell that the line has been crossed: the words *earlier*, *previously*,
+*originally*, *the first draft*, *was wrong*, *has been corrected*. In a document
+that is not an issue or a log, each of these is a candidate for deletion.
+
 ## Identity and caching
 
 ### Do not conflate identities that have different scopes

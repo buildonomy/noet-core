@@ -15,6 +15,7 @@ queries work. Read this first if you are new to noet.
 - [Main README](../README.md) — Installation, quick start, and overview
 - [DAG Model](design/core/dag_model.md) — Conceptual introduction: nodes, edges, the video camera query model
 - [Architecture Overview](design/core/architecture.md) — Core concepts and how the library works
+- [Query Language](query_language.md) — The textual query grammar: quick start, cookbook, filters, traversals, composition
 - [MCP Server](mcp.md) — Agent-facing tool documentation for querying via Model Context Protocol
 - [API Reference](https://docs.rs/noet-core) — Generated from rustdoc (run `cargo doc --open`)
 
@@ -32,6 +33,7 @@ queries work. Read this first if you are new to noet.
 ```
 docs/
 ├── README.md                      # This file
+├── query_language.md              # User-facing textual query grammar
 ├── mcp.md                         # MCP server setup and tool reference
 ├── design/                        # Architecture and design specifications
 │   ├── dag_model.md               # Conceptual intro: the DAG model (start here)
@@ -51,7 +53,7 @@ noet-core follows a **hierarchical documentation strategy**:
 1. **Quick Start** → [`../README.md`](../README.md) — "Should I use this library?"
 2. **Conceptual** → [`design/core/dag_model.md`](design/core/dag_model.md) — "Why a DAG? What are the three edge types?"
 3. **Architectural** → [`design/core/architecture.md`](design/core/architecture.md) — "How does the compiler work?"
-4. **Formal** → [`design/core/query_model.md`](design/core/query_model.md) — "How does the query algebra work?"
+4. **Formal** → [`design/core/query_model.md`](design/core/query_model.md) — "How does the query algebra work?" (the grammar you type is in [`query_language.md`](query_language.md))
 5. **Technical** → [`design/core/beliefbase_architecture.md`](design/core/beliefbase_architecture.md) — "How is it implemented?"
 6. **API Reference** → [Rustdoc](https://docs.rs/noet-core) — "How do I call this function?"
 
@@ -83,7 +85,8 @@ Formal specification of the query algebra.
 
 **Contents**: Subject/projection/instrument decomposition, Score semiring,
 NodeFilter and Traversal primitives, And/Or/Difference compositions, the Tape,
-sort functions, render modes, textual query syntax, prior art grounding.
+sort functions, render modes, prior art grounding. The textual query grammar is
+specified separately in [`query_language.md`](query_language.md).
 
 **Audience**: Contributors implementing or extending the query system.
 

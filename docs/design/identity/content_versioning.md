@@ -124,7 +124,7 @@ ordinary queries.
 Three properties of the existing query model make this fit rather than force:
 
 - **The query string is the canonical serialization** of a `QuerySpec`
-  (`query_model.md` §9.5.9), already shared across viewer URLs, `{query}`
+  ([`query_language.md`](../../query_language.md) §11), already shared across viewer URLs, `{query}`
   directives, and MCP. An anchor is therefore storable as text in a record and
   legible in a diff.
 - **The tape is self-contained.** `TapeContent::Edges` carries `output_bids`
@@ -816,8 +816,8 @@ wanted.
 ## 10. References
 
 - [`query_model.md`](../core/query_model.md) — §3 `QuerySpec`, §6 the Tape, §6.3
-  `QueryPackage` and the two-spec distinction, §9.5.9 canonical serialization,
-  §11 Q1 decidability
+  `QueryPackage` and the two-spec distinction, §11 Q1 decidability
+- [`query_language.md`](../../query_language.md) — §11 canonical serialization
 - [`living_corpus.md`](../annotation/living_corpus.md) — §4 anchoring and scope selection in
   the annotation model
 - [`dag_model.md`](../core/dag_model.md) — the three edge kinds
