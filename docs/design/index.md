@@ -36,8 +36,10 @@ name a target stably.
 
 | Document | Answers |
 |---|---|
+| [`identity_derivation.md`](identity/identity_derivation.md) | Where do identities come from? Minted vs. derived, the reserved namespaces, and the rule that anything surviving a rebuild must be derived. |
 | [`content_identity.md`](identity/content_identity.md) | How does a node keep a stable identity when it is moved or reformatted? Defines the identity hash. |
 | [`content_versioning.md`](identity/content_versioning.md) | What does "version" mean for a node or a claim, and how is staleness scoped? Defines `_content_hash` (§5.1, §5.1a). |
+| [`generational_archive.md`](identity/generational_archive.md) | What does noet retain so "what changed?" is answerable? The stub-shard/blob archive, the move-detection ladder, and the one comparison behind version history, staleness detail, and redlines. |
 | [`section_metadata_manifest.md`](identity/section_metadata_manifest.md) | How is per-section metadata tracked and persisted across a compile? |
 | [`link_format.md`](identity/link_format.md) | How are cross-document links written and resolved, combining readable paths with stable bref identifiers? |
 
@@ -49,7 +51,8 @@ modifying the source it annotates.
 | Document | Answers |
 |---|---|
 | [`living_corpus.md`](annotation/living_corpus.md) | What are the three layers (source, compiled, annotation), and how does the annotation loop close? The current model for how a corpus stays alive. |
-| [`overlay_model.md`](annotation/overlay_model.md) | When annotations are projected onto a compiled corpus, what is the resulting object and how is it read? Layer composition, and why federation is the same construction. |
+| [`annotation_channel.md`](annotation/annotation_channel.md) | How does a producer — parse, browser, agent — issue a record? The write-side handle: actor, session, minted `EventId`, two lanes (records vs. diagnostics), the halo of stores. |
+| [`overlay_model.md`](annotation/overlay_model.md) | When annotations are projected onto a compiled corpus, what is the resulting object and how is it read? Owner-edge halos, layer composition, and why federation is the same construction. |
 | [`collector_model.md`](annotation/collector_model.md) | Where do records live, who may write them, and how do they move between stores? Store topology, admission as a trust boundary, automatic promotion. |
 | [`attestation_fabric.md`](annotation/attestation_fabric.md) | How is cross-domain provenance recorded, and how do attestation records project onto graph edges (§12.3)? |
 | [`collaboration_overlay.md`](annotation/collaboration_overlay.md) | How can multiple people annotate a *static* generated site, with attested annotations layered over it? |
@@ -75,6 +78,7 @@ structure. Read `core/beliefbase_architecture.md` §3.2 before adding one.
 
 | Document | Answers |
 |---|---|
+| [`codec_determinism_contract.md`](codecs/codec_determinism_contract.md) | What must a codec guarantee so that hashes, anchors, and incremental parse work? Six guarantees, none compiler-enforced. **Read before writing or changing a codec.** |
 | [`myst_directive_architecture.md`](codecs/myst_directive_architecture.md) | How are MyST block directives (`{network_children}`, `{requirements_table}`) parsed and resolved in the deferred pass? |
 | [`network_authoring.md`](codecs/network_authoring.md) | How does an author declare a BeliefNetwork — `index.md`, whitelist/blacklist, subnets? User-facing reference. |
 | [`mapping_node_architecture.md`](codecs/mapping_node_architecture.md) | How do mapping nodes own edges, so a node can assert `{maps_to}` claims about others? |

@@ -816,6 +816,48 @@ pub type HtmlFragmentPairs = Vec<(
 )>;
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A document codec: the boundary where bytes become nodes and edges.
+///
+/// # Determinism contract
+///
+/// Everything downstream — content hashes, annotation anchors, incremental
+/// parse, shard export, codec-regression detection — assumes this boundary is a
+/// *function*: the same bytes produce the same graph. **None of the guarantees
+/// below are enforced by the compiler.** A codec can violate all of them and
+/// still build, still parse, and still emit a plausible graph; the failures are
+/// silent and surface one subsystem away.
+///
+/// - **G1 — output is a pure function of content.** No wall clock, no ambient
+///   environment, no random ids, no iteration over an order-unstable map.
+///   Violating it destabilizes `content_hash`, which stales every annotation in
+///   the corpus on every restart.
+/// - **G2 — output depends only on *this* file.** Cross-file *references* are
+///   fine (they resolve later via `cache_fetch`); cross-file *content
+///   dependence* during `parse` is not. Violating it corrupts incremental
+///   parse: editing B leaves A stale in the graph while A's hash reads clean.
+/// - **G3 — edge emission order follows the source text.** One thread per file,
+///   edges created as the parser reads. `WEIGHT_SORT_KEY` is then assigned as
+///   `max(existing) + 1`, so sort order is derived from the document rather
+///   than from scheduling. The anchor hash design depends on this: sibling
+///   order is *excluded* from the hash precisely because it is already covered
+///   by the content hash. **A codec that emits edges from a parallel iterator,
+///   a concurrent cross-file resolution pass, or an external edge stream breaks
+///   this** — and `content_versioning.md` §4.3 must be revisited before such a
+///   change lands.
+/// - **G4 — derive identity, never mint it**, wherever it must survive a
+///   rebuild. See [`Bid::codec_namespace`](crate::properties::Bid::codec_namespace),
+///   which normalizes with `to_anchor` before hashing.
+/// - **G5 — output is comparable across binaries.** No pointer values, no
+///   allocation-order iteration, no build timestamps. This is what makes
+///   codec-regression detection by hash manifest possible.
+/// - **G6 — diagnostics go to the `diagnostics` parameter**, never into node
+///   content. A diagnostic embedded in content changes the content hash, so a
+///   warning would stale every annotation on the node it warns about.
+///
+/// Full rationale, per-guarantee consumers, and the cheapest test for each:
+/// `docs/design/codecs/codec_determinism_contract.md`. Codec dispatch and the
+/// two-registry ordering constraints: `docs/design/core/beliefbase_architecture.md`
+/// §3.2 and §3.6.
 pub trait DocCodec: Sync {
     /// Parse a path into a proto node by reading the metadata frontmatter (if any)
     fn proto(&self, path: &Path) -> Result<Option<IRNode>, BuildonomyError>;

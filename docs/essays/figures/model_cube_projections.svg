@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 720" font-family="system-ui, -apple-system, sans-serif">
+  <title>The Model Cube: Six Generative Projections in N/S/P Space</title>
+
+  <!-- Background -->
+  <rect width="800" height="720" fill="#fafafa"/>
+
+  <!-- Title -->
+  <text x="400" y="35" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">The Model Cube: Six Projections in N × S × P Space</text>
+  <text x="400" y="55" text-anchor="middle" font-size="12" fill="#666">Each face is a projection plane. The signed direction determines explore vs exploit.</text>
+
+  <!-- === ISOMETRIC CUBE === -->
+  <!-- Isometric projection: x-axis goes right-down, y-axis goes left-down, z-axis goes up -->
+  <!-- Using 30° isometric angles -->
+
+  <g transform="translate(280, 380)">
+    <!-- Cube dimensions: 200 units per side in isometric -->
+    <!-- Isometric transforms: -->
+    <!-- x-axis: (cos30, sin30) = (0.866, 0.5) -->
+    <!-- y-axis: (-cos30, sin30) = (-0.866, 0.5) -->
+    <!-- z-axis: (0, -1) -->
+
+    <!-- Back faces (lighter, behind) -->
+    <!-- Top face: S×P plane → projects onto N axis -->
+    <polygon points="0,-200 173,-100 0,0 -173,-100"
+             fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1.5" opacity="0.7"/>
+    <!-- Right face: N×P plane → projects onto S axis -->
+    <polygon points="0,0 173,-100 173,100 0,200"
+             fill="#e8e8f4" stroke="#2d2d7d" stroke-width="1.5" opacity="0.7"/>
+    <!-- Left face: N×S plane → projects onto P axis -->
+    <polygon points="0,0 -173,-100 -173,100 0,200"
+             fill="#f4e8e8" stroke="#7d2d2d" stroke-width="1.5" opacity="0.7"/>
+
+    <!-- Axes from origin -->
+    <!-- S axis: right-down -->
+    <line x1="0" y1="0" x2="240" y2="139" stroke="#2d2d7d" stroke-width="2.5" stroke-dasharray="8,4"/>
+    <text x="255" y="150" font-size="16" font-weight="bold" fill="#2d2d7d">S</text>
+    <text x="255" y="168" font-size="11" fill="#2d2d7d">Structure</text>
+    <text x="255" y="182" font-size="10" fill="#888" font-style="italic">Matter</text>
+
+    <!-- P axis: left-down -->
+    <line x1="0" y1="0" x2="-240" y2="139" stroke="#7d2d2d" stroke-width="2.5" stroke-dasharray="8,4"/>
+    <text x="-310" y="150" font-size="16" font-weight="bold" fill="#7d2d2d">P</text>
+    <text x="-310" y="168" font-size="11" fill="#7d2d2d">Procedure</text>
+    <text x="-310" y="182" font-size="10" fill="#888" font-style="italic">Field</text>
+
+    <!-- N axis: up -->
+    <line x1="0" y1="0" x2="0" y2="-280" stroke="#2d7d2d" stroke-width="2.5" stroke-dasharray="8,4"/>
+    <text x="10" y="-285" font-size="16" font-weight="bold" fill="#2d7d2d">N</text>
+    <text x="10" y="-267" font-size="11" fill="#2d7d2d">Normative</text>
+    <text x="10" y="-253" font-size="10" fill="#888" font-style="italic">Information</text>
+
+    <!-- Face labels -->
+
+    <!-- Top face: S×P → N -->
+    <text x="0" y="-85" text-anchor="middle" font-size="12" font-weight="bold" fill="#2d7d2d">S × P → N</text>
+    <text x="0" y="-68" text-anchor="middle" font-size="10" fill="#2d7d2d">P⟨S⟩ → R'_N : explore</text>
+    <text x="0" y="-54" text-anchor="middle" font-size="10" fill="#2d7d2d">S⟨P⟩ → ⟨R'_N⟩ : exploit</text>
+
+    <!-- Right face: N×P → S -->
+    <text x="100" y="55" text-anchor="middle" font-size="12" font-weight="bold" fill="#2d2d7d" transform="rotate(0)">N × P → S</text>
+    <text x="100" y="72" text-anchor="middle" font-size="10" fill="#2d2d7d">P⟨N⟩ → R'_S</text>
+    <text x="100" y="86" text-anchor="middle" font-size="10" fill="#2d2d7d">N⟨P⟩ → ⟨R'_S⟩</text>
+
+    <!-- Left face: N×S → P -->
+    <text x="-100" y="55" text-anchor="middle" font-size="12" font-weight="bold" fill="#7d2d2d">N × S → P</text>
+    <text x="-100" y="72" text-anchor="middle" font-size="10" fill="#7d2d2d">S⟨N⟩ → R'_P</text>
+    <text x="-100" y="86" text-anchor="middle" font-size="10" fill="#7d2d2d">N⟨S⟩ → ⟨R'_P⟩</text>
+
+    <!-- Origin dot -->
+    <circle cx="0" cy="0" r="4" fill="#333"/>
+  </g>
+
+  <!-- === LEGEND: Notation === -->
+  <g transform="translate(450, 495)">
+    <text x="0" y="0" font-size="14" font-weight="bold" fill="#1a1a1a">Notation</text>
+
+    <text x="0" y="20" font-size="11" fill="#444">⟨X⟩ marks the world's content — external to this model.</text>
+    <text x="0" y="35" font-size="11" fill="#444">Unmarked content is the model's own.</text>
+    <text x="0" y="53" font-size="11" fill="#444">The function is always the model's own lens, never marked.</text>
+    <text x="0" y="68" font-size="11" fill="#444">Explore predicts my norms; exploit predicts the world's.</text>
+    <text x="0" y="86" font-size="10" fill="#888" font-style="italic">P⟨S⟩ — my procedures read the world's structure.</text>
+    <text x="0" y="100" font-size="10" fill="#888" font-style="italic">P(S) — unmarked argument: the model projects on itself.</text>
+  </g>
+
+  <!-- === LEGEND: The three operations === -->
+  <g transform="translate(50, 495)">
+    <text x="0" y="0" font-size="14" font-weight="bold" fill="#1a1a1a">Projection → Surprise → Update</text>
+
+    <text x="0" y="22" font-size="11" fill="#444">1. Projection (cross product): X⟨Y⟩ → R' on the third axis</text>
+    <text x="0" y="39" font-size="11" fill="#444">2. Surprise (inner product): axis(R', R) → scalar signal</text>
+    <text x="0" y="56" font-size="11" fill="#444">3. Update: surprise ≠ 0 → content change on the surprised axis</text>
+  </g>
+
+  <!-- === LEGEND: Explore vs Exploit === -->
+  <g transform="translate(50, 588)">
+    <text x="0" y="0" font-size="14" font-weight="bold" fill="#1a1a1a">Signed Direction (on S×P → N plane)</text>
+
+    <rect x="0" y="12" width="14" height="14" fill="#e8f4e8" stroke="#2d7d2d" stroke-width="1"/>
+    <text x="22" y="24" font-size="11" fill="#444">Explore — P⟨S⟩ → R'_N : my field reads the world's matter,</text>
+    <text x="22" y="38" font-size="11" fill="#444">predicting my own norms.</text>
+    <text x="22" y="53" font-size="10" fill="#888">"How must my norms change to accommodate reality?"</text>
+
+    <rect x="0" y="66" width="14" height="14" fill="#d4ead4" stroke="#2d7d2d" stroke-width="1"/>
+    <text x="22" y="78" font-size="11" fill="#444">Exploit — S⟨P⟩ → ⟨R'_N⟩ : my matter read against the world's</text>
+    <text x="22" y="92" font-size="11" fill="#444">field, predicting the world's norms.</text>
+    <text x="22" y="107" font-size="10" fill="#888">"How must the world change according to my preferences?"</text>
+  </g>
+
+  <!-- === N-SKEW NOTE === -->
+  <g transform="translate(450, 600)">
+    <text x="0" y="0" font-size="14" font-weight="bold" fill="#1a1a1a">N-Skew (Encoding Parallax)</text>
+    <text x="0" y="20" font-size="11" fill="#444">All externalized content passes through N</text>
+    <text x="0" y="35" font-size="11" fill="#444">(information is the recording medium).</text>
+    <text x="0" y="55" font-size="11" fill="#444">N(R,R') → sharpest surprise (minimal parallax)</text>
+    <text x="0" y="70" font-size="11" fill="#444">P(R,R') → blurred surprise (field→info parallax)</text>
+    <text x="0" y="85" font-size="11" fill="#444">S(R,R') → blurred surprise (matter→info parallax)</text>
+  </g>
+</svg>

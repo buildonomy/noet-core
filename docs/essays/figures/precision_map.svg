@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="system-ui, -apple-system, sans-serif">
+  <title>Precision Map: Anchoring State as Mesh Resolution</title>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="#fafafa"/>
+
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">Precision Map: Anchoring State as Mesh Resolution</text>
+  <text x="400" y="50" text-anchor="middle" font-size="12" fill="#666">Reality coupling points are nodes in the mesh. Precision degrades with distance from nodes.</text>
+
+  <!-- === MODEL DOMAIN === -->
+  <g transform="translate(80, 80)">
+    <!-- Domain boundary -->
+    <rect x="0" y="0" width="620" height="340" rx="8" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="6,3"/>
+    <text x="310" y="-8" text-anchor="middle" font-size="12" fill="#666">Model Operating Domain</text>
+
+    <!-- Precision gradient regions -->
+    <!-- Well-anchored region (near coupling points) -->
+
+    <!-- Coupling point 1: Flight test data -->
+    <circle cx="120" cy="100" r="85" fill="#d4ead4" opacity="0.4"/>
+    <circle cx="120" cy="100" r="55" fill="#a8d5a8" opacity="0.5"/>
+    <circle cx="120" cy="100" r="25" fill="#6bbe6b" opacity="0.6"/>
+    <circle cx="120" cy="100" r="8" fill="#2d7d2d"/>
+    <text x="120" y="72" text-anchor="middle" font-size="9" font-weight="bold" fill="#1a5c1a">R₁</text>
+    <text x="120" y="205" text-anchor="middle" font-size="10" fill="#2d7d2d">Flight test</text>
+    <text x="120" y="218" text-anchor="middle" font-size="10" fill="#2d7d2d">data</text>
+
+    <!-- Coupling point 2: Ground test -->
+    <circle cx="300" cy="160" r="70" fill="#d4ead4" opacity="0.4"/>
+    <circle cx="300" cy="160" r="45" fill="#a8d5a8" opacity="0.5"/>
+    <circle cx="300" cy="160" r="20" fill="#6bbe6b" opacity="0.6"/>
+    <circle cx="300" cy="160" r="8" fill="#2d7d2d"/>
+    <text x="300" y="132" text-anchor="middle" font-size="9" font-weight="bold" fill="#1a5c1a">R₂</text>
+    <text x="300" y="250" text-anchor="middle" font-size="10" fill="#2d7d2d">Ground test</text>
+
+    <!-- Coupling point 3: Expert review (weaker anchoring) -->
+    <circle cx="200" cy="260" r="40" fill="#e8e8d4" opacity="0.4"/>
+    <circle cx="200" cy="260" r="20" fill="#d4d4a8" opacity="0.5"/>
+    <circle cx="200" cy="260" r="8" fill="#7d7d2d"/>
+    <text x="200" y="232" text-anchor="middle" font-size="9" font-weight="bold" fill="#5c5c1a">R₃</text>
+    <text x="200" y="315" text-anchor="middle" font-size="10" fill="#7d7d2d">Expert review</text>
+    <text x="200" y="328" text-anchor="middle" font-size="9" fill="#888">(weaker anchoring)</text>
+
+    <!-- Stale coupling point (necrotic) -->
+    <circle cx="470" cy="100" r="60" fill="#f4e8e8" opacity="0.3" stroke="#c44" stroke-width="1" stroke-dasharray="4,3"/>
+    <circle cx="470" cy="100" r="8" fill="#c44" opacity="0.6"/>
+    <line x1="464" y1="94" x2="476" y2="106" stroke="#fff" stroke-width="2"/>
+    <line x1="476" y1="94" x2="464" y2="106" stroke="#fff" stroke-width="2"/>
+    <text x="470" y="72" text-anchor="middle" font-size="9" font-weight="bold" fill="#c44">R₄</text>
+    <text x="470" y="178" text-anchor="middle" font-size="10" fill="#c44">Stale data</text>
+    <text x="470" y="191" text-anchor="middle" font-size="9" fill="#c44">(S changed since R₄)</text>
+
+    <!-- No-field region -->
+    <text x="540" y="270" text-anchor="middle" font-size="13" fill="#999" font-style="italic">No coupling</text>
+    <text x="540" y="287" text-anchor="middle" font-size="13" fill="#999" font-style="italic">points</text>
+    <text x="540" y="310" text-anchor="middle" font-size="10" fill="#bbb">Precision unknown</text>
+
+    <!-- Annotations -->
+    <!-- Near-field label -->
+    <line x1="145" y1="82" x2="200" y2="45" stroke="#2d7d2d" stroke-width="1"/>
+    <text x="205" y="42" font-size="10" fill="#2d7d2d">Near-field: high precision,</text>
+    <text x="205" y="54" font-size="10" fill="#2d7d2d">parallax measurable</text>
+
+    <!-- Far-field label -->
+    <line x1="205" y1="110" x2="250" y2="65" stroke="#888" stroke-width="1"/>
+    <text x="255" y="60" font-size="10" fill="#888">Far-field: degrading precision,</text>
+    <text x="255" y="72" font-size="10" fill="#888">interpolation error grows</text>
+  </g>
+
+  <!-- === LEGEND === -->
+  <g transform="translate(80, 450)">
+    <circle cx="8" cy="0" r="6" fill="#2d7d2d"/>
+    <text x="22" y="4" font-size="10" fill="#444">RWS-grounded coupling point (through-zero / living floor)</text>
+
+    <circle cx="198" cy="0" r="6" fill="#7d7d2d"/>
+    <text x="212" y="4" font-size="10" fill="#444">Human-epistemic coupling (weaker, smaller near-field)</text>
+
+    <circle cx="438" cy="0" r="6" fill="#c44" opacity="0.6"/>
+    <text x="452" y="4" font-size="10" fill="#444">Stale coupling point (necrotic — S changed since R)</text>
+  </g>
+</svg>

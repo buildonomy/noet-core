@@ -2792,8 +2792,9 @@ impl DocumentCompiler {
     ///
     /// Call this after `sync_asset_snapshot`/`sync_subnet_stubs` (i.e. once
     /// `session_bb` reflects the post-absorption state) at every `drain_epoch()`
-    /// call site. See `AccInner::reparse_bids` and `.scratchpad/url_alias_resolution_gap.md`
-    /// for why this exists: a citing document's Phase 4 link-rewrite can race an
+    /// call site. See `AccInner::reparse_bids` and commit `5f31d75`
+    /// ("fix(codec): resolve url-alias citations to claimants, not absorbed
+    /// stubs") for why this exists: a citing document's Phase 4 link-rewrite can race an
     /// alias-claim absorption within the same epoch batch, and this closes that
     /// gap within the same compile rather than requiring a second `parse_all` call.
     ///
@@ -2834,7 +2835,8 @@ impl DocumentCompiler {
     /// href stub is accepted as a valid hit and returned in preference to the
     /// claimant that absorbed it. The citing document then keeps its edge to the
     /// stub, re-emits it, and the duplicate path is recreated on the next PathMap
-    /// rebuild. Self-sustaining: see `.scratchpad/url_alias_resolution_gap.md`.
+    /// rebuild. Self-sustaining: see commit `5f31d75` ("fix(codec): resolve
+    /// url-alias citations to claimants, not absorbed stubs") defect (E).
     ///
     /// Applying the rename to `session_bb` closes the loop. `NodeRenamed` is the
     /// right event: `BeliefBase::process_event` routes it to `replace_bid`, which

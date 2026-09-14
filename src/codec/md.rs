@@ -601,8 +601,9 @@ fn check_for_link_and_push(
             // link converges to whatever `ctx.beliefbase()` currently believes.
             //
             // Without this, a citation that raced an alias-claim and got rewritten
-            // to point at the stub (see .scratchpad/url_alias_resolution_gap.md,
-            // "Bug 2") stays wrong forever: the stub gets absorbed and deleted, but
+            // to point at the stub (see commit `5f31d75` ("fix(codec): resolve
+            // url-alias citations to claimants, not absorbed stubs"), defect (A))
+            // stays wrong forever: the stub gets absorbed and deleted, but
             // nothing ever re-examines the embedded bref against the current graph
             // state, so the dangling reference is re-emitted unchanged on every
             // subsequent parse. This check is deliberately namespace-agnostic —

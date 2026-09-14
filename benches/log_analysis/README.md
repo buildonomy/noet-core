@@ -23,7 +23,7 @@ works for everything but produces very large logs (a 90-second corpus run with
 | `extract_miss_keys.py` | **nothing** | Same CLI diagnostic stream. Also accepts a legacy `MISS on re-parse` tracing format that needed `noet_core::codec::fast_path=debug`. |
 | `diff_miss_keys.py` | same as `extract_miss_keys.py` | Compares two such logs. |
 | `analyze_pathmap.py` | `noet_core::paths::scan=debug`,<br>`noet_core::paths::perf=debug` | Also covered by a blanket `RUST_LOG=debug`; naming the targets trims the log modestly and keeps it readable. |
-| (no tool yet) | `noet_core::paths::collision=debug` | `[indexed_get] multi-candidate path` — fires when one path string has more than one claimant, logging the path, claimant BIDs, stub flags, and ids. **Expected to be silent**: zero hits over 1.29M lookups on a full corpus since the `alias-scope` and bare-anchor fixes. Any hit is either a legitimate stub-vs-content overlap (check the `stub` flag) or a new path-generation defect. Grep it directly. |
+| `parse_log.py --warnings` | `noet_core::paths::collision=warn` (covered by any log level) | `[PathMap::new] two entries share one path` — the current one-path-one-BID enforcement signal, classified as "Duplicate path survived to PathMap construction" in the warnings report. See §One-path-one-BID enforcement below. This superseded an `indexed_get`-level `Vec`-based probe from an older `PathMap` architecture; that probe's log line no longer exists in the code (`path_map` is now `FxHashMap<String, usize>`, which cannot represent more than one claimant), so grepping for the literal string `multi-candidate path` will never match a current build. |
 | `url_depth_sweep.py` | **no log at all** | Reads a URL list or a `NOET_DUMP_NAMESPACES` dump. |
 
 Targeted captures for the common cases:
@@ -243,14 +243,28 @@ normal on a corpus with unresolved links that are later declared as aliases; a
 flood suggests the same URL is being claimed and re-stubbed repeatedly, which
 is worth tracing to the document pair involved.
 
-The second should never appear. `path_map` is `FxHashMap<String, usize>` — a
+The second should never appear — `path_map` is `FxHashMap<String, usize>`, and a
 duplicate cannot be represented, so construction keeps the later entry and
 discards the earlier one. That is a silent resolution change: a link that used
 to reach one node now reaches another. Treat any occurrence as a bug in
 whichever write path produced the duplicate, not as a tuning parameter.
 
-Both are on `noet_core::paths::collision` at `warn`, so they appear at any log
-level and need no special `RUST_LOG`.
+**Known open defect, `--jobs > 1` only**: on a corpus with at least one
+reparse epoch, this classifier fires for a document's own internal
+`path#anchor` keys (not `alias-template`-derived keys — an earlier writeup
+misattributed it to `alias-template`; that framing is retracted). A fresh
+sequential (`--jobs 1`) parse of the same subtree produces zero hits; a
+`--jobs 4` parse of the same subtree reliably reproduces them. The mechanism
+is a `parse_epoch` reparse-seeding gap related to, but distinct from, the
+ancestor-BID seed-miss defect this same investigation found and fixed
+(reparse's per-document balanced seed resolves the ancestor `doc_bid`/`net_bid`
+correctly but does not make the document's own section BIDs visible to
+`cache_fetch`, so the reparse mints fresh BIDs for them). See
+`docs/project/0_open/ISSUE_97_BUILD_PERFORMANCE_BOTTLENECKS.md` (Bottleneck 9)
+for the corrected mechanism and evidence.
+
+Both classifiers are on `noet_core::paths::collision` at `warn`, so they appear
+at any log level and need no special `RUST_LOG`.
 
 ## Adding new warning classifiers
 

@@ -1,4 +1,8 @@
-# noet-core Documentation
+---
+title = "noet-core Documentation"
+---
+
+# noet-core Documentation {#__continue}
 
 This directory contains all documentation for the noet-core library.
 

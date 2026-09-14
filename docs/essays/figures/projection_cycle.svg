@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 470" font-family="system-ui, -apple-system, sans-serif">
+  <title>The Predict-Evaluate-Update Cycle</title>
+
+  <!-- Background -->
+  <rect width="800" height="470" fill="#fafafa"/>
+
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">The Universal Projection Cycle</text>
+  <text x="400" y="50" text-anchor="middle" font-size="12" fill="#666">Every projection follows: predict → evaluate → update. V&amp;V is the same structure.</text>
+
+  <!-- === MAIN CYCLE === -->
+  <g transform="translate(400, 230)">
+
+    <!-- Step 1: Predict -->
+    <g transform="translate(-250, -80)">
+      <rect x="-80" y="-30" width="160" height="60" rx="8" fill="#e8e8f4" stroke="#2d2d7d" stroke-width="2"/>
+      <text x="0" y="-8" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d2d7d">1. Predict</text>
+      <text x="0" y="12" text-anchor="middle" font-size="11" fill="#2d2d7d">X⟨Y⟩ → R'_Z</text>
+      <text x="0" y="25" text-anchor="middle" font-size="8.5" fill="#666">⟨·⟩ = the world's; unmarked = mine</text>
+
+      <!-- Inputs -->
+      <text x="-80" y="-55" text-anchor="middle" font-size="10" fill="#666">X: the model's lens</text>
+      <text x="-80" y="-42" text-anchor="middle" font-size="9" fill="#888">(execution mode)</text>
+      <line x1="-80" y1="-38" x2="-80" y2="-30" stroke="#666" stroke-width="1" marker-end="url(#arrowGray)"/>
+
+      <text x="80" y="-55" text-anchor="middle" font-size="10" fill="#666">⟨Y⟩: the world's content</text>
+      <text x="80" y="-42" text-anchor="middle" font-size="9" fill="#888">(data mode)</text>
+      <line x1="80" y1="-38" x2="80" y2="-30" stroke="#666" stroke-width="1" marker-end="url(#arrowGray)"/>
+    </g>
+
+    <!-- Arrow 1→2 -->
+    <line x1="-90" y1="-75" x2="50" y2="-75" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="-20" y="-85" text-anchor="middle" font-size="10" fill="#333">R'_Z (predicted</text>
+    <text x="-20" y="-58" text-anchor="middle" font-size="10" fill="#333">record on axis Z)</text>
+
+    <!-- Step 2: Evaluate -->
+    <g transform="translate(130, -80)">
+      <rect x="-80" y="-30" width="160" height="60" rx="8" fill="#e8f4e8" stroke="#2d7d2d" stroke-width="2"/>
+      <text x="0" y="-8" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d7d2d">2. Evaluate</text>
+      <text x="0" y="12" text-anchor="middle" font-size="11" fill="#2d7d2d">Z(R'_Z, R_Z) → σ</text>
+
+      <!-- Actual record input -->
+      <text x="80" y="-55" text-anchor="middle" font-size="10" fill="#666">R_Z (actual)</text>
+      <text x="80" y="-42" text-anchor="middle" font-size="9" fill="#888">(observed record)</text>
+      <line x1="80" y1="-38" x2="80" y2="-30" stroke="#666" stroke-width="1" marker-end="url(#arrowGray)"/>
+    </g>
+
+    <!-- Arrow 2→3 -->
+    <line x1="130" y1="-20" x2="130" y2="50" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="155" y="20" font-size="10" fill="#333">surprise σ,</text>
+    <text x="155" y="33" font-size="10" fill="#333">scaled to Φ = a·m</text>
+
+    <!-- Step 3: Update -->
+    <g transform="translate(130, 100)">
+      <rect x="-80" y="-30" width="160" height="60" rx="8" fill="#f4e8e8" stroke="#7d2d2d" stroke-width="2"/>
+      <text x="0" y="-8" text-anchor="middle" font-size="13" font-weight="bold" fill="#7d2d2d">3. Update</text>
+      <text x="0" y="12" text-anchor="middle" font-size="11" fill="#7d2d2d">infer Δ on axis Z</text>
+      <text x="0" y="25" text-anchor="middle" font-size="8.5" fill="#a55">deduce / induct / abduce</text>
+    </g>
+
+    <!-- Feedback arrow (update back to model, which feeds predict) -->
+    <path d="M 50,130 L -280,130 L -280,-20 L -250,-20"
+          fill="none" stroke="#333" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow)"/>
+    <text x="-140" y="150" text-anchor="middle" font-size="10" fill="#888">updated model feeds next cycle</text>
+
+    <!-- Fixed point annotation -->
+    <g transform="translate(130, 100)">
+      <text x="100" y="-8" font-size="10" fill="#999">Φ ≈ 0 →</text>
+      <text x="100" y="7" font-size="10" fill="#999">no update</text>
+      <text x="100" y="22" font-size="10" fill="#999">(fixed point)</text>
+    </g>
+  </g>
+
+  <!-- === RECORDS NOTE === -->
+  <g transform="translate(60, 330)">
+    <rect x="0" y="0" width="680" height="52" rx="6" fill="#f0f4f8" stroke="#aac" stroke-width="1"/>
+    <text x="15" y="20" font-size="12" font-weight="bold" fill="#445">Every projection yields a record, not content:</text>
+    <text x="15" y="38" font-size="11" fill="#445">X⟨Y⟩ produces R'_Z — a predicted record typed to axis Z (⟨R'_Z⟩ when exploiting). Recovering latent N/S/P from R is a separate inferential step (3).</text>
+  </g>
+
+  <!-- === V&V CALLOUT === -->
+  <g transform="translate(60, 396)">
+    <rect x="0" y="0" width="680" height="55" rx="6" fill="#f8f8f0" stroke="#cca" stroke-width="1"/>
+    <text x="15" y="20" font-size="12" font-weight="bold" fill="#554">V&amp;V is this same cycle:</text>
+    <text x="15" y="38" font-size="11" fill="#554">Predict: P⟨S⟩ → R'_N   |   Evaluate: N(R'_N, R_N) → σ   |   Verification R: model-internal   |   Validation R: RWS-grounded</text>
+  </g>
+
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M 0,0 L 8,4 L 0,8 Z" fill="#333"/>
+    </marker>
+    <marker id="arrowGray" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M 0,0 L 6,3 L 0,6 Z" fill="#666"/>
+    </marker>
+  </defs>
+</svg>

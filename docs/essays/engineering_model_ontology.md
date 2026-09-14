@@ -68,9 +68,9 @@ of its epistemic health.
 This framing unifies several observations that are treated as separate in the
 literature. The distinction between verification and validation (Banks, 1998;
 ASME V&V 10) is derivable from first principles within this framework: both
-follow the universal projection structure. The generative model `P(S)` produces
-predicted observations `R'`; actual observations `R` supply the comparison stream;
-the normative scoring function `N` evaluates the divergence: `N(R, R') → surprise`.
+follow the universal projection structure. The generative model $P(S)$ produces
+predicted records $R'$; actual observations $R$ supply the comparison stream;
+the normative scoring function $N$ evaluates the divergence: $N(R', R) \to \sigma$.
 The difference is the provenance of `R`: validation evaluates `R` produced by the
 world actually running (`P(s_t) → s_{t+1}` where `s_t` is a Real-world system
 (RWS) state), while verification evaluates `R` produced by a model-internal process
@@ -131,9 +131,10 @@ surprise. The cross-product structure is what makes `N`, `S`, and `P` genuinely
 orthogonal: each is the predicted output of the other two, and the prediction can
 be wrong.
 
-This framework has four consequences. First, it grounds the organizational belief
-network ([wp-connectome]) in a precise theory of what "models" are and how they
-couple. Second, it provides a principled basis for model credibility assessment:
+This framework has four consequences. First, it grounds the notion of an
+organizational belief network — the graph of models, assumptions, and
+inter-disciplinary agreements an organization holds — in a precise theory of what
+"models" are and how they couple. Second, it provides a principled basis for model credibility assessment:
 assessment factors map onto the content types and their projection relationships.
 Third, it resolves the boundary question — a model needs to be formally registered
 when its `N` content becomes an ontology dependency for another model's `S` content.
@@ -207,12 +208,12 @@ when, and why — a death that can be felt rather than a silent disappearance. T
 archive of retired couplings is itself epistemic evidence: it documents what the
 organization has learned, what it has outgrown, and what it chose to stop tracking.
 
-The organizational belief network framework ([wp-connectome]) identifies this relational
-structure as the engineering program's primary epistemic object: the graph of
-models, assumptions, and inter-disciplinary agreements that the organization holds
-about the system it is building. But that paper treats "model" informally — the
-meaning of "model" is taken as understood, and the compilation of artifacts into
-a belief network is described at the level of document types and cross-references.
+This relational structure is the engineering program's primary epistemic object:
+the graph of models, assumptions, and inter-disciplinary agreements that the
+organization holds about the system it is building. Treatments of it typically
+take the meaning of "model" as understood, describing the compilation of
+artifacts into a belief network at the level of document types and
+cross-references.
 
 This paper makes the model concept precise. The central claim: **artifacts are not
 models; they are carriers of content on which models are built.** A model is a
@@ -283,7 +284,7 @@ components," "Minimize time-to-diagnosis for operator-facing fault conditions."
 The distinction matters for credibility assessment and for surprise propagation
 dynamics. Constraint violations are detectable by direct comparison of observation
 to threshold. Optimization signal failures require tracking the proxy relationship
-over time and detecting drift — the Goodhart failure mode described in [wp-connectome].
+over time and detecting drift — the Goodhart failure mode (§1).
 
 `N` content has a special role in inter-model coordination: it is the **exposed
 preference surface** of a model, published at an abstraction level that other
@@ -311,16 +312,16 @@ acting on `S`: the thermal equations act on the geometry, the physics of
 transistor switching acts on the binary, the numerical integrator acts on the
 model equations, the coordination dynamics act on the org structure. In the active
 inference framework (Friston, 2010), `p(o|s)` — the generative model mapping
-hidden states to expected observations — corresponds to the `P(S)` pair taken
+hidden states to expected observations — corresponds to the $P(S)$ pair taken
 together, not to `S` alone. `S` is the argument; `P` is the operator; the
 generation requires both.
 
 This is why structural content is the target of credibility assessment (§9).
-`S` is what is being trusted when a downstream model treats a `P(S)` output as
+`S` is what is being trusted when a downstream model treats a $P(S)$ output as
 an RWS substitute. Errors in `S` — wrong geometry, wrong binary, wrong equations
 — propagate through every `P` that acts on it, producing systematically wrong
 `s_{t+1}` that no amount of procedural rigor in `P` can correct. The credibility
-question is always: does `P(S)` produce states consistent with `P(RWS)` within
+question is always: does $P(S)$ produce states consistent with $P(\text{RWS})$ within
 the claimed operating domain?
 
 `S` content is hierarchically decomposable: a system-level structural model is
@@ -339,11 +340,11 @@ line running a process, a reviewer reading a design: each is `P` acting on `S`.
 
 The written procedure, the source code, the test plan, the manufacturing
 specification — these are not `P`. They are structural content whose subject
-is execution: `S(P)`. A test procedure document describes the *structure* of
+is execution: $S_P$. A test procedure document describes the *structure* of
 how to test — the sequence, the conditions, the branches. The test engineer who
 reads it and executes it is `P`. A state machine diagram describes the
 *structure* of state transitions. The runtime that traverses it is `P`. This
-distinction — between the map of execution (`S(P)`) and the territory of
+distinction — between the map of execution ($S_P$) and the territory of
 execution (`P`) — is what makes `P` the hardest content type to
 externalize.[^P-epistemic]
 
@@ -353,9 +354,9 @@ terms. `S` is one projection deep: we see structure through normativity — we n
 to understand what is being declared to see how it is composed. `P` is two
 projections deep: we see causation through structure through normativity. We can
 only read about execution by understanding the structural descriptions of it
-(`S(P)`), which we understand through their normative context. This epistemic
+($S_P$), which we understand through their normative context. This epistemic
 ordering explains why `P` is the most aberrated from direct access. We never
-observe `P` directly — we observe `S(P)` (structural descriptions of execution)
+observe `P` directly — we observe $S_P$ (structural descriptions of execution)
 and `R` (the effects of execution). `P` itself is the gap between the two.
 
 `P` is the operator that acts on `S` to produce states. When `P` is applied to
@@ -407,9 +408,9 @@ recorded. The model evolves through `N×S×P`; its `R` events are fixed points
 in the causal structure.
 
 `R` becomes epistemically useful when consumed as the comparison stream in the
-universal projection structure: the generative model `P(S)` produces predicted
-observations `R'`; `R` supplies the actual observations; the normative scoring
-function `N` evaluates the divergence — `N(R, R') → surprise`. This is the unified
+universal projection structure: the generative model $P(S)$ produces predicted
+records $R'$; $R$ supplies the actual observations; the normative scoring
+function $N$ evaluates the divergence — $N(R', R) \to \sigma$. This is the unified
 form of both verification and validation — the difference is the provenance of the
 `R` being evaluated:
 
@@ -464,10 +465,10 @@ underlying property — *directed asymmetry* (directionality and causation):
 - **State transition verbs**: movement between states — "transition", "switch",
   "enter", "exit", "become"
 
-Strictly, the grammatical classifier detects `S(P)` — structural content whose
+Strictly, the grammatical classifier detects $S_P$ — structural content whose
 subject is execution — rather than `P` directly. Written text is always
 structure; when that structure describes causation, the classifier detects the
-causal subject matter. This detection is useful precisely because `S(P)` content
+causal subject matter. This detection is useful precisely because $S_P$ content
 tells you what kind of `P` (executor, infrastructure) the model requires. A
 state machine description (S) with dense causal grammar tells you the model
 needs a runtime (P). A test procedure (S) with imperative grammar tells you
@@ -513,7 +514,7 @@ content, and at what cost is it being held there?"
 | `N` only | `S` lives in the implementer's judgment; no `P` committed (no executor assigned) | Wrongness is undetectable; internal consistency cannot rule out consistent error |
 | `S` only | `N` is implicit in the designer's intent; no `P` committed (no one exercises the structure) | No basis for evaluating outputs; no mechanism for generating validation evidence |
 | `P` only (executor without explicit S or N) | `S` is the tacit model the executor works against; `N` is the unstated pass/fail criterion | `R` is produced but uninterpretable; no model to evaluate against |
-| `N` + `S`, no `P` | No executor committed — even if procedure documents exist (those are `S(P)`), no one and nothing is running them | Validity cannot be empirically confirmed; the verified-on-paper failure mode |
+| `N` + `S`, no `P` | No executor committed — even if procedure documents exist (those are $S_P$), no one and nothing is running them | Validity cannot be empirically confirmed; the verified-on-paper failure mode |
 | `N` + `P`, no `S` | `S` is whatever the executor improvises; no persistent structure for `P` to act on | `P` exercises nothing stable; `R` cannot be attributed to a persistent structure |
 | `S` + `P`, no `N` | `N` is the executor's implicit pass/fail judgment | `R` is produced but the evaluation standard is private and irreproducible |
 
@@ -535,28 +536,86 @@ Every `N`, `S`, or `P` artifact has a dual nature: as **data** (the outside view
 readable, diffable, queryable) and as **execution machinery** (the inside view —
 the lens that generates predictions when exercised). A projection[^1] puts one
 content type in execution mode (the function) and another in data mode (the
-argument), producing a *predicted observation* on the output axis.
+argument), producing a *predicted record* typed to the output axis.
 
 [^1]: The latent model is the operational reality. The expressed `N`, `S`, and `P` are lossy projections of it along three orthogonal axes — no externalized artifact fully reproduces the latent phenomenon.
 
-The notation `F(arg) → R'` should be read as: the model exercises its internal
-content of type `F` as a lens on an argument `arg` (in data mode) to produce `R'`
-— a predicted observation of what content on the output axis should look like.
-The prediction does not directly update the model. The model update is a separate
-operation: the prediction `R'` is compared against the actual content `R` on that
-axis, producing a **surprise** signal — `axis(R', R) → surprise`. Content changes
-only when surprise is non-zero.
+**Notation.** Angle brackets mark whose content a term is. $\langle X \rangle$ is
+the *world's* content — external to this model, sourced from another model, an
+artifact, or the environment. An unmarked term is the model's **own** content.
+The function is always the model's own lens and is therefore never marked; only
+arguments and outputs carry the distinction. So $P\langle S \rangle$ reads "my
+procedures applied to the world's structure," while $S\langle P \rangle$ reads
+"my structure evaluated against the world's procedures." An unmarked argument —
+$P(S)$ — is the model projecting on itself.
 
-The **argument** (parenthesized term) is content in data mode — sourced from the
-model itself or from an external model or artifact. The **function** (term before
-the parenthesis) is content in execution mode — the internal lens. The **output**
-(term after `→`) is the predicted observation on the third axis.
+This convention is what distinguishes the two orientations of each projection
+plane, and it is load-bearing throughout §5 and §6. It also disambiguates the
+operator from the *content-type qualifier* $S_P$ — structural content whose
+subject matter is execution (§3.3). The subscript is a type ascription, not an
+application: $S_P$ is $S$-axis content, qualified by what it is about. It has no
+second operand and produces nothing. It composes with the bracket marking in the
+ordinary way, so $P\langle S_P \rangle \to R'_N$ reads "my procedures applied to
+the world's written procedures" — a test campaign run against a supplier's
+delivered test plan.
+
+**Projections produce records, not content.** The notation
+$X\langle Y \rangle \to R'_Z$ should be read as: the model exercises its internal
+content of type $X$ as a lens on argument $Y$ to produce $R'_Z$ — a *predicted
+record*, typed to axis $Z$ because that is the axis it bears on. It is not
+itself $Z$-content. This distinction matters: a projection yields an expectation
+about what would be observed, and observations are records (§3.4), not norms,
+structures, or procedures.
+
+Getting from a record back to content takes two further operations:
+
+1. **Evaluate** — compare the predicted record against the actual record on the
+   same axis: $Z(R'_Z, R_Z) \to \sigma$. This is a same-axis comparison of two
+   records and yields a scalar, not content. Scaled by informational mass it
+   becomes the normalized surprise $\Phi$ (§6.3).
+2. **Infer** — recover the latent $N$, $S$, or $P$ content that the divergence
+   implies. This is the step that changes the model.
+
+Content changes only at step 3, and only when surprise is non-zero. Neither the
+projection nor the comparison updates the model on its own — a point that is
+easy to lose because the three steps are usually performed together by the same
+engineer in the same sitting.
+
+**Three modes of inference, three strengths of warrant.** The inferential step
+is not a single operation. All three classical modes apply, and which one is
+available is a property of the model's state, not of the engineer's preference:
+
+| Mode | From records to content | Warrant |
+|---|---|---|
+| **Deduction** | The content follows necessarily from the records and the model's existing commitments. A constraint boundary was crossed; the constraint is violated. No alternative account exists. | Certain, given the premises. Narrow — available only where the model is already specified tightly enough to force the conclusion. |
+| **Induction** | A pattern across many records supports a general claim: repeated observations within a domain establish that a constraint holds *there*. | Probabilistic and domain-bounded. Strengthens with coverage; never closes. This is what the validation domain (§9.1) accumulates. |
+| **Abduction** | The records are surprising, and the engineer proposes the content that would best explain them — a revised structure, an unstated assumption made explicit, a mechanism not previously modeled. | Weakest and most generative. Several revisions may explain the same divergence; the inference selects among them on grounds the records underdetermine. |
+
+Deduction and induction cannot introduce content the model does not already
+implicitly contain — they tighten, confirm, or falsify. Only abduction extends
+the model into genuinely new territory, which is why it carries the weakest
+warrant and why the content it produces most needs subsequent verification. A
+model that grows only by abduction is speculative; one that never abducts cannot
+learn anything its initial framing did not anticipate.
+
+This is a claim about the **evidential status** of the resulting content, and it
+propagates: content abduced from a single surprising record and content deduced
+from a violated constraint are not equally credible, even when both are recorded
+as $N$-axis updates. The credibility assessment of §9 is in part an audit of
+which mode produced which content.
+
+The **argument** (bracketed or parenthesized term) is content in data mode —
+sourced from the model itself or from an external model or artifact. The
+**function** (term before it) is content in execution mode — the internal lens.
+The **output** (term after $\to$) is the predicted record, marked
+$\langle R'_Z \rangle$ when the prediction is about the world's content on that
+axis rather than the model's own.
 
 The six projections exhaust the combinations[^3]: three content types, each occupying
 the function role once per pair of argument types. All six are regularized
 inversions.
 
-[^3]: The projections have cross-product character: each takes content on two axes and produces a prediction on the third — the missing orthogonal dimension. The six operations correspond to the six ordered pairs of three axes (the cross product is anti-commutative; swapping function and argument roles produces a different prediction, matching `P(N) → R'_S` ≠ `N(P) → R'_S`). The surprise evaluation `axis(R', R) → surprise` has dot-product (inner product) character: it compares two values on the *same* axis and produces a scalar. Cross products for inter-axis prediction, inner products for same-axis evaluation — together these form a complete algebra on the three-axis model space.
+[^3]: The projections have cross-product character: each takes content on two axes and produces a prediction on the third — the missing orthogonal dimension. The six operations correspond to the six ordered pairs of three axes (the cross product is anti-commutative; swapping function and argument roles produces a different prediction, matching $P\langle N \rangle \to R'_S \neq N\langle P \rangle \to R'_S$). The surprise evaluation $Z(R'_Z, R_Z) \to \sigma$ has inner-product character: it compares two values on the *same* axis and produces a scalar. Cross products for inter-axis prediction, inner products for same-axis evaluation. Note that the algebra is not closed under composition: a projection's output is a record, and a record is not admissible as the function of another projection, so projections do not chain directly. Iteration proceeds through the full predict-evaluate-abduce cycle, which returns to content before the next projection can be applied.
 
 The expressed `N`, `S`, and `P` are not the latent model — they are
 low-dimensional projections of it: lossy, finite-fidelity representations captured
@@ -591,9 +650,15 @@ surface. This duality operates on all three projection planes:
 
 | Output axis | Explore (sink: absorb, grind) | Exploit (source: project, shape) |
 |---|---|---|
-| `N` (norms) | `P(S) → R'_N`: world's matter reshapes self's norms | `S(P) → R'_N`: self's matter shapes the world's norms |
-| `S` (structure) | `P(N) → R'_S`: world's information reshapes self's structure | `N(P) → R'_S`: self's information shapes the world's structure |
-| `P` (field) | `S(N) → R'_P`: world's information reshapes self's processes | `N(S) → R'_P`: self's information shapes the world's processes |
+| $N$ (norms) | $P\langle S \rangle \to R'_N$: world's matter reshapes self's norms | $S\langle P \rangle \to \langle R'_N \rangle$: self's matter shapes the world's norms |
+| $S$ (structure) | $P\langle N \rangle \to R'_S$: world's information reshapes self's structure | $N\langle P \rangle \to \langle R'_S \rangle$: self's information shapes the world's structure |
+| $P$ (field) | $S\langle N \rangle \to R'_P$: world's information reshapes self's processes | $N\langle S \rangle \to \langle R'_P \rangle$: self's information shapes the world's processes |
+
+The asymmetry in the output position is the sign. Explore predicts a record
+about the model's *own* content on the output axis — the model expects to be
+changed. Exploit predicts a record about the *world's* content — the model
+expects the world to conform. Reading the direction off the shape of the
+expression is what the bracket notation buys.
 
 This corresponds directly to the perceptual inference / active inference duality
 in the free energy literature (Friston, 2010): explore updates the model; exploit
@@ -609,13 +674,16 @@ interaction. The structural containment hierarchy (§8.1) ensures that every
 epistemic and procedural coupling has a structural home.
 
 This is why iterated projection is the convergence mechanism. Each round-trip
-(e.g. `P(N) → R'_S` followed by `N(S) → R'_P`) folds the model's own state
-through a different axis — an adaptive optics cycle that grinds the lens surface
-toward less aberration on each pass. When the argument is sourced from a different
-model, the projection is an inter-model operation — the normal case for coupled
-systems. Whether iterated predict-evaluate-update cycles converge to a fixed
-point, oscillate, or diverge depends on the initial configuration and the
-structure of the model-space (§11).
+(e.g. $P\langle N \rangle \to R'_S$ followed by $N\langle S \rangle \to \langle R'_P \rangle$)
+folds the model's own state through a different axis — an adaptive optics cycle
+that grinds the lens surface toward less aberration on each pass. Because a
+projection yields a record rather than content, each pass must complete the full
+predict-evaluate-infer cycle before the next projection has content to act on;
+the cycles are sequential, not composable. When the argument is sourced from a
+different model, the projection is an inter-model operation — the normal case for
+coupled systems. Whether iterated cycles converge to a fixed point, oscillate, or
+diverge depends on the initial configuration and the structure of the model-space
+(§11).
 
 ![The Model Cube: Six Projections in N × S × P Space](figures/model_cube_projections.svg)
 
@@ -624,109 +692,126 @@ structure of the model-space (§11).
 ### 5.1 The Six Projections
 
 Each projection below describes what the operation *predicts* on its output axis.
-The prediction is subject to surprise evaluation against actual content — the model
-update is downstream of the comparison, not a direct consequence of the projection.
+The prediction is a record, subject to surprise evaluation against the actual
+record on that axis; the content change is inferred from the divergence. The
+model update is downstream of both steps, not a direct consequence of the
+projection.
 
-**`P(N) → S`** — exploit (Top-down implementation): The model's internal development process
-(`P`) is applied to normative requirements (`N`) to produce a structural
-implementation (`S`). `N` constrains the solution space;  `P`
-selects within it.
+The orientation follows from the notation: where the output is unmarked the
+prediction lands on the model's own content (explore), and where it is marked
+$\langle \cdot \rangle$ it lands on the world's (exploit). Each plane appears
+twice in the list, once per orientation. Where the descriptions below say a
+projection "produces" or "derives" content, read this as shorthand for the full
+cycle — the projection predicts, the comparison scores, and the engineer infers
+the content that resolves the divergence.
+
+**$P\langle N \rangle \to R'_S$** — explore (Top-down implementation): The model's
+internal development process ($P$) is applied to external normative requirements
+($\langle N \rangle$) to produce a structural implementation ($S$). $N$ constrains
+the solution space; $P$ selects within it. The prediction lands on the model's own
+structure — the world's norms reshape what the model builds.
 
 *Example*: A set of interface latency requirements from a customer specification
-(external `N`) is applied through a software architecture process (internal `P`) to
-produce a service decomposition and data-flow design (`S`). The requirements bound
+($\langle N \rangle$) is applied through a software architecture process ($P$) to
+produce a service decomposition and data-flow design ($S$). The requirements bound
 which architectures are admissible; the process selects among them.
 
 *PM register*: A budget ceiling and delivery schedule from a program directive
-(external `N`) is applied through a work-breakdown and staffing process (internal `P`)
-to produce a project plan (`S`) — the structural implementation of the commitment.
+($\langle N \rangle$) is applied through a work-breakdown and staffing process ($P$)
+to produce a project plan ($S$) — the structural implementation of the commitment.
 
-**`P(S) → N`** — explore (Interface definition): The model's internal analysis methodology
-(`P`) is applied to an external structural implementation (`S`) to derive normative
-constraints (`N`) governing its interfaces. The procedure observes how the external
-`S` behaves at its boundaries and codifies what it finds.
+**$P\langle S \rangle \to R'_N$** — explore (Interface definition): The model's
+internal analysis methodology ($P$) is applied to an external structural
+implementation ($\langle S \rangle$) to derive normative constraints ($N$)
+governing its interfaces. The procedure observes how the external $S$ behaves at
+its boundaries and codifies what it finds.
 
-*Example*: An integration test campaign (internal `P`) run against a supplier's
-delivered subsystem (external `S`) produces the interface control document (`N`)
+*Example*: An integration test campaign ($P$) run against a supplier's delivered
+subsystem ($\langle S \rangle$) produces the interface control document ($N$)
 specifying the timing, data format, and error-handling constraints that all
 downstream consumers of that subsystem must satisfy.
 
-*PM register*: A capacity assessment process (internal `P`) applied to an existing
-team's demonstrated velocity (external `S`) produces the throughput constraints
-(`N`) — rate limits, queue depths, dependency windows — that bound what the
+*PM register*: A capacity assessment process ($P$) applied to an existing team's
+demonstrated velocity ($\langle S \rangle$) produces the throughput constraints
+($N$) — rate limits, queue depths, dependency windows — that bound what the
 program plan can commit to.
 
-**`S(N) → P`** — explore (Operational procedure derivation): The model's internal structural
-implementation (`S`) is evaluated against external normative constraints (`N`) to
-derive the procedures by which the implementation correctly and safely performs its
-intended function. The procedures are elicited by the combination of what the
-structure can do and what the norms require of it — they are not written from
-scratch.
+**$S\langle N \rangle \to R'_P$** — explore (Operational procedure derivation): The
+model's internal structural implementation ($S$) is evaluated against external
+normative constraints ($\langle N \rangle$) to derive the procedures by which the
+implementation correctly and safely performs its intended function. The procedures
+are elicited by the combination of what the structure can do and what the norms
+require of it — they are not written from scratch.
 
-*Example*: A database system's replication architecture (internal `S`) is evaluated
-against external data-durability and recovery-time requirements (`N`) to derive the
-backup schedule, failover procedure, and operator runbook (`P`) that correctly
-operationalize the architecture within its normative constraints.
+*Example*: A database system's replication architecture ($S$) is evaluated against
+external data-durability and recovery-time requirements ($\langle N \rangle$) to
+derive the backup schedule, failover procedure, and operator runbook ($P$) that
+correctly operationalize the architecture within its normative constraints.
 
-*PM register*: A team's organizational structure and toolchain (internal `S`) is
-evaluated against external delivery commitments and reporting requirements (`N`) to
-derive the sprint cadence, review gates, and escalation procedure (`P`) that
-correctly operationalizes the team's capacity against its commitments.
+*PM register*: A team's organizational structure and toolchain ($S$) is evaluated
+against external delivery commitments and reporting requirements
+($\langle N \rangle$) to derive the sprint cadence, review gates, and escalation
+procedure ($P$) that correctly operationalizes the team's capacity against its
+commitments.
 
-**`S(P) → N`** — exploit (Procedure-bounded constraint derivation): The model's internal
-structural implementation (`S`) is evaluated against external execution procedures
-(`P`) to derive the normative boundaries accessible to the model within those
-procedural constraints. This projection produces the boundary conditions under
+**$S\langle P \rangle \to \langle R'_N \rangle$** — exploit (Procedure-bounded
+constraint derivation): The model's internal structural implementation ($S$) is
+evaluated against external execution procedures ($\langle P \rangle$) to derive the
+normative boundaries accessible to the model within those procedural constraints. This projection produces the boundary conditions under
 which the model's claims are epistemically grounded — the entire observable space
 that the model can accommodate. This is equivalent to model-checking, such as
 implemented in LTL or CTL.
 
-*Example*: A control system's implemented state machine (internal `S`) is
-exhaustively explored against a qualification test suite from a certification body
-(external `P`) to derive the full set of reachable states and transition
-properties (`N`) — the complete behavioral envelope that the state machine can
-exhibit under the conditions the test suite exercises.
+*Example*: A control system's implemented state machine ($S$) is exhaustively
+explored against a qualification test suite from a certification body
+($\langle P \rangle$) to derive the full set of reachable states and transition
+properties ($\langle N \rangle$) — the complete behavioral envelope that the state
+machine can exhibit under the conditions the test suite exercises.
 
-*PM register*: A project's current tracking and reporting infrastructure (internal
-`S`) is evaluated against the audit and review procedures required by a program
-oversight body (external `P`) to derive the complete set of observable metrics and
-status categories (`N`) — everything the infrastructure can actually measure and
-report under those procedures.
+*PM register*: A project's current tracking and reporting infrastructure ($S$) is
+evaluated against the audit and review procedures required by a program oversight
+body ($\langle P \rangle$) to derive the complete set of observable metrics and
+status categories ($\langle N \rangle$) — everything the infrastructure can actually
+measure and report under those procedures.
 
-**`N(P) → S`** — explore (Procedure-feasibility-filtered design): The model's internal
-normative content (`N`) is applied to external development or qualification
-procedures (`P`) to derive the structural implementation that the available
+**$N\langle P \rangle \to \langle R'_S \rangle$** — exploit
+(Procedure-feasibility-filtered design): The model's internal normative content
+($N$) is applied to external development or qualification procedures
+($\langle P \rangle$) to derive the structural implementation that the available
 procedures can actually build, exercise, and verify. This projection acts as a
-feasibility filter: it eliminates designs that satisfy `N` on paper but cannot
-be realized or confirmed given the `P` actually available.
+feasibility filter: it eliminates designs that satisfy $N$ on paper but cannot be
+realized or confirmed given the $P$ actually available.
 
-*Example*: A system's safety requirements (internal `N`) are evaluated against the
-qualification test procedures available at the intended test facility (external
-`P`) to derive the design configuration (`S`) that satisfies the requirements and
-is fully exercisable by those procedures — excluding configurations that would
-require test capabilities the facility does not have.
+*Example*: A system's safety requirements ($N$) are evaluated against the
+qualification test procedures available at the intended test facility
+($\langle P \rangle$) to derive the design configuration ($\langle S \rangle$) that
+satisfies the requirements and is fully exercisable by those procedures — excluding
+configurations that would require test capabilities the facility does not have.
 
-*PM register*: A program's contractual deliverable requirements (internal `N`) are
-evaluated against the review and acceptance procedures specified by the customer
-(external `P`) to derive the work product structure (`S`) — document formats,
-traceability matrices, artifact naming — that satisfies the requirements and
-passes through the customer's acceptance process.
+*PM register*: A program's contractual deliverable requirements ($N$) are evaluated
+against the review and acceptance procedures specified by the customer
+($\langle P \rangle$) to derive the work product structure ($\langle S \rangle$) —
+document formats, traceability matrices, artifact naming — that satisfies the
+requirements and passes through the customer's acceptance process.
 
-**`N(S) → P`** — exploit (Verification and validation planning): The model's internal
-normative content (`N`) is applied to an external structural implementation (`S`) to
-derive the procedures by which the implementation can be shown to satisfy the
-requirements. This is the canonical V&V planning operation, and the primary
-mechanism by which normative couplings are made empirically checkable.
+**$N\langle S \rangle \to \langle R'_P \rangle$** — exploit (Verification and
+validation planning): The model's internal normative content ($N$) is applied to an
+external structural implementation ($\langle S \rangle$) to derive the procedures by
+which the implementation can be shown to satisfy the requirements. This is the
+canonical V&V planning operation, and the primary mechanism by which normative
+couplings are made empirically checkable.
 
-*Example*: A set of reliability and fault-tolerance requirements (internal `N`) is
-evaluated against an implemented service architecture (external `S`) to produce the
-failure-injection test plan and coverage matrix (`P`) that demonstrates the
-architecture satisfies the requirements under the specified fault conditions.
+*Example*: A set of reliability and fault-tolerance requirements ($N$) is evaluated
+against an implemented service architecture ($\langle S \rangle$) to produce the
+failure-injection test plan and coverage matrix ($\langle P \rangle$) that
+demonstrates the architecture satisfies the requirements under the specified fault
+conditions.
 
-*PM register*: A program's schedule and budget commitments (internal `N`) are
-evaluated against the current project plan and burn rate (external `S`) to produce
-the earned-value measurement procedure and variance-reporting cadence (`P`) that
-keeps the commitments empirically checkable throughout execution.
+*PM register*: A program's schedule and budget commitments ($N$) are evaluated
+against the current project plan and burn rate ($\langle S \rangle$) to produce the
+earned-value measurement procedure and variance-reporting cadence
+($\langle P \rangle$) that keeps the commitments empirically checkable throughout
+execution.
 
 ### 5.2 Artifacts and Projection Roles
 
@@ -734,12 +819,13 @@ The central consequence of the projection structure is that **artifact type
 classification is a category error**. An artifact does not have a fixed type —
 it carries content that plays different roles in different projection instances.
 
-A requirements document carries `N` content. In a `P(N) → S` projection instance,
-it is the external argument: the stimulus a team's development process acts
-against. In an `N(S) → P` projection instance, it is the internal lens: the model's
-own normative content applied to an external design. In a `P(S) → N` projection
-instance, it may be the *output* — the normative content that an analysis
-procedure is generating for the first time.
+A requirements document carries `N` content. In a $P\langle N \rangle \to R'_S$
+projection instance, it is the external argument: the stimulus a team's
+development process acts against. In an
+$N\langle S \rangle \to \langle R'_P \rangle$ projection instance, it is the
+internal lens: the model's own normative content applied to an external design.
+In a $P\langle S \rangle \to R'_N$ projection instance, it may be the *output* —
+the normative content that an analysis procedure is generating for the first time.
 
 The same artifact, three distinct roles — external argument, internal function,
 or generated output — depending entirely on which projection instance it participates
@@ -754,14 +840,22 @@ questions are: "What content type does this artifact primarily carry?" and
 
 Section 3 established that incomplete models carry latent content; the projections
 describe the operations by which that content is elicited. Model growth is the
-sequential application of projection instances to externalize what was implicit:
+sequential application of projection cycles to externalize what was implicit —
+each cycle predicting a record, scoring it, and inferring the content that
+resolves the divergence:
 
-- A model with only `N` grows by applying `P(N) → S` (elicit the implementation),
-  then `N(S) → P` (elicit the verification procedure), then executing `P` to produce `R`.
-- A model with only `S` grows by applying `P(S) → N` (elicit the interface
-  requirements), then `N(S) → P` (elicit the verification procedure).
-- A model with only `R` (informal test data) grows by articulating the `S` that
-  produced it, then the `N` against which it should be evaluated.
+- A model with only $N$ grows by applying $P\langle N \rangle \to R'_S$ (elicit the
+  implementation), then $N\langle S \rangle \to \langle R'_P \rangle$ (elicit the
+  verification procedure), then executing $P$ to produce $R$.
+- A model with only $S$ grows by applying $P\langle S \rangle \to R'_N$ (elicit the
+  interface requirements), then $N\langle S \rangle \to \langle R'_P \rangle$ (elicit
+  the verification procedure).
+- A model with only $R$ (informal test data) grows by inferring the $S$ that
+  produced it, then the $N$ against which it should be evaluated. This is the
+  inferential step running without a prior prediction — records in hand, content
+  recovered backward. It is characteristically abductive: with no prediction to
+  diverge from, there is nothing to deduce against and no established domain to
+  induct over.
 
 The six projections are not one-time operations. They recur throughout the model's
 life as design matures, the operating environment changes, and new `R` arrives —
@@ -784,7 +878,7 @@ that makes credibility state visually inspectable.
 genuinely orthogonal: each is the cross-product output of the other two (§5),
 and the prediction can be wrong — non-zero surprise on the output axis is what
 makes the axes independent. If `N` were derivable from `S` and `P`, the
-projection `P(S) → R'_N` would always produce zero surprise, and the `N` axis
+projection $P\langle S \rangle \to R'_N$ would always produce zero surprise, and the `N` axis
 would be redundant. It is not. A node can carry strong content on all three axes
 simultaneously — a safety analysis document that states requirements (high `N`),
 maps architecture (high `S`), and defines verification procedures (high `P`) lives
@@ -843,7 +937,7 @@ The three spatial dimensions differ in their relationship to directionality:
 ### 6.2 Informational Mass
 
 The six projections produce predictions; the inner products evaluate them
-against `R`. But the raw surprise `σ = N(R', R)` is scale-dependent. A 1mm
+against $R$. But the raw surprise $\sigma = N(R'_N, R_N)$ is scale-dependent. A 1mm
 alignment error is catastrophic for a docking mechanism and negligible for a
 test fixture. The same physical divergence produces different credibility
 impact depending on how much structure depends on the entity being within its
@@ -878,27 +972,27 @@ reverberates widely through the coupled network.
 
 ### 6.3 Normalized Surprise
 
-The normative constraint `N` defines a boundary on the entity — what the entity
-claims about its behavior. The **boundary divergence** `a` measures how far the
+The normative constraint $N$ defines a boundary on the entity — what the entity
+claims about its behavior. The **boundary divergence** $a$ measures how far the
 observation landed from that boundary, in units of the constraint's own
-tolerance. The informational mass `m` is the assembly index. Their product is
-the **normalized surprise** `F` — the credibility impact on the belief network:
+tolerance. The informational mass $m$ is the assembly index. Their product is
+the **normalized surprise** $\Phi$ — the credibility impact on the belief network:
 
-```
-F = a × m = boundary_divergence(N, R', R) × assembly_index(entity)
-```
+$$
+\Phi = a \, m = \mathrm{boundary\_divergence}(N, R', R) \times \mathrm{assembly\_index}(\text{entity})
+$$
 
-This is `F = ma` for credibility. The boundary divergence is the
-acceleration — how hard the observation pushes against the model's claims. The
-mass determines how much of the belief network that push affects. A small
-divergence on a high-mass entity (a tight tolerance nearly violated on a
-deep-chain model) produces moderate `F` — worth monitoring. A large divergence
-on a high-mass entity produces very high `F` — a credibility crisis. A large
-divergence on a low-mass entity produces moderate `F` — locally concerning but
-contained.
+This is $F = ma$ for credibility, with $\Phi$ in the role of force. The boundary
+divergence is the acceleration — how hard the observation pushes against the
+model's claims. The mass determines how much of the belief network that push
+affects. A small divergence on a high-mass entity (a tight tolerance nearly
+violated on a deep-chain model) produces moderate $\Phi$ — worth monitoring. A
+large divergence on a high-mass entity produces very high $\Phi$ — a credibility
+crisis. A large divergence on a low-mass entity produces moderate $\Phi$ —
+locally concerning but contained.
 
-Policy thresholds at each lifecycle gate are applied to `F`, not to raw
-divergence. A threshold on `F` automatically demands tighter raw tolerance on
+Policy thresholds at each lifecycle gate are applied to $\Phi$, not to raw
+divergence. A threshold on $\Phi$ automatically demands tighter raw tolerance on
 high-mass entities and permits looser raw tolerance on low-mass entities.
 Criticality classification — the manual assignment of consequence levels — is
 subsumed by the mass computation.
@@ -936,7 +1030,7 @@ restores it.
 
 **Edge properties**: Edges between models carry visual encodings for coupling
 type (`WeightKind` as color: section = grey, epistemic = blue, pragmatic =
-orange), for normalized surprise (`F` as thickness), and for `R` provenance
+orange), for normalized surprise ($\Phi$ as thickness), and for `R` provenance
 and recency (as opacity, matching the node rendering).
 
 **Query-driven overlays**: The rendering supports composable diagnostic
@@ -974,11 +1068,11 @@ marks each transition:
 > **Gate = (projection set, input specification, surprise threshold)**
 > - Which cross products must have been executed
 > - With what input N/S/P content (at what maturity and resolution)
-> - Producing what output R with what maximum normalized surprise F
+> - Producing what output R with what maximum normalized surprise $\Phi$
 
 The **(query, threshold)** formulation from §6.4 is the rendered version of
 this underlying structure: queries highlight couplings where the specified
-projections have not been executed or where F exceeds the gate's threshold.
+projections have not been executed or where $\Phi$ exceeds the gate's threshold.
 The projection specification is the principled basis; the rendered overlay is
 the visual diagnostic.
 
@@ -1190,9 +1284,10 @@ latent and unvalidated produces R whose confidence is uncharacterized. The
 surrogate's own credibility state (§9) propagates into every R event it
 participates in producing.
 
-This connects to surrogate coupling (§8.2): "when N(R_surrogate, R') is
-evaluated as if R_surrogate were R_RWS, the resulting surprise signal
-inherits A's model error invisibly." The E/F/M framework generalizes this:
+This connects to surrogate coupling (§8.2): "when
+$N(R', R_\text{surrogate})$ is evaluated as if $R_\text{surrogate}$ were
+$R_\text{RWS}$, the resulting surprise signal inherits A's model error
+invisibly." The E/F/M framework generalizes this:
 every verification R inherits the simulation environment's model error. The
 simulation environment is itself a model portfolio — a collection of RWS
 models with their own fidelity, validation history, and potential for
@@ -1417,9 +1512,9 @@ are epistemically grounded. A project manager asks whether the vesicles are
 resourced. A test engineer asks what surrogates are available and at what
 fidelity. Each role installs a different inference algorithm on the same
 shared object: which projections to check, which gaps to surface, which
-surprise thresholds to apply. This is how the organizational belief network
-([wp-connectome]) supports multiple operational perspectives without
-fragmenting into per-role databases — the graph is one; the lens is many.
+surprise thresholds to apply. This is how a compiled belief network supports
+multiple operational perspectives without fragmenting into per-role databases —
+the graph is one; the lens is many.
 
 ### 7.5 Wireframe and Credibility Texture
 
@@ -1537,7 +1632,7 @@ outputs are consumed by an analysis procedure as if they were telemetry. A timin
 model's bounds are consumed by a safety argument as if they were empirically
 confirmed flight data. The surrogate is the execution `P(A.S) → R`: `A.S` is
 authored and owned; the resulting `R` is treated as observed and grounded. When
-`N(R_surrogate, R')` is evaluated as if `R_surrogate` were `R_RWS`, the resulting
+$N(R', R_\text{surrogate})$ is evaluated as if $R_\text{surrogate}$ were $R_\text{RWS}$, the resulting
 surprise signal inherits A's model error invisibly — every downstream model that
 acts on B's surprise-driven updates is implicitly trusting A's `S` as if
 exercising it produced RWS-equivalent observations.
@@ -1578,10 +1673,11 @@ to adapt its own plans. The full signal palette — and its protocol
 specification for the compiled belief network — is developed in a
 companion document.
 
-The organizational belief network ([wp-connectome]) is the compiled graph of
+The organizational belief network is the compiled graph of
 these coupling relationships: normative couplings on the epistemic axis,
 surrogate couplings on the validation axis. Both verification and validation
-follow the universal projection structure `P(S) → R'`, `N(R, R') → surprise`;
+follow the universal projection structure $P\langle S \rangle \to R'_N$,
+$N(R'_N, R_N) \to \sigma$;
 what the belief network tracks is the provenance of `R` at each coupling —
 whether it is RWS-grounded or model-internal — which determines the
 credibility weight of the surprise signal it produces.
@@ -1645,9 +1741,29 @@ through before reaching a direct measurement of the RWS? Long chains accumulate
 epistemic uncertainty at each coupling. Short chains with strong measurement
 coupling give high pedigree.
 
+**Inference pedigree**: by which mode was each piece of the model's content
+recovered from its records (§5)? Data pedigree asks how far the *records* sit
+from reality; inference pedigree asks how strong the *warrant* was for the
+content inferred from them. The two are independent — content abduced from
+high-pedigree records is still abduced, and a well-warranted deduction from
+low-pedigree records inherits their weakness.
+
+| Mode | What the content rests on | Assessment question |
+|---|---|---|
+| **Deduction** | Existing commitments forcing the conclusion | Are the premises themselves credible? The inference adds no risk; it inherits the premises' standing. |
+| **Induction** | Accumulated records within a domain | Does the validation domain actually cover the region where the content is being trusted? Inductive content silently degrades outside its sampled range. |
+| **Abduction** | An engineer's judgment that this explanation is best | Were competing explanations considered and ruled out, and has the abduced content since been independently confirmed? |
+
+Abduced content that has never been re-verified is the highest-risk category in
+a model, and it is invisible to a checklist that records only *that* content
+exists. This is the mechanism behind the necrotic floor (§9.3): a plausible
+explanation, adopted once under time pressure and never revisited, is
+indistinguishable in the artifact from a deduced certainty. Recording the mode
+alongside the content is what makes the distinction auditable.
+
 **Verification, validation, and review** are all instances of the same
-projection: `P(S)(R) → R'`, `N(R, R') → surprise`. The operation is identical;
-the provenance of `R` differs:
+projection cycle: $P\langle S \rangle \to R'_N$, then $N(R'_N, R_N) \to \sigma$.
+The operation is identical; the provenance of the actual record $R_N$ differs:
 
 - *Verification `R`*: produced by a model-internal process — a test harness,
   formal checker, or controlled environment. The projection checks whether `S`
@@ -1725,8 +1841,9 @@ is being used, the consuming model's decisions are highly sensitive to the accur
 of those inputs. High robustness means the outputs are stable across the plausible
 input range; low robustness means the surrogate relationship is fragile.
 
-**Use/analysis technical review**: has an independent agent executed an `N(S) → P`
-projection for this specific consumption context — evaluated the model's `N` against
+**Use/analysis technical review**: has an independent agent executed an
+$N\langle S \rangle \to \langle R'_P \rangle$ projection for this specific
+consumption context — evaluated the model's `N` against
 its `S` to generate a specific verification of this use, and executed that
 verification? Independent review of the use assessment, input pedigree, and
 uncertainty characterization closes the human-epistemic coupling for this
@@ -1747,8 +1864,8 @@ of the residual uncertainty floor in each factor's domain.
 
 ![Precision Map: Anchoring State as Mesh Resolution](figures/precision_map.svg)
 
-Following the propagation model of the organizational belief network ([wp-connectome]),
-four floor types can be distinguished:
+Following a propagation model over the belief network, four floor types can be
+distinguished:
 
 | Floor | Description | Engineering signature |
 |-------|-------------|----------------------|
@@ -1945,10 +2062,9 @@ shrink it.
 Coupling two models (§8.2) couples two dynamical systems. The joint stability of
 the coupled system is a distinct question from the stability of either model alone,
 and is where inter-model surprise propagation lives. This is the model-level
-counterpart of the quantitative surprise propagation problem identified in
-[wp-connectome] §10: whether message-passing inference on a factor graph
-representation of the compiled belief network can tractably propagate surprise
-signals across coupled models.
+counterpart of the quantitative surprise propagation problem: whether
+message-passing inference on a factor graph representation of the compiled
+belief network can tractably propagate surprise signals across coupled models.
 
 **Model granularity**: the framework does not specify the right level of
 granularity at which to identify a model. A system can be treated as one model
@@ -1995,7 +2111,7 @@ feedback loop that grinds the lens.
 
 **Quantitative surprise propagation across coupled models**: the compiler can
 detect surprise at individual couplings — the divergence between expected and
-actual informational mass at each node (§8 of [wp-connectome]). Propagating these
+actual informational mass at each node. Propagating these
 signals across chains of surrogate couplings is harder: each coupling introduces
 its own encoding parallax (footnote 4), and the accumulated aberration across a
 chain is not easily decomposed into per-element contributions. The factor graph
@@ -2024,7 +2140,7 @@ the validation domain remain current while others have drifted?
 
 **Directed asymmetry and the nature of `P`**: §3.3 identifies `P` as the causal
 agent — the executor that acts on `S` to produce state transitions — and
-distinguishes it from `S(P)`, structural descriptions of execution (written
+distinguishes it from $S_P$, structural descriptions of execution (written
 procedures, source code, state machine diagrams). The distinctive property of
 `P` is directed asymmetry: `N` is undirected, `S` is symmetric, `P` is the
 arrow. This directionality is not necessarily temporal — logical implication
@@ -2032,11 +2148,11 @@ has direction without chronology; energy flow has direction without narrative.
 This raises a question about whether `P` as a dimension of model-space is
 really capturing three separable phenomena or three aspects of one:
 (1) **causal structure** — the shape of directed dependencies, detectable in
-text as `S(P)` content; (2) **execution capacity** — the energy source that
+text as $S_P$ content; (2) **execution capacity** — the energy source that
 enlivens structure, the executor itself; (3) **directionality** — the
 irreversible arrow that makes observation possible. If these are aspects of a
 single phenomenon, then `P` as a model-space dimension is the axis along which
-directionality is measured. `S(P)` is the structural trace left by past
+directionality is measured. $S_P$ is the structural trace left by past
 execution (assembly index, §6.2, measures this); `P` as executor is the energy
 available for future execution; `R` is the observation that makes the
 asymmetry manifest. Whether this unification holds, and what it implies for
@@ -2079,8 +2195,8 @@ resolved surprise — it is an orphaned observation that the belief network
 cannot route.
 
 **Epistemic and pragmatic surprise as projection orientations**: the epistemic
-and pragmatic axes of the organizational belief network ([wp-connectome] §3)
-correspond to the explore and exploit orientations of the S×P projection plane
+and pragmatic axes of the organizational belief network correspond to the
+explore and exploit orientations of the S×P projection plane
 (§5). The epistemic axis is the explore orientation — self's processes as lens,
 world's structure as data, asking how the model's norms must change to accommodate
 reality. The pragmatic axis is the exploit orientation — self's structure as lens,
@@ -2099,9 +2215,6 @@ INCOSE MBSE Initiative.
 
 Friston, K. (2010). "The free-energy principle: a unified brain theory?"
 Reviews Neuroscience*, 11(2), 127–138.
-
-Lyjak, A. [wp-connectome]. "The Organizational Connectome: Toward a Paradigm for
-Systems Engineering and Project Management." Unpublished companion paper.
 
 NASA (2024). NASA-STD-7009B: Standard for Models and Simulations. National
 Aeronautics and Space Administration.

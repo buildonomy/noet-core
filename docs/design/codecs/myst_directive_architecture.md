@@ -624,6 +624,85 @@ Second paragraph that belongs to "My Section".
 
 ---
 
+### 6.5. Inline Anchor Nodes (parse-only)
+
+An explicit anchor `{#id}` written inside a **paragraph or list item** — rather than
+in a heading — makes that block a named node in the graph. Like `{#__continue}`, this
+uses standard Markdown anchor syntax rather than the directive forms, is **not**
+registered in `DIRECTIVES`, and is detected entirely within `MdCodec::parse`.
+
+This lets individually-addressable items — requirements, checklist entries, hazard
+causes — become first-class nodes without giving each one a heading.
+
+**Syntax:**
+
+```markdown
+## Requirements
+
+{#req-001} The system shall do X.
+
+{#req-002} The system shall do Y.
+
+- {#chk-a} First check
+- {#chk-b} Second check
+```
+
+This produces four child nodes under `Requirements`, all siblings.
+
+**Behaviour:**
+
+- **Detection is at block end.** A candidate splice point is recorded at
+  `Start(Paragraph)` / `Start(Item)`; at `End(Paragraph)` / `End(Item)` the buffered
+  events are scanned for `{#id}` via `scan_for_inline_anchor`. Scanning at the close
+  rather than peeking at the first `Text` event means the anchor may appear anywhere
+  in the block — `*important* {#req-003} Details.` is detected. The inner block wins
+  when nested, so a loose list item detects at its paragraph and a tight one at the
+  item.
+- **Depth is `enclosing heading + 1`**, where the enclosing heading is the most
+  recently opened heading node; before any heading, the document root's depth is used.
+  Consecutive inline anchors under one heading are therefore **siblings, not nested**.
+- **The whole block belongs to the node.** Its events are spliced off the current
+  node's tail and become the new node's, so `source_line` points at the block's
+  opening line.
+- **`id` is normalized, `title` is not.** The id is `to_anchor(anchor)` while the
+  title keeps the authored spelling — `{#Req_001}` yields id `req_001`, title
+  `Req_001`. There is no separate heading text to fall back on.
+- **Following content folds in.** A plain paragraph after an anchor block accumulates
+  into that anchor's node, exactly as a plain paragraph below a heading accumulates
+  into the heading's. The node closes at the next heading, the next inline anchor, or
+  end of document.
+- **The boundary is a full node boundary.** It performs the same state reset as a
+  heading: the relation-context stack is drained (one warning per unclosed
+  `` `{end}` ``), and `{maps_to}` / `{query}` block state is cleared. `traverse_schema`
+  runs on the closed node, so schema inheritance matches heading nodes.
+- **Collisions get a `slug-N` suffix**, appended to the *full* id rather than to a
+  stripped numeric base, and emit a warning. A second `{#swdp-63}` becomes
+  `swdp-63-2`, not `swdp-7`. This differs from the heading-collision path (§2.2.1 of
+  [`beliefbase_architecture.md`](../core/beliefbase_architecture.md)), which strips a
+  trailing numeric component because the base is title-derived; an inline anchor is
+  entirely author-chosen, so every character is significant.
+
+**HTML rendering:** heading anchors are re-emitted by pulldown-cmark's
+`ENABLE_HEADING_ATTRIBUTES`, but inline-anchor blocks get no such treatment, so
+`render_html_body` handles them explicitly. It identifies an inline-anchor proto as
+one with an explicit id, `heading > 2`, and no `Start(Heading)` in its events; it then
+injects `<a id="{id}" class="noet-inline-anchor" title="bref://…"></a>` and strips the
+literal `{#id}` from the rendered text. The class is the hook `assets/viewer/content.js`
+uses to attach the 🔗 affordance, appending it to the parent `p`/`li`.
+
+**Where it does not fire:**
+
+| Context | Why |
+|---|---|
+| Code spans — `` `{#id}` `` | Emits `MdEvent::Code`, which the scan ignores |
+| Fenced code blocks | Their text falls outside any paragraph/item scan range |
+| **Table cells** | `Start(TableCell)` is not a detection boundary; the `{#id}` renders literally |
+
+The table-cell case is the one to watch: it fails *visibly*, leaving braces in the
+output, rather than silently producing no node.
+
+---
+
 ## 7. Splicing: `splice_sentinels`
 
 After builders produce HTML, `generate_html_for_path` splices the results into the

@@ -86,7 +86,8 @@ impl<'a> ExtendedRelation<'a> {
     /// original URL is the only copy, and once overwritten the link can never be
     /// re-derived on a later parse.
     ///
-    /// See `.scratchpad/url_alias_resolution_gap.md` for the incident this came
+    /// See commit `5f31d75` ("fix(codec): resolve url-alias citations to
+    /// claimants, not absorbed stubs") defect (D) for the incident this came
     /// from.
     pub fn root_path_is_bref(&self) -> bool {
         !self.root_path.is_empty() && self.root_path == self.other.bid.bref().to_string()

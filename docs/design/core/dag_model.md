@@ -325,4 +325,4 @@ not fatal errors — the graph is always available, even when incomplete. See
   graph invariants, and incremental updates.
 - **[MCP Server](../../mcp.md)** — Agent-facing tool documentation for querying a
   compiled BeliefBase via the Model Context Protocol.
-- **[README](../../README.md)** — Project overview, installation, and quick start.
+- **[README](../../../README.md)** — Project overview, installation, and quick start.

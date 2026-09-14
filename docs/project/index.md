@@ -1,4 +1,8 @@
-# Project Management and Issue Resolution Workflow
+---
+title = "Project Management and Issue Resolution Workflow"
+---
+
+# Project Management and Issue Resolution Workflow {#__continue}
 
 This directory contains issues, roadmaps, and planning documents for `noet-core` development. This README documents the collaborative workflow used between human developers and AI agents to manage work effectively.
 
