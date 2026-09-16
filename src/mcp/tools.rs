@@ -492,7 +492,7 @@ pub async fn query(state: &McpState, input: QueryInput) -> Result<QueryOutput, M
         McpError::invalid_params(
             format!(
                 "Query parse error: {e}. \
-                 See docs/design/core/query_model.md \u{00a7}9.5 for the textual grammar. \
+                 See docs/query_language.md for the textual grammar. \
                  Examples: \"id://net composed_of(*)\", \"title:auth AND schema:procedure\"."
             ),
             None,

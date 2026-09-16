@@ -135,7 +135,7 @@ cannot turn itself on. The observer — the person looking at the
 metadata card — IS P. Their role determines which inferences from
 the declarative graph state are relevant to them:
 
-Each PII (Personal Inference Interface) surface presents the same
+Each PII (Personal Inspection Interface) surface presents the same
 inference output parameterized by the user's role:
 
 | Role | Primary inference | What the card highlights |
@@ -160,16 +160,16 @@ role cares about. The collaboration overlay’s credential model
 (§4a) already defines peer-derived credentials; the inference
 algorithm can consume these as role selectors.
 
-The existing procedure system (`docs/design/procedures/procedure_schema.md`,
-`procedure_execution.md`, `redline_system.md`) is the early
-incarnation of this. Its three-layer architecture maps directly
-to EMO primitives: Intention = N (what should happen), Execution
-= P (the runtime exercising structure), Reality = R (as-run
-record). The redline system is the surprise lifecycle: template =
+The existing procedure system (`docs/design/procedures/procedure_model.md`,
+`observation_model.md`, `deviation_model.md`) is the early
+incarnation of this. Its architecture maps directly
+to EMO primitives: the template = N (what should happen), the actor
+exercising it = P, and the record set = R (as-run
+evidence). The deviation model is the surprise lifecycle: template =
 predicted surprise, as-run deviation = unresolved surprise,
-template promotion = resolved surprise (N updated from R). The
+promotion = resolved surprise (N updated from R). The
 `inference_hint` / observation channel mechanism is the wiring
-that connects different P to the same S. The procedure schema is
+that connects different P to the same S. The procedure model is
 the role specification format — it defines what an executor
 should attend to in a given context. The inference engine
 generalizes this from domain-specific procedure execution to
@@ -299,7 +299,7 @@ validated.
   which requires no inference. Implicit boundary detection layers
   on via Issue 94 without changing the inference engine's API.
 - **Content profile (Issue 91) may need recalibration**: the P
-  refinement (P is executor, not procedure; classifier detects S(P))
+  refinement (P is executor, not procedure; classifier detects $S_P$)
   changes how the content profile is interpreted. → **Mitigation**:
   the classifier's detection mechanism is unchanged — only the
   label interpretation shifts. Recalibration is Issue 91 follow-on
@@ -318,7 +318,7 @@ validated.
 
 - **Issue 91** (content classifier): provides the N/S/P content
   profile consumed by the inference algorithm. Interpretation of
-  the P score shifts (detects S(P), not P directly) but the
+  the P score shifts (detects $S_P$, not P directly) but the
   classifier code is unchanged.
 - **Issue 85** (3D credibility viewer): the credibility surface is
   the rendering mode this issue adds to the viewer

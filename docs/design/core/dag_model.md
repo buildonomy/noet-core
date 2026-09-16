@@ -46,9 +46,105 @@ that document is a node. A network — a collection of related documents — is 
 
 Every edge has three participant roles:
 
-- **Source** (`<`) — the child, dependent, or more-discrete end
-- **Sink** (`>`) — the parent, depended-upon, or more-interconnected end
+- **Source** (`<`) — the depended-upon, **less conditioned** end
+- **Sink** (`>`) — the dependent, **more conditioned** end
 - **Owner** (`@`) — the node that *declared* the edge
+
+> **Say source and sink. Every other vocabulary misleads.**
+>
+> An edge runs `source → sink`, and the sink is the **more conditioned** end: its
+> meaning depends on what it derives from, and it is what becomes unmoored if the
+> source is removed. Sources are correspondingly less conditioned — a requirement
+> referenced by nothing still says what must be true.
+>
+> **The operational test is which one survives the other's deletion.** Delete a
+> document and its sections still mean something; delete a section and the
+> document is now a different document. Delete a claim and its evidence stands;
+> delete the evidence and the claim is unsupported. Delete a design and the
+> requirement stands; delete the requirement and the design is unjustified. **The
+> source survives, the sink is orphaned** — asymmetric dependency, with no
+> metaphysics required.
+>
+> This is the existence-tense of the change test in §3 ("what breaks when the
+> cited thing changes"): both change and orphaning propagate sink-ward.
+>
+> **Why "conditioned" and not "abstract".** Deriving *is* adding conditions, so
+> conditionality tracks the arrow across all three kinds. Abstraction does not.
+> Aggregating (Section) and synthesizing (Epistemic) move toward generality, but
+> specializing moves away from it — a requirement is more abstract than the design
+> that implements it, while still being its source. An unbound requirement is
+> foundational in the sense of having a **short reference chain**, not of being
+> physically primary: it says what must hold while referencing almost nothing. A
+> design is long-chain — *given this hardware, this language, this buffer size.*
+>
+> **A sink can be constitutive of its sources, and that is a second kind of
+> causation.** The asymmetry above is about *derivation*: the sink derives from
+> the source, so removing the source orphans the sink. But a sink also
+> **constrains the interaction of its sources**, and removing it does not
+> annihilate them — it changes what they mean. A section lifted out of its
+> document still exists; it no longer says the same thing, because the document
+> was the context fixing which of its claims were load-bearing. This is
+> Aristotle's formal cause as against efficient cause, and the
+> *context-sensitive constraint* of Juarrero (2023) — a whole that enables and
+> restricts its parts rather than pushing them around.
+>
+> **The corpus already formalizes this**, which is the reason to say it here
+> rather than in an essay. A node's `content_hash` covers its own fields and does
+> not move when its context changes; its **closure hashes** do
+> (`identity/content_versioning.md` §5.4). Two hashes, two kinds of causation:
+> content for what the node is in itself, closure for what its context makes of
+> it. An annotation choosing which one to anchor to is choosing which causation
+> it is claiming about — "I proofread this paragraph" wants the content hash, "I
+> reviewed this section" wants the closure.
+>
+> **The strongest form is constitution by inclusion, where no edge is involved
+> at all.** A generic procedure included in two corpora is byte-identical in
+> both, so its `content_hash` matches and no edge differs. Yet "has this been
+> done?" has a different answer in each, because each corpus supplies a different
+> evidence set. The question is not one the template's content can answer; the
+> context is what makes a particular absence count as a gap
+> (`annotation/living_corpus.md` §5).
+>
+> Two rules follow. **A context-determined property must never be cached onto a
+> node**, because the node is the same in every context and the property is not.
+> And **two contexts may give contradictory answers with neither being wrong** —
+> discharged here, outstanding there — which is a correct result rather than an
+> inconsistency to reconcile.
+>
+> Practically: do not read the arrow as the *only* direction influence travels.
+> It is the direction **derivation** travels. Constitutive constraint runs the
+> other way, and it is why staleness propagation along incoming edges is a real
+> question rather than a confusion (Issue 105 §Open Questions).
+>
+> **Child/parent inverts it.** "Child → parent" reads as though the parent were
+> produced by the child, which is backwards from how the arrow runs and has
+> repeatedly misled readers of this corpus.
+>
+> **Tree terms invert it too, and add a second error.** A leaf is understood as
+> produced by its stem, so `leaf → root` carries the same reversed derivation.
+> And leaf/branch/root presupposes single-rootedness — precisely what "Why DAG,
+> Not Tree" below says this model is not. A node with several sinks is ordinary
+> here and unnameable in a tree.
+>
+> **Upstream/downstream is safe** because it names position along the arrow
+> without implying what produced what: sources are upstream, sinks are
+> downstream.
+>
+> **This binds field names, not only prose.** A field pointing at a sink is
+> `enclosing_*` or is named for its referent — `enclosing_run`, `target_version` —
+> never `parent_*`. The one legitimate exception is BID *lineage*
+> (`Bid::parent_bref`, `adopt_into`, `src/properties.rs`), which describes
+> genuine ancestry: a derived BID really is produced by the one it descends
+> from, so the word is accurate there and nowhere else.
+>
+> **That exception has a trap, and it is the likeliest source of confusion in
+> this corpus.** A section's BID is generated from its containing node, so that
+> node is both the section's **derivation parent** and the **sink** of its
+> Section edge — the same node in two roles pointing opposite ways. Containment
+> runs contained → container; derivation runs container → contained. Say
+> *derivation parent* in full whenever both relations are in scope, and never
+> read `parent_bref` as evidence about edge direction
+> (`identity/identity_derivation.md` §4).
 
 In the common case, the owner is the source or sink itself. In cross-document
 traceability claims, the owner is a third-party node that declares a relationship
@@ -82,7 +178,7 @@ Arrows point from source (tributary) to sink (ocean). The Design Doc is the sink
 the Pragmatic `{uses}` edge — it depends on REQ-001 as a source constraint.
 Review §3.1 *owns* the `{uses}` edge (arrow points at the edge, not at a node) —
 it asserts coverage of the relationship between Design Doc and REQ-001.
-All four nodes are Section-children of a shared Project Network (not shown).
+All four nodes are Section sources of a shared Project Network sink (not shown).
 ```
 
 The design document *draws from* Concept-A (epistemic provenance — the concept is the
@@ -96,7 +192,8 @@ questions, one coherent graph.
 
 ### Why DAG, Not Tree
 
-A tree allows each node exactly one parent. A DAG allows multiple parents — a node
+A tree allows each node exactly one outgoing structural edge. A DAG allows
+several — a node
 can be the source of edges to multiple sinks across different edge types. This is
 essential because real knowledge has multi-dimensional structure:
 
@@ -149,6 +246,43 @@ path a newcomer follows when learning the system.
 declarations, classification. When someone says "this review covers that requirement,"
 that is a pragmatic edge. These are the only edges that encode normative, executable
 relationships.
+
+### Choosing a kind: what breaks when the cited thing changes
+
+The three descriptions above say what each axis *encodes*. Deciding which one a
+particular citation belongs to is a separate question, and the reliable test is
+counterfactual:
+
+| If the cited thing changes… | Kind | Because the citing thing |
+|---|---|---|
+| the citing thing's **boundaries** change | **Section** | contained it |
+| the citing thing's **conclusion** may be wrong | **Epistemic** | reasoned from it |
+| the citing thing's **act must be re-performed** | **Pragmatic** | operated on it |
+
+Two cases that look alike and are not:
+
+- **An analysis consumes a dataset.** Change the dataset and the analysis must be
+  **re-run** — so this is Pragmatic, and `{uses}` is the verb. It is tempting to
+  call it Section because the analysis is *built on* the data, but Section would
+  claim containment, and that is false: the dataset exists independently, is not
+  owned by the analysis, and does not move when the analysis is reorganized.
+- **A bug discussion cites the report where the bug was found.** Change the
+  report and the discussion's **conclusion** may be wrong, but nothing needs
+  re-performing — Epistemic, `{draws_from}`.
+
+**A note on a tempting heuristic.** Section relations are mostly tree-like while
+Epistemic relations are heavily re-cited, so re-use frequency *correlates* with
+the right answer. But it is a consequence rather than a criterion: Section is
+tree-like **because containment is exclusive**. Wanting a DAG where you have
+written Section is a reliable smell that containment was the wrong claim — useful
+as a check, not as the rule.
+
+**Coupling strength is not the criterion either.** An analysis is coupled to the
+whole of its dataset and a citation may reach only one filtered part of its
+source, but that difference belongs to the *staleness policy* — how far a change
+propagates — not to the edge kind. Re-running an analysis is heavier than
+revisiting a conclusion, which is why the Pragmatic case can feel more structural
+than it is.
 
 Orthogonality matters because any query can filter, traverse, or compose along any
 combination of these axes independently. A Section traversal can be followed by a
@@ -326,3 +460,10 @@ not fatal errors — the graph is always available, even when incomplete. See
 - **[MCP Server](../../mcp.md)** — Agent-facing tool documentation for querying a
   compiled BeliefBase via the Model Context Protocol.
 - **[README](../../../README.md)** — Project overview, installation, and quick start.
+
+### External
+
+Juarrero, A. (2023). *Context Changes Everything: How Constraints Create
+Coherence*. MIT Press. — the account of **context-sensitive constraint** behind
+§2's second causation: a whole that enables and restricts its parts rather than
+pushing them around.

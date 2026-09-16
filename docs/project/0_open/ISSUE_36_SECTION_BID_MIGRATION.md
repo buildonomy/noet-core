@@ -13,7 +13,35 @@ collapse). This issue is its implementation vehicle and owns the consumers: move
 detection and unification. `docs/design/identity/content_versioning.md` §5.1, §5.1a defines
 the sibling key `metadata["_content_hash"]` (staleness) and the rule that hashes
 live in `metadata`, not `payload`.
-**Blocks**: None (quality-of-life improvement)
+**Blocks**: **Issue 74's archive and move-aware diff** consume the *move-detection* half — the archive stub is keyed on `_identity_hash`, so an exact move is a stub-level match rather than a remove-plus-add (`docs/design/identity/generational_archive.md` §3.2). Unification blocks nothing and stays deferred. **Bounds Issue 66's BID-stability guarantee** — see the note below.
+
+> **Relationship to Issue 66 (shard hydration).** Issue 66 makes BIDs survive across
+> builds for nodes whose *path key* is unchanged: the prior run's shards are hydrated
+> into `global_bb` before parsing, so `cache_fetch` resolves an unchanged heading to its
+> existing BID by `NodeKey::Path` (network-relative `doc.md#slug`) instead of minting a
+> fresh time-based one. That is identity-by-location, and it is exactly the boundary
+> this issue exists to move: a heading whose slug changes, or a section cut from one
+> file and pasted into another, misses the path key and re-mints even though the
+> content is the same. **Issue 66 preserves identity for unchanged nodes; this issue
+> preserves it across renames and moves. Neither substitutes for the other.**
+>
+> Two consequences for this issue's design:
+>
+> - **The prior state now has a source.** Move detection correlates deleted → created
+>   pairs by identity hash (§Integration Points 1). Under Issue 66 the "deleted" side
+>   is the hydrated prior shard, so the correlation has a stable, cross-invocation
+>   baseline to work from rather than only the in-session diff. That makes move
+>   detection viable on cold `noet parse` runs, not just in `noet watch`.
+> - **`_identity_hash` must ride the shards.** For the correlation to work across a
+>   cold start, the identity hash has to be present on the hydrated prior node. It
+>   lives in `metadata` (per `content_identity.md`), which serializes with the node
+>   (`src/shard/wire.rs`), so this holds by default — but it is now a requirement, not
+>   an incidental property. A future decision to strip `metadata` from shards would
+>   break move detection.
+>
+> A rename-induced BID change on a corpus built with Issue 66 is **this issue's gap,
+> not an Issue 66 regression**. Downstream anchor consumers (Issue 105) are expected to
+> carry a secondary re-attachment key for exactly this case until move detection ships.
 
 ## Summary
 
@@ -130,6 +158,25 @@ This generalizes move detection and copy-unification into a single mechanism. Th
 ### 1. Event Stream Analysis (Compiler Level)
 
 **File**: `src/codec/compiler.rs`
+
+> [!IMPORTANT]
+> **Stages 2 and 3 of detection belong here, not in `builder.rs`.**
+> `GraphBuilder::parse_content` sees one file at a time (`builder.rs:920`), and in
+> a parallel epoch the source and destination of a move are parsed by different
+> tasks. Only `DocumentCompiler` spans epochs, and it already carries the
+> cross-file indices this needs — `proto_index` (`:173`),
+> `absorbed_to_claimant` (`:223`), `parsed_node_paths` (`:237`).
+>
+> Specified in `docs/design/identity/generational_archive.md` §5.
+>
+> The asset-dedup precedent cited under Risks is already at this layer:
+> `create_asset_hardlinks` (`compiler.rs:5467`) compares a content hash across
+> every file in the run. Section move detection is the same shape over
+> `_identity_hash`.
+>
+> The builder's responsibility ends at **computing and attaching**
+> `_identity_hash` — a pure function of one node's content. Interpreting hashes
+> *across* files is the compiler's.
 
 During `finish_parse_session()` or event stream processing:
 - Collect `BeliefEvent::NodeDelete` events (sections removed)
@@ -344,10 +391,18 @@ cannot be edited through one parent, and sections fail that condition.
 ## Open Questions
 
 ### Q1: Matching Threshold
-- What confidence score triggers automatic migration?
-- Should user confirm migrations < 100% confidence?
-- **Proposed**: exact hash match → automatic (confidence 1.0); fuzzy match → log warning,
-  no automatic action until user confirms.
+
+**Scoped down by the three-stage ladder**
+(`docs/design/identity/generational_archive.md` §4, which specifies the stages
+and the machinery each uses). Only the last stage has a threshold: stage 2 is an
+exact `_identity_hash` match, confidence 1.0, automatic. So Q1 ranges over
+**stage 3 only** — a much smaller question than it first appeared.
+
+- **Proposed**: stage 3 emits `BidMigration` with the similarity score in
+  `confidence`, logs at info, and requires confirmation below a threshold chosen
+  against real data.
+- Open: the threshold value, and whether a stage-3 hit emits *move then edit* as
+  two events or one `BidMigration` plus a `NodeUpdate`.
 
 ### Q2: Multi-Hop Moves
 - What if section moved twice in one session? (A → B → C)
@@ -410,8 +465,14 @@ Not decided here.
 - **Issue 15**: Filtered Event Streaming (event consumption pattern)
 - **Issue 34**: Cache Stability (prerequisite - cache must work correctly)
 - **Issue 35**: Cache Invalidation (interacts with content hashing)
-- **Issue 66**: Incremental Parse (ships `metadata["_content_hash"]` — a sibling
-  key, **not** a substitute for `_identity_hash`; see `content_identity.md` §2.3)
+- **Issue 66**: Incremental Parse via Shard Hydration — makes BIDs stable across
+  builds for *unchanged* path keys by hydrating prior shards before parse; this issue
+  extends stability across renames and moves. 66 also supplies the cross-invocation
+  baseline that move detection correlates against (see the note at the top of this
+  issue). Note `metadata["_content_hash"]` is **Issue 105's**, not 66's, and is a
+  sibling key, **not** a substitute for `_identity_hash` (`content_identity.md` §2.3)
+- **Issue 105**: Annotation sidecar store — the anchor consumer that is orphaned by a
+  rename until this issue ships; carries a secondary re-attachment key in the interim
 
 ## References
 

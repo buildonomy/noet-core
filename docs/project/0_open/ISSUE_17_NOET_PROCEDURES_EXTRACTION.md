@@ -1,581 +1,597 @@
-# Issue 17: Procedure Codec and Steps Schema
+# Issue 17: Procedure Lifecycle Grammar
 
 **Priority**: HIGH
-**Estimated Effort**: 4.5-4.75 days (RELATIVE COMPARISON ONLY) — 2-2.5 for the
-codec and schema, +0.75 for the annotation subtypes recovered from Issue 18,
-+1.5 for consolidating the procedural design-doc space (step 4)
-**Dependencies**: Issue 1 (Schema Registry), Issue 2 (Section Metadata)
-**Blocks**: Issue 109 (annotation lifecycle) — for step-type combinator semantics and the annotation subtypes below
-**Related**: Issue 104 (annotation vocabulary) is a *sibling*, not a dependant — see Scope; Issue 95 owns the eventual crate split; Issue 105 (annotation sidecar store) owns the record store; Issue 106 (source write-back) owns promotion into a source edit
+**Estimated Effort**: 3.25 days (RELATIVE COMPARISON ONLY) — 0.5 for the
+directive registrations, 1.25 for the field-set derivation, 1.5 for consolidating
+the procedural design-doc space
+**Dependencies**: Issue 1 (Schema Registry), Issue 2 (Section Metadata), Issue
+91B (inline anchor nodes — **completed**; supplies step identity)
+**Blocks**: Issue 105 (record store and fold) — for the exit-predicate semantics
+and the marking model below
+**Related**: Issue 104 (annotation vocabulary) is a *sibling*, not a dependant —
+it registers `redline` and `ask`; this issue supplies their field sets (step 2a);
+Issue 95 owns the eventual crate split; Issue 106 owns promotion into a source
+edit
 
 > [!IMPORTANT]
-> **Re-scoped.** This issue previously defined a three-piece "as-run data model"
-> (template / executor context / as-run record) as bespoke types. That model is
-> **withdrawn**. Under the living-corpus design, **an annotation *is* an as-run
-> record**, and a procedure instance is the set of annotations sharing a common
-> `RunStart` ancestor — a *query* over the annotation store, not a new type.
->
-> What remains is a codec and a schema. See "What Was Removed and Why".
+> **No `.procedure` codec.** The lifecycle grammar is a set of **MyST
+> directives** over ordinary markdown. Issue 91B's inline anchor nodes already
+> give every step a node with a stable BID, so the codec this issue was named
+> for has no work left to do. See "What Was Removed and Why".
 
 ## Summary
 
-Deliver two things: a `ProcedureCodec` for `.procedure` files, and a `steps`
-schema extension registered with `SCHEMAS`. Together they let a procedure
-document compile into a hierarchy of step nodes with stable BIDs and typed
-combinators.
+Deliver a **lifecycle grammar**: directive registrations that let an authored
+markdown document define a state machine, plus the **evidence** — field sets and
+observed lifecycles mined from real records — that Issue 104 needs to register
+the kinds which drive one.
 
-This supplies the **template** side of the annotation model — the as-written
-definition that a run is folded against. It adds **no record types**. The record
-side is already covered: `Envelope` + `Annotation`
-(`docs/design/core/beliefbase_architecture.md` §4.3) carries who/when/why, Issue 105
-stores it, and Issue 109 brackets a run and folds it.
+The grammar factors the old nesting operators into their two halves — an **exit
+predicate** over a resolved node set, and a discriminated **outcome** with an
+effect. That factoring makes a cycle expressible without a second grammar, makes
+a cross-run guard fall out of the existing query language, and dissolves the
+codec.
 
 ## Goals
 
-1. Implement `ProcedureCodec` for `.procedure` files, registered with the
-   noet-core codec map
-2. Define the procedure schema as a runtime-registered extension that validates
-   the `steps` field structure
-3. Generate nodes from the `steps` field — schema-driven, hierarchical, recursive
-4. Give every step a **stable BID** so a run can name which step it discharges,
-   surviving template revision
-5. Establish whether step types can carry **transition semantics**, not merely
-   execution order (see Risk 1 — this may fail, and failing is a valid outcome)
-6. Define the **annotation subtypes** a procedural state machine needs to be
-   driven by records — redline being the obvious one (see below)
-7. Add **no new record primitives**; ship as a module inside noet-core with
-   crate extraction deferred to Issue 95
+1. Register `{exit}` and `{outcome}` as directives; define the marking semantics
+   a fold applies
+2. Let exit predicates range over an arbitrary **queryset**, defaulting to
+   containment children
+3. Express a cycle as an outcome that **clears marks**, with no back-edge and no
+   transition construct
+4. Keep `derive` a **pure function of (record set, corpus version)** — no wall
+   clock
+5. Supply Issue 104 with the **`redline` and `ask` field sets**, derived from
+   real records, and verify the grammar can express their lifecycles
+6. Add **no new record primitives** and **no new codec**
 
 ## Scope: what this issue is not
 
-The re-scope moved several things out. Named explicitly, because three other
-issues previously waited on this one and no longer should:
-
 | Concern | Owner |
 |---|---|
-| Annotation record field set (`{todo}`/`{note}`/`{reviewed}`) | **Issue 104** — authoritative |
+| Annotation record field set | **Issue 104** — authoritative |
 | Record storage, `(bid, version)` anchoring, retention | **Issue 105** |
-| Run bracketing, nesting, folding a log into state | **Issue 109** |
+| Run bracketing, nesting, folding a log into state | **Issue 105** |
 | Envelope (`actor`, `observed_at`, `caused_by`) | `beliefbase_architecture.md` §4.3 |
 | Execution loop, deviation analysis | **Issue 18** |
 | Promotion of a record into a source edit | **Issue 106** |
 
-### What came back from Issue 18
-
-Issue 18 was reduced to an aspirational stub, and its concrete types went with
-it. **The subset needed to drive a procedural state machine belongs here**, not
-in an undesigned issue: a template that no record can advance is inert, so the
-template side and the annotation subtypes that discharge it are one deliverable.
-
-This is a **vocabulary** obligation, not a record-schema one. Issue 104 owns the
-annotation record's field set and Issue 105 owns the store; what this issue adds
-is the set of `protocol_id` values — and their payload shapes — that let a run
-synchronize with the state machine its template defines.
-
-**Redline is the worked example.** A redline annotation proposes a change to the
-node it anchors. Issue 106 promotes one into a source edit and already depends on
-it existing (`ISSUE_106` §Redline promotion cites "an annotation whose
-`protocol_id` marks it as proposing a change"), but no issue currently defines
-that `protocol_id`. That gap closes here.
-
-What this does **not** reintroduce: `ProcedureRun`, `ExecutionRecord`,
-`CorrectionEvent`, `DeviationReport`, or `ObservationEvent`. Those were withdrawn
-because they were bespoke record *types*. A subtype here is a registered
-`protocol_id` plus a payload schema — the same mechanism `{todo}` and
-`{reviewed}` already use, not a parallel one.
-
-**An event is an annotation subtype.** Run lifecycle events are not a separate
-enum and do not expand `src/event.rs`. A sequence of annotations sharing a
-`RunStart` ancestor *is* what was formerly called an as-run log — which is why
-the withdrawn types had no home to return to.
-
-**Issue 17 does not block Issue 104.** The previous header claimed it did. Issue
-104 needs a `protocol_id` and a store, not a `.procedure` parser; its three
-built-in kinds are degenerate templates that need no template *file*. The two can
-proceed in parallel.
-
-Issue 109's dependency is real but narrow: it needs the **step-type combinator
-semantics** (`all_of` / `any_of` / `sequence` decide whether a parent folds in a
-child) and a **stable step reference**. It does not need the codec.
+Issue 105's dependency is narrow: it needs the **exit-predicate semantics** and a
+**stable step reference**. Both are supplied without a codec.
 
 ## Architecture
 
-### Codec-First Design Principle
-
-**Why a specialized codec?** Procedures prioritize structure and operations
-(connections, execution order, logical operators) over text content. Generating
-nodes from the `steps` field hierarchy conflicts with markdown's content-driven
-generation from headings. Rather than merging three sources of truth, the file
-extension signals the parsing strategy:
-
-- `.md` → MdCodec → nodes from headings, `sections` as metadata, text is primary
-- `.procedure` → ProcedureCodec → nodes from `steps`, text supplements structure
-
-This gives clear semantics per file type and no authority conflicts — the codec
-owns generation strategy. MdCodec may still handle text content within a
-`.procedure` file, but ProcedureCodec orchestrates parsing.
-
-> See `docs/design/core/beliefbase_architecture.md` §3.2 and §3.6 — "Two-Registry
-> Codec Dispatch" — before implementing. `WALK_CODECS` and `CLAIM_MAP` have
-> non-obvious ordering constraints.
-
 ### What Was Removed and Why
 
-The withdrawn three-piece model was: **Template** (as-written), **Executor
-Context** (who/when/where), **As-Run Record** (what happened). Each piece has a
-home, and none of those homes is a new type here:
+Two removals, in two rounds. The first withdrew a three-piece "as-run data
+model" (template / executor context / as-run record):
 
 | Withdrawn piece | Where it went |
 |---|---|
-| **Template** | **Survives, demoted.** Not a data model — it is a compiled `.procedure` document plus a two-field reference to it. That reference is a general "node at a content version", not a procedure-specific type (see below). |
-| **Executor Context** | **Collapses into `Envelope`.** `executor_id` → `actor`; `timestamp` → `observed_at` (`beliefbase_architecture.md` §4.3). `credential_type` is already a payload field of the sign-off protocol (Issue 104). `environment` had **no named reader** and is dropped until something asks for it. |
-| **As-Run Record** | **Collapses into a query.** The set of annotations sharing a `RunStart` ancestor (Issue 109). `template` → the `RunStart`'s reference; `context` → its envelope; `status` → the fold's output; `steps` → member records carrying `run_id`/`task`; `provenance` → `caused_by`; `evidence_hash` → per-record, Issue 108's concern. |
+| **Template** | **Survives, demoted.** Not a data model — an authored markdown document plus a two-field reference to it. That reference is a general "node at a content version", owned by Issue 105. |
+| **Executor Context** | **Collapses into `Envelope`.** `executor_id` → `actor`; `timestamp` → `observed_at` (`beliefbase_architecture.md` §4.3). `environment` had no named reader and is dropped. |
+| **As-Run Record** | **Collapses into a query.** The set of annotations sharing a `RunStart` ancestor (Issue 105). |
 
-The governing constraint: **new primitives in core types must be few and
-general.** A `record type` or a `cause-ordering predicate` is general. An
-`AsRunRecord` is not — it is a procedure-specific spelling of something the
-annotation model already expresses.
+The second removes the **`.procedure` codec** and most of the `steps` TOML
+schema. A step is a node; Issue 91B makes any `{#anchor}` block a node with a
+stable BID at the right depth, round-tripped and tested. Everything the codec was
+specified to provide — node generation, parent-child structure, stable step
+identity, lossless round-trip — is shipped. A second parser producing the same
+node shape from TOML would be a second authoring surface for one concept.
 
-> **Do not resurrect `AsRun`.** A struct of that name, with `AsRunState`
-> (`Running`/`Failed`/`Redlined`/`Inventory`) and `RenderMode`, existed in
-> `src/properties.rs` as dead code — orphaned when completed Issue 10 removed the
-> client events that used it. It has been deleted. Its state space is **not** the
-> `open`/`closed` space a fold produces, and it was never designed against one.
+From the prior step schema, these do not survive: `parallel` (once a predicate is
+about *completion of the parent*, "unordered" and "all required, any order" are
+the same operator), `variables` / `selection_variable` / `stores_in_variable`
+(engine state — a prompt response *is* a record, so a predicate reads the
+discharging record's payload, not an environment), and `avoid` (a negative
+predicate with no stated semantics and no observed use).
 
-### The one reference type, and why it is not defined here
+> **Do not resurrect `AsRun`.** A struct of that name with `AsRunState` existed
+> as dead code in `src/properties.rs` and has been deleted. Its state space is
+> not the space a fold produces.
 
-A run must name the template it ran against: a BID plus a content version.
+### The factored core
 
-That pair is **not procedure-specific** — Issue 105 needs the same
-`(bid, content_version)` anchor for *every* record it stores, and
-`content_versioning.md` §5.1 already defines what the version is. Defining it
-here would put a general primitive behind a codec issue and make three issues
-wait on a `.procedure` parser they do not need.
+A step declares what satisfies it; records discharge it. Three concepts:
 
-**Decision**: the version-anchored node reference is owned by Issue 105 (the
-store that keys on it), named neutrally. This issue *consumes* it.
+- **Exit predicate** — what makes this step complete, evaluated over a resolved
+  node set: `all` / `any` / `ordered` / `n-of`.
+- **Outcome** — exit is *discriminated*, not boolean. A review exits `approved`
+  or `rejected`. The discharging record names the outcome in its payload.
+- **Effect** — what an outcome does to the marking. Default: mark this step with
+  that outcome. The only other effect is `clears`.
 
-### The Procedure Schema Is the Lifecycle Definition
+**State is a marking, not a position.** There is no program counter and nothing
+enables anything; the template is a constraint system. `ordered` is a *legality
+predicate on each record* — an out-of-order discharge is Issue 105's "illegal
+transition" diagnostic, never a scheduler.
 
-**This issue owns the single definition of what a lifecycle is.** Nothing else
-may declare one.
+**Marks live on leaves; interior state is computed.** A parent's state is its
+exit predicate applied to its `over:` set, evaluated at read time. This is what
+makes the next point cheap.
 
-Annotation kinds are stateful — a `{todo}` goes `open → closed`, a review
-progresses through phases — and deriving that state from an immutable record log
-requires knowing which states exist and which transitions are legal. An earlier
-design put a `[protocol.states]` / `[[protocol.transitions]]` block in the
-attestation protocol registry (`attestation_fabric.md` §6). **That is withdrawn**:
-it would have been a second grammar for something this issue already defines.
+**A cycle is an outcome that clears marks.** `rejected` on a review step clears
+the marks of the draft steps. Not a jump, not a back-edge, not a traversal —
+which is why it needs no transition construct and cannot be a second grammar.
 
-A procedure *is* a state machine. The `steps` field declares ordered states; the
-step types declare the transition semantics:
+Clearing is the template-scale form of the **squash** that `living_corpus.md`
+§Movement defines at record scale. Both are lossy in the same direction: the log
+keeps the journey, the current state says what is. A third rejection produces a
+marking identical to the first, so **the state space is bounded by the template
+regardless of how many times a cycle runs.** That is the termination argument,
+and it is stronger than a fuel guard.
 
-| Step type | Transition meaning |
-| --------- | ------------------ |
-| `sequence` | states advance in order |
-| `any_of` | one branch satisfies the parent |
-| `all_of` | every branch must be satisfied |
-| `parallel` | branches progress independently |
+### Combinators range over a queryset
 
-So a lifecycle is an authored `.procedure` document, and a registry entry
-references it rather than embedding a state machine. Three things follow:
+The `over:` option is a query string; the default is `composed_of(1)`. Authored
+children become the degenerate case.
 
-- **A custom lifecycle is still no code change** — it is a `.procedure` file plus
-  a registry entry pointing at it.
-- **A lifecycle becomes a first-class graph node.** It can be versioned,
-  reviewed, annotated, and traversed like any other content. An embedded TOML
-  block could not.
-- **The step types must be expressive enough to serve as transition semantics**,
-  not merely as execution ordering. **This is not yet established — see Risk 1.**
+| `over:` | Reads as |
+|---|---|
+| `composed_of(1)` (default) | containment children — the old nesting operators |
+| `constrained_by(1)` | the step's declared normative inputs |
+| `uses(1)` | the step's declared material inputs (`inventory`) |
+| a role query | the actors expected to act — the **agential** case, below |
+| any query | a set discovered after authoring — an N-ary join |
 
-Read the step types as **combining predicates over a set of records**, not as an
-execution order. "Did this run satisfy its parent step?" is `all_of` / `any_of` /
-`sequence` applied to the child records. That reading is what Issue 109 already
-assumes, and it is what keeps the semantics general rather than tied to a running
-engine this issue does not build.
+This answers step 2's standing question about `inventory` versus `caused_by`:
+**yes, they are the same relation in two tenses — but they are not merged.** A
+step declares inputs ($S_P$, the conduit); records cite what they drew from ($R$,
+the traversal); the exit predicate is the comparison. The general primitive is
+**coverage of a declared set by a discharged set**. `procedure_model.md` §6.1's
+material-resources boundary survives untouched, because nothing is collapsed —
+`uses` stays material, `constrained_by` stays normative, and the combinator does
+not care which relation it ranges over.
 
-**Step types must be an open enum.** Downstream vocabularies will add types, and
-a closed enum forces a core change for each. Note the consequence: an open enum
-makes the type set a **versioning surface** — a record folded against a template
-using a step type the reader does not know must fail visibly rather than silently
-mis-fold. Schema versioning is Issue 32's; see Open Question 2 for the namespace
-mechanism.
+**The same primitive covers actors, which is how multi-signature sign-off
+works.** A conduit may declare a **role** rather than a node — "a safety reviewer
+is expected to act here" — and "2 of 3 reviewers" is then
+`{exit} n-of :count: 2` over a queryset resolving that role. No conduit-level
+state machine is needed, and no new grammar: the declared set is the role, the
+discharged set is the actors who emitted runs against it, and the exit predicate
+is the same comparison.
 
-Consumers: Issue 109 folds a record log against a template to derive state, and
-uses a step reference (`task`) to decide whether a nested run counts toward its
-parent. Issue 104's three built-in kinds are degenerate templates. Neither
-defines a lifecycle format of its own.
+This is the material/normative pattern in its **agential** tense:
 
-### Relationship to the Attestation Record
+| Tense | Declares | Discharged by | Kind |
+|---|---|---|---|
+| material (`uses`) | an input a step needs | records citing what they used | Pragmatic |
+| normative (`constrained_by`) | a constraint a step answers to | records citing what constrained them | Epistemic |
+| **agential** (a role) | an actor *class* expected to act | actor → run edges from actors who acted | **Pragmatic** |
 
-The unification that motivated the withdrawn model still holds, and is now
-someone else's to enforce: an as-run record and an attestation record in
-`docs/design/annotation/attestation_fabric.md` §4.2 are **the same object described from two
-ends** — one starts from "a procedure was executed", the other from "a claim was
-made about an artifact".
+The agential case is Pragmatic for the same reason `uses` is: a role declares an
+**expected act** ($S_P$), and a run proves one happened ($R$). An actor is a graph
+node with a derived BID, and the edge is
+`(source: actor, sink: run, WEIGHT_OWNED_BY: actor)` — see
+`docs/design/annotation/living_corpus.md` §5. A *record* may likewise cite another
+actor to pull them into the run's scope, which is the agential counterpart of
+citing an input and is Pragmatic for the same reason.
 
-Because this issue defines no record type, it cannot cause that divergence and
-cannot prevent it. The append-only, anchoring, and one-schema-one-store
-constraints belong to **Issue 105**, which owns the store, and the field set
-belongs to **Issue 104**. They are noted here only so a reader arriving from the
-old version of this issue knows where they went.
+**Selection comes from `query_model.md`; combination comes from nesting.** The
+predicate leaf therefore gets **no `and` / `or` / `not`** — `all`/`any` over a
+nested set already *is* the boolean algebra. This is the structural reason the
+`over:` slot cannot grow into a general condition language.
+
+> **Claim to verify, not to build on**: declared-set versus discharged-set, per
+> owner, is what `{maps_to}` and the traceability matrix already compute. If it
+> holds, a coverage matrix and a procedure state are one operation at two scales.
+
+### Purity: no wall clock
+
+> **`derive` must be a pure function of (record set, corpus version).**
+
+Anchor resolution passes — a function of corpus state at a version. Staleness
+passes — a content-hash comparison. **A timeout fails**: two readers folding an
+identical record set would derive different states, breaking the set-union merge
+the store rests on. A timeout is not a weak transition, it is a
+*non-deterministic* one.
+
+Observed "default if unanswered" dispositions are therefore **payload** — a
+standing instruction to whoever looks — and the transition happens when a human
+asserts it. **Time is a sort key for attention, never an input to state.** Stuck
+runs surface on a dashboard ordered by age.
+
+### Cross-run guards need no syntax
+
+Issue 105 §Cross-run guards assigns this issue "the syntax". There is none to
+add. The fold derives runs in `caused_by`-topological order and puts derived
+state in the run node's payload (105 §Project); `resolve_property_path`
+(`src/query/spec.rs:580`) serializes the whole `BeliefNode` and walks it, so
+`payload` is reachable from the query grammar and `payload.priority > 3`
+round-trips today (`src/query/parser.rs:2838`).
+
+A guard is therefore an `over:` query with a payload predicate on projected run
+state. **Issue 105's evaluation half is unchanged; this issue's syntax half
+dissolves into the existing grammar.** Confirm the exact spelling of a traversal
+composed with a payload predicate against `query_model.md` §9.5 during step 2.
+
+### Authoring surface
+
+Three new directive names over existing machinery: fenced directives with `:key:`
+options (`parse_directive_options`, `src/codec/myst.rs:659`), query shorthands
+(`src/query/parser.rs:414`), inline-anchor nodes (91B), Section containment.
+
+````markdown
+## Change plan lifecycle {#plan-lifecycle}
+
+```{exit} ordered
+```
+
+- {#drafted} Proposed text is complete.
+- {#placed} Target section is pinned.
+- {#packaged} Rendered as a change request.
+  ```{exit} all
+  :over: constrained_by(1)
+  ```
+- {#submitted} Handed to the process owner.
+  ```{outcome} rejected
+  :clears: #drafted
+  ```
+````
+
+`#packaged` does not complete until every node it declares itself constrained by
+is discharged — a blocking relation expressed as a queryset rather than a status
+value.
+
+**Open-enum rule**: an unknown combinator or outcome validates structurally and
+**fails loudly at fold time**. Same rule for an unknown `record_kind`.
+
+**The one place a guard is genuinely needed**: because `over:` is an arbitrary
+query, the *over-graph* can cycle. Exit evaluation and `clears` propagation both
+walk it and need a visited set; a cycle in the over-graph is a template lint.
+This does **not** apply to the record fold, which is a linear pass over records
+and cannot diverge.
 
 ### Module Layout
 
-Ship as a module in noet-core. **Issue 95 (Workspace Decomposition) owns
-crate-splitting** — extraction of this module into a separate `noet-procedures`
-crate is deferred to whenever Issue 95 lands, and should not be attempted here.
-The layout below is designed to make that later extraction mechanical.
-
 ```
 src/procedures/
-├── codec/            # ProcedureCodec implementation
-│   ├── mod.rs        # ProcedureCodec, registers with CODECS
-│   ├── parse.rs      # Parse .procedure files, generate nodes from steps
-│   └── generate.rs   # Generate .procedure source from nodes
-├── schema/           # Procedure schema definitions
-│   ├── mod.rs        # Schema registration with SCHEMAS
-│   ├── procedure.rs  # Core procedure schema (validates steps field)
-│   └── steps.rs      # Step types (open enum) + combining predicates
-└── mod.rs            # Public API, initialization
+├── lifecycle.rs   # exit predicates, outcomes, marking semantics
+└── mod.rs         # directive registration, public API
 ```
 
-Note the absent `as_run/` directory — it was the withdrawn model's home.
-
-Out of scope: `execution/` and `redlines/` (Issue 18), `promotion/` (Issue 106),
-any record type or store (Issues 104, 105, 109).
-
-### ProcedureCodec Behavior
-
-`ProcedureCodec::parse` reads TOML frontmatter into a document node, retrieves
-the registered `Procedure` schema, and calls `generate_nodes_from_steps` on the
-`steps` field. That function recursively walks the steps array: each step becomes
-a node, substeps become child nodes, and the `heading` field carries the
-parent-child relationship. This is the **opposite** of MdCodec — schema-driven,
-not content-driven. Markdown after the frontmatter is optional documentation,
-injected into step nodes as `text`; it does not define structure.
-
-### Boundaries
-
-**Provided here**: `ProcedureCodec`, the procedure schema, node generation from
-the `steps` field with stable step BIDs, and the step-type combining predicates
-— built on noet-core's existing codec registry, schema registry, and lattice
-primitives.
-
-**Not provided here**: any record type, a running execution engine or deviation
-analysis (Issue 18), source write-back or template promotion (Issue 106), record
-persistence (Issue 105), or behavior prediction, sensor integration, and learning
-algorithms (all downstream-product concerns).
+No `codec/`, no `as_run/`. Issue 95 owns crate extraction; do not attempt it
+here.
 
 ## Implementation Steps
 
-### 1. Codec Infrastructure (2 days)
+### 1. Directive registration and marking semantics (1 day)
 
-- [ ] Create `src/procedures/codec/mod.rs`, implement `DocCodec` for `ProcedureCodec`
-- [ ] Register with `CODECS.insert("procedure", ...)` and `WALK_CODECS`; verify
-      claim-time dispatch ordering against `beliefbase_architecture.md` §3.6
-- [ ] Parse `steps` from TOML frontmatter; recursively generate `IRNode`s
-- [ ] Set `heading` for parent-child relationships (substeps)
-- [ ] Handle step types: action, prompt, sequence, parallel, any_of, all_of
-- [ ] **Stable step BIDs** — a step is a node, so it already has a BID; that BID
-      *is* the step reference Issue 109 needs for its `task` field. Derive it
-      from a stable string (see `Bid::codec_namespace`, `src/properties.rs:336`),
-      never from a positional index, so it survives template revision. This adds
-      **no new primitive** and resolves what was Open Question 2.
-- [ ] Inject optional post-frontmatter markdown as step `text`
+- [ ] Register `{exit}` and `{outcome}` in `DIRECTIVES` (`src/codec/myst.rs`).
+      Both are fenced-block, parse-only (`builder: None`) — they configure a
+      node, they do not render
+- [ ] Parse the combinator argument (`all` / `any` / `ordered` / `n-of` with
+      `:count:`) and options (`:over:`, `:outcome:`, `:clears:`)
+- [ ] Store the parsed lifecycle on the step node's `payload` so the fold reads
+      it without re-parsing source
+- [ ] Implement exit evaluation over a resolved `over:` set, with a visited set
+      against over-graph cycles
+- [ ] Implement `clears`: resolve to leaf marks, clear transitively through
+      `over:` sets
+- [ ] Confirm the traversal-plus-payload-predicate spelling against
+      `query_model.md` §9.5; if it is not expressible, **that** is the one
+      genuine grammar gap and it belongs to the query model, not here
+- [ ] Acceptance: `draft → peer-reviewed → board-approved` with a rejection path
+      back to `draft` parses, validates, and folds. Notify Issue 105
 
-### 2. Schema Registration and Step Semantics (1 day)
+### 2. Schema registration (0.25 days)
 
-> Steps 2 and 2a together answer whether a template can actually be driven by
-> records. Neither is complete without the other.
+- [ ] Register the step payload shape via `SCHEMAS`; validate combinator and
+      outcome discriminants
+- [ ] Unknown combinator or outcome: structurally valid, loud at fold time
+- [ ] Document each combinator as a predicate over a **resolved node set**,
+      which is the form Issue 105 consumes
 
-- [ ] Define the procedure schema in Rust; register via `SCHEMAS`
-- [ ] Validate `steps` field structure and step-type discriminants
-- [ ] Step types as an **open enum** — an unknown type validates structurally and
-      fails loudly at fold time rather than being silently ignored
-- [ ] Document each step type as a **combining predicate over a record set**,
-      which is the form Issue 109 consumes
-- [ ] **Design the cycle construct** (Risk 1) — a transition step type meeting
-      the five constraints in Risks. Acceptance: `draft → peer-reviewed →
-      board-approved` with a rejection path back to `draft`. Record the design
-      here and notify Issues 104 and 109
-- [ ] Registration tests; verify TOML parsing against the registered schema
+### 2a. Derive the `redline` and `ask` field sets from data (1.25 days) — **may start before step 1**
 
-### 2a. Procedural Annotation Subtypes (0.75 days)
+> [!IMPORTANT]
+> **`redline` and `ask` are general annotation kinds, not procedural subtypes,
+> and this issue does not register them.** A redline is any proposed change to
+> any content — `overlay_model.md` §2.5 defines it with no procedure involved,
+> and a redline against content that does not exist yet anchors to a path like
+> any other (`redline_model.md` §4). **Issue 104
+> owns the registry entries** (`noet:redline:v1`, `noet:ask:v1`) alongside
+> `receipt` and `gap`.
+>
+> What this step owns is the **evidence**: the field sets and observed
+> lifecycles, mined from real records, which Issue 104 consumes. Plus one thing
+> only this issue can do — **check that the lifecycle grammar can express those
+> lifecycles**. If it cannot, the grammar is wrong, and that is a finding about
+> steps 1–2 rather than about the vocabulary.
+>
+> The design homes are
+> `docs/design/annotation/redline_model.md` (the general kind) and
+> `docs/design/procedures/deviation_model.md` (the as-run comparison that may
+> motivate one).
 
-- [ ] Register the `protocol_id` values a run needs to advance a state machine.
-      Minimum: **redline** (proposes a change to the anchored node — Issue 106
-      consumes it and currently has no definition to point at)
-- [ ] Payload schema per subtype, in Issue 104's record shape — **no new record
-      type**, no addition to `src/event.rs`
-- [ ] Define how a subtype names the step it discharges: the `task` field is a
-      step BID (step 1), so this is a reference convention, not a new mechanism
-- [ ] Test: a record carrying an unknown `protocol_id` fails loudly at fold time
-      rather than being silently dropped — same rule as the open step-type enum
+> **This step has real input data and must be done against it.** A corpus of ~25
+> hand-written change-plan records with state-bearing frontmatter exists in a
+> sibling repository (ask the human for the location). Derive the field sets
+> **from** those files. Where a designed schema and the hand-written frontmatter
+> disagree, the frontmatter wins: it has the evidence. **Do not cite that
+> corpus, its documents, or its organization in noet-core** — describe it by
+> structural properties only (`AGENTS.md` § Application-Neutral Content).
+
+**What the corpus already establishes.** Its flat 7-value status enum conflates
+three different determinants, and the factoring separates them:
+
+| Authored value | Actually determined by | Share |
+|---|---|---|
+| "blocked" | state of a **cited run** | ~9/25 |
+| "needs-placement" | **anchor does not resolve** — the target section is absent | ~4/25 |
+| "ready" | absence of both of the above | ~6/25 |
+| terminal values | a **record** asserting a discharge | ~6/25 |
+
+Only the last row is a state. The other three are derived conditions, and the
+flat enum conflated them *because it had no predicate language*. This maps onto
+Issue 105's bracketed-operation versus derived-condition split, so the fold
+needs no new machinery.
+
+**The predicate vocabulary follows** — three subjects, one evaluation-time split:
+
+| Predicate | Subject | Evaluated |
+|---|---|---|
+| combinator over `over:` | a resolved node set | at fold |
+| payload predicate on a cited run | projected run state | at fold |
+| anchor resolves | the anchor `QuerySpec`'s result | at look time |
+
+- [ ] **Derive the field sets and hand them to Issue 104** — do not register
+      them here:
+      - **redline** — proposes a change to the content it anchors. Observed
+        fields: target document and section, proposed text (before/after),
+        rationale, driving external requirement, destination process, owner
+        contact, blocked-on. These are **authoring-surface fields**, and the
+        observed section granularity is correct at that level — storage is a
+        file map (`generational_archive.md` §6.1), the same split git makes
+        between hunks and blobs. Record the fields as observed; do not flatten
+        them to the storage shape
+      - **ask** — a question whose answer unblocks another record. Its
+        `caused_by` cites what it unblocks; its target is an **actor or process,
+        not a node**. Issue 104's primitive census has no row for that — hand it
+        the finding
+- [ ] `destination_process` is **derivable from the target document** in ~22 of
+      25 observed records, because document control defines the route from the
+      document class. Computed, not authored
+- [ ] **Lifecycle authoring check, on paper** (0.5 days) — **the part only this
+      issue can do**. Write the observed redline and ask lifecycles using only
+      the grammar from steps 1–2, including the cross-run guard. Expected:
+      expressible, with the guard as a payload predicate and no new syntax. A
+      lifecycle that cannot be written is a **defect in the grammar**, not a
+      special case for the vocabulary
+- [ ] **Partial supersession is payload, not lifecycle.** One observed record was
+      absorbed in half by another. Which claims moved is a redline-payload
+      concern; do not build it into the predicate logic
+- [ ] Test: an unknown `record_kind` fails loudly at fold time
+
+**What this step does *not* do**: register a `record_kind` (Issue 104), define
+the redline payload's storage shape (`redline_model.md` §3), or design the
+promotion path (Issue 74 for the package, Issue 106/107 for enactment).
 
 ### 3. Documentation (0.25 days)
 
 - [ ] Rustdoc for public APIs; module-level docs
-- [ ] Update `docs/design/procedures/procedure_schema.md` for ProcedureCodec behavior and
-      the `.procedure` extension
-- [ ] Record the withdrawal of the three-piece model wherever
-      `procedure_schema.md`, `attestation_fabric.md` §4.2, or
-      `docs/design/procedures/procedure_execution.md` still assumes it — the latter's §2 is
-      titled "The Three-Piece 'As-Run' Model" and states it directly
+- [ ] **Fix `myst_directive_architecture.md` §3.1** — the registered-verb table
+      lists `draws_from`/`underlies` and omits the canonical
+      `constrained_by`/`constrains` pair. `src/codec/myst.rs:307` and
+      `src/query/parser.rs:1176` are correct; the table is stale
+- [ ] Add `{exit}` / `{outcome}` to §3.1 and §8 (extension point)
 
-### 4. Consolidate the procedural design-doc space (1.5 days) — **near-final step**
+### 4. Consolidate the procedural design-doc space (1.5 days) — **partially complete**
 
-> **Do this last, after steps 1-2a are built.** The consolidation should describe
-> what was implemented, not what was planned. Doing it first would mean
-> documenting a design that the build may still change.
+> **Done ahead of steps 1–2a, deliberately and in reduced scope.** The
+> consolidation was to describe what was implemented; nothing here is
+> implemented yet. What has landed is everything that does not require the
+> implementation to exist: the target document set, the harvest, the removals,
+> the corrections, and a named stub where the grammar will be specified. The
+> remaining boxes need built code to describe.
 
-**The problem.** Five design documents describe procedural architecture, and they
-currently total ~3,460 lines built substantially on the withdrawn as-run model:
+**Landed document set** (3,459 lines → ~1,900, five documents → five):
 
-| Document | Lines | State |
-|---|---|---|
-| `procedure_execution.md` | 724 | Banner-marked withdrawn; §2 rewritten; §8 API depends on withdrawn types |
-| `action_observable_schema.md` | 938 | Banner-marked; `inference_hint` half is sound |
-| `noet_procedures_readme.md` | 872 | Banner-marked; argument survives, API does not |
-| `redline_system.md` | 543 | Banner-marked; §2, §3.3, §6, §7, §10, §11 stand |
-| `procedure_schema.md` | 387 | Sound; the step grammar lives here |
+| Document | State |
+|---|---|
+| `procedure_model.md` | **New.** Entry point: a procedure is a document, a potentialized annotation, a marking derived from records. Absorbs `procedure_schema.md` |
+| `lifecycle_grammar.md` | **New — the named stub.** Settled decisions for steps 1–2a; no live specification |
+| `observation_model.md` | Renamed from `action_observable_schema.md`; `inference_hint` schema preserved, integration half stubbed |
+| `deviation_model.md` | **New.** The as-run-versus-template comparison and its vocabulary |
+| `../annotation/redline_model.md` | **New, and outside this group.** A redline is a *general* annotation kind — any proposed change to any content — so it lives in `annotation/`. `redline_system.md`'s procedure-specific framing was an error inherited from the withdrawn model |
+| `procedures_vs_alternatives.md` | Renamed from `noet_procedures_readme.md`; heavily cut, layering corrected |
 
-Those banners were triage, not a fix. A reader arriving at any of these cannot
-tell which parts describe the system and which describe a withdrawn draft.
+`procedure_execution.md` was removed. Four passages were harvested first (§4.1's
+append-only-log reasoning, §6.1 concurrency, §6.2 nesting, §11 principles); its
+withdrawn component inventory is recorded in Issue 18.
 
-**The mandate.** Design docs must be **pedagogic about what IS**, not archaeology
-about what used to be. This step has full authority to **edit, move, merge,
-split, delete, or create** documents in `docs/design/` so that the procedural
-architecture reads as one coherent design.
+> **A redline is not a procedural concept, and this issue's framing of it was
+> wrong.** `redline_system.md` scoped redlines to procedure execution, and the
+> consolidation initially inherited that. It does not hold: `overlay_model.md`
+> §2.5 defines a redline as "an annotation proposing a change" with no procedure
+> involved, `generational_archive.md` §6 fixes its payload as a file map, and
+> a redline against absent content anchors to a path like any other
+> (`redline_model.md` §4). Most redlines
+> involve no run at all.
+>
+> The split: **`annotation/redline_model.md`** owns the general kind — payload
+> shape, anchoring, the candidate-state read, and the two exits.
+> **`procedures/deviation_model.md`** owns the as-run-versus-template
+> comparison. A deviation is an *observation*; turning a pattern of them into a
+> proposal is a human judgement that produces an ordinary redline. Procedures
+> compose with redlines in both directions — a step can expect a redline as its
+> discharge (a procedure for drafting a procedure), and a run's deviations can
+> motivate one.
 
-- [ ] **Decide the target document set first**, and record the shape before
-      editing. Consolidation is the expected outcome — five overlapping documents
-      for one subsystem is the problem — but the split is a judgment call. A
-      plausible target: one document for the procedure/annotation model as built,
-      one for the schema reference, and stubs for what Issue 18 will own.
-- [ ] **Remove the withdrawal banners by making them unnecessary.** A banner
-      saying "this describes a withdrawn model" is a placeholder for this step.
-      When it is done, no procedural design doc should carry one.
-- [ ] **Preserve what was assessed as sound** rather than rewriting it:
-      `action_observable_schema.md`'s `inference_hint` schema (grouping and
-      transition events, temporal and confidence constraints, the Participant
-      channel, `response_config`); `procedure_execution.md` §4.1's
-      append-only-log-plus-derived-state design and §6.2's run nesting, both of
-      which anticipated the current model; §11's design principles; and the
-      deviation taxonomy in `redline_system.md`. These are requirements the
-      current model relocates rather than answers.
-- [ ] **`CorrectionType` / `DeviationType` become payload vocabulary** for the
-      redline `protocol_id` registered in step 2a. They enumerate distinctions
-      the payload schema must express; they are not event types.
-- [ ] **Fix the inverted layering in `noet_procedures_readme.md`**: it says the
-      redline channel "injects `BeliefEvent`s to modify the loaded BeliefBase".
-      That violates assert-vs-mutate (`beliefbase_architecture.md` §4.3) —
-      annotations project into events *via the fold*, never the reverse, and the
-      result is a **held-out** BeliefBase (`living_corpus.md` §2).
-- [ ] **Resolve the bespoke query APIs.** `procedure_execution.md` §8 and
-      `redline_system.md` §6 define Rust signatures for questions that may be
-      expressible in the existing grammar (`query_model.md`). Decide; do not
-      leave both standing.
-- [ ] **Do not delete history — relocate it.** Where a withdrawn design needs
-      recording, put a note in this issue or Issue 18, not in a design doc.
-      `AGENTS.md` forbids deleting documents outright: propose consolidation or
-      archiving, and get agreement before removing any file.
+- [x] **Decide the target document set first** and record the shape before
+      editing
+- [x] **Remove the withdrawal banners by making them unnecessary** — no
+      procedural design doc carries one
+- [x] **Preserve what was assessed as sound**: the `inference_hint` schema is
+      intact in `observation_model.md`; the append-only-log-plus-derived-state
+      reasoning is `procedure_model.md` §4.1; run nesting is §5.2; the design
+      principles are §10; the deviation taxonomy is `deviation_model.md` §3.1
+- [x] **`CorrectionType` / `DeviationType` become payload vocabulary** —
+      *resolved with a correction.* `DeviationType` is payload vocabulary
+      (`deviation_model.md` §3.1). `CorrectionType` is **not**: its values are
+      *concluded* about a run rather than described in a record, so they are
+      **outcome discriminants**. This generalized into a claim the model now
+      carries — **an outcome is a derived enumeration** with at least three
+      determinant sources (an actor's assertion; a derived condition such as an
+      anchor going stale under an in-progress run; a cited run's state), all of
+      which are functions of (record set, corpus version) and so preserve the
+      purity rule. See `procedure_model.md` §4.4 and `deviation_model.md` §3.2
+- [x] **Fix the inverted layering** — corrected in
+      `procedures_vs_alternatives.md` §5.1, which states that records project
+      into a **held-out** BeliefBase via the fold, and that no channel is
+      privileged with direct write access
+- [x] **Resolve the bespoke query APIs** — *decided: `query_model.md` wins.* No
+      bespoke Rust API. A run is a node whose payload carries derived state
+      (Issue 105 §Project) and `resolve_property_path` reaches payload, so the
+      analysis questions are traversals with payload predicates. Selection is
+      the query model's; aggregation belongs to a `View` (§7).
+      `deviation_model.md` §4 holds the question → answer table
+- [x] **Do not delete history — relocate it.** *Archive convention decided: no
+      `docs/design/superseded/`.* Git history is the archive and the owning
+      issue is the design note, per `DOCUMENTATION_STRATEGY.md` Rule 4's routing
+      table. A superseded design doc retained in the tree is exactly the
+      on-topic-plausible-and-false noise Rule 4 exists to prevent; a directory
+      name is weaker insulation than readers assume
+- [x] Named stub locations for Issue 18's scope, cross-referenced from Issue 18,
+      and Issue 18's task list updated to match
+- [x] Repoint inbound references: `ISSUE_93` and `ISSUE_16` (filename only — it
+      is completed, so its content stands)
+- [ ] **Revisit once steps 1–2a land.** `lifecycle_grammar.md` is a stub by
+      construction; it becomes the live specification when there is built code
+      to describe. The `{exit}` / `{outcome}` option spellings and the marking
+      semantics are its content — **not** the `redline` / `ask` payload schemas,
+      which are Issue 104's
+- [ ] **Re-verify the architecture map** in `procedure_model.md` §7 against the
+      tree when steps 1–2a land
 
-**Stub, do not design, Issue 18's territory.** Execution loop, deviation
-analysis, and the participant channel are Issue 18's. This step creates the
-sections or documents those will occupy, with enough context that Issue 18 can
-pick them up — and creates nothing more. A stub that quietly becomes a design is
-this step failing.
-
-- [ ] Named stub locations for Issue 18's scope, cross-referenced from Issue 18
-- [ ] **Verify Issue 18's task list matches those stubs.** Issue 18 is currently
-      an aspirational stub with three undecided candidate directions; it must
-      contain the tasks and cross-references needed to resume, or the stubs will
-      be orphaned.
-- [ ] Check the remaining inbound references — `ISSUE_16_AUTOMERGE_INTEGRATION.md`
-      (four `procedure_correction` citations plus a `redline_system.md`
-      dependency) and `ISSUE_93_MODEL_MAP_INFERENCE_ENGINE.md` — and repoint them
-      at whatever the consolidation produces
-
-**Two open questions this step must settle, not inherit:**
-
-- **Is `procedure_execution.md` salvageable or superseded?** It is the most
-  withdrawn-dependent of the five. Merging its surviving parts into a new
-  document may be cleaner than repairing it in place.
-- **Where does `docs/design/` archive superseded material?** There is no
-  convention — `docs/project/trades/superseded/` exists for trade studies, but
-  design docs have no equivalent. If archiving rather than deleting, this step
-  establishes the convention.
+**Both open questions are settled.** `procedure_execution.md` was superseded
+rather than salvageable — four passages survived and were harvested. The archive
+convention is git history plus an issue note, with no superseded directory.
 
 ## Testing Requirements
 
-**Codec**: registration with `CODECS` and claim-time dispatch; TOML frontmatter
-parsing; hierarchical node generation from `steps`; recursive substeps produce
-correct heading levels; optional markdown injected as `text` without altering
-structure; round-trip parse → generate → parse yields an identical node set; all
-step types (action, prompt, sequence, parallel, any_of, all_of).
+**Directives**: registration and dispatch for both forms; `:key:` option parsing;
+unknown combinator validates structurally and fails loudly at fold time;
+round-trip through `generate_source` is lossless.
 
-**Schema**: registration and retrieval; `steps` validation including malformed
-and deeply nested cases.
+**Exit predicates**: each combinator returns the correct verdict over a synthetic
+record set (`all` with one missing child fails; `any` with one present child
+passes; `ordered` flags an out-of-order discharge as a diagnostic, not a
+refusal). No execution engine — evaluate against a fixture.
 
-**Step identity**: a step's BID is stable across a template edit that does not
-touch that step — specifically, inserting a step *before* it must not change it.
-This is the test that a positional index would fail, and Issue 109 depends on it.
+**Queryset ranging**: default `composed_of(1)` matches the old nesting behaviour;
+a non-default `over:` resolves and evaluates; an over-graph cycle is caught by
+the visited set and reported as a template lint.
 
-**Step semantics**: each combining predicate returns the correct verdict over a
-synthetic record set (`all_of` with one missing child fails; `any_of` with one
-present child passes; `sequence` respects order). No execution engine — evaluate
-the predicate against a fixture.
+**Cycles**: the acceptance workflow folds correctly; a second and third rejection
+produce a marking **identical** to the first.
 
-**Integration**: GraphBuilder creates correct edges for substeps; all
-`.procedure` examples parse; doctests pass.
+**Purity**: the same record set folded twice at one corpus version yields
+identical state. No test may depend on wall-clock time.
 
-**Negative**: no new record type is introduced. A grep for `AsRunRecord`,
-`ExecutorContext`, `ProcedureRun`, `ExecutionRecord`, `CorrectionEvent`,
-`DeviationReport`, `ObservationEvent`, or a resurrected `AsRun` finds nothing —
-the annotation subtypes are `protocol_id` registrations, not types.
+**Step identity**: covered by Issue 91B's shipped tests — a step's BID is stable
+across an edit that does not touch it. Re-verify at the lifecycle level only.
 
-**Annotation subtypes**: a redline record round-trips through Issue 105's store
-and resolves to the node it anchors; an unknown `protocol_id` fails loudly at
-fold time rather than being dropped.
+**Negative**: no new record type. A grep for `AsRunRecord`, `ExecutorContext`,
+`ProcedureRun`, `ExecutionRecord`, `CorrectionEvent`, `DeviationReport`,
+`ObservationEvent`, or a resurrected `AsRun` finds nothing. **No `.procedure`
+codec**: `CODECS` gains no entry.
 
 ## Success Criteria
 
-- [ ] `ProcedureCodec` registered and claiming `.procedure` files
-- [ ] Procedure schema registered via the `SCHEMAS` API — no hardcoding in noet-core
-- [ ] Nodes generated from the `steps` field, including recursive substeps
-- [ ] Round-trip parse → generate → parse is lossless
-- [ ] **Every step has a BID stable across template revision**; Issue 109 can use
-      it as `task` without further work
-- [ ] Step types are an open enum, documented as combining predicates
-- [ ] **A cycle is expressible** — the acceptance workflow in Risk 1 parses,
-      validates, and folds correctly, with termination guaranteed
-- [ ] **No procedural design doc carries a withdrawal banner**, and none
-      describes a type that does not exist
-- [ ] **A reader new to the codebase can learn the procedural architecture from
-      the design docs alone**, without needing to know which parts were withdrawn
-- [ ] **Issue 18's territory is stubbed, not designed**, and Issue 18 carries the
-      tasks and cross-references to resume from those stubs
+- [ ] `{exit}` and `{outcome}` registered; a lifecycle is authorable in ordinary
+      markdown with **no new codec and no new file extension**
+- [ ] Exit predicates range over an arbitrary queryset, defaulting to containment
+- [ ] **A cycle is expressible** as an outcome that clears marks; the acceptance
+      workflow parses, validates, and folds, with termination by construction
+- [ ] **A cross-run guard is expressible with no syntax added by this issue**
+- [ ] `derive` is pure over (record set, corpus version); no wall-clock input
+- [ ] Combinators and outcomes are open enums, loud on the unknown
+- [ ] The **`redline` and `ask` field sets are derived from data and handed to
+      Issue 104**, which registers them; their observed lifecycles are shown to
+      be expressible in this issue's grammar
 - [ ] **Zero new record types**; no addition to `src/properties.rs` or
-      `src/event.rs` — the annotation subtypes are registered `protocol_id`
-      values with payload schemas, not new Rust types
-- [ ] A **redline** `protocol_id` exists and is registered, so Issue 106's
-      promotion path has a definition to resolve
-- [ ] Module layout is extraction-ready for Issue 95 (no noet-core internals
-      reached into from `src/procedures/`)
-- [ ] No execution engine, deviation analysis, or persistence layer in this issue
-- [ ] No product-specific code
+      `src/event.rs`
+- [x] **No procedural design doc carries a withdrawal banner**, and none
+      describes a type or a codec that does not exist
+- [x] **A reader new to the codebase can learn the procedural architecture from
+      the design docs alone** — `procedure_model.md` is the entry point
+- [x] **Issue 18's territory is stubbed, not designed** — three named stubs,
+      listed in Issue 18
+- [ ] Module layout is extraction-ready for Issue 95
+- [ ] No execution engine, deviation analysis, or persistence layer
 
 ## Open Questions
 
-1. **Do `.procedure` templates need explicit frontmatter or a file-extension
-   marker to bind to the right codec?** Extension-based dispatch handles the
-   simple case, but a template embedded in or adjacent to other content may need
-   an explicit declaration. Settle during step 1 against the two-registry
-   dispatch rules (`beliefbase_architecture.md` §3.2).
-2. **Can `Bid::codec_namespace` (or another reserved namespace) carry schema
-   versions?** Networks already map into the buildonomy namespace by
-   construction; the same mechanism could identify, link, and migrate
-   *sub-schemas*, which the open step-type enum now requires. Promising and
-   unproven. Broader schema evolution is Issue 32's; this question is only
-   whether the namespace mechanism is the right carrier.
-3. **Cross-referencing**: markdown docs referencing `.procedure` steps via BID
-   URLs (`bid://procedures/example#step_two`). Largely dissolved by the
-   stable-step-BID decision — a step is an addressable node like any other — but
-   confirm the resolver handles the fragment form.
-
-### Resolved or moved
-
-- ~~Where does `version` come from for a template ref?~~ → `content_versioning.md`
-  §5.1 defines the content version; Issue 105 owns the anchor.
-- ~~Step IDs: globally unique or procedure-scoped?~~ → **Resolved**: a step is a
-  node, so its BID is the reference. See step 1.
-- ~~Schema versioning~~ → Issue 32 owns evolution; Issue 105 owns whether the
-  store can resolve a superseded template version.
-- ~~Event enum expansion~~ → **Stale as written**: `src/event.rs` has `Ping` and
-  `Belief`; there is no `Focus` variant. The envelope question is settled in
-  `beliefbase_architecture.md` §4.3.
+1. **Is a traversal composed with a payload predicate expressible in
+   `query_model.md` §9.5 today?** `payload.x > n` parses and resolves; what needs
+   confirming is the composed form. If it is not expressible, the gap belongs to
+   the query model and this issue files it there.
+2. **Does the coverage reading hold?** Declared-set versus discharged-set per
+   owner is what the traceability matrix computes. **Still open** — step 4
+   recorded it as `procedure_model.md` §8 question 1 rather than settling it,
+   because deciding it needs the predicate evaluator that step 1 builds.
+3. **Can `Bid::codec_namespace` carry schema versions?** The open combinator enum
+   makes the type set a versioning surface. Broader evolution is Issue 32's; this
+   is only whether the namespace mechanism is the right carrier.
 
 ## Risks
 
-**Risk 1 — superseded by a design task: the step grammar needs a cycle
-construct.** Not a risk to mitigate; a thing to design during step 2.
+**Risk 1 — resolved.** The step grammar needed a cycle construct. Resolved by
+§The factored core: a cycle is an outcome that clears marks. No transition
+construct, no back-edge, no second grammar. The five constraints that were
+written against a transition construct are superseded; note in particular that
+**constraint 4 conflated graph traversal with record folding** — the fold is a
+linear pass over records and cannot diverge. A visited set is needed for
+over-graph evaluation, which is a different thing.
 
-**The finding (verified).** `sequence` / `parallel` / `all_of` / `any_of` are a
-*nesting tree* grammar (`docs/design/procedures/procedure_schema.md` §4.2 — operators
-contain `steps = [ ... ]`), and a tree has no back-edge. A `grep` across that
-document for `goto|next_state|transition|on_fail|on_reject|repeat|loop|retry`
-returns **nothing** — no transition construct exists. A review lifecycle with a
-rejection path (`draft → peer-reviewed → draft`) is a cycle, so as written the
-grammar cannot express the workflow that motivated the lifecycle unification.
-Issues 104 and 109 both assume it can; neither checked.
+**Risk 1a — resolved, and smaller than stated.** Cross-run guards need no syntax;
+see §Cross-run guards. The genuinely harder case the original framing missed is
+the **N-ary join over a dynamically discovered set** — observed as several
+independent records that must ship as one package, grouped after authoring.
+Dissolved by §Combinators range over a queryset, not by a new construct.
 
-**The resolution is to extend the grammar.** This is our design and the open
-step-type enum already accommodates an addition. What is **not** acceptable is a
-second lifecycle grammar appearing elsewhere — a transition construct inside
-`steps` is one grammar; a `[protocol.transitions]` block beside it is two, which
-is exactly what this issue's single-definition rule exists to prevent.
+**Risk**: the `over:` option grows into a general condition language →
+**Mitigation**: the predicate leaf has no boolean combinators; nesting is the
+boolean algebra. Selection is `query_model.md`'s, combination is the tree's.
 
-**Constraints the construct must satisfy** — design against these:
+**Risk**: a wall-clock transition reappears as "just a convenience" →
+**Mitigation**: the purity rule and the no-clock test. A timeout is
+non-determinism, not a weak transition.
 
-1. **It names a target rather than nesting.** A transition is a real grammar
-   addition, not a reinterpretation of the existing operators.
-2. **The target is a stable step BID** (step 1's decision), never a positional
-   index — a transition naming a position breaks on template revision.
-3. **It stays a combining predicate over a record set.** Issue 109 folds records
-   against the template; a construct meaningful only to a *running engine* would
-   break that reading and re-couple lifecycle state to execution.
-4. **Termination.** A cycle means the fold can revisit a step, so it needs a
-   visited-set or an explicit iteration bound. Precedent: `PathMap` already
-   carries a `loops` guard for same-kind Section cycles — cycles-with-guards is
-   an established pattern here, not a new hazard.
-5. **Unknown transition types fail loudly at fold time**, per the open-enum rule.
+**Risk**: the withdrawn as-run model creeps back as "just a small struct" →
+**Mitigation**: the zero-new-record-types criterion and the negative grep.
 
-**Acceptance test**: express `draft → peer-reviewed → board-approved` with a
-rejection path back to `draft`. Tell Issues 104 and 109 the outcome.
+**Risk**: a `.procedure` codec creeps back for "schema validation TOML gives us
+free" → **Mitigation**: the negative `CODECS` test. Validation is the `SCHEMAS`
+registry's job and does not require a file format.
 
-**Risk**: Codec dispatch ordering implemented incorrectly, silently wrong
-behavior → **Mitigation**: read `beliefbase_architecture.md` §3.2/§3.6 first;
-test claim-time dispatch explicitly
-
-**Risk**: The withdrawn as-run model creeps back in as "just a small struct" →
-**Mitigation**: the zero-new-record-types success criterion and the negative
-grep test. If a record field seems to have no home, that is a question for
-Issue 104, not a reason to define a type here.
-
-**Risk**: Schema registry (Issue 1) incomplete → **Mitigation**: validate the
-registry API before starting; block if it is not ready
-
-**Risk**: Scope creeps back toward an execution engine → **Mitigation**: the
-`execution/` and `redlines/` paths are explicitly out of scope; any run loop
-belongs to Issue 18
-
-**Risk**: Module boundaries leak, making the Issue 95 extraction painful →
-**Mitigation**: treat `src/procedures/` as if it were already a separate crate
+**Risk**: scope creeps toward an execution engine → **Mitigation**: any run loop
+belongs to Issue 18.
 
 ## References
 
-- `docs/design/core/beliefbase_architecture.md` §4.3 — `Envelope` and `Annotation`;
-  where the withdrawn executor context went
-- `docs/design/annotation/living_corpus.md` §2 — annotations as a privileged subset of `R`;
-  the reason an annotation *is* an as-run record
-- `docs/design/annotation/living_corpus.md` §5 — the conduit model; a template step is
-  `S(P)`, a record is the `R`
-- `docs/design/procedures/procedure_schema.md` §4.2 — the step-type grammar; the nesting
-  structure behind Risk 1
-- `docs/design/core/beliefbase_architecture.md` §3.2, §3.6 — codec dispatch
-- `src/properties.rs:336` — `Bid::codec_namespace`, the stable-BID-from-string
-  pattern step identity uses
+- `docs/design/core/beliefbase_architecture.md` §4.3 — `Envelope` and `Annotation`
+- `docs/design/annotation/living_corpus.md` §2 — annotations as a privileged subset of `R`
+- `docs/design/annotation/living_corpus.md` §5 — the conduit model; a step is $S_P$, a record is `R`
+- `docs/design/annotation/living_corpus.md` §Movement — squash; the record-scale form of clearing marks
+- `docs/design/codecs/myst_directive_architecture.md` §2, §3, §8 — directive registry and extension point
+- `docs/design/core/query_model.md` §9.5 — the `over:` predicate language
+- `docs/design/procedures/procedure_model.md` — the consolidated model (step 4)
+- `docs/design/procedures/lifecycle_grammar.md` — the stub this issue fills
+- `src/query/spec.rs:580` — `resolve_property_path`; why payload is query-reachable
+- `src/codec/myst.rs:659` — `parse_directive_options`
+- `ISSUE_91B_INLINE_ANCHOR_NODES.md` — **completed**; supplies step identity
 - `ISSUE_104_ANNOTATION_VOCABULARY.md` — authoritative for the record field set
-- `ISSUE_109_ANNOTATION_LIFECYCLE.md` — run bracketing and folding; consumes the
-  step semantics defined here
+- `ISSUE_105_RECORD_STORE_AND_FOLD.md` — consumes the exit-predicate semantics
 - `ISSUE_01_SCHEMA_REGISTRY.md`, `ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md`,
   `ISSUE_95_WORKSPACE_DECOMPOSITION.md`
 
 ## Next Steps After Completion
 
-1. **Issue 109** — folds a record set against a template using the step
-   combinators and step BIDs defined here; the immediate consumer
+1. **Issue 105** — folds a record set against a template using the exit
+   predicates and step BIDs defined here; the immediate consumer
 2. **Issue 18** — execution loop, participant-channel observations, deviation
    analysis
 3. **Issue 95** — extracts `src/procedures/` into its own crate

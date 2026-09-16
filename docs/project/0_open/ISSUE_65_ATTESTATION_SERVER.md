@@ -1,17 +1,17 @@
 ---
 version = "0.1"
-title = "Issue 65: Attestation Server — General Infrastructure and noet Collaboration Overlay MVP"
+title = "Issue 65: The First Federated Store — a Corpus-Blessed, Promotion-Accepting Peer"
 ---
 
-# Issue 65: Attestation Server — General Infrastructure and noet Collaboration Overlay MVP
+# Issue 65: The First Federated Store
 
 **Priority**: LOW
 **Estimated Effort**: 7–9 days (RELATIVE COMPARISON ONLY)
-**Dependencies**: Requires Issue 105 (record schema + sidecar file format — the
-server stores and syncs the same records), Issue 102 (`noet serve` — the
-consuming side of the event stream). Neither blocks the *server's* own
-implementation, but both must be settled before the sync path can be built
-against a stable format.
+**Dependencies**: **Requires Issue 105** — the record schema, the fold, the
+annotation manifest (including `default_halo`), and the `sync` slot this store
+attaches to. **Requires Issue 104** for the record kinds it holds. Requires
+Issue 102 (`noet serve`) for the consuming side of the event stream. This issue
+does not define any of those; it instantiates them at shared scope.
 **Related design doc**: `docs/design/annotation/collaboration_overlay.md` (sketch, v0.1)
 **Schema authority**: `docs/design/core/beliefbase_architecture.md` §4.3
 
@@ -26,18 +26,33 @@ Phase 1 MVP: a self-hosted attestation server plus a thin viewer client script
 that provides progressive enhancement on top of any static noet site.
 
 > [!IMPORTANT]
-> **Re-scoped: this is Issue 105's mechanism at a broader scope, and this issue
-> is a validation effort.**
+> **This is the first federated store, not a server project.**
 >
-> Issue 105's sidecar store and this server are **one mechanism instantiated at
-> two scopes**, not two systems with a handoff between them. Both hold out the
-> same thing — the held-out BeliefBase that Layer 3's live projection consists of
-> (`docs/design/annotation/living_corpus.md` §2) — over the same `Envelope` + `Annotation`
-> records, with the same union merge. Issue 105 instantiates it at local/repo
-> scope; this issue instantiates it at shared scope. The scope differs; the
-> object does not. This is why "sync peer" is a topological description rather
-> than an integration contract, and why there is no import/export boundary to
-> design between them.
+> What this issue delivers is **one record store with three properties the local
+> ones lack**: it is *corpus-blessed* (named in the annotation manifest's
+> `default_halo`, so every reader of the corpus sees it by default — Issue 105),
+> it *accepts promoted records* rather than being written to directly, and it is
+> *reachable by readers with no local store*. Everything else — the record
+> schema, the fold, the union merge, the halo it joins, the `sync` slot it
+> attaches to — is built by Issues 104 and 105 before this issue starts.
+>
+> Issue 105's sidecar store and this one are **one mechanism instantiated at two
+> scopes**, not two systems with a handoff between them. Both hold out the same
+> thing — the held-out BeliefBase that Layer 3's live projection consists of
+> (`docs/design/annotation/living_corpus.md` §2) — over the same
+> `Envelope` + `Annotation` records, with the same union merge. The scope
+> differs; the object does not. This is why "sync peer" is a topological
+> description rather than an integration contract, and why there is no
+> import/export boundary to design between them.
+>
+> **The consequence for scope**: the questions worth answering here are the ones
+> that only appear at shared scope — what a promotion boundary admits, what a
+> corpus-blessed default means for a reader who diverges from it
+> (`living_corpus.md` §5), and whether credentials can be peer-derived. The
+> server binary, its endpoints, and its storage are an *implementation* of the
+> `sync` conduit Issue 105 leaves a slot for — the protocol is
+> `collector_model.md` §4's, and a git remote is an equally valid transport for
+> a team that has one.
 >
 > Two consequences for how this issue should be worked:
 >
@@ -149,13 +164,13 @@ The server stores `path` and `version` internally rather than the decomposition.
 
 **Record schema**: the server stores the same `Envelope` + `Annotation` types as
 Issue 105, per `docs/design/core/beliefbase_architecture.md` §4.3 — **not** a
-separate server-only schema. Record kind is discriminated by `protocol_id`
+separate server-only schema. Kind is discriminated by the `record_kind` field
 (`attestation_fabric.md` §6), so the server's storage and a sidecar record file
 hold the same object in two encodings. This is what makes "sync peer" a
 well-defined role rather than an integration project.
 
 **Attestation kinds** (Phase 1): `Comment`, `SignOff`, `Flag` — expressed as
-`protocol_id` values, not as a closed enum.
+`record_kind` values, not as a closed enum.
 
 **Attestation server**: separate repo (`noet-collab`), Axum + SQLite,
 self-hosted, substrate-agnostic (one instance serves multiple sites and, in
@@ -169,12 +184,10 @@ pages. The server it talks to is not noet-specific.
 **Identity**: Phase 1 uses OIDC/JWT from operator-configured provider.
 Phase 2 migrates to Keyhive (no schema changes needed).
 
-**Credentials**: Sign-offs carry a credential claim. Credentials are peer-attested
-("I attest that Alice is a Structures Engineer") rather than administrator-assigned.
-A node's sign-off policy (embedded in its noet frontmatter) declares what credential
-types are required and in what quantity. The signer presents a peer-issued credential
-alongside their sign-off; the collab server validates the credential against the policy
-and records both. No central role administrator is required.
+**Credentials**: role annotations on actor nodes, peer-attested rather than
+administrator-assigned, with `sign_off_policy` declaring required roles and
+counts. **Specified in Issue 112**, not here — this store consumes the predicate
+to decide what it admits.
 
 **Key API endpoints**:
 ```
@@ -272,8 +285,9 @@ Summary.
       implemented instantiate at shared scope without a second schema, a second
       fold, or a second store. Gaps found here are upstream findings, not
       server-side workarounds.
-- [ ] Design peer-attested credential model (see §Credential Model below) and record
-      in `collaboration_overlay.md`.
+- [ ] Consume Issue 112's credential model — this store's job is the push-rule
+      predicate, not the model. Record the integration in
+      `collaboration_overlay.md`.
 - [ ] Upgrade `collaboration_overlay.md` from Sketch → Draft with all decisions recorded.
 - [ ] **Reconcile the anchor change through the whole overlay doc.** §1–§3 are
       updated to `(site_url, bid, version)`, but §3.4 (record schema), §5
@@ -289,11 +303,11 @@ Summary.
       105 — they are a query-efficient encoding of that record, not a second
       schema.** Any field in the record that has no column must still round-trip;
       carry it in a blob column rather than dropping it.
-  - `attestations(id, path, version, attester_id, credential_type, kind, protocol_id, result, evidence_hash, timestamp, policy_satisfied, credential_id FK)`
+  - `attestations(id, path, version, attester_id, credential_type, kind, record_kind, result, evidence_hash, timestamp, policy_satisfied, credential_id FK)`
   - `provenance(attestation_id FK, cited_path, cited_version, role)` — optional per-attestation cited records
   - `versions(path, version, predecessor, registered, registrant)` — predecessor chain for path+version history
-  - `credential_attestations` table (see §Credential Model)
-  - `envelopes(event_id, lamport, actor, observed_at)` and `causes(event_id, cites_event_id)` — the envelope fields; required for merge and provenance, and for lossless round-trip with sidecar files
+  - `credential_attestations` table — schema per Issue 112
+  - `envelopes(event_id, actor, observed_at)` and `causes(event_id, cites_event_id)` — the envelope fields; required for merge and provenance, and for lossless round-trip with sidecar files
   - `peer_watermarks`, `site_config`
 - [ ] Sidecar import/export: read a directory of Issue 105 record files into the
       tables, and write the tables back out in that same file-per-record form.
@@ -350,7 +364,7 @@ Summary.
       prerequisite: the client needs each node's hashes, and today the viewer
       emits only `data-bid` (`assets/viewer/metadata.js:156,230`). Add
       `data-content-hash` and `data-section-hash` alongside it, sourced from the
-      shard. A record anchors to whichever its `protocol_id` designates — a note
+      shard. A record anchors to whichever its `record_kind` designates — a note
       on a heading to `content_hash`, a section sign-off to `section_hash`. This
       is a new noet-core requirement created by the anchor decision; it did not
       exist when `asset_version` was the anchor, because that value was global and
@@ -381,96 +395,23 @@ Summary.
 
 ---
 
-## Credential Model
+## Credentials
 
-### Design Principle: Peer-Derived, Not Administrator-Assigned
+**Specified in `ISSUE_112_CREDENTIALS_AND_PROMOTION.md`, a follow-on to Issue
+104.** Credentials are role annotations on actor nodes, recorded and projected
+like any other record; a `sign_off_policy` is Issue 17's `n-of` predicate over a
+role queryset, authored in frontmatter rather than as a directive.
 
-Credentials are claims that one authenticated user makes about another. There is no
-administrator who configures roles. Any authenticated user can attest that any other
-user holds a credential; the weight of that attestation derives from the web of attesters,
-not from a privileged admin account.
+They moved out of this issue because three consumers need them and only one is
+this store: a promotion-accepting store gating admission (here), role conduits
+resolving to actors who may discharge them (Issue 17), and any node carrying a
+`sign_off_policy`.
 
-This is the same model as PGP's web-of-trust applied to professional credentials: "I,
-Alice (Structures Lead), attest that Bob holds the credential `structures-engineer`."
-
-### Credential Attestation Schema
-
-```
-CredentialAttestation {
-    credential_id:   Uuid,         // stable ID for this attestation record
-    attester_id:     AuthorId,     // who is making the claim (JWT subject)
-    subject_id:      AuthorId,     // who the credential is being claimed for
-    credential_type: String,       // e.g. "structures-engineer", "safety-reviewer"
-                                   // free-form string; consuming app defines valid types
-    issued_at:       SystemTime,
-    revoked_at:      Option<SystemTime>,  // null = active; set to revoke
-    note:            Option<String>,      // optional justification
-}
-```
-
-Credential types are free-form strings. The collaboration server does not define
-a fixed set — it stores whatever strings are used. The sign-off policy in the
-document frontmatter defines which types are required; the server checks that the
-presented credential's type matches what the policy requires.
-
-### Sign-Off Policy in Document Frontmatter
-
-The sign-off policy lives in the noet source document's frontmatter (TOML, YAML, or
-JSON block). It is compiled into the rendered page's `data-signoff-policy` attribute
-on the node's DOM element, where `noet-collab.js` reads it.
-
-Example frontmatter policy:
-
-```toml
-[sign_off_policy]
-required = [
-    { credential = "structures-engineer", count = 1 },
-    { credential = "safety-reviewer",     count = 1 },
-]
-# Optional: require attesters themselves to hold a meta-credential
-# attester_credential = "team-lead"
-```
-
-The policy says: this node requires at least one sign-off from someone holding
-`structures-engineer` AND at least one from someone holding `safety-reviewer`.
-Neither requirement names a specific individual — only a credential type.
-
-### Validation Flow at Sign-Off Time
-
-```
-1. Signer POSTs a SignOff attestation including:
-   - their JWT (identifies author_id)
-   - presented_credential_id: the CredentialAttestation UUID they are signing with
-
-2. Server validates:
-   a. JWT is valid → author_id extracted
-   b. CredentialAttestation[presented_credential_id] exists, is not revoked,
-      and subject_id == author_id  (signer can only present their own credentials)
-   c. policy (from request body) requires a credential of type
-      CredentialAttestation[presented_credential_id].credential_type
-   d. If all pass: record attestation with policy_satisfied = true
-      If (c) fails: record attestation with policy_satisfied = false
-      (the sign-off is still recorded; it just doesn't count toward policy)
-
-3. GET /sign-offs/summary computes policy_status by counting distinct
-   credential_type buckets that have at least `count` policy_satisfied sign-offs
-   at the current asset_version.
-```
-
-### Trust and Sybil Resistance
-
-The system does not prevent a single user from attesting credentials for all of their
-colleagues. Trust in the credential graph is a social and organizational concern, not
-a technical one. For QMS contexts, the expectation is that credential attestations are
-traceable — every credential record shows who vouched for whom — so organizational
-review processes can audit the web of trust.
-
-For stronger Sybil resistance in later phases, Keyhive's capability model can gate
-who is permitted to issue credentials of a given type (e.g. only existing
-`team-lead`-credentialed users can attest `team-lead` credentials). This is a Phase 2
-concern; the schema supports it without changes.
-
----
+What remains this issue's: **being the first store that gates on a policy.**
+That is a push-rule question — may this record cross into this store? — and the
+predicate it consults is Issue 112's. Gate movement, not storage: a record whose
+credential does not satisfy a policy is still written and still readable
+(Issue 105 §Promotion reads the fold).
 
 ## Backend Analytics (Internal Operator Tooling)
 
@@ -487,7 +428,7 @@ at the current version. High latency indicates a queue, a capacity constraint,
 or unclear ownership at that boundary. In a well-organized team, latency is low
 and spikes are traceable to specific external events.
 
-**Yield rate by protocol** — for each `protocol_id`, the fraction of
+**Yield rate by protocol** — for each check-bearing `record_kind`, the fraction of
 `IndependenceCheck` attestations that return `result = fail` over a rolling
 window. Near-zero yield over an extended period is evidence the protocol is not
 calibrated to catch real problems. High yield is evidence of a real quality

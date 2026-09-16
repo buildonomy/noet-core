@@ -1265,8 +1265,9 @@ impl DocumentCompiler {
                         // merge-key/absorption handling as parse_all's
                         // EpochDrain path — including reparse-bid tracking
                         // for citing documents that raced an absorption
-                        // within this batch. See
-                        // `.scratchpad/url_alias_resolution_gap.md` part (C).
+                        // within this batch. See commit `5f31d75`
+                        // ("fix(codec): resolve url-alias citations to
+                        // claimants, not absorbed stubs") defect (C).
                         let reparse_bids = crate::beliefbase::accumulator::apply_absorbing_batch(
                             &mut batch,
                             global_bb,

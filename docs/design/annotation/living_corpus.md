@@ -136,25 +136,32 @@ layer's live projection is a held-out BeliefBase — in essence a diff applied t
 its root corpus context.** Fold the records, project them (§4), and apply the
 resulting `BeliefEvent`s into a graph held *separately from* the compiled one.
 
-> **The projection's concrete form is specified in
-> [`overlay_model.md`](./overlay_model.md), which is authoritative for it.**
-> Briefly: it is not literally a `BeliefGraph`. `BeliefGraph::union_mut`
-> (`src/beliefbase/graph.rs:706-714`) replaces nodes wholesale, so an overlay
-> holding only *observations about* a node would erase that node's other content.
-> The recommendation is a read-through wrapper implementing `BeliefSource` —
-> BeliefBase-*like* rather than a BeliefBase. **Issue 110 step 1 ratifies it**,
-> at which point this section's wording narrows to match. The layer model here is
-> unaffected either way.
+> **[`overlay_model.md`](./overlay_model.md) §2 is authoritative for the
+> projection's concrete form.** In one sentence: **an annotation does not modify
+> the nodes it concerns — it is a node that owns edges into them**, the
+> third-party ownership `{maps_to}` already uses. That is what makes the overlay
+> compose without a merge, and §2 gives the mechanism, the rejected alternatives,
+> and the `union_mut` constraint behind it.
 
 Reading the corpus with annotations live is reading the compiled graph with that
 overlay continuously merged on top; reading it without is dropping the overlay.
 Nothing is written into the compiled graph to make the first true, and nothing
 is undone to make the second.
 
-**Diff is therefore the annotation layer's native operation, not machinery
-borrowed for it.** Comparing "corpus" against "corpus + overlay" *is* reading the
-overlay. Issue 74's `Diff` render mode is the surface; §11 develops the case that
-forces it.
+**Projection, then diff — both, in that order.** These are two operations at two
+layers, not rival framings of one. Projection is **additive and universal**:
+folding records and projecting them sprinkles context onto the corpus graph, and
+nothing is removed or rewritten. A **redline** goes a layer further — its payload
+carries proposed content which parses into a *candidate graph*
+(`identity/generational_archive.md` §6.1), and comparing that against the base is
+where mutations and removals of nodes *and* edges appear. Reading an annotated
+corpus exercises only the projection; rendering a change package exercises
+fold → project → parse → diff.
+
+**Comparison is therefore native to the annotation layer, not machinery borrowed
+for it.** Reading the overlay is comparing "corpus" against "corpus + overlay",
+and the delta is the halo. Issue 74's `Diff` render mode is the surface for both
+depths; Issue 74 owns what the redline case demands of it.
 
 **This is §3's pattern, not an exception to it.** Sidecar records are the durable
 store, the held-out graph is the live projection, and the fold is the rebuild —
@@ -181,7 +188,7 @@ Every layer is a **durable store plus a live projection**:
 
 | Layer | Durable store | Live projection | Rebuild operation |
 |---|---|---|---|
-| 1 | source files | — | — |
+| 1 | source files | text editor | — |
 | 2 | shards | in-memory graph | hydrate |
 | 3 | sidecar records | derived state | fold |
 
@@ -234,7 +241,7 @@ projection. `BeliefEvent` also carries removal, rename, and ordering
 (`PathUpdate` takes an order vector), so an annotation kind that repositions or
 supersedes content projects into those. The general form is a **diff**: fold the
 records, compare the result against the compiled corpus, emit the difference.
-See §11 (greenfield authoring) for the case that requires it.
+Authoring new content is the case that requires it — see §5.
 
 The consequence: **consumers that only care about graph state never see an
 `Annotation`.** They subscribe downstream of the projection. Only consumers
@@ -246,13 +253,34 @@ This is why annotations are not variants of `BeliefEvent`. Every existing
 Merging them would force every `match` in the apply path to carry arms for events
 it cannot apply.
 
+### How records are issued
+
+A record enters the system through the **annotation channel**
+([`annotation_channel.md`](./annotation_channel.md)): a producer opens a handle
+with an `ActorId`, calls `emit` with a typed payload and an anchor, receives the
+`EventId` the handle minted, and closes. The producer never sees the store. The
+parse pipeline, a browser session, and an MCP agent are three clients of one
+API, differing only in actor and sink.
+
+The layer this document describes can therefore be read end to end as **a system
+for issuing, moving, and semantically enhancing log-type records**: the channel
+issues them, the stores hold and move them (§6, `collector_model.md`), and the
+fold and the anchor make them stateful. Which compiler observations become
+records — rather than staying node `metadata` or going out as plain
+diagnostics — is the producer's choice of lane, decided per observation
+(`annotation_channel.md` §3, §7).
+
 ### Anchoring
 
-An annotation names what it is about with `(bid, version)`, where `version` is a
-content hash — not a build identifier. Editing one node does not stale
-annotations on another.
+An annotation names what it is about with `(target, target_version)`, where
+`target_version` is a content hash — not a build identifier. Editing one node
+does not stale annotations on another.
 
-**`protocol_id` selects the staleness semantics, not just the schema.** An
+In the common case the target is a single node and the version is its content
+hash. The general form is broader, because a target can be a *scope* rather than
+a node; the rest of this section builds up to it.
+
+**`record_kind` selects the staleness semantics, not just the schema.** An
 annotation asserts about a *scope*, and different kinds legitimately assert about
 different ones — so a node carries a family of hashes rather than a single
 version, and the record kind picks which one it anchors to:
@@ -270,11 +298,14 @@ is the one that makes this necessary rather than elegant: a requirement's own
 text can be untouched while the evidence supporting it has moved, and only an
 Epistemic-scoped anchor detects that.
 
-Underneath, a scope is a **query**: an anchor is `(QuerySpec, tape_hash)` — the
-query defining what was looked at, paired with a hash over what it returned. The
-named hashes above are the precomputed cache of the common scopes; a filtered
-scope ("I reviewed all Class-A items under §3") is an ordinary query with no
-cached field.
+Underneath, a scope is a **query**, and that is the general form the opening
+paragraph pointed at: an anchor is `(QuerySpec, tape_hash)` — the query defining
+what was looked at, paired with a hash over what it returned. `target` is the
+query; `target_version` is the tape hash. A single node is the degenerate case,
+where the query selects one node and the hash is its `content_hash`. The named
+hashes above are the precomputed cache of the common scopes; a filtered scope
+("I reviewed all Class-A items under §3") is an ordinary query with no cached
+field.
 
 Specified in [`content_versioning.md`](../identity/content_versioning.md), which is
 authoritative; this table is orientation.
@@ -294,42 +325,50 @@ current state is the fold over that chain — §3's pattern applied to Layer 3.
 ```
   record: open        record: assign      record: close
      │                     │  causes ┐        │  causes ┐
-     └────────────────────┘────────┘──────────┘────────┘
+     └─────────────────────┘─────────┘────────┘─────────┘
                             fold → state: closed
 ```
 
-A fold needs a **transition function**, and that is what is currently
-unspecified. Today "open/closed" is hardcoded per directive, which does not
-survive contact with the next requirement.
+A fold needs a **transition function**. Hardcoding "open/closed" per directive
+does not survive contact with the next requirement, so the function is declared
+rather than compiled in — Issue 104 registers it per kind.
 
 **The state machine is a procedure, referenced by the protocol registry.**
-`attestation_fabric.md` §6 resolves a `protocol_id` to a check specification, a
+`attestation_fabric.md` §6 resolves a `record_kind` to a check specification, a
 node schema, and a `graph_roles` block declaring which edges a record of that
-kind emits. For the lifecycle it carries a **`NodeVersionRef` pointing at a
-`.procedure` document** — *not* an embedded `[protocol.states]` block.
+kind emits. For the lifecycle it carries a **`NodeVersionRef` pointing at an
+authored lifecycle document** — *not* an embedded `[protocol.states]` block.
 
-That is deliberate, and §6 is authoritative for it. A `.procedure` document
-already declares ordered steps with types (`sequence`, `any_of`, `all_of`,
-`parallel`) which *are* transition semantics (Issue 17). Embedding a second
-state-machine grammar in registry entries would give one concept two schemas,
-two parsers, and two ways to drift. Referencing one instead means the lifecycle
-is a first-class graph node — versionable, reviewable, and annotatable like any
-other content, which an inline TOML block could never be.
+That is deliberate, and §6 is authoritative for it. A lifecycle document declares
+steps whose **exit predicates and outcomes** *are* the transition semantics
+(Issue 17). Embedding a second state-machine grammar in registry entries would
+give one concept two schemas, two parsers, and two ways to drift. Referencing one
+instead means the lifecycle is a first-class graph node — versionable,
+reviewable, and annotatable like any other content, which an inline TOML block
+could never be.
 
 That is also what makes **custom annotation kinds** tractable. The
 `local:<team>:<name>:<ver>` namespace of §6.2 already anticipates team-defined
 protocols that are valid but not portable; a team defines a review workflow — say
-`local:safety:hazard-review:v1`, a `.procedure` document with steps
+`local:safety:hazard-review:v1`, a markdown document whose steps run
 `draft → peer-reviewed → board-approved` — and points a registry entry at it. No
-code change, and the definition travels with the corpus. Where custom definitions
-*live* — source, the sidecar, or both — is unresolved; see §11.
+code change, and the definition travels with the corpus.
 
-> **Open, and it is Issue 17's Risk 1.** The step-type grammar nests
-> (`type = "sequence"`, `steps = [...]`), which is a *tree* — and a tree has no
-> back-edge. A rejection path returning to `draft` is a cycle, so the example
-> above is not yet expressible. Issue 17 step 2 designs the transition construct;
-> the constraint is that it must not become the second grammar this design
-> avoided.
+**Where such a document lives is the corpus author's decision, not this
+architecture's.** A lifecycle document is an ordinary markdown document carrying
+`{exit}` and `{outcome}` directives (Issue 17), so it sits wherever the project
+puts its documents and is reached by the same `NodeVersionRef` from anywhere. The
+same holds for a template annotation: whether it is authored as a `{maps_to}`-style
+directive, implied by a frontmatter `sign_off_policy`, or generated from a schema,
+all three routes produce the same graph structure, and nothing downstream can tell
+which was used. Keeping the registry entry a reference rather than an inline block
+is what buys that indifference.
+
+> **A rejection path is an outcome that clears marks.** Step state is a marking,
+> not a position: an outcome of `rejected` on the review step clears the marks of
+> the draft steps, so `peer-reviewed → draft` needs no back-edge and no
+> transition construct. A repeated cycle produces an identical marking, so the
+> state space stays bounded by the document. Issue 17 owns the grammar.
 
 **There are two state mechanisms, not one.** A `{todo}` closing and a sign-off
 going `stale` are both transitions, but they differ in what drives them:
@@ -346,9 +385,10 @@ unordered append-only log nothing groups them — two concurrent executions of t
 same procedure on the same node would interleave indistinguishably. The mechanism
 is a `RunStart`/`RunEnd` bracket carrying a `run_id` that the fold partitions on,
 with the `RunStart` citing the procedure template whose states and transitions
-govern it. A `RunStart` may also cite a parent `run_id`, so runs nest — a
-sub-effort spawned from an in-progress one, with the parent link projecting as an
-Epistemic edge. **Issue 109 owns this**; do not force staleness through the
+govern it. A `RunStart` may also cite an enclosing `run_id` via its
+`enclosing_run` field, so runs nest — a sub-effort spawned from an in-progress one, with that
+link projecting as a Section edge toward the enclosing run: containment, not
+citation (§5). **Issue 105 owns this**; do not force staleness through the
 bracket.
 
 Two constraints hold regardless:
@@ -361,7 +401,12 @@ Two constraints hold regardless:
 - **A transition the state machine forbids is a diagnostic, not a rejected
   write.** The store is append-only and its merge is set union; refusing a write
   would break both. An illegal transition is surfaced by `check_consistency`, in
-  the same register as a broken evidence citation.
+  the same register as a broken evidence citation. It is judged after a merge the
+  writer could not see, which is why it cannot be an admission decision — but it
+  is not toothless either: whether a run's transitions were legal is a fold
+  output, so a promotion predicate can require consistency before a record
+  crosses a store boundary. **Gate movement, not storage** (Issue 105
+  §Promotion reads the fold).
 
 ---
 
@@ -374,14 +419,14 @@ what *is* a Pragmatic edge, in a representation that is inert?
 "a test engineer exercising a test procedure, a CPU executing a binary … each is
 `P` acting on `S`." It also says what `P` is *not*: "the written procedure, the
 source code, the test plan — these are not `P`. They are structural content whose
-subject is execution: `S(P)`." And its footnote closes the loop:
+subject is execution: $S_P$." And its footnote closes the loop:
 
-> We never observe `P` directly — we observe `S(P)` (structural descriptions of
+> We never observe `P` directly — we observe $S_P$ (structural descriptions of
 > execution) and `R` (the effects of execution). **`P` itself is the gap between
 > the two.**
 
 A compiled graph is inert. It therefore cannot contain `P`. What a Pragmatic edge
-holds is `S(P)`: a **declared conduit** along which an actor is expected to act.
+holds is $S_P$: a **declared conduit** along which an actor is expected to act.
 The actor acting is `P`, which happens outside the graph. The annotation the actor
 emits is the `R` proving it happened.
 
@@ -396,8 +441,34 @@ points for expected observer/actor operations.
 
 | State | Shape | Meaning |
 |---|---|---|
-| Potentialized | Pragmatic edge, no actor bound | "an actor of this kind is expected to act here" |
-| Actualized | annotation record citing that edge | "this actor did act, and here is what resulted" |
+| Potentialized | a **node** declaring an expected act — no edge, nothing to sink | "an actor of this kind is expected to act here" |
+| Actualized | a Pragmatic edge from that node to a run | "this actor did act, and here is what resulted" |
+
+The asymmetry is deliberate. A declaration cannot be an edge because it has no
+second endpoint — the run it anticipates does not exist yet. It is a surface the
+corpus can be queried against: *what kinds of run does this corpus know how to
+start, and which of them has anything started?*
+
+**Revocation needs no special edge semantics.** A revoking record is an ordinary
+record citing the act it withdraws, so the log holds the whole sequence and the
+fold decides what the projection shows. Whether a promoted summary carries the
+withdrawn act or only the net outcome is a **promotion configuration** — the log
+keeps the journey, the summary states what is (`ISSUE_105` §Promotion reads the
+fold) — not a property of the edge or of the conduit.
+
+**A conduit may name a role rather than an actor**, and several actors can
+discharge it. "2 of 3 reviewers" needs no conduit-level state machine: it is
+`{exit} n-of :count: 2` over a queryset resolving the role — Issue 17's existing
+combinator applied to actors instead of steps. That is the same primitive Issue
+17 factors out for inputs, **coverage of a declared set by a discharged set**, in
+its agential tense: the declared set is the role ($S_P$, no actor bound), the
+discharged set is the actors who emitted runs ($R$), and the exit predicate is
+the comparison.
+
+So the two tenses hold throughout: a **procedure cites a role**, a **record cites
+an actor**. A record may also cite another *actor* to bring them into the run's
+scope — the agential counterpart of citing an input, and Pragmatic for the same
+reason, where an evidence citation is Epistemic (Issue 17 §Combinators).
 
 Several features already in flight turn out to be this same object:
 
@@ -406,22 +477,31 @@ Several features already in flight turn out to be this same object:
 - A **sign-off policy** in frontmatter (Issue 65) declares which credentialed
   actors are expected to act on a node: a potentialized annotation with a type
   constraint on the actor.
-- A **procedure** (Issue 17) is a potentialized annotation with steps — `S(P)`
+- A **procedure** (Issue 17) is a potentialized annotation with steps — $S_P$
   awaiting a `P`.
 
 ### The mechanism already exists: owned edges
 
-A potentialized annotation is a **node owning a `template_annotation → target`
-edge** — a third party declaring that an act is expected on some node, without
-being either the actor or the target. That is what `{maps_to}` already does.
-`mapping_node_architecture.md` §1: "the `{maps_to}` directive lets any section or
-document node own directed edges between two other nodes **without being either
-endpoint**. The owning node is a third-party observer." Ownership is carried by
-`WEIGHT_OWNED_BY` on the edge (`src/properties.rs:626`), whose value is the bref
-of the owning node.
+A declaration has two parts, and only one of them is an edge.
 
-So the conduit needs no new primitive, and inherits three properties that would
-otherwise need designing:
+**The declaration itself is a node** — a template annotation carrying
+`record_kind` and actor constraints. It has no run to point at, so nothing about
+the *expected act* is edge-shaped.
+
+**What it may additionally own is scope**: a `template_annotation → target` edge
+naming which nodes the act is expected *on*. That part is third-party ownership
+in the `{maps_to}` sense — `mapping_node_architecture.md` §1: "the `{maps_to}`
+directive lets any section or document node own directed edges between two other
+nodes **without being either endpoint**. The owning node is a third-party
+observer." Ownership is carried by `WEIGHT_OWNED_BY` (`src/properties.rs:626`).
+
+The distinction matters because the two answer different questions. The node
+answers *what kind of act is expected*; the scope edges answer *on what*. A
+template with no scope edges is still a valid declaration — a run kind the corpus
+knows how to start, awaiting an anchor supplied at `RunStart`.
+
+So the conduit needs no new primitive, and the scope half inherits three
+properties that would otherwise need designing:
 
 - **Authoring** — a fenced MyST block with a TOML body, the pattern authors
   already use for traceability.
@@ -429,13 +509,16 @@ otherwise need designing:
   (`mapping_node_architecture.md` §1). Delete the declaration and the conduits go
   with it. A potentialized annotation is therefore never orphaned.
 - **Query** — `get_maps_to_traceability` already walks owner → sink → sources.
-  "Which conduits has this plan declared, and which are actualized?" is the
-  existing traceability query with annotations as the coverage set.
+  "Which nodes has this plan declared an act on, and which have one?" is the
+  existing traceability query with annotations as the coverage set. The
+  complementary question — *which declared run kinds has nothing started* — is a
+  node-level absence over templates, not an edge complement.
 
-**Why a template rather than a bare edge.** The conduit must say more than "an
-act is expected here" — it must say *what kind*, so the gap query can distinguish
-an unreviewed node from an untested one, and so an actor can tell whether their
-credential applies. A template annotation is a record with `protocol_id` and
+**What the template node carries.** A declaration must say more than "an act is
+expected here" — it must say *what kind*, so the gap query can distinguish an
+unreviewed node from an untested one, and so an actor can tell whether their
+credential applies. That payload is the second reason a declaration is a node:
+an edge has nowhere to put it. A template annotation is a record with `record_kind` and
 actor constraints bound, but `actor`, `observed_at`, and `result` absent — the
 same record schema as an actualized annotation, minus what only execution can
 supply. Actualization fills the holes.
@@ -467,22 +550,24 @@ graph TB
     ACT -.->|traverses| CON
     ACT -->|emits| REC
     REC -->|"Pragmatic — actualizes"| TGT
-    REC -->|"Epistemic — draws from"| EVD
+    EVD -->|"Epistemic — the record draws from it"| REC
 ```
 
 The dotted arrow is the one thing the graph can never contain. `P` is "the gap
-between" `S(P)` and `R`: the conduit is the structural description, the record is
+between" $S_P$ and `R`: the conduit is the structural description, the record is
 the effect, and the act itself is unobservable — not merely stored elsewhere, but
 inaccessible in principle. No amount of instrumentation recovers it; the moment an
 act is recorded it has become `R`.
 
-**Gap analysis falls out as a plain graph query.** Both endpoints are
-graph-resident: the conduit arrives by parsing source, the actualization by the
-record → `BeliefEvent` projection (§4), which `noet serve` performs once and all
-consumers read downstream of. "Which conduits have no actualization?" is therefore
-the ordinary complement operation over Pragmatic edges that
-`attestation_fabric.md` §12.1 describes for coverage — no joining of two data
-sources at query time, no special-casing in the query layer. A corpus states not
+**Gap analysis falls out as a plain graph query.** Both sides are
+graph-resident: the declaration arrives by parsing source, the actualization by
+the record → `BeliefEvent` projection (§4), which `noet serve` performs once and
+all consumers read downstream of. The question takes two forms and both are
+ordinary. *Which declared run kinds has nothing started?* is a **node-level
+absence** — templates with no incident actualization edge. *Which declared
+targets have no act on them?* is the **edge complement** `attestation_fabric.md`
+§12.1 describes for coverage. Neither joins two data sources at query time, and
+neither needs special-casing in the query layer. A corpus states not
 only what it contains but what work it expects, and the difference is computable.
 
 The projection is what buys this. Without it, every consumer would mux records
@@ -496,37 +581,208 @@ throughout* — it is, after all, the actualization of a Pragmatic conduit. That
 nearly right, and the exception is exact: getting it wrong breaks the per-kind
 acyclicity invariant the stratified hashing depends on.
 
-An annotation emits edges of **two** kinds, and which is which follows from what
-each edge asserts:
+An annotation emits edges of **all three** kinds, and which is which follows
+from what each edge asserts. The run node the fold projects
+(`ISSUE_105` §Project) is the source of every one of them:
+
+Direction is not uniform, and the split is the point. A run **reaches into** the
+nodes it concerns — it injects context those nodes did not carry, so the run is
+the *source* there, which is `overlay_model.md` §2's self-owned mode and the
+shipped semantics. A run is **conditioned by** everything it derives from — its
+actor, its template, the records it cites — so it is the *sink* of those. And a
+nested run is a *part of* its enclosing run, which follows the ordinary Section
+convention that the contained node is the source.
 
 | Edge | Kind | Why |
 |---|---|---|
-| annotation → the node it acts on | **Pragmatic** | actualizes a declared conduit; "this act covers that node" |
-| annotation → the record node it cites | **Epistemic** | "this claim draws from that evidence" — provenance, not action |
-| annotation → a prior annotation (`caused_by`) | **Epistemic** | a close, revoke, or redline reasons *from* the record it supersedes |
+| actor → run | **Pragmatic** | the actor *performed* this run; delete the actor and the run is unattributable |
+| run → the nodes its anchor selected | **Epistemic** | the claim *draws from* the set the `QuerySpec` returned, and reaches into each member — self-owned, `WEIGHT_OWNED_BY = "source"` |
+| the procedure it follows → run | **Pragmatic** | the run is *executing* that template — delete the template and the run is meaningless; the conduit the `RunStart` actualizes |
+| nested run → the run enclosing it (`enclosing_run`) | **Section** | containment, not citation — the contained node is the source, as with `composed_of` |
+| a prior record (`caused_by`) → run | **Epistemic** by default | a close, revoke, or reply reasons *from* what it cites, and cannot stand without it |
+| a cited record node → run | **Epistemic** | "this claim draws from that evidence" — provenance |
 
-The split is not a compromise. Acting on a node and drawing from evidence are
-different assertions, and `attestation_fabric.md` §12.3 already assigns them this
-way. Collapsing both into Pragmatic would put provenance chains — DAGs of
-arbitrary depth — into the same subgraph as coverage claims, and would mean a
-redline citing an as-run citing a template forms a Pragmatic chain competing with
-genuine coverage semantics.
+**Why the anchor edge points the other way from the rest.** Deleting a node the
+annotation concerns does orphan the claim — but that is the *anchor*
+(`(QuerySpec, tape_hash)`), which needs no edge to express. The edge expresses
+something else: an annotation **adds context a node did not have**. A receipt does
+not make a section what it is; it adds "someone read this" to what the section
+already carries. That is additive, where a template is constitutive of the run
+executing it. The closure hashes depend on this orientation — a node's Epistemic
+closure must pick up annotations about it, which is the constitutive-constraint
+case `content_versioning.md` §5 describes.
 
-So: **annotations are Pragmatic in what they act on, Epistemic in what they draw
-from.** The conduit model sharpens the first half; it does not merge the two.
+**The actor is a graph node.** The edge is
+`(source: actor, sink: run, WEIGHT_OWNED_BY: actor)` — the same orientation as
+every other row, since the actor is what the run proceeded *from*. It also keeps
+a prolific actor out of the way of halo propagation, which fixes at the lowest
+sink and therefore traverses *away from* a source hub rather than into it.
 
-One consequence to check at implementation time: a Pragmatic edge from an
-annotation to its target coexists with the potentialized conduit it actualizes.
-Whether those are the same edge with an actor bound, or two edges (declaration and
-actualization), is an open modelling question — see §11.
+Ownership and endpoint are orthogonal fields, so "the actor owns this edge" and
+"the actor is the source" are one consistent statement rather than two competing
+accounts — `WEIGHT_OWNED_BY` admits source, sink, or a third party
+(`mapping_node_architecture.md` §1).
+
+Without this edge the actor is the one envelope field with no graph
+representation, and "everything this person signed off" is a payload scan rather
+than a traversal — the same argument that makes the anchor a real edge rather
+than a field.
+
+**Actor identity is derived, not minted.** **Issue 105 step 4 owns creating the
+actor node**, alongside the run node it attaches to. An `ActorId` resolves to a
+BID derived from an email address, so the same actor is the same node across corpora with no
+coordination — `identity_derivation.md`'s rule that anything surviving a rebuild
+must be derived. Distributed identity tokens — DIDs and equivalents — are the
+natural later addition; the derivation rule is what makes them a substitution
+rather than a redesign.
+
+**One actor holding several addresses is an attested binding, not a frontmatter
+field.** The `url_aliases` mechanism (`codecs/network_authoring.md` §8) composes
+additively over one node and is the obvious reuse, but it is authored in a
+document: using it on an actor node would let anyone with commit access claim
+another actor's address and inherit their attributed records. An actor's
+identity-bearing fields must derive from the authentication mechanism or be
+signed by it (`ISSUE_112_CREDENTIALS_AND_PROMOTION.md`).
+
+**Fan-out is bounded by promotion, not by the edge.** A prolific actor accumulates
+one edge per run, but most runs stay in local logs that are out of scope for most
+queries (§6). What a query sees is the promoted subset, so the hub is far smaller
+in practice than the record count suggests.
+
+Two things this table gets right that a two-kind split could not.
+
+**The target edge is Epistemic, not Pragmatic.** An annotation's scope is a
+`QuerySpec` evaluated lazily (`content_versioning.md` §4), so what it relates to
+is *the set that query returned* — a claim about what it drew from, not an act
+performed on each member. This matters for the closure hashes: coverage claims
+and provenance stay in different subgraphs, and an annotation over a 200-node
+scope does not manufacture 200 Pragmatic coverage assertions.
+
+**`caused_by`'s kind is a record-kind assertion, not a fixed rule.** The relation
+is one field on the `Envelope`; what it *means* structurally depends on the kind
+of the citing record, and that translation is declared by the kind and applied by
+the fold. A nested run's `enclosing_run` link is Section; a reply's citation is
+Epistemic. `ISSUE_105` §Project is authoritative; Issue 104 registers the
+translation per kind.
+
+**Not every dependency between records is an edge.** An `ask` blocking a redline
+from reaching `packaged` is the clearest case: the ask is a *sub-run* of the
+redline's procedure, so its structural relation is already the Section link its
+`enclosing_run` projects, and the blocking itself is a **fold predicate** — a
+transition
+precondition on the cited run's derived state, evaluated in
+`caused_by`-topological order (`ISSUE_105` §Cross-run guards). Adding a Pragmatic
+edge for it would encode in the graph what the lifecycle already decides, and
+double-count a relation the Section link carries. A "redline" is a record kind's
+payload, not a node; there is nothing for such an edge to point at.
+
+**Where Pragmatic survives is procedure execution.** A run is Pragmatic toward
+the template it follows — that is the conduit being actualized (§5), and it is
+what makes "which declared reviews have happened" a coverage query. The conduit
+model sharpens *that* relation; it never governed the annotation's relation to
+its subject matter.
+
+**A template is not an edge, and the actualization is not the same edge with an
+actor bound.** Two reasons, and the second reframes what a declaration *is*.
+
+The mechanical one: a procedure may be run many times. One edge gaining an actor
+could represent at most one execution, so every subsequent run of the same
+template would have nowhere to land. An actualization is therefore always a new
+edge — `(source: template, sink: run)` — and the declaration is untouched by it.
+
+The structural one: **$S_P$ is not an edge at all.** A template has no `RunStart`
+to sink, because no run has happened; there is nothing for a declaration edge to
+connect. What a procedure declares is a **queryable surface** — the set of run
+kinds this corpus knows how to start. It is a node with steps, discoverable by
+query, and it becomes an edge only when something actualizes it.
+
+This narrows the gap query rather than weakening it. "Which declared reviews have
+happened" is not a complement over edges; it is *templates with no actualizing
+run in the reader's scope*, which is a node-level absence and the same shape as a
+derived `gap` (Issue 104). Neither side needs the declaration to have been an
+edge.
+
+**Authoring new content needs no separate mechanism.** A redline is a map of
+corpus-relative path to content (`identity/generational_archive.md` §6.1), so a
+*new* document is a key not present in the base and a *new section* is content
+written where it goes. Both anchor to `(path, base_corpus_version)`, which every
+redline already carries — a path needs no referent, so it may name a file that
+does not exist yet. A new **network** is the same shape: the path is
+`subnet/index.md`, and the `documents` table (Issue 103 Part C) carries its
+ordering. What a redline cannot create is a **corpus**, since it names paths
+relative to one; Issue 106 could change that if source write-back ever gains a
+root.
+
+This is why there is no draft-specific anchor. A positional triple would answer
+"where does this fragment go?" — a question a file map never asks, because the
+file *is* the position. What remains is a diff-quality problem: proposed content
+that moves a section must render as a move rather than a delete-plus-add, which
+is Issue 74's.
+
+**The scope qualifier is load-bearing, not pedantry.** A generic procedure
+included in several corpora accumulates runs globally, and a reader asking "has
+this been done?" almost never means *anywhere, by anyone*. They mean: in this
+application, for this program, by us. A template with a thousand actualizations
+elsewhere and none here must read as a gap, or the query answers a question
+nobody asked.
+
+**This is constitutive constraint again** (`dag_model.md` §2). A generic
+procedure has no gaps in itself — "is this done?" is not a question its own
+content can answer. The *context* supplies the question: including the template
+in an application corpus is what makes some particular absence count as a gap.
+The template is unchanged by the inclusion; what it *means* is not.
+
+Two things follow that the derivation reading alone would miss. A template's
+`content_hash` is identical in every corpus including it, while its gap status
+differs in each — so gap status is not a property of the node and must never be
+cached onto one. And the same template can be simultaneously discharged in one
+corpus and outstanding in another, with neither answer wrong, because the two
+contexts constrain it differently.
+
+**The halo supplies the mechanism**, and no new one is needed: which records
+layer onto a corpus is exactly which stores a reader listens to
+(`annotation_channel.md` §6). The gap query therefore ranges over the halo, not
+over every record that exists. Two consequences follow, and they are worth
+stating because they are easy to get backwards:
+
+- **The denominator is corpus-scoped; the numerator is halo-scoped.** Templates
+  come from the compiled graph — what *this* corpus declares. Actualizations come
+  from the stores in scope. A shared procedure contributes its declaration to
+  every corpus that includes it, while its runs stay wherever they were emitted.
+- **Widening the halo can only close gaps, never open them.** Adding a store adds
+  actualizations, so the gap set shrinks monotonically. That makes "why is this
+  still a gap?" answerable by naming a store the reader is not listening to,
+  rather than by auditing records.
+
+**A corpus declares a default halo**, because coordination requires one. A team
+has to agree on what counts as its sources of truth before "is this done?" has a
+shared answer; without a corpus-side default, a compliance number is a property
+of whoever ran the query and two readers disagree without either being wrong.
+The default names the stores a reader should listen to for this corpus, and it
+belongs in the annotation manifest (Issue 105) alongside `precedence` and
+`ships`, which travels with the shards and is therefore reviewable — the same
+argument §10 makes for declaring write authority in source rather than in a
+gitignored setting.
+
+**The default does not preclude individual manipulation.** A reader may widen the
+halo to include their own scratch store, or narrow it to check what a subset
+implies; that is the ordinary exploratory case and nothing gates it. What the
+default buys is that the *unmodified* reading is the same for everyone, and that
+a reader who has diverged from it can see that they have. Two details Issue 105
+settles when it builds the manifest: whether a reported figure may be computed
+from a widened halo at all, and how divergence is surfaced — since silently
+computing against a different evidence set is the failure this exists to
+prevent.
 
 ---
 
 ## 6. PII Surfaces
 
-A **PII surface** (Personal Inference Interface) connects a class of executor to
-the corpus. The acronym is deliberately dual — it is also where user identity
-meets what the user is shown.
+A **PII surface** (Personal Inspection Interface) connects a class of actor to
+the corpus: it reads the live projection and writes into Layer 3. Inspection
+names what the actor comes for; every surface below also emits, and one of them
+reaches source (§7). The acronym is deliberately dual — it is also where user
+identity meets what the user is shown.
 
 **This section is authoritative for what a surface reads and writes.**
 `attestation_fabric.md` §13 covers the attestation-service deployment concerns
@@ -540,16 +796,23 @@ same four surfaces, this table governs.
 | MCP | AI agent | graph via structured query | agent actions |
 | CLI | pipeline | graph | CI-emitted records |
 
-All four share one shape: **read the live projection, write into Layer 3.** None
-writes Layer 2 directly — the graph is compiled, not authored. Only the write-back
-path (§7) reaches Layer 1, and it does so through the codec layer, not around it.
+All four share one shape: **read the live projection, write into Layer 3.** The
+viewer row covers the deployed static site as well as a served one: it ships
+WASM, so the fold and the halo query can run client-side against shards with no
+server, and a browser store gives it somewhere to write. Whether that is
+*implemented* is Issue 105 step 5's open constraint; what stands in the way
+is measured in `generational_archive.md` §7 and owned by Issue 103 Part D.
+
+None writes Layer 2 directly — the graph is compiled, not authored. Only the
+write-back path (§7) reaches Layer 1, and it does so through the codec layer, not
+around it.
 
 This framing resolves what an LSP *is* in noet. It is not a compilation feature;
 it is a PII surface that happens to live in an editor — a **shim** translating
 annotations into diagnostics and hover, and editor actions back into records.
 Code actions are annotations and source edits.
 
-**Not every annotation is written down.** A compiler diagnostic is an observation
+**Not every annotation is durable.** A compiler diagnostic is an observation
 about a node by an identified `P`, anchored to a version — an annotation by §2's
 definition — but it is *derived* from the current parse and regenerated on every
 compile. Persisting it would put recomputable data in a store sized for
@@ -558,18 +821,26 @@ inference findings, cursors, and presence.
 
 **This is a scope, not a separate class.** The annotation store already has a
 hierarchy — repo / user / shared (Issue 105) — with union reads and precedence
-governing writes. Ephemeral records occupy an **in-memory scope** below repo:
+governing writes. Ephemeral records occupy a **regenerated scope** below repo:
 the most local one. A diagnostic does not bypass the store; it lives in the
 most-local store and never extends past it.
 
-| Scope | Persists | Typical contents |
+| Scope | Survives a rebuild | Typical contents |
 |---|---|---|
-| **in-memory** | no | diagnostics, inference findings, cursors, presence |
-| repo | yes, per corpus | `{todo}`, `{reviewed}`, redlines |
+| **regenerated** | no — replaced wholesale each parse | diagnostics, inference findings, cursors, presence |
+| repo | yes, per corpus | receipts, redlines, judged gaps |
 | user | yes, per person | cross-corpus annotations |
 | shared | yes, synced | what a team has agreed to publish |
 
-Two mechanisms govern movement, and both are **per-`protocol_id`** properties
+**Regenerated does not mean memory-resident.** These records are routinely
+written to disk — compiler observations ship in the shard export so a browser
+can read them with no server. What distinguishes the scope is not *where* the
+records live but *who owns their lifetime*: the producing actor replaces the
+whole set on its next run, so nothing outside that actor may depend on a
+particular record surviving. A regenerated store on disk is a cache; a repo
+store on disk is a record.
+
+Two mechanisms govern movement, and both are **per-`record_kind`** properties
 rather than special cases:
 
 - **Staleness policy** — what a record does when its anchor version changes.
@@ -580,23 +851,24 @@ rather than special cases:
   stays local until its run closes; then a summary promotes. This is the same
   operation as percolation across a federation boundary
   (`federated_belief_network.md` §1.2), which is why it should be one mechanism.
+  A flush is therefore a **squash**: many constituent records in, one summary
+  out, stating what the run concluded rather than how it got there. Issue 105
+  §Promotion reads the fold gives the contract.
 
-Ephemeral records travel the same route and render through the same surfaces as
-durable ones; the scope decides persistence, not the router. Whether they also
-*project into the graph*, or render only at the surface, is unresolved —
-projecting a diagnostic as a node would put derived data in the compiled graph,
-which §4's assert/mutate boundary argues against. Issue 11 Open Question 0
-carries the decision; Issue 109 is the likely owner of flush semantics, since a
-flush is a form of close.
+Regenerated records travel the same route, project the same way, and render
+through the same surfaces as durable ones; the scope decides how long they
+survive, not whether they participate. **Projection is uniform**: the fold
+turns any run into a node of its own owning edges into its anchor set
+(§5), so nothing derived is ever written *into* a corpus node — which is what
+§4's assert/mutate boundary actually forbids. A diagnostic projects like a
+receipt; it simply does not survive the next parse.
 
-> [!NOTE]
-> **One surface genuinely is a client-side mux: the deployed static site.** There
-> is no server there to run the record → `BeliefEvent` projection, so
-> `noet-collab.js` (Issue 65) fetches records and decorates the rendered DOM
-> against `data-bid` attributes. Same records, same rendering, projection absent.
-> This is why Issue 65 is a *surface* rather than an alternative architecture —
-> and why both paths must render from the same `Annotation` type, or a reader and
-> an author will see different answers to the same question.
+**The boundary is at Layer 1, not at the graph.** Records fold onto the graph
+freely and may carry proposed changes as payload, but nothing folds arbitrarily
+back into *source*. That path is Issue 106 — a deliberate tool, gated on declared
+write authority per network and per codec, and in the common case still requiring
+an actor to carry the change to whoever owns the target (§7). Flush semantics are
+Issue 105's, since a flush is a form of close.
 
 ---
 
@@ -605,66 +877,103 @@ flush is a form of close.
 ```mermaid
 graph TB
     subgraph L1["Layer 1 — Source · write truth"]
-        FS["content files"]
-        TA["template annotations — declared conduits"]
+        direction LR
+        subgraph FS["content files"]
+            TA["template annotations — declared PII conduits"]
+        end
     end
 
     subgraph L2["Layer 2 — Graph · compiled truth"]
+        direction LR
+        DB["corpus graph — authoritative in session"]
         SH["shards — durable"]
-        DB["live graph — authoritative in session"]
     end
+
+    DS["a fold — the stateful annotation subgraph,<br/>held out from compiled truth"]
+    HO{{"hand-off — the owning process"}}
 
     subgraph L3["Layer 3 — Annotation · asserted truth"]
+        direction LR
+        EV[("R evidence stores — outside noet")]
         SC["records — durable, immutable"]
-        DS["derived state — a fold"]
+        subgraph PII["PII surfaces — every act names an actor"]
+            V["browser, LSP, MCP, CLI, etc."]
+        end
     end
-
-    subgraph PII["PII surfaces — every act names an actor"]
-        V["viewer"]
-        L["LSP"]
-        M["MCP"]
-        C["CLI / CI"]
-    end
-
-    EV[("R evidence stores — outside noet")]
 
     FS -->|parse| DB
-    TA -->|"parse — owned Pragmatic edge"| DB
     SH -.->|hydrate| DB
     DB -->|export| SH
 
-    DB -->|"read — graph, gaps, diagnostics"| PII
-    PII -->|"Event::Annotation — actor bound"| SC
+    DB -->|"read — graph, gaps, diagnostics"| V
+    V -->|"Event::Annotation — actor bound"| SC
 
     SC -.->|fold| DS
-    DS -->|"project — Pragmatic acts on, Epistemic draws from"| DB
-    DS -->|"cite — address, never ingest"| EV
-    DS -->|"redline → write-back"| FS
+    DS -->|"project — annotation relations"| DB
+    SC -->|"cite — address, never ingest"| EV
+    DS -->|"render change package"| HO
+    HO -.->|"enact — the next source version"| FS
 
     style L1 fill:none
     style L2 fill:none
     style L3 fill:none
     style PII fill:none
+    style FS fill:none
 ```
 
-Read clockwise. Source compiles to graph — both its *content* and the *conduits*
-it declares (`TA`, §5), which is the denominator the gap query needs. The graph
-serves the PII surfaces. An actor at a surface emits an `Event::Annotation`.
-Records fold into derived state, which projects back into the graph, cites
-evidence held elsewhere (§8, one-way), and — for records proposing a change —
-promotes into source.
+The diagram is laid out by layer rather than by step: Layer 3 on top, Layer 2 on the
+bottom, and the hand-off and Layer 1 sandwiched between them. That puts the two arrows
+that actually carry the loop on opposite sides — **`read` goes up** from the graph to the
+surfaces, and **`fold` comes back down** from the records to the graph.
 
-Two things the arrows say that a coarser reading would miss.
+Source compiles to graph: both its *content* and the *conduits* it declares. The graph
+serves the PII surfaces. An actor at a surface emits an `Event::Annotation`. Records fold
+into the annotation subgraph, which projects back into the graph, cites evidence held
+elsewhere (§8, one-way), and — for records proposing a change — **renders a change package
+and hands it to whatever process owns the target.**
 
-**The promote arrow is what makes this a loop rather than a pipeline.** Without
-it, annotation terminates in a store and the reader who spotted the error still
-has to go fix it by hand somewhere else. With it, a redline is a proposal that can
-be applied, and the application is itself recorded as an annotation citing the
-redline — so the audit trail survives the change. It runs through codec
-write-back, which does not exist yet; see §10.
+The one node that is not a layer is the hand-off. It sits *between* Layer 3's records and
+Layer 1's source, because that is the gap noet cannot close by itself. `enact` is dotted
+and terminates at the next source version rather than at the file that produced this one —
+the loop does not write back over its own input.
 
-**The dotted arrows are rebuilds**, not steady-state flow: hydration and folding
-happen at startup and after invalidation, not per query.
+Three things the arrows say that a coarser reading would miss.
+
+**The loop closes at a hand-off, not at a write.** A redline is a claim about a
+*future* state of a document, and the authority to enact it belongs to that
+document's owner — which is usually not noet and often not the redline's author.
+So what closes the loop is a **rendered change package** delivered in the form
+the owning process consumes: proposed text, rationale, the requirement driving
+it, and the impact set. The redline then closes with a link to the submission.
+
+Promotion is therefore **one operation with a variable boundary cost**, not two
+different operations. What varies is who owns the target:
+
+| Target | Owner | Promotion is |
+|---|---|---|
+| a matrix the analyst maintains | the analyst | a commit |
+| a controlled procedure | a document-control process | a change request with named approvers |
+| a design doc in another team's repo | that team | a contribution path, which may not exist |
+| an upstream requirement | the requirements owner | a comment and a negotiation |
+
+**Codec write-back is the special case where that boundary happens to be free.**
+It is a genuine capability and worth having — it is how the analyst's own commit
+gets automated — but it is an *exit*, not the definition of closure, and it is
+the exit fewest real targets qualify for. It is also **not** a property noet can
+assert about every corpus it reads: read access does not imply write authority,
+so enactment is opt-in per network and per codec (§10).
+
+**An unenactable redline is not a failure state.** When no automated path
+exists, the redline still reaches `packaged` — the package is the deliverable,
+and a human carries it across. This is the same shape as an `ask`, whose target
+is a person or process rather than a node: both are records whose completion
+depends on an actor noet does not control. Modelling the hand-off explicitly is
+what lets the state machine represent "done, awaiting someone else" rather than
+stalling.
+
+**The dotted arrows are rebuilds or conditional**, not steady-state flow:
+hydration and folding happen at startup and after invalidation, not per query,
+and enactment runs only where authority has been configured.
 
 ---
 
@@ -752,11 +1061,12 @@ issues are listed only where nothing exists yet.
 | Element | Status |
 |---|---|
 | record + envelope schema | decided — `beliefbase_architecture.md` §4.3; unimplemented |
+| annotation channel (`open`/`emit`/`close`, two lanes) | **Issue 110** — `annotation_channel.md` |
 | sidecar store, scope precedence | **Issue 105** |
-| annotation vocabulary (`{todo}`, `{note}`, `{reviewed}`) | **Issue 104** |
+| annotation vocabulary (`receipt`, `gap`, `redline`, `ask`) | **Issue 104** |
 | procedure codec + `steps` schema (the template side) | **Issue 17** |
-| procedural annotation subtypes (incl. redline) | **Issue 17** step 2a |
-| run bracketing (`RunStart`/`RunEnd`, `run_id`, nesting, folding) | **Issue 109** |
+| `redline` / `ask` field sets, derived from real records | **Issue 17** step 2a — evidence for Issue 104 |
+| run bracketing (`RunStart`/`RunEnd`, `run_id`, nesting, folding) | **Issue 105** |
 | execution loop over a run — organizing, advancing, checking | **Issue 18** — aspirational stub, undesigned |
 | record → `BeliefEvent` projection | `attestation_fabric.md` §12.3 (spec); **Issue 102** (owner) |
 | multi-user sync peer | **Issue 65** |
@@ -836,101 +1146,43 @@ relations (`{maps_to}`, links) have a textual site that can be edited.
 document position, so changing it means moving text, possibly across files. That
 is document restructuring, not editing, and is deliberately out of scope.
 
-**Issue 107** builds the general capability. Until it lands, the promote arrow is
-aspirational.
+### Write authority is configured, not assumed
+
+Even once the mechanism exists, **the ability to parse a corpus does not confer
+the authority to write to it.** noet reads generated corpora that a pipeline
+overwrites, drafting copies whose controlled originals live elsewhere, and
+repositories the operator can read but not commit to. Writing into any of these
+is wrong by default, and wrong in a way the writer cannot detect locally — the
+edit succeeds and is silently discarded, or succeeds and is unauthorized.
+
+So enactment is **opt-in, declared per network and per codec**:
+
+- **Per network**, because authority is a property of the corpus, not of the
+  session. The declaration belongs in the network node's frontmatter payload,
+  alongside `whitelist` / `blacklist` (`codecs/network_authoring.md`), which
+  makes it **version-controlled and reviewable** — the same reason those live
+  there. A `.noet/` setting would be the wrong home: it is gitignored, so the
+  authority claim would not survive a clone and could not be reviewed.
+- **Per codec**, because round-tripping is a codec capability. A codec that
+  cannot regenerate source faithfully must not be asked to, and
+  `CodecContentMode` already distinguishes text from binary.
+
+This also subsumes the `--write` flag, which asserts the same authority as an
+ephemeral command-line argument: invisible in review, easy to pass by accident,
+and attached to the invocation rather than to the corpus it affects.
+
+**Issue 107** builds the general mechanism; **Issue 106** turns a redline into an
+edit through it. Until they land, enactment is unavailable — but the loop is not
+blocked on them, because closure is the hand-off (§7) and the rendered change
+package is what crosses it.
 
 ---
 
-## 11. What Is Deliberately Not Unified
+## 11. Deliberate Non-Goals
 
-Recorded so future work does not mistake these for oversights.
-
-**Greenfield authoring.** Every annotation anchors to `(bid, version)` (§4), so
-the model as specified assumes the thing being annotated *exists*. Drafting new
-content has neither a BID nor a version to be current against. This is a gap in
-the anchor, not a missing record kind — adding a `noet:draft:v1` alongside the
-others would not address it.
-
-The intended shape, recorded so it is not foreclosed: **anchor a draft to
-`(parent_bid, parent_version, position)`** — a claim about *where content should
-go* rather than about a node. That composes with the conduit model (§5): a
-`{expects}` declaration is a potentialized annotation, and a draft is one kind of
-actualization. It also stales correctly when the parent changes underneath the
-draft. The alternative — minting a BID for a node with no source file — is more
-powerful but inverts the invariant that BIDs come from parsing source, which
-would make a source-less node a genuinely new object class.
-
-A draft's position may **supplant** an existing node's, so the projection must be
-able to reorder, not only add. §4's table lists `NodeUpsert` and
-`RelationUpdate` because those are what today's annotation kinds emit — but
-`BeliefEvent` already carries the rest of the vocabulary:
-`PathUpdate(bref, path, bid, order, origin)` takes an order vector, so reordering
-is an ordinary event. The table is incomplete, not the model.
-
-**The right frame is diff, not projection**, which §2 now states generally: the
-annotation layer's live projection is a held-out BeliefBase, a diff against the
-root corpus context. Folding the annotation queue against the compiled corpus
-produces a *difference between two graph states*, and emitting it as
-`BeliefEvent`s is stream-editing one into the other. Issue 74 supplies the
-machinery and also applies it to two versioned snapshots; here one side is the
-corpus and the other is corpus-plus-queue. Two requirements follow, and they are
-the useful decomposition:
-
-1. **An arbitrary difference between corpus state and sidecar state must be
-   representable.** This is a completeness question about `BeliefEvent`: can
-   every reachable state delta be expressed? Additions, removals, reorderings,
-   and renames each have a variant; whether the set is *complete* for this
-   purpose has not been checked.
-2. **The difference should be generated as the most semantically meaningful queue
-   of primitive operations.** Not merely a correct edit script but the one that
-   reads as what the author meant — "moved this section" rather than "removed
-   here, added there." This is the classic diff-quality problem, and it is where
-   the work is.
-
-Issue 74 already establishes the machinery: a `ContentHash` `NodeFilter` as a
-score annotator, with added/removed/changed/unchanged falling out of
-`Difference` and `And` compositions over the existing query algebra — "no new
-projection primitive, no custom diff engine." A draft queue is another pair of
-graph states to run that against, and the `Diff` render mode is already the
-surface for showing it.
-
-This also settles the PII-overlay-versus-projection question that looked open: it
-is both, and they are the same computation. The overlay is the diff rendered; the
-commit is the diff emitted as events. Nothing needs to be decided about which,
-only about when the events are applied.
-
-The editing-buffer properties come for free if this is built: records are
-immutable and append-only, so rollback is dropping records rather than undoing
-edits; the fold gives buffer state; and the G-Set merge means concurrent drafting
-needs no conflict resolution.
-
-**Writing back to non-source substrates.** §7's promote arrow targets Layer 1
-source files, via a codec (Issue 107). A corpus that ingests from heterogeneous
-systems could in principle stage a batch of changes as annotations and commit it
-outward to *several* substrates — source, an issue tracker, a spreadsheet — with
-the annotation store as the staging layer.
-
-This is the read direction of external ingestion reversed, and it is plausible
-rather than planned. `SourceSink` (Issue 107) is one instance of the shape: a
-sink accepting `BeliefEvent`s and producing a substrate edit. A tracker sink
-would be the same trait against a different substrate, which is the mirror of
-what `RecordSource` (§8) does for reads. Getting there needs external ingestion
-to move from a batch tool into bidirectional codecs, which is a larger
-restructuring than this document scopes. Recorded so that `SourceSink` is not
-designed in a way that forecloses it — not as a commitment to build it.
-
-**Cross-kind dependency closures.** "Did anything upstream of me change, along
-any edge?" is not answerable by traversal. `BeliefBase` invariant 0
-(`src/beliefbase/base.rs:237`) guarantees acyclicity *per `WeightKind`*, not
-across their union — a cycle alternating kinds is legal. The question is
-answerable by *composing* the per-kind hashes, not by walking the union. See
-`content_versioning.md`.
-
-**Staleness propagation along Epistemic edges.** A node's content hash cannot see
-its incoming edges: a requirement that gains a `{maps_to}` claim has unchanged
-content but changed meaning. Propagating staleness is a policy question — which
-edge kinds, how far, which direction — and needs real annotation data before the
-policy can be chosen. Guessing risks rebuilding an always-fires signal.
+Work this architecture does not do. These need no owner because there is nothing
+to resolve — unlike the calibration questions each issue carries, which belong
+with the issue that will answer them rather than here.
 
 **Character-level concurrent editing.** Two people typing in the same document is
 a genuinely different problem from annotation merge, and it collides with source
@@ -944,42 +1196,12 @@ see §8. Materializing evidence into the graph stays out of scope.
 
 **Structural mutation via write-back.** See §10.
 
-**Declaration versus actualization as graph structure.** §5 establishes that a
-Pragmatic edge is a potentialized annotation and an annotation record actualizes
-it. It does *not* settle whether those are one edge that gains an actor or two
-edges (the conduit, and the act traversing it). One edge is simpler and keeps
-coverage queries unchanged; two preserves the declaration when an act is revoked,
-and lets several actors traverse one conduit — which a multi-signature sign-off
-policy requires. Two edges is the likely answer, but it should be settled against
-a real sign-off policy rather than in the abstract.
-
-The owned-edge framing sharpens this: the conduit is owned by the *declaring*
-node, while an actualization is owned by — or at least attributed to — the
-*actor*. Two edges with different owners is the shape that falls out naturally,
-since `WEIGHT_OWNED_BY` holds exactly one bref.
-
-**Where template annotations are declared.** Source-authored `{maps_to}`-style
-directives are the obvious mechanism, but a template could equally be emitted by a
-policy (a frontmatter `sign_off_policy` implies conduits without anyone writing
-them) or generated from a schema. These should produce the same graph structure
-by whatever route; whether the directive is the only authoring surface, or one of
-several, is unsettled.
-
-**Where annotation-kind definitions live.** §4 argues a protocol's state machine
-belongs in the registry, but not where a *custom* registry entry is stored.
-Source (normative, version-controlled, matching the template/record split of §5)
-versus the sidecar (travels with the annotations, available to a team without
-commit access) pull in opposite directions, and Issue 105's three-scope precedence
-is the same tension already surfaced once. Likely resolution: definitions resolve
-through the same scope chain as records, so a corpus-owned definition can be
-overridden or extended locally — but the precedence semantics need care, because
-unlike records (union) a definition genuinely is an override.
-
-**Whether a conduit itself has states.** A declared conduit is currently binary:
-actualized or not. A multi-signature sign-off policy needs "2 of 3 satisfied",
-which is a conduit-level state distinct from any individual record's state. This
-may be derivable by folding the actualizing records, or may need the conduit to
-carry its own machine. Settle alongside the one-edge-or-two question above.
+**Writing back to non-source substrates.** §7's enact arrow targets Layer 1
+source files via a codec. Staging changes outward to an issue tracker or a
+spreadsheet is the read direction of external ingestion reversed — plausible,
+and deliberately not planned. It is recorded as a **shape constraint** on
+`SourceSink` (Issue 107 §`SourceSink`): keep the trait substrate-neutral so the
+option is not foreclosed, and build nothing toward it.
 
 ---
 
@@ -996,12 +1218,16 @@ carry its own machine. Settle alongside the one-edge-or-two question above.
   what a `version` anchor is and how scopes are computed
 - [`attestation_fabric.md`](./attestation_fabric.md) — §4.2 record schema, §12.3
   projection, §13 PII surfaces
+- [`annotation_channel.md`](./annotation_channel.md) — how a record is issued;
+  the `open`/`emit`/`close` API and the two-lane split
+- [`identity_derivation.md`](../identity/identity_derivation.md) — where an
+  `EventId` comes from; minted versus derived identity
 - [`mapping_node_architecture.md`](../codecs/mapping_node_architecture.md) — owned edges,
   the mechanism §5 builds the conduit on
 - [`collaboration_overlay.md`](./collaboration_overlay.md) — the multi-user
   Layer 3 surface
 - [`../essays/engineering_model_ontology.md`](../../essays/engineering_model_ontology.md)
-  — §3.3 `P` and `S(P)`, §3.4 as-run records
+  — §3.3 `P` and $S_P$, §3.4 as-run records
 - [`beliefbase_architecture.md`](../core/beliefbase_architecture.md) §4.3
   — record schema and content hashing decisions
 - [`../project/UX_AUDIT.md`](../../project/UX_AUDIT.md) §3.9 — the view-to-edit

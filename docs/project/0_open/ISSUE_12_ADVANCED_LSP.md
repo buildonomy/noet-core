@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > **Architectural re-scoping needed.** Same as Issue 11: the LSP is
-> a PII (Personal Inference Interface) surface for the attestation
+> a PII (Personal Inspection Interface) surface for the attestation
 > service. Advanced features
 > (code actions, completion, rename) are procedure-driven responses
 > from the inference engine's rule maps, not standalone editor

@@ -27,7 +27,7 @@ include the requirement's own text at all.
 
 These are different scopes, and they must stale independently. If a corpus can
 only answer "did this node's bytes change", every claim about it inherits the
-wrong sensitivity: the section review misses a child edit, and the verification
+wrong sensitivity: the section review misses an edit below it, and the verification
 misses everything.
 
 This document defines **scoped content identity** — how a version is computed
@@ -88,8 +88,8 @@ kind rather than a storage detail.
 Two annotations on the same node, by the same actor, at the same instant, can
 legitimately stale differently — because they claimed different things.
 
-**`protocol_id` carries the selection.** The protocol registry
-(`attestation_fabric.md` §6) already resolves a `protocol_id` to a record schema
+**`record_kind` carries the selection.** The protocol registry
+(`attestation_fabric.md` §6) already resolves a `record_kind` to a record schema
 and a `graph_roles` block. Scope selection belongs in the same entry: a
 `noet:signoff:v1` record anchors to `section_hash`, a `noet:attest:v1` to the
 Epistemic closure, and a custom `local:<team>:<name>:v1` to whatever its
@@ -155,13 +155,13 @@ or optimizing a traversal — so improving the evaluator would stale every
 annotation in the corpus. The caller's expressed intent is the scope; the
 evaluator's expansion of it is an implementation detail.
 
-### 4.3 The tape hash: order-insensitive by default, with one real exception
+### 4.3 The tape hash: a lexically ordered set of member hashes
 
 Hashing requires reproducibility: the same graph and spec must yield the same
 hash.
 
-**Default: canonicalize.** Collect the tape's output BIDs, take each node's
-`content_hash`, sort, then hash:
+**Collect the tape's output BIDs, take each node's `content_hash`, sort those
+hashes, then hash:**
 
 ```
 tape_hash = sha256(
@@ -175,28 +175,76 @@ asking different questions, are distinguishable — a review of "everything unde
 §3" and a review of "the Class-A items under §3" must not be interchangeable
 just because §3 currently contains only Class-A items.
 
-#### Why sorting is a default, not a claim that order is meaningless
+**Sort the member hashes, not the BIDs.** A BID is not stable across a rebuild
+that cannot resolve a node against a prior store, so BID order would make the
+anchor hash depend on identity churn the claim does not care about. Content
+hashes are stable by construction, so an ordering over them is stable too.
 
-The tempting justification — "a *scope* is a set, so order is a rendering
-concern" — is too strong, and the distinction matters.
+#### Why order is excluded, and why that is not a concession
 
-Tape order is not incidental. `query_model.md` §6.1 specifies `TapeContent::Edges`
-as "Ordered by `WEIGHT_SORT_KEY` (sibling order)", and §7.3's sort table reads
-topological and sibling ordering *directly off the tape* rather than from a
-separate pass. `WEIGHT_SORT_KEY` is an **explicit graph property**, not a
-traversal artifact: it is persisted on the edge, and reordering peers is already
-expressible as a `BeliefEvent` (`PathUpdate` carries an order vector). Combined
-with discovery order, it yields a genuine topological property of the graph.
+The question is whether sibling order should enter the hash. It should not, and
+the reason is that **including it would hash the same fact twice.**
 
-So "the same nodes in a different order" can mean a real change — someone
-reordered the document — and an order-insensitive hash will not see it.
+`WEIGHT_SORT_KEY` looks like an independent graph property — it is persisted on
+the edge, and reordering peers is expressible as a `BeliefEvent`. But it is
+*derived*: sort keys are assigned in edge-arrival order
+(`BeliefBase::assign_sort_key`, `src/beliefbase/base.rs:2228`), parsing is
+single-threaded per file, and edges are created as the parser reads the source.
+So arrival order is a function of the source text — and within a batch,
+`sort_relation_events` (`src/paths/pathmap.rs:340`) reorders topologically
+rather than by wall clock, so the property survives batching.
 
-#### The two cases, distinguished by where the order comes from
+The source text is already covered. A node's `content_hash` moves when its text
+moves, and for document nodes the frontmatter `sections` table carries each
+contained node's `bid`/`id`/`schema` (§8), so adding, removing, or renaming one
+already changes the containing node's hash. **Folding sort keys in as well would add a
+second, covariant account of one fact** — two hash inputs that move together,
+doubling the noise without adding signal.
 
-| Order source | Reproducible? | In the hash? |
-|---|---|---|
-| `WEIGHT_SORT_KEY` + discovery (`TapeContent::Edges`) | **Yes** — a persisted graph property | **Optionally**, per protocol |
-| `SortPayload.score` (TF-IDF, decay, boosting) | **No** — see below | **Never** |
+> **This rests on a codec guarantee, and that guarantee has a name.** Edge order
+> deriving from a linear read of one file by one thread is
+> [`codecs/codec_determinism_contract.md`](../codecs/codec_determinism_contract.md)
+> **G3**, which names this section as what consumes it. An edge source that is
+> not that — concurrent cross-file resolution, an externally supplied edge
+> stream, or a codec emitting from a parallel iterator — would not inherit it,
+> and G3's own note requires revisiting *this* argument **before** such a change
+> lands rather than after. A codec that cannot uphold G3 is required to say so
+> explicitly.
+
+One consequence to accept deliberately: **moving a node from one in-scope
+container to another** does not move a set hash by itself. What catches it is the
+containing node's own payload, and the rule is general — **containment order
+lives in the container's payload, never the contained node's.** A section says
+nothing about which document holds it or where in the order it sits; the
+document's `sections` table says both, so the document's `content_hash` moves
+when its membership or ordering does.
+
+A consequence worth naming, because it qualifies §5.1's framing: **a document
+node is therefore not purely content-scoped.** Its `content_hash` already moves
+when a section is added, removed, or renamed — though not when a section's prose
+is edited, which is why the separate closure hash still earns its place. "A
+node's own fields are entirely unchanged" is too absolute for document nodes.
+
+That rule has a hole one level up: a **network** node carries no equivalent
+table, so adding, removing, or reordering a *document* changes no node's hash and
+a network-anchored claim does not stale. Issue 103 Part C closes it by giving a
+network node a `documents` table — the same role over its documents that a
+document node already has over its sections — which makes "the container's hash
+covers its membership" true at every level of containment rather than only the
+innermost.
+
+**Epistemic and Pragmatic edges are caught by a different mechanism, and caught
+more tightly.** They are *content-expressed*: a `{draws_from}` or `{uses}` link
+is written in the citing node's own body, so reordering two citations reorders
+`payload.text` and moves that node's `content_hash` directly — no container
+table required. This is the asymmetry Issue 103 Part C names: containment lives
+in the parent's payload, while citation lives in the citing node's own.
+
+One consequence is worth stating because it cuts the other way from the Section
+case: a *cosmetic* reordering of two citations that changes nothing about the
+claim will still stale an anchor. That is the cost of deriving the hash from
+source text, and it is the conservative direction to err in — a false stale is a
+re-read, a false fresh is a wrong answer.
 
 **TF-IDF scores must never enter an anchor hash.** IDF is a function of
 *corpus-global* term statistics, so a score depends on every other document in
@@ -204,33 +252,50 @@ the corpus. Adding an unrelated document anywhere shifts the scores, and
 threshold effects can reorder results. An anchor including score order would go
 stale on edits to documents it never looked at — the exact false-positive class
 §6 exists to prevent. Any tape entry whose order derives from `SortPayload` must
-be canonicalized before hashing.
+be canonicalized before hashing. Unlike structural order, this one is not
+merely redundant: it is not reproducible at all.
 
-**Structural order is a per-protocol choice.** Whether reordering two sections
-should stale a review of their parent is a question about the *claim*, not about
-the hash function — "I reviewed these three requirements" survives a reorder;
-"I approved this procedure" may not, if step order is the point. The default
-remains order-insensitive because it is the weaker, safer assumption, and
-because an order-sensitive anchor stales more often. A protocol that needs
-sequence-sensitivity should be able to request an order-preserving variant
-rather than being silently denied one.
+### 4.4 Traversal bounds: the cap is parse-time, not anchor-time
 
-> **Open.** The order-sensitive variant is not specified, and no consumer has
-> asked for one yet. What is settled: sorting is a **default with a rationale**,
-> not a claim that order is meaningless — and score-derived order is excluded
-> unconditionally, because it is not reproducible at all. See §8.
+`query_model.md` §11 Q1 notes that `MAX_TRAVERSAL` (10, `src/query/mod.rs:30`)
+preserves decidability of query equivalence: depth-bounded projection
+corresponds to a decidable bounded-CRPQ fragment, and removing the cap while
+retaining `Not`/`Difference` would not.
 
-### 4.4 Inherited constraint: bounded traversal
+**Anchor evaluation is exempt from the cap**, and terminates by visited set
+instead. Three reasons, in order of weight:
 
-`query_model.md` §11 Q1 notes that `MAX_TRAVERSAL` preserves decidability of
-query equivalence: depth-bounded projection corresponds to a decidable
-bounded-CRPQ fragment, and removing the cap while retaining `Not`/`Difference`
-would not.
+- **Capping produces false negatives in the case anchors exist for.** A closure
+  must reach every node it claims to cover. Truncated at 10 hops, a
+  section-scoped sign-off on a deep corpus silently stops detecting changes
+  below hop 10 — the attestation still renders as current while the evidence
+  under it moves. An over-deep traversal costs latency; an under-deep one is
+  wrong, and wrong invisibly.
+- **The cost lands on the consumer that asked for it.** Staleness is evaluated
+  lazily — when someone opens a node or runs "changed since I read" — and
+  memoized on `(spec, corpus_version)`. So a large closure is one caller's
+  latency, not a tax on the shared store. That distinction matters because the
+  at-rest forms *are* shared: an in-memory `BeliefBase` holds its relations
+  behind a lock, and `DbConnection` issues one SQL traversal per hop
+  (`src/db.rs:963`). Memoization, not truncation, is what keeps repeated looks
+  off those.
+- **Equivalence has no consumer.** The decidability argument defends "do these
+  two annotations assert about the same scope?", and nothing asks it. Staleness
+  is re-run-and-compare, which needs **determinism**, not decidability. If an
+  equivalence consumer appears, it can be scoped to query-expressible anchors
+  without re-capping evaluation.
 
-Anchors are queries, so they inherit this. "Do these two annotations assert about
-the same scope?" is a query-equivalence question, and it is answerable only
-because the cap holds. Any proposal to raise or remove `MAX_TRAVERSAL` must
-account for anchor equivalence, not only query performance.
+So the cap stays where it does work — bounding *query evaluation*, whose cost is
+paid by the shared store on every call — and anchor closures rely on the
+termination mechanism the evaluator already has (§5.4).
+
+**A timeout must never gate a hash.** A budget is a property of the machine and
+the moment, not of the scope, so a hash computed under one would differ between
+a fast and a slow host — staleness noise indistinguishable from real change
+(§6). Where a caller needs a bound, the correct return is `Option<Hash>`: either
+the hash, or nothing. There is no partial hash. **A `None` must not be
+memoized** — caching a timeout would turn one slow evaluation into a
+permanently unanswerable anchor.
 
 ---
 
@@ -253,23 +318,65 @@ cached instances of §4, not a rival design:
 **Two caveats on the query column**, both of which mean "corresponding" rather
 than "equivalent":
 
-- **Direction.** In the Section model source = child (`query_model.md` §5.2), and
-  §5.4 below folds in a node's *sources*. So the closure runs root→leaf —
-  `composed_of` / `k-section-s`, not `component_of` / `s-section-k`, which walks
-  toward ancestors. The same orientation applies to the other two kinds.
+- **Direction.** In the Section model the contained node is the source
+  (`query_model.md` §5.2), and
+  §5.4 below folds over a node's *source* closure. So the closure runs toward what
+  a node contains — `composed_of` / `k-section-s`, not `component_of` /
+  `s-section-k`, which walks toward what contains it. The same orientation applies to the other two kinds.
 - **Depth.** `MAX_TRAVERSAL` is 10 (`src/query/mod.rs:30`) and `DepthCount::Max`
-  clamps to it (`src/query/spec.rs:1274`), so `(*)` is a 10-hop traversal. The
-  cached hashes recurse to fixpoint. On a corpus deeper than 10 hops in one kind
-  they diverge, and the cache is the more complete answer.
+  clamps to it (`src/query/spec.rs:1274`), so `(*)` is a 10-hop traversal. A
+  closure runs to completion. On a corpus deeper than 10 hops in one kind they
+  diverge, and the closure is the more complete answer.
 
-The depth divergence is unresolved and interacts with §4.4, which cites the same
-cap approvingly as what keeps anchor equivalence decidable. Either closures adopt
-the cap (making cache and query genuinely equal, and §4.4's argument cover both),
-or anchor evaluation is documented as exempt (which reopens §4.4). See §8.
+**The depth divergence is resolved in favour of the closure**: anchor evaluation
+is exempt from `MAX_TRAVERSAL` and terminates by visited set (§4.4, §5.4). A
+capped closure would under-report on corpora deeper than 10 hops in one kind,
+which is a false negative in the compliance case. The cap remains in force for
+ordinary query evaluation, whose cost is borne by the shared store.
+
+> **The exemption covers the cached closures, not every anchor.** An annotation
+> anchors by query (§4), and an anchor written as an arbitrary `QuerySpec` is
+> evaluated by the ordinary evaluator — so `MAX_TRAVERSAL` bounds how far that
+> annotation's scope can reach. **An annotation's scope is depth-limited unless
+> it names a cached closure.**
+>
+> This is a real constraint on what a claim can be about, not an implementation
+> detail. "I reviewed this section and everything under it" is expressible at any
+> depth, because it resolves to `section_hash`. "I reviewed everything within 12
+> hops along this filtered path" is not — it silently becomes 10 hops, and the
+> annotation under-reports without saying so.
+>
+> Two directions this could go, and the choice belongs with Issue 105: extend the
+> exemption to any anchor-role evaluation, which costs the decidability argument
+> §4.4 sets aside; or reject an anchor whose spec exceeds the cap at emit time,
+> so a claim that cannot be evaluated faithfully is never made. **Silently
+> truncating is the one option to rule out** — it is the false-negative failure
+> §4.4 rejects for closures, arriving by a different route.
 
 An annotation whose scope matches a cached instance stores that field's name and
 value; the check is a field comparison. An annotation with an arbitrary scope
 stores `(QuerySpec, tape_hash)` and pays for a query at check time.
+
+**The split between `content_hash` and the closures is semantic, not only a
+performance tier.** `dag_model.md` §2 ("Directionality") distinguishes two ways a
+node can be determined by the graph around it: it **derives from** its sources,
+and it is **constituted by** the context that constrains it — Aristotle's
+efficient versus formal cause, and the context-sensitive constraint of
+Juarrero (2023). The two hash classes are exactly those two relations made
+checkable:
+
+| Hash class | Moves when | Answers |
+|---|---|---|
+| `content_hash` | the node's own fields change | what the node is **in itself** |
+| the closures | the node's context changes, its own fields untouched | what its **context makes of it** |
+
+A section lifted out of its document still exists and its `content_hash` is
+unchanged; it no longer says the same thing, and its `section_hash` records that.
+So **choosing an anchor scope is choosing which kind of determination the claim is
+about** — "I proofread this paragraph" is a claim about the node in itself and
+wants `content_hash`; "I reviewed this section" is a claim about a bounded whole
+and wants the closure (§3). That is why the family is a family rather than one
+hash with a radius parameter.
 
 ### 5.1 What is hashed for `content_hash`
 
@@ -295,6 +402,18 @@ This placement is also what keeps the definition non-circular: `metadata` is
 excluded from the hash, so a node never hashes a field containing its own hash.
 Storing hashes in `payload` would require carving an exception out of the hashed
 field set — the placement decision removes the problem instead of managing it.
+
+**The hash input is a projection, not the node's own `Serialize`.**
+`BeliefNode` derives `Serialize`, but the derive emits `bid` and `metadata` —
+both excluded above, and `metadata` circularly so, since it is where the hash
+lands — and its `skip_serializing_if` attributes make an empty field
+indistinguishable from an absent one. The hash therefore reads an explicit
+content-bearing projection in fixed field order, serialized by **one named
+codec**. Both codecs already in the tree are self-delimiting, so no separate
+length-delimiting scheme is needed; what matters is that exactly one is pinned,
+and that it is the same form an archive stores (Issue 74 §Archive), since a blob
+store keyed by `content_hash` cannot verify values serialized differently.
+Named and built by **Issue 103 Part B step 6**.
 
 Use the established underscore convention for compiler-internal keys
 (`_query_specs`, `_maps_to_specs`): `metadata["_content_hash"]`, and
@@ -326,10 +445,12 @@ Use the established underscore convention for compiler-internal keys
 
 ### 5.1a `metadata` is three tables wearing one name
 
-§5.1 excludes `metadata` from the hash and stores the hash there. Both are
+§5.1 excludes `metadata` (as implemented in [ISSUE_26_GIT_AWARE_NETWORKS.md](../../project/2_completed/ISSUE_26_GIT_AWARE_NETWORKS.md)) from the hash and stores the hash there. Both are
 correct, but they are correct for different reasons, and the reason matters
-because `metadata` is not one kind of thing. It is currently three, and only one
-of them is what §5.1's rationale describes.
+because `metadata` is not one kind of thing. The table below sorts its keys into
+three classes, and only one of them is what §5.1's rationale describes. Issue 105
+step 3a-pre separates them; until it lands, a reader must apply the
+classification by hand.
 
 | Key | Written at | Derived from | Class |
 |---|---|---|---|
@@ -481,9 +602,38 @@ are only partially loaded (`src/properties.rs:520-532`) and which is **stripped
 on merge**. Hashing it means a node hashed while Trace and rehashed once complete
 produces two different versions — silently staling every annotation on it.
 
-Hash only content-bearing kinds. Audit `External` on the same grounds. This is a
-correctness requirement, not an optimization: without it, shard hydration
-(Issue 66) invalidates the corpus.
+Hash only content-bearing kinds. This is a correctness requirement, not an
+optimization: without it, shard hydration (Issue 66) invalidates the corpus.
+
+**The exclusion may be vacuous at rest, which would be the better outcome.**
+Bare `Trace` is an in-transit condition and should not survive into a shard or
+the DB at all; Issue 66 carries the invariant — *at rest, `Trace` implies
+`External`* — and the count that tests it. If it holds, this rule still guards
+the in-memory case and never fires on stored nodes.
+
+**`External` is content-bearing and must not be excluded**, despite appearing
+alongside `Trace` in several places. It marks two different situations, and only
+one of them is load-state:
+
+| Form | Where | Meaning |
+|---|---|---|
+| `External \| Trace` | API node, href network (`src/properties.rs`) | permanently incomplete — `Trace` already excludes it |
+| `External` alone | **asset and directory nodes** (`src/codec/builder.rs`) | real content: the node carries a fingerprint of external bytes |
+
+`Trace` does the excluding in the first row, so no separate rule is needed. The
+second row is genuine content — §5.1's asset-relocation note depends on it, since
+moving `payload["content_hash"]` to `metadata["_content_hash"]` presupposes that
+asset nodes are hashed at all.
+
+**Hashing the external bytes is a separate operation from hashing node fields.**
+An asset's fingerprint covers content noet cannot parse, so computing it needs
+the file rather than the node — it is I/O-bound and cannot be a pure function of
+`BeliefNode`. It therefore belongs on the asset-ingest path, not in the node
+hasher, and the node hasher simply reads the value the ingest path already wrote.
+That split is what makes an out-of-band or asynchronous refresh possible later
+without touching the node hash. Owned by **Issue 103 Part B step 6** for the node
+side and **Issue 108** for external-source fingerprints generally
+(`RecordSource::verify` is the same question for evidence stores).
 
 ### 5.3 Stratification: why closures are per edge kind
 
@@ -514,19 +664,61 @@ Take `kind` as a parameter and never union edge kinds inside the traversal. A
 debug assertion that the walk stays within `kind` makes a future violation fail
 loudly rather than hang.
 
-### 5.4 Computation
+**Termination is the forcing argument, but it is not the only one.** Stratifying
+by kind would be right even if the union were acyclic, because the three kinds
+carry different relations and a claim is made about one of them. Containment,
+provenance, and coverage constitute a node differently — `dag_model.md` §3's
+change test turns on exactly that difference — so a single mixed hash would tell
+an annotation that *something* in its neighbourhood moved without saying whether
+what moved was what it claimed about. A reviewer who read a section is not stale
+because an unrelated requirement started citing it. The per-kind split keeps the
+staleness signal answerable at the granularity the claim was made at, which is
+also why §5.6 refuses to compose the kinds into one value.
+
+### 5.4 Computation: a flat set fold, not a Merkle tree
 
 ```
 content_hash(n) = H( content-bearing fields of n )
 
-kind_hash(n, k) = H( content_hash(n)
-                   ‖ kind_hash(s, k) for s in sources(n, k), canonical order )
+kind_hash(n, k) = H( sorted( content_hash(m)
+                             for m in closure(n, k) ∪ {n} ) )
 ```
 
-Bottom-up with memoization: **each node is hashed exactly once**, one post-order
-traversal, O(V+E) per kind. Children contribute their computed hashes, not their
-contents — this is what git does for tree objects. Nodes may have several parents
-within a kind, so this is a DAG; memoization handles shared substructure.
+`closure(n, k)` is every node reachable from `n` along kind-`k` edges. The fold
+is over a **set**, canonicalized by sorting the member content hashes — the same
+construction as §4.3's `tape_hash`, which is what makes the cached family
+genuinely instances of §4 rather than a parallel design.
+
+**Why flat rather than Merkle.** A Merkle fold
+(`H(content_hash(n) ‖ kind_hash(s) for s in sources)`) is structure-sensitive:
+it distinguishes the same node set arranged differently. That sensitivity would
+have to come from somewhere reproducible, and the only candidate is
+`WEIGHT_SORT_KEY` — which §4.3 shows is derived from source text that
+`content_hash` already covers. A Merkle fold over a derived order therefore adds
+a covariant second account of one fact rather than new signal, and it costs the
+equivalence with §4: a per-node Merkle hash and a tape hash over the same scope
+would disagree, so the cache could not answer for the general form.
+
+**Termination is by visited set, not by depth.** Per-kind acyclicity is
+*reported* rather than enforced — `built_in_test` collects SCC violations into
+an error list (`src/beliefbase/base.rs:1194-1223`) and nothing rejects the
+graph — so a closure must be resilient to a cycle rather than assume its
+absence. A visited set gives that, and bounds the walk at O(V+E) regardless of
+depth. This is the same mechanism the query evaluator already uses:
+`apply_traversal` retains each frontier against a visited set and stops when it
+empties (`src/beliefbase/base.rs:3751-3760`).
+
+> **The query API is the likely implementation.** `TapeFn::Fold { op: Union,
+> range: None }` is documented as "seed ∪ all prior tape BIDs"
+> (`src/query/spec.rs:917`) — which *is* the visited set — and
+> `TapeContent::Edges` stores `output_bids` so the tape is self-contained
+> (`:995`). A closure hash is then: evaluate `id://X k-section-s(*)`, take the
+> union fold, hash the members' content hashes. The one blocker is that
+> `max_hops()` clamps to `MAX_TRAVERSAL` (`src/query/spec.rs:1274`), so
+> expressing a true closure needs an uncapped variant per §4.4. Worth doing:
+> it removes a second traversal implementation, and `Then(None)` vs
+> `Fold{Union}` stops being ambiguous because only the union fold is correct
+> here.
 
 **Cost**: 32 bytes of raw digest per node per kind — ~4 MB for four fields on a
 32k-node corpus. **That is the in-memory floor, not the delivered cost.** These
@@ -537,25 +729,33 @@ of 10 MB, not 4. Measure before treating either number as a constraint.
 **Subnet boundaries are ordinary Section edges.** A closure does not stop at a
 network boundary, so a network index node's `section_hash` covers its whole
 network. This is a semantic decision, not an implementation detail: it means
-editing any document in a subnet stales a section-scoped claim on the parent
+editing any document in a subnet stales a section-scoped claim on the enclosing
 network.
 
-**Base case is implicit.** A node with no sources on a kind folds in nothing, so
-its `kind_hash` equals its `content_hash`. No sentinel, and the degenerate case
-is also the correct one: for a node containing nothing, "did anything under me
-change?" and "did I change?" are the same question.
+**Base case is implicit.** A node with no sources on a kind folds in only its
+own `content_hash`, so its `kind_hash` is a hash of a one-member set. The
+degenerate case is also the correct one: for a node containing nothing, "did
+anything under me change?" and "did I change?" are the same question. Note this
+makes the source-free collapse of §5.5 a hash *of* the content hash rather than
+the content hash itself — equal in what they detect, not in value.
 
-### 5.5 The leaf collapse, and what it breaks
+### 5.5 When a closure collapses to the content hash
 
-The base case is a trap for the caller, not for the implementation. Because a
-leaf's `kind_hash` equals its `content_hash`, **anchoring a claim to the wrong
-cached field can be silently wrong rather than merely imprecise.**
+The base case is a trap for the caller, not for the implementation. Where a node
+has no sources **on the kind being hashed**, its `kind_hash` covers exactly the
+content its `content_hash` covers — so **anchoring a claim to the wrong cached
+field can be silently wrong rather than merely imprecise.**
 
-The concrete case: a verification attestation on a requirement. Requirements are
-typically Section leaves. Anchoring it to `section_hash` means anchoring to
-`content_hash`, so the attestation detects edits to the requirement's own text
-and *nothing else* — including changes to the evidence it rests on. That is the
-one thing a verification claim exists to notice.
+The qualifier is the whole point: having no sources is a property *per kind*, not
+a property of the node. A node can be source-free on Section while carrying a
+deep Epistemic closure, and that combination is exactly where the trap springs.
+
+The concrete case: a verification attestation on a requirement. A requirement
+typically contains nothing — no Section sources — while drawing on a great deal
+of evidence along Epistemic edges. Anchoring to `section_hash` therefore detects
+edits to the requirement's own text and *nothing else*, including changes to the
+evidence it rests on. That is the one thing a verification claim exists to
+notice.
 
 The correct anchor is the Epistemic closure. This is why the family cannot be
 trimmed to `content_hash` and `section_hash`, the two structurally obvious
@@ -596,6 +796,12 @@ platforms, and a rebuild from shards. Fixed field order, canonical serialization
 no map-iteration-order dependence. An unstable hash stales every annotation on
 every restart, which is indistinguishable from the whole-corpus failure mode
 §2 rejects.
+
+This is a requirement on **codecs**, not on this document, and it is stated as
+one: [`codecs/codec_determinism_contract.md`](../codecs/codec_determinism_contract.md)
+**G1** (pure function of content) and **G5** (comparable across binaries, not
+merely across runs). That document is where a codec author is expected to read
+it; the two hazards below are the same two it records.
 
 Two known hazards for determinism:
 
@@ -644,9 +850,10 @@ issue in the build sequence that needs one; that keeps the issue gating
 everything else small.
 
 **Closure hashes are annotation infrastructure, not parse infrastructure.** A
-closure recurses to fixpoint and traverses subnet boundaries (§5.4), so editing
-one leaf changes every ancestor's hash to the network root. For anchoring that is
-correct — "I reviewed this section" *should* stale when a child changes. For skip
+closure runs to completion and traverses subnet boundaries (§5.4), so editing
+one node changes every containing node's hash up to the network root. For anchoring that is
+correct — "I reviewed this section" *should* stale when something it contains
+changes. For skip
 logic it is the opposite of what is wanted: it would invalidate the whole
 ancestor chain and defeat the skip the incremental parse exists to enable.
 
@@ -656,7 +863,7 @@ So the split is by consumer, not by convenience of implementation:
   `_content_hash` (radius 0 — no traversal, needed by cross-version diff and by
   every annotation kind as its base case).
 - **Issue 105** computes the closure members it needs, when it needs them, having
-  the `protocol_id` → scope mapping that determines which.
+  the `record_kind` → scope mapping that determines which.
 
 Export walking every node makes it *tempting* to compute closures there too. That
 is an argument about where the loop is, not about who needs the value, and it put
@@ -679,6 +886,10 @@ stored hash manifest does.
 
 The mechanism is a corpus fixture plus a manifest of expected node hashes — no
 new machinery, just a golden test over a value this document already defines.
+It works only while codecs uphold **G5**
+([`codecs/codec_determinism_contract.md`](../codecs/codec_determinism_contract.md)),
+which names this detector as what consumes it: a hash that varies between
+binaries for reasons other than codec behaviour makes the manifest useless.
 Deliberately **empirical rather than declared**: a `DocCodec::version()` would
 detect only the drift an author remembered to declare, whereas a hash manifest
 detects actual output drift. Do not add a codec versioning scheme for this.
@@ -697,81 +908,48 @@ It has no issue and should not get one until per-node hashes land.
 
 ## 8. Open Questions
 
-- ~~**Which family members are computed in Phase 1.**~~ **Partly resolved**:
-  §7.1 assigns `_content_hash` to Issue 66 and *all* closure members to Issue 105,
-  because closures serve annotation anchoring rather than parse skip logic.
+- **Node deletion orphans a directly-anchored annotation — a presentation
+  question, not a hashing one.** Deleting a Section source changes every
+  ancestor's `section_hash`, so closure-anchored annotations stale correctly.
+  An annotation anchored *directly* to the deleted node has an anchor that
+  resolves to nothing, and "resolves to nothing" is distinct from "resolves to
+  something changed": stale means re-read, orphaned means the subject is gone.
 
-  What remains open is which closures **Issue 105** computes. §5.5 argues the
-  Epistemic member is required for attestation correctness — a requirement leaf's
-  `_section_hash` equals its `_content_hash`, so a section-anchored attestation
-  cannot see its evidence move. Counter-argument: an Epistemic closure over a
-  densely-linked corpus may fire constantly, which is §2's always-fires failure in
-  a new form. Computing it is the only way to get fire-rate data. Recommend
-  computing it in Issue 105 while treating closure-scoped attestation anchoring as
-  provisional.
-- ~~**`content_hash` collides with an existing payload key.**~~ **Resolved**:
-  node hashes live in `metadata` under underscore-prefixed keys
-  (`_content_hash`, `_section_hash`) — see §5.1. `metadata` is derived per-parse
-  data and is hash-excluded, so the placement is both semantically right and
-  non-circular. The asset-node `payload["content_hash"]` is the **same** notion
-  and must relocate to `metadata` for the same reason — not optional, and not
-  future work: while it sits in `payload` the hash is circular on every asset
-  node. Owned by Issue 105 step 3a-pre.
-- **Node deletion.** Deleting a Section source changes every ancestor's
-  `section_hash`, so closure-anchored annotations stale correctly. An annotation
-  anchored *directly* to the deleted node orphans, and nothing specifies whether
-  that surfaces as stale, broken, or silent. Structurally identical to the BID
-  migration question in `content_identity.md` §8; answer together.
+  **It only arises for durable stores.** A regenerated-scope record is replaced
+  wholesale on the next parse (`annotation/living_corpus.md` §6), so an orphan
+  never outlives the run that made it. Only stores that accept promotion
+  accumulate records whose subject can disappear underneath them, which is what
+  makes this a **UX question owned by a follow-on to Issue 105** rather than
+  anything this document decides. Structurally identical to the BID-migration
+  case in `content_identity.md` §8 — in both, the anchor is intact and the target
+  is not — so answer them together.
 - **`{maps_to}` resolution is not content-expressed.** The premise that content
   hashes capture relations for free holds for the directive text, but the resolved
   spec lives in `metadata["_maps_to_specs"]` (hash-excluded by design) and the
   edge is third-party-owned via `WEIGHT_OWNED_BY` — so it appears in neither
   endpoint's `content_hash`. Matters most for the Epistemic case, since
   `{maps_to}` is the traceability primitive.
-- **Document nodes are not purely content-scoped.** `MdCodec::finalize` writes a
-  `sections` table into the document node's frontmatter carrying each child's
-  `bid`/`id`/`schema` (`src/codec/md.rs:2630-2695`), and frontmatter becomes
-  `payload`. A document node's `content_hash` therefore already moves when a child
-  is added, removed, or renamed — though not when a child's prose is edited. The
-  argument for a separate closure hash survives (in-place edits are the common
-  case), but the "own fields are entirely unchanged" framing is too absolute for
-  document nodes.
-- **Radius between 0 and closure.** The family caches radius 0 and radius ∞. A
-  depth-1 or depth-2 scope is expressible as a `QuerySpec` but not cached. Whether
-  any is common enough to warrant caching needs usage data.
+- **Which family members are worth caching.** §7.1 assigns ownership; what is
+  unsettled is the *set*, on two axes.
 
-- **Do cached closures respect `MAX_TRAVERSAL`?** §5.1's query column and §5.4's
-  fixpoint recursion disagree beyond 10 hops. §4.4 leans on the cap for anchor
-  equivalence decidability, so exempting closures weakens that argument while
-  capping them makes a "closure" not a closure. **Decide before implementation** —
-  it changes what Issue 66 computes.
+  **By kind**: §5.5 argues the Epistemic member is required for attestation
+  correctness — a source-free requirement's `_section_hash` equals its
+  `_content_hash`, so a section-anchored attestation cannot see its evidence
+  move. Against that, an Epistemic closure over a densely-linked corpus may fire
+  constantly, which is §2's always-fires failure in a new form. Computing it is
+  the only way to get fire-rate data, so **compute it in Issue 105 and treat
+  closure-scoped attestation anchoring as provisional.**
 
-- **Hash input serialization is unspecified.** §5.1 names the fields and §6
-  requires canonical encoding, but no encoding is named. `payload` and `metadata`
-  are `toml::value::Table`, `id` is a custom type, `kind` an `EnumSet`. The
-  encoding must be length-delimited, or `title="ab", id="c"` and `title="a",
-  id="bc"` collide. Needs a named encoding, not a principle.
+  **By radius**: the family caches radius 0 and radius ∞. A depth-1 or depth-2
+  scope is expressible as a `QuerySpec` but not cached, and whether any such
+  scope is common enough to earn a field needs usage data.
 
-- **Which `kind` values are content-bearing.** §5.2 excludes `Trace` and says to
-  audit `External` — but `External` is not obviously load-state; it marks a node
-  wrapping an unparseable reference, which is arguably content. The builder cannot
-  defer this. Needs the explicit set.
+  The two share one decision procedure — ship the members the compliance case
+  demands, measure fire rate against the W4 pilot, and add or drop on evidence.
+  A cached member that fires on every build is worse than no member at all,
+  because a signal nobody trusts still costs a lookup.
 
-- **Source ordering for Epistemic and Pragmatic closures.** §5.4 folds sources in
-  "canonical order". For Section that is `pathmap_order`
-  (`src/paths/pathmap.rs:476`). For the other two kinds nothing is specified;
-  `WEIGHT_SORT_KEY` on the edge is the likely answer but must be stated, since an
-  unstable fold order destabilizes the hash.
 
-- **Which tape lens `tape_hash` uses.** §4.3 hashes "the tape's output BIDs", but
-  `query_model.md` §6.3 requires choosing a `TapeFn` lens — `Then(None)` yields
-  the final frontier, `Fold{Union, None}` everything discovered at any depth. For
-  a closure query those differ enormously. Either name the lens or state that it
-  is part of the `QuerySpec` and the anchor inherits it.
-
-- ~~**Where the hashes are stored.**~~ **Resolved**: `metadata`, under
-  underscore-prefixed keys (§5.1). No new `BeliefNode` field, so no breaking
-  serde change; `metadata` already round-trips through the DB and shards.
 
 - **Should the asset and node content hashes eventually unify?** They are the
   same notion — a content fingerprint — produced by different codecs over
@@ -798,10 +976,11 @@ It has no issue and should not get one until per-node hashes land.
 | `_content_hash` in shard records | **Issue 105** step 3a |
 | Closure members (`_section_hash`, Epistemic, Pragmatic) | **Issue 105** step 3b — see §7.1 |
 | Closure hashes in the DOM | **Issue 65**, after Issue 105 |
-| `protocol_id` → scope selection | **Issue 104**, **Issue 105** |
+| `record_kind` → scope selection | **Issue 104**, **Issue 105** |
 | `(QuerySpec, tape_hash)` general form | unowned — needs an issue |
 | Tape canonicalization for hashing | unowned — needs an issue |
 | `payload`/`metadata` reclassification (§5.1a) | **Issue 105** step 3a-pre — blocks 3a |
+| Network `documents` table (§4.3) — makes membership hash-visible one level up | **Issue 103** Part C |
 | Identity-hash normalization | specified in `content_identity.md`; built by **Issue 36** — `_content_hash` deliberately does not normalize |
 | Codec-regression hash manifest (§7.2) | unowned by design — not before per-node hashes land |
 
@@ -820,6 +999,9 @@ wanted.
 - [`query_language.md`](../../query_language.md) — §11 canonical serialization
 - [`living_corpus.md`](../annotation/living_corpus.md) — §4 anchoring and scope selection in
   the annotation model
+- [`codec_determinism_contract.md`](../codecs/codec_determinism_contract.md) — the
+  codec-side guarantees this document's hashes rest on: **G1** determinism,
+  **G3** edge order (§4.3), **G5** cross-binary comparability (§7.2)
 - [`dag_model.md`](../core/dag_model.md) — the three edge kinds
 - [`attestation_fabric.md`](../annotation/attestation_fabric.md) — §6 protocol registry, the
   home for scope selection
@@ -834,3 +1016,9 @@ wanted.
 - `src/beliefbase/base.rs` — invariant 0 and the SCC checks
 - `src/beliefbase/graph.rs` — `as_subgraph`
 - `src/paths/pathmap.rs` — `pathmap_order` (L476), the `loops` cycle guard
+
+**External**
+
+Juarrero, A. (2023). *Context Changes Everything: How Constraints Create
+Coherence*. MIT Press. — context-sensitive constraint, the account behind §5's
+content-versus-closure split.

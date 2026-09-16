@@ -96,7 +96,7 @@ union semantics across them. Federation generalizes that: a peer's scope is
 another in the same union.
 
 What makes this more than a sync protocol is that **runs nest**
-(`living_corpus.md` §5, Issue 109). A `RunStart` may cite a parent `run_id`, so a
+(`living_corpus.md` §5, Issue 105). A `RunStart` may cite a parent `run_id`, so a
 team-level effort can decompose into individual work queues:
 
 ```
@@ -129,7 +129,7 @@ stating:
 - **It preserves auditability.** The summary cites its constituents by
   `EventId`; the chain is traversable *if* the detail scope is available. An
   unresolvable citation is the ordinary partial-scope case
-  (Issue 109 §Failure Modes), not corruption.
+  (Issue 105 §Failure Modes), not corruption.
 
 > **This open question may already be answered.** Issue 110's layered
 > read-through model makes policy-vs-transport a false dichotomy: **filtering on
@@ -235,7 +235,7 @@ incidental:
 |---|---|---|
 | Entries | graph mutations — **order-dependent** | claims — **order-independent** |
 | Ownership | exactly one writer per node | many writers, no coordination |
-| Merge | replay in `(actor, sequence)` order | set union (G-Set) |
+| Merge | replay in `(actor, session, sequence)` order | set union (G-Set) |
 | Conflicts | impossible by partitioned ownership | impossible by immutability |
 
 A rename followed by a content update is not the same as the reverse, so Layer 2 entries

@@ -59,6 +59,11 @@ Each stage has distinct responsibilities:
 
 noet-core implements **multi-ID triangulation** - the same node can be referenced through multiple identity types, each serving different purposes. This enables robust references that survive structural changes while supporting user-friendly semantic identifiers.
 
+> This section defines what each identity *means* and how references resolve.
+> Where identities *come from* — minting vs. derivation, the reserved
+> namespaces, and the rule governing which identities survive a rebuild — is
+> [`identity/identity_derivation.md`](../identity/identity_derivation.md).
+
 #### Identity Types
 
 Every node in the system can be referenced through five **NodeKey** variants:
@@ -492,7 +497,12 @@ Domain asks: "What schema defines this node's structure?"
 
 ### 2.4. The API Node and System Network Namespaces
 
-Every `BeliefBase` contains a special **API node** and uses **three system-defined network namespaces** for tracking special categories of references. Understanding these reserved namespaces is critical for distributed synchronization, schema evolution, and preventing BID collisions.
+Every `BeliefBase` contains a special **API node** and uses **system-defined network namespaces** for tracking special categories of references. Understanding these reserved namespaces is critical for distributed synchronization, schema evolution, and preventing BID collisions.
+
+> This section covers the API node's role and lifecycle. The full set of
+> reserved namespaces, including `UUID_NAMESPACE_CODEC` and the two proposed
+> additions (`Record`, `Actor`), is tabulated in
+> [`identity/identity_derivation.md`](../identity/identity_derivation.md) §5.
 
 #### Purpose and Architecture
 
@@ -1963,7 +1973,7 @@ including `BeliefSink::apply_batch` — to carry arms for events it cannot apply
 Consumers that care only about graph state subscribe downstream of the
 projection and never observe an `Annotation`.
 
-Annotation *kinds* are distinguished by a `protocol_id` resolved through the
+Annotation *kinds* are distinguished by a `record_kind` resolved through the
 protocol registry (`attestation_fabric.md` §6), not by Rust enum variants, so a
 new kind is a registry entry rather than a code change.
 
@@ -1973,20 +1983,73 @@ new kind is a registry entry rather than a code change.
 > **Sketch. Issue 104 is authoritative for the field set.** The shape below
 > records intent, not a settled schema. Issue 104 defines the necessary and
 > sufficient properties and updates this section once implemented; Issue 105
-> (persistence) and Issue 109 (run brackets) contribute fields.
+> (persistence) and Issue 105 (run brackets) contribute fields.
 
 An annotation needs metadata the graph does not hold: who made it, how it orders
 against concurrent annotations, and what it reasons from. Roughly:
 
 ```rust
 pub struct Envelope {
-    pub id: EventId,             // (actor, sequence) — globally unique, uncoordinated
+    pub id: EventId,             // (actor, session, sequence) — globally unique, uncoordinated
     pub actor: ActorId,          // opaque: user, peer, or pipeline
     pub observed_at: Timestamp,  // wall clock, display only
     pub caused_by: Vec<EventId>, // what this record reasons from — retrospective
     pub payload: Annotation,
 }
 ```
+
+#### Why `EventId` has three fields
+
+`(actor, sequence)` alone is unique per *writing process*, not per actor. One
+human using the viewer, an MCP agent, and the CLI is one `ActorId` with three
+concurrent writers, and `noet watch --serve` and `noet mcp` are separate
+processes (`src/cli.rs:989`, `:1057`). Two of them minting `sequence = N+1`
+against the same counter produce the same id — and because `caused_by` cites
+`EventId`s and Issue 105 derives `run_id` from one, a duplicate corrupts the
+causal DAG rather than merely colliding a filename.
+
+**`session` identifies one writing process.** It is **64 bits of CSPRNG
+entropy** minted at startup — a browser tab, a CLI invocation, and a
+long-running server are each one session — and is **never persisted**.
+`sequence` is therefore process-local, starts at zero, and needs no high-water
+mark, no recovery scan, and no lock. Uniqueness is structural rather than
+enforced, which is what lets a record be written offline, in a browser, or
+against a store no other writer can reach.
+
+**Entropy, not coordination.** The two fields carry different burdens, and
+separating them is what removes the coordination point: `sequence` needs
+contiguity but only *within* a session, where one process owns the counter;
+`session` needs uniqueness but has no ordering or contiguity requirement, so it
+can be drawn at random. Nothing iterates sessions and nothing ranges over them
+— cross-session ordering is `observed_at`.
+
+64 bits is sized against the scope that matters: a collision is only harmful
+between two sessions of the *same* actor, and 10⁶ sessions for one actor gives a
+collision probability near 2.7×10⁻⁸. Entropy is available on every surface
+including WASM (`getrandom` with the `js` feature), so a browser tab mints its
+own session with no server round trip — the case that rules out any
+lock-or-lease scheme.
+
+**One hazard**: a forked child inherits its parent's session *and* counter, and
+both would then mint identical ids. Mint the session lazily on first write, or
+re-derive it when the PID changes.
+
+Three properties follow, and each has a consumer:
+
+- **Total order within a session.** `sequence` is a monotonic counter over one
+  writer's own log (`collector_model.md` §5.1).
+- **Contiguity within a session.** A run of records from one `(actor, session)`
+  is a contiguous `sequence` span, which is what lets a promotion boundary cite
+  a remainder as one `RecordRange::Sequence { from, to }` (Issue 108 Decision 3)
+  instead of pushing each record.
+- **Concurrency between sessions.** Two sessions of one actor are genuinely
+  concurrent; no order between them is invented. Sibling display order is
+  `observed_at`, per `collector_model.md` §5.1.
+
+`session` is not a device. Two processes on one machine are two sessions, and
+the same actor on two machines is two more — the distinction the id needs is
+*which writer*, and a device identifier answers a coarser question that nothing
+here asks.
 
 **This wraps annotations, not `BeliefEvent`s.** `BeliefEvent`s are
 compiler-generated at thousands per parse, single-writer by construction, and
@@ -2001,10 +2064,13 @@ Two consequences of that scoping:
   answers "already applied to my state?" — a dispatch concern. `actor` answers
   "who produced this?" If envelopes were universal, `actor == self` would subsume
   `EventOrigin`; scoped to annotations, the two never meet.
-- **A logical clock may not be needed at all.** Ordering matters for the
-  derived-state fold, and `(observed_at, id)` may suffice for records that merge
-  by set union. A lamport field is only justified if something reads it; Issue 105
-  carries that obligation. **Open — Issue 104 to settle.**
+- **There is no logical clock.** Ordering matters only to the derived-state
+  fold, which orders by `(observed_at, id)`. `sequence` totally orders one
+  session's records; records from different sessions are genuinely concurrent
+  (`collector_model.md` §5.1), and `caused_by` states causality explicitly as a
+  DAG. A Lamport field would be a weaker, implicit encoding of a fact the records
+  already carry — and a field nothing reads is a liability
+  (`LESSONS_LEARNED.md` §Design constraints).
 
 `caused_by` is deliberately retrospective: a record names what it reasons *from*,
 not what it predicts. `attestation_fabric.md` §4.2a calls the same relation
@@ -2021,12 +2087,6 @@ The envelope is what makes the stream replicable. `federated_belief_network.md`
 with globally unique `id`s form a grow-only set, so merging two stores is set
 union — conflict-free by construction, with no CRDT library required.
 
-**If** a `lamport` field is adopted, it carries an obligation: the derived-state
-fold must then order by `(lamport, observed_at, id)` rather than by wall clock,
-so the field is exercised on a single writer rather than lying dormant until a
-second one appears. A clock nobody reads is a clock nobody maintains correctly.
-That obligation is a *consequence* of the open question above, not a decision
-ahead of it.
 
 See `living_corpus.md` for the layer model this participates in, and
 `content_versioning.md` for how a record anchors to a node version.

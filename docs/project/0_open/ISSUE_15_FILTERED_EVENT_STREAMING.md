@@ -68,7 +68,7 @@ Reuse existing `Query`/`PaginatedQuery` infrastructure from `src/query.rs`:
 >
 > If that holds, this issue is defining the **cursor/focus annotation**, and
 > "every PII surface has a focus filter it fully owns" becomes a structural
-> property of the layer model (`docs/design/annotation/overlay_model.md` §5)
+> property of the layer model (`docs/design/annotation/overlay_model.md` §4)
 > rather than a convention. It would also mean subscriptions get scope,
 > provenance, and persistence for free instead of needing their own mechanisms.
 >

@@ -324,6 +324,39 @@ batch boundaries and behind an explicit opt-in.
 
 ## Design constraints
 
+### The graph may cycle; every construction over it must be resilient
+
+Authors write across repositories, and no build-time check can stop them from
+creating a cycle. Per-kind acyclicity is therefore *reported*, not enforced:
+`built_in_test` collects SCC violations into an error list and the graph is
+built anyway. Refusing to build would be a worse failure than reporting one.
+
+The obligation lands on the consumer. **Every traversal must have a named
+termination argument**, and there are only three legitimate ones:
+
+| Mechanism | Use when | Example |
+|---|---|---|
+| **Visited set** | completeness is required | reachability walks; closure hashes; the query evaluator's frontier retain |
+| **Depth cap** | the bound is semantic, and cost falls on a shared resource | `MAX_TRAVERSAL` in query evaluation |
+| **Documented cutoff** | neither fits, and the number has a rationale | `BALANCE_CUTOFF`, deliberately 15 rather than 10 |
+
+A depth cap is the weakest of the three and is often reached for first. It does
+not bound *work*: one hop from a hub node can touch more of a corpus than ten
+hops down a chain. A visited set bounds both work and termination, which is why
+it is the default for anything that must be complete.
+
+The subtle failure is a construction that guards one path and not another. A
+path-building routine detected back edges during initial construction and
+skipped them, but its incremental update path performed no such check — so the
+same relation behaved differently depending on whether it arrived during the
+first build or as a later event, and only the second path could not terminate.
+
+**Practice**: when adding a traversal, name which of the three mechanisms it
+uses and say so in a comment. When a structure has both a batch-construction
+path and an incremental path, verify the guard exists on *both* — a test that
+builds the same graph each way and compares results is the cheapest oracle.
+Never assume an invariant that is only checked, never enforced.
+
 ### A forward-compatibility field is a liability unless something exercises it
 
 "It costs nothing to carry" is false. A field written but never read is not
@@ -385,6 +418,31 @@ The tell that the line has been crossed: the words *earlier*, *previously*,
 that is not an issue or a log, each of these is a candidate for deletion.
 
 ## Identity and caching
+
+### An identity that must survive a rebuild must be derived, not minted
+
+A minted identity draws on the clock or on entropy, so the same inputs produce a
+different value on the next run. A derived identity is a pure function of its
+inputs, so it does not. Minting is right for anything whose identity is
+established once and then persisted; it is wrong for anything reconstructed from
+source on every build.
+
+The failure is invisible in the test that would catch it. Within one process the
+minted value is held in memory and every reference resolves, so the object looks
+stable. It destabilizes only across a process boundary — a rebuild, a cold CI
+run, a regenerated corpus — which is exactly the boundary a unit test does not
+cross. The same defect was found three times in unrelated subsystems: content
+nodes re-minting when no prior store resolved them, record identities colliding
+across concurrent writers of one actor, and a folded record projecting to a
+freshly-minted graph node on every fold.
+
+**Practice**: for each durable identity, name the function that produces it and
+the inputs that function reads. If any input is the clock, entropy, or
+iteration order, then either (a) a persistence path is part of the design and
+must be tested across a restart, or (b) the identity is wrong. "It is stable
+because nothing re-runs it" is not a persistence path. Test identity stability
+across a process boundary and a serialization round trip, never by hashing the
+same in-memory value twice.
 
 ### Do not conflate identities that have different scopes
 

@@ -174,7 +174,7 @@ ActivityEvent {
     focus_context: Some("focus-daily-routine"),
 }
 
-// Redline correction (redline_system.md)
+// Redline correction (annotation/redline_model.md)
 ActivityEvent {
     id: "laptop-1:seq-1235",
     timestamp: "2025-01-23T10:35:00Z",
@@ -593,7 +593,7 @@ Focus {
     - [ ] Test end-to-end: observation → inference → event log
 
 12. **Redline Correction Events** (2 days)
-    - [ ] Integrate with Redline System (redline_system.md)
+    - [ ] Integrate with Redline System (annotation/redline_model.md)
     - [ ] Generate `procedure_correction` events from participant feedback
     - [ ] Link corrections to original procedure matches
     - [ ] Update learned_parameters table from correction events
@@ -717,7 +717,7 @@ Focus {
 - **Related**:
   - `procedure_engine.md` - Procedure matching and redline learning
   - `action_inference_engine.md` - Action detection events
-  - `redline_system.md` - Correction feedback loop
+  - `annotation/redline_model.md` - Correction feedback loop
   - [`docs/design/annotation/federated_belief_network.md`](../../design/annotation/federated_belief_network.md) -
     Distributed compiler-DB coordination. Defines the **Layer 2** belief graph replication
     protocol that sits below the **Layer 3** activity event log specified here. The two layers

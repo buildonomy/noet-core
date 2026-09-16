@@ -53,23 +53,25 @@ modifying the source it annotates.
 | [`living_corpus.md`](annotation/living_corpus.md) | What are the three layers (source, compiled, annotation), and how does the annotation loop close? The current model for how a corpus stays alive. |
 | [`annotation_channel.md`](annotation/annotation_channel.md) | How does a producer — parse, browser, agent — issue a record? The write-side handle: actor, session, minted `EventId`, two lanes (records vs. diagnostics), the halo of stores. |
 | [`overlay_model.md`](annotation/overlay_model.md) | When annotations are projected onto a compiled corpus, what is the resulting object and how is it read? Owner-edge halos, layer composition, and why federation is the same construction. |
-| [`collector_model.md`](annotation/collector_model.md) | Where do records live, who may write them, and how do they move between stores? Store topology, admission as a trust boundary, automatic promotion. |
+| [`collector_model.md`](annotation/collector_model.md) | Where do records live, who may write them, and how do they move between stores? Store topology, admission as a trust boundary, and the case for derived rather than commanded promotion (§4, unratified). |
 | [`attestation_fabric.md`](annotation/attestation_fabric.md) | How is cross-domain provenance recorded, and how do attestation records project onto graph edges (§12.3)? |
+| [`redline_model.md`](annotation/redline_model.md) | How is a proposed change to the corpus recorded, read as a before/after, and handed off or enacted? The general proposal kind. |
 | [`collaboration_overlay.md`](annotation/collaboration_overlay.md) | How can multiple people annotate a *static* generated site, with attested annotations layered over it? |
 | [`federated_belief_network.md`](annotation/federated_belief_network.md) | How do separate corpora share annotations, source, and compiled state across a boundary? |
 
 ## `procedures/` — operational definitions and as-run records
 
-Turning nodes into executable procedures and capturing what actually happened.
-Most of this group is withdrawn; the schema documents remain active.
+Turning documents into executable procedures and deriving what actually
+happened from the record set. Read `procedure_model.md` first; the others
+specify one face of it each.
 
 | Document | Answers |
 |---|---|
-| [`procedure_schema.md`](procedures/procedure_schema.md) | How is a procedure defined as data on a node? **Active.** |
-| [`action_observable_schema.md`](procedures/action_observable_schema.md) | How is an observable action — a step and its expected observation — represented? **Active** as schema; execution integration withdrawn. |
-| [`procedure_execution.md`](procedures/procedure_execution.md) | How would runtime tracking and as-run recording work? **Withdrawn**; retained for its requirements. |
-| [`redline_system.md`](procedures/redline_system.md) | How are as-run deviations from a written procedure tracked and promoted? **Withdrawn** record types; analysis retained. |
-| [`noet_procedures_readme.md`](procedures/noet_procedures_readme.md) | Why observable, auditable, event-driven procedures at all? **Withdrawn** model; positioning argument retained. |
+| [`procedure_model.md`](procedures/procedure_model.md) | What *is* a procedure in a belief graph, where does its state come from, and what is a run? The model the rest of this group elaborates — start here. |
+| [`lifecycle_grammar.md`](procedures/lifecycle_grammar.md) | What notation declares when a step is complete and what an outcome does? **Stub** — the decisions are settled, the grammar is unbuilt (Issue 17). |
+| [`observation_model.md`](procedures/observation_model.md) | How does a step declare the observation that discharges it, whether the observer is a sensor, a system, or a human? |
+| [`deviation_model.md`](procedures/deviation_model.md) | How is the delta between a written procedure and what was done recorded and analysed? The comparison falls out of the fold. |
+| [`procedures_vs_alternatives.md`](procedures/procedures_vs_alternatives.md) | Why this shape rather than a notebook, a workflow DAG, or a declarative reconciler? Positioning against Jupyter, Airflow, and Terraform. |
 
 ## `codecs/` — reading and writing external formats
 

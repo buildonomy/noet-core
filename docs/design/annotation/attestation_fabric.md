@@ -169,7 +169,7 @@ The direction is one-way and structural: a `BeliefEvent` is an instruction
 applied directly; an `Annotation` is a claim requiring interpretation. Folding an
 annotation *emits* BeliefEvents; nothing turns a BeliefEvent back into a record
 (`core/beliefbase_architecture.md` §4.3). So the fold **is** the new
-infrastructure this passage said was unnecessary — Issue 109 owns it, and
+infrastructure this passage said was unnecessary — Issue 105 owns it, and
 `on_belief_event` is the wiring point *downstream* of it.
 
 **Key difference:** noet's event stream is currently designed for belief graph
@@ -269,7 +269,7 @@ credential_type  = "<string — matches policy requirement>"
 
 # What was attested
 kind             = "Comment | SignOff | Flag | IndependenceCheck | SchemaValidation | ..."
-protocol_id      = "<string — from registry, or 'local:<team>:<name>:<ver>'>"
+record_kind      = "<string — from registry, or 'local:<team>:<name>:<ver>'>"
 result           = "pass | fail | n/a"
 evidence_hash    = "sha256:<hex>"   # hash of structured evidence payload; null for Comment/Flag
 
@@ -330,7 +330,7 @@ version          = "sha256:b7c9d..."
 attester_id      = "engineer@example.com"
 credential_type  = "guidance-engineer"
 kind             = "SignOff"
-protocol_id      = "noet:peer-signoff:v1"
+record_kind      = "noet:peer-signoff:v1"
 result           = "pass"
 evidence_hash    = "sha256:e4f2a..."   # structured rationale document
 
@@ -378,7 +378,7 @@ auditor's concern. The server records the stated basis so that:
 
 **`role`** is a free-form string describing how the cited record supports this
 attestation. It is human-readable rationale, not a machine-executable check.
-The machine-executable check is the `protocol_id` on the cited record itself.
+The machine-executable check is the `record_kind` on the cited record itself.
 
 **Provenance is not policy** — with one exception. The sign-off policy for a
 boundary declares what credential types are required; provenance records are
@@ -470,7 +470,7 @@ required = [
 ]
 
 [independence_protocol]
-protocol_id = "noet:schema-validate:v1"
+record_kind = "noet:schema-validate:v1"
 checks = [
     "payload conforms to declared schema",
     "all required fields present",
@@ -555,13 +555,35 @@ of predecessor tracking. The version registry formalizes and generalizes it.
 ### 6.1 Role
 
 The protocol registry is a shared, version-controlled store that resolves
-`protocol_id` strings to their check specifications. It plays the same role as
+`record_kind` values to their check specifications. It plays the same role as
 DNS: a shared vocabulary, not a shared gatekeeper.
 
-A `protocol_id` like `noet:bounds-check:v1` resolves to a registry entry that
+A `record_kind` like `noet:bounds-check:v1` resolves to a registry entry that
 is simultaneously a **check specification**, a **node schema definition**, and
-a **graph traversal role declaration**. The `protocol_id` is the `schema:`
-value used in noet query filters — the same identifier viewed from three angles.
+a **graph traversal role declaration** — the same identifier viewed from three
+angles.
+
+> **One field, one registry.** Every record carries a `record_kind` naming what
+> sort of claim it is (`living_corpus.md` §6), and every entry in this registry
+> is keyed by one.
+>
+> **"Protocol" names a *property of an entry*, not a kind of identifier.** An
+> entry is a protocol when it carries a `checks` block — when it specifies work
+> an attesting agent must perform. A `receipt`'s entry resolves to a payload
+> schema and a lifecycle and no checks; `noet:bounds-check:v1` resolves to those
+> *plus* a check specification. The identifier has the same shape in both cases.
+>
+> So this section governs the check-bearing subset of one registry, not a
+> parallel registry with a parallel field. The `schema:` value used in noet query
+> filters is the `record_kind`, for every kind.
+
+**What this means for a check authored in code.** A machine check — a schema
+validator, a bounds checker — is written as code, but what binds it into the
+corpus is a registry entry: the `checks` block states what the code must verify,
+and `attester_credential` names what the agent running it must hold. The code is
+the implementation; the `record_kind` is the contract. An agent claims "I ran
+`noet:bounds-check:v1`", and the registry is what makes that claim checkable by
+someone who did not write the code.
 
 ```toml
 [[protocol]]
@@ -582,7 +604,7 @@ outputs     = ["pass | fail", "violated_check_id"]
 evidence    = "machine-readable JSON report, hash-bound to input"
 attester_credential = "bounds-checker"
 
-# Node schema definition — fields a node tagged with this protocol_id must carry
+# Node schema definition — fields a node of this record_kind must carry
 [protocol.schema]
 required = ["path", "version", "attester_id", "result", "evidence_hash", "timestamp"]
 optional = ["provenance"]
@@ -632,12 +654,12 @@ the existing traversal syntax (`KIND_SET`, `INPUT_ROLES`, `OUTPUT_ROLES`) handle
 the relational structure.
 
 The `attester_credential` field names the credential type that a passing
-attestation must carry. The attestation server resolves the `protocol_id` at
+attestation must carry. The attestation server resolves the `record_kind` at
 policy evaluation time — a single read-only lookup, with no write coupling.
 
 The five seed protocol entries for the initial registry are:
 
-| `protocol_id` | Schema tag | Primary graph roles |
+| `record_kind` | Schema tag | Primary graph roles |
 | ------------- | ---------- | ------------------- |
 | `noet:peer-signoff:v1` | Human approval with credential | Epistemic → provenance; Pragmatic → boundary |
 | `noet:schema-validate:v1` | Machine schema conformance check | Pragmatic → boundary |
@@ -658,15 +680,18 @@ self-contained in the `evidence_hash` field).
 > are legal.
 >
 > **That is a procedure, and noet already has one definition of it.** A
-> `.procedure` document declares ordered steps with types — `sequence`,
-> `any_of`, `all_of`, `parallel` — which *are* transition semantics. Declaring a
-> second state-machine grammar inside registry entries would give the same
-> concept two schemas, two parsers, and two ways to drift.
+> **lifecycle document** — ordinary markdown carrying `{exit}` and `{outcome}`
+> directives — declares steps whose **exit predicates**
+> (`all` / `any` / `ordered` / `n-of`) range over a resolved node set, with a
+> discriminated **outcome** and an **effect** on the marking (Issue 17). That is
+> the lifecycle definition. Declaring a second state-machine grammar inside
+> registry entries would give the same concept two schemas, two parsers, and two
+> ways to drift.
 >
 > So the registry entry carries a **`NodeVersionRef`** — the general
 > `(bid, content_version)` node reference owned by **Issue 105** — pointing at a
 > procedure document, rather than an embedded `[protocol.states]` block. A
-> custom lifecycle is an authored `.procedure` file plus a registry entry
+> custom lifecycle is an authored lifecycle document plus a registry entry
 > pointing at it — still no code change, and the template is a first-class graph
 > node that can be versioned, reviewed, and annotated like any other content.
 >
@@ -679,7 +704,7 @@ self-contained in the `evidence_hash` field).
 > unrecognized protocol is accepted and marked rather than rejected.
 >
 > **Definition: Issue 17** (procedure codec and schema) owns what a lifecycle
-> *is*. **Fold semantics: Issue 109** owns deriving state from a record log
+> *is*. **Fold semantics: Issue 105** owns deriving state from a record log
 > against one. See `docs/design/annotation/living_corpus.md` §4 for the model.
 
 ### 6.2 Namespacing
@@ -689,7 +714,7 @@ self-contained in the `evidence_hash` field).
 - **`local:<team>:<name>:<ver>`** — experimental protocols; valid but not
   portable across organizations. Teams can use these without registry approval,
   accepting that downstream consumers may not recognize them. When an attestation
-  server receives an attestation referencing a `local:` `protocol_id` it has
+  server receives an attestation referencing a `local:` `record_kind` it has
   never seen, it accepts the attestation but records `policy_status:
   unrecognized_protocol` for that entry. The attestation is never silently
   rejected — unknown local protocols are logged as candidates for registry

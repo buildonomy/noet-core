@@ -8,8 +8,10 @@ title = "Issue 107: Generalized Codec Write-Back — BeliefEvent to Source"
 **Priority**: MEDIUM
 **Estimated Effort**: 4 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: Requires Issue 103 (node source ranges — a codec must know which
-byte span a `Bid` occupies). Blocks Issue 106 (source write-back and redline
-promotion) and the `L3 → L1` arrow in `docs/design/annotation/living_corpus.md`.
+byte span a `Bid` occupies). Blocks Issue 106 (enactment interface) and the
+`L3 → L1` **enact** arrow in `docs/design/annotation/living_corpus.md` §7 — which
+is the conditional arrow, not the arrow that closes the loop. **Blocks nothing
+on the pilot path.**
 **Design doc**: `docs/design/annotation/living_corpus.md` §What Is Not Yet Bidirectional
 
 ## Summary
@@ -17,8 +19,33 @@ promotion) and the `L3 → L1` arrow in `docs/design/annotation/living_corpus.md
 The compile pipeline is bidirectional only *within a single parse*. A codec can
 rewrite the file it just parsed, because it still holds that file's event vector
 — but no codec can accept a `BeliefEvent` for a node it did not just parse and
-turn it into a source edit. Every design that closes the annotate → change loop
-assumes that capability. This issue builds it.
+turn it into a source edit. This issue builds that capability.
+
+> [!IMPORTANT]
+> **This issue is the write half only, and it does not gate loop closure.**
+>
+> The annotate → change loop closes at a **hand-off**: a rendered change package
+> delivered to whatever process owns the target (`living_corpus.md` §7). In most
+> real cases that target is a controlled document, another team's repository, or
+> a generated file, and noet holds no authority to write it.
+>
+> **The change package does not pass through this issue.** It is produced
+> entirely on the read side — project the redline into a graph state, diff it
+> against the corpus, render the result with the record's provenance (Issue 74).
+> No source text is written, and none needs to be. Do not treat this issue as a
+> narrower version of that path; it is different machinery serving a different
+> purpose. What lives here is byte ranges, cmark event vectors, atomic writes,
+> and conflict detection — none of which the render needs.
+>
+> Two consequences for this issue's scope:
+>
+> - **Round-trip fidelity is a per-codec property that must be declarable**, not
+>   assumed of every codec. Issue 106 gates on it together with a per-network
+>   authority declaration.
+> - **This issue is the *last* step of enactment, not the first.** Its input is a
+>   `BeliefEvent` stream that some upstream step already produced. If that stream
+>   comes from folding a redline, the fold is Issue 105's and the projection is
+>   Issue 110's — see the unowned step noted in Issue 74.
 
 ## The current asymmetry
 
@@ -175,6 +202,14 @@ coordinate rather than solving it twice.
    - [ ] Instantiate or reuse the owning codec via `CodecMap`
    - [ ] Group events by target file so each file is opened, mutated, and
          rendered once per batch
+   - [ ] **Apply multiple edits to one file in a single pass**, or sorted
+         descending by offset. A batch is the normal case, not an optimisation:
+         one change package routinely carries several edits to one document
+         (Issue 106 §Redline promotion). Applying them sequentially against
+         ranges recorded before the first edit is **silently corrupting** — the
+         first splice shifts every later offset in the file
+   - [ ] Detect two events targeting overlapping spans and surface it as a
+         conflict rather than applying both
    - [ ] Honour the two-registry dispatch rules (`beliefbase_architecture.md`
          §3.2) — a claimed file must route to its claiming codec
 
@@ -247,18 +282,17 @@ coordinate rather than solving it twice.
   range in ways a non-file substrate could not satisfy. `open`/`apply`/`render`
   is already substrate-neutral in shape; keep it that way. This is a
   don't-foreclose constraint, not a requirement to generalize now.
-- Where does a *new* node get written — a node created in the graph with no
-  existing source site? Appending to the parent document is the obvious answer
-  but is a policy choice. Recommend deferring: Phase 1 writes edits to existing
-  nodes only, which is what redline promotion needs.
+- Where does a *new* node get written? **A redline names the file**, so there is
+  no placement policy to choose: a new document is a path absent from the base
+  map, a new section is content written in place, and a new network is
+  `subnet/index.md` (`living_corpus.md` §5,
+  `identity/generational_archive.md` §6.1). Phase 1 may still restrict itself to
+  edits of existing files, but that is a scope decision rather than a gap in the
+  model.
 
-  Note the upstream half of this is unsolved and larger: a draft has no
-  `(bid, version)` to anchor to, so greenfield content has no place in the
-  annotation model at all yet (`living_corpus.md` §11). The intended anchor is
-  `(parent_bid, parent_version, position)`. If that lands, this issue inherits a
-  harder case than "append to the parent" — a draft may **supplant** an existing
-  position, which means a write that reorders siblings rather than splicing into
-  a span. Do not assume the write set is always a single contiguous range.
+  What this issue does inherit: proposed content may **supplant** an existing
+  position, so a write can reorder siblings rather than splice into a span. **Do
+  not assume the write set is always a single contiguous range.**
 - Does write-back belong in the codec at all, or in a layer above it that owns
   source text and calls codecs only for rendering? The codec has the event vector
   and the range mapping, so it is the natural site — but revisit if the routing

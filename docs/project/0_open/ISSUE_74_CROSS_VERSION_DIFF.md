@@ -2,7 +2,9 @@
 
 **Priority**: MEDIUM
 **Estimated Effort**: 7 days (RELATIVE COMPARISON ONLY)
-**Dependencies**: Issue 66 (Incremental Parse — shard hydration mechanism), Issue 73 (Versioned Rendering — per-version sharded output)
+**Dependencies**: Issue 66 (Incremental Parse — shard hydration mechanism). **For the archive and move-aware diff**: Issue 36's *move-detection* half — the archive stub carries `_identity_hash`, which Issue 36 computes and persists (see `docs/design/identity/generational_archive.md` §3.2). Issue 36's unification half is **not** a dependency and must not gate this issue. **For a browser-side redline diff**: Issue 103 Part D (`GraphBuilder` on wasm32).
+**Design authority**: `docs/design/identity/generational_archive.md` — the archive format, the move-detection ladder, and the redline-as-file-map rule are specified there, not here.
+**Supersedes**: Issue 73 (Versioned Rendering). Shard generations subsume per-version rendered output; a versioned render is recoverable on top of the archive, not the reverse.
 **Version**: 0.1
 
 ## Summary
@@ -12,9 +14,12 @@ Enable structural comparison between two versioned BeliefBase snapshots using th
 No new projection primitives are introduced. Cross-version diff is a score interpretation that falls out of the existing algebra when the score carries content identity instead of relevance weight.
 
 **Two consumers, and the snapshot case is only one of them.** The annotation
-layer's live projection is a held-out BeliefBase — a diff against the root corpus
-context (`docs/design/annotation/living_corpus.md` §2) — so diffing is that layer's *native*
-read operation, not an application of machinery built for snapshots. See
+layer's live projection is a held-out BeliefBase
+(`docs/design/annotation/living_corpus.md` §2), so comparison is that layer's
+*native* read operation rather than machinery built for snapshots. Note the depth
+difference: ordinary annotation is **additive** — the overlay only ever adds
+nodes and edges — while a **redline** parses proposed content into a candidate
+graph that may remove or reorder. The second is what needs a full diff. See
 §The Annotation Layer below before fixing the design around versioned builds.
 
 ## Problem
@@ -293,10 +298,18 @@ the only — or the primary — consumer. Per `docs/design/annotation/living_cor
 diff applied to its root corpus context.** The annotation server maintains that
 overlay and merges it continuously on top of the compiled graph.
 
-So for the annotation layer, diffing is not an application of machinery built
+So for the annotation layer, comparison is not an application of machinery built
 elsewhere — it *is* the layer's read operation. "Compiled corpus" versus "corpus
 with the annotation queue folded in" is not a comparison performed on the
-overlay; it is what looking at the overlay means. This issue builds the primitive
+overlay; it is what looking at the overlay means.
+
+**But the two consumers exercise different depths of it.** Projection is
+additive: an annotation owns edges into the nodes it concerns and modifies none
+of them, so the delta is purely new material and the "diff" is the halo. A
+redline's payload parses into a **candidate graph** that can mutate and remove,
+which is where `Difference` over content identity does real work. Build for the
+second and the first falls out; build only for the first and redlines have no
+surface. This issue builds the primitive
 that operation is expressed in, and should be evaluated against that use as much
 as against snapshot comparison.
 
@@ -311,6 +324,75 @@ builds of a corpus is a real need with its own BID-stability problem
 (§Problem, `--hydrate-from`). It is simply no longer the framing that governs the
 annotation half.
 
+### A third consumer: the change package
+
+A **change package** is what crosses the organizational boundary when a redline
+cannot be enacted directly — which is the common case, since most targets are
+controlled documents or repositories noet cannot write to
+(`docs/design/annotation/living_corpus.md` §7). It carries proposed text against
+current text, the rationale, the requirement driving the change, and the impact
+set.
+
+Structurally that is **a diff with provenance attached**, and the diff half is
+this issue's machinery pointed at a *proposed* rather than an *observed* change:
+one side is the corpus as it is, the other is the corpus with a redline's
+replacement folded in. The provenance half the redline record already carries.
+
+Two things follow. The package is a **rendering**, not a new subsystem — no
+bespoke change-request builder is needed. And it is **useful with no write
+authority at all**, which decouples it from Issue 106/107: the render is what a
+human carries to a document-control process, and it is valuable precisely where
+enactment is impossible. Note the direction — the package is produced wholly on
+the *read* side; no source text is written to produce it.
+
+#### The unowned step: what is the second side of the comparison?
+
+This issue diffs two graph states. A change package diffs the corpus against
+**the corpus as it would be if a redline landed**, and nothing currently owns
+producing that second state. Two shapes, and they are not equivalent:
+
+| | **Two-payload** | **Candidate graph state** |
+|---|---|---|
+| What is compared | the redline's proposed text vs. the target node's current text | base graph vs. graph with the redline folded in |
+| Needs a graph? | no | yes |
+| Serves | a single-target redline | a redline whose landing changes several nodes |
+| Coverage of observed data | 8 of 25 hand-written records | all 25 |
+
+The second is required by the real case: one change plan landing flips ten
+coverage tags *and* adds cross-reference blocks citing sections that did not
+exist when the gap was written. No two-payload view shows that.
+
+> **This fork is now settled — the candidate state is required, not preferred.**
+> `docs/design/identity/generational_archive.md` §6 shows the
+> two-payload form is not merely weaker but *insufficient*: proposed text that
+> has never been parsed carries no `_content_hash` and no `_identity_hash`, so it
+> produces no node comparable with the corpus and structurally cannot answer "did
+> this section move." §6.1 fixes the redline's shape as a map of corpus-relative
+> path to content, parsed by the real `GraphBuilder` — the file being the
+> smallest unit at which a parse is total and an anchor therefore well-defined.
+
+> **The candidate side must resolve to the corpus's identities, and must never be
+> stored.** Diff pairs nodes by BID — which is why `--hydrate-from` exists — but
+> the candidate need not have BIDs assigned up front: parsing proposed source
+> resolves each node's key list against the existing graph (`cache_fetch`,
+> `src/codec/builder.rs:4026`), so a node may pair by `Path` or `Id` and carry the
+> corpus BID once paired. Pairing on any `NodeKey` variant rather than BID alone
+> is what lets a retitled section read as an edit instead of a delete plus an add.
+> Reusing the base's BIDs is safe
+> **only** because it is a rendering artifact: it lives in one `QueryPackage`,
+> is discarded after the read, and is never merged back. Persisting it would put
+> two accounts of one node's content in a store with nothing to reconcile them,
+> and `BeliefGraph::union_mut` (`src/beliefbase/graph.rs:706-714`) would resolve
+> the collision by destroying the base node.
+>
+> `docs/design/annotation/overlay_model.md` §2.5 states the rule and §2.6 the
+> constraint behind it. Nothing in the type system distinguishes a safe candidate
+> from an unsafe one, so this issue should assert it in a test: **a candidate
+> package is not reachable from any `BeliefSource` after the render completes.**
+
+Recorded here, as with the annotation case, so the instrument's output shape does
+not foreclose it — not as a dependency in either direction.
+
 Two implications worth carrying while building this:
 
 - **BID stabilization matters differently.** §Problem solves BID instability
@@ -322,19 +404,169 @@ Two implications worth carrying while building this:
   only correctness. Emitting one as `BeliefEvent`s — which is what committing an
   annotation queue means — additionally wants the *most semantically meaningful*
   sequence of primitive operations: "moved this section" rather than "removed
-  here, added there." That is a diff-quality concern this issue does not currently
-  address and does not need to, but the instrument's output shape should not
-  foreclose it.
+  here, added there." **This issue owns that.** Telling a reorder apart from a
+  delete-plus-add, and an edit apart from a replacement, is what a structural
+  diff is for; a comparison that cannot do it reports churn instead of change.
+  Draft content sharpens the same requirement — a draft may *supplant* an
+  existing node's position, so the script must express a move
+  (`PathUpdate` carries an order vector) rather than a removal and an addition
+  (`living_corpus.md` §5).
 
 Not a dependency in either direction; recorded so the machinery is not built in a
 way that serves only the snapshot case.
+
+## Creating an Archive: making "what changed" answerable
+
+**Scope: after the W4 pilot, prioritized by use.** The MVP can say a receipt is
+stale; it cannot say *what* moved. That is `git status` without `git diff` — the
+reader must re-read the document, which is most of the cost the receipt exists
+to remove. This section records the design so the MVP does not foreclose it.
+
+### The store: stub shards plus a blob cache
+
+> **Specified in `docs/design/identity/generational_archive.md` §3.**
+> The format is a stub shard — `BTreeMap<Bid, (ContentHash, IdentityHash,
+> BeliefKindSet)>` plus whole relations — alongside a content-addressed blob
+> store. §3.2 explains why the stub carries `identity_hash` (without it a moved
+> section reads as remove-plus-add); §3.3 gives the measured ~25% cost; §3.4
+> lists the two checks before the format is frozen.
+>
+> **Move detection is a three-stage ladder** (§4): naive diff, exact
+> `identity_hash` match, then TF-IDF over the remainder using the shipped
+> `tokenize`/`Stemmer`/IDF machinery. Stages 2 and 3 belong to
+> `DocumentCompiler`, not `GraphBuilder` (§5) — a move is a cross-file
+> observation and the builder sees one file at a time. Issue 36 owns the
+> detection implementation; this issue consumes it.
+
+This issue's share of the archive is the **read path and the render**:
+
+### The read
+
+1. Receipt's `corpus_version` → that generation's manifest → the stub shards
+   covering its scope
+2. Stubs → blobs for the node bodies
+3. Assemble `BeliefGraph` → `BeliefBase::from` (`src/beliefbase/base.rs:147`) —
+   the existing hydration path, not a new one
+4. `BeliefBase::compute_diff(old, new, scope)` (`:704`) yields the ordered delta,
+   which is this issue's render input
+
+**This is a better `--hydrate-from`.** That flag needs a whole prior shard set on
+disk; the archive rehydrates only the networks a receipt's scope touches.
+Cross-version diff between two builds still wants the flag; diff against *what I
+read* wants the archive.
+
+### Three-way diff: the archive supplies a merge base
+
+A redline records the `corpus_version` it was written against. When the corpus
+has moved past it, the archive resolves that generation and the comparison
+becomes three-way rather than two-way — base, current, proposed. That is what
+separates *the author changed this* from *the corpus changed underneath them*,
+and the two need opposite handling
+(`identity/generational_archive.md` §6.4 has the classification table).
+
+Two consequences for this issue:
+
+- **The `Diff` render mode needs a three-side variant**, or at least must not
+  assume two. A conflict — both sides changed the same span — is a distinct
+  render state from *changed*, and collapsing them loses the distinction that
+  makes staleness actionable.
+- **It degrades cleanly.** With no base generation available the comparison is
+  the ordinary two-way one, still correct and still renderable; what is lost is
+  conflict detection. Build the two-way case first and treat the base as an
+  optional third input.
+
+### Retention
+
+> **Specified in `docs/design/identity/generational_archive.md` §9.** The corpus
+> follows a source-control model: `STAGED` overwritten by default, labelled
+> generations promoted deliberately, on the rule *bless what you cannot
+> re-derive* (§9.1). The annotation layer needs no equivalent — an append-only log
+> discards nothing, so a trail is replayed rather than retained, and its
+> interaction layer is an Issue 105 follow-on (§9.2). §9.3 covers the join: a
+> record's `corpus_version` points at a generation, so a trail is only as
+> replayable as the generations its records reference.
+
+### Yes, this is git's data model
+
+Worth naming, because the resemblance is a design signal in both directions.
+
+| git | here |
+|---|---|
+| blob | node body, content-addressed |
+| tree | stub shard (names + hashes + structure) |
+| commit | a generation |
+| tag | a blessed label |
+| index / working tree | `STAGED` |
+| reachability GC from refs | prunable unless a live receipt points in |
+| `diff A B` | `compute_diff(old, new)` |
+
+Arriving at it independently is evidence the constraints are real. It is also a
+warning: git spent two decades on packing, delta compression, and GC, and a naïve
+version of each is where storage goes wrong. **Using git itself** was considered —
+`beliefbase/archive/` as a nested repo, the same argument the record store makes
+for its own sidecar — and rejected for one hard reason: **the browser cannot run
+git**, and the halo query is meant to work client-side against a static site.
+Msgpack's poor delta compression is a soft second reason.
+
+### The ladder
+
+Three rungs, each useful alone. Do not build rung 2 before rung 1 has users.
+
+1. **Per-node text diff from a blob cache.** For the common case — prose changed
+   in a section I read — what a reader needs is old `payload.text` against new.
+   That is one blob and a string diff rendered through `render_markdown_snippet`,
+   which the halo already uses. No relations, no hydration, no `compute_diff`, no
+   generations.
+2. **Stub-shard generations** for blessed builds, when graph-level diff
+   (containment, edges, ordering) is wanted.
+3. **Packing** if generations proliferate enough to need it.
+
+### Two properties that fall out
+
+- **GC has a derived criterion.** A generation is prunable when no live receipt
+  points into it; blobs are prunable when no retained stub shard names them.
+  Retention is *defined by the receipts* rather than by a separate policy.
+- **Relation diffs come from stored relations, not re-derivation.** The stub
+  shard carries the edges, so nothing has to reconstruct them. Node-level
+  containment still follows the "include the parent" rule (below), but that is a
+  scoping question now, not a derivability one.
+
+### What the MVP must not foreclose
+
+Three constraints, cheap now and expensive later:
+
+- **Issue 104**: a receipt's `tape_hash` must be resolvable to its member set —
+  either a tree object in the archive or a manifest in the receipt payload.
+  Decide at census time; the archive prefers the tree, since receipts share it.
+- **Issue 103 Part B**: the canonical serialization used to compute
+  `content_hash` is the serialization the blob stores. One form, not two.
+- **Issue 66**: the export path holds the prior node when it computes the new
+  hash. Do not structure it so the prior is dropped before the new is written.
+
+### Open
+
+- Whether the archive is one store per corpus or rides the annotation store
+  halo (`annotation_channel.md` §6). It is compiler output, not an annotation,
+  which argues for the former.
+- **Whether a stub carries `BeliefKindSet`** — see the format checks above. This
+  is the one open question that changes the size estimate.
+- Whether a stub shard preserves **tape order** for the scope a receipt covered,
+  or only the network's own ordering. `tape_hash` sorts member hashes lexically
+  by design (`content_versioning.md` §4.3), so order cannot come from the anchor.
+  Within a network, relations carry `WEIGHT_SORT_KEY`, so the stub shard has it;
+  the gap is only for a scope spanning networks.
+- Whether hydration should **close containment automatically** — pull in a
+  member's parent network or document even when the receipt's scope excluded it.
+  It makes a generation self-sufficient for diffing at the cost of retaining
+  shards nobody asked about. A receipt anchored to `id://doc composed_of(*)`
+  already includes its document, so this only bites on hand-written scopes.
 
 ## References
 
 - `docs/design/annotation/living_corpus.md` §2 — the held-out-BeliefBase model of Layer 3's
   live projection; authoritative for why diff is the annotation layer's native
   operation
-- `docs/design/annotation/living_corpus.md` §11 — the annotation-queue diff case above
+- `docs/design/annotation/living_corpus.md` §2 — projection then diff; the annotation-queue case
 - Issue 66: Incremental Parse via Shard Hydration — shard deserialization, `global_bb` hydration
 - Issue 73: Versioned Rendering — per-version sharded output, version selector UI
 - Issue 63: Traceability View (COMPLETE) — primary rendering surface for diff annotations

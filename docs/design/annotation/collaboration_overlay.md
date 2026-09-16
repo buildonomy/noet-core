@@ -105,7 +105,7 @@ The noet-specific fields that compose the anchor are:
   [`content_versioning.md`](../identity/content_versioning.md)**, which is authoritative;
   it is not restated here. What matters to this document: `version` changes when
   the annotated scope changes and not otherwise, and which scope a record anchors
-  to is selected by its `protocol_id`.
+  to is selected by its `record_kind`.
 - **`site_url`** — the canonical base URL of the deployed site (from
   `<script id="noet-base-url">`), disambiguating between multiple deployments
   of the same source
@@ -513,25 +513,26 @@ The federation doc's open question §7.1 (log storage format) applies here:
 SQLite is the simplest start; Automerge unifies with Issue 16 but adds
 complexity. For Phase 1, SQLite is recommended.
 
-### 7.2. `redline_system.md`
+### 7.2. `redline_model.md`
 
-The `redline_system.md` doc defines deviation tracking for procedure
-execution. The collaboration overlay's `Flag` and `Comment` kinds are
-complementary: a flag on a procedure node ("this step is consistently
-skipped") is a precursor to a formal redline. The attestation schema is
-intentionally designed to accommodate redline payloads in Phase 2 without
-schema changes.
+[`redline_model.md`](./redline_model.md) defines the general proposal kind: an
+annotation whose payload says what content should say instead. The overlay's
+`Flag` and `Comment` kinds are complementary to it — a flag ("this is
+outdated") observes, a redline proposes — and the two differ in what they commit
+their author to rather than in how they are stored.
 
-> [!NOTE]
-> **Two corrections.** `redline_system.md`'s record types are withdrawn (it
-> carries a banner); a redline is now an **annotation subtype** — a registered
-> `protocol_id` with a payload schema, owned by **Issue 17** step 2a, with
-> promotion into a source edit owned by **Issue 106**. Consequently **no
-> `AttestationKind::Redline` variant is needed** — that is the enum-variant
-> approach the current model explicitly rejects. The overlay's forward
-> compatibility is better than this section claimed: a new kind is a registry
-> entry, not a code change (`attestation_fabric.md` §6;
-> `beliefbase_architecture.md` §4.3).
+**A redline is a `record_kind`, not an `AttestationKind` variant.** It is a
+registered kind with a payload schema (Issue 104), and promotion of one
+into a source edit is Issue 106's. So the overlay needs **no
+`AttestationKind::Redline` variant** — adding one would be the enum-variant
+approach the record model exists to avoid.
+
+That makes the overlay's forward compatibility stronger than a Phase 2 schema
+change: **a new kind is a registry entry, not a code change**
+(`attestation_fabric.md` §6; `beliefbase_architecture.md` §4.3). Carrying
+redline payloads costs this document nothing, which is why §3.3 can defer
+redlines to a later phase on scope grounds alone — the constraint is the
+write-back path, not the schema.
 
 ### 7.3. noet-core impact
 

@@ -1,38 +1,18 @@
 ---
-title = "Observable Action Schema"
+title = "The Observation Model: How a Step Is Discharged"
 authors = "Andrew Lyjak, Claude"
-last_updated = "2025-01-24"
-status = "Active (schema) / Withdrawn (execution integration)"
+last_updated = "2026-09-14"
+status = "Draft"
 version = "0.2"
-dependencies = ["procedure_schema.md (v0.1)", "procedure_execution.md (v0.1)", "beliefbase_architecture.md"]
+dependencies = ["procedure_model.md", "beliefbase_architecture.md"]
 ---
 
-# Observable Action Schema
+# The Observation Model
 
-> [!IMPORTANT]
-> **Partially withdrawn: the observation model stands, the record types do not.**
->
-> This document has two halves. The **`inference_hint` schema** — grouping and
-> transition events, temporal and confidence constraints, the Participant
-> channel, and `response_config` — is a declarative description of *what pattern
-> to match*. It does not depend on the withdrawn as-run model and is **retained
-> as sound**; Issue 18's stub independently reaffirms its governing insight, that
-> "a prompt is not a step type" and every step advances via an observation
-> regardless of whether the observer is a sensor, a system, or a human.
->
-> The **integration half** — how an observation becomes a record, where response
-> variables are scoped, and what an engine does with a detection — was written
-> against the withdrawn three-piece as-run model. `ProcedureRun` and
-> `ObservationEvent` are withdrawn types and do not exist. The current model is
-> `docs/design/annotation/living_corpus.md` §2 and
-> `docs/project/0_open/ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` → "What Was
-> Removed and Why": **an annotation *is* an as-run record**, a run is the set of
-> annotations sharing a `RunStart` ancestor (a query, not a type), and **an event
-> is an annotation subtype** — a registered `protocol_id` with a payload schema,
-> not a Rust type.
->
-> Affected passages are marked inline. No replacement execution design exists
-> yet; Issue 18 is an aspirational stub.
+> [!NOTE]
+> **This document describes a target architecture.** The `inference_hint` schema
+> below is specified and stable; nothing consumes it yet. What would act on a
+> detection is undesigned and stubbed in §Consuming a detection.
 
 ## Purpose
 
@@ -42,9 +22,31 @@ This document defines the schema for marking procedure steps as **observable** -
 - Recursive pattern structure (grouping and transition events)
 - Temporal and confidence constraints
 - Participant channel for interactive observations
-- Integration with procedure execution
+
+A step declares what would discharge it; a record reports that it happened. This
+document specifies the first half. What a procedure *is*, and how records become
+a marking, is [`procedure_model.md`](./procedure_model.md).
 
 This schema is **general-purpose**: it defines *what patterns to match*, not *how to observe* them. Observation producers (sensors, monitors, scanners, participant input) are product-specific implementations.
+
+> **A channel is an external record store, and this schema is the translation
+> layer.** Issue 108 specifies `RecordSource` — a registered, codec-shaped
+> interface over a store of `R` that noet *addresses* rather than ingests. A
+> channel is one: `source_id` names it, an `inference_hint` is a selector over
+> it, and a detection is a `summarize` result crossing a threshold. The mapping
+> is one-to-one:
+>
+> | This document | Issue 108 |
+> |---|---|
+> | `channel` (`iot`, `participant`, `system`) | `source_id` — a registered `RecordSource` |
+> | `producer` plus pattern | a `RecordRange::Selector` over that store |
+> | a detection | a `summarize` aggregate, not a materialized span |
+> | "noet does not ingest event streams" | Decision 6 — address, never absorb |
+>
+> This is why the schema can stay product-neutral while producers stay
+> product-specific: `RecordSource` is the extension point, and the two
+> `ObservationProducer` / `InferenceEngine` traits below are what an
+> implementation of it looks like from this side.
 
 ## Guiding Principle: Unified Observation Model
 
@@ -94,12 +96,15 @@ Every observable action step is a **BeliefNode** with:
                        │
                        ▼
 ┌─────────────────────────────────────────────────┐
-│ Procedure Engine                                │
-│ • Matches event to waiting step                 │
-│ • Advances state machine                        │
-│ • Records as-run execution                      │
+│ Record store (Issue 105)                        │
+│ • The detection is appended as a record         │
+│ • Folding the record set derives the marking    │
 └─────────────────────────────────────────────────┘
 ```
+
+The third box is where this document stops. Appending the record *is* the
+as-run recording, and the step's completion is derived by folding rather than
+asserted by an engine ([`procedure_model.md`](./procedure_model.md) §4).
 
 ## Schema Definitions
 
@@ -329,19 +334,19 @@ The `Participant` channel enables procedures to request human input. These are *
 
 ### How Participant Observations Work
 
-1. **Procedure reaches Participant channel step**
-2. **Engine emits `observation_requested` event** with the step's BeliefNode data
-3. **Product's UI renderer** subscribes to these events:
-   - Uses step `title` as prompt title
-   - Uses step markdown text as prompt description
-   - Uses `response_config` to render form element
-4. **Participant responds** via UI
-5. **An observation record is emitted** with response data — an annotation
-   carrying a registered `protocol_id`, not a bespoke `ObservationEvent` type
-   (Issue 17 step 2a registers procedural subtypes)
-6. **Inference engine matches** observation to hint
-7. **Procedure advances**, stores response in run context *(run scoping: see the
-   note under "Variable Scoping")*
+1. A step with a Participant-channel hint is **unmarked** — the marking says
+   it is outstanding
+2. A surface **solicits** the observation, using the step's own fields:
+   - `title` as the prompt title
+   - the step's markdown text as the description
+   - `response_config` to render the form element
+3. The participant responds
+4. **A record is appended** carrying the response in its payload, the
+   responding actor, and the step it discharges
+5. **Folding derives the new marking**
+
+Nothing in this flow holds state between steps 1 and 5. Who solicits, and when,
+is undesigned — see §Consuming a detection.
 
 ### Participant Producers
 
@@ -543,12 +548,11 @@ description = "Reference to a contributing observation record (product-specific 
 ```
 
 > [!NOTE]
-> `supporting_data` formerly said "Reference to `ObservationEvent`". That type is
-> withdrawn. A contributing observation is an **annotation** carrying a
-> registered `protocol_id`; a reference to one is an `EventId`, and the
-> "contributed to this match" relation is `caused_by`
-> (`beliefbase_architecture.md` §4.3). The field remains — only its referent's
-> spelling changes.
+> A contributing observation is an ordinary record carrying a registered
+> `record_kind`. A reference to one is an `EventId`, and "contributed to this
+> match" is the `caused_by` relation (`beliefbase_architecture.md` §4.3).
+> `stored_in_variable` names the **payload key** the captured value lands under
+> in the record that captured it; see §Captured values below.
 
 ## Multi-Modal Observations
 
@@ -613,69 +617,94 @@ stores_in_variable = "operator_confirmed"
 Production deployment requires both automated config verification AND explicit operator confirmation. Confirm you have reviewed the deployment plan.
 ```
 
-## Integration with Procedure Execution
+## What a Detection Becomes
 
-> [!CAUTION]
-> **This section describes the withdrawn execution model.** The `inference_hint`
-> schema above is independent of it and stands; what follows presumes a running
-> engine with a mutable run context, which is undesigned. Issue 18 — which owned
-> the execution loop — is an aspirational stub, and `procedure_execution.md`
-> carries the same withdrawal banner. Read the lifecycle below as a statement of
-> the steps an observation must pass through, not as owned mechanics.
+A matched pattern becomes a **record**, appended to the record store. That is
+the whole of the integration, and it is deliberately thin: this document ends
+where the record begins.
 
-### Lifecycle
+1. A step declares an `inference_hint` — the pattern above
+2. An observation source emits observations on a channel
+3. Something matches an observation against the declared pattern
+4. The match is appended as a record naming the step, the actor, and what was
+   captured
+5. Folding the record set derives the marking
+   ([`procedure_model.md`](./procedure_model.md) §4)
 
-1. **Template Loading**: Procedure engine loads BeliefNodes representing steps
-2. **Pattern Registration**: Inference hints registered with observation pipeline
-3. **Step Execution**: When step is reached, procedure state becomes "awaiting_observation"
-4. **Observation Request**: For Participant channel, engine emits `observation_requested` event
-5. **Event Matching**: Observation events matched against registered patterns
-6. **Action Detection**: Inference engine emits `action_detected` events
-7. **Variable Storage**: For responses with `stores_in_variable`, value stored in run context
-8. **Procedure Advancement**: State machine advances to next step
-9. **As-Run Recording**: Execution recorded with observed data — under the
-   current model steps 6–9 are not distinct phases: **appending the annotation
-   *is* the as-run recording**, and advancement is what the fold derives from
-   the record set (`living_corpus.md` §2–§3; folding is Issue 109's)
+Steps 4 and 5 are not separate phases of an engine advancing a state machine.
+**Appending the record is the as-run recording**, and completion is derived, not
+asserted. Nothing holds a run open in memory, and there is no state to lose.
 
-### State Machine Behavior
+Step 3 is undesigned; see §Consuming a detection.
 
-When a procedure reaches an observable action step:
-- **Awaiting Observation**: Pattern registered, waiting for matching event
-- **Observed**: Event received, confidence above threshold
-- **Completed**: Action confirmed, procedure continues
-- **Skipped**: Explicitly bypassed by executor
+### Captured values
 
-### Variable Scoping
-
-> [!CAUTION]
-> **`ProcedureRun` is a withdrawn type and does not exist.** There is no run
-> context object to store a variable in. A run is the set of annotations sharing
-> a `RunStart` ancestor — a query over the annotation store keyed on `run_id`
-> (**Issue 109**) — so a captured value lives in the payload of the record that
-> captured it, and "run-scoped" means *reachable by querying the same `run_id`*.
->
-> **The requirement is sound and unmet**: a later step needing an earlier step's
-> captured value implies a read across records in the same run, and nothing
-> currently specifies how a `condition` expression resolves such a name. That is
-> a design decision for the replacement, not one to make here.
-
-Response variables are **run-scoped**: stored in the run's record set and accessible to subsequent steps:
+A response with `stores_in_variable` names the **payload key** the captured
+value lands under in the record that captured it. There is no run context object
+and no variable environment — a captured value lives in the record, and
+"run-scoped" means *reachable by querying the same `run_id`*.
 
 ```toml
-# Step 1: Capture temperature
 [inference_hint]
 channel = "Participant"
 producer = "Measurement"
 [inference_hint.response_config]
 stores_in_variable = "sample_temp"
-
-# Step 2: Use temperature in conditional
-[[procedure.steps]]
-type = "if"
-condition = "sample_temp < 0"
-# ... handle cold sample
 ```
+
+A record discharging this step carries `sample_temp` in its payload.
+
+> **How a later step reads it is unspecified.** A predicate on a subsequent step
+> that needs an earlier step's captured value implies a read across records in
+> the same run, and no spelling for that name resolution exists. Recorded as an
+> open item in [`lifecycle_grammar.md`](./lifecycle_grammar.md) §5.
+
+### Confidence is payload, not a gate
+
+A `confidence_threshold` on a hint says what the matcher should treat as a
+match. The resulting record carries its confidence in its payload, and a reader
+can weigh or dispute it.
+
+Confidence never silently decides a step's state. A low-confidence match is a
+claim like any other — attributable, disputable, and correctable by a later
+record citing it.
+
+## Consuming a Detection {#consumer-stub}
+
+> **Stub — Issue 18.** This section marks a boundary, not a design.
+
+This document specifies the **pattern a step declares**. It does not specify the
+component that watches a channel, evaluates a pattern against arriving
+observations, and decides a match occurred. That component is undesigned.
+
+What it would have to account for:
+
+- Evaluating temporal constraints (`min_duration_minutes`, `time_of_day`)
+  without making wall-clock time an input to *state* — a duration bound is
+  checked against recorded timestamps, never against "now"
+  ([`procedure_model.md`](./procedure_model.md) §4.3)
+- Deciding which of several open steps an ambiguous observation discharges,
+  given that two procedures may legitimately be in progress at once
+- Soliciting a participant observation: when to ask, whom to ask, and how often
+- Registering and deregistering patterns as a marking changes
+
+**Part of this is Issue 108's, not Issue 18's.** Watching a channel, evaluating a
+pattern against what arrives, and reporting a match are `RecordSource`
+operations — a store implementation's job, behind a registered interface. What
+remains genuinely undesigned is the *procedure-side* half: which open step an
+ambiguous detection discharges, when to solicit a participant observation, and
+how patterns register and deregister as a marking changes. Issue 18 owns that
+half and has chosen none of its candidate directions. The
+related stubs are
+[`procedure_model.md` §Execution is not designed](./procedure_model.md#execution-stub)
+and
+[`deviation_model.md` §Detection is not designed](./deviation_model.md#detection-stub).
+
+Note that a participant-channel step is probably a *specific case* of a general
+mechanism rather than a parallel schema: a procedure is a potentialized
+annotation, and a prompt is one with a response shape attached
+(`living_corpus.md` §5). If the general mechanism is right, this schema is an
+instance of it.
 
 ## Extension Points
 
@@ -706,15 +735,14 @@ Component that matches observation streams to inference hints:
 ```rust
 trait InferenceEngine {
     fn register_pattern(&mut self, node_bid: Bid, hint: InferenceHint);
-    fn process_observation(&mut self, event: ObservationEvent);  // WITHDRAWN TYPE
+    fn process_observation(&mut self, record: &Envelope);
     fn emit_action_detected(&self, detection: ActionDetection);
 }
 ```
 
-> `ObservationEvent` is withdrawn. The parameter is an annotation record
-> (`Envelope` + payload, `beliefbase_architecture.md` §4.3) whose `protocol_id`
-> identifies it as an observation. The trait's *shape* — register patterns,
-> consume observations, emit detections — is unaffected by the renaming.
+> An observation is an ordinary record — `Envelope` plus payload
+> (`beliefbase_architecture.md` §4.3) — whose `record_kind` identifies it as
+> one. There is no observation-specific type.
 
 Responsibilities:
 - Pattern matching (grouping/transition logic)
@@ -728,11 +756,9 @@ Component that displays prompts and captures responses:
 ```rust
 trait ParticipantRenderer {
     fn render_observation_request(&self, step: &BeliefNode) -> Result<()>;
-    fn collect_response(&self) -> Result<ObservationEvent>;  // WITHDRAWN TYPE
+    fn collect_response(&self) -> Result<Envelope>;
 }
 ```
-
-> As above: the return value is an annotation record, not an `ObservationEvent`.
 
 Uses BeliefNode fields:
 - `title` → Prompt title
@@ -823,8 +849,8 @@ Wait for all microservices to report healthy status with normal load for at leas
 ### Product-Specific (Downstream)
 
 - Observation event producers (hardware/software integrations)
-- Observation payload schema (product defines structure, within the annotation
-  record shape — formerly written as "`ObservationEvent` schema", a withdrawn type)
+- Observation payload schema (a product defines the structure, within the
+  record shape)
 - Inference engine implementation (pattern matching algorithms)
 - Confidence scoring formulas
 - Semantic label resolution (mapping labels to concrete values)
@@ -839,10 +865,9 @@ Wait for all microservices to report healthy status with normal load for at leas
 
 Treating all observations (sensors, systems, participants) with the same schema:
 1. **Conceptual simplicity**: One state machine model for all steps
-2. **Consistent as-run recording**: All observations recorded the same way — this
-   is the insight Issue 18's stub preserves as "a prompt is not a step type", and
-   it is strengthened rather than weakened by the withdrawal: one record shape
-   for every observation, distinguished by `protocol_id`
+2. **Consistent as-run recording**: all observations are recorded the same way.
+   **A prompt is not a step type** — one record shape for every observation,
+   distinguished by `record_kind`
 3. **Natural multi-modal patterns**: Easy to combine automatic + manual verification
 4. **Extension friendly**: Adding new observation channels is uniform
 
@@ -911,28 +936,16 @@ is a downstream-application concern.
 
 ## References
 
-**Current model** (read these first):
-
-- **living_corpus.md** §2 - the three-layer model; an annotation *is* an as-run record
-- **beliefbase_architecture.md** §4.3 - `Envelope` + `Annotation`; the assert-vs-mutate boundary
-- **ISSUE_17_NOET_PROCEDURES_EXTRACTION.md** - procedure codec, `steps` schema,
-  and the procedural annotation subtypes (step 2a); "What Was Removed and Why"
-- **ISSUE_104** - annotation record field set · **ISSUE_105** - the record store
-  and `NodeVersionRef` · **ISSUE_109** - `RunStart`/`RunEnd`, `run_id`, folding
-- **ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md** - **aspirational stub**; its prior
-  draft design (the execution loop this document's integration half assumes) is
-  withdrawn and not yet replaced
-
-**Withdrawn framing, retained for requirements:**
-
-- **procedure_execution.md** - execution lifecycle (carries a withdrawal banner)
-- **redline_system.md** - as-run deviation tracking (same framing)
-
-**Unaffected:**
-
-- **procedure_schema.md** - Core procedure schema
-
-## Version History
-
-- **v0.1** (2025-01-24): Initial schema definition, migrated from product workspace
-- **v0.2** (2025-01-24): Unified model - merged participant prompts into observable actions, clarified BeliefNode structure
+- [`procedure_model.md`](./procedure_model.md) — what a procedure is; how a marking is derived
+- [`lifecycle_grammar.md`](./lifecycle_grammar.md) — the notation that declares when a step is complete
+- [`deviation_model.md`](./deviation_model.md) — what happens when an observation contradicts the template
+- [`procedures_vs_alternatives.md`](./procedures_vs_alternatives.md) — why observation rather than embedded execution
+- [`../annotation/living_corpus.md`](../annotation/living_corpus.md) §2 (annotations as `R`), §5 (conduits; a prompt as a potentialized annotation)
+- [`../core/beliefbase_architecture.md`](../core/beliefbase_architecture.md) §4.3 — `Envelope` and the assert/mutate boundary
+- `ISSUE_17_NOET_PROCEDURES_EXTRACTION.md` — the lifecycle grammar
+- `ISSUE_104_ANNOTATION_VOCABULARY.md` — the record field set
+- `ISSUE_105_RECORD_STORE_AND_FOLD.md` — the store, run brackets, and the fold
+- `ISSUE_18_EXTENDED_PROCEDURE_SCHEMAS.md` — what consumes a detection; undesigned
+- `ISSUE_108_RECORD_SOURCES.md` — `RecordSource` and `RecordRange`; a channel is
+  one, and the address-never-ingest rule is why this schema matches rather than
+  ingests

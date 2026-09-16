@@ -421,8 +421,12 @@ while a section is editable — which is why unification is safe there and not h
 
 - **Node deletion and orphaned anchors.** An annotation anchored directly to a
   node whose BID migrates — or to a deleted node — has no specified behaviour.
-  `content_versioning.md` §8 raises the structurally identical question from the
-  staleness side; they should be answered together.
+  The anchor is intact; its target is not, which is a different condition from
+  staleness and wants a different presentation. It arises only for stores that
+  accept promotion, since a regenerated-scope record does not outlive the parse
+  that wrote it — so it is a UX question owned by a follow-on to Issue 105.
+  `content_versioning.md` §8 raises the structurally identical case from the
+  staleness side; answer them together.
 
 ## 9. References
 

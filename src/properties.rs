@@ -254,9 +254,16 @@ impl Bid {
         *self.parent_bref().bytes() != BID_NAMESPACE_NIL
     }
 
-    /// Mutates the BID's namespace to match the parent namespace ID. This is useful for
-    /// transforming uninitialized BIDs (generated from [Bid::default] or [Bid::nil]) into
-    /// initialized BIDs.
+    /// Stamp `parent`'s bref into octets 10-15, making it this BID's **derivation
+    /// parent** — the BID this one was generated from. Useful for transforming
+    /// uninitialized BIDs (from [Bid::default] or [Bid::nil]) into initialized ones.
+    ///
+    /// **Derivation parent is not graph containment**, though for a section node
+    /// they are the same node in opposite roles: `builder.rs` generates a
+    /// section's BID from its containing node, which is also the *sink* of that
+    /// section's Section edge. Containment runs contained → container; derivation
+    /// runs container → contained. Never read this field as evidence about edge
+    /// direction. See `docs/design/identity/identity_derivation.md` §4.
     pub fn adopt_into(&mut self, parent: &Bid) -> Bid {
         let mut self_bytes = *self.0.as_bytes();
         self_bytes[10..16].copy_from_slice(parent.bref().bytes());
@@ -275,8 +282,8 @@ impl Bid {
     /// - All system BIDs (API versions, href tracking, etc.) are derived from
     ///   one of the UUID_NAMESPACE_* contstants
     ///
-    /// - When creating BIDs via `Bid::new()` or similar, the parent's namespace becomes the child's
-    ///   parent_namespace_bytes (octets 10-15)
+    /// - When creating BIDs via `Bid::new()` or similar, the derivation parent's
+    ///   bref is stamped into octets 10-15 of the new BID
     ///
     /// - We check if those bytes match the Buildonomy namespace (octets 10-15 of
     ///   UUID_NAMESPACE_BUILDONOMY)
@@ -296,9 +303,11 @@ impl Bid {
         self.0.as_simple().encode_lower(&mut Uuid::encode_buffer())[..BREF_IDX_START].to_string()
     }
 
-    /// Return the least significant 6 bytes of the Bid's UUID buffer. Per UUIDv7 format and BID
-    /// construction, these bits work as a key to the identity of the BID for the generating source
-    /// (parent) of this id.
+    /// Return the least significant 6 bytes of the Bid's UUID buffer — the bref of
+    /// this BID's **derivation parent**, the BID it was generated from.
+    ///
+    /// Not a containment relation: see [Bid::adopt_into] for why the two differ
+    /// even when they name the same node.
     pub fn parent_bref(&self) -> Bref {
         // We can unwrap because we know that UUIDs will have 16 bytes
         let mut arr = [0u8; 6];
@@ -306,15 +315,17 @@ impl Bid {
         Bref(arr)
     }
 
-    /// Generate a parent namespace from this ID, for use as the source context when generating
-    /// another BID, or for determining whether this BID is the source context for a pre-existing
-    /// BID.
+    /// Generate this BID's namespace key — what gets stamped into a BID generated
+    /// *from* this one, and what [Bid::is_parent_filter] matches against to find
+    /// BIDs already derived from it.
     pub fn bref(&self) -> Bref {
         generate_namespace(self).parent_bref()
     }
 
-    /// Generate a filter function to determine whether the input's [Bid::parent_bref] matche
-    /// this object's [Bid::bref].
+    /// Generate a filter matching BIDs whose **derivation parent** is this BID —
+    /// that is, whose [Bid::parent_bref] equals this object's [Bid::bref].
+    ///
+    /// This selects by identity lineage, not by graph containment.
     pub fn is_parent_filter<U>(&self) -> impl Fn(&U) -> bool
     where
         U: AsRef<Bid>,

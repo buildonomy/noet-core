@@ -5,9 +5,9 @@ title = "Issue 66: Incremental Parse via Shard Hydration"
 
 # Issue 66: Incremental Parse via Shard Hydration
 
-**Priority**: MEDIUM
+**Priority**: HIGH — first in the living-corpus sequence (planning Issue 31, Wave B)
 **Estimated Effort**: 5 days (RELATIVE COMPARISON ONLY)
-**Dependencies**: Requires Issue 50 (sharding), Requires Issue 64 (MCP — first consumer of static shard loading); Informs Issue 11 (LSP); Feeds Issue 102 (`noet serve` — owns the `/events` shard-invalidation endpoint that consumes this issue's per-network `compiled_at` values, and with it the supersession of Issue 41's BeliefEvent streaming)
+**Dependencies**: Requires Issue 50 (sharding), Requires Issue 64 (MCP — first consumer of static shard loading); Informs Issue 11 (LSP); Feeds Issue 102 (`noet serve` — owns the `/events` shard-invalidation endpoint that consumes this issue's per-network `compiled_at` values, and with it the supersession of Issue 41's BeliefEvent streaming). **Blocks Issue 105 and every annotation anchored to `(bid, version)`** — see § Why this issue is first.
 
 ## Summary
 
@@ -16,14 +16,66 @@ title = "Issue 66: Incremental Parse via Shard Hydration"
 store. Both are unnecessary once shards are treated as the durable, structured
 representation of a completed parse pass.
 
-This issue makes shards the authoritative cross-invocation artifact by: (1) embedding
+This issue makes shards the authoritative cross-invocation artifact by: (1) hydrating
+the in-memory DB from the previous run's shards **before** parsing, so that unchanged
+nodes resolve to their existing BIDs instead of minting new ones; (2) embedding
 per-network `compiled_at` timestamps and source content hashes into the shard manifest
-so clean networks can be skipped on re-parse; (2) hydrating the in-memory DB from shards
-at startup so `noet watch` no longer needs a file-based DB; and (3) exposing the
-`last_diagnostics` accessor that MCP (`check_consistency`) and LSP
-(`publishDiagnostics`) need. A configurable memory budget governs how much shard data
-is kept in the in-memory DB at once, with eviction back to shard files when the limit
-is approached.
+so clean networks can be skipped on re-parse; (3) making `noet watch` stateless between
+restarts by removing its file-based DB; and (4) exposing the `last_diagnostics`
+accessor that MCP (`check_consistency`) and LSP (`publishDiagnostics`) need. A
+configurable memory budget governs how much shard data is kept in the in-memory DB at
+once, with eviction back to shard files when the limit is approached.
+
+## Why this issue is first
+
+**BID stability is the primary deliverable. Skip logic is the secondary one.** An
+earlier framing of this issue led with incremental skip and treated hydration as the
+mechanism that makes skip possible. That ordering is backwards for the program this
+issue now gates.
+
+`Bid::new` is time-based (`Uuid::now_v6`, `src/properties.rs:239-241`). A node that
+`cache_fetch` cannot resolve against `global_bb` gets a fresh BID on every parse
+(`src/codec/builder.rs:2306-2308`, `NodeSource::Generated`). Today the only way a BID
+survives across invocations is either `--write` (persist it into source frontmatter)
+or `noet watch`'s `belief_cache.db`. **Neither is available on the corpora this
+program targets:**
+
+- **Generated corpora cannot be written back to.** Where source files are produced by
+  an upstream generator on each build, `--write` is pointless — the next regeneration
+  discards the injected BIDs. The generator emits stable `id:` frontmatter but no
+  `bid:`; measured on one such corpus, zero of ~120 generated documents carried a BID.
+- **CI builds are cold.** The production render path is a one-shot `parse` with no
+  `--db` and no `--write`, so every build mints every non-persisted BID afresh.
+
+The consequence: **every annotation anchored to `(bid, version)` is orphaned on the
+next build**, regardless of how good the version hash is. `content_versioning.md` §6
+states the determinism requirement for the *hash*; this issue is what makes the *BID*
+half of the anchor deterministic across builds. Without it, Issue 105's store cannot
+survive a rebuild on the pilot corpus, and the living corpus has no anchor to stand on.
+
+Hydrating the prior shards into `global_bb` before parsing gives `cache_fetch` a
+`GlobalCache` hit for every unchanged heading, so only genuinely new content reaches
+`Generated`. **This must hold for dirty networks too** — a network with one edited
+file still has hundreds of unchanged headings whose BIDs must be preserved, so its
+prior shard is hydrated and then overwritten by the re-parse, never skipped over.
+
+Two further reasons this precedes the annotation wave rather than following it:
+
+- **Corpus currency.** A compute-limited CI runner cannot afford a full re-parse of a
+  large corpus daily; an out-of-date corpus is not annotatable in any useful sense.
+  Skip logic is what makes a daily build affordable.
+- **Iteration speed** on the served corpus, for ordinary corpus work. This is real but
+  is the weakest of the three — the annotation layer's own development loop should run
+  against a small fixture, not the production corpus.
+
+> **Operational consequence, outside this repo.** Shard-based BID stability holds only
+> across an unbroken shard chain: the previous run's `beliefbase/*.msgpack` and
+> manifest must be **restored as an input** before `parse` runs in CI, not merely
+> published as an output. Losing the chain once re-mints every BID. Consumers of the
+> anchor should therefore carry a secondary re-attachment key (source path plus
+> frontmatter `id:` or heading slug) — that is Issue 105's concern, noted here so
+> the chain's fragility is not mistaken for an Issue 66 defect. The CI restore step is
+> a planning-repo item, not a noet-core one.
 
 **Lifecycle clarification**: the in-memory DB is *authoritative* while the process is
 running. During a `watch` session, multiple consumers (browser viewer, MCP clients,
@@ -38,6 +90,9 @@ changing the startup sequence. See Architecture § File-based DB for debugging.
 
 ## Goals
 
+- **A node whose source is unchanged between two `noet parse` runs keeps its BID**,
+  with no `--write` and no `belief_cache.db`, provided the prior run's shards are
+  present. This holds for nodes in dirty networks as well as clean ones.
 - `noet parse` skips networks whose constituent source files all hash identically to
   the values recorded in their shard, reducing re-parse time proportionally to the
   unchanged fraction of the corpus
@@ -71,13 +126,26 @@ is identical for both commands:
 ```
 Startup:
   1. Read existing shard manifest (if present) → identify clean/dirty networks
-  2. Hydrate in-memory DB from clean network shards (within memory budget)
-  3. Parse only dirty networks → stream events into in-memory DB
+  2. Hydrate in-memory DB from ALL prior network shards (within memory budget) —
+     clean networks so they can be skipped; dirty networks so their unchanged
+     nodes resolve to existing BIDs via cache_fetch during the re-parse
+  3. Parse only dirty networks → stream events into in-memory DB, overwriting
+     the hydrated state for those networks
   4. finalize_html → write updated shards from DB state + emit last_diagnostics snapshot
 
 noet watch (continuous loop):
   File change → mark containing network dirty → repeat steps 3-4 for dirty set only
 ```
+
+Step 2 hydrating *dirty* networks is the part that distinguishes this design from a
+pure skip cache, and it is the load-bearing part (§ Why this issue is first). On a
+re-parse, `GraphBuilder::push` calls `cache_fetch`, which checks `doc_bb` →
+`session_bb` → `global_bb`; a hit returns the existing node and BID
+(`NodeSource::GlobalCache`), a miss mints `Bid::new(parent_bid)`
+(`src/codec/builder.rs:2306-2308`). The hydrated shard is what turns the second case
+into the first for every heading whose path key has not changed. If the memory budget
+cannot hold every prior shard, **dirty networks are hydrated first** — skipping a clean
+network costs a re-parse; failing to hydrate a dirty one costs its BIDs.
 
 `noet watch` becomes stateless between restarts: it always cold-starts from shards,
 never needs `belief_cache.db`. The file-based DB is deleted from the watch startup
@@ -161,6 +229,13 @@ source and stops being a skip decision anywhere.
 treats assets: one content hash per file in scope, produced during the index build and
 handed to the skip logic.
 
+> **Do not drop the prior node before the new hash is written.** A follow-on
+> capability (Issue 74 §Archive) writes a content-addressed store of prior node
+> states alongside the shards, and export is the one place where the hydrated
+> prior and the freshly parsed node are both in hand. Nothing here needs to
+> *build* that store — only to avoid a structure that discards the prior state at
+> the moment the new hash is computed. This is a don't-foreclose constraint.
+
 The precedent already ships. `DocumentCompiler::process_asset_batch`
 (`src/codec/compiler.rs:1016-1026`) does exactly this for every asset — `tokio::fs::read`
 plus SHA-256, concurrency-bounded by a semaphore. This step generalizes it to the source
@@ -200,7 +275,8 @@ Before dispatching parse work for a network, `DocumentCompiler` (or its caller i
 
 If all four hold: skip the network. Emit a `tracing::debug!` line noting the skip and
 the shard age. If any hash differs, the file set differs, or the shard is absent:
-proceed with normal parse.
+proceed with normal parse — **with the network's prior shard already hydrated into
+`global_bb`** (if one exists), so the re-parse preserves BIDs for its unchanged nodes.
 
 The evaluation never terminates on an mtime comparison. A cheap `stat` may be used to
 short-circuit toward *dirty* (a newer mtime is a sufficient reason to re-parse without
@@ -222,8 +298,9 @@ for not needing one.
 
 ### Shard hydration into in-memory DB
 
-At startup, after reading the manifest and identifying clean networks, the clean
-shards are loaded into the in-memory DB via a new `hydrate_from_shards` function:
+At startup, after reading the manifest and classifying networks, **all** prior shards
+are loaded into the in-memory DB via a new `hydrate_from_shards` function — dirty
+networks first, then clean ones, until the budget is reached:
 
 ```rust
 async fn hydrate_from_shards(
@@ -235,11 +312,23 @@ async fn hydrate_from_shards(
 ) -> Result<(), BuildonomyError>
 ```
 
-Each clean network's `{bref}.msgpack` is deserialized and its nodes/edges are
-inserted into the DB via the existing `Transaction::add_event` path — the same path
-used during live parse. Networks are hydrated in ascending `estimated_size_mb` order
-until the budget is reached; remaining clean networks are left on disk and loaded on
-demand when a query touches them.
+Each network's `{bref}.msgpack` is deserialized and its nodes/edges are inserted into
+the DB via the existing `Transaction::add_event` path — the same path used during live
+parse. `dirty_brefs` is consulted for **priority**, not exclusion: dirty networks are
+hydrated first (their prior state is what preserves BIDs through the re-parse), then
+clean networks in ascending `estimated_size_mb` order until the budget is reached.
+Remaining clean networks are left on disk and loaded on demand when a query touches
+them. A dirty network whose prior shard could not be hydrated is re-parsed anyway and
+logs a `tracing::warn!` that its BIDs may not be preserved.
+
+**Fidelity requirement for BID preservation.** `cache_fetch` resolves a heading by
+`NodeKey::Path` computed from `speculative_path_key`; the hydrated shard must therefore
+populate the `paths` table with the same network-relative keys a live parse would
+produce, or every lookup misses and silently falls through to `Generated`. Issue 75
+found this path fragile once already (`beliefbase_architecture.md` §2.2.1, the
+`cache_fetch` miss when `--write` was off). The test that decides whether this issue
+delivers its primary goal is the BID-stability round-trip in § Testing Requirements,
+not the skip-rate test.
 
 The `ShardConfig::memory_budget_mb` field (already present, already used by the
 browser viewer to cap client-side shard loading) is reused here as the server-side
@@ -283,6 +372,37 @@ a different purpose: **write-only debugging output**.
 This is distinct from the eliminated `belief_cache.db` (cross-session persistence)
 and from the in-memory DB (live query surface). The debug DB is a window into the
 live session, not a cache or persistence layer.
+
+### CLI consequences: `--write` retires, `--html-output` becomes required
+
+Once shards are the identity store, `--write` has no remaining job on the parse
+path. Its purpose was to persist time-based BIDs into source frontmatter so they
+survive the next invocation (`compiler.rs:977-989` preserves `rewritten_content`
+across re-parses for exactly this reason). Hydration does that without touching
+source, and does it for corpora where source *cannot* be touched. Keeping both
+mechanisms means two identity stores that can disagree — a frontmatter BID and a
+shard BID for the same heading — which is worse than either alone.
+
+- **Remove `--write` from `Parse` and `Watch`** (`src/cli.rs:194`, `:262`).
+  `DocumentCompiler::new`/`with_html_output` lose the `write: bool` parameter;
+  `parse_one_path`'s write-back block (`compiler.rs:2158-2175`) goes with it.
+  The `generate_source() != content` check (`builder.rs:1488-1496`) stays — it
+  still answers "did normalization change anything?" for diagnostics, and Issue
+  107 (codec write-back) will need it — but nothing acts on the answer here.
+- **Make `--html-output` required on `Parse`** (`cli.rs:202`). The shard
+  directory lives under it, and a parse that writes no shards preserves no
+  identity; a parse with no output directory is now a parse whose BIDs are
+  discarded, which is not a mode worth supporting. `Watch` already requires an
+  output directory when `--serve` is set; make it unconditional there too.
+- **What `--write` also did**: link normalization and frontmatter merge ride the
+  same `rewritten_content` path. Those are source *edits*, not identity
+  persistence, and they belong to Issue 107's write-back — which runs through
+  `BeliefEvent` → codec, not through a parse-time flag. Record in Issue 107 that
+  it inherits normalization-on-request; do not preserve `--write` as a stopgap.
+
+Existing tests that pass `write = true` to exercise BID persistence
+(`tests/codec_test/bid_tests.rs`, `compiler.rs:6577-6611` `collect_bids`) are
+rewritten to persist via shards instead — see § Testing Requirements.
 
 ### `last_diagnostics` accessor on `DocumentCompiler`
 
@@ -411,7 +531,7 @@ and falls back to loading the single `beliefbase.msgpack`.
    - [ ] Note: Issue 11 (LSP `publishDiagnostics`) is the second consumer — add
          the accessor once, coordinate to avoid duplication
 
-3. **Incremental skip + shard hydration in parse/watch startup** (1.5 days)
+3. **Shard hydration + incremental skip in parse/watch startup** (1.5 days)
    - [ ] Read existing `beliefbase/manifest.json` at startup (both `noet parse` and
          `noet watch`); classify each network as clean or dirty by comparing stored
          `source_hashes` against the hashes computed in step 1b
@@ -419,13 +539,21 @@ and falls back to loading the single `beliefbase.msgpack`.
    - [ ] Assert the invariant in review: no code path may conclude *clean* from an
          mtime comparison. A `stat` may short-circuit toward *dirty* only
    - [ ] Implement `hydrate_from_shards(db, output_dir, manifest, dirty_brefs,
-         memory_budget_mb)`: deserialize each clean network's `{bref}.msgpack` and
-         insert into the in-memory DB via `Transaction::add_event`; hydrate in
-         ascending `estimated_size_mb` order until budget is reached; leave remaining
-         clean networks on disk for on-demand reload
+         memory_budget_mb)`: deserialize each prior network's `{bref}.msgpack` and
+         insert into the in-memory DB via `Transaction::add_event`. **Hydrate dirty
+         networks first**, then clean ones in ascending `estimated_size_mb` order
+         until budget is reached; leave remaining clean networks on disk for
+         on-demand reload. Warn when a dirty network's prior shard could not be
+         hydrated
    - [ ] Call `hydrate_from_shards` before `parse_all` / the watch loop, passing the
          classified dirty set
-   - [ ] Parse only dirty networks; clean networks' data is already in the DB
+   - [ ] Parse only dirty networks; clean networks' data is already in the DB. Confirm
+         that the re-parse of a dirty network resolves unchanged headings through
+         `cache_fetch` → `GlobalCache` rather than `Generated` — check the hydrated
+         `paths` table matches what `speculative_path_key` computes
+   - [ ] **`--force` re-parses everything but still hydrates first.** Force means
+         "do not trust the skip decision", not "discard identity". A separate
+         `--fresh-bids` (or equivalent) is the only way to intentionally re-mint
    - [ ] Add a summary line at `tracing::info!` level:
          `"N/M networks reused from shard cache; K networks re-parsed"`
    - [ ] Remove `belief_cache.db` file creation from `noet watch` startup path;
@@ -466,10 +594,37 @@ and falls back to loading the single `beliefbase.msgpack`.
 
 ## Testing Requirements
 
+- **BID stability round-trip (the primary test)**: parse a multi-network fixture;
+  record every node's BID from the shards; edit one file in one network; parse again
+  with the prior shards present. Every node whose source is unchanged — including
+  nodes in the *edited* network — has the same BID as before. Only nodes whose heading
+  text or position changed may differ. **This test is expected to fail before this
+  issue lands**, because every non-persisted BID is currently re-minted per parse.
+
+  **Build this by adapting `tests/codec_test/bid_tests.rs`, not from scratch.** Its
+  `test_sequential_db` / `test_parallel_db` already do the right shape: parse 1
+  populates a persistent store, parse 2 cold-starts from it with a fresh compiler and
+  asserts zero `rewritten_content` and zero graph-modifying events. Three changes
+  turn it into this test: (1) the store is the shard directory, not
+  `belief_cache.db`, and parse 2 hydrates from it; (2) parse 1 no longer writes
+  `rewritten_content` to disk (`apply_rewrite`, L210-225) — with `--write` retired
+  the *only* thing carrying BIDs across the two parses is the shards, which is what
+  the test must prove; (3) add the edit-one-file step between the parses, and assert
+  BID equality on unchanged nodes by set comparison rather than only asserting "no
+  events" — the zero-event check is necessary but does not distinguish "same BIDs"
+  from "nothing was compared". The `in_memory` variants stay as-is; they test the
+  parse pipeline, not persistence.
+- BID stability across a shard-only cold start: delete the source tree's `.git` and
+  any `belief_cache.db`, keep the shards, parse again — BIDs are unchanged. Nothing
+  other than the shards may be load-bearing for identity. (The `db` variants above
+  currently prove this for `belief_cache.db`; once that file is removed from the
+  startup path they must prove it for shards, or they test a store that no longer
+  exists.)
 - `noet parse` on an unchanged multi-network source tree of a few thousand documents
   (after an initial full parse) skips all networks and completes in < 1 second,
   *including* the full-tree hash pass
-- `noet parse --force` re-parses everything; output is byte-identical to a fresh parse
+- `noet parse --force` re-parses everything; output is byte-identical to a fresh
+  parse **and BIDs are preserved** — force bypasses skip, not identity
 - Modifying one source file causes only the containing network to be re-parsed; others
   are skipped and their data is present in the DB via hydration
 - A content change is detected regardless of what the mtime does — unchanged, moved
@@ -487,6 +642,9 @@ and falls back to loading the single `beliefbase.msgpack`.
 
 ## Success Criteria
 
+- [ ] **An unchanged node keeps its BID across two cold `noet parse` runs with no
+      `--write`**, given the prior shards, whether or not its network was re-parsed.
+      The BID-stability round-trip test passes
 - [ ] `NetworkShardMeta` has `compiled_at` and `source_hashes` (SHA-256 hex) fields
       with `#[serde(default)]`; existing manifest roundtrip tests pass
 - [ ] `ProtoIndex::build()` produces a content hash per in-scope source file, grouped
@@ -494,7 +652,11 @@ and falls back to loading the single `beliefbase.msgpack`.
       pass 2 only
 - [ ] `noet parse` on an unchanged corpus skips all clean networks, hydrates the
       in-memory DB from shards, and logs a summary line showing reuse count
-- [ ] `--force` bypasses skip logic; output is identical to a fresh parse
+- [ ] `--force` bypasses skip logic but still hydrates prior shards; output is
+      identical to a fresh parse and BIDs are preserved
+- [ ] `--write` is removed from `Parse` and `Watch`; `--html-output` is required on
+      `Parse`; `DocumentCompiler` constructors no longer take `write`. No test passes
+      `write = true`
 - [ ] `noet watch` does not create `belief_cache.db`; startup hydrates from shards
 - [ ] `DocumentCompiler::last_diagnostics()` exists; MCP `check_consistency` live
       mode uses it to surface `UnresolvedReference` diagnostics
@@ -522,8 +684,10 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   generator re-runs, every output file gets a new content hash even when the upstream
   source data is unchanged. In one measured corpus, ~1,260 of the generated Markdown
   documents carried such a timestamp; an incremental parse would correctly classify
-  all of them as dirty and skip nothing. The skip rate on that corpus would be zero,
-  and this issue would deliver no value there while still paying its complexity cost.
+  all of them as dirty and skip nothing. The skip rate on that corpus would be zero.
+  **The BID-stability goal survives this** — dirty networks are hydrated before
+  re-parse, so unchanged headings keep their BIDs even when nothing is skipped — but
+  the corpus-currency goal does not, since every build is still a full parse.
   → **Mitigation**: this **cannot be fixed inside noet-core**. A document whose bytes
   genuinely changed is genuinely dirty, and noet-core cannot know that one field is
   noise. The fix belongs in the generator: move the render timestamp out of
@@ -555,6 +719,20 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   `WEIGHT_OWNED_BY` — see Issue 64 debug notes) will produce query differences.
   → **Mitigation**: Add a round-trip integration test that compares query results
   from a live parse vs. hydration from its own output shards.
+- **Hydration that does not preserve BIDs looks like success.** If the hydrated
+  `paths` table does not match the keys `speculative_path_key` produces, every
+  `cache_fetch` misses, every node is `Generated`, the parse completes, the output
+  renders, and the skip rate is fine — but every BID has changed and every downstream
+  annotation is orphaned. Nothing fails loudly. → **Mitigation**: the BID-stability
+  round-trip test is the gate; additionally log the `GlobalCache`/`Generated` ratio
+  per re-parsed network at `info!`, since a high `Generated` count on a lightly edited
+  network is the symptom.
+- **The shard chain is the identity store, and it can break.** A CI cache miss, a
+  deleted `_site/`, or a shard format change re-mints every BID. → **Mitigation**:
+  this issue makes stability *possible*; keeping the chain unbroken is an operational
+  concern for the deploying pipeline (restore shards before parse), and anchor
+  consumers should carry a secondary re-attachment key. Both are noted in § Why this
+  issue is first; neither is fixed here.
 - **Eviction correctness**: Evicting a network mid-query could produce inconsistent
   results if the eviction races with an in-progress query. → **Mitigation**: Eviction
   only occurs between parse passes (at the idle boundary), never during a query.
@@ -570,15 +748,62 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
 
 ## Open Questions
 
+- **Is a bare-`Trace` node at rest an integrity defect?** Trace marks partially
+  loaded relations — an in-transit condition — and it is stripped on merge. It
+  should therefore never survive into a shard or the DB. The exception is
+  `External | Trace`, which marks a *permanently* incomplete node (href, asset,
+  API, namespace root) where no deeper fetch will ever yield a complete version;
+  those are at rest legitimately and in volume.
+
+  **The invariant to test: at rest, `Trace` implies `External`.** This issue owns
+  it because it owns both crossings — export to at-rest and hydration back — and
+  either is a natural place to assert it. Expect violations on a real corpus:
+  each one is a machinery defect to chase, not a case to accommodate.
+
+  **Indirect evidence says it already holds for shards.** The SPA loads shards on
+  demand across a ~2,445-shard corpus via `bref_index` lookups and `get_context`
+  misses. A node reporting `is_complete() == false` while in fact complete
+  produces spurious fetches and unresolvable metadata panels — a failure class
+  that surfaces immediately in a browser. `export.rs` also states the intent
+  directly: "Trace nodes introduced by balanced traversal (cross-network
+  references) are excluded."
+
+  **`DbConnection` is the untested half.** Bare-Trace rows there would degrade a
+  query result rather than freeze a page — quieter, and likelier to have gone
+  unnoticed. Assert on both crossings.
+
+  Two consumers depend on this. `identity/generational_archive.md` §3.2 drops the
+  kind set from its archive stub on the strength of the invariant, accepting a
+  frivolous blob fetch as the cost of a violation — which is why §3.4 asks for a
+  **loud warning naming the node** rather than silent tolerance.
+  `content_versioning.md` §5.2 excludes Trace from hashing, which becomes vacuous
+  at rest if the invariant holds and still guards the in-memory case if it does
+  not.
+
 - Should `source_hashes` store paths relative to the repo root or relative to the
   network directory? Repo-root-relative is stable across network moves; network-
   relative is shorter. Recommend repo-root-relative for unambiguity.
+- **What preserves a BID when a heading is renamed?** Hydration resolves by path key,
+  so a heading whose slug changes misses `cache_fetch` and re-mints even though it is
+  "the same" section. That is Issue 36's content-identity problem and is explicitly
+  out of scope here — this issue preserves identity for *unchanged* nodes only. State
+  the boundary so a rename-induced re-mint is not filed as an Issue 66 regression.
+- **Should the shards record their own lineage?** A `parent_compiled_at` or manifest
+  hash in `NetworkShardMeta` would let a consumer detect a broken chain ("these BIDs
+  descend from no prior run") rather than inferring it from mass orphaning. Cheap;
+  not required for the primary goal; recommend deferring until an anchor consumer
+  asks for it.
 - Should the incremental skip summary line go to `tracing::info!` or `tracing::debug!`?
   Recommend `info!` — users benefit from seeing that incremental is working.
 - Should eviction be triggered by a size threshold (bytes in DB) or by
   `estimated_size_mb` from the manifest? Manifest estimates are coarse but require no
   DB introspection. DB byte-count is accurate but requires a `PRAGMA page_count`
   query. Recommend manifest estimates for simplicity; revisit if they prove inaccurate.
+- **`--write` removal: hard or deprecated?** Recommend hard removal in the same
+  release as `--debug-db`, with an error pointing at this issue — a deprecated
+  `--write` that still stamps frontmatter BIDs would create the two-identity-store
+  problem § CLI consequences describes. Anyone relying on it for link normalization
+  is waiting on Issue 107.
 - `--db` → `--debug-db` migration: should `--db` be removed immediately or
   deprecated with a warning for one release? Recommend hard removal with a clear
   error message: "The --db flag has been replaced by --debug-db. The file-based DB
@@ -650,9 +875,19 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
 ## References
 
 - [`docs/design/identity/content_versioning.md`](../../design/identity/content_versioning.md) — owns
-  per-*node* content hashing, which is **out of scope for this issue and unowned**.
-  Its §8 open questions (hash input encoding; `External` as content-bearing) remain
-  open. This issue's `source_hashes` is a per-*file* hash and is unrelated.
+  per-*node* content hashing, which is **out of scope for this issue** (Issue 105
+  owns it). Its §6 determinism requirement covers the *hash* half of a
+  `(bid, version)` anchor; this issue supplies the *BID* half. This issue's
+  `source_hashes` is a per-*file* hash and is unrelated to the node hash.
+- `src/properties.rs:239-241` — `Bid::new` is `Uuid::now_v6`; a BID not resolved from
+  cache is time-based and differs on every parse
+- `src/codec/builder.rs:2306-2308` — the `Generated` fall-through in `push` that mints
+  a fresh BID on a `cache_fetch` miss; hydration exists to make this branch rare
+- `docs/design/core/beliefbase_architecture.md` §2.2.1 (Issue 75 finding) — the prior
+  `cache_fetch` miss when `--write` was off; the same path key fidelity governs whether
+  hydration preserves BIDs
+- Issue 36 (content-based section identity) — owns BID preservation across *renames*;
+  this issue covers unchanged nodes only
 - `src/codec/proto_index.rs:348` — `ProtoIndex::build()`, where source-tree hashing
   lands; currently synchronous and metadata-only
 - `src/codec/proto_index.rs:133-307` — `net_dir_partition`, the existing

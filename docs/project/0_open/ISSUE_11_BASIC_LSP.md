@@ -3,7 +3,7 @@
 > [!NOTE]
 > **Re-scoped — this issue is now LSP protocol work only.** Four changes:
 >
-> 1. **The LSP is a PII (Personal Inference Interface) surface**, not a
+> 1. **The LSP is a PII (Personal Inspection Interface) surface**, not a
 >    compilation feature — see `docs/design/annotation/attestation_fabric.md` §13.
 >    Editor diagnostics are inference-engine gap findings (Issue 93); code
 >    actions are procedures firing from rule maps; hover is metadata card
@@ -147,7 +147,7 @@ and the LSP-shaped projection of what `serve` already knows.
 ### Data Structures
 
 **Position Tracking**: specified in
-[`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) and not
+[`ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md`](./ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md) and not
 duplicated here. Issue 103 delivers byte-offset source ranges per node, a
 position → BID lookup for a single document, and ranges on diagnostics. The LSP
 converts byte offsets to LSP `Position` values at the protocol boundary using the
@@ -189,7 +189,7 @@ struct NoetLanguageServer {
 
 ### 1. Consume Issue 103's node ranges (0 days — delivered by Issue 103)
 
-Position tracking is specified and built in [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md). This step is a consumption point only: convert Issue 103's byte-offset ranges to LSP `Position` values via `codec::byte_offset_to_location` at the protocol boundary.
+Position tracking is specified and built in [`ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md`](./ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md). This step is a consumption point only: convert Issue 103's byte-offset ranges to LSP `Position` values via `codec::byte_offset_to_location` at the protocol boundary.
 
 ### 2. Implement LSP Server with tower-lsp (1-2 days)
 
@@ -531,7 +531,7 @@ async fn main() {
 
    Three things follow, none of which belongs to this issue alone:
 
-   - **Staleness policy is per-`protocol_id`**, declared alongside the anchor
+   - **Staleness policy is per-`record_kind`**, declared alongside the anchor
      scope the kind already selects (`content_versioning.md` §3). Discard,
      retain-and-mark, and re-derive are the plausible values.
    - **Flush is promotion between scopes**, which is also how percolation works
@@ -546,7 +546,7 @@ async fn main() {
    data in the graph, which §4's assert/mutate boundary argues against.
 
    **Recommend**: `living_corpus.md` §2 gains the in-memory scope, Issue 105
-   extends its hierarchy downward, Issue 109 owns flush semantics (it already
+   extends its hierarchy downward, Issue 105 owns flush semantics (it already
    owns run brackets, and a flush is a close). Raise before implementing step 4.
 
 1. **Incremental document sync in Issue 11 or defer to Issue 12?**
@@ -567,7 +567,7 @@ async fn main() {
 6. **Where do per-node diagnostics and source positions live?**
 
    > **Resolved — moved to Issue 103.** The design below is carried forward in
-   > [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md), which
+   > [`ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md`](./ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md), which
    > also corrects two details that have since gone stale: `BeliefBase.diagnostics`
    > is already `Vec<ParseDiagnostic>` (not `Vec<String>`), and `BeliefNode` already
    > has a `metadata` field — but a serialized, equality-participating one, not the
@@ -669,7 +669,7 @@ async fn main() {
 
 **Decision 3: Position tracking via BeliefNode metadata field (deferred)**
 - **Resolved — moved to Issue 103.** See
-  [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) Decision 2,
+  [`ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md`](./ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md) Decision 2,
   which carries this design forward and reconciles it with the `metadata: Table`
   field that now exists on `BeliefNode`.
 - Date: [To be filled during implementation]
@@ -699,7 +699,7 @@ async fn main() {
   idle boundary. Supersedes the `DaemonService` model; Issue 10
   ([`2_completed/ISSUE_10_DAEMON_TESTING.md`](../2_completed/ISSUE_10_DAEMON_TESTING.md))
   is completed and its daemon framing no longer applies
-- **Depends On**: [`ISSUE_103_NODE_SOURCE_RANGES.md`](./ISSUE_103_NODE_SOURCE_RANGES.md) - node source ranges and position → BID lookup for hover and diagnostic placement
+- **Depends On**: [`ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md`](./ISSUE_103_LIVING_CORPUS_INFRASTRUCTURE.md) - node source ranges and position → BID lookup for hover and diagnostic placement
 - **Depends On**: [`ISSUE_66_INCREMENTAL_PARSE.md`](./ISSUE_66_INCREMENTAL_PARSE.md) - `last_diagnostics` accessor on `DocumentCompiler` required for `publishDiagnostics`
 - **Uses**: Issue 106 (source write-back) - atomic write path for LSP-initiated writes
 - **Enables**: [`ISSUE_12_ADVANCED_LSP.md`](./ISSUE_12_ADVANCED_LSP.md) - advanced LSP features

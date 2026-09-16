@@ -4,6 +4,13 @@
 **Estimated Effort**: 1-2 days (RELATIVE COMPARISON ONLY)
 **Dependencies**: None (CI orchestration is the consuming project's responsibility)
 
+> [!IMPORTANT]
+> **This issue's conclusion is superseded; its code ships and still works.**
+> `version-selector.js` is built and wired (`assets/viewer.js:63`, `:200`), and
+> nothing here should be deleted yet. What is superseded is the **design note
+> below**: that version identity belongs to CI and noet-core "stays simple" by
+> rendering one version at a time. See §Superseded by the shard archive.
+
 ## Summary
 
 Add a version-selector dropdown to the SPA viewer that reads a `versions.json` manifest and lets readers switch between documentation versions. noet-core provides the viewer JS and CSS; the consuming project's CI is responsible for building each version, arranging the output directory layout, and producing `versions.json`.
@@ -169,16 +176,55 @@ The responsive template (`assets/template-responsive.html`) loads `version-selec
 
 The following are explicitly **not** part of this issue. They are the consuming project's responsibility or future enhancements:
 
-- **`--version-tag` CLI flag**: not needed; CI controls version identity.
+- **`--version-tag` CLI flag**: not needed; CI controls version identity. **Reversed by the archive** — generations are labelled by noet-core.
 - **`versions-manifest` subcommand**: not needed; CI assembles `versions.json`.
 - **`version.json` per-build sidecar**: not needed; CI knows what it built.
 - **`data-version` attribute on `<html>`**: not needed; the JS infers the current version from the URL.
 - **Git tag detection / `GitCache` changes**: not needed; CI sets `--base-url` appropriately.
 - **Role-scoped entry points**: will compose on top of version selection (see `docs/project/UX_AUDIT.md`).
-- **Version diff UI**: structural diff between two versions is a separate feature.
+- **Version diff UI**: structural diff between two versions is a separate feature — **and it is the one that inverts this issue's premise.** Issue 74.
 - **Versioned MCP access**: already possible via `noet mcp --output-dir output/v/v1.0`.
 
-## Design Note: CI-Orchestrated Versioning
+## Superseded by the shard archive
+
+The premise of the design note below is that noet-core can stay simple because a
+version is just *another rendered directory* — CI builds each one, the viewer
+navigates between them, and no internal machinery is needed. That holds for as
+long as the only cross-version operation is **navigation**.
+
+**It stops holding the moment the operation is a diff.** Issue 74's archive
+retains graph generations so a reader can be told *what changed* since they last
+read something. Producing that answer means comparing two `BeliefBase`s — nodes,
+edges, containment, ordering — through `compute_diff`. Two rendered directories
+cannot yield it: diffing HTML gives you changed text, not a changed edge, a
+re-parented section, or a reordered network. The graph-and-property awareness has
+to live inside noet-core, which is exactly the internal infrastructure this issue
+argued was unnecessary.
+
+Two consequences:
+
+- **Version identity moves inward.** A generation is labelled by the archive
+  (`STAGED` by default, promoted deliberately), so `--version-tag` — listed in
+  Out of Scope below — becomes the natural interface rather than a rejected one.
+  `versions.json` is then a *projection* of the generation manifest, and the
+  selector reads that instead of a CI-authored file.
+- **The buildability runs one way.** Generations can reconstruct a versioned
+  render; a set of rendered directories cannot reconstruct generations. So the
+  archive is the lower layer, and this issue's capability sits on top of it.
+
+**Migration, in order.** Nothing here is urgent and nothing breaks in the
+meantime:
+
+1. Issue 74's archive lands with labelled generations
+2. Generations grow a tag vocabulary (promotion subcommands)
+3. `versions.json` becomes a generated projection of the generation manifest
+4. `version-selector.js` reads that; its resolution logic is unchanged
+5. This issue is closed and the design note below withdrawn
+
+Until step 1, the CI-orchestrated path is the only one that exists and remains
+correct. Do not remove the selector.
+
+## Design Note: CI-Orchestrated Versioning (superseded — see above)
 
 Traditional documentation versioning is page-level. noet versions the **graph**: each version is a complete BeliefBase at a specific git state. The version selector switches between graph snapshots.
 
