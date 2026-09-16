@@ -3929,6 +3929,18 @@ impl DocumentCompiler {
             return true;
         }
 
+        // Queued-but-not-yet-parsed dep: another document's forward reference already
+        // pushed this path onto `remainder_queue`, so it is scheduled to produce output
+        // later in this run but has not done so yet. `current_batch` does not contain it
+        // (Phase 2's `leaf_batch` filters out anything already queued), so falling through
+        // to the `current_batch` check below would report "cannot resolve" and the caller
+        // would mark the reference permanently unresolved — before the target had ever
+        // been parsed. Re-queue self instead; the dep's output lands first and this
+        // document resolves on its next pass.
+        if already_queued && !already_processed {
+            return true;
+        }
+
         // Same-batch sibling: pre-incremented before the batch ran, so
         // `already_processed` is true but the dep's parse output is NOT yet in
         // session_bb when siblings run. Self must re-queue to pick up the dep's
@@ -5431,7 +5443,7 @@ mod tests {
     #[cfg(feature = "service")]
     use crate::beliefbase::BeliefAccumulator;
     #[cfg(feature = "service")]
-    use crate::db::{db_init_memory, DbConnection};
+    use crate::db::{db_init_memory_named, DbConnection};
     #[cfg(feature = "git-tracking")]
     use crate::properties::NodeId;
     #[cfg(feature = "git-tracking")]
@@ -6379,9 +6391,11 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         )
         .unwrap();
 
-        // Use the DB-backed accumulator
+        // Use the DB-backed accumulator. Unique DB name: see `db_init_memory_named`.
         let (tx, rx) = unbounded_channel::<BeliefEvent>();
-        let db_pool = db_init_memory().await.unwrap();
+        let db_pool = db_init_memory_named("test_network_children_whitelists")
+            .await
+            .unwrap();
         let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
         let global_bb = accumulator.query_handle();
 
@@ -6502,9 +6516,12 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         )
         .unwrap();
 
-        // Use the DB-backed accumulator (mirrors `noet parse` CLI path)
+        // Use the DB-backed accumulator (mirrors `noet parse` CLI path).
+        // Unique DB name: see `db_init_memory_named`.
         let (tx, rx) = unbounded_channel::<BeliefEvent>();
-        let db_pool = db_init_memory().await.unwrap();
+        let db_pool = db_init_memory_named("test_finalize_html_deeply_nested")
+            .await
+            .unwrap();
         let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
         let global_bb = accumulator.query_handle();
 
@@ -6901,10 +6918,13 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         network_dir: &std::path::Path,
         html_dir: &std::path::Path,
         git_tracking: bool,
+        // Unique per caller: tests run concurrently and `db_init_memory`'s database
+        // name is process-wide, so a shared name means a shared store.
+        db_name: &str,
     ) -> Result<BeliefGraph, Box<dyn std::error::Error>> {
         let (tx, rx) = unbounded_channel::<BeliefEvent>();
 
-        let db_pool = db_init_memory().await?;
+        let db_pool = db_init_memory_named(db_name).await?;
         let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
         let global_bb = accumulator.query_handle();
 
@@ -6974,9 +6994,14 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         )
         .unwrap();
 
-        let graph = compile_to_html_via_db(repo_path, html_dir.path(), true)
-            .await
-            .expect("compile_to_html_via_db must succeed");
+        let graph = compile_to_html_via_db(
+            repo_path,
+            html_dir.path(),
+            true,
+            "test_metadata_in_exported_json",
+        )
+        .await
+        .expect("compile_to_html_via_db must succeed");
 
         // Locate the specific network node created by create_test_network (title "Test
         // Network"), rather than relying on iteration order to pick "the first" network node
@@ -7144,9 +7169,11 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
         let mut compiler = DocumentCompiler::simple(repo_path).unwrap();
 
         // Use the DB-backed accumulator (mirrors noet-core's parse CLI / a downstream
-        // consumer's render CLI path).
+        // consumer's render CLI path). Unique DB name: see `db_init_memory_named`.
         let (tx, rx) = unbounded_channel::<BeliefEvent>();
-        let db_pool = db_init_memory().await.unwrap();
+        let db_pool = db_init_memory_named("test_sync_asset_snapshot_namespace_children")
+            .await
+            .unwrap();
         let accumulator = BeliefAccumulator::new(DbConnection(db_pool), rx);
         let global_bb = accumulator.query_handle();
 

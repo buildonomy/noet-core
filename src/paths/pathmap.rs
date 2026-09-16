@@ -1168,6 +1168,21 @@ impl PathMapMap {
         computed
     }
 
+    /// Is `bid` registered in any network's `PathMap`?
+    ///
+    /// A single `BTreeMap` lookup against the `node_to_nets` reverse index, with no
+    /// per-network probing. The index holds an entry for every BID in every
+    /// `PathMap`'s `bid_map`, so a miss is proof that no network can resolve a path
+    /// for this BID -- the same invariant [`PathMapMap::indexed_path`] relies on to
+    /// return early, asserted by `tests::paths::test_node_to_nets_miss_implies_no_path`.
+    ///
+    /// Answers "is this node anchored?" without building the path string.
+    /// [`PathMapMap::indexed_path`] additionally probes subnet-holding networks to
+    /// *construct* the path, which this deliberately does not do.
+    pub fn has_path_entry(&self, bid: &Bid) -> bool {
+        self.node_to_nets.contains_key(bid)
+    }
+
     /// Test hook: does the reverse index have an entry for `bid`?
     #[cfg(test)]
     pub(crate) fn node_to_nets_contains_for_test(&self, bid: &Bid) -> bool {

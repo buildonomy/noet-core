@@ -2073,17 +2073,40 @@ pub async fn db_init(db_path: PathBuf) -> Result<Pool<Sqlite>, sqlx::Error> {
 }
 
 /// Initialise an **ephemeral in-memory** SQLite pool with the same schema as
-/// [`db_init`].
+/// [`db_init`], under the process-wide `noet_parse` database name.
 ///
 /// Use this for the `parse` command where the DB is a throw-away accumulator:
 /// `DbConnection::apply_batch` commits a single WAL-style transaction per epoch,
 /// which is cheaper than the full `BeliefBase::process_event` + PathMapMap
 /// reconstruction path, but the data does not need to survive the process.
 ///
-/// Each call creates a fresh, isolated database.  The pool is dropped (and the
-/// in-memory DB freed) when the last `Pool<Sqlite>` clone goes out of scope.
+/// # One database per process, not per call
+///
+/// The database is *named*, so every call in the same process attaches to the
+/// **same** in-memory database. That is correct for the CLI, which builds one
+/// pool per invocation, and it is what keeps the schema alive across connection
+/// recycling (see [`db_init_memory_named`]).
+///
+/// It is wrong for concurrent callers that each expect their own store — they
+/// will share one schema and contend on its locks, surfacing as
+/// `SQLITE_LOCKED_SHAREDCACHE` ("database schema is locked: main") when one
+/// caller's migrations race another's in-flight transaction. Tests that run
+/// concurrently must therefore call [`db_init_memory_named`] with a name unique
+/// to the test.
 pub async fn db_init_memory() -> Result<Pool<Sqlite>, sqlx::Error> {
-    // Use a named shared-cache in-memory database: `file:noet_parse?mode=memory&cache=shared`.
+    db_init_memory_named("noet_parse").await
+}
+
+/// [`db_init_memory`], but with a caller-chosen database name.
+///
+/// Two pools opened with the same `name` in one process share a single in-memory
+/// database; two pools opened with different names are fully isolated. Pass a
+/// name unique to the caller (e.g. the test function's name) when isolation is
+/// required.
+///
+/// The database is freed when its last connection closes.
+pub async fn db_init_memory_named(name: &str) -> Result<Pool<Sqlite>, sqlx::Error> {
+    // Use a named shared-cache in-memory database: `file:<name>?mode=memory&cache=shared`.
     //
     // The plain `sqlite::memory:` URI creates a *separate* in-memory database for
     // every new connection.  Under the previous `max_connections(1)` guard this was
@@ -2094,12 +2117,15 @@ pub async fn db_init_memory() -> Result<Pool<Sqlite>, sqlx::Error> {
     // migrations run ("no such table: beliefs").
     //
     // The named shared-cache URI fixes this: all connections to
-    // `file:noet_parse?mode=memory&cache=shared` within the same process see the
+    // `file:<name>?mode=memory&cache=shared` within the same process see the
     // same in-memory schema, so the pool is free to open, close, and recycle
     // connections without losing the migrated schema.  We retain min_connections(1)
     // to keep the DB alive for the pool's lifetime (SQLite drops a named in-memory
     // DB when the last connection to it closes).
-    let options = SqliteConnectOptions::from_str("file:noet_parse?mode=memory&cache=shared")?
+    //
+    // The corollary is that the name is the isolation boundary: callers that must
+    // not see each other's data need distinct names, not merely distinct pools.
+    let options = SqliteConnectOptions::from_str(&format!("file:{name}?mode=memory&cache=shared"))?
         .disable_statement_logging();
 
     let pool = PoolOptions::<Sqlite>::new()
@@ -2138,7 +2164,7 @@ pub async fn db_init_memory() -> Result<Pool<Sqlite>, sqlx::Error> {
     let migrator = Migrator::new(belief_migrations()).await?;
     migrator.run(&pool).await?;
 
-    tracing::debug!("In-memory DB initialised (ephemeral, parse-command path)");
+    tracing::debug!(name, "In-memory DB initialised (ephemeral)");
     Ok(pool)
 }
 
@@ -2158,7 +2184,11 @@ mod tests {
     /// effect is rolled back along with the failure.
     #[tokio::test]
     async fn execute_rolls_back_valid_statements_on_later_failure() {
-        let pool = db_init_memory().await.unwrap();
+        // Unique DB name: tests in this binary run concurrently and a shared name
+        // means a shared in-memory database. See `db_init_memory_named`.
+        let pool = db_init_memory_named("test_execute_rolls_back")
+            .await
+            .unwrap();
 
         let bid = Bid::from(uuid::Uuid::from_u128(1));
         let node = BeliefNode {

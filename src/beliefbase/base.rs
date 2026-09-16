@@ -978,8 +978,45 @@ impl BeliefBase {
                     }
                     Vec::default()
                 });
+            // Preserve WeightKinds on this pair that the current document does not
+            // own.
+            //
+            // `parsed_edges` holds only the kinds this parse is responsible for (see
+            // the ownership filter in Phase 2), but `RelationUpdate` is applied by
+            // `update_relation`, which *replaces* the edge's whole `WeightSet`. When a
+            // (source, sink) pair legitimately carries kinds from more than one
+            // document, emitting this document's kinds alone silently erases the rest.
+            //
+            // The case that matters: a network's `index.md` that also cites one of its
+            // own children by markdown link. The child owns a structural `Section` edge
+            // to the network (`document -> network`); the citation adds an `Epistemic`
+            // edge between the same pair. Parsing the citing document emitted a
+            // `RelationUpdate` carrying only `Epistemic`, dropping the child's `Section`
+            // edge -- after which the child had no Section ancestry, could not be
+            // anchored in any PathMap, and `ExtendedRelation::new` fell back to an empty
+            // `root_path`, rewriting every link to that child with an empty destination
+            // and breaking parse-to-parse idempotency.
+            //
+            // The pair is absent from `old_parsed_edges` (this document never parsed it
+            // before), so Phase 5's per-kind `RelationChange` path does not cover it --
+            // which is why the union has to happen here. This is the same merge
+            // `replace_bid` applies when it re-points an edge onto an existing pair.
+            //
+            // Covered by `link_tests::test_index_linked_target_is_path_resolvable_from_peer`
+            // (fixtures: `tests/network_1/index_linked_{peer,target}_test.md`).
+            let merged_weight = old_set
+                .bid_to_index(source)
+                .zip(old_set.bid_to_index(sink))
+                .and_then(|(src_idx, snk_idx)| {
+                    let relations = old_set.relations();
+                    let graph = relations.as_graph();
+                    graph
+                        .find_edge(src_idx, snk_idx)
+                        .map(|edge_idx| graph[edge_idx].union(weight))
+                })
+                .unwrap_or_else(|| weight.clone());
             new_edges.push((
-                BeliefEvent::RelationUpdate(*source, *sink, weight.clone(), EventOrigin::Remote),
+                BeliefEvent::RelationUpdate(*source, *sink, merged_weight, EventOrigin::Remote),
                 sink_order,
             ));
         }
