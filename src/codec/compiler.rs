@@ -30,7 +30,7 @@ use crate::{
 
 use sha2::Digest;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -180,6 +180,52 @@ pub struct DocumentCompiler {
     /// discoveries and re-parses. The `parse_all` batching path drains this queue into
     /// run count derived batches.
     remainder_queue: VecDeque<PathBuf>,
+    /// Paths re-queued because the *compiler* failed them, not because their content
+    /// has an outstanding dependency.
+    ///
+    /// The distinction matters because the two need different retry budgets and
+    /// different diagnostics. `remainder_queue` holds expected reparses — a document
+    /// citing a sibling that has not been parsed yet — which are a normal part of
+    /// converging the corpus. This queue holds paths whose *seed infrastructure*
+    /// failed: `parse_epoch`'s pre-spawn lookup could not resolve the owning-network
+    /// or document BID, so dispatching the path would mint duplicate nodes under a
+    /// fresh ancestor chain (Issue 97 Bottleneck 8).
+    ///
+    /// Entries from the two queues are never mixed in one batch, so a retry always
+    /// runs against a beliefbase that has absorbed the previous epoch's writes rather
+    /// than racing siblings from the same batch.
+    ///
+    /// The remainder loop **alternates** between the queues rather than draining this
+    /// one greedily. Two fallback epochs in a row are near-pointless: the second sees
+    /// a global state almost identical to the first, because a fallback epoch whose
+    /// paths fail again writes almost nothing. Interleaving a remainder epoch between
+    /// retries is what actually advances the beliefbase, and is therefore the only
+    /// thing that can change a retry's outcome. When one queue is empty the other runs
+    /// regardless — the alternation is a preference, not a requirement.
+    fallback_queue: VecDeque<PathBuf>,
+    /// Retry counter for `fallback_queue`, twinned with `processed`.
+    ///
+    /// Separate from `processed` because the two bound different things.
+    /// `processed` bounds how many times a document's *content* may be re-examined;
+    /// this bounds how many epochs may be spent waiting for the *seed infrastructure*
+    /// to become usable. A path can legitimately exhaust one without the other.
+    ///
+    /// The two are not independent, though, and deliberately so: a deferral is not
+    /// refunded against `processed`. The deferred path will be parsed in the next
+    /// epoch, so the attempt it occupies is a real one. The fallback *substitutes* for
+    /// the reparse the path would otherwise have had rather than adding to it, which
+    /// means a successful first fallback costs exactly what a normal reparse would.
+    /// Only the retry after a failed fallback is additional, and it is the last:
+    /// once `max_fallback_attempts` is spent the path is dispatched best-effort with
+    /// whatever seed exists.
+    ///
+    /// Eviction is terminal so a permanently-unresolvable seed cannot emit a warning
+    /// per epoch for the remainder of the build.
+    fallback_attempts: HashMap<PathBuf, usize>,
+    /// Attempts allowed per path in `fallback_queue` before it is evicted and the
+    /// failure is escalated to a `WARN`. Two chances: the initial deferral plus one
+    /// retry.
+    max_fallback_attempts: usize,
     processed: HashMap<PathBuf, usize>, // Track parse count per path
     max_reparse_count: usize,           // Prevent infinite loops
     /// Last parse result per path. Written by `process_one_parse_result` on every parse
@@ -364,6 +410,9 @@ impl DocumentCompiler {
             builder,
             proto_index,
             remainder_queue: VecDeque::new(),
+            fallback_queue: VecDeque::new(),
+            fallback_attempts: HashMap::new(),
+            max_fallback_attempts: 2,
             processed: HashMap::new(),
             max_reparse_count: max_reparse_count.unwrap_or(2),
             latest_results: HashMap::new(),
@@ -445,6 +494,9 @@ impl DocumentCompiler {
             builder,
             proto_index,
             remainder_queue: VecDeque::new(),
+            fallback_queue: VecDeque::new(),
+            fallback_attempts: HashMap::new(),
+            max_fallback_attempts: 2,
             processed: HashMap::new(),
             max_reparse_count: 2,
             latest_results: HashMap::new(),
@@ -660,7 +712,23 @@ impl DocumentCompiler {
 
         let parse_count = self.processed.get(&path).copied().unwrap_or(0);
 
-        if parse_count > self.max_reparse_count {
+        // A path evicted from `fallback_queue` is making its final, best-effort parse.
+        // Its epochs were spent waiting on seed infrastructure rather than resolving
+        // its own content, and this dispatch is the last one it will get —
+        // `defer_to_fallback_queue` latches the eviction so it is never deferred again.
+        //
+        // Keep the result rather than discarding it as over-budget: the parse ran, and
+        // a degraded parse carries far more of the document than the empty
+        // `ReparseLimitExceeded` placeholder does. What must *not* happen is a
+        // re-queue — nothing downstream will repair the seed, so re-queuing spins
+        // forever. `suppress_requeue` below enforces that, and is the whole reason this
+        // exemption is safe when a blanket exemption is not.
+        let final_best_effort = self
+            .fallback_attempts
+            .get(&path)
+            .is_some_and(|a| *a > self.max_fallback_attempts);
+
+        if parse_count > self.max_reparse_count && !final_best_effort {
             tracing::debug!("[Compiler] Max reparse limit reached for {:?}", path);
             self.latest_results
                 .entry(path.clone())
@@ -675,6 +743,10 @@ impl DocumentCompiler {
                 .push(ParseDiagnostic::ReparseLimitExceeded);
             return;
         }
+
+        // Set for the final best-effort parse of an evicted path: record the result,
+        // but do not schedule another attempt.
+        let suppress_requeue = final_best_effort;
 
         match task_result {
             Err(e) => {
@@ -956,7 +1028,10 @@ impl DocumentCompiler {
                     }
                 }
 
-                if any_corpus_dependency && !self.remainder_queue.contains(&path) {
+                if any_corpus_dependency
+                    && !suppress_requeue
+                    && !self.remainder_queue.contains(&path)
+                {
                     self.remainder_queue.push_back(path.clone());
                 }
 
@@ -1332,9 +1407,9 @@ impl DocumentCompiler {
             // so that deeper subnets whose intermediate parent was rejected (and therefore
             // never ran its own NetworkCodec::parse() to register their rejections) are
             // also suppressed. This handles multi-level filtering, e.g.:
-            //   docs/ whitelists only flight_software_design/** → rejects developers/
-            //   developers/ (never parsed) → sub-networks like new_user/ are still in
-            //   ProtoIndex but must be treated as rejected transitively.
+            //   docs/ whitelists only published/** → rejects internal/
+            //   internal/ (never parsed) → sub-networks like internal/drafts/ are still
+            //   in ProtoIndex but must be treated as rejected transitively.
             let batch: Vec<PathBuf> = group
                 .into_iter()
                 .filter(|d| {
@@ -1740,8 +1815,37 @@ impl DocumentCompiler {
         // dispatch so that process_one_parse_result's reparse-limit check uses
         // consistent counts regardless of which sub-epoch a path lands in.
         let path_order = self.proto_index.ordered_path_index();
-        while !self.remainder_queue.is_empty() {
-            let mut candidates: Vec<PathBuf> = self.remainder_queue.drain(..).collect();
+        let mut last_was_fallback = false;
+        while !self.remainder_queue.is_empty() || !self.fallback_queue.is_empty() {
+            // Alternate between the queues rather than draining either greedily.
+            //
+            // The two queues are never mixed within a batch: a fallback path is being
+            // retried precisely because its seed could not be resolved, so putting it
+            // alongside fresh remainder work would have it race the very siblings whose
+            // writes it is waiting on. Running it as its own epoch guarantees the
+            // preceding `drain_epoch` committed everything the previous epoch produced
+            // before this retry's seed is computed.
+            //
+            // But back-to-back *fallback* epochs are near-pointless, which is why this
+            // ping-pongs instead of draining the fallback queue greedily. A fallback
+            // epoch parses only paths whose seeds already failed; if they fail again
+            // they write almost nothing, so the second epoch's seed sees a global state
+            // essentially identical to the first's. Measured, a back-to-back retry
+            // reached eviction 47ms after its predecessor — an attempt spent against
+            // unchanged state. Interleaving a remainder epoch first means every retry
+            // is evaluated against a beliefbase that has actually advanced, which is
+            // the only thing that could change the outcome.
+            //
+            // When one queue is empty the other runs regardless; the alternation is a
+            // preference, not a requirement.
+            let run_fallback = !self.fallback_queue.is_empty()
+                && (!last_was_fallback || self.remainder_queue.is_empty());
+            last_was_fallback = run_fallback;
+            let mut candidates: Vec<PathBuf> = if run_fallback {
+                self.fallback_queue.drain(..).collect()
+            } else {
+                self.remainder_queue.drain(..).collect()
+            };
             // Sort on pre-increment counts: stable ordering within each processed
             // bucket, tiebroken by DFS position.
             candidates.sort_by_key(|p| {
@@ -2348,9 +2452,38 @@ impl DocumentCompiler {
             // The pre-computation loop is sequential and async; each submap call acquires
             // the global_bb mutex once, and each balanced query runs a bounded traversal.
             // This is acceptable: we are in the pre-spawn setup phase, not inside a task.
+            //
+            // `fallback_indices` collects paths whose ancestor-BID resolution failed on a
+            // reparse (`pn > 1`). Dispatching one with an empty seed is silently unsound:
+            // `initialize_stack`'s slow path cannot find the real ancestor chain either
+            // (that is *why* the lookup failed), so it falls through to `push()`'s
+            // not-found branch and mints a fresh `Bid::new(parent_bid)` for the ancestor
+            // network. Every node the reparse produces is then keyed under that brand-new
+            // network BID, which never collides with the original in any single network's
+            // `PathMap` — so the duplicate-path warning never fires even though the same
+            // heading now exists twice in the corpus.
+            //
+            // These paths are withheld from this batch and deferred to `fallback_queue`
+            // (see `defer_to_fallback_queue`), which the remainder loop dispatches as its
+            // own epoch — still fully parallel, just a small batch containing only the
+            // affected paths. Nothing here runs sequentially. The point of the separate
+            // epoch is ordering, not concurrency: it guarantees a `drain_epoch` has
+            // committed the intervening work before these seeds are recomputed, and the
+            // loop interleaves a remainder epoch between retries so that state has
+            // actually advanced.
+            //
+            // Note what a miss here means. By the time any path is reparsed, epoch 0 has
+            // committed every network (phase 1) and every leaf document (phase 2), so the
+            // whole Section graph exists and only epistemic/pragmatic links can dangle. A
+            // reparse that cannot resolve its own owning-network BID is therefore not
+            // waiting on a propagation delay — the entry was never written, or was written
+            // under a different key. Treat this warning as a corruption signal and look
+            // for who keyed the node wrongly (Issue 97 Bottleneck 8: a directory symlink
+            // re-parented an entire subtree in `net_dir_partition`).
+            let mut fallback_indices: BTreeMap<usize, PathBuf> = BTreeMap::new();
             let mut doc_seeds: Vec<BeliefGraph> = Vec::with_capacity(n);
             {
-                for path in &paths {
+                for (path_idx, path) in paths.iter().enumerate() {
                     // Resolve directory → index file (mirrors parse_one_path).
                     let file_path = if path.is_dir() {
                         match crate::codec::network::detect_network_file(path) {
@@ -2416,13 +2549,22 @@ impl DocumentCompiler {
                                     _ => {
                                         let pn = self.processed.get(path).copied().unwrap_or(0);
                                         if pn > 1 {
+                                            // Do not dispatch this reparse with an empty
+                                            // seed — see the `fallback_indices` comment
+                                            // above for why that silently mints a
+                                            // duplicate subnet. Defer it to a later
+                                            // fallback epoch instead.
                                             tracing::warn!(
                                                 target: "noet_core::codec::fast_path",
                                                 path = %file_path.display(),
                                                 parent_rel_path = %parent_rel_path,
                                                 repo_bref = %repo_bid.bref(),
-                                                "[parse_epoch] seed: net_bid lookup failed on reparse"
+                                                "[parse_epoch] seed: net_bid lookup failed on reparse — \
+                                                 deferring to a fallback epoch. The full Section graph \
+                                                 exists by reparse time, so this indicates the owning \
+                                                 network was never registered or was keyed differently"
                                             );
+                                            fallback_indices.insert(path_idx, path.clone());
                                         }
                                         doc_seeds.push(BeliefGraph::default());
                                         continue;
@@ -2459,13 +2601,21 @@ impl DocumentCompiler {
                             _ => {
                                 let pn = self.processed.get(path).copied().unwrap_or(0);
                                 if pn > 1 {
+                                    // Same rationale as the net_bid case above: an empty
+                                    // seed for a reparse mints a fresh document BID rather
+                                    // than reusing the real one, duplicating this file's
+                                    // content under a new ancestor chain.
                                     tracing::warn!(
                                         target: "noet_core::codec::fast_path",
                                         path = %file_path.display(),
                                         doc_key = ?doc_key,
                                         net_bref = %net_bid.bref(),
-                                        "[parse_epoch] seed: doc_bid lookup failed on reparse"
+                                        "[parse_epoch] seed: doc_bid lookup failed on reparse — \
+                                         deferring to a fallback epoch. The document was parsed in \
+                                         epoch 0, so this indicates it was never registered or was \
+                                         keyed differently"
                                     );
+                                    fallback_indices.insert(path_idx, path.clone());
                                 }
                                 doc_seeds.push(BeliefGraph::default());
                                 continue;
@@ -2533,6 +2683,46 @@ impl DocumentCompiler {
             );
             let mut join_set: JoinSet<EpochTaskResult> = JoinSet::new();
 
+            // Collect results from JoinSet (completion order) into an index-keyed map,
+            // then reconstruct in original path order for deterministic output.
+            type EpochIndexed = (
+                PathBuf,
+                Result<ParseContentWithCodec, BuildonomyError>,
+                Vec<BeliefEvent>,
+            );
+            let mut indexed: HashMap<usize, EpochIndexed> = HashMap::with_capacity(n);
+
+            // Defer `fallback_indices` into `fallback_queue` rather than dispatching
+            // them. These paths have no usable seed, and dispatching one anyway is not
+            // merely slow but wrong: `initialize_stack`'s slow path cannot find the
+            // ancestor chain either, so `push()` mints a fresh `Bid::new(parent_bid)`
+            // and every node the parse produces is keyed under a subnet that should not
+            // exist — invisible to `PathMap`'s duplicate-path warning by construction.
+            //
+            // Skipping them here is safe because the caller re-dispatches the queue as
+            // its own epoch. Withholding a path from this batch does not lose it; the
+            // next epoch retries it against a beliefbase that has absorbed this epoch's
+            // writes. `retain` below drops the deferred entries from the dispatch list
+            // while preserving the relative order of the rest, so the surviving paths
+            // keep their document-order relationship for first-one-wins resolution.
+            // A path whose fallback budget is exhausted is *not* deferred: it stays in
+            // this batch and is dispatched with whatever seed exists, so that a
+            // permanently-unresolvable seed degrades the parse rather than dropping the
+            // document. Only the paths that were actually deferred are withheld.
+            let mut deferred_indices: BTreeSet<usize> = BTreeSet::new();
+            if !fallback_indices.is_empty() {
+                for (path_idx, path) in std::mem::take(&mut fallback_indices) {
+                    if self.defer_to_fallback_queue(path) {
+                        deferred_indices.insert(path_idx);
+                    }
+                }
+                tracing::debug!(
+                    target: "noet_core::codec::perf",
+                    deferred_count = deferred_indices.len(),
+                    "[parse_epoch] deferred paths to fallback_queue"
+                );
+            }
+
             // NOTE: processed counts were already incremented by the caller before
             // this function was invoked — do not increment here.
             // Clone the instance claim map Arc once outside the loop; each task gets
@@ -2540,6 +2730,10 @@ impl DocumentCompiler {
             // map is set, task_claim_map is None and the task falls back to &CLAIM_MAP.
             let instance_claim_map: Option<Arc<crate::codec::ClaimMap>> = self.claim_map.clone();
             for (idx, (path, doc_seed)) in paths.into_iter().zip(doc_seeds).enumerate() {
+                // Deferred to `fallback_queue` above — do not dispatch with an empty seed.
+                if deferred_indices.contains(&idx) {
+                    continue;
+                }
                 let repo_root = repo_root.clone();
                 let proto_index = proto_index.clone();
                 let global_bb = global_bb.clone();
@@ -2667,14 +2861,9 @@ impl DocumentCompiler {
                 );
             }
 
-            // Collect results from JoinSet (completion order) into an index-keyed map,
-            // then reconstruct in original path order for deterministic output.
-            type EpochIndexed = (
-                PathBuf,
-                Result<ParseContentWithCodec, BuildonomyError>,
-                Vec<BeliefEvent>,
-            );
-            let mut indexed: HashMap<usize, EpochIndexed> = HashMap::with_capacity(n);
+            // Collect results from JoinSet (completion order) into the same index-keyed
+            // map the fallback pass above populated, then reconstruct in original path
+            // order for deterministic output.
             while let Some(join_result) = join_set.join_next().await {
                 match join_result {
                     Ok((idx, path, result, task_events)) => {
@@ -2978,8 +3167,8 @@ impl DocumentCompiler {
     /// After a depth-group `drain_epoch`, the newly parsed subnet network nodes
     /// live in `global_bb` but are absent from `self.builder.session_bb`.  Without
     /// them, `epoch_session_snapshot` produces a `PathMapMap` that cannot resolve
-    /// multi-level path keys (e.g. `docs/flight_software_design/architecture`),
-    /// causing `cache_fetch` MISS warnings on re-parse.
+    /// multi-level path keys (e.g. `docs/subsystem/component`, a subnet nested two
+    /// levels below the repo root), causing `cache_fetch` MISS warnings on re-parse.
     ///
     /// For each subnet in the batch this method:
     ///   1. Uses `ProtoIndex` to derive the parent network directory and the
@@ -3009,7 +3198,46 @@ impl DocumentCompiler {
             return Ok(());
         }
 
+        // ── Make this pass order-independent ─────────────────────────────────
+        //
+        // A stub can only be registered once its parent network is in `session_bb`,
+        // because the parent's BID is the `net` half of the child's PathMap key. The
+        // caller iterates depth groups, which *should* guarantee the parent was handled
+        // in an earlier group — `network_dirs_by_tree_depth` documents exactly that
+        // invariant. It does not always hold: an id race upstream can perturb group
+        // composition and present a subnet before its parent.
+        //
+        // When that happened the old code hit `continue`, and the damage compounded:
+        // each child of the skipped subnet then found *its* parent unregistered and
+        // skipped in turn, so one inversion silently un-stubbed an entire subtree. The
+        // absent PathMap entry then surfaced far away, as a `parse_epoch` seed-lookup
+        // miss on reparse (Issue 97 Bottleneck 8).
+        //
+        // Rather than depend on the caller's ordering, repair it here. Pull in any
+        // ancestor network missing from this batch and process shallowest-first, so a
+        // parent is always registered before the children that key off it. This is
+        // cheap (a ProtoIndex walk, no `global_bb` traffic) and idempotent — an
+        // already-registered ancestor short-circuits on the `child_key` check below.
+        let mut ordered: BTreeSet<(usize, PathBuf)> = BTreeSet::new();
         for dir in batch {
+            let mut cursor = dir.clone();
+            loop {
+                if cursor == repo_root {
+                    break;
+                }
+                ordered.insert((cursor.components().count(), cursor.clone()));
+                match self
+                    .proto_index
+                    .owning_net_dir_for(&cursor.join(NETWORK_NAME))
+                {
+                    Some(parent) if parent != cursor => cursor = parent,
+                    _ => break,
+                }
+            }
+        }
+
+        for (_, dir) in ordered {
+            let dir = &dir;
             // Skip repo root — already in session_bb non-Trace from sequential
             // parse.
             if *dir == repo_root {
@@ -3036,11 +3264,18 @@ impl DocumentCompiler {
             let parent_bid = match self.builder.session_bb().get(&parent_key) {
                 Some(n) => n.bid,
                 None => {
-                    tracing::debug!(
+                    // The ancestor-expansion pass above should have registered this
+                    // parent already. Reaching here means it could not be — e.g. the
+                    // parent is absent from `global_bb` too — so this is an anomaly
+                    // worth surfacing rather than the routine ordering artifact it used
+                    // to be. The subtree below it will lose its stubs, which shows up
+                    // later as a `parse_epoch` seed-lookup miss.
+                    tracing::warn!(
                         target: "noet_core::codec::fast_path",
                         parent_rel = %parent_rel,
                         subnet = %dir.display(),
-                        "[sync_subnet_stubs] parent not in session_bb, skipping",
+                        "[sync_subnet_stubs] parent still not in session_bb after ancestor \
+                         expansion — skipping; descendants of this subnet will not be stubbed",
                     );
                     continue;
                 }
@@ -3229,9 +3464,15 @@ impl DocumentCompiler {
     }
 
     /// Handle file modification event (reset parse count and prioritize).
+    ///
+    /// Clears `fallback_attempts` alongside `processed`: the edit is a fresh start for
+    /// this file, and a stale over-budget entry would otherwise latch
+    /// `defer_to_fallback_queue` into permanent eviction, so a seed failure on the
+    /// edited file could never be retried for the life of the session.
     pub fn on_file_modified(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         self.processed.remove(&path);
+        self.fallback_attempts.remove(&path);
         self.enqueue_front(path);
     }
 
@@ -3243,6 +3484,8 @@ impl DocumentCompiler {
     pub fn on_file_deleted(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         self.remove_from_queues(&path);
+        self.fallback_queue.retain(|p| p != &path);
+        self.fallback_attempts.remove(&path);
         self.processed.remove(&path);
         CLAIM_MAP.unclaim(&path);
     }
@@ -3255,8 +3498,105 @@ impl DocumentCompiler {
     }
 
     /// Remove a path from the remainder queue.
+    ///
+    /// Deliberately does **not** touch `fallback_queue`.
+    ///
+    /// `process_one_parse_result` calls this for every path that produced a result.
+    /// The hazard is the *fallback* epoch: those paths are dispatched normally, so they
+    /// do produce results and do reach this function — and a path whose seed fails
+    /// again is re-deferred for its next attempt during that same epoch's dispatch,
+    /// before the results are processed. Clearing `fallback_queue` here would therefore
+    /// discard the retry that was just scheduled, and since `parse_epoch` withholds
+    /// deferred paths from dispatch, nothing else would re-queue the document.
+    ///
+    /// (Paths deferred from an ordinary remainder epoch are not at risk: they are
+    /// withheld from dispatch, produce no result, and never reach this function that
+    /// epoch. The fallback-epoch case is the one that makes this guard load-bearing.)
+    ///
+    /// `fallback_queue` is drained by the remainder loop and cleared on deletion
+    /// (`on_file_deleted`), which is the only place a pending retry should be
+    /// abandoned.
     fn remove_from_queues(&mut self, path: &PathBuf) {
         self.remainder_queue.retain(|p| p != path);
+    }
+
+    /// Queue `path` for a fallback epoch after its seed pre-computation failed.
+    ///
+    /// Charges the attempt to `fallback_attempts`, not `processed`: a seed failure is
+    /// the compiler's fault, and spending the document's content-reparse budget on it
+    /// would let `ReparseLimitExceeded` truncate a file that had one legitimate reparse
+    /// plus one seed failure. See [`DocumentCompiler::fallback_queue`].
+    ///
+    /// Returns `true` if the path was deferred, `false` if its budget is exhausted
+    /// and the caller should dispatch it in the current epoch after all.
+    ///
+    /// # Budget model
+    ///
+    /// A deferral is **not** refunded against `processed`. The deferred path is going
+    /// to be parsed — just in the next epoch rather than this one — so the epoch it
+    /// occupies is a real parse attempt and counts as one. The fallback substitutes
+    /// for the reparse the path would otherwise have had; it does not add to it.
+    ///
+    /// The consequence is deliberate: a path whose first fallback attempt succeeds has
+    /// spent exactly the budget it would have spent anyway. A path whose first attempt
+    /// also fails gets a second attempt "for free" only in the sense that the seed
+    /// failure, not the document, caused it — and that second attempt is **final**.
+    /// There is no third: once `max_fallback_attempts` is spent the path is dispatched
+    /// as a best-effort parse with whatever seed exists.
+    ///
+    /// This keeps the two counters honest without the refund's hazard. Refunding made
+    /// a permanently-unresolvable seed cost nothing, so the only thing bounding the
+    /// retries was `max_fallback_attempts` — and any accounting slip there turned into
+    /// an unbounded reparse loop rather than a truncated document.
+    ///
+    /// # Termination
+    ///
+    /// Eviction dispatches in the *current* epoch rather than re-queuing. Re-queuing
+    /// would send the path back through this same guard, fail the seed lookup again,
+    /// and re-evict — an infinite loop, since nothing between the two attempts repairs
+    /// the seed.
+    ///
+    /// Eviction is also **terminal**: once a path is over budget it is never deferred
+    /// or warned about again, even though later epochs may keep re-dispatching it and
+    /// its seed will keep failing. Without that latch the counter climbs on every
+    /// re-entry and each visit re-evicts, so one unresolvable seed emits a warning per
+    /// epoch for the rest of the build.
+    #[must_use]
+    fn defer_to_fallback_queue(&mut self, path: PathBuf) -> bool {
+        let attempts = self.fallback_attempts.entry(path.clone()).or_insert(0);
+
+        // Already evicted: stay out of the way entirely. Do not re-count, do not
+        // re-warn, do not defer.
+        let already_evicted = *attempts > self.max_fallback_attempts;
+        if !already_evicted {
+            *attempts += 1;
+        }
+        let attempt_no = *attempts;
+
+        if attempt_no > self.max_fallback_attempts {
+            if !already_evicted {
+                tracing::warn!(
+                    target: "noet_core::codec::fast_path",
+                    path = %path.display(),
+                    attempts = attempt_no - 1,
+                    "[parse_epoch] fallback budget exhausted — seed still unresolvable \
+                     after retries; dispatching a best-effort parse, which may duplicate \
+                     this file's nodes under a freshly-minted ancestor network"
+                );
+            }
+            return false;
+        }
+
+        if !self.fallback_queue.contains(&path) {
+            tracing::debug!(
+                target: "noet_core::codec::fast_path",
+                path = %path.display(),
+                attempt = attempt_no,
+                "[parse_epoch] deferring to fallback_queue"
+            );
+            self.fallback_queue.push_back(path);
+        }
+        true
     }
 
     /// Compute a FNV-1a 64-bit hash of a byte slice.
@@ -6735,8 +7075,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     #[tokio::test]
     #[cfg(feature = "git-tracking")]
     async fn test_git_metadata_populated_on_network_node() {
-        use std::collections::BTreeSet;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
 
@@ -6968,8 +7306,6 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
     #[cfg(all(feature = "git-tracking", feature = "service"))]
     #[serial(db_tests)]
     async fn test_metadata_in_exported_json() {
-        use std::collections::BTreeSet;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let html_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();

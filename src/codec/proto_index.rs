@@ -147,6 +147,31 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
             .unwrap_or(false)
     }
 
+    /// Do not descend into a symlinked *directory*.
+    ///
+    /// Both passes below already drop symlinked **files** (see the `p.is_symlink()`
+    /// guards), for the reason given there: the target would be parsed under two
+    /// networks and produce duplicate nodes. A symlinked directory is the same hazard
+    /// one level up, and because `follow_links(true)` walks straight through it, it is
+    /// the more damaging one.
+    ///
+    /// Descending yields the target's real (canonicalized) paths while WalkDir is
+    /// recursing *under the link's parent*. Every network found through the link is
+    /// then recorded as a child of the linking directory, so `parent_of` in
+    /// `network_dirs_by_tree_depth` maps it to the wrong parent — typically one in an
+    /// unrelated subtree at a different tree depth. The child is then scheduled in a
+    /// depth group before its true parent, `sync_subnet_stubs` finds that parent absent
+    /// from `session_bb` and skips, the skip cascades through the subtree, and the
+    /// missing PathMap entries surface much later as `parse_epoch` seed-lookup misses
+    /// on reparse (Issue 97 Bottleneck 8).
+    ///
+    /// The target is still discovered and parsed at its canonical location by the same
+    /// walk. Cross-tree references should be expressed as epistemic or pragmatic edges,
+    /// not by grafting one tree into another.
+    fn is_dir_symlink(entry: &DirEntry) -> bool {
+        entry.path_is_symlink() && entry.path().is_dir()
+    }
+
     // ── Pass 1: discover all subnet directories ───────────────────────────────
     //
     // WalkDir does not guarantee that network files are yielded before sibling
@@ -168,7 +193,7 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
     let subnet_dirs: std::collections::BTreeSet<PathBuf> = WalkDir::new(path)
         .follow_links(true)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e) || e.path() == path)
+        .filter_entry(|e| (!is_hidden(e) && !is_dir_symlink(e)) || e.path() == path)
         .filter_map(|e| match e {
             Ok(e) => Some(e.into_path()),
             Err(ref err) => {
@@ -214,7 +239,7 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
     let files = WalkDir::new(path)
         .follow_links(true)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e) || e.path() == path)
+        .filter_entry(|e| (!is_hidden(e) && !is_dir_symlink(e)) || e.path() == path)
         .filter_map(|e| match e {
             Ok(e) => Some(e.into_path()),
             Err(ref err) => {
@@ -224,14 +249,13 @@ pub(crate) fn net_dir_partition(path: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> 
         })
         .filter_map(|mut p| {
             if p.is_file() {
-                // Skip file-level symlinks.  A symlinked file (e.g.
-                // `component/design_links/spec.md` → `docs/spec.md`) would
-                // otherwise be parsed under BOTH the symlink's network and
-                // the canonical location's network, producing duplicate nodes
-                // with different BIDs that cause cache_fetch misses on
-                // reparse.  The canonical copy is always discovered at its
-                // real path; cross-tree references should use epistemic or
-                // pragmatic edges (e.g. `resolve_design_links`) instead.
+                // Skip file-level symlinks.  A symlinked file (e.g. a link from
+                // a code subtree to a spec document elsewhere) would otherwise
+                // be parsed under BOTH the symlink's network and the canonical
+                // location's network, producing duplicate nodes with different
+                // BIDs that cause cache_fetch misses on reparse.  The canonical
+                // copy is always discovered at its real path; cross-tree
+                // references should use epistemic or pragmatic edges instead.
                 if p.is_symlink() {
                     return None;
                 }
@@ -1868,6 +1892,90 @@ mod tests {
         assert!(
             child_names.iter().any(|n| n == "doc.md"),
             "doc.md must appear as child of real_subnet; got: {child_names:?}"
+        );
+    }
+
+    /// A symlinked *directory* must not re-parent the networks it points at.
+    ///
+    /// Regression for Issue 97 Bottleneck 8. Layout:
+    ///
+    /// ```text
+    /// root/
+    ///   docs/
+    ///     index.md
+    ///     spec/                 <- real network, true parent is docs/
+    ///       index.md
+    ///   code/
+    ///     widget/
+    ///       index.md            <- nearest network ancestor of the link
+    ///       sample/             (plain dir, not a network)
+    ///         refs/             (plain dir, not a network)
+    ///           spec -> ../../../../docs/spec   (directory symlink)
+    /// ```
+    ///
+    /// The plain intervening directories are load-bearing: `net_dir_partition`
+    /// flattens them, so the target is attributed to `code/widget` — a network at a
+    /// *different tree depth* than the true parent `docs/`. That depth difference is
+    /// what inverts the grouping, scheduling `docs/spec` before `docs/`. A flatter
+    /// layout (link directly inside a network) does not reproduce the misattribution
+    /// and the test passes with or without the guard.
+    #[test]
+    #[cfg(unix)]
+    fn test_dir_symlink_does_not_reparent_target_network() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_index(root, "root");
+
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        write_index(&docs, "docs");
+
+        let spec = docs.join("spec");
+        fs::create_dir_all(&spec).unwrap();
+        write_index(&spec, "spec");
+        fs::write(spec.join("doc.md"), "# Doc\n").unwrap();
+
+        // The link sits under plain (non-network) directories, so its nearest network
+        // ancestor is `code/widget`, at a different tree depth than `docs/`.
+        let widget = root.join("code").join("widget");
+        fs::create_dir_all(&widget).unwrap();
+        write_index(&widget, "widget");
+
+        let links = widget.join("sample").join("refs");
+        fs::create_dir_all(&links).unwrap();
+        symlink(&spec, links.join("spec")).unwrap();
+
+        let idx = ProtoIndex::build(root, false).unwrap();
+        let docs_canon = crate::paths::canonicalize_path(&docs).unwrap();
+        let spec_canon = crate::paths::canonicalize_path(&spec).unwrap();
+        let widget_canon = crate::paths::canonicalize_path(&widget).unwrap();
+
+        // The real network is still discovered at its canonical location.
+        assert!(
+            idx.network_dirs().contains(&spec_canon),
+            "docs/spec must be discovered at its canonical path"
+        );
+
+        // It must be owned by docs/, not by the subtree that links to it.
+        assert_eq!(
+            idx.owning_net_dir_for(&spec_canon.join(NETWORK_NAME)),
+            Some(docs_canon),
+            "docs/spec must be owned by docs/, not by the linking directory"
+        );
+        assert!(
+            !idx.children_of(&widget_canon)
+                .unwrap_or_default()
+                .contains(&spec_canon),
+            "the linking subtree's network must not claim the symlink target as its child"
+        );
+
+        // Every non-root network must therefore land below depth 0.
+        let groups = idx.network_dirs_by_tree_depth();
+        assert!(
+            !groups[0].contains(&spec_canon),
+            "docs/spec must not be grouped at depth 0 alongside the repo root"
         );
     }
 

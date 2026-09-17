@@ -25,328 +25,179 @@ which surfaced the original `terminate_stack` symptom.
 > repository name. The mechanism is what transfers between corpora; the
 > proper noun is what leaks.
 
-## Current status (2026-08-21)
+## Current status
 
 The original subject of this issue — sequential `terminate_stack` taking ~70%
-of wall clock — **appears resolved**, most likely by `6c313d5` (multi-threaded
-runtime). See "Bottleneck 1" below. The issue has been broadened to track the
-bottlenecks that remain, because the profile has shifted substantially: parse
-is no longer the dominant cost.
+of wall clock — is resolved, most likely by `6c313d5` (multi-threaded runtime).
+The issue was then broadened into a register of build-performance bottlenecks,
+because the profile shifted: **parse is no longer the dominant cost.**
 
-From a full-corpus run at `4313c41` (`just jobs=4 render`, in-memory DB):
+On a full-corpus run, time outside the parse path accounted for roughly 4.5 of
+4.7 hours. Optimising inside the parse path therefore caps out near 15% of wall
+clock, and "outside the parse path" turned out to be at least three distinct
+mechanisms with different fixes rather than one.
 
-| Measure | Value |
-|---|---:|
-| Wall clock | 4.70h (was 12.45h at the prior version) |
-| Parse sequential sum | 0.62h (was 34.81h) |
-| In-permit parse work | 0.74h across 7,306 files (mean 0.362s, p95 0.89s) |
-| **Time outside the parse path** | **~4.5 of 4.7h** |
-
-**This reframes everything below.** Optimising inside the parse path now
-caps out at roughly 15% of wall clock. The open bottlenecks are in
-`finalize_html`, the C++/header path, and export.
-
-**Update (product-hierarchy corpus run, 2026-08-21):** two more measurements
-narrow this further. Bottleneck 2's `finalize_html` cost is now attributed —
-it is `compute_layout_metadata`, a single serial stage, not an unexplained gap
-(see below). And a distinct mechanism, Bottleneck 7, shows the pre-spawn
-per-epoch task setup collapsing to fully serial for the back ~60% of a
-deeply-nested corpus, costing 31.8 min (5.9%) of wall clock in moments where
-every worker was simultaneously blocked. Time "outside the parse path" is not
-one thing — it's at least three distinct mechanisms with different fixes.
-
-**Update (instrumented re-run, 2026-08-22):** both remaining large costs now
-have named root causes rather than symptoms. Bottleneck 2 is
-`compute_layout_metadata` at ~290s (8.6% of build wall clock), stable across
-two runs. Bottleneck 7's per-task cost is `PathMapMap::new` rebuilding
-per-network subgraphs via two unbounded full-graph passes — split into two
-fixes, both since implemented: the `as_subgraph_seeded` scan fix (`4f352e2`)
-and the shared epoch session base (`GraphBuilder::seed_session_from_base`,
-seeding 2,533s → 524s). A recurring lesson across both: **the first framing of
-each was an artifact of missing instrumentation**, not a real description of
-the defect.
-
-**Update (2026-08-25, both Bottleneck 2 and 7 now resolved):** two more
-full-corpus runs closed both remaining register entries. Bottleneck 2's
-force-simulation theory was wrong — the actual cost was an exhaustive
-`PathMapMap::path()` fallback scan that resolved nothing (84.6% of the
-stage, 100% wasted); deleting it took the stage 217.6s → 43.0s, 6.7x below
-the original 290s baseline. Bottleneck 7 gained a second fix on top of
-`4f352e2`: sharing one prebuilt `BeliefBase` per epoch instead of rebuilding
-it per task (`4452085`) took summed seeding time 2,533s → 524s.
-
-Three measurements on the same corpus, in commit order:
+Progress on the same corpus, in commit order:
 
 | | wall clock | parse phase | seeding (summed) |
 |---|---:|---:|---:|
 | `6bbf5c3` (baseline) | 28m19s | 20m38s | 2,533s |
 | `4452085` (shared epoch base) | 19m22s | 11m32s | 524s |
-| + uncommitted `indexed_path` fallback removal | ~8m | ~5m | 126.9s |
+| + `indexed_path` fallback removal | ~8m | ~5m | 126.9s |
 
-The third row's improvement over the second is not a layout-only effect: the
-`indexed_path` fallback (Bottleneck 2's fix) is called during parsing too
-(relation resolution, `beliefbase/context.rs`), so removing it sped up the
-parse phase as a side effect, independent of `finalize_html`. Three of seven
-register entries remain open (3, 4, 5); none of the three touch the parse or
-`finalize_html` path any of this work exercised.
+The third row is not a layout-only effect: the `indexed_path` fallback is also
+called during parsing (relation resolution, `beliefbase/context.rs`), so
+removing it sped up the parse phase independently of `finalize_html`.
+
+**Open**: Bottlenecks 3 (C++/header parse gaps), 4 (end-of-run insert storm),
+5 (warm-cache `--db` regression), and 9 (per-heading reparse-seed miss). None
+of 3, 4, or 5 touch the parse or `finalize_html` paths this work exercised.
+
+Bottlenecks 8 and 9 arrived from a correctness investigation rather than a
+performance measurement, and are recorded here because a silently duplicated
+subtree inflates every later O(graph size) stage.
 
 ## Bottleneck register
 
 | # | Bottleneck | Magnitude | Status |
 |---|---|---|---|
 | 1 | Sequential `terminate_stack` stalls | was ~70% of wall clock | **Likely resolved** — needs confirmation |
-| 2 | `compute_layout_metadata` | **290s → 43.0s (6.7x)** | **Resolved** — an exhaustive fallback scan was 84.6% of the stage and resolved nothing; removed. Stage is now 26.4% of `finalize_html`, no single dominant term |
-| 3 | C++/header parse gaps | ~163 min across 211 gaps >20s | **Open** — now instrumented, awaiting a full-corpus run to attribute |
+| 2 | `compute_layout_metadata` | **290s → 43.0s (6.7x)** | **Resolved** — see entry; stage is now 26.4% of `finalize_html`, no single dominant term |
+| 3 | C++/header parse cost and reparse-budget exhaustion | ~163 min across 211 gaps >20s; **510 files truncated** by `ReparseLimitExceeded` (90% C++) | **Open** — silent content loss, not just slowdown. Not parallelism-driven: the 510 are a perfect subset of the 649 seen at `--jobs 8`, and `--jobs 1` produces the same core set |
 | 4 | End-of-run insert storm | 962K log lines in 13 min | **Open** — mechanism unclear |
 | 5 | Warm-cache (`--db`) regression | 94s → 28m on one subtree | **Open** — `--db` only, not on `render` path |
 | 6 | PathMap read-path scan | 422M entries scanned/run | **Resolved** — `PathMap::path_map` index |
 | 7 | Pre-spawn epoch seeding collapses to serial | seeding 2,533s → 126.9s (summed, concurrent); wall clock 28m19s → 19m22s | **Resolved** — epoch fragmentation fixed (1,949 → 14 epochs); per-task `PathMapMap::new` rebuild fixed (`4f352e2`); redundant per-task rebuild eliminated via a shared epoch base (`4452085`) |
+| 8 | `parse_epoch` ancestor-BID seed miss on reparse | 70 → **0** misses / ~72,600 parses | **Resolved** — an unguarded **directory symlink** re-parented the networks it pointed at, inverting depth-group order so `sync_subnet_stubs` skipped a subtree and left no `PathMap` entry for the owning network. Guarded in `net_dir_partition`; `fallback_queue` added to contain the class |
+| 9 | Reparse-seed miss duplicates section BIDs under `--jobs > 1` | 389 `PathMap::new` collisions on a representative subtree (`--jobs 4`, 3 runs); `0` at `--jobs 1` (3 runs) | **Open** — a document's `net_bid`/`doc_bid` resolve correctly but its per-heading `cache_fetch` still misses, minting fresh section BIDs. Disjoint from Bottleneck 8 (measured on a run producing both) |
 
 ---
 
 ## Bottleneck 1 — Sequential `terminate_stack` (likely resolved)
 
-### Summary
+### Mechanism
 
-A sequential (`jobs=1`) large corpus parse showed
-`GraphBuilder::terminate_stack` (Phase 5) consuming ~70% of wall clock, with a
-worst-case single file taking 20 minutes for one diff. A follow-up run of the
-*same corpus* with `--jobs 4` showed every file's `terminate_stack` completing
-in **well under one second** — including the file that took 20 minutes under
-`jobs=1`, with an identical 908-`RelationUpdate` diff. This four-orders-of-
-magnitude gap is too large to be explained by parallelism alone (4 workers
-cannot turn a CPU-bound 20-minute task into 0.12s); it strongly suggests the
-sequential path was blocked on something external to `compute_diff`/
-`process_event`'s actual work — most likely a channel/receiver-side
-bottleneck (`tx.send` to `BeliefAccumulator`) or a runtime scheduling
-pathology specific to single-threaded inline dispatch.
+Under `jobs=1`, `GraphBuilder::terminate_stack` (Phase 5) consumed ~70% of wall
+clock on a large application corpus (~3,700 file records, 92.3 min): summed
+Phase-5-to-next-Phase-0 gap of 3,862.0s across 3,479 files, with Phase 0 itself
+negligible. The worst single file — a ~7,600-line slide-deck export — took
+1,172.73s for one `Diff events (2271): NodeUpdate(455), RelationUpdate(908),
+PathsAdded(908)` batch. A cluster of ~13 near-duplicate copies of that document
+(the same export re-emitted once per parent node linking it) each showed ~908
+`RelationUpdate`s and 20–30s gaps.
 
-This issue is scoped to root-causing *why* the sequential path is so much
-slower, rather than assuming Phase 5 pipelining (the original framing) is
-the right fix — the evidence suggests the fix may be much smaller and
-different in kind (e.g. an accidental blocking call, an unbounded/misused
-channel, or lock contention specific to single-task dispatch).
+The same corpus under `--jobs 4` completed **every** measured `terminate_stack`
+in under a second: that same export in **0.12s** with an identical
+908-`RelationUpdate` diff, max observed 0.22s, 8.9s summed across 2,556
+completions.
 
-### Evidence
+### Cause and fix
 
-#### Run 1 — `jobs=1` (default; no `--jobs`/`NOET_JOBS` set)
+`6c313d5` changed `noet parse` from `Builder::new_current_thread()` to a
+multi-threaded runtime. `parse_content`'s Phase 2 is CPU-bound with no yield
+points, so under a single-threaded runtime one task starves every other task —
+including tasks that only need to poll an already-resolvable future. The
+sequential path was not doing more work; it was waiting on a runtime that could
+not schedule the completion. That is what accounts for a gap of four orders of
+magnitude, which four workers alone cannot explain.
 
-```sh
-RUST_LOG=noet_core::codec::builder=debug,noet_core::codec::compiler=debug,noet_core::db::query_size=debug \
-  noet parse . --html-output /tmp/out 2>&1 | tee /tmp/run.log
-```
+### Durable findings
 
-run from the large application corpus (~3,700 file records, 92.3 minutes
-wall clock). Confirmed sequential: zero `parse_task{task_idx=...}` spans
-anywhere in the 337,100-line log (per `DocumentCompiler::with_html_output`,
-`compiler.rs:311-321`, `jobs` defaults to 1 unless explicitly set — see Open
-Questions on the CLI help text mismatch).
+**The symptom pointed at the channel; the cause was the runtime underneath it.**
+The leading hypothesis was a receiver-side bottleneck, and it was structurally
+plausible: `tx` is an `UnboundedSender` to a single `BeliefAccumulator`, and
+when `jobs == 1` `parse_one_path` runs inline in the compiler's own async
+context using the compiler's own `builder`, with a direct `tx` send and no task
+spawn or semaphore (`compiler.rs:1758-1769`). A lock-contended receiver would
+therefore serialise straight into `terminate_stack`'s critical path. It was
+wrong. When a cost appears only on the inline-dispatch path, check runtime
+scheduling before auditing the data structures that path touches.
 
-Analyzed with `benches/log_analysis/parse_log.py --phase-summary`:
+**The naive phase-gap metric is invalid for parallel runs.**
+`parse_log.py --phase-summary` diffs consecutive log records in file order,
+which interleaves unrelated concurrent tasks once `jobs > 1`. Use a task-scoped
+measure instead: per `task_idx`, the interval from that task's own "Phase 5:
+terminating stack" line to its own "Diff events" line.
 
-- Naive "Phase 5 start of file N → Phase 0 start of file N+1" gap, summed
-  across 3,479 files: 3,862.0s (64.4 minutes) — 69.7% of wall clock. Phase 0
-  itself is negligible (mean 0.00s, max 0.18s).
-- Worst single file (a large slide-deck export, ~7,600 lines) — 1,172.73s
-  (~20 minutes) for one `Diff events (2271): NodeUpdate(455),
-  RelationUpdate(908), PathsAdded(908)` batch.
-- A cluster of ~13 near-duplicate large slide decks (the same ~7,600-line
-  document, re-exported once per parent node it is linked from) each
-  independently show ~908 `RelationUpdate`s and 20–30s gaps.
-- Zero panics, zero `WARN`/`ERROR`-level lines, zero "unbalanced"
-  diagnostics — confirms Issue 26's content-quality fixes are effective for
-  this subtree in isolation (does **not** confirm the original full-build
-  balanced-set panic is resolved; see Issue 26).
+**The pathology does not reproduce at small scale.** A 30-file subtree at
+`jobs=1` completes every Phase 5 in well under a millisecond (51–184 µs
+observed). Any confirmation run needs a corpus large enough to have reproduced
+the original stall.
 
-#### Run 2 — `--jobs 4` (same corpus, in progress at time of writing)
-
-Same command with `--jobs 4` added. The naive gap metric from
-`parse_log.py --phase-summary` is **not valid for parallel runs** — it
-diffs consecutive log records in file order, which interleaves across
-unrelated concurrent tasks once `jobs > 1`. A task-scoped measurement was
-used instead: for each `task_idx`, the time from that task's own
-"Phase 5: terminating stack" line to that same task's own "Diff events"
-line (see `.scratchpad` script used for this investigation — not persisted,
-reproduce via the method described in Implementation Steps).
-
-Results (2,556 `terminate_stack` completions measured so far, run still in
-progress):
-
-- **That same slide-deck export: 0.12s** (was 1,172.73s under
-  `jobs=1` — same 908 `RelationUpdate`s, same content).
-- **Every measured file completes in under 1 second**; max observed 0.22s.
-  Sum across all 2,556 completions: 8.9s total.
-- Zero warnings/errors so far, consistent with Run 1.
-
-**This run was still in progress when this data was captured** — the full
-warning/panic comparison and final wall-clock total should be re-confirmed
-once it completes.
-
-#### Run 3 — `jobs=1` at `6031c95` (2026-08-21)
-
-Spot-check on a 30-file subtree (a small application-corpus subtree) with
-`RUST_LOG=debug`, sequential:
-
-```
-17:42:50.047692  Phase 5: terminating stack ...
-17:42:50.047743  Diff events (12): ...      <-  51 microseconds
-17:42:50.051827  Phase 5: terminating stack ...
-17:42:50.052011  Diff events (39): ...      <- 184 microseconds
-```
-
-Every Phase 5 completes in well under a millisecond under `jobs=1`. The
-pathology does not reproduce on this subtree.
-
-#### Probable cause: `6c313d5` (multi-threaded runtime)
-
-That commit changed `noet parse` from `Builder::new_current_thread()` to a
-multi-threaded runtime, and its message describes exactly the mechanism this
-issue hypothesised: `parse_content`'s Phase 2 is CPU-bound with no yield
-points, so under a single-threaded runtime one task starves every other task
-— including tasks that only need to poll an already-resolvable future. That
-is the "cooperative scheduling starvation" candidate listed under Risks, and
-it explains why a 20-minute stall could collapse to 0.12s without the diff
-work itself changing.
-
-It also explains the four-orders-of-magnitude gap that seemed too large for
-parallelism alone: the sequential path was not doing more work, it was
-waiting on a runtime that could not schedule the completion.
-
-**Not yet confirmed**, because the check above used a 30-file subtree rather
-than the corpus that originally reproduced it. To close Bottleneck 1:
+### To close
 
 - [ ] Re-run the full application corpus with `jobs=1` at current HEAD
 - [ ] Confirm the worst-case slide-deck export completes Phase 5 in well
       under a second (was 1,172.73s)
-- [ ] If confirmed, record the resolution and remove the Goals/Implementation
-      sections below, which are written against the unresolved framing
+- [ ] Confirm no regression in event-ordering correctness tests; `codec_test`
+      must pass unchanged
+- [ ] Add a regression assertion that a single-document `terminate_stack` call
+      with a large synthetic diff (hundreds of `RelationUpdate`s) completes
+      within a fixed time budget, to catch a reintroduction of this pathology
 
 ---
 
 ## Bottleneck 2 — `compute_layout_metadata` (single largest serial stage)
 
-**This entry was originally "`finalize_html` silent gap" — a hunt for
-unaccounted wall time.** That framing was an artifact of low-fidelity logging:
-with no stage timers, a 608s block appeared to be a defect in pipeline
-plumbing. Stage-level timers (`[finalize_html stage] <name>`,
-`noet_core::codec::perf`, debug) closed the gap question completely — all 10
-stages are now instrumented and "no silent gap remains uninstrumented" — and
-revealed that the time was never mysterious. It was one stage doing real,
-expensive, fully serial compute. The entry is now scoped to that cost.
+`compute_layout_metadata` (`src/layout.rs`) computes the 3D credibility-map
+force simulation after all parsing completes. It is single-threaded and nothing
+overlaps it, so it is pure critical path. At 290s it was ~4x the next-largest
+`finalize_html` stage and 8.6% of build wall clock, stable across two runs.
 
-`compute_layout_metadata` (`src/layout.rs`) is the 3D credibility-map force
-simulation over the full corpus graph. Measured across two full-corpus runs:
+### Root cause: an exhaustive `PathMapMap::path()` fallback that resolved nothing
 
-| Stage | Run A | Run B | % of finalize_html (Run B) |
-|---|---:|---:|---:|
-| **`compute_layout_metadata`** | **292.7s** | **288.6s** | **62.9%** |
-| `build_search_indices` | 75.0s | 75.5s | 16.4% |
-| `create_asset_hardlinks` | 35.4s | 72.3s | 15.7% |
-| `export_beliefbase` | 11.9s | 12.1s | 2.6% |
-| `BeliefBase::from(graph)` rebuild | 8.8s | 8.6s | 1.9% |
-| `export_beliefgraph` | 1.6s | 1.5s | 0.3% |
-| all others | <1s each | <1s each | <0.5% combined |
+The cost was never the `O(200 × n²)` force simulation. It was scope
+resolution — `PathMapMap::indexed_path` (BID→path), the same `O(N_networks)`
+read-path family as Bottleneck 6. Per-route counters split calls from probes:
 
-Stable across runs at ~290s, ~4x the next-largest stage, and **8.6% of total
-build wall clock** (288.6s of a 55m48s run). It is single-threaded and runs
-after all parsing completes, so it is pure critical path — no other work
-overlaps it. That makes it comparable in size to the parse-side bottlenecks in
-this register while being considerably more self-contained: one stage, one
-module, no concurrency or correctness invariants entangled with it.
+| Route | Calls | Probes | Probes/call | Time | Share |
+|---|---:|---:|---:|---:|---:|
+| indexed | 233,542 | 1,561,651 | 6.7 | 34.7s | 16.7% |
+| **fallback** | **58,922** | **66,640,782** | **1,131.0** | **175.3s** | **84.6%** |
 
-The run also carries 137,244 nodes / 219,827 relations into this stage, so
-whether cost is linear or superlinear in graph size determines whether this
-grows into the dominant build cost as corpora scale.
+The fallback was 20.1% of calls but 97.7% of probes — and it found nothing. The
+arithmetic reconciles exactly: 135,590 nodes − 58,922 fallback calls = 76,668
+resolvable; minus 3,918 reserved-namespace nodes = 72,750 = the logged
+`mapped_nodes`. All 66.6M probes returned `None`. 175.3s of confirming absence.
 
-### Root cause: one synthetic network holds 97.4% of the cost
+### The fixes
 
-Cost was attributed analytically against a compiled corpus shard manifest
-(1,435 networks, 264,757 nodes) rather than by re-running the build. The
-intra-bubble simulation is `O(iterations x n^2)` per network with
-`iterations = 200`, so total work is `sum over networks of 200 * n^2 / 2`.
-That sum is almost entirely one term:
+**1. Delete the fallback** (`src/layout.rs`, `src/paths/pathmap.rs`).
+`node_to_nets` holds an entry for every BID in every `PathMap`'s `bid_map`, and
+`PathMap::path` resolves only BIDs reachable through some `bid_map` — so an
+index miss *is* proof of absence, and the scan only rediscovers that at
+`O(N_networks)` cost. `indexed_path` now returns `None` directly on a miss.
 
-| Network | Nodes | Share of total force-sim work |
-|---|---:|---:|
-| **synthetic href-tracking namespace** | **78,479** | **97.41%** |
-| largest real content network | 3,095 | 0.15% |
-| all 1,430 other networks combined | 183,183 | 2.44% |
+That inference is load-bearing, so it is asserted rather than argued:
+`test_node_to_nets_miss_implies_no_path` checks, for every BID in the fixture,
+that an index miss implies the exhaustive scan also finds nothing. The counter
+test asserts a miss records **zero** probes, which is what catches a
+reintroduced scan. `scan_indexed_path` is retained `#[cfg(test)]` as the
+ground-truth oracle the narrowing tests compare against.
 
-The href-tracking namespace is a **reserved, synthetic namespace**
-(`href_namespace()`, see `properties.rs::const_namespaces`) holding one
-External|Trace node per distinct outbound hyperlink. It is not user-authored
-content, it is not browsable in the viewer, and its nodes have no meaningful
-N/S/P content profile. Its node count scales with the number of *links* in the
-corpus, not the number of documents — so it grows faster than the real corpus
-and will increasingly dominate this stage.
+**2. Narrow the indexed route to subnet ancestors.** `node_to_nets` records
+*direct* containment, while `PathMap::path` also resolves a BID held by a
+*subnet* by recursing into it — so narrowing to direct hits alone silently
+regresses those nodes to `None`. Probing subnet ancestors preserves that.
+Equivalence against the exhaustive scan is asserted for every BID in the graph
+plus an absent one (`test_indexed_path_narrowing_matches_full_scan`),
+mutation-checked so that dropping the subnet term makes it fail, with the
+fixture asserted to contain a subnet so the recursion case cannot silently stop
+being covered.
 
-Confirmed against the emitted shards: the href-tracking shard carries 78,479
-`render_position` entries, i.e. the simulation really is running over all of
-them.
+The subnet-holder set is a property of the map, not of the BID, so it is
+memoized; invalidation hangs off `make_pathmap_unique`, the pre-write
+chokepoint a new write site cannot bypass. `PathMapMap`'s derived `Clone` was
+replaced with a hand-written one so a clone starts cold rather than inheriting
+a cache that may not describe it.
+`test_indexed_path_narrowing_survives_subnet_mutation` warms the cache, gives a
+network a new subnet, and re-asserts scan-equivalence, with vacuity guards
+asserting the parent genuinely gained a subnet it lacked when warmed — without
+those the test passed even with invalidation disabled.
 
-### Why aggressive task spawning does not help here
-
-Parallelising the per-network loop is the obvious move and it is nearly
-worthless, because makespan is bounded below by the single largest task
-(Amdahl). With the href network included:
-
-| Workers | Predicted speedup | Predicted stage time |
-|---:|---:|---:|
-| 4 | 1.03x | 282s |
-| 16 | 1.03x | 282s |
-| 64 | 1.03x | 282s |
-
-Spawning cannot beat 282s at *any* worker count. Parallelism only becomes
-worthwhile *after* the dominant task is removed:
-
-| Scope | Serial | 4 workers | 8 workers |
-|---|---:|---:|---:|
-| excluding href-tracking namespace | ~7.5s | ~1.9s | ~0.9s |
-
-So the ordering matters: **skip reserved namespaces first (290s -> ~7.5s, a
-~39x win), then parallelise if the residual still matters (~7.5s -> ~1s).**
-Doing it in the other order buys 3%.
-
-### Secondary defect: full edge-list rescan per network
-
-`run_intra_bubble_layout` iterates *every* edge in the whole graph to find the
-edges local to one network, once per network. That is `O(networks x E)` =
-1,164 x 499,634 = **5.8e8 iterations**, each with two `BTreeMap<Bid, usize>`
-lookups. It is masked by the `n^2` term today; once the href network is
-excluded it becomes the dominant remaining cost. Fix is a single pre-pass
-bucketing edges by home network.
-
-- [x] Add spans around the discrete stages of `finalize_html`
-- [x] Attribute the silent block to a stage — it is `compute_layout_metadata`,
-      confirmed on two independent full-corpus runs
-- [x] Profile `compute_layout_metadata` internally — cost is the `O(200 * n^2)`
-      intra-bubble repulsion loop, 97.4% of it in the synthetic href-tracking
-      namespace. Scaling is **quadratic in the largest network's node count**,
-      and that network grows with link count, so this worsens with corpus size.
-- [x] Establish whether the simulation needs to run over the *full* graph — it
-      does not. Reserved/synthetic namespaces (`Bid::is_reserved()`) are not
-      viewer-facing and should be excluded outright.
-- [x] Exclude reserved namespaces from layout (expected 290s -> ~7.5s)
-- [x] Bucket edges by home network in `run_intra_bubble_layout`, removing the
-      `O(networks x E)` rescan
-- [x] Add an `O(n^2)` guard: networks above `--layout-max-nodes` /
-      `NOET_LAYOUT_MAX_NODES` (default 5,000) are skipped with a warning
-- [x] Add `--no-layout` to skip the stage entirely (layout remains on by default)
-- [x] Confirm the predicted ~39x on a full-corpus run — **the prediction was
-      wrong**; see "Measured result" below
-- [x] Narrow `indexed_path` candidates through the `node_to_nets` reverse index
-- [x] Re-run with per-step timers — 539s -> 265.8s, and the residual is now
-      fully attributed: 96.1% is still `pathmap.path()`
-- [x] Remove the per-call `read_arc()` over all networks in `indexed_path`
-      (memoized subnet-holder set)
-- [ ] Re-measure after the memoization
-- [ ] Only then consider parallelising the per-network loop (~7.5s -> ~1s);
-      ceiling is 3% while the href network is still in scope
-
-### Resolution (implemented, pending full-corpus confirmation)
-
-`compute_layout_metadata` now takes a `LayoutConfig { enabled, max_nodes }` and
-selects its network scope up front via `select_networks`:
+**3. Exclude reserved namespaces from layout scope.** `compute_layout_metadata`
+takes a `LayoutConfig { enabled, max_nodes }` and resolves its network scope up
+front via `resolve_scope`:
 
 - Reserved namespaces (`Bid::is_reserved()`, covering all four
   `const_namespaces()`) are excluded. This is a **correctness** fix as much as a
@@ -357,232 +208,157 @@ selects its network scope up front via `select_networks`:
 - Networks above `max_nodes` are skipped with a warning naming the flag, so an
   oversized network degrades loudly instead of silently stalling the build.
 
-Exclusion is applied once, in `build_home_network_map`, so excluded networks
-drop out of *every* downstream step rather than being computed and discarded.
-
-Note the two exclusions differ in kind: the reserved-namespace rule is
-permanent and semantic, while `max_nodes` is a pragmatic guard against the
-`O(n^2)` term and can be raised when a large network genuinely needs layout.
+Exclusion is applied once, in scope resolution, so excluded networks drop out of
+*every* downstream step rather than being computed and discarded. The two
+exclusions differ in kind: the reserved-namespace rule is permanent and
+semantic — synthetic `External|Trace` bookkeeping nodes carry none of the N/S/P
+assumptions layout scoring is built on (see
+`docs/essays/engineering_model_ontology.md` §3), so computing viewer
+coordinates for them was a category error. `max_nodes` is a pragmatic guard
+against the `O(n²)` term and can be raised when a large network genuinely needs
+layout; networks above it are skipped with a warning naming the flag
+(`--layout-max-nodes` / `NOET_LAYOUT_MAX_NODES`, default 5,000), so an oversized
+network degrades loudly instead of silently stalling the build. `--no-layout`
+skips the stage entirely; layout remains on by default.
 
 **Consumer impact**: `render_position`, `structural_weight` and
 `structural_depth` are now legitimately absent for some networks. Issue 85's
 viewer must treat all four layout fields as optional and fall back gracefully.
 
-### Measured result: the prediction was wrong (2026-08-25)
+### Measured outcome
 
-The predicted ~39x did not materialise. The stage went **290s -> 539s** — it
-got *worse*. Two independent errors, both instructive:
-
-**1. The cost model was calibrated on a stale corpus.** The `O(n²)` analysis
-used a shard manifest from an earlier build in which the href-tracking
-namespace held 78,479 nodes. On the actual run it held **3,676** — a 456x
-smaller force-simulation term. The whole "97.4% of cost" finding was an
-artifact of measuring one corpus and predicting another. Total nodes differed
-too (264,757 vs 135,590), which should have been the tell.
-
-**2. The fix introduced a regression.** Timestamps in the run localise it:
-
-| Phase | Elapsed |
-|---|---:|
-| `BeliefBase::from` -> first `select_networks` log | **265.2s** |
-| selection log -> stage end | 273.8s |
-| total | 539.0s |
-
-Those 265s are *before any layout work begins*. `select_networks` added a
-second full `PathMapMap::path()` pass to count nodes per network, and
-`build_home_network_map` then repeated it. `path()` is `O(networks)` — it probes
-every network's `PathMap` and takes a minimum — so each pass is ~1.5e8 PathMap
-probes at this corpus size, and the change doubled it to ~3.1e8.
-
-**The real bottleneck was never the force simulation.** It is
-`PathMapMap::path()`, the same `O(networks)` read-path family as Bottleneck 6.
-The force-sim `n²` term is a rounding error on this corpus:
-spread over 1,128 selected networks it is ~0.7s.
-
-**Fixed**: selection and mapping are fused into `resolve_scope`, restoring a
-single `path()` call per node. Per-step timers were added under
-`noet_core::codec::perf` (`[layout step] <name>`) so the residual 273.8s can be
-attributed rather than guessed at — `compute_network_aggregates` calls
-`pathmap.submap()` once per network and is the leading suspect.
-
-**Lesson**: the exclusion work still stands on its own — scoring synthetic
-namespaces against the N/S/P ontology is a category error regardless of cost —
-but it was justified with a performance number derived from a different corpus
-than the one it ran against. Calibrate cost models against the corpus you will
-measure on, and instrument *before* optimising, not after.
-
-### Follow-on: narrowing `indexed_path` via the `node_to_nets` reverse index
-
-With the true bottleneck identified as `PathMapMap::path()`, the fix is the
-index that already exists for exactly this fan-out. `process_event_queue`
-already routes relation events through `node_to_nets` "rather than broadcasting
-to all O(N_networks) PathMaps"; `indexed_path` was still broadcasting.
-
-`indexed_path` now probes only the networks that directly contain the BID, plus
-every network holding subnets. That second term is required for correctness,
-not caution: `node_to_nets` records **direct** containment, while
-`PathMap::path` also resolves a BID held by a *subnet* by recursing into it.
-Narrowing to direct hits alone silently regresses those nodes to `None`.
-Unknown BIDs fall back to the full scan, so a stale index cannot change results.
-
-Equivalence is asserted against the exhaustive scan for every BID in the graph
-plus an absent one (`test_indexed_path_narrowing_matches_full_scan`). The test
-was mutation-checked: dropping the subnet term makes it fail, so it is not
-passing vacuously. The fixture is also asserted to contain a subnet, so the
-recursion case cannot silently stop being covered.
-
-**Expected gain is a ratio, not a constant**: candidate-set width goes from
-`N_networks` to `direct + subnet_holding_nets`. At this corpus size the win is
-~3x if 30% of networks hold subnets, ~20x if 5% do. `subnet_holding_nets` is now
-logged alongside the scope-resolution timer so the next run reports the actual
-ratio instead of it being predicted. **No speedup is claimed here until
-measured** — that is the error this entry already records once.
-
-Note this also speeds up `indexed_path` for *all* callers, not just layout —
-it is the same read path as Bottleneck 6.
-
-#### Measured (2026-08-25, second run)
-
-`compute_layout_metadata`: **539.0s -> 265.8s** (2.03x). Against the original
-290s baseline that is only 1.09x — the narrowing repaid the regression I
-introduced, and little more. Per-step timers now attribute the whole stage:
-
-| Step | Time | Share |
-|---|---:|---:|
-| **scope resolution (`pathmap.path`)** | **255.5s** | **96.1%** |
-| `compute_render_positions` | 10.2s | 3.8% |
-| all other six steps combined | <0.1s | ~0.0% |
-
-Two things this settles:
-
-1. **The force simulation was never the problem.** The `O(n²)` term everything
-   was originally built around is 3.8% of the stage. The six remaining steps
-   are collectively unmeasurable. Every hypothesis in this entry prior to
-   instrumentation was aimed at the wrong 4%.
-
-2. **The first narrowing under-delivered, and the log said why.** The candidate
-   set fell 5.5x (1,131 -> 203 subnet-holders + ~2 direct) but the stage only
-   improved 1.04x on that step. Cost was not proportional to the candidate
-   count because the *filter itself* iterated all 1,131 networks per call,
-   taking a `read_arc()` on each just to test `subnets()` — ~1.5e8 lock
-   acquisitions, exactly the fan-out the index was meant to remove.
-
-**Fixed**: the subnet-holder set is a property of the map, not of the BID, so
-it is now memoized and the per-call loop iterates only `direct + holders`.
-Invalidation hangs off `make_pathmap_unique`, which HEAD already established as
-the pre-write chokepoint — a new write site cannot bypass it. `PathMapMap`'s
-derived `Clone` was replaced with a hand-written one so a clone starts with a
-cold cache rather than inheriting one that may not describe it (clones diverge
-via `make_pathmap_unique`).
-
-Staleness is the whole risk in a cache like this, so
-`test_indexed_path_narrowing_survives_subnet_mutation` warms the cache, gives a
-network a *new* subnet, and re-asserts scan-equivalence. It carries vacuity
-guards asserting the parent genuinely gained a subnet it lacked when warmed —
-without those the test passed even with invalidation disabled, which is how the
-first version of it was caught being useless.
-
-**No further speedup is predicted here.** The next run measures it.
-
-#### Measured (2026-08-25, runs 3 and 4)
-
-Probing subnet *ancestors* rather than all subnet-holders: **271.3s -> 217.7s**
-(1.25x). Reproduced at 217.6s. Scope resolution 260.2s -> 207.2s.
-
-Smaller than the structure suggested — candidates per call fell ~100x for the
-narrowed route, but wall time moved 1.25x — so the per-route counters were
-added. They ended the guessing immediately:
-
-| Route | Calls | Probes | Probes/call | Time | Share |
-|---|---:|---:|---:|---:|---:|
-| indexed | 233,542 | 1,561,651 | 6.7 | 34.7s | 16.7% |
-| **fallback** | **58,922** | **66,640,782** | **1,131.0** | **175.3s** | **84.6%** |
-
-**The fallback was 20.1% of calls but 97.7% of probes.** Every narrowing so far
-had been tuning the 16.7%.
-
-Worse, the fallback found nothing. The arithmetic reconciles exactly: 135,590
-nodes - 58,922 fallback calls = 76,668 resolvable; minus 3,918 reserved-namespace
-nodes (3,676 + 241 + 1) = 72,750 = the logged `mapped_nodes`. So all 66.6M probes
-returned `None`. 175.3s of confirming absence.
-
-**Fixed by deleting the fallback.** `node_to_nets` holds an entry for every BID
-in every `PathMap`'s `bid_map`, and `PathMap::path` resolves only BIDs reachable
-through some `bid_map` — so an index miss *is* proof of absence, and the scan
-only rediscovers that at `O(N_networks)` cost. `indexed_path` now returns `None`
-directly on a miss.
-
-That inference is the load-bearing part, so it is asserted rather than argued:
-`test_node_to_nets_miss_implies_no_path` checks, for every BID in the fixture,
-that an index miss implies the exhaustive scan also finds nothing. The counter
-test now asserts a miss records **zero** probes, which is what would catch a
-reintroduced scan. `scan_indexed_path` is retained `#[cfg(test)]` as the
-ground-truth oracle the narrowing tests compare against.
-
-**Measured (run 5): 217.6s -> 43.0s** (5.1x), against a predicted ~42.3s — 1.6%
-error, the first prediction in this entry that held. Scope resolution 207.2s ->
-32.3s; fallback probes 66,640,782 -> 0. Against the original 290s baseline the
-stage is **6.7x faster, 247s saved**.
-
-The stage is no longer dominated by one term: scope resolution is 32.3s (75%)
-and the force simulation 10.6s (25%). `compute_layout_metadata` has gone from
-62.5% of `finalize_html` to 26.4%, and `create_asset_hardlinks` (72.5s) is now
-the largest stage in it.
+**290.0s → 43.0s (6.7x, 247s saved).** Scope resolution 255.5s → 32.3s; fallback
+probes 66,640,782 → 0. The stage is no longer dominated by one term — scope
+resolution 32.3s (75%), force simulation 10.6s (25%) — and has gone from 62.9%
+of `finalize_html` to 26.4%, leaving `create_asset_hardlinks` (72.5s) as the
+largest stage in it.
 
 The CoW sentinel is unchanged at 4.17% (baseline ~2.8%), confirming the
 `read_arc()` calls added by the subnet-ancestor index did not provoke spurious
 copies — worth checking because any read guard held across a write inflates
 `Arc::strong_count`.
 
-#### Method note
+### Durable findings
 
-Three successive "optimisations" of this stage moved wall time by ~0, +2%, and
-1.25x, because each targeted a term chosen by inspection. The counter that split
-calls from probes found the real 84.6% on its first run. Cheap attribution
-beats careful reasoning about which term dominates — and "probes" versus "calls"
-was the distinction that mattered, since the expensive route was the rarer one.
+**The force simulation was never the problem — and a cost model calibrated on
+the wrong corpus said otherwise, confidently.** An `O(200 × n²)` analysis run
+against a shard manifest attributed 97.41% of stage cost to the synthetic
+href-tracking namespace (`href_namespace()`, `properties.rs::const_namespaces`),
+at 78,479 nodes, and predicted a ~39x win from excluding it. On the corpus
+actually measured that namespace held **3,676** nodes — a 456x smaller term —
+and the force simulation was 3.8% of the stage. Total node counts differed too
+(264,757 vs 135,590), which should have been the tell. The arithmetic was
+sound; the inputs described a different corpus. Calibrate cost models against
+the corpus you will measure on.
 
-The full sequence, for calibration against future estimates:
+**Parallelising the per-network loop is not the fix.** Makespan is bounded
+below by the single largest task, so with a dominant network in scope, spawning
+cannot beat ~1.03x speedup at *any* worker count. Once the dominant term is
+removed the residual force-sim work is ~10s serial, and parallelising it is
+worth ~1s. Reserved-namespace exclusion had to come first; the other order buys
+3%.
 
-| Change | Stage | Basis |
-|---|---:|---|
-| baseline | 290.0s | — |
-| exclude reserved namespaces | 539.0s | cost model from a *stale corpus*; also added a second pathmap pass |
-| narrow to subnet-holders | 265.8s | reasoned about candidate count |
-| memoize holder set | 271.3s | reasoned about lock overhead |
-| narrow to subnet-ancestors | 217.6s | reasoned about which candidates could match |
-| **delete the fallback** | **43.0s** | **measured attribution** |
+**Scope selection must not add a second `PathMapMap::path()` pass.** Splitting
+network selection from home-network mapping made each node pay `path()` twice
+(~1.5e8 probes → ~3.1e8 at this corpus size) and regressed the stage 290s →
+539s, all of it *before any layout work began*. Selection and mapping are fused
+in `resolve_scope` for this reason.
 
-Every reasoned step landed within 2x of no-op or made things worse. The one
-measured step delivered 5.1x. Note also that the first change *regressed* the
-stage by 86% while being justified with a confident quantitative argument — the
-argument was arithmetically sound and calibrated on the wrong corpus.
+**Cheap attribution beats reasoning about which term dominates.** Three
+successive optimisations chosen by inspection moved the stage by ~0, +2%, and
+1.25x. Adding one counter that split *calls* from *probes* found the real 84.6%
+on its first run and yielded 5.1x. The calls-vs-probes distinction was what
+mattered, because the expensive route was the rarer one — a per-call average
+would have hidden it. Instrument before optimising.
 
-#### Follow-on
+**`run_intra_bubble_layout`'s per-network full edge scan is a latent
+`O(networks × E)` cost** (1,164 × 499,634 ≈ 5.8e8 iterations, two
+`BTreeMap<Bid, usize>` lookups each), masked today by other terms. If the force
+simulation matters again, bucket edges by home network in one pre-pass.
+
+### Follow-on
 
 Removing the fallback speeds up `indexed_path` for every caller, not just
 layout — MCP tools, `beliefbase/context.rs`, and relation resolution all use it,
 and 97,952 of the 233,542 indexed calls in this run came from outside layout.
-Bottleneck 6 concerns the same read path; confirmed unaffected by this fix
-(Bottleneck 6 is about `PathMap::indexed_get`'s path→BID lookup, not
-`PathMapMap::path`'s BID→path lookup this fix touches — different index,
-same family of defect).
+This is also why the fix shortened the parse phase, not just `finalize_html`.
 
-## Bottleneck 3 — C++/header parse gaps (~163 min)
+Bottleneck 6 concerns the same read path and is confirmed unaffected: it is
+about `PathMap::indexed_get`'s path→BID lookup, not `PathMapMap::path`'s
+BID→path lookup this fix touches — different index, same family of defect.
 
-211 process-wide silent gaps >20s, totalling ~163 minutes. The largest
-cluster falls in minutes 170–265 during the **C++ source corpus** — gaps of
-114–288s each with near-zero log output, at `task_idx` ~1090–1260 on
-deeply-included C++ headers.
+Remaining, if the stage matters again: parallelise the per-network loop
+(~10s → ~1s).
+
+## Bottleneck 3 — C++/header parse cost and reparse-budget exhaustion
+
+Two symptoms on the same population of deeply-included C++ headers: a large
+aggregate time cost, and silent content loss when those files exhaust their
+reparse budget.
+
+### Symptom A — parse gaps (~163 min)
+
+211 process-wide silent gaps >20s, totalling ~163 minutes. The largest cluster
+falls in the **C++ source corpus** — gaps of 114–288s each with near-zero log
+output, on deeply-included headers.
 
 Larger in aggregate than Bottleneck 2 but spread across 211 events, so more
 likely to be genuine CPU-bound tree-sitter parsing (i.e. real work) than a
 structural defect. Worth measuring before assuming either.
 
-- [ ] Determine whether these gaps are tree-sitter parse time, include
+### Symptom B — `ReparseLimitExceeded` truncation (510 files)
+
+A full-corpus run truncates **510 files** with `ReparseLimitExceeded`, meaning
+their parse budget (`max_reparse_count`, default 2) ran out before their
+references resolved. Every one of these emits an empty `ParseResult`, so this
+is **silent content loss**, not a slowdown.
+
+The population is overwhelmingly C++:
+
+| extension | count |
+|---|---:|
+| `.h` | 290 |
+| `.cpp` | 170 |
+| `.md` | 39 |
+| other | 11 |
+
+90% C++, and 452 of the 510 sit under a single source tree. The shape is
+consistent with an include graph deeper than two passes can close: a header
+whose own includes are still unresolved on pass 2 has no third pass in which to
+resolve them.
+
+**Parallelism is not the cause.** Measured on the same corpus:
+
+| | `--jobs 1` | `--jobs 8` |
+|---|---:|---:|
+| truncations | 510 | 649 |
+| `PathMap` collisions | 1,280 | 8,560 |
+
+The 510 are a **perfect subset** of the 649 — no file truncates only at
+`--jobs 1`. The 139 additional truncations under parallel dispatch are
+themselves 85% C++ (72 `.h`, 44 `.cpp`), so they most likely share this
+mechanism rather than arising from a separate parallel defect.
+
+**Mostly not Bottleneck 9 either.** Only 17 of those 139 parallel-only
+truncations have a matching entry in that run's collision set — too few to
+attribute, and the C++ skew points elsewhere. Note the contrast in how the two
+metrics respond to `--jobs`: collisions scale 6.7x with parallelism (a genuine
+parallel-only defect) while truncations grow only 1.3x. They are measuring
+different things.
+
+- [ ] Determine whether the gaps are tree-sitter parse time, include
       resolution, or something else
 - [ ] Compare per-file cost against file size / include count to see whether
       the relationship is superlinear
+- [ ] Establish whether the 510 truncations are genuinely include-depth-bound
+      by re-running with a raised `max_reparse_count` and checking whether the
+      count falls to zero (and at what depth it bottoms out). If it does, the
+      fix is a depth-aware budget rather than a flat constant — a C++ header
+      graph legitimately needs more passes than a markdown document
+- [ ] Quantify what is actually lost. `ReparseLimitExceeded` emits an empty
+      `ParseResult`, so 510 files currently contribute nothing to the graph;
+      confirm whether their nodes are absent entirely or merely stale from an
+      earlier pass
 
 ## Bottleneck 4 — End-of-run insert storm
 
@@ -681,387 +457,428 @@ improving four orders of magnitude with no user-visible effect.
 
 ## Bottleneck 7 — Pre-spawn epoch seeding collapses to serial
 
-Found via `parse_log.py --stalls` on a deeply-nested product-hierarchy corpus
-under `--jobs 4`, confirmed by the reporter as consistent with multiple prior
-runs, and quantified on the completed run (53m54s wall clock, 63,045 parses).
-Two related measurements on the same mechanism:
+Found via `parse_log.py --stalls` on a deeply-nested corpus under `--jobs 4`.
+Two compounding mechanisms, with three distinct fixes.
 
-**1. Epoch batch size collapses as directory depth increases.** `parse_epoch`
-groups files into batches by directory-component depth (see `parse_all`'s
-depth-grouping comment), so batch size is a function of corpus shape, not
-`--jobs`. Measured across 1,949 epoch batches for the full run:
+### Mechanism 1: epoch batch size collapses with directory depth
 
-| Segment | Epochs | Mean batch size | Size-1 (fully serial) epochs |
-|---|---:|---:|---:|
-| First third | 649 | 3.35 | 40.2% |
-| Middle third | 650 | 1.26 | 79.4% |
-| Last third | 650 | 1.12 | 88.6% |
+`parse_all` grouped files into `parse_epoch` batches by
+`dir.components().count()` (OS path components), so batch size was a function
+of path shape, not `--jobs`. On a deeply-nested corpus 69.4% of the 1,949
+epochs held a single file — rising from 40.2% in the first third of the run to
+88.6% in the last — giving `--jobs 4` no parallelism for the bulk of the run.
 
-A deeply-nested corpus (many directories with few siblings at depth) spends
-most of its epochs at batch size 1 — `--jobs 4` provides no parallelism for
-the bulk of the run once depth grows past the corpus's average branching
-factor. 69.4% of all epochs in the full run were size 1.
+**Fixed by `ProtoIndex::network_dirs_by_tree_depth()`** (`164a35d`), which
+groups by subnet-tree depth (parent hops). `ProtoIndex::children_of` already
+flattens plain intervening directories — a subnet at `A/docs/parts/B/` is a
+*direct* child of `A`, exactly like one at `A/B2/` — so component-count
+grouping was splitting true siblings across epochs and delaying the
+deeper-pathed one by the length of its path prefix, serialising work with no
+dependency between it. Tree-depth grouping reduces epoch count and grows batch
+size without weakening the drain-between-groups invariant: every dir in group D
+still has its parent in group D-1, by construction.
 
-**2. Each task pays multi-second, fully serial setup cost before its own
-parse begins — even at batch size 1.** Every spawned task logs
-`Initializing GraphBuilder` immediately after semaphore acquisition, then
-`[parse_epoch] task seeded` immediately after `GraphBuilder::seed_session`
-returns — both inside the same task future, so the gap between them should
-be near-zero. Measured across all 3,721 tasks in the full run:
-
-| Measure | Value |
-|---|---:|
-| Gaps > 3s | 1,433 (38.5% of all tasks) |
-| Sum of per-task gaps | 8,772s (exceeds wall clock — tasks overlap; see caveat below) |
-| Mean gap (all tasks) | 2.42s |
-| Median gap (all tasks) | 0.15s |
-| Max gap | 8.25s |
-
-**Caveat on the 8,772s figure**: this sums each task's individual gap, but
-tasks run concurrently, so the sum double-counts overlapping wall-clock time
-and cannot be read as "seconds of the build." A wall-clock-bounded measure —
-summing only the literal `[task-switch]`-tagged gaps between *consecutive log
-lines* (i.e., moments where nothing in the whole process logged anything) —
-gives **1,907s (31.8 min, 5.9% of the 53.9-minute run)** as the portion of
-wall clock where every worker was simultaneously blocked on this mechanism.
-That 5.9% is a lower bound: it only counts moments where *all* concurrent
-tasks stalled together, not the (much larger) per-task cost that's hidden
-behind other tasks' useful work.
-
-The bimodal distribution (439 tasks <10ms, 1,097 tasks >5s) suggests two
-distinct populations rather than one scaling cost — consistent with the
-`doc_seed` vs. `network_ancestors` fallback branch in `seed_session`
-(`builder.rs`): tasks with a non-empty per-document seed take one path,
-fallback tasks clone the full `network_ancestors` snapshot (including the
-href/asset const-namespaces) via `union_graphs`. Working theory — **not yet
-confirmed** — is that this clone cost is the dominant term, and that it grows
-with `session_bb`'s accumulated const-namespace size over the run (the same
-growth pattern documented in Bottlenecks 4/5). No log output exists inside
-this gap regardless of cause, so the specific line responsible has not been
-isolated.
-
-- [x] Add span-level timing inside `seed_session` (the `union_graphs` call
-      specifically) and `epoch_session_snapshot` to attribute the gap to a
-      specific operation rather than the whole `GraphBuilder::new` →
-      `seed_session` span
-- [x] Confirm or refute the clone-cost-scales-with-corpus-size theory by
-      correlating gap size against `network_ancestors_has_href` /
-      `session_bb_nodes` at the time of the gap — **refuted**; see "Measured
-      outcome" below
-- [x] Determine whether the depth-based epoch batching strategy itself should
-      change (e.g. batch across sibling subtrees rather than strictly by
-      depth) once the per-task cost is understood, since fixing the per-task
-      cost matters most for exactly the size-1 epochs this bottleneck
-      describes — **yes; changed to subnet-tree depth**
-- [x] Re-run against a full-corpus log (not a partial run) to get total
-      wall-clock share rather than an in-flight lower bound
-
-### Agreed next steps (2026-08-22)
-
-Four-session plan, in order:
-
-1. ~~**Rebalance small epoch batches.**~~ **Superseded — done differently.**
-   The premise was that small batches should be enlarged by merging the next
-   depth-group forward. Reading the code showed that is *never* safe: under
-   correct depth-grouping every member of group D+1 has its parent in group D,
-   which has not been drained yet, so every merge candidate hits the
-   uncommitted-parent path that mints a fresh BID and panics in Phase 4
-   `get_context` (the failure the pre-epoch repo-root block documents).
-
-   The real defect was in the grouping metric, not the batch size.
-   `parse_all` grouped by `dir.components().count()` (OS path components), but
-   `ProtoIndex::children_of` already flattens plain intervening directories —
-   a subnet at `A/docs/parts/B/` is a *direct* child of `A`, exactly like one
-   at `A/B2/`. Component-count grouping split those true siblings into
-   different epochs and delayed the deeper-pathed one by the length of its
-   path prefix, serializing work with no dependency between it.
-
-   Fixed by `ProtoIndex::network_dirs_by_tree_depth()`, which groups by
-   subnet-tree depth (parent hops) instead. This *reduces* epoch count and
-   *grows* batch size without weakening the drain-between-groups invariant:
-   every dir in group D still has its parent in group D-1, by construction.
-   Note this does not manufacture parallelism where none exists — a genuine
-   subnet chain still yields size-1 groups under either metric, so the effect
-   on the 69.4% figure depends on how much plain-directory indirection the
-   corpus actually has. Step 3 measures that.
-2. **Instrument the real `Initializing GraphBuilder` → `task seeded` cost.**
-   **Done.** `[seed_session] session_bb built` splits per-task cost into
-   `union_us` / `clone_us` / `rebuild_us`; `[epoch_session_snapshot] built`
-   splits the serial per-epoch cost across its three parts plus the state
-   clone and edge filter. Both on `noet_core::codec::perf` at `debug`.
-   `benches/log_analysis/analyze_seed_session.py` aggregates them, tests
-   whether the bimodality tracks the `unioned` branch, and reports first- vs.
-   last-quarter growth.
-
-   **Early signal, small corpus only — not yet corpus-scale evidence**: on a
-   14-task run, `BeliefBase::from` rebuild was 94.4% of seeding cost and
-   `union_graphs` only 1.8%. If that holds at corpus scale it points *away*
-   from the standing `union_graphs` theory (and therefore away from
-   const-namespace nesting as the step-4 fix) and toward PathMap
-   reconstruction. Step 3 decides; do not act on this number alone.
-3. **Re-run the product-hierarchy corpus** with both changes in place and
-   re-assess against this issue's numbers. **Done — see "Measured outcome".**
-4. **Tackle the initialization cost directly.** The original plan named
-   nesting the const-namespaces by URL segment. **Superseded by measurement**
-   — the cost is `BeliefBase::from`'s PathMap rebuild, not `union_graphs`, and
-   nesting does not address it (it re-parents nodes rather than reducing their
-   count, and the cost tracks node count). Nesting is now backlogged; see
-   `docs/project/BACKLOG.md`. Split into the `as_subgraph_seeded` scan fix
-   (local, done first — `4f352e2`) and a shared epoch session base (expected to
-   be invasive, only if the scan fix left cost on the table — it did).
-   **Both are now done.** The shared base turned
-   out not to need the overlay redesign that made it look invasive: sharing one
-   prebuilt `BeliefBase` per epoch, with copy-on-write in `PathMapMap`, was
-   local to the seeding path. See `GraphBuilder::seed_session_from_base`.
-
-### Measured outcome (2026-08-22)
-
-Re-run: same corpus, same `--jobs 4`, 63,045 parses, 55m48s (baseline 53m54s).
-A competing benchmark contended for CPU during the first ~10 min; all
-attribution figures below are unchanged when that window is excised
-(`analyze_seed_session.py --skip-first-min 12`), so the confound does not
-affect the conclusions — only absolute wall clock.
-
-**Epoch structure — tree-depth grouping (step 1) worked:**
-
-| | Baseline | This run |
+| | Before | After |
 |---|---:|---:|
 | Parallel epochs | 1,949 | **14** |
 | Mean batch size | 1.12–3.35 | **265.8** |
-| Size-1 epochs | 69.4% | **7.1%** (1 of 14) |
+| Size-1 epochs | 69.4% | **7.1%** |
 | Tasks | 3,721 | 3,721 |
 
 Identical task count with 139× fewer epochs: the corpus was almost entirely
-plain-directory indirection, and component-count grouping had been spreading
-true siblings across ~1,900 artificial epochs. Batch sizes are now
-`[12, 54, 373, 228, 262, 151, 33, 3, 1, 8, 1163, 544, 885, 4]`.
+plain-directory indirection.
 
-**Per-task seeding — the `union_graphs` theory is refuted:**
+### Mechanism 2: per-task seeding rebuilt shared state
 
-| sub-step | total | share |
-|---|---:|---:|
-| `BeliefBase::from` rebuild | 8,607s | **95.5%** |
-| `union_graphs` | 259s | 2.9% |
-| graph clone | 145s | 1.6% |
+Every spawned task logged `Initializing GraphBuilder` after semaphore
+acquisition and `[parse_epoch] task seeded` after `GraphBuilder::seed_session`
+returned — both inside the same task future, so the gap should be near-zero. It
+was bimodal: 439 tasks <10ms, 1,171 tasks >5s, max 8.25s, 38.5% of tasks over
+3s. Attribution: `BeliefBase::from` rebuild 95.5%, `union_graphs` 2.9%, graph
+clone 1.6%. Within `BeliefBase::new_unbalanced`, `PathMapMap::new` is 99.3%,
+and within that `PathMap::new` is 92.9%.
 
-The const-namespace *is* the discriminator, exactly as the bimodality
-predicted — fast tasks (439, <10ms) have `unioned=0%` and `const_ns_states=0`;
-slow tasks (1,171, >5s) have `unioned=100%` and `const_ns_states=112,177`. But
-the expensive part is rebuilding indices over those states, not copying them.
-
-**Root cause, profiled one level deeper:** within `BeliefBase::new_unbalanced`,
-`PathMapMap::new` is 99.3%; within that, `PathMap::new` is 92.9%. Its opening
-`as_subgraph_seeded` call brackets a bounded DFS with two *unbounded*
-full-graph passes, and runs once per network (1,011 of them) — O(networks ×
-graph size). Per-state cost rises 5.0 → 20.9 µs/state as graphs grow from 562
-to 1,809 states, and a `n_nets × (nodes + edges)` model tracks the measurement
-within a small constant. Fixed in `4f352e2` — see below.
-
-### The fix: `as_subgraph_seeded` scanned the whole graph per network
-
-`PathMapMap::new` builds one `PathMap` per network, and each called
-`as_subgraph_seeded`, which bracketed a correctly-bounded DFS with two
-**unbounded** full-graph passes:
-
-- a `BTreeMap` over *every node* in the graph, built only to resolve one seed
-- a scan over *every edge* in the graph, then filtered to the reachable set
-
-With ~1,011 networks this is O(networks × graph size). Two changes, which only
-work together (the first alone leaves the edge scan; the second alone leaves the
-index build):
+**Fix A — `as_subgraph_seeded` scanned the whole graph per network**
+(`4f352e2`). `PathMap::new`'s opening `as_subgraph_seeded` call bracketed a
+correctly-bounded DFS with two **unbounded** full-graph passes: a `BTreeMap`
+over every node in the graph, built only to resolve one seed; and a scan over
+every edge, then filtered to the reachable set. With ~1,011 networks that is
+O(networks × graph size). Two changes, which only work together (the first
+alone leaves the edge scan; the second alone leaves the index build):
 
 1. `as_subgraph_seeded_indexed` takes a caller-supplied `FxHashMap<Bid,
    NodeIndex>`; `PathMapMap::new` builds it once and reuses it across networks.
 2. Edge collection walks outward from the reachable set via `edges_directed`
    instead of scanning all edges.
 
-**Measured on the full corpus** (same command, same `--jobs 4`, 3,721 tasks,
-identical epoch structure and identical `merged_states` — same work, not less):
+**Fix B — share one prebuilt `BeliefBase` per epoch** instead of rebuilding it
+per task (`4452085`, `GraphBuilder::seed_session_from_base`). This did not need
+the overlay redesign that made it look invasive: sharing one prebuilt base per
+epoch, with copy-on-write in `PathMapMap`, was local to the seeding path.
 
-| metric | before | after | change |
+### Measured outcome
+
+| | wall clock | parse phase | seeding (summed) |
 |---|---:|---:|---:|
-| `BeliefBase::from` rebuild | 8,607.8s | 2,166.5s | **3.97x** |
-| seeding total | 9,012.5s | 2,574.0s | 3.50x |
-| `union_graphs` (control, untouched) | 259.5s | 262.5s | 0.99x |
-| **parse phase wall clock** | **48.2 min** | **21.2 min** | **2.3x** |
+| baseline | 28m19s | 20m38s | 2,533s |
+| + shared epoch base (`4452085`) | **19m22s** | **11m32s** | **524s** |
 
-On the slow-path population specifically (1,432 unioned tasks, mean 104,014
-`merged_states` in both runs): mean rebuild 5.85s → 1.48s, max 7.74s → 3.13s,
-56.3 → 14.2 µs/state, and **tasks >5s: 1,171 → 0**. Bottleneck 7's headline
-finding is eliminated.
+Fix A alone, measured on the full corpus with identical task count, epoch
+structure and `merged_states` (same work, not less): `BeliefBase::from` rebuild
+3.97x, seeding total 3.50x, parse phase 48.2 min → 21.2 min. On the slow-path
+population (1,432 unioned tasks): mean rebuild 5.85s → 1.48s, 56.3 → 14.2
+µs/state, and **tasks >5s: 1,171 → 0**.
 
-The unchanged `union_graphs` total is the strongest evidence the gain is real
-rather than machine-state drift — a faster machine would have moved both.
+`union_graphs` was left untouched as a control and moved 259.5s → 262.5s
+(0.99x) — the strongest evidence the gain is real rather than machine-state
+drift, since a faster machine would have moved both.
 
-**Ordering was load-bearing and not preserved for free.** `edge_references()`
-yields in edge-index order; `edges_directed` yields per-node in reverse
-insertion order. Since `BidSubGraph` is a `GraphMap` (insertion-ordered) that
-`PathMap::new` then DFSes, this would have silently changed traversal order.
-Edges are tagged with `edge_ref.id().index()` and sorted to reproduce the
-original sequence;
+**Residual**: 14.2 µs/state is not flat (a micro-corpus sits near 7.4) and
+`PathMapMap::new` remains 84.2% of seeding, since each network still walks its
+own reachable set. If this matters again, partition edges by owning network in
+one pass rather than per-network — driven by a fresh measurement, not assumed.
+
+### Durable findings
+
+**The `union_graphs` clone-cost theory is refuted.** The const-namespace *is*
+the discriminator the bimodality predicted — fast tasks have `unioned=0%` and
+`const_ns_states=0`, slow tasks `unioned=100%` and `const_ns_states=112,177` —
+but the expensive part is rebuilding indices over those states, not copying
+them. Const-namespace nesting by URL segment, once the leading candidate fix,
+does not address this: it re-parents nodes rather than reducing their count,
+and the cost tracks node count. Backlogged; see `docs/project/BACKLOG.md`.
+
+**Small epoch batches cannot be enlarged by merging the next depth-group
+forward.** Under correct depth-grouping every member of group D+1 has its
+parent in group D, which has not been drained yet, so every merge candidate
+hits the uncommitted-parent path that mints a fresh BID and panics in Phase 4
+`get_context`. Fix the grouping metric, not the batch size.
+
+**Tail latency is not the binding metric; aggregate cost is.** After Fix A the
+>5s tail was zero, which made Fix B look unwarranted — but seeding was still
+~half the parse phase, 97.5% of it redundant reconstruction of shared data, and
+Fix B then took seeding 2,533s → 524s. Likewise, removing epoch fragmentation
+(Mechanism 1) did not move wall clock on its own: seeding cost is *per task*,
+so fewer, larger batches simply meant more tasks running concurrently against a
+large namespace. Judge a per-task cost by its sum, not its worst case.
+
+**Edge iteration order was load-bearing and not preserved for free.**
+`edge_references()` yields in edge-index order; `edges_directed` yields
+per-node in reverse insertion order. Since `BidSubGraph` is a `GraphMap`
+(insertion-ordered) that `PathMap::new` then DFSes, the swap would have
+silently changed traversal order. Edges are tagged with
+`edge_ref.id().index()` and sorted to reproduce the original sequence;
 `test_subgraph_seeded_matches_reference_implementation` pins it against an
 in-test copy of the old algorithm, and deleting the sort makes it fail.
 
-**Residual, not yet addressed**: 14.2 µs/state is still not flat (a micro-corpus
-sits near 7.4), and `PathMapMap::new` remains 84.2% of seeding. Each network
-still walks its own reachable set. If this matters again, the next step is
-partitioning edges by owning network in one pass rather than per-network — but
-that should be driven by a fresh measurement, not assumed.
+**A 14-task run is not corpus-scale evidence — but it pointed the right way.**
+The small-corpus signal (`BeliefBase::from` 94.4% of seeding, `union_graphs`
+1.8%) matched the full-corpus split (95.5% / 2.9%) closely enough to have saved
+a session had it been trusted. Treat it as a hypothesis generator, not a
+decision input.
 
-**Consequence for the shared-`session_bb` redesign**: it was justified by the
->5s tail, which is now zero, so on this evidence it looked unwarranted.
-**That conclusion was wrong** — it judged by *tail latency* when the binding
-metric was *aggregate cost*. The tail was gone while seeding was still ~half
-the parse phase, 97.5% of it redundant reconstruction of shared data. Sharing
-one prebuilt base per epoch subsequently took seeding 2,533s → 524s and wall
-clock 28m19s → 19m22s. The fix above was still worth doing and is what made the
-remaining cost legible; only the "therefore stop here" inference was mistaken.
+**Summing per-task gaps overstates build cost.** Tasks run concurrently, so the
+8,772s of summed per-task gaps double-counts overlapping wall clock. The
+wall-clock-bounded measure is the sum of `[task-switch]`-tagged gaps between
+*consecutive log lines* — moments where nothing in the whole process logged
+anything — which gave 1,907s (5.9% of the run) as the portion where every
+worker was simultaneously blocked. That is a lower bound: it counts only
+all-stall moments, not per-task cost hidden behind other tasks' useful work.
 
-**Wall clock did not improve** (55m48s vs 53m54s), and 2,032s of inter-line
-gaps still terminate at a seeding line (baseline 1,907s). Step 1 removed epoch
-fragmentation, but seeding cost is *per task* — fewer, larger batches mean more
-tasks run concurrently against a large namespace, so the aggregate held. The
-remaining cost is the `as_subgraph_seeded` full-graph scan's to remove.
-
-**Unrelated finding:** `compute_layout_metadata` took 288.6s in
-`finalize_html` — a single serial stage worth 8.6% of the run, not currently in
-this register. Worth its own entry.
+**Tooling**: `[seed_session] session_bb built` splits per-task cost into
+`union_us` / `clone_us` / `rebuild_us`; `[epoch_session_snapshot] built` splits
+the serial per-epoch cost across its three parts plus the state clone and edge
+filter. Both on `noet_core::codec::perf` at `debug`;
+`benches/log_analysis/analyze_seed_session.py` aggregates them.
 
 ---
 
-## Bottleneck 1 — working sections
+## Bottleneck 8 — `parse_epoch` ancestor-BID seed miss on reparse (resolved)
 
-> Retained from the original single-bottleneck framing of this issue.
-> Scoped to Bottleneck 1 only; the other bottlenecks track their own
-> checkboxes inline above.
+Found while diagnosing a correctness defect (duplicate content nodes; see
+`docs/design/codecs/network_authoring.md` §8), not from a performance
+measurement — but a silently duplicated subtree inflates every later
+O(graph size) stage, so it is recorded here per this issue's cross-cutting
+lesson about correctness bugs inflating downstream cost.
 
-### Goals
+### Symptom
 
-1. Identify the specific mechanism causing `terminate_stack` to take orders
-   of magnitude longer under `jobs=1` than under `jobs=4` for the *identical*
-   diff content (908 `RelationUpdate`s, same file).
-2. Determine whether this is a bug (e.g. a blocking call, unbounded channel
-   growth, or lock contention specific to the inline sequential path) or an
-   inherent property of single-threaded dispatch that parallel dispatch
-   incidentally avoids.
-3. Fix the root cause if it's a bug, or document why `jobs=1` is expected to
-   remain slow and recommend `jobs > 1` as the practical mitigation if not.
+Under `--jobs > 1`, `parse_epoch`'s pre-spawn seed computation resolves each
+path's owning-network BID and document BID from `session_bb`, falling back to
+`global_bb`. On a **reparse** (`processed[path] > 1`) both lookups could miss,
+and the path was dispatched into the parallel batch anyway with an **empty
+seed**.
 
-### Architecture
+An empty seed is not a slower path to the same answer — it is silently wrong.
+`GraphBuilder::initialize_stack`'s slow path cannot find the ancestor chain
+either (that is *why* the lookup failed), so `push()`'s node-not-found branch
+mints a **fresh `Bid::new(parent_bid)`** for the ancestor network, and every
+node the reparse produces is keyed under it. Because the duplicate lives in a
+structurally distinct subnet it never competes with the original for a slot in
+any one network's `PathMap`, so the one-path-one-BID collision warning never
+fires — the two copies are invisible to each other by construction, not merely
+undetected.
 
-Per `docs/design/core/beliefbase_architecture.md` §3.1, Phase 5
-(`terminate_stack`) does, per document:
+### Root cause
 
-```
-compute_diff(session_bb, doc_bb, parsed_nodes)              [O(diff size)]
-for event in diff_events: session_bb.process_event(event)   [sequential await loop]
-tx.send(event) for all tx_events                             [sequential await loop]
-```
+A **directory symlink** pointing from one subtree into another, with two plain
+(non-network) directories between the link and its nearest network ancestor.
 
-Per `compiler.rs:1758-1769`: when `jobs == 1`, `parse_one_path` runs inline
-in the compiler's own async context using the compiler's own `builder` — no
-task spawn, no semaphore, direct `tx` send. When `jobs > 1`, each path is a
-separate `tokio::task::spawn` task with its own `GraphBuilder`, `tx` clone,
-and `global_bb` handle.
+`net_dir_partition` walks with `follow_links(true)`. Both of its passes drop
+symlinked **files**, with an explicit rationale: the target would otherwise be
+parsed under two networks and produce duplicate nodes with different BIDs.
+There was no equivalent guard for symlinked **directories**, so the walk
+descended through one and recorded the target's canonicalized paths while
+recursing under the *link's* parent.
 
-**Original leading hypothesis** (channel/receiver bottleneck): `tx` is an
-`UnboundedSender` to a single `BeliefAccumulator` receiver, so under `jobs=1`
-a synchronous or lock-contended receiver would serialise into
-`terminate_stack`'s critical path.
+The chain:
 
-**Superseded.** The parenthetical alternative in that hypothesis —
-"cooperative yielding starvation" — is what `6c313d5` found and fixed: under
-`Builder::new_current_thread()`, a CPU-bound Phase 2 with no yield points
-starved every other task on the runtime. Retained here because the reasoning
-trail matters: the symptom pointed at the channel, and the cause was the
-runtime underneath it.
+1. Descending through the link attributes the target network to the link's
+   nearest network ancestor, in an unrelated subtree. The plain intervening
+   directories are load-bearing: `net_dir_partition` flattens them, so the
+   target lands in the child list of a network at a **different tree depth**
+   than its true parent.
+2. `network_dirs_by_tree_depth`'s `parent_of` map therefore holds the wrong
+   parent. That parent's depth is not yet assigned when the child is visited,
+   so the child falls through to `.unwrap_or(0)` and is grouped at **depth 0**
+   alongside the repo root — ahead of its real parent at depth 1.
+3. This violates the invariant that function documents explicitly: *every dir
+   in group `k` has its parent network in group `k-1`*.
+4. `sync_subnet_stubs` then runs for the subnet before its parent exists in
+   `session_bb`, takes its skip branch, and registers no stub.
+5. **The skip cascades**: each child subnet finds *its* parent unstubbed and
+   skips in turn — one skip per subnet in the subtree.
+6. No stub means no `PathMap` entry for the owning network, so `parse_epoch`'s
+   seed loop misses it in both `session_bb` and `global_bb`.
+7. On a reparse, that is the seed-miss symptom above.
 
-Other candidate mechanisms to rule out:
+Correlation was exact across every run measured: skips present ⇔ seed misses
+present, in fixed proportion; zero skips ⇔ zero seed misses.
 
-- `global_bb` lock contention that behaves pathologically for a single
-  writer with no concurrent readers/writers to naturally interleave against
-  (unlikely, but should be checked).
-- An accidental `O(n)` or worse scan inside `process_event`'s derivative
-  computation that scales with total accumulated `session_bb` size in the
-  sequential path but is somehow bypassed or amortized differently in the
-  parallel path (this would be surprising given both paths call the same
-  `process_event` code, but worth explicitly ruling out via profiling
-  rather than assumed away).
+**Why a seed miss on reparse is always a corruption signal, never a timing
+one.** Epoch staging makes this provable rather than probable. `parse_all`
+runs Phase 1 (every network directory, grouped by tree depth, drained between
+groups), then Phase 2 (every leaf document), and only then the remainder loop.
+So by the time any path is reparsed, every network and document in the corpus
+has been parsed once and committed to `global_bb`. The complete Section graph
+exists; only epistemic and pragmatic links can still be dangling.
 
-### Implementation Steps
+A reparse that cannot resolve its own owning-network BID is therefore not
+waiting on anything — the entry it needs was either never created or was
+created under the wrong key. That is what made "the sibling task's write hasn't
+propagated yet" the wrong hypothesis, and why deferral could never have fixed
+this on its own: more epochs cannot supply a `PathMap` entry that nothing
+writes. It also gives the `fallback_queue`'s eviction warning its real meaning
+— **it is a corruption alarm, not a slow-convergence notice.** Any future
+occurrence should be investigated as a structural defect in how the node was
+keyed, on the model of this one.
 
-> Written against the unresolved framing. If the full-corpus `jobs=1`
-> confirmation above passes, steps 1–2 are moot and only step 3's validation
-> remains.
+Intermittency came from an id race deciding whether the bad parent edge was
+traversed before the real one. The contested ids were title-derived and each
+appeared three times — once at the canonical location and again via the link.
+The corpus contained no duplicate explicit `id:` fields; the duplication was
+the symlink's doing.
 
-1. Instrumentation (0.5 day)
-   - [ ] Add fine-grained timing (or use `tokio-console` / `tracing` spans)
-         inside `terminate_stack` to split `compute_diff` time,
-         `process_event` loop time, and `tx.send` loop time separately.
-   - [ ] Re-run the `jobs=1` reproduction on a smaller corpus subset
-         containing just the worst-case slide-deck export and enough prior
-         context to reproduce the 20-minute stall, to get a fast iteration
-         loop.
-2. Root cause (1 day)
-   - [ ] Determine which sub-phase accounts for the multi-order-of-magnitude
-         gap between `jobs=1` and `jobs=4` for identical diff content.
-   - [ ] If it's `tx.send`/channel-related: inspect `BeliefAccumulator`'s
-         receive loop for synchronous or lock-contended per-event work that
-         could explain serialized-sender pathology.
-   - [ ] If it's `session_bb.process_event`: check for any accumulation
-         (e.g. an internal `Vec` or index) whose per-call cost grows with
-         total nodes/relations processed so far in the run, and confirm
-         whether `jobs>1`'s per-task fresh `GraphBuilder`/`session_bb`
-         instances reset that accumulation in a way the sequential path
-         does not.
-3. Fix + validate (0.5 day)
-   - [ ] Apply the identified fix (or, if none is warranted, document the
-         finding and recommend `jobs > 1` as the practical mitigation).
-   - [ ] Re-run the full application corpus under `jobs=1` post-fix and
-         confirm `terminate_stack` durations converge toward the `jobs=4`
-         baseline (sub-second per file).
+**Ruled out, recorded so they are not retried**: `drain_epoch` sequencing;
+`session_bb`/`global_bb` accumulator staleness; a `NodeKey::Path` form mismatch
+between the two parses; `requeue_reparse_bids` (absent from the failing burst
+entirely). Also not an ordering bug *within* `sync_subnet_stubs` — expanding
+that pass to pull in missing ancestors and process them shallowest-first does
+**not** help, because the parent is genuinely unparsed at that point rather
+than merely out of order.
 
-### Testing Requirements
+### Fix
 
-- Existing `codec_test` suite must continue to pass unchanged.
-- If a fix is applied: a regression test or benchmark assertion that a
-  single-document `terminate_stack` call with a large synthetic diff
-  (hundreds of `RelationUpdate`s) completes within a fixed time budget
-  (e.g. <1s), to catch future regressions of this specific pathology.
-- Benchmark: `jobs=1` vs `jobs=4` on the application corpus (or a
-  smaller reproducible subset), before/after the fix, to confirm
-  convergence.
+Two layers: one prevents the defect, one contains the class.
 
-### Success Criteria
+**Prevention** — `net_dir_partition` no longer descends into a symlinked
+directory (`is_dir_symlink`, applied in both `WalkDir` passes). The target is
+still discovered and parsed at its canonical location by the same walk.
 
-- [ ] Root cause of the `jobs=1` vs `jobs=4` `terminate_stack` timing gap is
-      identified and attributed to a specific code path.
-- [ ] Either a fix is implemented and validated (sequential `terminate_stack`
-      durations converge to sub-second, matching the parallel path), or a
-      documented explanation is provided for why `jobs=1` is inherently slow
-      and `jobs > 1` is the recommended mitigation.
-- [ ] No regression in event-ordering correctness tests.
+**Containment** — `fallback_queue` keeps an unresolvable seed loud and bounded
+rather than silently corrupting. When pre-spawn seed resolution fails on a
+reparse, the path is deferred to a dedicated queue instead of dispatching with
+an empty seed. The two queues' entries are never mixed within a batch, so a
+retry never races the siblings whose writes it is waiting on.
 
-### Risks
+The remainder loop **alternates** between the queues rather than draining the
+fallback queue greedily. Back-to-back fallback epochs are near-pointless: a
+fallback epoch parses only paths whose seeds already failed, so if they fail
+again the epoch writes almost nothing and the next retry's seed sees a global
+state essentially identical to the last. Measured under greedy draining, a
+second attempt reached eviction **47ms** after the first — an attempt spent
+against unchanged state. With alternation the same gap is **7.5s**, one full
+remainder epoch, so each retry is evaluated against a beliefbase that actually
+advanced. When one queue is empty the other runs regardless; the alternation is
+a preference, not a requirement.
 
-- Risk: The root cause may be difficult to reproduce outside the full
-  corpus context (similar to the original Issue 26 balanced-set panic,
-  which only reproduced at full-build scale) → **Mitigation**: start
-  instrumentation on the full application corpus where the effect is
-  already confirmed, and only attempt to shrink the repro once the
-  mechanism is understood well enough to know what state is required to
-  trigger it.
-- Risk: This may overlap with or be superseded by Issue 66 (Incremental
-  Parse via Shard Hydration), which changes the parse pipeline's caching
-  model → **Mitigation**: check Issue 66's status before starting
-  implementation; coordinate if both are active concurrently.
-- Risk: If the mechanism turns out to be inherent to single-threaded
-  dispatch (e.g. cooperative scheduling starvation with no other task to
-  yield to) rather than a bug, the "fix" may just be recommending
-  `jobs > 1` as standard practice, with no code change — acceptable outcome,
-  but should be validated rather than assumed given the magnitude of the
-  gap (4 orders of magnitude is unusually large for a pure scheduling
-  effect).
+Retries are counted in `fallback_attempts`, separate from `processed` because
+the two bound different things: `processed` bounds how many times a document's
+*content* is re-examined, `fallback_attempts` how many epochs may be spent
+waiting for its *seed infrastructure*. Three rules make the interaction sound:
+
+- **A deferral is not refunded against `processed`.** The deferred path will be
+  parsed next epoch, so the attempt it occupies is real. The fallback
+  *substitutes* for the reparse the path would otherwise have had rather than
+  adding to it, so a successful first fallback costs exactly what a normal
+  reparse would. Only the retry after a failed fallback is additional.
+- **Eviction is terminal.** Once over budget a path is never deferred or warned
+  about again; without the latch the counter climbs on every re-entry and each
+  visit re-evicts.
+- **The eviction parse is final, and its result is kept.** It is exempt from
+  `ReparseLimitExceeded` but has its re-queue suppressed. Both halves are
+  load-bearing, and getting either alone wrong is instructive:
+  - Exempting *without* suppressing the re-queue is an infinite reparse loop
+    (observed: a 900 MB log). The limit is otherwise the only thing that
+    terminates the remainder loop.
+  - Suppressing *without* exempting discards the best-effort parse as
+    over-budget, which measured **54 of 54 deferred paths truncated** — every
+    document that hit a seed failure replaced by an empty
+    `ReparseLimitExceeded` placeholder. Strictly worse than the duplication
+    being prevented.
+
+  With both, zero deferred paths are truncated and the degraded parse is
+  retained.
+
+### Measured
+
+Full-corpus runs (`--jobs 8`, ~69,000 files, ~72,600 parses):
+
+| | before | after |
+|---|---|---|
+| seed misses | 70 | **0** |
+| `sync_subnet_stubs` skips | 18 | 0 |
+| `PathMap` collisions | 8,619 | 8,610 |
+
+All 70 original misses were `net_bid` misses and **zero** were `doc_bid`
+misses — consistent with a missing *network* stub rather than a document-level
+problem. The unchanged collision count confirms Bottleneck 9 is a separate
+defect this fix does not touch.
+
+Reduced repro: 4-10 failures per 12 runs before, **0 per 14** after, with parse
+count stable at the passing value. Wall clock is not a useful signal here —
+full-corpus runs vary by more than 4x on the same cache for unrelated reasons;
+the per-path instrumentation (`noet_core::codec::fast_path` at `debug`) is what
+to measure.
+
+### Reproduction and regression
+
+The defect needs the **triggering structure**, not merely scale. A dozen
+earlier attempts capped at ~2,400 files all missed it because none contained a
+directory symlink of this shape. Any subtree that does contain one reproduces
+it at ~1/30 the cost of a full-corpus run (~2,500 files, ~40s), intermittently,
+at `--jobs > 1`; `--jobs 1` never reproduces it.
+
+All 70 full-corpus misses fell in **one subtree** out of ~69,000 files. Nesting
+depth is not the discriminator (over a thousand networks sit at depth ≥4
+without failing), nor is any particular index-file directive. The subtree was
+singled out because exactly one directory symlink in the corpus pointed into
+it.
+
+The unit regression is `test_dir_symlink_does_not_reparent_target_network`
+(`proto_index.rs`), which reproduces the corpus's *shape* — the link must sit
+under plain directories so its nearest network ancestor is in an unrelated
+subtree at a different tree depth. Verified to fail without the guard and pass
+with it. A flatter synthetic layout does **not** reproduce the misattribution
+and silently passes either way.
+
+### Relationship to Bottleneck 9: disjoint defects
+
+Measured on one full-corpus run producing both: **zero** of its 8,619 `PathMap`
+collisions fall in the subtree holding **all** 70 seed misses, and the subtree
+repro that yields 71 seed misses yields zero collisions. Two defects, disjoint
+populations, one shared trigger surface (parallel dispatch plus a reparse
+epoch). Bottleneck 9's `net_bid`/`doc_bid` resolve correctly, so a missing
+subnet stub cannot explain it.
+
+- [ ] The id race that made this intermittent is no longer reachable through
+      this path, but `FIRST-ONE-WINS` firing three times per contested id
+      suggests it may surface elsewhere — worth its own investigation
+
+---
+
+## Bottleneck 9 — reparse-seed miss duplicates section BIDs under `--jobs > 1` (open)
+
+A reparsed document's per-heading `cache_fetch` misses even though its
+`net_bid`/`doc_bid` resolve correctly, so the reparse task mints fresh BIDs for
+every heading. Because those duplicates are ordinary first-one-wins content (not
+Bottleneck 8's freshly-minted, structurally-isolated subnet) they do land in the
+same `PathMap`, which is why `[PathMap::new] two entries share one path` is the
+visible symptom here.
+
+**Reproduction** — a representative requirements subtree, fresh copy per run:
+`--jobs 4` produces 389 `PathMap::new` collisions on each of three independent
+runs; `--jobs 1` produces **zero** on each of three. Parallel dispatch plus at
+least one reparse epoch is the precondition.
+
+Evidence for the mechanism: of the 389 collisions, 387 are plain internal
+`path#anchor` keys. Tracing one collision's `previous`/`replacement` BIDs to
+their log lines shows one document parsed by two tasks in the same run — once
+in the first epoch, once in a reparse epoch triggered by an unrelated
+unresolved reference. The reparse logs `[cache_fetch] MISS on re-parse` for all
+~45 of its headings while `submap_by_bid(net_bid, Some(doc_bid), 0, true)`
+reports a non-empty `seed_states=67`. So the seed resolves the document's
+ancestor identity and still fails to make its headings visible — a narrower
+failure than Bottleneck 8, and one the `pn > 1` fallback guard does not catch.
+The remaining 2 collisions are the pre-existing href-stub absorption pattern
+from `5f31d75`.
+
+**Ruled out by measurement, so do not re-investigate:**
+
+- *`MdCodec`'s alias machinery.* No `alias-template`-derived key appears in any
+  fresh-parse log, and the per-node alias loop and `AliasScope` play no part.
+  Duplicate-BID pairs in a stored snapshot that once suggested otherwise were
+  stale build artifacts; a fresh parse resolves the worked example to one BID.
+- *The Section-edge-clobbering defect* fixed in `compute_diff` Phase 4 (a
+  network's `index.md` citing its own child erased that child's structural edge,
+  leaving it unanchorable). Plausible — an unanchored node is unfindable by path
+  key on reparse, which is this signature — but the same subtree still produces
+  exactly 389 collisions on three runs after that fix, and the corpus contains
+  no `index.md` with the trigger shape.
+- *Bottleneck 8's missing subnet stub.* Disjoint populations on a single
+  full-corpus run producing both: zero of its 8,619 collisions fall in the
+  subtree holding all 70 seed misses, and the seed-miss repro yields zero
+  collisions. The two share a trigger surface (parallel dispatch plus a reparse
+  epoch), not a defect.
+- *The corpus's `ReparseLimitExceeded` truncations.* A plausible link, since
+  both involve reparses going wrong, but the populations barely intersect: only
+  17 of the 139 parallel-only truncations have a matching collision entry, and
+  the truncations are 90% C++ while the collisions are markdown sections and
+  href stubs. The two metrics also respond differently to `--jobs` — collisions
+  scale 6.7x, truncations 1.3x. See Bottleneck 3.
+
+**Where to look next.** `submap_by_bid`'s `depth: 0` is a *subnet-crossing*
+budget, not a Section-tree depth, so headings are included in the returned BID
+set — the seed is not truncated at the source. `cache_fetch`'s probe for a
+heading is path-index-keyed (`net_get_from_path` → `PathMap`, consulted *before*
+`states`), so a node whose state is merged but whose `PathMap` entry is missing
+misses. `seed_session_from_base` merges the per-doc seed incrementally via
+`process_event_queue` rather than rebuilding the index, and that path has at
+least three silent drops worth instrumenting: `to_event_stream_with`'s
+`evaluate_query` error return, its `already_present` edge elision, and
+`process_relation_update`'s sink-missing early return. Counting each would
+distinguish them.
+
+- [ ] Root-cause why `submap_by_bid`'s balanced seed for a reparsed document
+      does not make all of its heading BIDs visible to `cache_fetch` on the reparse
+      task, despite `doc_bid`/`net_bid` resolving correctly and `seed_states` being
+      reported non-empty — likely in `to_event_stream_with`'s tape-scoped
+      halo/section-ancestor traversal (`beliefbase/graph.rs`) or in how
+      `seed_session_from_base` merges the per-doc seed into the shared epoch base
+      (`builder.rs`). Reproduced on two distinct documents, so this is a general
+      defect rather than a fixture artifact
+
+- [ ] Extend the seed-failure guard in `parse_epoch` to also catch a
+      resolved-but-*incomplete* per-document seed, not just an outright
+      ancestor-BID lookup failure. The `fallback_queue` mechanism built for
+      Bottleneck 8 is the natural home: the detection differs, the containment
+      does not
+- [ ] A regression fixture is still needed and is a prerequisite for any fix.
+      Synthetic fixtures did **not** reproduce this at `--jobs 4` (tried up to 40
+      networks × 60 cross-referencing headings, with reparse-forcing unresolved
+      wikilinks); only real corpus subtrees do.
+
+---
 
 ## Cross-cutting lessons
 
@@ -1098,12 +915,123 @@ inapplicable:
 sort keys are monotonic, so the random-insert distribution it assumed never
 occurs. Measured shift was exactly zero.
 
+**A correctness bug can look like (and compound) a performance problem.**
+Bottleneck 8's duplicate-node defect was found while investigating a
+data-quality report, not a slow-build complaint, but its failure mode is
+directly on this issue's cost model: every silently-duplicated subnet pays
+`PathMapMap::new`'s full per-network construction cost for content that
+should not exist. A one-path-one-BID violation that produces no collision
+warning (because the two copies never share a `PathMap` to collide in) is
+invisible to every classifier in `benches/log_analysis/`; only per-path node
+counts or a targeted reparse-seed probe surfaced it. When a corpus's node or
+edge counts look implausibly large for its file count, check for silent
+duplication before assuming the graph is simply big.
+
+**"Same end state" is not "same defect" — confirm by measuring the fix, not
+by matching symptoms.** Several distinct bugs in this codebase converge on one
+observable: a node that is present by BID but has no resolvable path, which
+downstream code reports as a `cache_fetch` miss, a `PathMap::new` collision, or
+an empty `root_path`. Bottleneck 9 and the `compute_diff` Section-edge-clobber
+defect share that signature exactly, and the latter is a mechanically plausible
+cause of the former — an unanchored node *is* unfindable by path key on
+reparse. They are unrelated: Bottleneck 9's collision count is bit-identical
+before and after that fix, and the corpus contains no instance of its trigger
+shape. The cheap discriminator is to check whether the corpus even *contains*
+the candidate cause's precondition before attributing.
+
+**A corpus-wide rate is not a per-subtree probability — check whether a rare
+defect is *localized* before concluding it needs scale.** Bottleneck 8 measured
+0.095% corpus-wide (69 of 72,594 parses), and roughly a dozen repro attempts on
+real subtrees up to ~2,400 files never fired it once. The natural reading —
+"too rare for anything below full-corpus scale" — was wrong. All 70 hits were
+concentrated in a *single* top-level subtree; copying just that subtree
+reproduces it at 2,514 files in ~40s. The corpus-wide rate was low only because
+the denominator included 66,000 files that could never trigger it. The
+diagnostic that broke the impasse was cheap and should come first: bucket the
+failure's own log lines by path and look at the distribution. A defect that is
+0.1% overall but 100% within one subtree is a *localization* problem, not a
+scale problem, and the two call for opposite strategies.
+
+**A guard that names its rationale should be checked against the adjacent
+case.** `net_dir_partition` dropped symlinked *files* in both of its passes,
+with a comment explaining that following them would parse the target under two
+networks and duplicate its nodes. That rationale applies verbatim to symlinked
+*directories*, which `follow_links(true)` walked straight through — and the
+directory case is worse, because it re-parents every network beneath the link
+rather than duplicating one file. The corpus had 52 symlinks: 51 files, all
+handled; 1 directory, which produced this defect. When a guard exists for one
+member of a category, check whether the sibling members are covered, especially
+where the traversal API makes following the default.
+
+**Reproduce the corpus's *shape*, not just its scenario.** The first regression
+test for this placed the symlink one level under a network and passed with and
+without the fix — a false negative that would have shipped a dead test. The
+real corpus interposes two plain directories between the link and its nearest
+network ancestor, and `net_dir_partition` flattens those, which is what puts
+the misattributed parent at a *different tree depth* than the true one. Only
+then does the depth grouping invert. Always verify a regression test fails
+without its fix; for structural defects, that check is what distinguishes
+reproducing the mechanism from merely reproducing the vocabulary.
+
+**A shared trigger is not a shared defect.** Bottlenecks 8 and 9 are both
+reachable under parallel dispatch plus a reparse epoch, which made a common
+root cause tempting. Measuring one run that produced both settled it: their
+affected populations are disjoint (zero of 8,619 collisions in the subtree
+holding all 70 seed-misses, and zero collisions in the subtree repro that
+yields 71 seed-misses). Check the rarer bug's specific signature directly
+rather than inferring it from the commoner bug's presence.
+
+**`grep -c` returning 0 proves nothing until the log filter is verified.**
+A `RUST_LOG` filter of `warn,noet_core::codec::fast_path=debug` cannot emit
+`Max reparse limit reached`, which is a `debug!` on the *default*
+`noet_core::codec::compiler` target — so "zero truncations" was a statement
+about the filter, not the build. This is the ANSI-colour trap's sibling and it
+fails the same way: silently, in the direction of good news. Before concluding
+that an event did not occur, confirm its target and level are actually enabled,
+ideally by grepping for a known-present line from the same target.
+
+**A retry is only worth its budget if something changed between attempts.**
+The fallback queue originally drained greedily, so a path's retries ran in
+consecutive fallback epochs — but a fallback epoch contains only paths whose
+seeds already failed, and when they fail again it writes almost nothing. The
+second attempt therefore evaluated against a near-identical global state and
+reached eviction 47ms after the first, consuming a budget unit for no new
+information. Alternating with remainder epochs raised that gap to 7.5s of real
+progress. Generally: when scheduling a retry, identify which other work
+produces the state change the retry depends on, and ensure that work is
+interleaved — otherwise the retry count measures patience rather than
+opportunity.
+
+**Ask what the pipeline's staging already guarantees before theorising a
+race.** Bottleneck 8's seed miss was first attributed to a sibling task's write
+not having propagated yet — a plausible story that cost several sessions. The
+epoch schedule rules it out for free: `parse_all` commits every network (Phase
+1) and every leaf document (Phase 2) before the remainder loop reparses
+anything, so at reparse time the whole Section graph exists and only
+epistemic/pragmatic links can dangle. A lookup that misses *then* cannot be
+early; the entry is missing or mis-keyed, i.e. corrupted. Whenever a defect is
+about to be explained as "not yet propagated", check whether the phase ordering
+makes that impossible — it converts an open-ended timing hunt into a bounded
+search for who wrote the wrong key.
+
+**A retry mechanism must be reconciled against every counter and termination
+guard it touches, and "safe" combinations are not composable pairwise.** The
+`fallback_queue` deferral carried its own attempt counter precisely to keep
+seed retries off the content-reparse budget, and still interacted with
+`processed` three ways before it was right: the remainder loop pre-increments
+on dispatch; the over-budget counter kept climbing on re-entry so every epoch
+re-evicted; and eviction-by-requeue re-entered the same guard. The instructive
+part is the last step, where two individually-reasonable choices each fail
+alone — exempting the final parse from the reparse limit without suppressing
+its re-queue is an infinite loop (a 900 MB log), while suppressing the re-queue
+without the exemption discards that parse as over-budget and truncated 54 of 54
+affected documents. Only both together are correct. Enumerate the interactions,
+and measure the combination rather than reasoning about each guard in
+isolation.
+
 ## Open Questions
 
-- Was Run 2 (`--jobs 4`) capturing a corpus that had already benefited from
-  warm OS filesystem caches from Run 1, and could that (rather than `jobs`)
-  explain part of the difference? Largely moot now that `6c313d5` supplies a
-  mechanism, but the full-corpus `jobs=1` re-run would settle it.
+
 - Do Bottlenecks 4 and 5 share a mechanism? Both show a local PathMap far
   smaller than the authoritative membership. A single DB-query-count probe
   would answer this for both.
@@ -1114,6 +1042,7 @@ occurs. Measured shift was exactly zero.
   4/5? All three show cost that scales with `session_bb`'s accumulated
   const-namespace size rather than with the individual document being
   parsed. If so, a fix to one may resolve all three.
+
 - The `--jobs` CLI help text (`cli.rs:144`) says "default: available CPUs",
   but `DocumentCompiler::with_html_output` actually defaults to `jobs=1`
   (parallel dispatch requires explicit opt-in via `--jobs` or `NOET_JOBS`).
@@ -1123,8 +1052,7 @@ occurs. Measured shift was exactly zero.
   parallel path is production-validated, per the comment at
   `compiler.rs:313`).
 - Does `BeliefAccumulator`'s channel have bounded capacity, and if so, could
-  the *receiver* side have been the actual bottleneck in Run 1 regardless of
-  sender concurrency?
+  the *receiver* side throttle throughput regardless of sender concurrency?
 
 ## References
 
@@ -1144,9 +1072,13 @@ occurs. Measured shift was exactly zero.
   `parse_content` Phase 5 entry (~L1246); `seed_session_from_base` and
   `epoch_session_snapshot`, the shared-epoch-base path that replaced the
   refuted `union_graphs`-clone-cost theory for Bottleneck 7.
-- `noet-core/src/codec/compiler.rs` — `with_html_output` jobs resolution
-  (~L311-321), `parse_epoch` sequential/parallel dispatch (~L2150-2444),
+- `noet-core/src/codec/compiler.rs` — `with_html_output` jobs resolution,
+  `parse_epoch` sequential/parallel dispatch, `fallback_queue` /
+  `fallback_attempts` / `defer_to_fallback_queue` (Bottleneck 8 containment),
   `finalize_html` (Bottleneck 2).
+- `noet-core/src/codec/proto_index.rs` — `net_dir_partition`'s symlink guards
+  and `network_dirs_by_tree_depth`'s parent/depth mapping (Bottleneck 8 fix);
+  `test_dir_symlink_does_not_reparent_target_network` is the regression.
 - `noet-core/src/layout.rs` — `compute_layout_metadata`, `LayoutConfig`,
   `resolve_scope` (Bottleneck 2 fix: reserved-namespace exclusion,
   `max_nodes` guard, `indexed_path` fallback removal).
@@ -1159,6 +1091,18 @@ occurs. Measured shift was exactly zero.
   `analyze_seed_session.py` — tooling added for Bottlenecks 2/3/4/5/7
   respectively; see their module docstrings for the `RUST_LOG` targets each
   needs.
+- `noet-core/benches/log_analysis/parse_log.py --warnings` — the
+  `noet_core::paths::collision`-target classifiers that surfaced Bottlenecks 8
+  and 9 ("Stub evicted by content-node claim" and "Duplicate path survived to
+  PathMap construction"); see `benches/log_analysis/README.md` §"One-path-one-BID
+  enforcement".
+- `noet-core/docs/design/codecs/network_authoring.md` §8 ("URL Aliasing") —
+  `alias-template`/`alias-scope` mechanism; ruled out as Bottleneck 9's cause,
+  kept here as the reference that documents why the theory was plausible.
+- `noet-core/src/beliefbase/base.rs` — `compute_diff` Phase 4's weight-union
+  clause. A separate one-path-one-BID defect with a symptom that looks like
+  Bottleneck 9's (unanchored node → `cache_fetch` miss on reparse) but is
+  unrelated to it; see the Cross-cutting lesson on distinguishing the two.
 - `planning/project/ISSUE_26_pandoc_markdown_quality.md` — origin of this
   investigation.
 - Commits: `6c313d5` (multi-threaded runtime — probable Bottleneck 1 fix),
@@ -1166,6 +1110,5 @@ occurs. Measured shift was exactly zero.
   `164a35d` (epoch tree-depth grouping), `4f352e2` (`as_subgraph_seeded` scan
   fix), `2784514` (collision-check index conversion), `85c631a`
   (alias-template scope + path-mangling fix), `d4e0a17` (one path, one BID),
-  `4452085` (shared epoch session base — Bottleneck 7 resolved).
-  `src/layout.rs`'s reserved-namespace exclusion and `indexed_path`
-  narrowing (Bottleneck 2 resolved) are uncommitted as of this writing.
+  `4452085` (shared epoch session base — Bottleneck 7 resolved), `ba2f745`
+  (preserve edge kinds and unblock queued deps on reparse).
