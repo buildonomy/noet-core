@@ -83,6 +83,7 @@ structure. Read `core/beliefbase_architecture.md` §3.2 before adding one.
 | [`codec_determinism_contract.md`](codecs/codec_determinism_contract.md) | What must a codec guarantee so that hashes, anchors, and incremental parse work? Six guarantees, none compiler-enforced. **Read before writing or changing a codec.** |
 | [`myst_directive_architecture.md`](codecs/myst_directive_architecture.md) | How are MyST block directives (`{network_children}`, `{requirements_table}`) parsed and resolved in the deferred pass? |
 | [`network_authoring.md`](codecs/network_authoring.md) | How does an author declare a BeliefNetwork — `index.md`, whitelist/blacklist, subnets? User-facing reference. |
+| [`codec_namespaces.md`](codecs/codec_namespaces.md) | How does a codec resolve references written in a non-filesystem addressing scheme (`#include` paths, package coordinates), and what happens when a name is never declared? |
 | [`mapping_node_architecture.md`](codecs/mapping_node_architecture.md) | How do mapping nodes own edges, so a node can assert `{maps_to}` claims about others? |
 | [`xlsx_codec_schema.md`](codecs/xlsx_codec_schema.md) | What index-tab schema must an XLSX/ODS workbook follow to be ingested? |
 

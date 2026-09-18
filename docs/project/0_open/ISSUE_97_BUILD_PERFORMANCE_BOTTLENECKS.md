@@ -49,9 +49,9 @@ The third row is not a layout-only effect: the `indexed_path` fallback is also
 called during parsing (relation resolution, `beliefbase/context.rs`), so
 removing it sped up the parse phase independently of `finalize_html`.
 
-**Open**: Bottlenecks 3 (C++/header parse gaps), 4 (end-of-run insert storm),
-5 (warm-cache `--db` regression), and 9 (per-heading reparse-seed miss). None
-of 3, 4, or 5 touch the parse or `finalize_html` paths this work exercised.
+**Open**: Bottlenecks 4 (end-of-run insert storm), 5 (warm-cache `--db`
+regression), and 9 (per-heading reparse-seed miss). Neither 4 nor 5 touches the
+parse or `finalize_html` paths this work exercised.
 
 Bottlenecks 8 and 9 arrived from a correctness investigation rather than a
 performance measurement, and are recorded here because a silently duplicated
@@ -63,7 +63,7 @@ subtree inflates every later O(graph size) stage.
 |---|---|---|---|
 | 1 | Sequential `terminate_stack` stalls | was ~70% of wall clock | **Likely resolved** — needs confirmation |
 | 2 | `compute_layout_metadata` | **290s → 43.0s (6.7x)** | **Resolved** — see entry; stage is now 26.4% of `finalize_html`, no single dominant term |
-| 3 | C++/header parse cost and reparse-budget exhaustion | ~163 min across 211 gaps >20s; **510 files truncated** by `ReparseLimitExceeded` (90% C++) | **Open** — silent content loss, not just slowdown. Not parallelism-driven: the 510 are a perfect subset of the 649 seen at `--jobs 8`, and `--jobs 1` produces the same core set |
+| 3 | Reparse-budget exhaustion on unresolvable codec-namespace references | full corpus **649 → 73** truncations and **6,170 → 4,980** warnings; **zero** `.h`/`.cpp` remain (was ~460); C++ subtree wall clock −24% at `--jobs 1` | **Resolved** — an unconditional retry that also suppressed the permanently-unresolved latch, so a reference nothing declares re-queued until the budget truncated it. Fixed by the `parse_count <= 1` guard, plus external-reference demotion and four CMake target-recognition gaps. 23 residual truncations are a distinct `Id`-keyed defect |
 | 4 | End-of-run insert storm | 962K log lines in 13 min | **Open** — mechanism unclear |
 | 5 | Warm-cache (`--db`) regression | 94s → 28m on one subtree | **Open** — `--db` only, not on `render` path |
 | 6 | PathMap read-path scan | 422M entries scanned/run | **Resolved** — `PathMap::path_map` index |
@@ -290,75 +290,90 @@ BID→path lookup this fix touches — different index, same family of defect.
 Remaining, if the stage matters again: parallelise the per-network loop
 (~10s → ~1s).
 
-## Bottleneck 3 — C++/header parse cost and reparse-budget exhaustion
+## Bottleneck 3 — reparse-budget exhaustion on unresolvable codec-namespace references (resolved)
 
-Two symptoms on the same population of deeply-included C++ headers: a large
-aggregate time cost, and silent content loss when those files exhaust their
-reparse budget.
+### Symptom
 
-### Symptom A — parse gaps (~163 min)
+A full-corpus run truncated 649 files with `ReparseLimitExceeded` (510 at
+`--jobs 1`, a perfect subset), ~90% of them C++ headers and sources under one
+subtree. Separately, 211 silent parse gaps >20s totalling ~163 min clustered on
+the same population. Both were this one defect.
 
-211 process-wide silent gaps >20s, totalling ~163 minutes. The largest cluster
-falls in the **C++ source corpus** — gaps of 114–288s each with near-zero log
-output, on deeply-included headers.
+To recognise it elsewhere: a file re-queues on every pass and then truncates,
+and **raising `max_reparse_count` does not reduce the count**. Measured 599
+truncations on the C++ subtree at limits of 2, 3, 4, 6, and 10, with parses
+rising by exactly 599 per increment — a flat plateau means the work is not
+converging, so budget is not the constraint.
 
-Larger in aggregate than Bottleneck 2 but spread across 211 events, so more
-likely to be genuine CPU-bound tree-sitter parsing (i.e. real work) than a
-structural defect. Worth measuring before assuming either.
+### Cause and fix
 
-### Symptom B — `ReparseLimitExceeded` truncation (510 files)
+`process_unresolved_reference` returned `true` unconditionally for any
+codec-namespace reference. That single value served two purposes: it requested
+a re-queue, *and* it withheld the key from `permanently_unresolved`, because the
+caller only latches keys for references returning `false`. A reference no
+document declares — a third-party header, say — therefore missed identically on
+every pass, re-queued every pass, and latched never.
 
-A full-corpus run truncates **510 files** with `ReparseLimitExceeded`, meaning
-their parse budget (`max_reparse_count`, default 2) ran out before their
-references resolved. Every one of these emits an empty `ParseResult`, so this
-is **silent content loss**, not a slowdown.
+Fixed by returning `parse_count <= 1`, matching the guard the adjacent
+synthetic-path case already used. This *adds* a terminating condition rather
+than exempting anything from one, so the remainder loop drains strictly sooner.
 
-The population is overwhelmingly C++:
+Two follow-on fixes made the remaining references correct rather than merely
+quiet:
 
-| extension | count |
-|---|---:|
-| `.h` | 290 |
-| `.cpp` | 170 |
-| `.md` | 39 |
-| other | 11 |
+- **Demotion to external references.** A codec may now declare that absent keys
+  in its namespace denote out-of-corpus targets, so the citation resolves to an
+  `href_namespace` node instead of reporting a broken link. Specified in
+  [`codec_namespaces.md`](../../design/codecs/codec_namespaces.md) §4.
+- **CMake target recognition.** Three parser gaps each silently removed whole
+  components from the graph, so their headers registered no include alias and
+  every `#include` of them missed permanently: `add_library(foo)` without a type
+  keyword, `add_library(foo\n src/...)` with inline sources, and
+  `target_sources(... FILE_SET HEADERS BASE_DIRS <dir>)` as the sole declaration
+  of an include root. A fourth gap made `include/` inference conditional on the
+  file declaring no other include dir, so a sibling *test* target's dir
+  suppressed it.
 
-90% C++, and 452 of the 510 sit under a single source tree. The shape is
-consistent with an include graph deeper than two passes can close: a header
-whose own includes are still unresolved on pass 2 has no third pass in which to
-resolve them.
+### Measured
 
-**Parallelism is not the cause.** Measured on the same corpus:
-
-| | `--jobs 1` | `--jobs 8` |
+| | before | after |
 |---|---:|---:|
-| truncations | 510 | 649 |
-| `PathMap` collisions | 1,280 | 8,560 |
+| truncations, full corpus | 649 | **73** |
+| truncations, C++ subtree `--jobs 1` | 483 | **23** |
+| `.h`/`.cpp` truncating | ~460 | **0** |
+| warnings, full corpus | 6,170 | **4,980** |
+| C++ subtree wall clock, `--jobs 1` | 123.5s | **93.5s** |
 
-The 510 are a **perfect subset** of the 649 — no file truncates only at
-`--jobs 1`. The 139 additional truncations under parallel dispatch are
-themselves 85% C++ (72 `.h`, 44 `.cpp`), so they most likely share this
-mechanism rather than arising from a separate parallel defect.
+Rendered output is unchanged: all pages identical after normalising run-to-run
+BIDs, and every internal include link resolves to a page that exists.
 
-**Mostly not Bottleneck 9 either.** Only 17 of those 139 parallel-only
-truncations have a matching entry in that run's collision set — too few to
-attribute, and the C++ skew points elsewhere. Note the contrast in how the two
-metrics respond to `--jobs`: collisions scale 6.7x with parallelism (a genuine
-parallel-only defect) while truncations grow only 1.3x. They are measuring
-different things.
+Of 285 externally-demoted keys, **1** names a file present in the corpus — a
+header that exists under that name only in a build directory, created by
+`file(COPY_FILE)` during the build. Not resolvable from source; demoting it is
+correct.
 
-- [ ] Determine whether the gaps are tree-sitter parse time, include
-      resolution, or something else
-- [ ] Compare per-file cost against file size / include count to see whether
-      the relationship is superlinear
-- [ ] Establish whether the 510 truncations are genuinely include-depth-bound
-      by re-running with a raised `max_reparse_count` and checking whether the
-      count falls to zero (and at what depth it bottoms out). If it does, the
-      fix is a depth-aware budget rather than a flat constant — a C++ header
-      graph legitimately needs more passes than a markdown document
-- [ ] Quantify what is actually lost. `ReparseLimitExceeded` emits an empty
-      `ParseResult`, so 510 files currently contribute nothing to the graph;
-      confirm whether their nodes are absent entirely or merely stale from an
-      earlier pass
+### Residual and follow-on
+
+The 23 remaining truncations are 21 `.md`, one `.xlsx`, and one directory — no
+C++. Identical at `--jobs 1` and `--jobs 8` and flat under a raised budget, so
+the same shape but a different cause: their unresolved references are `Id`-keyed
+cross-network anchor references, and the `Id`-keyed re-queue branch in
+`process_one_parse_result` has the same missing-latch shape.
+
+The demoted set is undifferentiated — a vendored library and a mis-resolved
+internal path look alike. Classifying it against a package manifest would answer
+a dependency-inventory question and make the set self-auditing. Tracked externally.
+
+- [ ] Latch `Id`-keyed cross-network anchor references that miss on reparse
+
+### Regressions
+
+`test_codec_namespace_ref_stops_requeuing_after_first_parse`,
+`codec_namespace_external_demotion_requires_reparse_and_opt_in`,
+`test_external_include_does_not_render_an_internal_page_link`, and in the C++
+codec four `CmakeInfo::parse` cases covering the target-recognition gaps. All
+verified to fail against the unfixed code.
+
 
 ## Bottleneck 4 — End-of-run insert storm
 
@@ -845,7 +860,9 @@ from `5f31d75`.
   17 of the 139 parallel-only truncations have a matching collision entry, and
   the truncations are 90% C++ while the collisions are markdown sections and
   href stubs. The two metrics also respond differently to `--jobs` — collisions
-  scale 6.7x, truncations 1.3x. See Bottleneck 3.
+  scale 6.7x, truncations 1.3x. Bottleneck 3's resolution confirms the
+  separation: those truncations were an unlatched codec-namespace re-queue, and
+  removing them leaves the collisions untouched.
 
 **Where to look next.** `submap_by_bid`'s `depth: 0` is a *subnet-crossing*
 budget, not a Section-tree depth, so headings are included in the returned BID
@@ -882,152 +899,112 @@ distinguish them.
 
 ## Cross-cutting lessons
 
-Recorded because each cost real investigation time and would otherwise be
-relearned.
+General debugging practice earned on this issue's bottlenecks. Mechanism-specific
+detail stays in the entry it belongs to; what follows is what transfers.
 
-**Silence is where the time is.** Three of the five open bottlenecks were
-found by measuring *gaps between log lines*, not by reading instrumented
-numbers. `parse_log.py --stalls` is the highest-yield first tool on any
-unexplained wall-clock complaint.
+### Measuring
 
-**A large metric is not necessarily a binding constraint.** The PathMap scan
-was 422M operations per run and removing it changed wall clock by ~1%.
-Establish that a cost is on the critical path before optimising it.
+**Silence is where the time is.** Three bottlenecks were found by measuring
+*gaps between log lines*, not by reading instrumented numbers.
+`parse_log.py --stalls` is the highest-yield first tool on any unexplained
+wall-clock complaint.
+
+**A large metric is not necessarily a binding constraint.** The PathMap scan was
+422M operations per run; removing it moved wall clock ~1%. Establish that a cost
+is on the critical path before optimising it. The converse also held: a mid-run
+projection missed the total by 2.5x because the remaining phases had not started.
+
+**A null result is only as good as the instrument.** `grep -c` returning 0
+proves nothing until the log filter is verified — a `RUST_LOG` that excludes the
+target cannot emit the line, and the tracing subscriber colourises even when
+redirected, so `grep 'parse_task{'` finds none of the 12,046 present. Both fail
+silently and in the direction of good news. Confirm the instrument by grepping
+for a line you know is there.
 
 **Check which knobs the harness actually sets.** The warm-cache regression is
-invisible to `just render` because that recipe never passes `--db`. Two
-sessions nearly compared incomparable runs. Confirm the flags before
-comparing numbers.
+invisible to the standard render recipe because it never passes `--db`. Two
+sessions nearly compared incomparable runs.
 
-**Strip ANSI before grepping.** The tracing subscriber colourises even when
-redirected to a file, wrapping span and field names token by token, so
-`grep -c 'parse_task{'` returns 0 on a log containing 12,046 of them. See
-`benches/log_analysis/README.md`.
+### Attributing
 
-**Extrapolating from a partial run is unreliable.** A mid-run projection of
-~2h from a 119-minute checkpoint missed by 2.5x, because the last hours are
-dominated by phases that had not started. Wait for completion before
-quoting a total.
+**"Same end state" is not "same defect."** Several distinct bugs here converge
+on one observable: a node present by BID but with no resolvable path. Matching
+symptoms is not attribution — measure whether fixing one moves the other, and
+check whether the corpus even *contains* the candidate cause's precondition.
+Bottlenecks 8 and 9 share a trigger surface and are disjoint defects.
 
-**Model assumptions before trusting a model.** The original `n²/4`
-const-namespace insert-cost model was analytically reasonable and empirically
-inapplicable:
-sort keys are monotonic, so the random-insert distribution it assumed never
-occurs. Measured shift was exactly zero.
+**A corpus-wide rate is not a per-subtree probability.** Bottleneck 8 measured
+0.095% across the corpus and never reproduced in a dozen attempts at ~2,400
+files — because all 70 hits sat in *one* subtree, where it fires reliably. Bucket
+a failure's own log lines by path before concluding you need scale; a defect
+that is 0.1% overall but 100% within one subtree is a localization problem, and
+the two call for opposite strategies.
 
-**A correctness bug can look like (and compound) a performance problem.**
-Bottleneck 8's duplicate-node defect was found while investigating a
-data-quality report, not a slow-build complaint, but its failure mode is
-directly on this issue's cost model: every silently-duplicated subnet pays
-`PathMapMap::new`'s full per-network construction cost for content that
-should not exist. A one-path-one-BID violation that produces no collision
-warning (because the two copies never share a `PathMap` to collide in) is
-invisible to every classifier in `benches/log_analysis/`; only per-path node
-counts or a targeted reparse-seed probe surfaced it. When a corpus's node or
-edge counts look implausibly large for its file count, check for silent
-duplication before assuming the graph is simply big.
+**A correctness bug can look like a performance problem, and compound one.**
+Bottleneck 8 was found while investigating data quality, but every silently
+duplicated subtree pays full construction cost for content that should not
+exist. When node or edge counts look implausible for the file count, check for
+silent duplication before assuming the graph is simply big.
 
-**"Same end state" is not "same defect" — confirm by measuring the fix, not
-by matching symptoms.** Several distinct bugs in this codebase converge on one
-observable: a node that is present by BID but has no resolvable path, which
-downstream code reports as a `cache_fetch` miss, a `PathMap::new` collision, or
-an empty `root_path`. Bottleneck 9 and the `compute_diff` Section-edge-clobber
-defect share that signature exactly, and the latter is a mechanically plausible
-cause of the former — an unanchored node *is* unfindable by path key on
-reparse. They are unrelated: Bottleneck 9's collision count is bit-identical
-before and after that fix, and the corpus contains no instance of its trigger
-shape. The cheap discriminator is to check whether the corpus even *contains*
-the candidate cause's precondition before attributing.
+### Bounding and retrying
 
-**A corpus-wide rate is not a per-subtree probability — check whether a rare
-defect is *localized* before concluding it needs scale.** Bottleneck 8 measured
-0.095% corpus-wide (69 of 72,594 parses), and roughly a dozen repro attempts on
-real subtrees up to ~2,400 files never fired it once. The natural reading —
-"too rare for anything below full-corpus scale" — was wrong. All 70 hits were
-concentrated in a *single* top-level subtree; copying just that subtree
-reproduces it at 2,514 files in ~40s. The corpus-wide rate was low only because
-the denominator included 66,000 files that could never trigger it. The
-diagnostic that broke the impasse was cheap and should come first: bucket the
-failure's own log lines by path and look at the distribution. A defect that is
-0.1% overall but 100% within one subtree is a *localization* problem, not a
-scale problem, and the two call for opposite strategies.
+**A budget that truncates reports a symptom; the defect is whatever spent it.**
+Sweeping the limit discriminates cheaply: a count that falls as the budget rises
+is genuinely budget-bound, while a flat plateau means the work is not converging
+and no budget shape will fix it.
 
-**A guard that names its rationale should be checked against the adjacent
-case.** `net_dir_partition` dropped symlinked *files* in both of its passes,
-with a comment explaining that following them would parse the target under two
-networks and duplicate its nodes. That rationale applies verbatim to symlinked
-*directories*, which `follow_links(true)` walked straight through — and the
-directory case is worse, because it re-parents every network beneath the link
-rather than duplicating one file. The corpus had 52 symlinks: 51 files, all
-handled; 1 directory, which produced this defect. When a guard exists for one
-member of a category, check whether the sibling members are covered, especially
-where the traversal API makes following the default.
-
-**Reproduce the corpus's *shape*, not just its scenario.** The first regression
-test for this placed the symlink one level under a network and passed with and
-without the fix — a false negative that would have shipped a dead test. The
-real corpus interposes two plain directories between the link and its nearest
-network ancestor, and `net_dir_partition` flattens those, which is what puts
-the misattributed parent at a *different tree depth* than the true one. Only
-then does the depth grouping invert. Always verify a regression test fails
-without its fix; for structural defects, that check is what distinguishes
-reproducing the mechanism from merely reproducing the vocabulary.
-
-**A shared trigger is not a shared defect.** Bottlenecks 8 and 9 are both
-reachable under parallel dispatch plus a reparse epoch, which made a common
-root cause tempting. Measuring one run that produced both settled it: their
-affected populations are disjoint (zero of 8,619 collisions in the subtree
-holding all 70 seed-misses, and zero collisions in the subtree repro that
-yields 71 seed-misses). Check the rarer bug's specific signature directly
-rather than inferring it from the commoner bug's presence.
-
-**`grep -c` returning 0 proves nothing until the log filter is verified.**
-A `RUST_LOG` filter of `warn,noet_core::codec::fast_path=debug` cannot emit
-`Max reparse limit reached`, which is a `debug!` on the *default*
-`noet_core::codec::compiler` target — so "zero truncations" was a statement
-about the filter, not the build. This is the ANSI-colour trap's sibling and it
-fails the same way: silently, in the direction of good news. Before concluding
-that an event did not occur, confirm its target and level are actually enabled,
-ideally by grepping for a known-present line from the same target.
+**A retry predicate must name who eventually says "stop."** The Bottleneck 3
+defect was one unconditional "retry" whose comment explained why a first attempt
+deserves one and never addressed what happens when the target never appears.
+Worse, the same value doubled as "not yet known bad", so the optimistic branch
+could never become pessimistic. State a retry's terminating condition in the
+same breath, and check whether a sibling case in the same function already has
+one.
 
 **A retry is only worth its budget if something changed between attempts.**
-The fallback queue originally drained greedily, so a path's retries ran in
-consecutive fallback epochs — but a fallback epoch contains only paths whose
-seeds already failed, and when they fail again it writes almost nothing. The
-second attempt therefore evaluated against a near-identical global state and
-reached eviction 47ms after the first, consuming a budget unit for no new
-information. Alternating with remainder epochs raised that gap to 7.5s of real
-progress. Generally: when scheduling a retry, identify which other work
-produces the state change the retry depends on, and ensure that work is
-interleaved — otherwise the retry count measures patience rather than
-opportunity.
+Identify which other work produces the state change the retry depends on, and
+ensure it is interleaved — otherwise the retry count measures patience rather
+than opportunity. Relatedly, a retry mechanism must be reconciled against *every*
+counter and termination guard it touches: individually reasonable choices can
+each fail alone, and exempting a parse from a limit without also suppressing its
+re-queue is an infinite loop.
 
-**Ask what the pipeline's staging already guarantees before theorising a
-race.** Bottleneck 8's seed miss was first attributed to a sibling task's write
-not having propagated yet — a plausible story that cost several sessions. The
-epoch schedule rules it out for free: `parse_all` commits every network (Phase
-1) and every leaf document (Phase 2) before the remainder loop reparses
-anything, so at reparse time the whole Section graph exists and only
-epistemic/pragmatic links can dangle. A lookup that misses *then* cannot be
-early; the entry is missing or mis-keyed, i.e. corrupted. Whenever a defect is
-about to be explained as "not yet propagated", check whether the phase ordering
-makes that impossible — it converts an open-ended timing hunt into a bounded
-search for who wrote the wrong key.
+**Ask what the pipeline's staging already guarantees before theorising a race.**
+Bottleneck 8's miss was attributed to propagation delay for several sessions;
+the epoch schedule rules that out for free, because every network and document
+is committed before any reparse. A lookup that misses *then* is corrupted, not
+early. This converts an open-ended timing hunt into a bounded search for who
+wrote the wrong key.
 
-**A retry mechanism must be reconciled against every counter and termination
-guard it touches, and "safe" combinations are not composable pairwise.** The
-`fallback_queue` deferral carried its own attempt counter precisely to keep
-seed retries off the content-reparse budget, and still interacted with
-`processed` three ways before it was right: the remainder loop pre-increments
-on dispatch; the over-budget counter kept climbing on re-entry so every epoch
-re-evicted; and eviction-by-requeue re-entered the same guard. The instructive
-part is the last step, where two individually-reasonable choices each fail
-alone — exempting the final parse from the reparse limit without suppressing
-its re-queue is an infinite loop (a 900 MB log), while suppressing the re-queue
-without the exemption discards that parse as over-budget and truncated 54 of 54
-affected documents. Only both together are correct. Enumerate the interactions,
-and measure the combination rather than reasoning about each guard in
-isolation.
+### Changing things safely
+
+**Before reclassifying a population of failures as benign, audit what is in it.**
+A change that makes a warning class disappear is only as good as the evidence
+that every member deserved to. Partition by a check *independent* of the one
+that produced the warning — here "does a file with this name exist?" — because
+the alternative converts real defects into plausible-looking successes, which
+are harder to find than the warnings they replaced.
+
+**A parser over a permissive grammar fails by omission, and omission is silent.**
+Four separate CMake gaps each dropped whole components from the graph: a missing
+optional keyword, an inline argument list, an unread modern idiom, and a
+condition that was too narrow. Nothing errored in any case. A parser that
+*rejects* bad input announces itself; one that *skips* unrecognised-but-valid
+input removes content silently. Enumerate the optional syntax the grammar
+allows, and be most suspicious where a field is load-bearing for downstream
+visibility rather than merely descriptive.
+
+**A guard that names its rationale should be checked against the adjacent case.**
+`net_dir_partition` dropped symlinked *files* with a comment explaining why —
+a rationale that applied verbatim to symlinked *directories*, which it followed.
+When a guard exists for one member of a category, check the siblings.
+
+**Verify a regression test fails without its fix, and reproduce the corpus's
+*shape* rather than its scale.** Two tests here passed against unfixed code: one
+because a flatter synthetic layout did not reproduce the structural trigger,
+another because an unrelated fallback produced the same output. Both would have
+shipped as dead tests. Revert the fix, watch the test fail, restore.
+
 
 ## Open Questions
 
@@ -1075,7 +1052,11 @@ isolation.
 - `noet-core/src/codec/compiler.rs` — `with_html_output` jobs resolution,
   `parse_epoch` sequential/parallel dispatch, `fallback_queue` /
   `fallback_attempts` / `defer_to_fallback_queue` (Bottleneck 8 containment),
-  `finalize_html` (Bottleneck 2).
+  `finalize_html` (Bottleneck 2); `process_unresolved_reference`'s
+  codec-namespace and synthetic-path guards plus `permanently_unresolved`
+  (Bottleneck 3 fix), with
+  `test_codec_namespace_ref_stops_requeuing_after_first_parse` as the
+  regression.
 - `noet-core/src/codec/proto_index.rs` — `net_dir_partition`'s symlink guards
   and `network_dirs_by_tree_depth`'s parent/depth mapping (Bottleneck 8 fix);
   `test_dir_symlink_does_not_reparent_target_network` is the regression.

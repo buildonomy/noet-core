@@ -611,6 +611,24 @@ were themselves all sandboxed or all unsandboxed.
 **Practice**: run watch and notification tests unsandboxed. When a test
 fails only in one environment, suspect the environment before the test.
 
+### A ratchet over an enumerated list cannot see an unenumerated leak
+
+The neutrality audit greps for a denylist of customer, program, and system
+names. A design doc's worked example used a source path and type name copied
+verbatim out of a real corpus — deployment-derived, and exactly what the rule
+forbids — and the audit passed both before and after, because the path contained
+no listed term. The check was working as designed; the design cannot cover this.
+
+The same blindness applies to anything structural rather than nominal: a
+directory layout, a dependency list, a set of symbol names. Each is derived from
+a real deployment and none trips a name-based search.
+
+**Practice**: treat a green audit as "no known name recurred", not "this is
+neutral". Invent examples rather than pasting them — a made-up
+`src/widget/include/widget/Widget.h` teaches the same mechanic as a real path
+and cannot leak. The reflex to copy a working example from the corpus you are
+debugging is the specific thing to resist.
+
 ### Duplicated maintenance sites are how invariants rot
 
 Three separate code paths rebuilt the same set of indices with copy-pasted

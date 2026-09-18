@@ -3026,6 +3026,28 @@ impl GraphBuilder {
         Ok((href_node, update_queue))
     }
 
+    /// The external href a codec-namespace key should resolve to, if it has
+    /// proven absent and its namespace opted into demotion.
+    ///
+    /// Returns `None` — leaving the reference unresolved — unless all of:
+    /// the key is a `Path` in a registered codec namespace; that namespace has an
+    /// external template (see [`crate::codec::set_codec_namespace_external`]); and
+    /// this is a reparse. The last condition is what distinguishes "absent" from
+    /// "not yet parsed": on pass 1 a miss is an ordinary forward reference, and
+    /// demoting it would mint an external node that shadows the real target once
+    /// the declaring document lands.
+    fn codec_namespace_external_target(key: &NodeKey, parse_number: usize) -> Option<String> {
+        if parse_number <= 1 {
+            return None;
+        }
+        match key {
+            NodeKey::Path { net, path } if is_codec_namespace(net) => {
+                crate::codec::codec_namespace_external_href(net, path)
+            }
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn push_relation<B: BeliefSource + Clone>(
         &mut self,
@@ -3255,6 +3277,31 @@ impl GraphBuilder {
                     // via indexed_get (which prefers content nodes over stubs).  If we
                     // reached here, no content alias was found — create a stub.
                     let (href_node, href_events) = self.ensure_href_entry(&href)?;
+                    update_queue.extend(href_events);
+                    (href_node, NodeSource::Generated)
+                } else if let Some(external_href) =
+                    Self::codec_namespace_external_target(&other_key_regularized, parse_number)
+                {
+                    // A key in an externally-resolvable codec namespace that is still
+                    // absent on reparse. By reparse time every document has been parsed
+                    // at least once, so every entry this namespace will ever hold
+                    // exists; a key still missing is owned by nothing in the corpus and
+                    // denotes an out-of-corpus target. The namespace's codec declared a
+                    // template for exactly this case, so resolve the citation to an
+                    // external href node rather than reporting a broken link.
+                    //
+                    // The `parse_number > 1` condition is load-bearing, not a
+                    // heuristic: on pass 1 the same miss is an ordinary forward
+                    // reference, and minting an external node then would permanently
+                    // shadow a real target that is about to be registered.
+                    tracing::debug!(
+                        target: "noet_core::codec::fast_path",
+                        key = ?other_key_regularized,
+                        href = %external_href,
+                        "[push_relation] codec-namespace key absent on reparse — \
+                         resolving as an external reference",
+                    );
+                    let (href_node, href_events) = self.ensure_href_entry(&external_href)?;
                     update_queue.extend(href_events);
                     (href_node, NodeSource::Generated)
                 } else {
@@ -4217,10 +4264,12 @@ impl GraphBuilder {
         if let Some(state) = found_state {
             Ok(GetOrCreateResult::Resolved(state, source))
         } else if parse_number > 1 {
-            // Const/codec namespace references (e.g. C++ #include paths like
-            // "mp-units/systems/si.h") will never resolve — they're external
-            // headers with no corresponding source in the corpus. Downgrade
-            // to debug instead of warn to avoid flooding the build log.
+            // Const/codec namespace references (e.g. a C++ #include path such
+            // as "pkg/systems/unit.h") may never resolve — the target can be
+            // outside the corpus entirely. Downgrade to debug instead of warn
+            // to avoid flooding the build log. A namespace that has opted into
+            // external resolution has already been handled by `push_relation`
+            // before reaching here; see `set_codec_namespace_external`.
             let is_const_ns = keys.iter().any(|k| match k {
                 NodeKey::Path { net, .. } => {
                     is_codec_namespace(net)
@@ -4925,6 +4974,7 @@ mod tests {
         codec::belief_ir::IRNode,
         codec::GraphBuilder,
         event::{BeliefEvent, EventOrigin},
+        nodekey::NodeKey,
         paths::to_anchor,
         properties::{
             href_namespace, BeliefKind, BeliefKindSet, BeliefNode, Bid, NodeId, Weight, WeightKind,
@@ -5676,6 +5726,66 @@ Test network for unit tests.
             session.states().contains_key(&repo_bid),
             "repo root must be preserved by the union"
         );
+    }
+
+    /// A codec namespace opted into external resolution demotes a key that has
+    /// proven absent — but only on reparse, and only for that namespace.
+    ///
+    /// The `parse_number` condition is the load-bearing half. On pass 1 a miss is an
+    /// ordinary forward reference (the declaring document may not have been parsed
+    /// yet), so demoting then would mint an external node that permanently shadows
+    /// a real target about to be registered. Only a reparse miss proves absence.
+    #[test]
+    fn codec_namespace_external_demotion_requires_reparse_and_opt_in() {
+        crate::codec::clear_codec_namespaces();
+
+        let opted_in = Bid::codec_namespace("test-external-index").bref();
+        let opted_out = Bid::codec_namespace("test-internal-index").bref();
+        crate::codec::register_codec_namespace(opted_in);
+        crate::codec::register_codec_namespace(opted_out);
+        crate::codec::set_codec_namespace_external(opted_in, "pkg::{path}");
+
+        let key = |net| NodeKey::Path {
+            net,
+            path: "other/Dep.h".to_string(),
+        };
+
+        // Pass 1: never demote, even for an opted-in namespace.
+        assert_eq!(
+            GraphBuilder::codec_namespace_external_target(&key(opted_in), 1),
+            None,
+            "a first-parse miss is a forward reference, not proven absence",
+        );
+
+        // Reparse: demote, substituting the key into the template.
+        assert_eq!(
+            GraphBuilder::codec_namespace_external_target(&key(opted_in), 2),
+            Some("pkg::other/Dep.h".to_string()),
+            "a reparse miss in an opted-in namespace must resolve externally",
+        );
+
+        // A namespace that did not opt in keeps reporting the miss: for it, an
+        // absent key is a real defect rather than an out-of-corpus target.
+        assert_eq!(
+            GraphBuilder::codec_namespace_external_target(&key(opted_out), 2),
+            None,
+            "demotion must be opt-in per namespace",
+        );
+
+        // A non-codec-namespace key is untouched by this path.
+        assert_eq!(
+            GraphBuilder::codec_namespace_external_target(
+                &NodeKey::Id {
+                    net: opted_in,
+                    id: "some-id".to_string()
+                },
+                2
+            ),
+            None,
+            "only Path keys carry a namespace path to substitute",
+        );
+
+        crate::codec::clear_codec_namespaces();
     }
 
     /// Two tasks seeded from one shared epoch base must not see each other's writes.

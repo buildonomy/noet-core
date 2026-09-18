@@ -72,8 +72,17 @@ encountered and propose neutral replacements before proceeding with other change
 > workspace that includes a private planning repo, use its audit script; if you
 > are not, apply the rule by reading.
 >
+> **A passing audit is not a clean bill of health.** The script is a ratchet
+> over an enumerated term list, so it catches *recurrences of known names* and
+> is structurally blind to everything else — a verbatim source path, a type or
+> symbol name, a dependency list, a directory layout. All of these are
+> deployment-derived and none contain a listed term. Copying a real path into an
+> example passes the check and still leaks.
+>
 > **In practice**: when you cannot verify, prefer the neutral phrasing. It costs
-> nothing to write "a large application corpus" instead of a repository name.
+> nothing to write "a large application corpus" instead of a repository name, or
+> `src/widget/include/widget/Widget.h` instead of a path you copied out of a
+> corpus. Invent the example; never paste one.
 
 ### No Historical Narrative in Documents
 

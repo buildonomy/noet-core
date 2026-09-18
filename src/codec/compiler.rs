@@ -4035,14 +4035,31 @@ impl DocumentCompiler {
         net_ref: Bref,
     ) -> bool {
         // Codec namespace brefs (derived from UUID_NAMESPACE_CODEC) are synthetic
-        // secondary indices — not filesystem networks.  They have no disk path to
-        // resolve, and their nodes are populated lazily during push().  Return true
-        // so the caller treats this as a corpus dependency (triggering reparse)
-        // rather than marking it as permanently unresolved.  The reference will
-        // resolve on a subsequent pass once the target node's namespace_paths
-        // entry has been committed to global_bb.
+        // secondary indices — not filesystem networks. They have no disk path to
+        // resolve, and their nodes are populated lazily during push(): the target's
+        // entry only exists once the document *declaring* it has been parsed and
+        // committed to global_bb. So a first-parse miss is expected and warrants a
+        // reparse — return true, which re-queues the citing document.
+        //
+        // A miss on reparse is not. By then every document in the corpus has been
+        // parsed at least once, so every namespace entry that will ever exist does.
+        // A key still absent is one no document declares — a reference to a target
+        // outside the corpus (a third-party or toolchain header, for a C++ include
+        // index) or one whose declaring codec declined to register it. No further
+        // pass can invent it.
+        //
+        // This latch is load-bearing, not an optimisation. Returning true
+        // unconditionally re-queues the citing document *and* keeps the key out of
+        // `permanently_unresolved` (the caller only records keys for refs that
+        // return false), so the same miss recurs on every pass and the document
+        // burns its whole reparse budget on a reference that cannot resolve —
+        // terminating only when `max_reparse_count` truncates it. Raising the budget
+        // does not help; it just buys more futile passes. See Issue 97 Bottleneck 3.
+        //
+        // Mirrors the `parse_count <= 1` guard applied below to synthetic paths that
+        // do not exist on disk, for the same reason.
         if crate::codec::is_codec_namespace(&net_ref) {
-            return true;
+            return self.processed.get(path).copied().unwrap_or(1) <= 1;
         }
 
         // Use session_bb rather than doc_bb here. doc_bb is cleared and rebuilt for each
@@ -6080,6 +6097,48 @@ Test network for unit tests.
                 crate::codec::ParseDiagnostic::Warning { .. }
             ),
             "A still-unresolved result must produce a warning; diagnostics: {unresolved_diags:?}"
+        );
+    }
+
+    /// Issue 97 Bottleneck 3: a codec-namespace reference that is still missing on
+    /// reparse must stop re-queuing its citing document.
+    ///
+    /// A codec namespace (the C++ `#include` index, say) is populated lazily by the
+    /// documents that declare entries in it, so a miss on the *first* parse is
+    /// expected and must re-queue. By reparse time every document has been parsed
+    /// once, so a key still absent belongs to no document — it names a target
+    /// outside the corpus. Re-queuing again is futile, and because the caller only
+    /// records `permanently_unresolved` keys for refs that return `false`, an
+    /// unconditional `true` also prevents the key from ever being latched. The
+    /// document then re-queues every pass until `max_reparse_count` truncates it.
+    #[test]
+    fn test_codec_namespace_ref_stops_requeuing_after_first_parse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        create_test_network(temp_dir.path());
+        let mut compiler = DocumentCompiler::new(temp_dir.path(), None, None, false).unwrap();
+
+        let ns_bref = Bid::codec_namespace("test-include-index").bref();
+        crate::codec::register_codec_namespace(ns_bref);
+
+        let citing = temp_dir.path().join("citing.h");
+
+        // First parse: the declaring document may not have been parsed yet, so the
+        // miss is expected and the citing document must get another pass.
+        compiler.processed.insert(citing.clone(), 1);
+        assert!(
+            compiler.process_unresolved_reference(&citing, "other/Dep.h", ns_bref),
+            "a first-parse codec-namespace miss must re-queue: the declaring \
+             document may not have been parsed yet",
+        );
+
+        // Reparse: every document has now been parsed at least once, so the entry
+        // is never going to appear. Returning false is what lets the caller latch
+        // the key into `permanently_unresolved` and stop the re-queue cycle.
+        compiler.processed.insert(citing.clone(), 2);
+        assert!(
+            !compiler.process_unresolved_reference(&citing, "other/Dep.h", ns_bref),
+            "a codec-namespace miss on reparse must NOT re-queue — no later pass \
+             can create an entry no document declares (Issue 97 Bottleneck 3)",
         );
     }
 

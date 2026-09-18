@@ -147,4 +147,5 @@ proves nothing, because the instability lives in serialization and re-hydration.
 | `core/beliefbase_architecture.md` §3.2, §3.6 | Codec dispatch, the two registries, `DocCodec` as the frontend interface |
 | `identity/content_versioning.md` §4.3, §6, §7.2 | What the hashes mean; the determinism requirement; the regression detector |
 | `identity/identity_derivation.md` | Minted vs. derived identity; the reserved namespaces |
+| `codecs/codec_namespaces.md` | Resolving references in a non-filesystem addressing scheme; a registered namespace name is codec output and must be as deterministic as the rest |
 | `project/LESSONS_LEARNED.md` | The failure modes these guarantees prevent |

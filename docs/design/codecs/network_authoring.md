@@ -413,6 +413,11 @@ and those citations still land on the internal node. No rewriting of link text i
 required, and the graph gains real edges where it would otherwise hold orphan
 stubs.
 
+> The mechanism here is author-declared, in frontmatter. A codec can register
+> alternative addresses programmatically for an addressing scheme of its own
+> (`#include` paths, package coordinates) — see
+> [`codec_namespaces.md`](codec_namespaces.md).
+
 Two mechanisms produce aliases; a third controls only how they are displayed:
 
 | Field | Where | Effect |

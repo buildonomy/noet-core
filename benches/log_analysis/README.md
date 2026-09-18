@@ -518,11 +518,13 @@ sharing itself.
 
 **Requirements:** Python 3.10+, no third-party packages.
 
-Correlates C++ tree-sitter parse cost against file size and include count
-(Issue 97 Bottleneck 3 — 211 silent gaps >20s, ~163 min total, clustered in
-the C++ corpus; larger in aggregate than Bottleneck 2 but spread across many
-files, so more likely genuine parse cost than a defect). This tool exists to
-check that hypothesis rather than assume it.
+Correlates C++ tree-sitter parse cost against file size and include count.
+Built for Issue 97 Bottleneck 3, where a cluster of silent gaps in the C++
+corpus looked like it might be genuine parse cost; the tool answered that it is
+not. Tree-sitter totalled 584 ms across 2,357 parses on that corpus (0.25 ms
+average, 29 ms worst case) — the gaps were redundant *passes*, not parsing. The
+measurement is what ruled the hypothesis out, and the tool remains the way to
+re-check it on another corpus.
 
 Run the downstream C++ codec's own parse CLI with `info` level plus debug-level
 tracing on its `cpp::perf` target and an HTML output path, redirecting combined

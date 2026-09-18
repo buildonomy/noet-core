@@ -662,7 +662,11 @@ impl ClaimMap {
 #[cfg(not(target_arch = "wasm32"))]
 pub static CLAIM_MAP: Lazy<ClaimMap> = Lazy::new(ClaimMap::create);
 
-// ── Codec namespace registry ─────────────────────────────────────────────────────
+// ── Codec namespace registry ──────────────────────────────────────────────
+//
+// See `docs/design/codecs/codec_namespaces.md` for what a codec namespace is,
+// how a codec registers and cites names in one, and the reparse-miss hazard
+// that external resolution exists to handle.
 
 /// Global registry of codec namespace brefs created during parsing.
 ///
@@ -700,11 +704,76 @@ pub fn codec_namespace_brefs() -> Vec<crate::properties::Bref> {
     CODEC_NAMESPACES.read().unwrap().iter().copied().collect()
 }
 
+// ── Externally-resolvable codec namespaces ───────────────────────────────────
+
+/// Templates for codec namespaces whose absent keys denote out-of-corpus targets.
+///
+/// Keyed by namespace bref; the value is a template containing `{path}`.
+static CODEC_NAMESPACE_EXTERNALS: Lazy<
+    std::sync::RwLock<std::collections::HashMap<crate::properties::Bref, String>>,
+> = Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Declare that absent keys in a codec namespace denote targets *outside* the
+/// corpus, and give the template that names them.
+///
+/// A codec namespace is an index that documents populate as they are parsed — a
+/// C++ `#include` index, say. Some of its keys are never populated because
+/// nothing in the corpus declares them: a header from a third-party package is
+/// referenced but not owned. Without this declaration such a key stays
+/// unresolved forever and is reported as a broken link, which misrepresents
+/// correct source as an authoring error.
+///
+/// Registering a template opts the namespace into **demotion**: once a key has
+/// proven absent (see below), the reference resolves to an `href_namespace`
+/// external node named `template` with `{path}` replaced by the missing key.
+/// The citation becomes a first-class outbound edge — queryable as an external
+/// dependency — instead of a warning.
+///
+/// `{path}` is the only substitution. A template may produce a URL
+/// (`"https://docs.example.com/{path}"`) when the namespace has a known
+/// documentation home, or an opaque identifier (`"pkg::{path}"`) when it does
+/// not; `href_namespace` holds both, and rendering is the codec's business.
+///
+/// **Demotion is deliberately not applied on a document's first parse.** A miss
+/// then is ordinary forward reference — the declaring document may simply not
+/// have been parsed yet — and demoting it would mint an external node for a key
+/// that is about to exist, permanently shadowing the real target. Only a miss on
+/// reparse proves absence, because by then every document has been parsed once.
+///
+/// Opt-in by design: a namespace whose keys must always resolve internally
+/// should keep reporting misses, since for it an absent key is a real defect.
+///
+/// Call this during codec registration. Unlike [`register_codec_namespace`]
+/// (which `push()` calls lazily when it first creates the namespace node), the
+/// declaring codec knows its own namespace bref up front.
+///
+/// See `docs/design/codecs/codec_namespaces.md` §4 — in particular §4.3 on
+/// auditing a namespace's absent names before opting in, and §4.4 on rendering.
+pub fn set_codec_namespace_external(bref: crate::properties::Bref, template: impl Into<String>) {
+    CODEC_NAMESPACE_EXTERNALS
+        .write()
+        .unwrap()
+        .insert(bref, template.into());
+}
+
+/// Resolve `path` through a codec namespace's external template.
+///
+/// Returns `None` when the namespace has no template registered, i.e. has not
+/// opted into demotion. See [`set_codec_namespace_external`].
+pub fn codec_namespace_external_href(bref: &crate::properties::Bref, path: &str) -> Option<String> {
+    CODEC_NAMESPACE_EXTERNALS
+        .read()
+        .unwrap()
+        .get(bref)
+        .map(|template| template.replace("{path}", path))
+}
+
 /// Clear the codec namespace registry.  Used between test runs to avoid
 /// cross-test contamination.
 #[cfg(test)]
 pub fn clear_codec_namespaces() {
     CODEC_NAMESPACES.write().unwrap().clear();
+    CODEC_NAMESPACE_EXTERNALS.write().unwrap().clear();
 }
 
 // ── No-op fallback codec ──────────────────────────────────────────────────────
