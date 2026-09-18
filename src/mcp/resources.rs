@@ -105,7 +105,7 @@ fn find_design_doc(stem: &str) -> Option<&'static File<'static>> {
 /// Called in response to a `resources/list` request. Returns:
 /// 1. The static orientation resource.
 /// 2. One entry per served help doc compiled into the binary (see
-///    [`design_doc_files`]).
+///    `design_doc_files`).
 pub fn list_resources() -> Vec<Resource> {
     let mut resources = Vec::new();
 

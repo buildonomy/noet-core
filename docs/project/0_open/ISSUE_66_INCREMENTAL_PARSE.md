@@ -16,15 +16,20 @@ title = "Issue 66: Incremental Parse via Shard Hydration"
 store. Both are unnecessary once shards are treated as the durable, structured
 representation of a completed parse pass.
 
-This issue makes shards the authoritative cross-invocation artifact by: (1) hydrating
-the in-memory DB from the previous run's shards **before** parsing, so that unchanged
-nodes resolve to their existing BIDs instead of minting new ones; (2) embedding
-per-network `compiled_at` timestamps and source content hashes into the shard manifest
-so clean networks can be skipped on re-parse; (3) making `noet watch` stateless between
-restarts by removing its file-based DB; and (4) exposing the `last_diagnostics`
-accessor that MCP (`check_consistency`) and LSP (`publishDiagnostics`) need. A
-configurable memory budget governs how much shard data is kept in the in-memory DB at
-once, with eviction back to shard files when the limit is approached.
+This issue makes shards the authoritative cross-invocation artifact by: (1) introducing
+**`ShardStore`**, a `BeliefSource` + `BeliefSink` backend over the shard directory that
+**replaces `DbConnection`** as the store backing the parse, so unchanged nodes resolve
+to their existing BIDs instead of minting new ones; (2) embedding per-network
+`compiled_at` timestamps and source content hashes into the shard manifest so clean
+networks can be skipped on re-parse; (3) making `noet watch` stateless between restarts
+by removing its file-based DB; and (4) exposing the `last_diagnostics` accessor that
+MCP (`check_consistency`) and LSP (`publishDiagnostics`) need.
+
+Because `GraphBuilder::cache_fetch` is already generic over `BeliefSource`
+(`builder.rs:4026`), shard awareness lives entirely behind the trait and the compiler
+is unchanged. Memory budgeting and eviction are deferred to § Performance — fetch-on-
+miss makes a partially-loaded store correct, so the budget is a footprint knob rather
+than a correctness concern.
 
 ## Why this issue is first
 
@@ -53,11 +58,11 @@ states the determinism requirement for the *hash*; this issue is what makes the 
 half of the anchor deterministic across builds. Without it, Issue 105's store cannot
 survive a rebuild on the pilot corpus, and the living corpus has no anchor to stand on.
 
-Hydrating the prior shards into `global_bb` before parsing gives `cache_fetch` a
-`GlobalCache` hit for every unchanged heading, so only genuinely new content reaches
-`Generated`. **This must hold for dirty networks too** — a network with one edited
-file still has hundreds of unchanged headings whose BIDs must be preserved, so its
-prior shard is hydrated and then overwritten by the re-parse, never skipped over.
+Backing `global_bb` with the prior shards gives `cache_fetch` a `GlobalCache` hit for
+every unchanged heading, so only genuinely new content reaches `Generated`. **This must
+hold for dirty networks too** — a network with one edited file still has hundreds of
+unchanged headings whose BIDs must be preserved, so its prior shard backs the re-parse
+and is overwritten at export, never skipped over.
 
 Two further reasons this precedes the annotation wave rather than following it:
 
@@ -77,75 +82,80 @@ Two further reasons this precedes the annotation wave rather than following it:
 > the chain's fragility is not mistaken for an Issue 66 defect. The CI restore step is
 > a planning-repo item, not a noet-core one.
 
-**Lifecycle clarification**: the in-memory DB is *authoritative* while the process is
-running. During a `watch` session, multiple consumers (browser viewer, MCP clients,
-LSP clients) query the live in-memory DB concurrently. Shards are *checkpoints* for
-cold-start hydration and for HTML output, not the primary query surface. The framing
-"stateless between restarts" applies to the cold-start path (no persistent DB file
-needed), but during a session the DB is the live authority.
+**Lifecycle clarification**: `ShardStore`'s in-memory graph is *authoritative* while
+the process is running. During a `watch` session, multiple consumers (browser viewer,
+MCP clients, LSP clients) query it concurrently. Shard files are *checkpoints* for
+cold start and for HTML output, not the live query surface. "Stateless between
+restarts" means the cold-start path needs no persistent DB file — during a session the
+store is the live authority.
 
-The existing `--db` flag is replaced by `--debug-db`, which writes the in-memory DB
-state to a file for developer inspection (`sqlite3 /tmp/noet-debug.db`) without
-changing the startup sequence. See Architecture § File-based DB for debugging.
+The existing `--db` flag is replaced by `--debug-db`, which mirrors session state to a
+file for developer inspection (`sqlite3 /tmp/noet-debug.db`). See Architecture
+§ File-based DB for debugging.
 
 ## Goals
 
 - **A node whose source is unchanged between two `noet parse` runs keeps its BID**,
   with no `--write` and no `belief_cache.db`, provided the prior run's shards are
-  present. This holds for nodes in dirty networks as well as clean ones.
+  present. This holds for nodes in dirty networks as well as clean ones
+- **`ShardStore` replaces `DbConnection`** as the store backing the parse, so shards
+  are the durable representation and SQLite leaves the identity path entirely
 - `noet parse` skips networks whose constituent source files all hash identically to
   the values recorded in their shard, reducing re-parse time proportionally to the
   unchanged fraction of the corpus
-- `noet watch` eliminates its file-based `belief_cache.db`: the in-memory DB is
-  hydrated from shards at startup and updated incrementally on each dirty-network
-  re-parse, making the watch daemon stateless between restarts. During a session,
-  the in-memory DB is the authoritative query surface for all consumers (browser
-  viewer, MCP, LSP)
+- `noet watch` eliminates its file-based `belief_cache.db`: `ShardStore` loads from
+  shards at startup and is updated in memory on each dirty-network re-parse, making
+  the watch daemon stateless between restarts. During a session the store is the
+  authoritative query surface for all consumers (browser viewer, MCP, LSP)
 - Per-network `compiled_at` timestamp and `source_hashes` embedded in
   `NetworkShardMeta`, readable by MCP `check_consistency` and the incremental skip
   logic
 - `DocumentCompiler::last_diagnostics()` accessor exposing the diagnostic snapshot
   from the last completed parse pass — consumed by MCP `check_consistency` (live mode)
   and LSP `publishDiagnostics` (Issue 11)
-- Configurable in-memory DB memory budget: networks are evicted from the DB (back to
-  their shard file) when the budget is approached, and reloaded on demand
+- A key whose home shard is not loaded resolves by **fetch-on-miss**, so a
+  partially-loaded store is correct rather than merely fast
+- **Exactly one writer per output directory**, enforced by an exclusive advisory lock
+  held for the writing process's lifetime; readers take no lock and observe whole
+  generations via atomic rename
 - `--force` flag on `noet parse` bypasses incremental skip logic (already exists;
   must remain respected)
-- No behavioral change when sharding is disabled (monolithic mode)
+- Monolithic mode is the one-shard case: identity preservation works there too, and
+  only *skip* requires sharding
 
 ## Architecture
 
 ### Unified startup model
 
-Both `noet parse` and `noet watch` already use an **ephemeral in-memory SQLite DB**
-as `global_bb` during compilation (see `db_init_memory()` in `src/bin/noet/main.rs`).
-The only difference is that `noet watch` additionally maintains a persistent
-`belief_cache.db` for cross-invocation state. After this issue, the startup sequence
-is identical for both commands:
+Both `noet parse` and `noet watch` build an **ephemeral store** as `global_bb` during
+compilation — today an in-memory SQLite DB (`db_init_memory()`, wired at
+`src/cli.rs:583-602`), with `noet watch` additionally maintaining a persistent
+`belief_cache.db`. After this issue both use `ShardStore`, and the startup sequence is
+identical for the two commands:
 
 ```
 Startup:
-  1. Read existing shard manifest (if present) → identify clean/dirty networks
-  2. Hydrate in-memory DB from ALL prior network shards (within memory budget) —
-     clean networks so they can be skipped; dirty networks so their unchanged
-     nodes resolve to existing BIDs via cache_fetch during the re-parse
-  3. Parse only dirty networks → stream events into in-memory DB, overwriting
-     the hydrated state for those networks
-  4. finalize_html → write updated shards from DB state + emit last_diagnostics snapshot
+  1. Open ShardStore over the output directory — read the manifest, load the
+     global shard (the bref → home-network routing table)
+  2. Classify networks clean/dirty by comparing source_hashes
+  3. Load prior network shards into the store. Dirty networks matter most:
+     their unchanged nodes resolve to existing BIDs via cache_fetch during
+     the re-parse. A key whose shard is not loaded is fetched on miss.
+  4. Parse only dirty networks → events land in the store, superseding the
+     loaded state for those networks
+  5. finalize_html → re-export dirty shards + emit last_diagnostics snapshot
 
 noet watch (continuous loop):
-  File change → mark containing network dirty → repeat steps 3-4 for dirty set only
+  File change → mark containing network dirty → repeat steps 4-5 for dirty set only
 ```
 
-Step 2 hydrating *dirty* networks is the part that distinguishes this design from a
-pure skip cache, and it is the load-bearing part (§ Why this issue is first). On a
-re-parse, `GraphBuilder::push` calls `cache_fetch`, which checks `doc_bb` →
-`session_bb` → `global_bb`; a hit returns the existing node and BID
-(`NodeSource::GlobalCache`), a miss mints `Bid::new(parent_bid)`
-(`src/codec/builder.rs:2306-2308`). The hydrated shard is what turns the second case
-into the first for every heading whose path key has not changed. If the memory budget
-cannot hold every prior shard, **dirty networks are hydrated first** — skipping a clean
-network costs a re-parse; failing to hydrate a dirty one costs its BIDs.
+Step 3 loading *dirty* networks is what distinguishes this from a pure skip cache, and
+it is the load-bearing part (§ Why this issue is first). On a re-parse,
+`GraphBuilder::push` calls `cache_fetch`, which checks `doc_bb` → `session_bb` →
+`global_bb`; a hit returns the existing node and BID (`NodeSource::GlobalCache`), a
+miss mints `Bid::new(parent_bid)` (`src/codec/builder.rs:2306-2308`). The prior shard
+behind `global_bb` is what turns the second case into the first for every heading whose
+path key has not changed.
 
 `noet watch` becomes stateless between restarts: it always cold-starts from shards,
 never needs `belief_cache.db`. The file-based DB is deleted from the watch startup
@@ -265,7 +275,7 @@ Two caveats to carry into implementation:
 ### Skip logic in `DocumentCompiler`
 
 Before dispatching parse work for a network, `DocumentCompiler` (or its caller in
-`main.rs`) checks:
+`src/cli.rs`) checks:
 
 1. Does a shard exist for this network? (manifest present, file exists on disk)
 2. Is `--force` absent?
@@ -275,8 +285,11 @@ Before dispatching parse work for a network, `DocumentCompiler` (or its caller i
 
 If all four hold: skip the network. Emit a `tracing::debug!` line noting the skip and
 the shard age. If any hash differs, the file set differs, or the shard is absent:
-proceed with normal parse — **with the network's prior shard already hydrated into
-`global_bb`** (if one exists), so the re-parse preserves BIDs for its unchanged nodes.
+proceed with normal parse — **with the network's prior shard backing `global_bb`** via
+`ShardStore` (if one exists), so the re-parse preserves BIDs for its unchanged nodes.
+
+Skip and identity are independent: skipping is an optimisation over the *parse*, while
+the store preserves BIDs whether or not anything is skipped.
 
 The evaluation never terminates on an mtime comparison. A cheap `stat` may be used to
 short-circuit toward *dirty* (a newer mtime is a sufficient reason to re-parse without
@@ -296,113 +309,244 @@ section rejects. If such a cache ships, it ships as a knowingly-taken risk with 
 documented off switch, not as an accident. The measured read cost above is the argument
 for not needing one.
 
-### Shard hydration into in-memory DB
+### `ShardStore`: shards as a `BeliefSource` backend
 
-At startup, after reading the manifest and classifying networks, **all** prior shards
-are loaded into the in-memory DB via a new `hydrate_from_shards` function — dirty
-networks first, then clean ones, until the budget is reached:
+Shard awareness lives **behind the `BeliefSource` trait**, not in the compiler.
+`GraphBuilder::cache_fetch` is already generic over `B: BeliefSource + Clone`
+(`builder.rs:4026`) and reaches its backing store through exactly one call —
+`global_bb.evaluate(&mut package)`. A backend that knows how to find, load, and
+write shards therefore needs **no compiler changes at all**.
+
+`ShardStore` implements `BeliefSource` (`src/query/mod.rs:40`) and `BeliefSink`
+(`src/beliefbase/sink.rs:41`), and **replaces `DbConnection`** as the store backing
+the accumulator:
 
 ```rust
-async fn hydrate_from_shards(
-    db: &DbConnection,
-    output_dir: &Path,
-    manifest: &ShardManifest,
-    dirty_brefs: &HashSet<String>,
-    memory_budget_mb: f64,
-) -> Result<(), BuildonomyError>
+// cli.rs — was: BeliefAccumulator::new(DbConnection(db_pool), rx)
+BeliefAccumulator::new(ShardStore::open(output_dir)?, rx)
 ```
 
-Each network's `{bref}.msgpack` is deserialized and its nodes/edges are inserted into
-the DB via the existing `Transaction::add_event` path — the same path used during live
-parse. `dirty_brefs` is consulted for **priority**, not exclusion: dirty networks are
-hydrated first (their prior state is what preserves BIDs through the re-parse), then
-clean networks in ascending `estimated_size_mb` order until the budget is reached.
-Remaining clean networks are left on disk and loaded on demand when a query touches
-them. A dirty network whose prior shard could not be hydrated is re-parsed anyway and
-logs a `tracing::warn!` that its BIDs may not be preserved.
+`BeliefAccumulator<S>` is already generic over its store, so batching, query caching,
+and `resolve_merge_keys` are unchanged. SQLite leaves the parse path entirely.
 
-**Fidelity requirement for BID preservation.** `cache_fetch` resolves a heading by
-`NodeKey::Path` computed from `speculative_path_key`; the hydrated shard must therefore
-populate the `paths` table with the same network-relative keys a live parse would
-produce, or every lookup misses and silently falls through to `Generated`. Issue 75
-found this path fragile once already (`beliefbase_architecture.md` §2.2.1, the
-`cache_fetch` miss when `--write` was off). The test that decides whether this issue
-delivers its primary goal is the BID-stability round-trip in § Testing Requirements,
-not the skip-rate test.
+**Read path.** `ShardStore` holds a `BeliefBase`. Loading a shard is
+`BeliefBase::merge` (`base.rs:2946`), whose pass 3 drives `PathMapMap` via
+`process_event_queue` (`base.rs:2996`) and builds the path index. `NodeKey::Path`
+then resolves through `BeliefBase::get` (`base.rs:616`) — in memory, no SQL, no
+`paths` table. This is the mechanism the browser viewer already uses
+(`wasm.rs:902`).
 
-The `ShardConfig::memory_budget_mb` field (already present, already used by the
-browser viewer to cap client-side shard loading) is reused here as the server-side
-in-memory DB budget. The same concept — "how much shard data to keep hot" — applies
-to both consumers.
+**Routing.** The manifest plus the always-resident global shard is a complete
+routing table; no scan is needed to find a key's home shard:
 
-### Shard eviction and on-demand reload
+| Key | Resolves via |
+|---|---|
+| `Path { net, .. }`, `Id { net, .. }` | `net` **is** the network bref — names its shard directly |
+| `Bid`, `Bref` | `GlobalShard.bref_index` (node bref → home network bref) |
 
-When the in-memory DB approaches the memory budget during a watch session (e.g. after
-many incremental re-parses have added data), networks can be evicted by removing their
-nodes/edges from the DB (using the existing `Transaction::remove_nodes` path) and
-marking them as "on-disk only". A subsequent query that touches an evicted network
-triggers a reload from its shard file.
+A miss against the loaded set is therefore a **fetch**, not a failure: resolve the
+key to a home shard, load it, retry. This is what makes a partially-loaded store
+correct rather than merely fast.
 
-This gives operators a knob — `memory_budget_mb` in `ShardConfig` or a new
-`--memory-budget` CLI flag — to tune the watch daemon's footprint without sacrificing
-query correctness.
+**The Trace halo is the fetch trigger.** Each network shard embeds more than its own
+members: every edge endpoint outside the network (`export.rs:279-299`), every
+third-party `{maps_to}` owner (`:301-324`), and each extern's Section edge to its
+namespace parent together with that parent node (`:326-353`). So a shard is
+self-sufficient for upward traversal, and an extern copy carries the real node with
+its real BID — enough to identify the home shard and pull it. A partially-loaded
+store has no broken parent chains.
 
-**Multi-consumer awareness**: during a `watch` session, the in-memory DB serves
-multiple concurrent consumers (browser viewer via local API, MCP clients, LSP
-clients). Eviction must not occur while a query is in flight. The
-`compiler_idle_notify` signal in `FileUpdateSyncer` remains the correct eviction
-trigger boundary, but the idle detection must account for active queries from all
-consumers, not just the compiler.
+**Write path — deferred.** `apply_batch` marks the touched network dirty; whole
+shards are re-exported at `finalize_html` through the existing `export_sharded`.
+No per-event shard mutation. The store is live and authoritative in memory
+throughout, so deferring the write costs no correctness. This is also the shape
+`generational_archive.md` §9.1 assumes: a single `STAGED` generation overwritten
+every parse.
+
+**Monolithic mode is the one-shard case.** Absence of `beliefbase/manifest.json`
+means load `beliefbase.msgpack` as a single unit. Identity preservation works
+everywhere; only *skip* is sharded-only, because only sharding provides the
+per-network granularity a skip decision needs.
+
+**`get_file_mtimes` is retired.** It exists on `BeliefSource` with a default-empty
+implementation (`query/mod.rs:68`), and `DbConnection` satisfied it from the
+`file_mtimes` table for `check_stale_files`. That table was a workaround for having
+no durable prior generation. `ShardStore` has one: "did this file change?" is
+answered by comparing `source_hashes` in the manifest (§ Skip logic), which also
+catches additions and deletions by key-set comparison. `ShardStore` takes the
+default impl and `check_stale_files` goes with it. Record this rationale in a doc
+comment on the impl, so the default does not read as an unimplemented stub.
+
+**Fidelity is the thing that can silently fail.** If a loaded shard does not yield
+the same network-relative keys `speculative_path_key` produces, every lookup misses,
+every node falls through to `Generated`, and the parse still succeeds. Issue 75 found
+this path fragile once already (`beliefbase_architecture.md` §2.2.1, the `cache_fetch`
+miss when `--write` was off). Two tests gate it, and the second is the more useful
+diagnostic: the BID-stability round-trip reports that the aggregate went wrong, while
+the path-key fidelity test names *which* key shape broke. Both are in § Testing
+Requirements.
+
+**Three consumers, one loader.** MCP static mode (`mcp/state.rs:272-380`) and the
+browser viewer (`wasm.rs:819`) each hand-roll shard deserialization today. MCP static
+mode adopts `ShardStore` once the parse path is verified, retiring the
+`TODO(Issue 66)` hook in `src/mcp/state.rs`. The viewer keeps its own loader for now —
+it is `wasm32` and carries its own `loaded_shards` eviction bookkeeping — but the two
+should converge, and `ShardStore` is the shape they converge on.
+
+> **Non-foreclosure for Issue 74.** `generational_archive.md` §3.1 requires archived
+> stub shards to "hydrate through the existing shard path" so that `compute_diff`
+> receives a real `BeliefBase` with relations and indices. Because `ShardStore` is a
+> backend rather than a startup step, the archive's old side is simply **a second
+> instance over a different generation**. A startup-step design would have required a
+> parallel loader; this one does not. Do not reintroduce an assumption that only one
+> store exists per process.
+
+### One writer per output directory
+
+Once shards are the identity store, two processes exporting to one output directory
+can interleave their writes and produce a mixed generation. Before this issue that
+cost a re-render; after it, it costs every BID in the corpus. The store therefore
+enforces what `living_corpus.md` §2 already asserts about Layer 2 —
+**single-owner-per-node, one writer** — as opposed to Layer 3, which is many-writer
+and uncoordinated by design.
+
+The two hazards are different and need different mechanisms. Conflating them produces
+a design where readers block on every export.
+
+| Hazard | Mechanism |
+|---|---|
+| Two writers interleaving a generation | exclusive advisory lock on the output directory |
+| A reader observing a half-written shard | temp-write + atomic rename; manifest renamed last |
+| A reader observing a consistent but stale generation | nothing — that is correct behaviour |
+
+**The writer lock.** A `ShardStore` opened for writing acquires an exclusive advisory
+lock on the output directory at open, holds it for the process lifetime, and releases
+it on exit. `noet serve` takes it the moment it comes online against a given output
+directory — not per export — so the "there is exactly one writer" invariant holds for
+the whole session rather than only during the write burst.
+
+**Contention fails fast**, with a message naming the holder:
+
+```
+another noet process is writing to `_site/` (pid 4821, since 14:02:11)
+run against a different --html-output, or stop that process
+```
+
+Failing loses no work, and this is worth stating because the instinct is to block:
+**Layer 2 is a pure function of Layer 1** (`living_corpus.md` §2). A refused parse has
+written nothing and discarded nothing; re-running it reproduces the identical graph.
+The artifact that genuinely cannot be re-derived is an annotation, and annotations
+never pass through this writer — they are Layer 3, written to the halo of stores
+(`annotation_channel.md` §6) alongside the shard corpus rather than into it. A
+blocking acquire would instead turn a hand-run `noet parse` into a silent hang behind
+a watch daemon, and give CI a queue where it wants an error.
+
+**Readers take no lock.** MCP static mode and the browser viewer open the store
+read-only, and must never block behind an export. Safety comes from atomic publication
+instead: `export_sharded` currently writes each shard in place with `tokio::fs::write`
+(`export.rs:388`, manifest at `:425`), which truncates — a reader mid-write sees a
+truncated msgpack. Writing each file to a temp name and `rename`-ing it into place
+makes every observation atomic, and renaming `manifest.json` **last** makes it the
+commit point: a reader either sees the whole prior generation or the whole new one.
+The manifest-last ordering is already what the code does; only the atomicity is
+missing. This also makes MCP's existing mtime-polling reload (`mcp/mod.rs:96-130`)
+sound, which today races the export it is watching for.
+
+> **Scope.** This guards *local* concurrency. Advisory locks are unreliable on NFS,
+> and the CI shard-restore path crosses machines entirely, so an unbroken chain across
+> runners remains an operational concern — see § Why this issue is first.
 
 ### File-based DB for debugging
 
-The current `--db` flag creates a persistent `belief_cache.db` that serves as
-cross-session state. This issue replaces it with `--debug-db <path>`, which serves
-a different purpose: **write-only debugging output**.
+With `ShardStore` backing the parse path, SQLite has no role in identity or
+resolution. The `--db` flag and its persistent `belief_cache.db` are replaced by
+`--debug-db <path>`, which is unambiguously **write-only debugging output**:
 
-- The DB is always initialized from shards (or empty) on startup — never read
-  from a prior file-based DB.
-- `--debug-db /tmp/noet-debug.db` causes the in-memory DB to be backed by a
-  file at the specified path, overwritten each session.
-- The file is never read on subsequent startups. It exists solely for developer
-  inspection: `sqlite3 /tmp/noet-debug.db` to examine graph state, run ad-hoc
-  queries, debug edge resolution, etc.
-- Can also be enabled via `NOET_DEBUG_DB=path` environment variable.
+- `--debug-db /tmp/noet-debug.db` mirrors the session's graph state into a SQLite
+  file for inspection — `sqlite3 /tmp/noet-debug.db` to examine nodes, run ad-hoc
+  queries, debug edge resolution.
+- The file is overwritten each session and never read back. Nothing in the startup
+  path consults it, so there is no "must not read this" discipline to enforce — the
+  read path no longer exists.
+- Also settable via `NOET_DEBUG_DB=path`.
 
-This is distinct from the eliminated `belief_cache.db` (cross-session persistence)
-and from the in-memory DB (live query surface). The debug DB is a window into the
-live session, not a cache or persistence layer.
+The debug DB is a window into the live session, not a cache and not a persistence
+layer.
 
 ### CLI consequences: `--write` retires, `--html-output` becomes required
 
-Once shards are the identity store, `--write` has no remaining job on the parse
-path. Its purpose was to persist time-based BIDs into source frontmatter so they
-survive the next invocation (`compiler.rs:977-989` preserves `rewritten_content`
-across re-parses for exactly this reason). Hydration does that without touching
-source, and does it for corpora where source *cannot* be touched. Keeping both
-mechanisms means two identity stores that can disagree — a frontmatter BID and a
+Retiring `--write` moves identity persistence **from N per-codec source caches to
+one durable store.** That is the whole of the argument, and it is worth stating in
+its general form because the special cases are otherwise easy to mistake for
+exceptions.
+
+Every mechanism below writes a value into source so that the *next* parse can read
+it back and recover identity. Each exists because there was no durable store to
+recover it from. `ShardStore` is that store:
+
+| Cache | Written into | Recovered from the store by |
+|---|---|---|
+| `bid:` frontmatter | markdown | the hydrated node's BID |
+| `{#anchor}` heading injection | markdown | the hydrated node's `id` |
+| `[sections."id://x"]` table | markdown | the hydrated section nodes |
+| `__noet_bid__`, `tabs_meta.<tab>.bid` | xlsx cells | the hydrated node's BID |
+| hidden `RelationBref` columns | xlsx | the hydrated relation (`xlsx/codec.rs:669-692`) |
+
+The xlsx entries are the least visible — a hidden column is not something you notice
+reading the file — but they are instances of the rule, not exceptions to it. The
+comment at `xlsx/codec.rs:671` says as much: the bref "was written by a prior
+`--write` pass" to give "stable resolution even if the human-readable cell text
+changes." That is a hand-rolled identity store.
+
+Keeping both means two identity stores that can disagree — a frontmatter BID and a
 shard BID for the same heading — which is worse than either alone.
 
-- **Remove `--write` from `Parse` and `Watch`** (`src/cli.rs:194`, `:262`).
-  `DocumentCompiler::new`/`with_html_output` lose the `write: bool` parameter;
-  `parse_one_path`'s write-back block (`compiler.rs:2158-2175`) goes with it.
+- **Remove `--write` from `Parse` and `Watch`** (`src/cli.rs:192-194`, `:259-262`;
+  note `#[arg(short, long)]` also binds `-w`). `DocumentCompiler::new` /
+  `with_html_output` lose the `write: bool` parameter, as do `WatchService::new` /
+  `with_html_output` and `FileUpdateSyncer::new`, which carry a parallel chain
+  (`watch.rs:293`, `:305`, `:324`, `:354`, `:517`, `:730`). `parse_one_path`'s
+  write-back block (`compiler.rs:2159-2190`) goes with it — **both arms**, text and
+  binary; the binary arm is `generate_source_bytes` for xlsx.
   The `generate_source() != content` check (`builder.rs:1488-1496`) stays — it
   still answers "did normalization change anything?" for diagnostics, and Issue
   107 (codec write-back) will need it — but nothing acts on the answer here.
-- **Make `--html-output` required on `Parse`** (`cli.rs:202`). The shard
+- **Make `--html-output` required on `Parse`** (`cli.rs:200-202`). The shard
   directory lives under it, and a parse that writes no shards preserves no
   identity; a parse with no output directory is now a parse whose BIDs are
   discarded, which is not a mode worth supporting. `Watch` already requires an
   output directory when `--serve` is set; make it unconditional there too.
-- **What `--write` also did**: link normalization and frontmatter merge ride the
-  same `rewritten_content` path. Those are source *edits*, not identity
-  persistence, and they belong to Issue 107's write-back — which runs through
-  `BeliefEvent` → codec, not through a parse-time flag. Record in Issue 107 that
-  it inherits normalization-on-request; do not preserve `--write` as a stopgap.
+  **`DocumentCompiler::html_output_dir` stays `Option<PathBuf>`** — required at the
+  CLI is not the same as non-optional in the struct, and `DocumentCompiler::simple`,
+  `WatchService::new`, and ~20 tests still construct with `None`.
+- **What `--write` also did**: link normalization and the `bref://` title
+  annotation ride the same `rewritten_content` path. Those are source *edits*, not
+  identity persistence, and they belong to Issue 107's write-back — which runs
+  through `BeliefEvent` → codec, not through a parse-time flag. Record in Issue 107
+  that it inherits normalization-on-request; do not preserve `--write` as a stopgap.
 
-Existing tests that pass `write = true` to exercise BID persistence
-(`tests/codec_test/bid_tests.rs`, `compiler.rs:6577-6611` `collect_bids`) are
-rewritten to persist via shards instead — see § Testing Requirements.
+**Consequence to state plainly**: shard presence becomes load-bearing for identity
+in cases where a source-embedded fallback previously existed. A cold parse with no
+shard chain recovers nothing. This is the same chain fragility § Why this issue is
+first already documents for BIDs, now applying uniformly.
+
+**Test migration.** Tests that observe write-back by reading the source file back
+from disk migrate to observing `payload["text"]` — the pattern two alias tests
+already use (`tests/codec_test/alias_tests.rs:223`, `:272`). Three groups need more
+than a parameter drop, and the CLI teardown should not start until they are
+scoped:
+
+- `tests/codec_test/xlsx_tests.rs:486`, `:549` assert BIDs land *inside the workbook
+  bytes*. They test the mechanism being removed; delete or re-point at the store.
+  `:397` derives BID continuity from the file rather than a store and needs a
+  shard-backed harness.
+- `tests/cache_invalidation_test.rs` — all 5 tests open `belief_cache.db`
+  out-of-band to observe mtimes. Both the file and the mtime table are going away.
+- `tests/codec_test/bid_tests.rs` `_db` variants and `link_tests.rs:106` use a file-DB
+  cold start as the harness. The shard equivalent is the BID-stability round-trip
+  below. Note the two `in_memory` variants already pass `write = false` and
+  self-manage persistence, and `collect_bids` (`compiler.rs:6711-6745`) has a single
+  caller passing `false` — both are arity drops only.
 
 ### `last_diagnostics` accessor on `DocumentCompiler`
 
@@ -425,27 +569,12 @@ This is the correct source for:
 
 The change is purely additive — no behavior change to existing callers.
 
-### `BeliefSource` trait
+### Naming
 
-**Note**: `BeliefSource` as a shard-loading abstraction (the original intent here)
-conflicts with the existing `BeliefSource` query-execution trait in `src/query.rs`.
-The shard-loading abstraction needs a distinct name — `ShardLoader` or
-`ShardBeliefSource` are candidates. Decide at implementation time based on import
-topology.
-
-The shard-loading abstraction remains useful for MCP static mode as a `TODO(Issue 66)`
-hook in `src/mcp/state.rs`, but the primary motivation — eliminating the file DB from
-`noet watch` — is better served by the hydration approach above, which reuses the
-existing `DbConnection` / `BeliefAccumulator` infrastructure rather than introducing
-a new trait.
-
-### Monolithic mode
-
-When the export is below the shard threshold, `beliefbase.msgpack` is written
-instead of a `beliefbase/` directory. Incremental skip does not apply in monolithic
-mode (the whole graph is one file; there is no per-network manifest to consult).
-`ShardBeliefSource` detects monolithic mode by the absence of `beliefbase/manifest.json`
-and falls back to loading the single `beliefbase.msgpack`.
+There is no new trait. `ShardStore` is a new *implementation* of the existing
+`BeliefSource` (`src/query/mod.rs:40`) and `BeliefSink` (`src/beliefbase/sink.rs:41`)
+traits, so the name only has to describe a store — not disambiguate itself from the
+query-execution trait.
 
 ## Implementation Steps
 
@@ -531,49 +660,92 @@ and falls back to loading the single `beliefbase.msgpack`.
    - [ ] Note: Issue 11 (LSP `publishDiagnostics`) is the second consumer — add
          the accessor once, coordinate to avoid duplication
 
-3. **Shard hydration + incremental skip in parse/watch startup** (1.5 days)
-   - [ ] Read existing `beliefbase/manifest.json` at startup (both `noet parse` and
-         `noet watch`); classify each network as clean or dirty by comparing stored
-         `source_hashes` against the hashes computed in step 1b
+3. **`ShardStore` + incremental skip in parse/watch startup** (1.5 days)
+
+   **Spike first.** Before estimating the rest of this step: load a fixture's shards
+   through `BeliefBase::merge`, recompute `speculative_path_key` for a sample of
+   headings, and assert the keys resolve to the expected BIDs. This converts the
+   design's central claim into evidence and is the cheapest place to discover a
+   path-key mismatch.
+
+   - [ ] Implement `ShardStore` with `BeliefSource` (`src/query/mod.rs:40`) and
+         `BeliefSink` (`src/beliefbase/sink.rs:41`). It owns a `BeliefBase`, the
+         manifest, and the set of currently-loaded network brefs
+   - [ ] Load a shard by deserializing `{bref}.msgpack` and calling
+         `BeliefBase::merge` — pass 3 builds the `PathMapMap` (`base.rs:2996`).
+         Model on `wasm.rs:819-918`; lift the shared deserialization out of
+         `mcp/state.rs:330` rather than writing a third copy
+   - [ ] Route a key to its home shard: `Path`/`Id` carry `net` directly;
+         `Bid`/`Bref` resolve via `GlobalShard.bref_index`. Load the global shard
+         eagerly at open
+   - [ ] `evaluate` loads the home shard on miss, then retries. A key that resolves
+         to no known shard is a genuine miss
+   - [ ] `apply_batch` marks the touched network dirty; no per-event shard write
+   - [ ] Re-export dirty shards at `finalize_html` via the existing `export_sharded`
+   - [ ] **Exclusive writer lock** on the output directory, acquired at open for a
+         writable store and held for the process lifetime. Fail fast on contention
+         with a message naming the holding pid and its start time. Readers
+         (MCP static, viewer) open read-only and take no lock
+   - [ ] **Atomic publication** in `export_sharded`: write each shard and the manifest
+         to a temp name and `rename` into place, manifest last. Removes the torn-read
+         window that `tokio::fs::write` (`export.rs:388`, `:425`) leaves open
+   - [ ] Monolithic: absence of `beliefbase/manifest.json` → load
+         `beliefbase.msgpack` as a single unit
+   - [ ] `get_file_mtimes` takes the default-empty impl; document why in a doc
+         comment on the impl. Retire `check_stale_files` and its call sites
+         (`watch.rs:815`, `compiler.rs:1214`, `:1476`)
+   - [ ] Swap `BeliefAccumulator::new(DbConnection(db_pool), rx)` →
+         `BeliefAccumulator::new(ShardStore::open(..)?, rx)` in `cli.rs:583-602`.
+         Decide what the `#[cfg(not(feature = "service"))]` arm (`cli.rs:603-607`)
+         does — it currently has no DB at all
+   - [ ] Remove `belief_cache.db` creation from `WatchService::with_html_output`
+         (`watch.rs:336-338`). Remove the dead `BELIEF_CACHE_DB` const (`db.rs:44`)
+   - [ ] Replace `--db` with `--debug-db <path>` (and `NOET_DEBUG_DB`)
+   - [ ] Read `beliefbase/manifest.json` at startup; classify each network clean or
+         dirty by comparing stored `source_hashes` against step 1b's hashes
    - [ ] Handle missing files (dirty), new files (dirty), `--force` (all dirty)
    - [ ] Assert the invariant in review: no code path may conclude *clean* from an
          mtime comparison. A `stat` may short-circuit toward *dirty* only
-   - [ ] Implement `hydrate_from_shards(db, output_dir, manifest, dirty_brefs,
-         memory_budget_mb)`: deserialize each prior network's `{bref}.msgpack` and
-         insert into the in-memory DB via `Transaction::add_event`. **Hydrate dirty
-         networks first**, then clean ones in ascending `estimated_size_mb` order
-         until budget is reached; leave remaining clean networks on disk for
-         on-demand reload. Warn when a dirty network's prior shard could not be
-         hydrated
-   - [ ] Call `hydrate_from_shards` before `parse_all` / the watch loop, passing the
-         classified dirty set
-   - [ ] Parse only dirty networks; clean networks' data is already in the DB. Confirm
-         that the re-parse of a dirty network resolves unchanged headings through
-         `cache_fetch` → `GlobalCache` rather than `Generated` — check the hydrated
-         `paths` table matches what `speculative_path_key` computes
-   - [ ] **`--force` re-parses everything but still hydrates first.** Force means
+   - [ ] Parse only dirty networks. Confirm a dirty network's re-parse resolves
+         unchanged headings through `cache_fetch` → `GlobalCache` rather than
+         `Generated`
+   - [ ] **`--force` re-parses everything but still loads prior shards.** Force means
          "do not trust the skip decision", not "discard identity". A separate
          `--fresh-bids` (or equivalent) is the only way to intentionally re-mint
+   - [ ] Log the `GlobalCache`/`Generated` ratio per re-parsed network at `info!` —
+         a high `Generated` count on a lightly edited network is the symptom of a
+         fidelity failure that otherwise passes silently
    - [ ] Add a summary line at `tracing::info!` level:
          `"N/M networks reused from shard cache; K networks re-parsed"`
-   - [ ] Remove `belief_cache.db` file creation from `noet watch` startup path;
-         replace with in-memory DB + hydration
-   - [ ] Replace `--db` CLI flag with `--debug-db <path>` (and `NOET_DEBUG_DB`
-         env var): write-only file-backed DB for developer inspection, never
-         read on startup
+   - [ ] Assert **at rest, `Trace` implies `External`** on both crossings (export and
+         load), logging a violation that names the node. `generational_archive.md`
+         §3.2 drops the archive stub's kind set on the strength of this invariant
 
 4. **WebSocket shard-invalidation endpoint** — MOVED to Issue 102 (`noet serve`). Issue 66 provides the per-network `compiled_at` values that the broadcast carries; Issue 102 owns the endpoint, the consumer registry, and the SPA reload logic.
 
-5. **Shard eviction and on-demand reload** (0.5 days)
-   - [ ] Track per-network "hot" flag in the in-memory DB session
-   - [ ] When the DB size approaches `memory_budget_mb`, evict the least-recently-used
-         network by removing its nodes/edges via `Transaction::remove_nodes` and
-         marking it "on-disk"
-   - [ ] On a query that touches an evicted network, reload from its shard file
-   - [ ] Expose `--memory-budget <MB>` CLI flag on `noet watch` (default: reuse
-         `ShardConfig::DEFAULT_MEMORY_BUDGET_MB`)
+5. **MCP static mode adopts `ShardStore`** (0.5 days) — *after step 3 is verified*
+   - [ ] Replace `mcp/state.rs:272-380`'s hand-rolled loader with `ShardStore`;
+         retire the `TODO(Issue 66)` hook
+   - [ ] `check_consistency` reports per-network `compiled_at` from the manifest
 
-6. **Tests** (0.75 days)
+6. **CLI teardown** (1 day) — *after step 3 is verified*
+   - [ ] Drop `write` from `DocumentCompiler` (`compiler.rs:146`, `:281`, `:302`,
+         `:357`, `:437`, `:1887`) and the `WatchService`/`FileUpdateSyncer` chain
+         (`watch.rs:293`, `:305`, `:324`, `:354`, `:517`, `:730`)
+   - [ ] Remove the write-back block (`compiler.rs:2159-2190`), **both arms**
+   - [ ] Remove `--write` from `Parse` and `Watch`; make `--html-output` required on
+         `Parse` and unconditional on `Watch`, collapsing the two-arm constructor
+         splits (`cli.rs:615`, `:690`, `:955`, `:990`)
+   - [ ] Migrate disk-observing tests to `payload["text"]`; re-point or delete the
+         xlsx byte-assertion tests and the `cache_invalidation_test.rs` suite
+         (see § CLI consequences)
+   - [ ] Fix stale docs: `src/lib.rs:118` doctest, `src/watch.rs:177-194` and `:202`,
+         `src/mcp/mod.rs:431-432`, `src/mcp/state.rs:12-13`
+   - [ ] Reconcile `docs/project/UX_AUDIT.md` §3.5, which argues for zero-config
+         `noet parse <dir>` — the opposite of required `--html-output`. A decision,
+         not a silent edit
+
+7. **Tests** (0.75 days)
    - [ ] Unit test: fixture shard with known `source_hashes`; assert network skipped
          when no file's content changed; assert re-parsed when one file's bytes change
    - [ ] Unit test: a file whose mtime is bumped but whose bytes are unchanged is
@@ -583,17 +755,48 @@ and falls back to loading the single `beliefbase.msgpack`.
          classified **DIRTY**. Under the rejected mtime-first ordering this test fails
    - [ ] Unit test — **false-clean regression**: two distinct writes to one file
          within the same whole second are both detected. `as_secs()` truncation
-         (`src/db.rs:186`, `src/codec/compiler.rs:567`) makes this invisible to mtime
-   - [ ] Unit test: `hydrate_from_shards` against a fixture output directory; assert
-         the in-memory DB contains the expected node count after hydration
-   - [ ] Unit test: eviction + reload cycle; assert query results identical before
-         and after eviction
+         (`src/codec/compiler.rs:567`) makes this invisible to mtime
+   - [ ] Unit test: `ShardStore::open` against a fixture output directory; assert the
+         expected node count after loading
+   - [ ] Unit test: fetch-on-miss — query a key whose home shard is not loaded;
+         assert it resolves and the shard is now loaded
+   - [ ] Unit test: a second writable `ShardStore` against a locked output directory
+         fails with the holder named; a read-only open against the same directory
+         succeeds
+   - [ ] Unit test: a reader opening concurrently with an export observes either the
+         whole prior generation or the whole new one — never a truncated shard and
+         never a manifest referencing a shard that is not yet in place
    - [ ] Regression: `noet parse --force` produces identical output to a fresh parse
          on a clean tree
    - [ ] Regression: `noet watch` startup does not create `belief_cache.db`
 
+8. **Closeout: reconcile the archive design** (0.25 days)
+
+   `identity/generational_archive.md` was drafted against the `DbConnection` parse
+   path. Three of its claims are affected, and all three are load-bearing for Issue 74
+   rather than cosmetic.
+
+   - [ ] §3.4 names `DbConnection` as "the untested half" of the bare-`Trace`
+         invariant and asks for assertions on two dissimilar crossings. That half no
+         longer exists; both crossings are shard crossings through `merge`
+   - [ ] §9.1's `STAGED` generation and this issue's deferred whole-shard re-export are
+         the same operation — confirm they are described as such
+   - [ ] §3.1's "hydrate through the **existing** shard path" now names `ShardStore`;
+         confirm the archive's old side is described as a second instance rather than
+         a parallel loader
+   - [ ] Either correct the three sections directly — **rewriting the claims, not
+         annotating them** (AGENTS.md § No Historical Narrative) — or, if the scope is
+         larger than an edit, file the cleanup against Issue 74, which owns the archive
+
 ## Testing Requirements
 
+- **Path-key fidelity (the sharpest diagnostic)**: load a fixture's shards into a
+  `ShardStore`; for a sample of headings spanning a document root, a nested section,
+  a subnet child, and a node reached only through the Trace halo, recompute
+  `speculative_path_key` and assert each key resolves to the BID the prior parse
+  recorded. The BID-stability round-trip below reports that the aggregate went
+  wrong; this names *which key shape* broke. Run it first — it is the spike in
+  step 3 promoted to a permanent test.
 - **BID stability round-trip (the primary test)**: parse a multi-network fixture;
   record every node's BID from the shards; edit one file in one network; parse again
   with the prior shards present. Every node whose source is unchanged — including
@@ -605,8 +808,8 @@ and falls back to loading the single `beliefbase.msgpack`.
   `test_sequential_db` / `test_parallel_db` already do the right shape: parse 1
   populates a persistent store, parse 2 cold-starts from it with a fresh compiler and
   asserts zero `rewritten_content` and zero graph-modifying events. Three changes
-  turn it into this test: (1) the store is the shard directory, not
-  `belief_cache.db`, and parse 2 hydrates from it; (2) parse 1 no longer writes
+  turn it into this test: (1) the store is a `ShardStore` over the shard directory,
+  not `belief_cache.db`; (2) parse 1 no longer writes
   `rewritten_content` to disk (`apply_rewrite`, L210-225) — with `--write` retired
   the *only* thing carrying BIDs across the two parses is the shards, which is what
   the test must prove; (3) add the edit-one-file step between the parses, and assert
@@ -626,19 +829,21 @@ and falls back to loading the single `beliefbase.msgpack`.
 - `noet parse --force` re-parses everything; output is byte-identical to a fresh
   parse **and BIDs are preserved** — force bypasses skip, not identity
 - Modifying one source file causes only the containing network to be re-parsed; others
-  are skipped and their data is present in the DB via hydration
+  are skipped and their data is present in the store
 - A content change is detected regardless of what the mtime does — unchanged, moved
   backwards, or within the same whole second as the previous write
 - Deleting a source file causes the containing network to be re-parsed
 - The `ProtoIndex::build()` hash pass adds no more than a small fraction of a full
   parse's wall time on a few-thousand-file corpus
-- `noet watch` startup does not create `belief_cache.db`; the in-memory DB is
-  hydrated from shards and query results match a fresh parse
+- `noet watch` startup does not create `belief_cache.db`; the store loads from shards
+  and query results match a fresh parse
 - MCP `check_consistency` (live mode) surfaces `ParseDiagnostic::UnresolvedReference`
   entries from `DocumentCompiler::last_diagnostics()` correctly
 - MCP static mode returns correct `check_consistency.compiled_at` values per network
-- With `--memory-budget 10` on a corpus > 10MB, eviction occurs without query
-  correctness regression
+- A query for a key whose home shard is not yet loaded resolves correctly, and the
+  home shard is loaded as a result (fetch-on-miss)
+- Query results from a `ShardStore` loaded from a run's own output shards match the
+  results from the live `BeliefBase` that produced them (hydration equivalence)
 
 ## Success Criteria
 
@@ -650,18 +855,27 @@ and falls back to loading the single `beliefbase.msgpack`.
 - [ ] `ProtoIndex::build()` produces a content hash per in-scope source file, grouped
       by `net_dir_partition`'s existing `network_dir → children` partition, hashed in
       pass 2 only
-- [ ] `noet parse` on an unchanged corpus skips all clean networks, hydrates the
-      in-memory DB from shards, and logs a summary line showing reuse count
-- [ ] `--force` bypasses skip logic but still hydrates prior shards; output is
+- [ ] `ShardStore` implements `BeliefSource` + `BeliefSink` and backs the
+      accumulator in place of `DbConnection`; no SQLite is on the parse path
+- [ ] The path-key fidelity test passes for document roots, nested sections, subnet
+      children, and Trace-halo nodes
+- [ ] A key whose home shard is unloaded resolves by fetch-on-miss
+- [ ] Exactly one writable `ShardStore` may hold an output directory; a second fails
+      fast naming the holder, and readers are never blocked by a writer
+- [ ] Shards and the manifest are published by atomic rename, manifest last, so no
+      reader can observe a torn generation
+- [ ] `noet parse` on an unchanged corpus skips all clean networks and logs a summary
+      line showing reuse count
+- [ ] `--force` bypasses skip logic but still loads prior shards; output is
       identical to a fresh parse and BIDs are preserved
 - [ ] `--write` is removed from `Parse` and `Watch`; `--html-output` is required on
       `Parse`; `DocumentCompiler` constructors no longer take `write`. No test passes
       `write = true`
-- [ ] `noet watch` does not create `belief_cache.db`; startup hydrates from shards
+- [ ] `noet watch` does not create `belief_cache.db`; startup loads from shards
 - [ ] `DocumentCompiler::last_diagnostics()` exists; MCP `check_consistency` live
       mode uses it to surface `UnresolvedReference` diagnostics
-- [ ] Shard eviction + on-demand reload cycle passes correctness tests
-- [ ] `--memory-budget` CLI flag on `noet watch` governs in-memory DB footprint
+- [ ] At rest, `Trace` implies `External`, asserted on both the export and load
+      crossings, with violations logged by node
 - [ ] Incremental skip unit tests pass, including mtime-bump and file-deletion cases
 - [ ] A file whose mtime is bumped but whose content is unchanged is classified CLEAN
 - [ ] Both false-clean regression tests pass: backwards-mtime content change and
@@ -676,6 +890,38 @@ The two WebSocket criteria previously listed here (`/events` broadcasting
 now **Issue 102's success criteria**. This issue's obligation is only to make the
 per-network `compiled_at` values available for Issue 102 to broadcast.
 
+## Performance: deferred until fidelity is proven
+
+This issue's deliverable is identity, not speed. Everything below is deferred so that
+the first pass optimises nothing and hides nothing — a `ShardStore` that loads every
+shard eagerly is correct, and correctness is what the annotation wave is waiting on.
+Promote these once the path-key fidelity and BID-stability tests pass.
+
+- **Memory budget and eviction.** `ShardConfig::memory_budget_mb` already exists and
+  already caps client-side loading in the viewer. Server-side it becomes an eviction
+  policy over `ShardStore`'s loaded set: drop a network's nodes and reload on the next
+  touch. Because fetch-on-miss makes a partially-loaded store *correct*, this is purely
+  a footprint knob — which is why it is not in the first pass. Add
+  `--memory-budget <MB>` when it is.
+- **Eviction boundary.** During a `serve` session the store backs several concurrent
+  consumers (viewer, MCP, LSP). Eviction must not race an in-flight query;
+  `compiler_idle_notify` in `FileUpdateSyncer` is the trigger boundary, extended to
+  account for all consumers rather than only the compiler.
+- **Partial-load behaviour under a budget.** With eviction active, measure how often a
+  parse touches an evicted network and what the reload costs. The Trace halo means the
+  worst case is a re-read, not a wrong answer, but the frequency is unmeasured.
+- **`ProtoIndex::build()` hash pass.** Benchmark the full-tree read added in step 1b on
+  a few-thousand-file corpus and record the delta. Estimated at roughly one `cat` of
+  the tree (~50–150 ms warm for ~3,000 files / ~30 MB); if the measurement contradicts
+  the estimate, revisit before shipping. Do **not** add a `(path, mtime, size)` hash
+  cache to avoid it without reading § On hash caching first.
+- **Incremental shard export.** `apply_batch` defers to a whole-shard re-export at
+  finalize. If re-exporting a large unchanged-but-dirty shard proves costly, the
+  question becomes worth asking; nothing needs it yet.
+
+Measurements belong in the application-specific `PERFORMANCE_LOG.md`, with mechanisms
+and status recorded in `ISSUE_97_BUILD_PERFORMANCE_BOTTLENECKS.md`.
+
 ## Risks
 
 - **Generated corpora defeat content hashing too**: Upstream document generators
@@ -685,9 +931,9 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   source data is unchanged. In one measured corpus, ~1,260 of the generated Markdown
   documents carried such a timestamp; an incremental parse would correctly classify
   all of them as dirty and skip nothing. The skip rate on that corpus would be zero.
-  **The BID-stability goal survives this** — dirty networks are hydrated before
-  re-parse, so unchanged headings keep their BIDs even when nothing is skipped — but
-  the corpus-currency goal does not, since every build is still a full parse.
+  **The BID-stability goal survives this** — prior shards back the store regardless of
+  what is skipped, so unchanged headings keep their BIDs even when nothing is skipped —
+  but the corpus-currency goal does not, since every build is still a full parse.
   → **Mitigation**: this **cannot be fixed inside noet-core**. A document whose bytes
   genuinely changed is genuinely dirty, and noet-core cannot know that one field is
   noise. The fix belongs in the generator: move the render timestamp out of
@@ -714,33 +960,41 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   backward-compatible. → **Mitigation**: `#[serde(default)]` on both new fields;
   a missing or empty `source_hashes` is treated as dirty, which triggers a re-parse —
   the safe direction. Old manifests degrade to full re-parse, never to a false skip.
-- **Hydration fidelity**: The in-memory DB hydrated from shards must be
-  query-equivalent to a DB built by a live parse. Any shard format gap (e.g. missing
+- **Load fidelity**: a `ShardStore` loaded from shards must be query-equivalent to the
+  live `BeliefBase` that produced them. Any shard format gap (e.g. missing
   `WEIGHT_OWNED_BY` — see Issue 64 debug notes) will produce query differences.
-  → **Mitigation**: Add a round-trip integration test that compares query results
-  from a live parse vs. hydration from its own output shards.
-- **Hydration that does not preserve BIDs looks like success.** If the hydrated
-  `paths` table does not match the keys `speculative_path_key` produces, every
-  `cache_fetch` misses, every node is `Generated`, the parse completes, the output
-  renders, and the skip rate is fine — but every BID has changed and every downstream
-  annotation is orphaned. Nothing fails loudly. → **Mitigation**: the BID-stability
-  round-trip test is the gate; additionally log the `GlobalCache`/`Generated` ratio
-  per re-parsed network at `info!`, since a high `Generated` count on a lightly edited
-  network is the symptom.
+  → **Mitigation**: the hydration-equivalence test in § Testing Requirements.
+- **A store that resolves nothing looks like success.** If loaded shards do not yield
+  the keys `speculative_path_key` produces, every `cache_fetch` misses, every node is
+  `Generated`, the parse completes, the output renders, and the skip rate is fine — but
+  every BID has changed and every downstream annotation is orphaned. Nothing fails
+  loudly. → **Mitigation**: the path-key fidelity test is the gate, because it names
+  the broken key shape rather than reporting an aggregate; additionally log the
+  `GlobalCache`/`Generated` ratio per re-parsed network at `info!`, since a high
+  `Generated` count on a lightly edited network is the symptom.
 - **The shard chain is the identity store, and it can break.** A CI cache miss, a
   deleted `_site/`, or a shard format change re-mints every BID. → **Mitigation**:
   this issue makes stability *possible*; keeping the chain unbroken is an operational
   concern for the deploying pipeline (restore shards before parse), and anchor
   consumers should carry a secondary re-attachment key. Both are noted in § Why this
   issue is first; neither is fixed here.
-- **Eviction correctness**: Evicting a network mid-query could produce inconsistent
-  results if the eviction races with an in-progress query. → **Mitigation**: Eviction
-  only occurs between parse passes (at the idle boundary), never during a query.
-  The `compiler_idle_notify` signal in `FileUpdateSyncer` is the correct eviction
-  trigger.
-- **Monolithic mode skipped**: Incremental parse and hydration only apply to sharded
-  output. Small repos below the 2MB threshold get no benefit. → **Mitigation**:
-  Acceptable; large repos that benefit are also large enough to be sharded.
+- **Replacing the store is a larger step than hydrating into one.** `ShardStore`
+  displaces `DbConnection` on the parse path rather than sitting beside it, so a defect
+  in it has no fallback. → **Mitigation**: the constituent parts all ship today —
+  `merge` (`base.rs:2946`), shard deserialization (`wasm.rs:819`, `mcp/state.rs:330`),
+  `BeliefSink for DbConnection` as the write template (`sink.rs:78`) — and the
+  accumulator is already generic over its store, so the swap is one line at
+  `cli.rs:601`. The spike in step 3 runs before any of it is wired.
+- **A stale lock file strands an output directory.** A process killed with `SIGKILL`
+  cannot run its release path. → **Mitigation**: use OS advisory locking
+  (`flock`/`LockFileEx`) rather than a hand-rolled lock file — the kernel releases the
+  lock when the fd closes, including on abnormal termination, so there is no stale
+  state to reap. A pid file alongside it carries the diagnostic message only and is
+  never the lock itself.
+- **Monolithic mode gets no skip**: below the 2MB threshold there is no per-network
+  manifest to consult. → **Mitigation**: identity still works — monolithic is the
+  one-shard case for `ShardStore`, so only *skip* is unavailable. Large repos that
+  benefit from skip are also large enough to be sharded.
 - **`last_diagnostics` snapshot timing**: The snapshot must be taken before the
   `latest_results` drain to capture the full diagnostic set. If taken after, the
   drain discards the data. → **Mitigation**: Code review checkpoint; add an assertion
@@ -756,9 +1010,11 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   those are at rest legitimately and in volume.
 
   **The invariant to test: at rest, `Trace` implies `External`.** This issue owns
-  it because it owns both crossings — export to at-rest and hydration back — and
-  either is a natural place to assert it. Expect violations on a real corpus:
-  each one is a machinery defect to chase, not a case to accommodate.
+  it because it owns both crossings — shard export and shard load — and either is a
+  natural place to assert it. With `ShardStore` replacing `DbConnection` on the parse
+  path, both crossings run through `merge`, so one assertion site covers both rather
+  than two dissimilar ones. Expect violations on a real corpus: each one is a
+  machinery defect to chase, not a case to accommodate.
 
   **Indirect evidence says it already holds for shards.** The SPA loads shards on
   demand across a ~2,445-shard corpus via `bref_index` lookups and `get_context`
@@ -767,10 +1023,6 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   that surfaces immediately in a browser. `export.rs` also states the intent
   directly: "Trace nodes introduced by balanced traversal (cross-network
   references) are excluded."
-
-  **`DbConnection` is the untested half.** Bare-Trace rows there would degrade a
-  query result rather than freeze a page — quieter, and likelier to have gone
-  unnoticed. Assert on both crossings.
 
   Two consumers depend on this. `identity/generational_archive.md` §3.2 drops the
   kind set from its archive stub on the strength of the invariant, accepting a
@@ -783,7 +1035,7 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
 - Should `source_hashes` store paths relative to the repo root or relative to the
   network directory? Repo-root-relative is stable across network moves; network-
   relative is shorter. Recommend repo-root-relative for unambiguity.
-- **What preserves a BID when a heading is renamed?** Hydration resolves by path key,
+- **What preserves a BID when a heading is renamed?** The store resolves by path key,
   so a heading whose slug changes misses `cache_fetch` and re-mints even though it is
   "the same" section. That is Issue 36's content-identity problem and is explicitly
   out of scope here — this issue preserves identity for *unchanged* nodes only. State
@@ -795,10 +1047,11 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   asks for it.
 - Should the incremental skip summary line go to `tracing::info!` or `tracing::debug!`?
   Recommend `info!` — users benefit from seeing that incremental is working.
-- Should eviction be triggered by a size threshold (bytes in DB) or by
-  `estimated_size_mb` from the manifest? Manifest estimates are coarse but require no
-  DB introspection. DB byte-count is accurate but requires a `PRAGMA page_count`
-  query. Recommend manifest estimates for simplicity; revisit if they prove inaccurate.
+- **What does the `#[cfg(not(feature = "service"))]` path use?** `cli.rs:603-607`
+  currently builds the accumulator over a bare `BeliefBase` with no DB at all. Since
+  `ShardStore` needs no `service` feature — it is filesystem plus `BeliefBase` — it
+  could become the single store for both arms, removing the branch. Confirm at
+  implementation time.
 - **`--write` removal: hard or deprecated?** Recommend hard removal in the same
   release as `--debug-db`, with an error pointing at this issue — a deprecated
   `--write` that still stamps frontmatter BIDs would create the two-identity-store
@@ -808,9 +1061,21 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   deprecated with a warning for one release? Recommend hard removal with a clear
   error message: "The --db flag has been replaced by --debug-db. The file-based DB
   is now a write-only debugging artifact, not a persistence layer. See Issue 66."
-- `ShardBeliefSource` (shard-loading abstraction for MCP static mode) — name
-  conflicts with the existing `BeliefSource` query trait in `src/query.rs`. Resolve
-  at implementation time; `ShardLoader` or `StaticBeliefSource` are candidates.
+- **Which advisory-locking crate?** No dependency provides this today and no locking
+  precedent exists in the crate — every `lock()` in `src/` is an in-process mutex.
+  `fs4` (maintained successor to `fs2`) and `fd-lock` are the candidates; both wrap
+  `flock`/`LockFileEx`. Pick at implementation time on maintenance and platform
+  coverage, not features.
+- **Does `noet parse` need the lock, or only `noet serve`?** A one-shot parse writes a
+  generation and exits, so it must hold the lock across its export. The asymmetry is
+  duration, not applicability: `serve` holds for its session, `parse` for its run.
+  Confirm there is no read-only `parse` mode that should be exempt once
+  `--html-output` is required.
+- **When does the browser viewer adopt `ShardStore`?** MCP static mode adopts it in
+  step 5. The viewer (`wasm.rs:819`) is the third hand-rolled loader, but it is
+  `wasm32` and carries its own `loaded_shards` eviction bookkeeping, so it stays put
+  for now. Converging it is worth an issue once the server-side eviction policy exists
+  to compare against.
 - **Command taxonomy: `parse` vs `serve` vs `watch`** — **RESOLVED, owned by Issue
   102.** `watch` is renamed to `serve`: `noet parse` is one-shot batch compilation
   that exits when done, while `noet serve` is the long-running application server
@@ -874,6 +1139,13 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
 
 ## References
 
+- [`docs/design/identity/generational_archive.md`](../../design/identity/generational_archive.md) —
+  §3.1 requires archived stubs to hydrate through the existing shard path, which
+  `ShardStore` provides as a second instance over another generation; §3.4 assigns this
+  issue the bare-`Trace` invariant on both crossings; §9.1's `STAGED`-overwritten-every-
+  parse is this issue's deferred write. **Closeout task**: §3.4 and §9.1 describe a
+  `DbConnection` crossing that no longer exists — assess and either correct them
+  directly or hand the cleanup to Issue 74
 - [`docs/design/identity/content_versioning.md`](../../design/identity/content_versioning.md) — owns
   per-*node* content hashing, which is **out of scope for this issue** (Issue 105
   owns it). Its §6 determinism requirement covers the *hash* half of a
@@ -902,13 +1174,38 @@ per-network `compiled_at` values available for Issue 102 to broadcast.
   truncation behind the same-second false-clean case
 - `src/codec/compiler.rs:570` — `current_mtime > cached`, the comparison that treats a
   backwards mtime as clean
+- `src/query/mod.rs:40` — the `BeliefSource` trait `ShardStore` implements
+- `src/beliefbase/sink.rs:41`, `:78` — `BeliefSink`, and `DbConnection`'s impl as the
+  write-side template
+- `src/beliefbase/base.rs:2946`, `:2996` — `merge_graph_mut`; pass 3 drives
+  `PathMapMap` and builds the path index that makes `NodeKey::Path` resolvable
+- `src/beliefbase/accumulator.rs` — `BeliefAccumulator<S>`, generic over its store;
+  the swap point is its type parameter
+- `src/wasm.rs:819-918` — `BeliefBaseWasm::load_shard`, the shipped precedent for
+  deserialize-and-merge; `:855` for `bref_index` routing
+- `src/mcp/state.rs:272-380` — the second hand-rolled shard loader; adopts
+  `ShardStore` in step 5
+- `src/shard/export.rs:279-360` — the Trace halo: extern endpoints, `{maps_to}`
+  owners, and namespace parents embedded per shard, which is what makes a
+  partially-loaded store traversable
 - `src/shard/manifest.rs` — `NetworkShardMeta`, `ShardManifest`, `network_shard_meta()`
-- `src/shard/export.rs` — `export_sharded`, `export_beliefbase`
+- `src/shard/export.rs` — `export_sharded`, `export_beliefbase`; `:388` and `:425` are
+  the in-place writes that become temp-write + atomic rename
+- `src/mcp/mod.rs:96-130` — `maybe_reload`, the reader that polls `manifest.json` mtime
+  and today races the export it watches for
+- [`docs/design/annotation/living_corpus.md`](../../design/annotation/living_corpus.md) §2 —
+  Layer 2 is single-owner-per-node and a pure function of Layer 1; Layer 3 is
+  many-writer and append-only. The writer lock enforces the first, and the second is
+  why refusing a parse loses no work
 - `src/shard/wire.rs` — `NetworkShard`, `GlobalShard` (deserialization types)
+- `src/codec/xlsx/codec.rs:669-692` — the hidden `RelationBref` column: a per-codec
+  identity cache that `ShardStore` supersedes
 - `src/codec/compiler.rs` — `DocumentCompiler`, `latest_results` drain, `parse_all`/`parse_sequential`
 - `src/codec/diagnostic.rs` — `ParseDiagnostic::UnresolvedReference`
-- `src/db.rs` — `db_init_memory`, `DbConnection`, `Transaction::add_event`, `Transaction::remove_nodes`
-- `src/bin/noet/main.rs` — in-memory DB instantiation for `noet parse` (see `db_init_memory()` block)
+- `src/db.rs` — `db_init_memory`, `DbConnection`; the store `ShardStore` replaces on
+  the parse path
+- `src/cli.rs:583-602` — where the accumulator's store is constructed today; the swap
+  point. (`src/bin/noet/main.rs` is three lines and holds no DB code)
 - `src/watch.rs` — `WatchService` (the only remaining mtime consumer: OS change
   notification triggers a hash, never a skip), `FileUpdateSyncer`,
   `compiler_idle_notify` (eviction trigger boundary)

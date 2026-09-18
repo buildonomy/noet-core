@@ -34,6 +34,8 @@ mod query_directive_tests;
 mod query_tests;
 #[path = "codec_test/section_tests.rs"]
 mod section_tests;
+#[path = "codec_test/text_purity_tests.rs"]
+mod text_purity_tests;
 
 #[cfg(feature = "xlsx")]
 #[path = "codec_test/xlsx_tests.rs"]

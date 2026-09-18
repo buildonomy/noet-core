@@ -139,7 +139,7 @@ const TERMINATORS: &str = ".,:;";
 ///   kept as-is — they are valid in HTML5 `id=` and modern browsers handle
 ///   non-ASCII URL fragments correctly.
 /// - Strip everything else (e.g. `&`, `!`, `:`, `#`, `%`, `+`, `=`, …)
-/// - **Drop boundary terminators**: a run of terminators ([`TERMINATORS`]:
+/// - **Drop boundary terminators**: a run of terminators (`TERMINATORS`:
 ///   `.` `,` `:` `;`) is only meaningful *within* a word. A run at a word
 ///   boundary — missing a neighbour on either side, or abutting the `-` word
 ///   separator — is dropped, so `"1. Introduction"` yields `1-introduction`

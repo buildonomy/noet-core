@@ -2426,22 +2426,35 @@ impl DocCodec for MdCodec {
             None,
             diagnostics,
         );
-        let maybe_text = if frontmatter_changed.is_some()
+        // `payload["text"]` is a pure function of the parsed source, so it is derived
+        // on every parse rather than only when some other mutation happened to fire.
+        // Gating the *derivation* on the mutation flags made the stored value a
+        // function of parse history: a settled document (every BID persisted, every
+        // link resolving) tripped none of the flags, so the key was left at whatever
+        // an earlier parse had written, or absent entirely.
+        let derived_text = if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
+            Self::events_to_text(
+                &self.content,
+                proto_events.1.iter().skip(start_idx).cloned(),
+            )
+        } else {
+            Self::events_to_text(&self.content, proto_events.1.iter().cloned())
+        };
+
+        // Emitting an updated node is still conditional — deriving the text on every
+        // parse must not turn every parse into a graph mutation. `text_changed`
+        // compares the derived value against what the cached node already carries, so
+        // a re-parse that produces identical text emits nothing, exactly as before.
+        let text_changed =
+            derived_text.as_deref() != ctx.node.payload.get("text").and_then(|v| v.as_str());
+
+        let node_changed = frontmatter_changed.is_some()
             || sections_metadata_merged
             || link_changed
             || id_changed
-        {
-            if let Some(start_idx) = find_frontmatter_end(&proto_events.1) {
-                Self::events_to_text(
-                    &self.content,
-                    proto_events.1.iter().skip(start_idx).cloned(),
-                )
-            } else {
-                Self::events_to_text(&self.content, proto_events.1.iter().cloned())
-            }
-        } else {
-            None
-        };
+            || text_changed;
+
+        let maybe_text = if node_changed { derived_text } else { None };
 
         // Helper: carry forward runtime metadata from ctx.node into any newly-constructed
         // BeliefNode.  Metadata (git status, source backlinks) is never stored in source

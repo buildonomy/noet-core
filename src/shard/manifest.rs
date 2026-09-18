@@ -11,6 +11,7 @@
 
 use crate::properties::{Bid, Bref};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Default sharding threshold: 2MB of serialized BeliefGraph JSON.
 ///
@@ -79,6 +80,26 @@ pub struct NetworkShardMeta {
     pub search_index_path: String,
     /// Approximate size of the search index in KB.
     pub search_index_size_kb: f64,
+    /// RFC-3339 UTC timestamp of when this shard was written.
+    ///
+    /// Exposed through MCP `check_consistency` and used to report which networks a
+    /// build reused. **Never an input to a skip decision** — that is
+    /// `source_hashes`' job; see its note on false-clean.
+    #[serde(default)]
+    pub compiled_at: String,
+    /// SHA-256 of every source file that contributed to this network, keyed
+    /// repo-root-relative.
+    ///
+    /// The skip decision compares this against hashes computed fresh by
+    /// `ProtoIndex`: a network is clean only when the **key sets are identical** and
+    /// every digest matches. Key-set equality is what catches additions and
+    /// deletions, neither of which changes any surviving file's hash.
+    ///
+    /// Empty on manifests written before this field existed, which reads as dirty
+    /// and forces a re-parse — the safe direction. An old manifest degrades to a
+    /// full rebuild, never to a false skip.
+    #[serde(default)]
+    pub source_hashes: BTreeMap<String, String>,
 }
 
 /// Metadata for the global shard (`beliefbase/global.msgpack`).
@@ -232,6 +253,7 @@ pub fn estimate_size_mb(serialized_bytes: usize) -> f64 {
 
 /// Build a `NetworkShardMeta` entry given the network identifiers, shard
 /// serialization size, and search index size.
+#[allow(clippy::too_many_arguments)]
 pub fn network_shard_meta(
     bref: Bref,
     bid: Bid,
@@ -240,6 +262,7 @@ pub fn network_shard_meta(
     relation_count: usize,
     shard_bytes: usize,
     search_index_bytes: usize,
+    source_hashes: BTreeMap<String, String>,
 ) -> NetworkShardMeta {
     let bref_str = bref.to_string();
     NetworkShardMeta {
@@ -252,7 +275,40 @@ pub fn network_shard_meta(
         path: format!("networks/{}.msgpack", bref_str),
         search_index_path: format!("../search/{}.idx.msgpack", bref_str),
         search_index_size_kb: search_index_bytes as f64 / 1024.0,
+        compiled_at: now_rfc3339(),
+        source_hashes,
     }
+}
+
+/// Current UTC time as an RFC-3339 string.
+///
+/// Hand-rolled from `SystemTime` rather than adding a date dependency: this is the
+/// only place the crate formats a wall-clock timestamp, and it is for human display
+/// and MCP reporting only — nothing parses it back or compares it.
+fn now_rfc3339() -> String {
+    let secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    };
+
+    // Civil-from-days (Howard Hinnant's algorithm), valid for the proleptic
+    // Gregorian calendar.
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 #[cfg(test)]
@@ -319,6 +375,8 @@ mod tests {
                 path: "networks/01abc.msgpack".to_string(),
                 search_index_path: "../search/01abc.idx.msgpack".to_string(),
                 search_index_size_kb: 12.5,
+                compiled_at: "2026-01-01T00:00:00Z".to_string(),
+                source_hashes: BTreeMap::new(),
             }],
             global: GlobalShardMeta {
                 node_count: 3,

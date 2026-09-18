@@ -22,12 +22,22 @@
 //! - [`SerializableBidGraph`] — portable edge list (BID strings, not petgraph indices)
 //! - [`SerializableEdge`] — one edge in a [`SerializableBidGraph`]
 //!
+//! ## Deserializing into a graph
+//!
+//! [`NetworkShard::into_graph`] and [`GlobalShard::into_graph`] convert a
+//! deserialized shard into a [`crate::beliefbase::BeliefGraph`]. This step is target-independent and
+//! shared by every consumer — the native `ShardStore`, MCP static mode, and the
+//! browser viewer — so that "parse BID strings, drop unparseable entries, build the
+//! edge list" has exactly one definition. What each consumer does *next* (residency,
+//! eviction, I/O) is properly theirs and differs.
+//!
 //! ## References
 //!
 //! - `docs/design/core/search_and_sharding.md` §5 — Per-network shard format
 //! - Issue 50: BeliefBase Sharding
 
-use crate::properties::{BeliefNode, WeightSet};
+use crate::beliefbase::{BeliefGraph, BidGraph};
+use crate::properties::{BeliefNode, Bid, WeightSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -71,6 +81,56 @@ pub struct GlobalShard {
     /// Built from PathMap data during export; used by the viewer to resolve
     /// which shard to load for an arbitrary node BID.
     pub bref_index: BTreeMap<String, String>,
+}
+
+// ── Shard → BeliefGraph ─────────────────────────────────────────────
+
+impl NetworkShard {
+    /// Convert this shard's states and relations into a [`BeliefGraph`].
+    ///
+    /// Entries whose BID string does not parse are dropped rather than failing the
+    /// load: a single corrupt key should cost one node, not the whole shard.
+    pub fn into_graph(self) -> BeliefGraph {
+        states_and_edges_into_graph(self.states, self.relations.edges)
+    }
+}
+
+impl GlobalShard {
+    /// Convert this shard's states and relations into a [`BeliefGraph`].
+    ///
+    /// `bref_index` is **not** part of the graph — read it from the shard before
+    /// calling this if the consumer needs shard routing.
+    pub fn into_graph(self) -> BeliefGraph {
+        states_and_edges_into_graph(self.states, self.relations.edges)
+    }
+}
+
+/// Shared conversion: string-keyed wire data → BID-keyed graph.
+fn states_and_edges_into_graph(
+    states: BTreeMap<String, BeliefNode>,
+    edges: Vec<SerializableEdge>,
+) -> BeliefGraph {
+    let states = states
+        .into_iter()
+        .filter_map(|(k, v)| match Bid::try_from(k.as_str()) {
+            Ok(bid) => Some((bid, v)),
+            Err(_) => {
+                tracing::warn!("shard contains unparseable state key {k:?}; dropping");
+                None
+            }
+        })
+        .collect();
+
+    let edges = edges.into_iter().filter_map(|e| {
+        let source = Bid::try_from(e.source.as_str()).ok()?;
+        let sink = Bid::try_from(e.sink.as_str()).ok()?;
+        Some((source, sink, e.weights))
+    });
+
+    BeliefGraph {
+        states,
+        relations: BidGraph::from_edges(edges),
+    }
 }
 
 // ── Portable BidGraph serialization ──────────────────────────────────────────

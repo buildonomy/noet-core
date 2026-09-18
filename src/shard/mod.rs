@@ -48,15 +48,23 @@ pub mod content_type;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod export;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod lock;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod manifest;
 pub mod search;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod store;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use export::{export_beliefbase, ExportMode};
+#[cfg(not(target_arch = "wasm32"))]
+pub use lock::WriteLock;
 #[cfg(not(target_arch = "wasm32"))]
 pub use manifest::{CodecManifest, SearchManifest, ShardConfig, ShardManifest, SHARD_THRESHOLD};
 #[cfg(not(target_arch = "wasm32"))]
 pub use search::build_search_indices;
 pub use search::{query_search_index, SearchIndex, SearchResult};
+#[cfg(not(target_arch = "wasm32"))]
+pub use store::ShardStore;
 
 pub use wire::{GlobalShard, NetworkShard, SerializableBidGraph, SerializableEdge};

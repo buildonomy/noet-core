@@ -229,6 +229,12 @@ fn manifest_from_beliefbase(bb: &BeliefBase) -> ShardManifest {
             path: String::new(),
             search_index_path: format!("../search/{}.idx.msgpack", node.bid.bref()),
             search_index_size_kb: 0.0,
+            // Synthesized from a monolithic export, which records neither a
+            // per-network compile time nor per-network source hashes. Empty
+            // `source_hashes` reads as dirty — correct here, since monolithic mode
+            // has no per-network granularity to skip on.
+            compiled_at: String::new(),
+            source_hashes: std::collections::BTreeMap::new(),
         })
         .collect();
 

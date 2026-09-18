@@ -150,7 +150,7 @@ pub fn evaluate_alias_template(
 /// every descendant derives its own alias.
 ///
 /// `__html_path` maps source extensions to their rendered `.html` form via
-/// [`normalize_path_extension_impl`]. For a **network** node it deliberately
+/// `normalize_path_extension_impl`. For a **network** node it deliberately
 /// yields the bare directory rather than `dir/index.html`: static-site
 /// generators serve a directory index at `.../guide/`, and that is the spelling
 /// documents actually cite. The trailing slash is dropped because the href

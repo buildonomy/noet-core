@@ -495,6 +495,11 @@ fn manifest_from_watch_service(service: &crate::watch::WatchService) -> ShardMan
             path: String::new(), // no shard file in live mode
             search_index_path: String::new(),
             search_index_size_kb: 0.0,
+            // Live mode has no shard files, so there is no publication time and no
+            // recorded source hashes. Both stay empty for the same reason the path
+            // and size fields do.
+            compiled_at: String::new(),
+            source_hashes: std::collections::BTreeMap::new(),
         })
         .collect();
 

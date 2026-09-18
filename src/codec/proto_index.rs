@@ -76,6 +76,17 @@ pub struct ProtoIndex {
     /// `PathBuf` = absolute network directory
     /// `Vec<PathBuf>` = ordered direct children produced by the repo-wide scan
     inner: Arc<RwLock<HashMap<PathBuf, Vec<PathBuf>>>>,
+    /// SHA-256 of every in-scope source file, grouped by owning network directory.
+    ///
+    /// Keyed by network dir → (repo-root-relative path → hex digest). Repo-relative
+    /// rather than network-relative so a key survives a network moving, and so the
+    /// same string can be compared against a shard manifest written by a different
+    /// working copy.
+    ///
+    /// This is the input to the incremental skip decision: a network is clean when
+    /// its current file set and every hash match what its shard recorded.
+    /// **Hashes only — never mtimes.** See `hash_network_sources`.
+    source_hashes: Arc<RwLock<HashMap<PathBuf, BTreeMap<String, String>>>>,
     /// Generic codec metadata cache.  Keyed by canonical network directory path,
     /// namespaced by a string key (e.g. `"git"`, `"cmake"`).  Each entry is a
     /// `serde_json::Value` that the producing codec serializes and the consuming
@@ -85,6 +96,103 @@ pub struct ProtoIndex {
     /// parsing via `set_meta()`.  Read-only after population; the `RwLock` guards
     /// concurrent access during parallel epoch tasks.
     codec_meta: Arc<RwLock<HashMap<PathBuf, HashMap<String, serde_json::Value>>>>,
+}
+
+/// Hash every in-scope source file, grouped by owning network directory.
+///
+/// # Why hashes and not mtimes
+///
+/// The two checks have asymmetric failure modes: mtime can report **false-clean**
+/// (a changed file classified unchanged), a content hash cannot. A false-clean
+/// silently skips a changed file, so the compiled graph stops reflecting source and
+/// the user has no way to detect it. The reachable cases are ordinary, not exotic:
+/// second-granularity truncation (two writes inside one second) and
+/// timestamp-preserving restores (`rsync -t`, `cp -p`, archive extraction) that move
+/// an mtime *backwards* while changing content.
+///
+/// So: **no check whose failure mode is false-clean may terminate the evaluation.**
+/// mtime may short-circuit toward *dirty* only, never toward *clean* — which is why
+/// no mtime appears here at all.
+///
+/// # Cost
+///
+/// This is a genuine extra full read: `MdCodec::proto` opens each file but reads
+/// only the frontmatter. The pass costs roughly one `cat` of the corpus and runs
+/// once at compiler startup, not once per re-parse. A `(path, mtime, size)` hash
+/// cache would avoid it and is deliberately **not** implemented — it reintroduces
+/// the same false-clean by a narrower route.
+///
+/// # What gets hashed
+///
+/// Every file in each network's child list, **plus that network's own index file**.
+/// The index is excluded from `children` (it represents the network itself), so
+/// hashing only the children would leave edits to `index.md` invisible to the skip
+/// decision — a false-clean of exactly the kind this function exists to prevent.
+/// Subnet directory entries are skipped: they are hashed under their own key.
+fn hash_network_sources(
+    map: &HashMap<PathBuf, Vec<PathBuf>>,
+) -> HashMap<PathBuf, BTreeMap<String, String>> {
+    use sha2::{Digest, Sha256};
+
+    // The shallowest network directory is the repo root; keys are relative to it so
+    // they are stable across checkouts and comparable to a stored manifest.
+    let repo_root = map
+        .keys()
+        .min_by_key(|p| p.components().count())
+        .cloned()
+        .unwrap_or_default();
+
+    let rel = |p: &Path| -> String { os_path_to_string(p.strip_prefix(&repo_root).unwrap_or(p)) };
+
+    let hash_one = |p: &Path| -> Option<String> {
+        let bytes = std::fs::read(p)
+            .map_err(|e| {
+                tracing::debug!("[ProtoIndex] cannot hash {}: {e}", p.display());
+            })
+            .ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Some(hex::encode(hasher.finalize()))
+    };
+
+    let started = std::time::Instant::now();
+    let mut out: HashMap<PathBuf, BTreeMap<String, String>> = HashMap::new();
+    let mut file_count = 0usize;
+    let mut byte_count = 0u64;
+
+    for (net_dir, children) in map {
+        let mut hashes = BTreeMap::new();
+
+        // The network's own index file — not present in `children`.
+        if let Some(index) = crate::codec::network::detect_network_file(net_dir) {
+            if let Some(h) = hash_one(&index) {
+                byte_count += std::fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+                file_count += 1;
+                hashes.insert(rel(&index), h);
+            }
+        }
+
+        for child in children {
+            // Subnet directories are hashed under their own partition key.
+            if child.is_dir() {
+                continue;
+            }
+            if let Some(h) = hash_one(child) {
+                byte_count += std::fs::metadata(child).map(|m| m.len()).unwrap_or(0);
+                file_count += 1;
+                hashes.insert(rel(child), h);
+            }
+        }
+
+        out.insert(net_dir.clone(), hashes);
+    }
+
+    tracing::debug!(
+        "[ProtoIndex] hashed {file_count} source files ({:.1} MB) in {:?}",
+        byte_count as f64 / (1024.0 * 1024.0),
+        started.elapsed(),
+    );
+    out
 }
 
 /// Returns the direct children of a network directory: subnet directories (those containing
@@ -355,6 +463,7 @@ impl ProtoIndex {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             codec_meta: Arc::new(RwLock::new(HashMap::new())),
+            source_hashes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -496,10 +605,31 @@ impl ProtoIndex {
         // Suppress unused-variable warning when feature is disabled.
         let _ = git_tracking;
 
+        let source_hashes = hash_network_sources(&map);
+
         Ok(Self {
             inner: Arc::new(RwLock::new(map)),
             codec_meta: Arc::new(RwLock::new(codec_meta)),
+            source_hashes: Arc::new(RwLock::new(source_hashes)),
         })
+    }
+
+    /// SHA-256 digests for one network's source files, repo-root-relative.
+    ///
+    /// Returns an empty map for an unknown directory.
+    pub fn source_hashes_for(&self, net_dir: &Path) -> BTreeMap<String, String> {
+        let key =
+            crate::paths::canonicalize_path(net_dir).unwrap_or_else(|_| net_dir.to_path_buf());
+        self.source_hashes
+            .read()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Total number of hashed source files, across all networks.
+    pub fn hashed_file_count(&self) -> usize {
+        self.source_hashes.read().values().map(|m| m.len()).sum()
     }
 
     /// Discover all network directories under `root` (directories containing `index.md`),

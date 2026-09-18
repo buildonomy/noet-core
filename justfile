@@ -34,6 +34,7 @@ default:
 # Install the toolchain pieces CI expects (wasm target, wasm-bindgen, components).
 deps:
     rustup target add wasm32-unknown-unknown
+    rustup target add x86_64-pc-windows-gnu
     rustup component add rustfmt clippy
     @if ! command -v wasm-bindgen > /dev/null 2>&1; then cargo install wasm-bindgen-cli --version 0.2.108; else echo "wasm-bindgen already present"; fi
 
@@ -96,6 +97,36 @@ lint: fmt-check clippy
 # Clippy for the wasm32 target — checks code the native lint job cannot see.
 clippy-wasm:
     cargo clippy --target wasm32-unknown-unknown --features wasm -- -D warnings
+
+# ---------------------------------------------------------------------------
+# CI job: check-windows
+#
+# Catches `cfg`-gated code that no native or wasm build compiles. The shard
+# writer lock is the motivating case: `src/shard/lock.rs` has a `#[cfg(unix)]`
+# arm using `libc::flock` and a `#[cfg(windows)]` arm using `LockFileEx`, and a
+# Linux CI runner type-checks neither the Windows arm nor its dependency
+# declaration. Windows is a supported target — `distribute` ships a Windows
+# bundle — so a break here is a real break, not a theoretical one.
+#
+# Feature sets are limited to those with no C dependencies. `service`
+# (libsqlite3-sys) and `git-tracking` (libz-sys via git2) need a full MinGW
+# cross-toolchain that a dev machine usually lacks; their build scripts fail
+# before rustc is reached, which says nothing about our code. A real
+# windows-latest runner compiles those natively and is the place to cover them
+# — the matrix in .github/workflows/test.yml has windows-latest commented out.
+# ---------------------------------------------------------------------------
+
+# Type-check the Windows target for the feature sets that cross-compile cleanly.
+check-windows:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! rustup target list --installed | grep -q x86_64-pc-windows-gnu; then
+        echo "ERROR: run 'just deps' first (missing x86_64-pc-windows-gnu target)" >&2
+        exit 1
+    fi
+    cargo check --target x86_64-pc-windows-gnu --no-default-features
+    cargo check --target x86_64-pc-windows-gnu --no-default-features --features mcp
+    cargo check --target x86_64-pc-windows-gnu --no-default-features --features xlsx
 
 # ---------------------------------------------------------------------------
 # CI job: docs
@@ -183,7 +214,7 @@ standalone:
 # ---------------------------------------------------------------------------
 
 # Run every gating CI job, in the order most likely to fail fast.
-ci: lint docs examples test-matrix wasm-interface standalone
+ci: lint check-windows docs examples test-matrix wasm-interface standalone
 
 # The subset worth running before every push: fast, and catches most CI failures.
 check: fmt-check clippy docs

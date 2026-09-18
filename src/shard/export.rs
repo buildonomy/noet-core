@@ -38,6 +38,26 @@
 //! read by JavaScript before WASM initializes. The monolithic export uses
 //! MessagePack (`beliefbase.msgpack`) to match the sharded wire format.
 //!
+//! ## Atomic publication
+//!
+//! Every file here is written to a temporary sibling and then **renamed** into
+//! place, and `manifest.json` is renamed **last**. Two properties follow, and both
+//! are load-bearing now that shards are the identity store:
+//!
+//! 1. **No reader can observe a torn file.** A plain write truncates the target
+//!    first, so a concurrent reader can deserialize a half-written shard. `rename`
+//!    is atomic within a filesystem, so a reader sees either the old file or the
+//!    new one.
+//! 2. **The manifest is the commit point.** Because it is renamed after every shard
+//!    it references, a reader that has the new manifest is guaranteed the shards it
+//!    names are already in place.
+//!
+//! This is what allows readers ([`ShardStore::open_read_only`]) to take no lock and
+//! never block behind a writer. Concurrent *writers* are excluded separately, by the
+//! advisory lock in [`super::lock`].
+//!
+//! [`ShardStore::open_read_only`]: super::store::ShardStore::open_read_only
+//!
 //! ## References
 //!
 //! - `docs/design/core/search_and_sharding.md` §3 — Output structure
@@ -58,6 +78,77 @@ use crate::{
     },
 };
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+
+/// Per-network source-file digests, supplied by the caller's `ProtoIndex`.
+///
+/// Keyed by network **bref** rather than directory path because that is what the
+/// export loop has in hand, and what the manifest is keyed by. Resolving
+/// directory → bref is the caller's job: only it knows the mapping, and doing it
+/// here would mean re-deriving a partition the compiler already holds.
+///
+/// An absent entry yields an empty map, which the skip logic reads as dirty. That
+/// is the safe direction: a network whose hashes were never recorded is re-parsed.
+#[derive(Debug, Default, Clone)]
+pub struct SourceHashes {
+    by_network: BTreeMap<Bref, BTreeMap<String, String>>,
+}
+
+impl SourceHashes {
+    /// Build from an iterator of `(network bref, repo-relative path → digest)`.
+    pub fn new(entries: impl IntoIterator<Item = (Bref, BTreeMap<String, String>)>) -> Self {
+        Self {
+            by_network: entries.into_iter().collect(),
+        }
+    }
+
+    /// Digests for one network; empty when unrecorded.
+    pub fn for_network(&self, bref: &Bref) -> BTreeMap<String, String> {
+        self.by_network.get(bref).cloned().unwrap_or_default()
+    }
+
+    /// True when no network has recorded hashes.
+    pub fn is_empty(&self) -> bool {
+        self.by_network.is_empty()
+    }
+}
+
+/// Write `bytes` to `path` atomically: write a temp sibling, then rename.
+///
+/// The temp file is created in the destination directory so the rename stays within
+/// one filesystem — a cross-device rename is not atomic and would fall back to a
+/// copy, reintroducing the torn-read window this exists to close.
+///
+/// The temp name embeds the process id so two writers cannot collide on it. They
+/// should never both be here (see [`super::lock`]), but a leftover temp file from a
+/// killed process must not break the next run either.
+async fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), BuildonomyError> {
+    let dir = path.parent().ok_or_else(|| {
+        BuildonomyError::Custom(format!(
+            "cannot write {}: no parent directory",
+            path.display()
+        ))
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        BuildonomyError::Custom(format!("cannot write {}: no filename", path.display()))
+    })?;
+
+    let tmp = dir.join(format!(".{}.{}.tmp", file_name, std::process::id()));
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .map_err(|e| BuildonomyError::Custom(format!("cannot write {}: {e}", tmp.display())))?;
+
+    match tokio::fs::rename(&tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Leave no debris if the rename fails.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(BuildonomyError::Custom(format!(
+                "cannot publish {}: {e}",
+                path.display()
+            )))
+        }
+    }
+}
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -112,6 +203,7 @@ pub async fn export_beliefbase(
     config: &ShardConfig,
     search_manifest: &SearchManifest,
     codec_manifest: &CodecManifest,
+    source_hashes: &SourceHashes,
 ) -> Result<ExportMode, BuildonomyError> {
     // Serialize the full graph to measure its size.
     let json_string = serde_json::to_string_pretty(&graph)
@@ -130,6 +222,7 @@ pub async fn export_beliefbase(
             config,
             search_manifest,
             codec_manifest,
+            source_hashes,
         )
         .await?;
         Ok(ExportMode::Sharded { manifest })
@@ -141,11 +234,13 @@ pub async fn export_beliefbase(
         );
         let msgpack_bytes = to_msgpack(&graph)?;
         let msgpack_path = output_dir.join("beliefbase.msgpack");
-        tokio::fs::write(&msgpack_path, msgpack_bytes).await?;
-        // Write codec manifest alongside monolithic export.
+        // Codec manifest first, then the graph: in monolithic mode
+        // `beliefbase.msgpack` is the generation token, so it is renamed last for
+        // the same reason `manifest.json` is in sharded mode.
         let codec_json = serde_json::to_string_pretty(codec_manifest)
             .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
-        tokio::fs::write(output_dir.join("codecs.json"), codec_json).await?;
+        write_atomic(&output_dir.join("codecs.json"), codec_json).await?;
+        write_atomic(&msgpack_path, msgpack_bytes).await?;
         tracing::debug!(
             "Exported BeliefGraph to {} ({:.2} MB, {} states, {} relations)",
             msgpack_path.display(),
@@ -180,6 +275,7 @@ async fn export_sharded(
     config: &ShardConfig,
     search_manifest: &SearchManifest,
     codec_manifest: &CodecManifest,
+    source_hashes: &SourceHashes,
 ) -> Result<ShardManifest, BuildonomyError> {
     let bb_dir = output_dir.join("beliefbase");
     let networks_dir = bb_dir.join("networks");
@@ -222,7 +318,7 @@ async fn export_sharded(
 
     let global_bytes = to_msgpack(&global_shard)?;
     let global_byte_len = global_bytes.len();
-    tokio::fs::write(bb_dir.join("global.msgpack"), global_bytes).await?;
+    write_atomic(&bb_dir.join("global.msgpack"), global_bytes).await?;
 
     shard_manifest.global = GlobalShardMeta {
         node_count: global_shard.states.len(),
@@ -385,7 +481,7 @@ async fn export_sharded(
         let bref_str = net_bref.to_string();
         let shard_filename = format!("{}.msgpack", bref_str);
         let shard_path = networks_dir.join(&shard_filename);
-        tokio::fs::write(&shard_path, shard_bytes).await?;
+        write_atomic(&shard_path, shard_bytes).await?;
 
         let net_title = graph
             .states
@@ -406,6 +502,7 @@ async fn export_sharded(
             net_shard.relations.edges.len(),
             shard_byte_len,
             (search_size_kb * 1024.0) as usize,
+            source_hashes.for_network(net_bref),
         );
 
         tracing::debug!(
@@ -419,15 +516,17 @@ async fn export_sharded(
         shard_manifest.networks.push(meta);
     }
 
-    // ── Write shard manifest ──────────────────────────────────────────────
-    let manifest_json = serde_json::to_string_pretty(&shard_manifest)
-        .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
-    tokio::fs::write(bb_dir.join("manifest.json"), manifest_json).await?;
-
     // ── Write codec manifest (sibling to beliefbase/) ─────────────────────
     let codec_json = serde_json::to_string_pretty(codec_manifest)
         .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
-    tokio::fs::write(output_dir.join("codecs.json"), codec_json).await?;
+    write_atomic(&output_dir.join("codecs.json"), codec_json).await?;
+
+    // ── Write shard manifest ── LAST: it is the commit point ─────────────────
+    // Every shard this manifest names is already renamed into place, so a reader
+    // that observes the new manifest is guaranteed to find the shards it lists.
+    let manifest_json = serde_json::to_string_pretty(&shard_manifest)
+        .map_err(|e| BuildonomyError::Serialization(e.to_string()))?;
+    write_atomic(&bb_dir.join("manifest.json"), manifest_json).await?;
 
     tracing::debug!(
         "[export_sharded] Wrote {} network shards + global ({} total nodes)",
@@ -893,6 +992,7 @@ mod tests {
             &config,
             &SearchManifest::new(),
             &CodecManifest::new(vec![], vec![]),
+            &SourceHashes::default(),
         )
         .await
         .unwrap();

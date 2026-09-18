@@ -512,12 +512,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok()
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-            // Resolve db: CLI flag > NOET_DB env var > false.
+            // `--db` / NOET_DB are inert on the parse path: shards are the
+            // cross-invocation store now, and SQLite no longer participates in
+            // identity or resolution. The flag is warned about here rather than
+            // silently ignored; its replacement by `--debug-db` is Issue 66 step 6.
             let use_file_db = db
                 || std::env::var("NOET_DB")
                     .ok()
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
+            if use_file_db {
+                tracing::warn!(
+                    "--db / NOET_DB no longer has any effect: the previous run's shards \
+                     under --html-output are the cross-invocation store. See Issue 66."
+                );
+            }
 
             if verbose {
                 println!("Parsing: {path:?}");
@@ -580,31 +589,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // on `tx`, so the `paths` table is correctly populated during parse.
                 //
                 // Without `service`, fall back to the in-memory `BeliefBase` accumulator.
-                #[cfg(feature = "service")]
-                let accumulator = {
-                    use crate::db::{db_init, db_init_memory, DbConnection};
-                    let db_pool = if use_file_db {
-                        let db_path = path.join("belief_cache.db");
-                        tracing::info!("Using file-backed belief DB: {}", db_path.display());
-                        db_init(db_path).await.map_err(|e| {
-                            crate::BuildonomyError::Custom(format!(
-                                "Failed to initialise file-backed belief DB: {e}"
-                            ))
-                        })?
-                    } else {
-                        db_init_memory().await.map_err(|e| {
-                            crate::BuildonomyError::Custom(format!(
-                                "Failed to initialise in-memory belief DB: {e}"
-                            ))
-                        })?
-                    };
-                    BeliefAccumulator::new(DbConnection(db_pool), rx)
+                // Back the parse with the previous run's shards when an output
+                // directory is available. This is what makes BIDs stable across cold
+                // builds: `cache_fetch` resolves an unchanged heading against the prior
+                // generation instead of minting a fresh time-based BID. Without an
+                // output directory there are no shards to stand on, so the parse falls
+                // back to an ephemeral store and its BIDs are not preserved.
+                //
+                // `ShardStore` takes the exclusive writer lock for the process lifetime
+                // when an output directory is present — exactly one writer may own a
+                // generation (`living_corpus.md` §2).
+                let shard_store = match html_output.as_ref() {
+                    Some(dir) => {
+                        std::fs::create_dir_all(dir)?;
+                        let store = crate::shard::ShardStore::open_writable(dir)?;
+                        let loaded = store.load_all()?;
+                        if loaded > 0 {
+                            tracing::info!(
+                                "Loaded {loaded} prior network shard(s) from {} — \
+                                 unchanged nodes will keep their BIDs",
+                                dir.display()
+                            );
+                        }
+                        store
+                    }
+                    None => {
+                        tracing::warn!(
+                            "No --html-output: parsing without a shard store, so every \
+                             non-persisted BID will be re-minted"
+                        );
+                        crate::shard::ShardStore::in_memory()
+                    }
                 };
-                #[cfg(not(feature = "service"))]
-                let accumulator = {
-                    use crate::beliefbase::BeliefBase;
-                    BeliefAccumulator::new(BeliefBase::empty(), rx)
-                };
+
+                let accumulator = BeliefAccumulator::new(shard_store, rx);
 
                 // `query_handle()` is a cheap, clonable view backed by the same
                 // `Arc<Mutex<AccInner>>` and `Arc<AccCache>`.  Pass this to `parse_all`

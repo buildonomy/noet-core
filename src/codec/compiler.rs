@@ -3636,6 +3636,79 @@ impl DocumentCompiler {
     /// Called by finalize() for watch service (has DbConnection).
     /// Can also be called separately by parse command after event synchronization.
     ///
+    /// Map each network's `ProtoIndex` source digests onto its bref, for the shard
+    /// manifest.
+    ///
+    /// `ProtoIndex` is keyed by network *directory*; the manifest is keyed by network
+    /// *bref*. The bridge is the network node itself: its BID is registered in the
+    /// `PathMapMap` under the network it roots, and a network node's own path entry
+    /// is the empty string.
+    ///
+    /// A network whose bref cannot be resolved is omitted. Its manifest entry then
+    /// carries no hashes, which the next build reads as dirty and re-parses — so an
+    /// omission costs a rebuild, never a false skip.
+    fn collect_source_hashes(
+        &self,
+        pathmap: &crate::paths::PathMapMap,
+    ) -> crate::shard::export::SourceHashes {
+        // Resolve each network directory to the bref the **export** will key its shard
+        // by. That bref must come from the same `PathMapMap` the export partitions on:
+        // `parsed_node_paths` records BIDs as each file was parsed, and a node absorbed
+        // or re-minted in a later epoch keeps its stale BID there. Keying off it
+        // produced brefs that matched nothing at export time — every network silently
+        // recorded zero hashes, which reads as "always dirty" rather than failing.
+        //
+        // `PathMapMap::map()` is keyed by network bref, and each network's own PathMap
+        // resolves the empty path to that network's node, so the two sides agree by
+        // construction.
+        let mut entries: Vec<(
+            crate::properties::Bref,
+            std::collections::BTreeMap<String, String>,
+        )> = Vec::new();
+
+        // network node BID -> its directory, from the ProtoIndex partition.
+        let dir_of_net_bid: std::collections::BTreeMap<crate::properties::Bid, std::path::PathBuf> =
+            self.proto_index
+                .network_dirs()
+                .into_iter()
+                .filter_map(|dir| {
+                    let canonical = crate::paths::canonicalize_path(&dir).ok()?;
+                    let index = crate::codec::network::detect_network_file(&canonical)?;
+                    // Find the parsed node whose recorded path is this network: either the
+                    // index file or the directory itself.
+                    let bid = self.parsed_node_paths.iter().find_map(|(bid, p)| {
+                        let c = crate::paths::canonicalize_path(p).ok()?;
+                        (c == canonical || c == index).then_some(*bid)
+                    })?;
+                    Some((bid, canonical))
+                })
+                .collect();
+
+        for (bref, pm) in pathmap.map() {
+            // The network node for this PathMap.
+            let Some((_, net_bid)) = pathmap.net_get_from_path(bref, "") else {
+                continue;
+            };
+            let _ = pm;
+            let Some(dir) = dir_of_net_bid.get(&net_bid) else {
+                continue;
+            };
+            let hashes = self.proto_index.source_hashes_for(dir);
+            if !hashes.is_empty() {
+                entries.push((*bref, hashes));
+            }
+        }
+
+        if entries.is_empty() {
+            tracing::debug!(
+                "[collect_source_hashes] no network resolved to a bref — shards will \
+                 carry no hashes and every network will be re-parsed next build"
+            );
+        }
+
+        crate::shard::export::SourceHashes::new(entries)
+    }
+
     /// # Parameters
     /// - `global_bb`: Synchronized BeliefBase with all events processed
     pub async fn finalize_html<B: BeliefSource + Clone>(
@@ -3792,6 +3865,11 @@ impl DocumentCompiler {
                 crate::codec::collect_known_extensions(),
                 crate::codec::WALK_CODECS.network_filenames(),
             );
+            // Record each network's source-file digests into its shard meta, so the
+            // next build can decide whether that network changed. Resolving network
+            // directory -> bref happens here because only the compiler holds both the
+            // ProtoIndex partition and the PathMap that names each network.
+            let source_hashes = self.collect_source_hashes(&pathmap);
             crate::shard::export::export_beliefbase(
                 graph,
                 &pathmap,
@@ -3799,6 +3877,7 @@ impl DocumentCompiler {
                 &shard_config,
                 &search_manifest,
                 &codec_manifest,
+                &source_hashes,
             )
             .await
         };
@@ -6391,6 +6470,7 @@ This has a [broken link](nonexistent.md "bref://000000000000000000000000").
             &config,
             &empty_search_manifest,
             &codec_manifest,
+            &crate::shard::export::SourceHashes::default(),
         )
         .await
         .unwrap();

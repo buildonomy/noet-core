@@ -97,6 +97,21 @@ uuid = { version = "1.16", features = ["serde", "std", "rng", "v5", "v6", "js"] 
 walkdir = "2.5"
 unicode-normalization = "0.1.25"
 
+# Advisory file locking for the shard writer lock (`src/shard/lock.rs`), which
+# enforces one writer per output directory. Native-only: the module is excluded
+# from wasm32 builds. Each platform gets the primitive whose lock the kernel
+# releases when the handle closes, so an abnormally terminated writer strands
+# nothing.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 async-trait = "0.1.77"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
